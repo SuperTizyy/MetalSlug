@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
@@ -10,7 +10,8 @@ class UUserWidget;
 
 /**
  * 活动系统核心控制器
- * 不依赖任何具体 UI
+ * 负责管理活动系统的业务逻辑，不依赖具体的UI组件
+ * 处理页面切换、页面缓存等核心功能
  */
 UCLASS()
 class METALSLUG01_API UActivityController : public UObject
@@ -19,36 +20,43 @@ class METALSLUG01_API UActivityController : public UObject
 
 public:
 
-	/** 初始化 Controller */
+	/** 初始化控制器
+	 *  @param InConfigTable - 活动配置表，包含活动项目的信息
+	 *  @param InContentHost - 内容承载容器，用于显示活动页面
+	 */
 	void Init(
 		UDataTable* InConfigTable,
 		UPanelWidget* InContentHost
 	);
 
-	/** 点击左侧菜单 */
+	/** 处理左侧菜单点击事件
+	 *  @param PageId - 要跳转的页面ID
+	 */
 	UFUNCTION()
 	void OnMenuClicked(FName PageId);
 
 private:
 
-	/** 切换页面 */
+	/** 切换到指定页面
+	 *  @param PageId - 要切换到的页面ID
+	 */
 	void SwitchToPage(FName PageId);
 
 private:
 
-	/** 活动配置表 */
+	/** 活动配置表 - 存储活动项目的基本信息 */
 	UPROPERTY()
 	UDataTable* ConfigTable;
 
-	/** 右侧内容容器 */
+	/** 右侧内容容器 - 用于承载和显示活动页面 */
 	UPROPERTY()
 	UPanelWidget* ContentHost;
 
-	/** 页面缓存 */
+	/** 页面缓存 - 缓存已创建的页面实例，避免重复创建 */
 	UPROPERTY()
 	TMap<FName, UUserWidget*> PageCache;
 
-	/** 当前显示页面 */
+	/** 当前显示页面 - 记录当前正在显示的页面实例 */
 	UPROPERTY()
 	UUserWidget* CurrentPage;
 };
