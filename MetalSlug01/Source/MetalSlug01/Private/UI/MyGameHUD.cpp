@@ -4,6 +4,7 @@
 #include "UI/MyGameHUD.h"
 #include "UI/GameRewardMainWidget.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/Activity/Root/ActivityRoot.h"
 
 AMyGameHUD::AMyGameHUD()
 {
@@ -26,25 +27,23 @@ void AMyGameHUD::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 预创建 UI 但不显示，保证弹出时零延迟
-	if (RewardWidgetClass)
-	{
-		CachedRewardWidget = CreateWidget<UGameRewardMainWidget>(GetWorld(), RewardWidgetClass);
-	}
+	UE_LOG(LogTemp, Error, TEXT("AMyGameHUD::BeginPlay CALLED"));
 	
-	if (RewardWidgetClass)
+	// 原签到逻辑
+	if (RewardWidgetClass && !CachedRewardWidget)
 	{
 		CachedRewardWidget = CreateWidget<UGameRewardMainWidget>(GetWorld(), RewardWidgetClass);
-		if (CachedRewardWidget)
-		{
-			// 调试用：强制显示，确保能看到界面
-			CachedRewardWidget->AddToViewport(99); 
-			UE_LOG(LogTemp, Log, TEXT("UI 已成功添加到视口"));
-		}
+		// 默认先不显示
 	}
-	else 
+
+	// 新增：创建 ActivityRoot
+	if (ActivityRootClass && !CachedActivityRootWidget)
 	{
-		UE_LOG(LogTemp, Error, TEXT("RewardWidgetClass 为空，无法创建 Widget"));
+		CachedActivityRootWidget = CreateWidget<UActivityRoot>(GetWorld(), ActivityRootClass);
+		if (CachedActivityRootWidget)
+		{
+			CachedActivityRootWidget->AddToViewport();
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ public:
 	);
 
 	/** 点击左侧菜单 */
+	UFUNCTION()
 	void OnMenuClicked(FName PageId);
 
 private:

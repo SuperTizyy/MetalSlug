@@ -24,6 +24,10 @@ void UActivityController::Init(
 
 void UActivityController::OnMenuClicked(FName PageId)
 {
+	UE_LOG(LogTemp, Error,
+		TEXT("Controller::OnMenuClicked PageId=%s"),
+		*PageId.ToString());
+	
 	// 左侧按钮点击后，统一走这里
 	SwitchToPage(PageId);
 }
@@ -61,8 +65,8 @@ void UActivityController::SwitchToPage(FName PageId)
 			return;
 		}
 
-		// 加载 Widget Class（同步示例，后面会升级异步）
-		UClass* WidgetClass = Config->PageWidget.LoadSynchronous();
+		
+		UClass* WidgetClass = Config->PageWidgetClass;
 		if (!WidgetClass)
 		{
 			UE_LOG(LogTemp, Warning,

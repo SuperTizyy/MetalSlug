@@ -6,25 +6,32 @@
 #include "UI/Activity/Root/ActivityMenuItem.h"
 #include "Components/VerticalBox.h"
 
-
-void UActivityRoot::NativeOnInitialized()
-{
-	Super::NativeOnInitialized();
-
-	// 创建 Controller
-	Controller = NewObject<UActivityController>(this);
-	Controller->Init(ActivityConfigTable, RightContent);
-
-	// 构建左侧菜单
-	BuildLeftMenu();
-}
-
 void UActivityRoot::BuildLeftMenu()
 {
-	TArray<FActivityConfig*> Rows;
-	ActivityConfigTable->GetAllRows(TEXT("ActivityRoot"), Rows);
+	if (!ActivityConfigTable || !LeftMenuBox)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("BuildLeftMenu failed: ActivityConfigTable=%p LeftMenuBox=%p"),
+			ActivityConfigTable,
+			LeftMenuBox);
+		return;
+	}
 
-	// 排序
+	TArray<FActivityConfig*> Rows;
+	ActivityConfigTable->GetAllRows(TEXT("BuildLeftMenu"), Rows);
+
+	UE_LOG(LogTemp, Error,
+		TEXT("BuildLeftMenu: Rows.Num() = %d"),
+		Rows.Num());
+
+	if (Rows.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("BuildLeftMenu: EMPTY TABLE OR STRUCT MISMATCH"));
+		return;
+	}
+
+	// ✅ UE 正确排序写法（注意是引用）
 	Rows.Sort([](const FActivityConfig& A, const FActivityConfig& B)
 	{
 		return A.SortOrder < B.SortOrder;
@@ -32,15 +39,21 @@ void UActivityRoot::BuildLeftMenu()
 
 	for (FActivityConfig* Row : Rows)
 	{
+		if (!Row || !MenuItemClass)
+		{
+			continue;
+		}
+
 		UActivityMenuItem* Item =
-			CreateWidget<UActivityMenuItem>(
-				GetWorld(),
-				UActivityMenuItem::StaticClass()
-			);
+			CreateWidget<UActivityMenuItem>(GetWorld(), MenuItemClass);
 
-		Item->PageId = Row->PageId;
+		if (!Item)
+		{
+			continue;
+		}
 
-		// 绑定点击事件
+		Item->Init(Row->PageId, Row->DisplayName);
+
 		Item->OnClicked.AddDynamic(
 			Controller,
 			&UActivityController::OnMenuClicked
@@ -48,4 +61,47 @@ void UActivityRoot::BuildLeftMenu()
 
 		LeftMenuBox->AddChild(Item);
 	}
+}
+
+
+
+
+void UActivityRoot::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+
+	UE_LOG(LogTemp, Error, TEXT("ActivityRoot::NativeOnInitialized START"));
+
+	if (!ActivityConfigTable)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("ActivityConfigTable is NULL in ActivityRoot"));
+		return;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("ActivityConfigTable OK"));
+	}
+
+	if (!RightContent || !LeftMenuBox)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("UI BindWidget failed: RightContent=%p LeftMenuBox=%p"),
+			RightContent,
+			LeftMenuBox);
+		return;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("BindWidget OK"));
+	}
+
+	Controller = NewObject<UActivityController>(this);
+	Controller->Init(ActivityConfigTable, RightContent);
+
+	UE_LOG(LogTemp, Error, TEXT("Controller Init OK"));
+
+	BuildLeftMenu();
 }

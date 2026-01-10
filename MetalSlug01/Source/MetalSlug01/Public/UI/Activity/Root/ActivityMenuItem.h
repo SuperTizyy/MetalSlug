@@ -4,39 +4,40 @@
 #include "Blueprint/UserWidget.h"
 #include "ActivityMenuItem.generated.h"
 
+class UButton;
+class UTextBlock;
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 	FOnActivityMenuClicked,
 	FName,
 	PageId
 );
 
-/**
- * 左侧菜单按钮
- */
 UCLASS()
 class METALSLUG01_API UActivityMenuItem : public UUserWidget
 {
 	GENERATED_BODY()
 
 public:
+	// 初始化菜单项
+	void Init(FName InPageId, const FText& InDisplayName);
 
-	/** 页面 ID */
-	UPROPERTY(BlueprintReadOnly, EditAnywhere)
-	FName PageId;
-
-	/** 点击事件 */
+public:
 	UPROPERTY(BlueprintAssignable)
 	FOnActivityMenuClicked OnClicked;
 
 protected:
-
 	virtual void NativeOnInitialized() override;
 
 protected:
-
-	/** 绑定按钮 */
 	UPROPERTY(meta = (BindWidget))
-	class UButton* ClickButton;
+	UButton* ClickButton;
+
+	UPROPERTY(meta = (BindWidget))
+	UTextBlock* TitleText;
+
+private:
+	FName PageId;
 
 	UFUNCTION()
 	void HandleClicked();
