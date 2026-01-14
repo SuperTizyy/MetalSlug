@@ -4,46 +4,41 @@
 
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
-#include "UI/Activity/Data/RewardData.h"
 #include "DailyLoginDayItem.generated.h"
 
 /**
- * 单日登录奖励 Item
- * 职责：
- * 1. 保存某一天的奖励内容
- * 2. 保存该天的领取状态
- * 3. 不包含任何 UI 或流程逻辑
+ * 每日登录单日数据（Model）
+ * ⚠ 仅 Track 可修改状态
  */
-UCLASS(BlueprintType)
+UCLASS()
 class METALSLUG01_API UDailyLoginDayItem : public UObject
 {
 	GENERATED_BODY()
 
 public:
-	// 第几天（Day1、Day2、Day8 等）
-	// 用于和服务器、配置表对齐
-	UPROPERTY(BlueprintReadOnly)
+	// ===== 只读查询 =====
+
+	int32 GetDayIndex() const { return DayIndex; }
+
+	bool CanClaim() const { return bCanClaim; }
+
+	bool IsClaimed() const { return bClaimed; }
+
+	// ===== 仅 Track 调用 =====
+
+	void Init(int32 InDayIndex);
+
+	void UpdateClaimable(bool bInCanClaim);
+
+	bool TryClaim();
+
+private:
+	UPROPERTY()
 	int32 DayIndex = 0;
 
-	// 当天的奖励内容（可多个）
-	UPROPERTY(BlueprintReadOnly)
-	TArray<FRewardData> Rewards;
+	UPROPERTY()
+	bool bCanClaim = false;
 
-	// 是否已领取
-	// true：已领取
-	// false：未领取
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY()
 	bool bClaimed = false;
-
-	// 是否可领取（由 Track 统一刷新）
-	UPROPERTY(BlueprintReadOnly)
-	bool bClaimable = false;
-
-public:
-	// 重置该天的状态（用于重建 / 测试）
-	void ResetState();
-	
-	// 请求领取（转发给 Track）
-	void RequestClaim();
 };
-

@@ -4,36 +4,45 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Blueprint/IUserObjectListEntry.h"
 #include "DailyLoginDayItemWidget.generated.h"
 
 class UTextBlock;
 class UButton;
+class UImage;
 class UDailyLoginDayItem;
+class UDailyLoginTrack;
 
 /**
- * 单日登录奖励 Item Widget
+ * 每日登录 Item Widget
  * 职责：
- * 1. 展示 DayIndex / 奖励 / 状态
- * 2. 将点击行为上抛（不处理逻辑）
+ * - 展示 DayIndex / 可领取 / 已领取
+ * - 点击按钮 → 通知 Track
+ *
+ * ⚠ 不保存状态
+ * ⚠ 不写规则
  */
 UCLASS()
-class METALSLUG01_API UDailyLoginDayItemWidget : public UUserWidget
+class METALSLUG01_API UDailyLoginDayItemWidget
+	: public UUserWidget
+	, public IUserObjectListEntry
 {
 	GENERATED_BODY()
 
-public:
-	// ListView 绑定入口
-	void BindItem(UDailyLoginDayItem* InItem);
-
 protected:
-	virtual void NativeOnInitialized() override;
+	/** ListView 设置 Item 时调用（核心入口） */
+	virtual void NativeOnListItemObjectSet(UObject* ListItemObject) override;
 
 private:
-	// 绑定的数据
+	/** 当前绑定的数据 */
 	UPROPERTY()
-	UDailyLoginDayItem* Item = nullptr;
+	UDailyLoginDayItem* ItemData = nullptr;
 
-	// ==== UI ====
+	/** Track 引用（只调用接口） */
+	UPROPERTY()
+	UDailyLoginTrack* LoginTrack = nullptr;
+
+	// ================= UI =================
 
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* DayText;
@@ -41,12 +50,14 @@ private:
 	UPROPERTY(meta = (BindWidget))
 	UButton* ClaimButton;
 
+	UPROPERTY(meta = (BindWidget))
+	UImage* ClaimedIcon;
+
 private:
-	// 点击领取
+	/** 点击领取 */
 	UFUNCTION()
 	void OnClaimClicked();
 
-	// 根据数据刷新 UI
+	/** 刷新 UI */
 	void RefreshView();
 };
-

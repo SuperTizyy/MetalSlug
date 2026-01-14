@@ -1,4 +1,4 @@
-﻿// 13
+﻿//13
 
 #pragma once
 
@@ -17,7 +17,10 @@ class UTreasureBoxItem;
  * 1. 显示宝箱状态（未解锁 / 可领取 / 已领取）
  * 2. 响应点击并通知 Model
  *
- * ⚠ 不做任何逻辑判断
+ * 规则：
+ * - 不做任何业务判断
+ * - 不直接操作 Track
+ * - 仅根据 Model 状态刷新显示
  */
 UCLASS()
 class METALSLUG01_API UTreasureBoxWidget : public UUserWidget
@@ -25,11 +28,11 @@ class METALSLUG01_API UTreasureBoxWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	/**
-	 * 绑定宝箱数据
-	 * 由 Page 调用
-	 */
+	/** 绑定宝箱数据（由 Page 调用） */
 	void BindBoxItem(UTreasureBoxItem* InBoxItem);
+
+	/** 外部触发刷新（领取后、联动用） */
+	void Refresh();
 
 protected:
 	virtual void NativeOnInitialized() override;
@@ -39,17 +42,17 @@ private:
 	UPROPERTY()
 	UTreasureBoxItem* BoxItem = nullptr;
 
-	// ================= UI 组件 =================
+	// ================= UI =================
 
-	/** 宝箱按钮（整体可点击区域） */
+	/** 宝箱按钮 */
 	UPROPERTY(meta = (BindWidget))
 	UButton* BoxButton;
 
-	/** 宝箱图标（根据状态切换外观） */
+	/** 宝箱图标 */
 	UPROPERTY(meta = (BindWidget))
 	UImage* BoxIcon;
 
-	/** 状态文本（锁定 / 可领取 / 已领取） */
+	/** 状态文本 */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* StateText;
 
@@ -58,7 +61,6 @@ private:
 	UFUNCTION()
 	void OnBoxClicked();
 
-	/** 根据 Model 刷新显示 */
+	/** 根据 Model 刷新 UI */
 	void RefreshView();
 };
-
