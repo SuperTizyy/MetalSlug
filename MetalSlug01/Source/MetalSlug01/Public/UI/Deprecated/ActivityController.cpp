@@ -1,4 +1,4 @@
-// 版权声明：在项目设置的描述页面填写您的版权信息
+/*// 版权声明：在项目设置的描述页面填写您的版权信息
 
 
 #include "UI/Activity/Controller/ActivityController.h"
@@ -114,4 +114,4 @@ void UActivityController::SwitchToPage(FName PageId)
 		// 调用页面显示事件
 		Page->OnPageShow();
 	}
-}
+}*/
