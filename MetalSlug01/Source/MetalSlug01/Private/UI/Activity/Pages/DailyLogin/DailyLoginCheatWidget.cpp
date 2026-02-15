@@ -20,14 +20,14 @@ void UDailyLoginCheatWidget::NativeConstruct()
 		FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
         
 		// 3. 将这个进度同步到你的输入框或显示文本上
-		// 假设你的输入框叫 DayInputEditableText
+		// 注意：Progress=0表示第一天可领取，所以显示时要加1
 		if (DayInput)
 		{
-			FString CurrentDayStr = FString::FromInt(Record.Progress);
+			FString CurrentDayStr = FString::FromInt(Record.Progress + 1);
 			DayInput->SetText(FText::FromString(CurrentDayStr));
 		}
         
-		UE_LOG(LogTemp, Log, TEXT("CheatWidget: 成功同步当前存档天数: %d"), Record.Progress);
+		UE_LOG(LogTemp, Log, TEXT("CheatWidget: 成功同步当前存档天数: %d (显示为第%d天)"), Record.Progress, Record.Progress + 1);
 	}
 	
 	// 4. 绑定按钮点击事件

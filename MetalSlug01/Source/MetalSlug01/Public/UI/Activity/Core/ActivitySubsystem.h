@@ -66,7 +66,10 @@ public:
 
 	/** 获取玩家记录 */
 	FPlayerLoginRecord& GetOrInitPlayerRecord(int32 ActivityID);
-
+		
+	/** 保存玩家记录 */
+	void SavePlayerRecord(int32 ActivityID);
+		
 	/** 获取每日登录配置 */
 	TArray<FDailyLoginConfigRow*> GetDailyLoginConfigs(int32 ActivityID) const;
 
@@ -81,6 +84,9 @@ public:
 
 	/** 批量尝试领取奖励 */
 	bool TryClaimMultipleRewards(int32 ActivityID, const TArray<int32>& DayIndices);
+
+	/** 根据物品ID获取物品详情 */
+	const FItemDetailRow* GetItemDetail(int32 ItemID) const;
 
 public:
 	// ================= 事件 =================
@@ -100,15 +106,20 @@ private:
 	UTreasureTrack* TreasureTrack = nullptr;
 
 	// ================= 管理器持有 =================
-
+		
 	UPROPERTY()
 	URedDotManager* RedDotManager = nullptr;
-
+		
 	UPROPERTY()
 	UActivityPageManager* ActivityPageManager = nullptr;
-
+		
 	UPROPERTY()
 	UActivityTimeManager* ActivityTimeManager = nullptr;
+		
+	// ================= SaveGame 缓存 =================
+		
+	UPROPERTY()
+	UDailyLoginSaveGame* CachedSaveGame = nullptr;
 };
 
 

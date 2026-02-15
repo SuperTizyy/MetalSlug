@@ -260,7 +260,17 @@ void UDailyLoginDayItemWidget::OnClaimButtonClicked()
 
 void UDailyLoginDayItemWidget::AddRewardIconFromConfig(const FDailyLoginConfigRow& ConfigRow)
 {
-    AddRewardIcon(ConfigRow.RewardItemID, ConfigRow.RewardCount);
+    // 根据奖励类型决定图标来源
+    if (ConfigRow.RewardType == ELoginRewardType::Box)
+    {
+        // 礼包/宝箱类型：使用FDailyLoginConfigRow的BoxImage字段
+        AddRewardIconFromBoxImage(ConfigRow.BoxImage, ConfigRow.RewardCount);
+    }
+    else
+    {
+        // 其他类型：通过RewardItemID查询FItemDetailRow的ItemIcon
+        AddRewardIcon(ConfigRow.RewardItemID, ConfigRow.RewardCount);
+    }
 }
 
 void UDailyLoginDayItemWidget::ClearRewardIcons()
@@ -273,8 +283,85 @@ void UDailyLoginDayItemWidget::ClearRewardIcons()
     }
 }
 
+void UDailyLoginDayItemWidget::AddRewardIconFromBoxImage(const TSoftObjectPtr<UTexture2D>& BoxImage, int32 RewardCount)
+{
+    UE_LOG(LogTemp, Warning, TEXT("=== AddRewardIconFromBoxImage 被调用 === RewardCount: %d"), RewardCount);
+    
+    // 专门处理礼包/宝箱类型的图标
+    if (!RewardContainer)
+    {
+        UE_LOG(LogTemp, Error, TEXT("DayItemWidget: RewardContainer (容器) 为空，无法添加图标"));
+        return;
+    }
+
+    if (!RewardIconClass)
+    {
+        UE_LOG(LogTemp, Error, TEXT("DayItemWidget: RewardIconClass (图标类) 未赋值，无法添加图标"));
+        return;
+    }
+
+    // 清空奖励容器
+    RewardContainer->ClearChildren();
+
+    // 创建奖励图标 Widget
+    UE_LOG(LogTemp, Warning, TEXT("准备创建BoxImage RewardIcon Widget，类名: %s"), *RewardIconClass->GetName());
+    UUserWidget* IconWidget = CreateWidget<UUserWidget>(GetWorld(), RewardIconClass);
+    if (IconWidget)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建BoxImage RewardIcon Widget"));
+        RewardContainer->AddChild(IconWidget);
+        UE_LOG(LogTemp, Warning, TEXT("✅ 已将BoxImage图标添加到RewardContainer"));
+
+        // 获取图标控件
+        UImage* RewardImage = Cast<UImage>(IconWidget->GetWidgetFromName(TEXT("RewardImage")));
+        UTextBlock* CountText = Cast<UTextBlock>(IconWidget->GetWidgetFromName(TEXT("CountText")));
+
+        if (RewardImage && BoxImage.IsValid())
+        {
+            UE_LOG(LogTemp, Warning, TEXT("检查BoxImage状态 - IsValid: %s, IsNull: %s, IsPending: %s"), 
+                BoxImage.IsValid() ? TEXT("是") : TEXT("否"),
+                BoxImage.IsNull() ? TEXT("是") : TEXT("否"),
+                BoxImage.IsPending() ? TEXT("是") : TEXT("否"));
+            UE_LOG(LogTemp, Warning, TEXT("开始加载BoxImage纹理"));
+            // 加载并设置宝箱图片
+            UTexture2D* Texture = BoxImage.LoadSynchronous();
+            if (Texture)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载BoxImage纹理: %s"), *Texture->GetName());
+                RewardImage->SetBrushFromTexture(Texture);
+                RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
+                RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                UE_LOG(LogTemp, Warning, TEXT("✅ 成功设置宝箱图标"));
+            }
+            else
+            {
+                UE_LOG(LogTemp, Error, TEXT("❌ BoxImage纹理加载失败"));
+            }
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("❌ RewardImage为空或BoxImage无效"));
+            if (!RewardImage)
+            {
+                UE_LOG(LogTemp, Error, TEXT("   RewardImage控件未找到"));
+            }
+            if (!BoxImage.IsValid())
+            {
+                UE_LOG(LogTemp, Error, TEXT("   BoxImage资源无效"));
+            }
+        }
+
+        if (CountText)
+        {
+            CountText->SetText(FText::AsNumber(RewardCount));
+        }
+    }
+}
+
 void UDailyLoginDayItemWidget::AddRewardIcon(int32 RewardID, int32 RewardCount)
 {
+    UE_LOG(LogTemp, Warning, TEXT("=== AddRewardIcon 被调用 === RewardID: %d, Count: %d"), RewardID, RewardCount);
+    
     // 1. 全局检查:确保奖励容器和奖励图标类已设置
     if (!RewardContainer)
     {
@@ -284,115 +371,95 @@ void UDailyLoginDayItemWidget::AddRewardIcon(int32 RewardID, int32 RewardCount)
 
     if (!RewardIconClass)
     {
-        // UE_LOG(LogTemp, Warning, TEXT("DayItemWidget: RewardIconClass (图标类) 未赋值，无法添加图标"));
+        UE_LOG(LogTemp, Error, TEXT("DayItemWidget: RewardIconClass (图标类) 未赋值，无法添加图标"));
         return;
     }
 
     // 2. 清空奖励容器中的所有子控件
-    if (RewardContainer)
-    {
-        int32 ChildCountBefore = RewardContainer->GetChildrenCount();
-        RewardContainer->ClearChildren();
-        // UE_LOG(LogTemp, Log, TEXT("清空奖励容器前有 %d 个子控件"), ChildCountBefore);
-    }
+    RewardContainer->ClearChildren();
 
     // 3. 创建奖励图标 Widget
+    UE_LOG(LogTemp, Warning, TEXT("准备创建RewardIcon Widget，类名: %s"), *RewardIconClass->GetName());
     UUserWidget* IconWidget = CreateWidget<UUserWidget>(GetWorld(), RewardIconClass);
     if (IconWidget)
     {
+        UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建RewardIcon Widget"));
         // 4. 将图标添加到容器中
         RewardContainer->AddChild(IconWidget);
+        UE_LOG(LogTemp, Warning, TEXT("✅ 已将图标添加到RewardContainer"));
 
         // 5. 获取图标 Widget 中的控件
-        // 假设 WBP_RewardIcon 中有 RewardImage(Image) 和 CountText(TextBlock) 控件
         UImage* RewardImage = Cast<UImage>(IconWidget->GetWidgetFromName(TEXT("RewardImage")));
         UTextBlock* CountText = Cast<UTextBlock>(IconWidget->GetWidgetFromName(TEXT("CountText")));
 
-        // UE_LOG(LogTemp, Log, TEXT("开始获取图标控件:RewardImage指针: %s, CountText指针: %s"), 
-        //     RewardImage ? TEXT("有效") : TEXT("无效"), 
-        //     CountText ? TEXT("有效") : TEXT("无效"));
-
         if (RewardImage)
         {
-            // 根据 RewardID 查找对应的奖励信息并设置
-            // UE_LOG(LogTemp, Log, TEXT("开始查找奖励信息，RewardID: %d"), RewardID);
-            
+            UE_LOG(LogTemp, Warning, TEXT("开始处理普通奖励图标，RewardID: %d"), RewardID);
+            // 通过RewardItemID从FItemDetailRow表获取ItemIcon
             if (UGameInstance* GI = GetGameInstance())
             {
                 if (UActivitySubsystem* ActivitySub = GI->GetSubsystem<UActivitySubsystem>())
                 {
-                    // 获取所有奖励信息
-                    TArray<FDailyLoginConfigRow*> AllRewards = ActivitySub->GetDailyLoginConfigs(101);
-                    // UE_LOG(LogTemp, Log, TEXT("获取到 %d 个奖励信息"), AllRewards.Num());
+                    UE_LOG(LogTemp, Warning, TEXT("✅ 获取到ActivitySubsystem"));
+                    // TODO: 这里需要从FItemDetailRow表查询ItemIcon
+                    // 暂时保持原有逻辑，后续需要实现从物品详情表获取图标
                     
-                    // 查找匹配的 RewardID
+                    // 获取所有奖励信息以查找匹配的RewardItemID
+                    TArray<FDailyLoginConfigRow*> AllRewards = ActivitySub->GetDailyLoginConfigs(101);
+                    UE_LOG(LogTemp, Warning, TEXT("获取到 %d 个奖励配置"), AllRewards.Num());
                     bool bFoundConfig = false;
+                    
                     for (auto* RewardRow : AllRewards)
                     {
                         if (RewardRow && RewardRow->RewardItemID == RewardID)
                         {
-                            // UE_LOG(LogTemp, Log, TEXT("找到匹配的奖励信息，RewardID: %d"), RewardID);
                             bFoundConfig = true;
+                            UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的奖励信息，RewardID: %d"), RewardID);
                             
-                            // 查找资源
-                            // 暂时注释复杂日志避免语法错误
+                            // 正确逻辑：非Box类型应该查询FItemDetailRow.ItemIcon
+                            UE_LOG(LogTemp, Warning, TEXT("🔍 查询ItemDetail表获取图标，ItemID: %d"), RewardID);
                             
-                            // 查找详细信息
-                            if (!RewardRow->RewardIcon.IsValid())
+                            // 通过ActivitySubsystem查询ItemDetail
+                            const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(RewardID);
+                            
+                            // 添加详细的调试信息
+                            if (ItemDetail)
                             {
-                                // UE_LOG(LogTemp, Warning, TEXT("RewardIcon属性:"));
-                                // UE_LOG(LogTemp, Warning, TEXT("  - 是否正在加载: %s"), RewardRow->RewardIcon.IsPending() ? TEXT("是") : TEXT("否"));
-                                // UE_LOG(LogTemp, Warning, TEXT("  - 是否为null: %s"), RewardRow->RewardIcon.IsNull() ? TEXT("是") : TEXT("否"));
-                            }
-                            
-                            if (RewardRow->RewardIcon.IsValid())
-                            {
-                                // 使用同步加载确保资源有效
-                                UTexture2D* Texture = RewardRow->RewardIcon.LoadSynchronous();
-                                // 暂时注释复杂日志避免语法错误
+                                UE_LOG(LogTemp, Warning, TEXT("🔍 ItemDetail记录详情:"));
+                                UE_LOG(LogTemp, Warning, TEXT("   ItemID: %d"), ItemDetail->ItemID);
+                                UE_LOG(LogTemp, Warning, TEXT("   ItemName: %s"), *ItemDetail->ItemName.ToString());
+                                UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsValid: %s"), ItemDetail->ItemIcon.IsValid() ? TEXT("是") : TEXT("否"));
+                                UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsNull: %s"), ItemDetail->ItemIcon.IsNull() ? TEXT("是") : TEXT("否"));
+                                UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsPending: %s"), ItemDetail->ItemIcon.IsPending() ? TEXT("是") : TEXT("否"));
                                 
-                                if (Texture)
+                                if (!ItemDetail->ItemIcon.IsNull())
                                 {
-                                    // UE_LOG(LogTemp, Log, TEXT("正确设置奖励图标控件"));
-                                    RewardImage->SetBrushFromTexture(Texture);
-                                    // 设置图标大小为原始大小
-                                    RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f)); // 2倍大小，宽高比为1:2.8
-                                    
-                                    // 强制设置图标大小
+                                    UE_LOG(LogTemp, Warning, TEXT("✅ 找到ItemDetail记录，使用UMG异步加载ItemIcon"));
+                                    // 使用UMG原生异步接口 - 更优雅的方式
+                                    // 注意：即使资源处于IsPending状态(!IsNull() && !IsValid())，UMG也会正确处理
+                                    RewardImage->SetBrushFromSoftTexture(ItemDetail->ItemIcon);
+                                    RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
                                     RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
-                                    
-                                    // 暂时注释复杂日志避免语法错误
-                                    
-                                    // 输出图标控件信息
-                                    // UE_LOG(LogTemp, Log, TEXT("图标控件:"));
-                                    // UE_LOG(LogTemp, Log, TEXT("  - 控件名称: %s"), *RewardImage->GetName());
-                                    // UE_LOG(LogTemp, Log, TEXT("  - 父控件: %s"), RewardImage->GetParent() ? *RewardImage->GetParent()->GetName() : TEXT("无"));
-                                    // UE_LOG(LogTemp, Log, TEXT("  - 画布大小: %s"), *RewardImage->GetCachedGeometry().GetLocalSize().ToString());
-                                    
-                                    // UE_LOG(LogTemp, Log, TEXT("成功设置奖励图标: ID %d, 资源 %s, 大小为原始大小"), 
-                                    //     RewardID, Texture->GetName());
+                                    UE_LOG(LogTemp, Warning, TEXT("✅ 已设置软引用纹理，UMG会自动异步加载: ID %d"), RewardID);
                                 }
                                 else
                                 {
-                                    // UE_LOG(LogTemp, Warning, TEXT("无法加载资源: ID %d"), RewardID);
+                                    UE_LOG(LogTemp, Error, TEXT("❌ ItemIcon资源为空，ItemID: %d"), RewardID);
+                                    // 显示灰色占位符
+                                    RewardImage->SetColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 1.0f)); // 灰色
+                                    RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
+                                    RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                                    UE_LOG(LogTemp, Warning, TEXT("⚠️ 显示灰色占位符图标: ID %d"), RewardID);
                                 }
                             }
                             else
                             {
-                                // UE_LOG(LogTemp, Warning, TEXT("奖励信息中没有有效资源: ID %d"), RewardID);
-                                
-                                // 如果处于pending状态，尝试异步加载
-                                if (!RewardRow->RewardIcon.IsNull() && RewardRow->RewardIcon.IsPending())
-                                {
-                                    // UE_LOG(LogTemp, Log, TEXT("奖励信息处于pending状态，使用异步加载: ID %d"), RewardID);
-                                    
-                                    // 使用同步异步加载
-                                    FLoadAssetAsyncOptionalParams Params;
-                                    RewardRow->RewardIcon.LoadAsync(
-                                        FLoadSoftObjectPathAsyncDelegate::CreateUObject(this, &UDailyLoginDayItemWidget::OnTextureLoaded, RewardImage, RewardID),
-                                        Params
-                                    );
-                                }
+                                UE_LOG(LogTemp, Error, TEXT("❌ 未找到ItemDetail记录，ItemID: %d"), RewardID);
+                                // 显示灰色占位符
+                                RewardImage->SetColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 1.0f)); // 灰色
+                                RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
+                                RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                                UE_LOG(LogTemp, Warning, TEXT("⚠️ 显示灰色占位符图标: ID %d"), RewardID);
                             }
                             break;
                         }
@@ -400,28 +467,29 @@ void UDailyLoginDayItemWidget::AddRewardIcon(int32 RewardID, int32 RewardCount)
                     
                     if (!bFoundConfig)
                     {
-                        // UE_LOG(LogTemp, Warning, TEXT("未找到匹配的奖励信息，RewardID: %d"), RewardID);
+                        UE_LOG(LogTemp, Error, TEXT("❌ 未找到匹配的奖励信息，RewardID: %d"), RewardID);
                     }
                 }
                 else
                 {
-                    UE_LOG(LogTemp, Error, TEXT("无法获取ActivitySubsystem"));
+                    UE_LOG(LogTemp, Error, TEXT("❌ 无法获取ActivitySubsystem"));
                 }
             }
             else
             {
-                UE_LOG(LogTemp, Error, TEXT("无法获取GameInstance"));
+                UE_LOG(LogTemp, Error, TEXT("❌ 无法获取GameInstance"));
             }
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("❌ RewardImage控件未找到"));
         }
 
         if (CountText)
         {
             // 设置奖励数量文本
             CountText->SetText(FText::AsNumber(RewardCount));
-            // // UE_LOG(LogTemp, Log, TEXT("设置奖励数量: %d"), RewardCount);
         }
-        
-        // // UE_LOG(LogTemp, Log, TEXT("成功添加奖励图标: ID %d, 数量 %d"), RewardID, RewardCount);
     }
 }
 

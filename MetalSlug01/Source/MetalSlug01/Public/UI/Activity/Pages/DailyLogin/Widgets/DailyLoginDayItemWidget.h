@@ -14,7 +14,7 @@ class METALSLUG01_API UDailyLoginDayItemWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// 新增：添加奖励图标的函数
+	// 新增：添加奖励图标的函数（通过RewardItemID查询FItemDetailRow）
 	// 注意：这里的 RewardID 和 Count 必须和你表里的字段名对应
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void AddRewardIcon(int32 RewardID, int32 RewardCount);
@@ -22,6 +22,10 @@ public:
 	// 新增：直接通过配置行添加奖励图标
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void AddRewardIconFromConfig(const FDailyLoginConfigRow& ConfigRow);
+	
+	// 新增：专门处理礼包/宝箱类型的图标（使用FDailyLoginConfigRow.BoxImage）
+	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
+	void AddRewardIconFromBoxImage(const TSoftObjectPtr<UTexture2D>& BoxImage, int32 RewardCount);
 	
 	/**
 	 * @brief 纹理异步加载完成回调

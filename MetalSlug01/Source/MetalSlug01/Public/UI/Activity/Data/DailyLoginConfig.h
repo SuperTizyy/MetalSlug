@@ -95,6 +95,8 @@ enum class ELoginRewardType : uint8
 	Box         UMETA(DisplayName = "礼包/宝箱")     // 礼包或宝箱类型奖励
 };
 
+
+
 /**
  * @brief 通用奖励状态枚举
  * @details 所有奖励系统统一使用的状态定义
@@ -200,9 +202,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyLogin|UI")
 	bool bIsSpecialReward;
 
-	/** 奖励图标资源 */
+	/** 宝箱图片资源（仅用于RewardType为Box类型） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyLogin|UI")
-	TSoftObjectPtr<UTexture2D> RewardIcon;
+	TSoftObjectPtr<UTexture2D> BoxImage;
 
 	/**
 	 * @brief 构造函数
@@ -391,7 +393,61 @@ public:
 		, RedDotPriority(0)
 		, TimeControlType(ETimeControlType::Permanent)
 		, bManualEnabled(true)
-	{}
+	{};
+};
+
+/**
+ * @brief 基础物品详情表结构
+ * @details 定义游戏中所有物品的基础属性和详细信息
+ * @note 作为物品系统的中央配置表，支持各种类型物品的统一管理
+ */
+USTRUCT(BlueprintType)
+struct FItemDetailRow : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// ==================== 基础标识 ====================
+	
+	/** 物品唯一ID */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Identity")
+	int32 ItemID;
+
+	/** 物品显示名称 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Identity")
+	FText ItemName;
+
+	/** 物品描述信息 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Identity")
+	FText ItemDescription;
+
+	// ==================== 视觉表现 ====================
+	
+	/** 物品图标资源 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Visual")
+	TSoftObjectPtr<UTexture2D> ItemIcon;
+
+	/** ==================== 快捷访问方法 ==================== */
+	
+	/**
+	 * @brief 获取物品ID
+	 * @return 物品唯一标识符
+	 */
+	FORCEINLINE int32 GetItemID() const { return ItemID; }
+
+	/**
+	 * @brief 获取物品名称
+	 * @return 物品显示名称
+	 */
+	FORCEINLINE FText GetItemName() const { return ItemName; }
+
+	/**
+	 * @brief 构造函数
+	 * @details 初始化默认物品配置
+	 */
+	FItemDetailRow() 
+		: ItemID(0)
+	{};
 };
 
 // ==================== 文件末尾说明 ====================
@@ -401,4 +457,5 @@ public:
  * 包括：基础信息、导航配置、红点配置、时间控制、页面路由等
  * 遵循项目规范：所有静态表结构体统一存放于此文件
  * 已移除冗余的FActivityConfig嵌套结构，使职责更加单一明确
+ * 新增FItemDetailRow结构用于统一管理物品详细信息
  */

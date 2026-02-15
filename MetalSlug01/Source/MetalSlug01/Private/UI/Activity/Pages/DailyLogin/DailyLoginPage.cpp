@@ -530,9 +530,9 @@ ERewardState UDailyLoginPage::CalculateState(int32 DayIndex)
         return ERewardState::Claimed;
     }
 
-    // 2. 进度判定：只要 DayIndex <= 当前签到进度，就是可领（补领核心）
-    // 如果 Cheat 输入 2026，Progress 就是 2026。那么 i=1, 2 都会进入此分支
-    if (DayIndex <= Record.Progress)
+    // 2. 进度判定：修改逻辑使Progress=0时第一天可领取
+    // Progress含义：已领取到第几天（0表示未领取任何天数，但第一天可领取）
+    if (DayIndex <= Record.Progress + 1)
     {
         return ERewardState::Claimable;
     }
