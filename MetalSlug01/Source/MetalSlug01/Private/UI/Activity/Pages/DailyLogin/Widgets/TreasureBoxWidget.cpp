@@ -1,70 +1,32 @@
 ﻿// 13
 
-
 #include "UI/Activity/Pages/DailyLogin/Widgets/TreasureBoxWidget.h"
+
 #include "Components/Button.h"
-#include "Components/TextBlock.h"
-#include "Components/Image.h"
 
-#include "UI/Activity/Model/Treasure/TreasureBoxItem.h"
-
-void UTreasureBoxWidget::NativeOnInitialized()
+void UTreasureBoxWidget::NativeConstruct()
 {
-	Super::NativeOnInitialized();
+    Super::NativeConstruct();
 
-	if (BoxButton)
-	{
-		BoxButton->OnClicked.AddDynamic(this, &UTreasureBoxWidget::OnBoxClicked);
-	}
+    // 绑定三个选项的点击事件
+    if (RewardOption_0) RewardOption_0->OnClicked.AddDynamic(this, &UTreasureBoxWidget::OnOption0Clicked);
+    if (RewardOption_1) RewardOption_1->OnClicked.AddDynamic(this, &UTreasureBoxWidget::OnOption1Clicked);
+    if (RewardOption_2) RewardOption_2->OnClicked.AddDynamic(this, &UTreasureBoxWidget::OnOption2Clicked);
+
+    // 绑定确认按钮
+    if (ConfirmButton) ConfirmButton->OnClicked.AddDynamic(this, &UTreasureBoxWidget::OnConfirmClicked);
+
+    // 初始化：确保默认选择中间
+    SelectedIndex = 1;
+    OnSelectionChanged(SelectedIndex);
 }
 
-void UTreasureBoxWidget::BindBoxItem(UTreasureBoxItem* InBoxItem)
+void UTreasureBoxWidget::OnOption0Clicked() { SelectedIndex = 0; OnSelectionChanged(SelectedIndex); }
+void UTreasureBoxWidget::OnOption1Clicked() { SelectedIndex = 1; OnSelectionChanged(SelectedIndex); }
+void UTreasureBoxWidget::OnOption2Clicked() { SelectedIndex = 2; OnSelectionChanged(SelectedIndex); }
+
+void UTreasureBoxWidget::OnConfirmClicked()
 {
-	BoxItem = InBoxItem;
-	RefreshView();
+    // 这里处理最终领取的逻辑，例如通知服务器玩家选择了索引为 SelectedIndex 的奖励
+    RemoveFromParent();
 }
-
-void UTreasureBoxWidget::Refresh()
-{
-	RefreshView();
-}
-
-void UTreasureBoxWidget::OnBoxClicked()
-{
-	if (!BoxItem)
-	{
-		return;
-	}
-
-	// 仅通知 Model，不判断规则
-	BoxItem->RequestReceive();
-
-	// 点击后立刻刷新一次
-	RefreshView();
-}
-
-void UTreasureBoxWidget::RefreshView()
-{
-	if (!BoxItem || !BoxIcon || !StateText)
-	{
-		return;
-	}
-
-	if (BoxItem->IsReceived())
-	{
-		StateText->SetText(FText::FromString(TEXT("已领取")));
-		BoxButton->SetIsEnabled(false);
-	}
-	else if (BoxItem->IsUnlocked())
-	{
-		StateText->SetText(FText::FromString(TEXT("可领取")));
-		BoxButton->SetIsEnabled(true);
-	}
-	else
-	{
-		StateText->SetText(FText::FromString(TEXT("未解锁")));
-		BoxButton->SetIsEnabled(false);
-	}
-
-}
-

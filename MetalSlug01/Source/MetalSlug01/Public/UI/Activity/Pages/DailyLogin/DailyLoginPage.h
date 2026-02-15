@@ -1,72 +1,92 @@
-﻿// 13
-
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
-#include "UI/Activity/Pages/ActivityPageBase.h"
+#include "Blueprint/UserWidget.h"
+#include "UI/Activity/Data/DailyLoginConfig.h"
+// 移除导航相关包含，保持每日登录功能纯净
 #include "DailyLoginPage.generated.h"
 
-class UListView;
-class UHorizontalBox;
-class UDailyLoginTrack;
-class UTreasureTrack;
-class UTreasureBoxWidget;
-
-/**
- * 每日登录活动页面
- * 职责：
- * 1. 构建每日登录列表
- * 2. 构建宝箱区域
- * 3. 负责 Track → UI 的刷新
- *
- * 规则：
- * - Page 不保存业务状态
- * - Page 不判断规则
- * - Page 只做“联动与刷新”
- */
 UCLASS()
-class METALSLUG01_API UDailyLoginPage : public UActivityPageBase
+class METALSLUG01_API UDailyLoginPage : public UUserWidget
 {
 	GENERATED_BODY()
 
+public:
+	virtual void NativeConstruct() override;
+	virtual void NativeDestruct() override;
+
+	UFUNCTION()
+	void RefreshRewardList();
+
+	UFUNCTION(BlueprintCallable)
+	void Cheat_SetDayAndRefresh(int32 NewDay);
+	
+	// 新增：显示奖励选项弹窗（用于礼包/宝箱类型奖励）
+	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
+	void ShowRewardOptionPopup(int32 DayIndex);
+	
+	// 新增：显示领取成功弹窗（用于普通奖励）
+	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
+	void ShowClaimSuccessPopup();
+	
+	// 新增：处理奖励点击事件
+	UFUNCTION()
+	void HandleRewardClick(int32 DayIndex, ELoginRewardType RewardType);
+	
 protected:
-	/** 页面显示时调用 */
-	virtual void OnPageShow_Implementation() override;
+	// --- 确保以下函数和变量都已声明 ---
+	UFUNCTION()
+	void OnBigRewardClicked();
 
-private:
-	// ================= UI =================
+	UFUNCTION()
+	void HandleStoreLogic(int32 DayIndex);
+	
+	// 新增：用于处理奖励选项弹窗的存储逻辑
+	UFUNCTION()
+	void HandleRewardOptionStore(int32 DayIndex);
 
-	/** 每日登录 ListView */
+	UFUNCTION()
+	void OpenTreasureBox();
+
+	UFUNCTION()
+	void OnFinalClaimComplete();
+
+	UFUNCTION()
+	void ScrollToCurrentDay();
+
+	// 新增：全部领取按钮点击事件
+	UFUNCTION()
+	void OnClaimAllButtonClicked();
+
+	// UI 组件绑定
 	UPROPERTY(meta = (BindWidget))
-	UListView* LoginDayList;
+	class UScrollBox* DayListScroll;
 
-	/** 宝箱容器（横排） */
+	// 新增：全部领取按钮
 	UPROPERTY(meta = (BindWidget))
-	UHorizontalBox* TreasureBoxContainer;
+	class UButton* ClaimAllButton;
 
-	// ================= Track =================
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class UDailyLoginDayItemWidget> ItemClass;
 
-	UPROPERTY()
-	UDailyLoginTrack* LoginTrack = nullptr;
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class UUserWidget> RewardOptionClass; // 弹窗类
 
-	UPROPERTY()
-	UTreasureTrack* TreasureTrack = nullptr;
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class UUserWidget> TreasureBoxClass;
+	
+	// 新增：领取成功弹窗类
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class UUserWidget> ClaimSuccessPopClass;
 
-	// ================= Runtime =================
-
-	/** 当前页面持有的宝箱 Widget */
-	UPROPERTY()
-	TArray<UTreasureBoxWidget*> TreasureBoxWidgets;
-
+	// meta = (BindWidget) 会自动将此变量与蓝图里同名的控件绑定
+	// 假设你的蓝图根节点或主要容器叫 MainLayout
+	UPROPERTY(meta = (BindWidget))
+	class UWidget* MainLayout;
+	
 private:
-	/** 构建每日登录列表 */
-	void BuildLoginList();
-
-	/** 构建宝箱区域 */
-	void BuildTreasureBoxes();
-
-	/** 刷新所有宝箱显示 */
-	void RefreshTreasureBoxes();
+	ERewardState CalculateState(int32 DayIndex);
+	// 成员变量（ActivitySubsystem 指针）
+	UPROPERTY()
+	class UActivitySubsystem* ActivitySub;
 };
-
-
