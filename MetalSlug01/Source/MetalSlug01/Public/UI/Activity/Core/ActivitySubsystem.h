@@ -4,10 +4,18 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
+#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "UI/Activity/Data/DailyLoginSave.h"
+#include "UI/Activity/Core/RedDotManager.h"
+#include "UI/Activity/Core/ActivityPageManager.h"
+#include "UI/Activity/Core/ActivityTimeManager.h"
 #include "ActivitySubsystem.generated.h"
 
 class UDailyLoginTrack;
 class UTreasureTrack;
+class URedDotManager;
+class UActivityPageManager;
+class UActivityTimeManager;
 
 /**
  * Activity 子系统
@@ -41,6 +49,47 @@ public:
 	/** 获取宝箱 Track */
 	UTreasureTrack* GetTreasureTrack() const;
 
+	/** 获取红点管理器 */
+	URedDotManager* GetRedDotManager() const;
+
+	/** 获取活动页面管理器 */
+	UActivityPageManager* GetActivityPageManager() const;
+
+	/** 获取活动时间管理器 */
+	UActivityTimeManager* GetActivityTimeManager() const;
+
+	/** 获取所有导航项 */
+	TArray<const FActivityInfoRow*> GetAllNavItems() const;
+
+	/** 获取活动信息 */
+	const FActivityInfoRow* GetActivityInfo(int32 ActivityID) const;
+
+	/** 获取玩家记录 */
+	FPlayerLoginRecord& GetOrInitPlayerRecord(int32 ActivityID);
+
+	/** 获取每日登录配置 */
+	TArray<FDailyLoginConfigRow*> GetDailyLoginConfigs(int32 ActivityID) const;
+
+	/** 根据天数获取奖励 */
+	TArray<FDailyLoginConfigRow*> GetRewardsByDay(int32 ActivityID, int32 Day) const;
+
+	/** 尝试领取奖励 */
+	bool TryClaimReward(int32 ActivityID, int32 DayIndex);
+
+	/** 作弊跳转到指定天 */
+	void Cheat_JumpToDay(int32 ActivityID, int32 NewDay);
+
+	/** 批量尝试领取奖励 */
+	bool TryClaimMultipleRewards(int32 ActivityID, const TArray<int32>& DayIndices);
+
+public:
+	// ================= 事件 =================
+	
+	/** 活动数据变更事件 */
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnActivityDataChanged);
+	UPROPERTY(BlueprintAssignable, Category = "Activity")
+	FOnActivityDataChanged OnActivityDataChanged;
+
 private:
 	// ================= Track 持有 =================
 
@@ -49,6 +98,17 @@ private:
 
 	UPROPERTY()
 	UTreasureTrack* TreasureTrack = nullptr;
+
+	// ================= 管理器持有 =================
+
+	UPROPERTY()
+	URedDotManager* RedDotManager = nullptr;
+
+	UPROPERTY()
+	UActivityPageManager* ActivityPageManager = nullptr;
+
+	UPROPERTY()
+	UActivityTimeManager* ActivityTimeManager = nullptr;
 };
 
 
