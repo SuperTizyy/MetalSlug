@@ -10,7 +10,7 @@
 // 核心：引入新的 Subsystem 和 存档类
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
-#include "UI/Activity/Pages/DailyLogin/Widgets/TreasureBoxWidget.h"
+
 #include "UI/Activity/Pages/DailyLogin/Widgets/DailyLoginDayItemWidget.h"
 #include "UI/Activity/Pages/DailyLogin/Widgets/RewardOptionWidget.h"
 #include "UI/Activity/Pages/DailyLogin/DailyLoginCheatWidget.h"
@@ -52,7 +52,7 @@ void UDailyLoginPage::NativeConstruct()
 	UE_LOG(LogTemp, Warning, TEXT("检查必要类设置:"));
 	UE_LOG(LogTemp, Warning, TEXT("  ItemClass: %s"), ItemClass ? *ItemClass->GetName() : TEXT("未设置"));
 	UE_LOG(LogTemp, Warning, TEXT("  RewardOptionClass: %s"), RewardOptionClass ? *RewardOptionClass->GetName() : TEXT("未设置"));
-	UE_LOG(LogTemp, Warning, TEXT("  TreasureBoxClass: %s"), TreasureBoxClass ? *TreasureBoxClass->GetName() : TEXT("未设置"));
+
 	UE_LOG(LogTemp, Warning, TEXT("  ActivityConfirmPopupClass: %s"), ActivityConfirmPopupClass ? *ActivityConfirmPopupClass->GetName() : TEXT("未设置"));
 	UE_LOG(LogTemp, Warning, TEXT("  ClaimSuccessPopClass: %s"), ClaimSuccessPopClass ? *ClaimSuccessPopClass->GetName() : TEXT("未设置"));
 
@@ -535,24 +535,6 @@ void UDailyLoginPage::OpenTreasureBox(int32 DayIndex)
     else
     {
         UE_LOG(LogTemp, Error, TEXT("❌ ActivityConfirmPopupClass 未设置！请在蓝图中指定 WBP_ActivityConfirmPopupWidget 类"));
-        
-        // 降级方案：如果ConfirmPopupClass未设置，仍然使用原来的TreasureBox
-        if (TreasureBoxClass)
-        {
-            UE_LOG(LogTemp, Warning, TEXT("⚠️ 降级到TreasureBoxWidget"));
-            UTreasureBoxWidget* BoxPopup = CreateWidget<UTreasureBoxWidget>(this, TreasureBoxClass);
-            if (BoxPopup)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建 TreasureBoxWidget 实例"));
-                BoxPopup->OnClaimFinished.AddDynamic(this, &UDailyLoginPage::OnFinalClaimComplete);
-                BoxPopup->AddToViewport(12);
-                UE_LOG(LogTemp, Warning, TEXT("✅ TreasureBoxWidget 已添加到视口"));
-            }
-            else
-            {
-                UE_LOG(LogTemp, Error, TEXT("❌ 创建 TreasureBoxWidget 失败！"));
-            }
-        }
     }
 }
 
