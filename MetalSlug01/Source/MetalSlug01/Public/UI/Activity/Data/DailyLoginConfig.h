@@ -202,10 +202,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyLogin|UI")
 	bool bIsSpecialReward;
 
-	/** 宝箱图片资源（仅用于RewardType为Box类型） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyLogin|UI")
-	TSoftObjectPtr<UTexture2D> BoxImage;
-
 	/**
 	 * @brief 构造函数
 	 * @details 初始化默认配置值
@@ -450,6 +446,67 @@ public:
 	{};
 };
 
+// ==================== 宝箱物品配置 ====================
+
+/**
+ * @brief 宝箱物品配置表结构
+ * @details 用于定义宝箱中包含的物品及其相关配置
+ * @note 支持随机物品和固定物品的混合配置
+ */
+USTRUCT(BlueprintType)
+struct FTreasureBoxItemRow : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// ==================== 基础索引 ====================
+	
+	/** 宝箱唯一ID */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Identity")
+	int32 BoxID;
+
+	/** 物品唯一ID */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Identity")
+	int32 ItemID;
+
+	// ==================== 视觉表现 ====================
+	
+	/** 宝箱图标资源 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Visual")
+	TSoftObjectPtr<UTexture2D> BoxIcon;
+
+	// ==================== 随机配置 ====================
+	
+	/** 是否为随机物品 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Random")
+	bool bIsRandomItem;
+
+	/** 物品数量 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Quantity")
+	int32 ItemCount;
+
+	/** 是否物品数量随机 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Random")
+	bool bIsItemCountRandom;
+
+	/** 随机权重 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TreasureBox|Random")
+	int32 RandomWeight;
+
+	/**
+	 * @brief 构造函数
+	 * @details 初始化默认宝箱物品配置
+	 */
+	FTreasureBoxItemRow() 
+		: BoxID(0)
+		, ItemID(0)
+		, bIsRandomItem(false)
+		, ItemCount(1)
+		, bIsItemCountRandom(false)
+		, RandomWeight(0)
+	{};
+};
+
 // ==================== 文件末尾说明 ====================
 
 /**
@@ -458,4 +515,5 @@ public:
  * 遵循项目规范：所有静态表结构体统一存放于此文件
  * 已移除冗余的FActivityConfig嵌套结构，使职责更加单一明确
  * 新增FItemDetailRow结构用于统一管理物品详细信息
+ * 新增FTreasureBoxItemRow结构用于管理宝箱物品配置
  */

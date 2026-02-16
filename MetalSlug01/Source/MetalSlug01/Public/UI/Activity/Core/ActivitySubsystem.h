@@ -88,6 +88,9 @@ public:
 	/** 根据物品ID获取物品详情 */
 	const FItemDetailRow* GetItemDetail(int32 ItemID) const;
 
+	/** 根据宝箱ID获取宝箱物品配置 */
+	const FTreasureBoxItemRow* GetTreasureBoxItem(int32 BoxID) const;
+
 public:
 	// ================= 事件 =================
 	

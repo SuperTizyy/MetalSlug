@@ -1,12 +1,10 @@
-﻿// 1
-
-
-#include "UI/Activity/Core/ActivitySubsystem.h"
-
+﻿#include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Track/DailyLogin/DailyLoginTrack.h"
 #include "UI/Activity/Track/Treasure/TreasureTrack.h"
+#include "UI/Activity/Core/RedDotManager.h"
+#include "UI/Activity/Core/ActivityPageManager.h"
+#include "UI/Activity/Core/ActivityTimeManager.h"
 #include "Kismet/GameplayStatics.h"
-// 管理器通过Track间接访问，无需直接包含
 
 void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -27,7 +25,9 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 
 	// ================= 初始化管理器 =================
-	// 管理器通过Track间接访问，无需在此处创建实例
+	RedDotManager = NewObject<URedDotManager>(this);
+	ActivityPageManager = NewObject<UActivityPageManager>(this);
+	ActivityTimeManager = NewObject<UActivityTimeManager>(this);
 }
 
 void UActivitySubsystem::Deinitialize()
@@ -143,7 +143,7 @@ FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
 		FPlayerLoginRecord NewRecord;
 		NewRecord.ActivityID = ActivityID;
 		NewRecord.PlayerID = TEXT("Player1"); // 临时使用固定玩家ID
-		NewRecord.Progress = 0;  // 进度为0，表示第一天可领取
+		NewRecord.Progress = 1;  // 进度为1，表示第一天可领取
 		NewRecord.CurrentClaimCount = 0;
 		NewRecord.ClaimedHistoryMask = 0;
 		NewRecord.LastClaimTimestamp = 0;
@@ -269,23 +269,40 @@ bool UActivitySubsystem::TryClaimReward(int32 ActivityID, int32 DayIndex)
 	FPlayerLoginRecord& PlayerRecord = GetOrInitPlayerRecord(ActivityID);
 	
 	// 检查是否可以领取
-	// Progress=0表示第一天可领取，Progress=1表示第二天可领取，以此类推
-	if (DayIndex <= PlayerRecord.Progress)
+	// 在Progress范围内的未领取天数
+	if (DayIndex > PlayerRecord.Progress)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 第%d天超出可领取范围，当前进度只到第%d天"), DayIndex, PlayerRecord.Progress);
+		return false;
+	}
+	
+	if (PlayerRecord.IsDayClaimed(DayIndex))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 第%d天已经领取过了"), DayIndex);
 		return false;
 	}
 	
-	if (DayIndex > PlayerRecord.Progress + 1)
+	// 更新玩家记录
+	PlayerRecord.SetDayClaimed(DayIndex, true);
+	if (!PlayerRecord.ClaimedDays.Contains(DayIndex))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 只能领取连续的天数，当前进度%d，请求领取第%d天"), PlayerRecord.Progress, DayIndex);
-		return false;
+		PlayerRecord.ClaimedDays.Add(DayIndex);
+	}
+	PlayerRecord.CurrentClaimCount++;
+	
+	// 智能Progress更新逻辑：
+	// 1. 如果是按顺序领取（DayIndex == Progress + 1），则更新Progress
+	// 2. 如果是跳跃式领取（通过作弊跳转），保持原有Progress不变
+	if (DayIndex == PlayerRecord.Progress + 1)
+	{
+		PlayerRecord.Progress = DayIndex;
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 顺序领取第%d天，更新Progress为%d"), DayIndex, PlayerRecord.Progress);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 跳跃式领取第%d天，保持Progress=%d不变"), DayIndex, PlayerRecord.Progress);
 	}
 	
-	// 更新玩家记录
-	PlayerRecord.Progress = DayIndex;
-	PlayerRecord.CurrentClaimCount++;
-	PlayerRecord.SetDayClaimed(DayIndex, true);
 	PlayerRecord.LastClaimTimestamp = FDateTime::Now().ToUnixTimestamp();
 	PlayerRecord.LastUpdateTime = FDateTime::Now();
 	
@@ -295,8 +312,7 @@ bool UActivitySubsystem::TryClaimReward(int32 ActivityID, int32 DayIndex)
 	// 广播数据变更事件
 	OnActivityDataChanged.Broadcast();
 	
-	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功领取第%d天奖励，当前进度:%d (表示第%d天可领取)"), DayIndex, PlayerRecord.Progress, PlayerRecord.Progress + 1);
-	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 第一天奖励现在可领取，Progress=%d"), PlayerRecord.Progress);
+	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功领取第%d天奖励，当前已领取天数:%d"), DayIndex, PlayerRecord.CurrentClaimCount);
 	return true;
 }
 
@@ -305,19 +321,14 @@ void UActivitySubsystem::Cheat_JumpToDay(int32 ActivityID, int32 NewDay)
 	// 获取玩家记录
 	FPlayerLoginRecord& PlayerRecord = GetOrInitPlayerRecord(ActivityID);
 	
-	// 更新进度
+	// 跳转逻辑：将Progress设置为目标天数，表示前面的天数都已经可领取
+	// 例如：JumpToDay(3) 表示第1、2、3天都可领取
 	int32 OldProgress = PlayerRecord.Progress;
-	// 用户输入的NewDay是想要跳转到的可领取天数
-	// Progress应该比可领取天数少1（Progress=0表示第一天可领取）
-	PlayerRecord.Progress = NewDay - 1;
+	PlayerRecord.Progress = NewDay;  // Progress表示已领取到第几天
 	PlayerRecord.LastUpdateTime = FDateTime::Now();
 	
-	// 更新领取历史（标记前面已领取的天数）
-	for (int32 Day = 1; Day < NewDay && Day <= 32; Day++)
-	{
-		PlayerRecord.SetDayClaimed(Day, true);
-	}
-	PlayerRecord.CurrentClaimCount = NewDay - 1;
+	// 不自动标记为已领取，让用户可以选择性领取
+	// 只更新进度，不改变已领取状态
 	
 	// 保存到磁盘
 	SavePlayerRecord(ActivityID);
@@ -325,7 +336,7 @@ void UActivitySubsystem::Cheat_JumpToDay(int32 ActivityID, int32 NewDay)
 	// 广播数据变更事件
 	OnActivityDataChanged.Broadcast();
 	
-	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 作弊跳转 - ActivityID=%d 从Progress=%d跳转到Progress=%d (第%d天可领取)"), 
+	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 作弊跳转 - ActivityID=%d 从Progress=%d跳转到Progress=%d (第1天到第%d天可领取)"), 
 		ActivityID, OldProgress, PlayerRecord.Progress, NewDay);
 }
 
@@ -346,7 +357,7 @@ bool UActivitySubsystem::TryClaimMultipleRewards(int32 ActivityID, const TArray<
 const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 {
 	// 从DT_ItemDetailRow表加载指定ItemID的物品详情
-	FString ConfigPath = TEXT("/Script/Engine.DataTable'/Game/UI/Activity/Data/DT_ItemDetailRow.DT_ItemDetailRow'");
+	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow");
 	UE_LOG(LogTemp, Warning, TEXT("🔍 GetItemDetail: 尝试加载路径 %s"), *ConfigPath);
 	
 	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
@@ -380,11 +391,60 @@ const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 				}
 			}
 		}
-		UE_LOG(LogTemp, Error, TEXT("❌ 未找到ItemID: %d 的记录"), ItemID);
+		
+		UE_LOG(LogTemp, Warning, TEXT("❌ 未找到ItemID: %d 的记录"), ItemID);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载DT_ItemDetailRow DataTable，路径: %s"), *ConfigPath);
+		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载ItemDetail DataTable: %s"), *ConfigPath);
+	}
+	
+	return nullptr;
+}
+
+const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) const
+{
+	// 从TreasureBoxItemRow表加载指定BoxID的宝箱物品配置
+	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow");
+	UE_LOG(LogTemp, Warning, TEXT("🔍 GetTreasureBoxItem: 尝试加载路径 %s"), *ConfigPath);
+	
+	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
+	
+	if (ConfigTable)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载DT_TreasureBoxItemRow DataTable"));
+		static const FString ContextString(TEXT("ActivitySubsystem"));
+		TArray<FTreasureBoxItemRow*> AllRows;
+		ConfigTable->GetAllRows<FTreasureBoxItemRow>(ContextString, AllRows);
+		
+		UE_LOG(LogTemp, Warning, TEXT("📊 TreasureBox DataTable包含 %d 条记录"), AllRows.Num());
+		
+		for (FTreasureBoxItemRow* Row : AllRows)
+		{
+			if (Row)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("📋 宝箱记录: BoxID=%d, ItemID=%d"), Row->BoxID, Row->ItemID);
+				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsValid: %s"), Row->BoxIcon.IsValid() ? TEXT("是") : TEXT("否"));
+				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsNull: %s"), Row->BoxIcon.IsNull() ? TEXT("是") : TEXT("否"));
+				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsPending: %s"), Row->BoxIcon.IsPending() ? TEXT("是") : TEXT("否"));
+				
+				if (Row->BoxID == BoxID)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的BoxID: %d"), BoxID);
+					UE_LOG(LogTemp, Warning, TEXT("   匹配记录的BoxIcon状态:"));
+					UE_LOG(LogTemp, Warning, TEXT("   IsValid: %s"), Row->BoxIcon.IsValid() ? TEXT("是") : TEXT("否"));
+					UE_LOG(LogTemp, Warning, TEXT("   IsNull: %s"), Row->BoxIcon.IsNull() ? TEXT("是") : TEXT("否"));
+					UE_LOG(LogTemp, Warning, TEXT("   IsPending: %s"), Row->BoxIcon.IsPending() ? TEXT("是") : TEXT("否"));
+					return Row;
+				}
+			}
+		}
+		
+		UE_LOG(LogTemp, Warning, TEXT("❌ 未找到BoxID: %d 的记录"), BoxID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载TreasureBoxItem DataTable: %s"), *ConfigPath);
 	}
 	
 	return nullptr;

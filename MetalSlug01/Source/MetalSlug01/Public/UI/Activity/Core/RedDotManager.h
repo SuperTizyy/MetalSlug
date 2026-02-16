@@ -65,6 +65,12 @@ public:
 
 protected:
 	/** 活动子系统引用 */
+	
+	
+	
+	
+	
+	
 	UPROPERTY()
 	TWeakObjectPtr<UActivitySubsystem> ActivitySubsystem;
 

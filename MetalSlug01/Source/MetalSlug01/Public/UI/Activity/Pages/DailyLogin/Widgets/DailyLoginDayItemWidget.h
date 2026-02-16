@@ -27,6 +27,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void AddRewardIconFromBoxImage(const TSoftObjectPtr<UTexture2D>& BoxImage, int32 RewardCount);
 	
+	// 新增：从TreasureBoxItemRow表查找宝箱图标
+	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
+	void AddRewardIconFromTreasureBox(int32 BoxID, int32 RewardCount);
+	
 	/**
 	 * @brief 纹理异步加载完成回调
 	 */
@@ -37,8 +41,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void ClearRewardIcons();
 	
-	// 修改 Init 声明：添加特殊奖励参数
-	void Init(int32 InDayIndex, int32 InCurrentProgress, ERewardState RewardState = ERewardState::Incomplete, bool bInIsSpecialReward = false);
+	// 修改 Init 声明：添加特殊奖励参数和自动加载图标功能
+	void Init(int32 InDayIndex, int32 InCurrentProgress, ERewardState RewardState = ERewardState::Incomplete, bool bInIsSpecialReward = false, class UActivitySubsystem* ActivitySubsystem = nullptr);
     
 	// 暴露给 C++ 绑定的按钮（主页面需要通过它拦截第8天的点击）
 	UPROPERTY(meta = (BindWidget), BlueprintReadWrite, Category = "DailyLogin")

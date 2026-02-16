@@ -47,6 +47,13 @@ void UDailyLoginPage::NativeConstruct()
 		UE_LOG(LogTemp, Error, TEXT("ClaimAllButton为空！请检查蓝图中是否正确设置了按钮绑定"));
 	}
 
+	// 检查必要的类是否已设置
+	UE_LOG(LogTemp, Warning, TEXT("检查必要类设置:"));
+	UE_LOG(LogTemp, Warning, TEXT("  ItemClass: %s"), ItemClass ? *ItemClass->GetName() : TEXT("未设置"));
+	UE_LOG(LogTemp, Warning, TEXT("  RewardOptionClass: %s"), RewardOptionClass ? *RewardOptionClass->GetName() : TEXT("未设置"));
+	UE_LOG(LogTemp, Warning, TEXT("  TreasureBoxClass: %s"), TreasureBoxClass ? *TreasureBoxClass->GetName() : TEXT("未设置"));
+	UE_LOG(LogTemp, Warning, TEXT("  ClaimSuccessPopClass: %s"), ClaimSuccessPopClass ? *ClaimSuccessPopClass->GetName() : TEXT("未设置"));
+
 	// CheatWidget相关代码保持不变
 	// CheatWidget会在自己的NativeConstruct中自动绑定事件
 	// 这里不需要额外处理
@@ -122,8 +129,8 @@ void UDailyLoginPage::RefreshRewardList()
                 }
             }
                 
-            // 关键：这里传入当前的 i、Record.Progress、State 和特殊奖励标志
-            NewItem->Init(i, Record.Progress, State, bIsSpecial);
+            // 关键：这里传入当前的 i、Record.Progress、State、特殊奖励标志和ActivitySubsystem
+            NewItem->Init(i, Record.Progress, State, bIsSpecial, ActivitySub);
                 
             // 根据 Is Special Reward 字段决定显示位置
             if (bIsSpecial)
@@ -148,14 +155,7 @@ void UDailyLoginPage::RefreshRewardList()
                 }
             }
                 
-            // 加载奖励图标
-            for (auto* RewardRow : Rewards)
-            {
-                if (RewardRow)
-                {
-                    NewItem->AddRewardIconFromConfig(*RewardRow);
-                }
-            }
+// 奖励图标加载已移到Init函数中自动处理
         }
     }
     }
@@ -469,14 +469,27 @@ void UDailyLoginPage::HandleRewardOptionStore(int32 DayIndex)
 
 void UDailyLoginPage::OpenTreasureBox()
 {
+    UE_LOG(LogTemp, Warning, TEXT("=== OpenTreasureBox 被调用 ==="));
+    
     if (TreasureBoxClass)
     {
+        UE_LOG(LogTemp, Warning, TEXT("TreasureBoxClass 存在，准备创建 TreasureBoxWidget"));
         UTreasureBoxWidget* BoxPopup = CreateWidget<UTreasureBoxWidget>(this, TreasureBoxClass);
         if (BoxPopup)
         {
+            UE_LOG(LogTemp, Warning, TEXT("成功创建 TreasureBoxWidget 实例"));
             BoxPopup->OnClaimFinished.AddDynamic(this, &UDailyLoginPage::OnFinalClaimComplete);
             BoxPopup->AddToViewport(12);
+            UE_LOG(LogTemp, Warning, TEXT("TreasureBoxWidget 已添加到视口"));
         }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("创建 TreasureBoxWidget 失败！"));
+        }
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("TreasureBoxClass 未设置！"));
     }
 }
 
@@ -521,22 +534,31 @@ ERewardState UDailyLoginPage::CalculateState(int32 DayIndex)
 {
     if (!ActivitySub) return ERewardState::Incomplete;
 
-    // 获取你定义的结构体记录
+    // 获取玩家记录
     FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
     
-    // 1. 数组判定：领奖数组里有这一天，就是已领取
-    if (Record.ClaimedDays.Contains(DayIndex))
+    // 1. 检查是否已领取（使用位掩码和数组双重检查）
+    if (Record.IsDayClaimed(DayIndex) || Record.ClaimedDays.Contains(DayIndex))
     {
+        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天已领取"), DayIndex);
         return ERewardState::Claimed;
     }
 
-    // 2. 进度判定：修改逻辑使Progress=0时第一天可领取
-    // Progress含义：已领取到第几天（0表示未领取任何天数，但第一天可领取）
-    if (DayIndex <= Record.Progress + 1)
+    // 2. 检查是否可领取：Progress范围内的未领取天数
+    if (DayIndex <= Record.Progress)
     {
+        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天可领取 (Progress=%d)"), DayIndex, Record.Progress);
         return ERewardState::Claimable;
     }
     
+    // 3. 检查是否为明日可领取（Progress+1）
+    if (DayIndex == Record.Progress + 1)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天为明日可领 (Progress=%d)"), DayIndex, Record.Progress);
+        return ERewardState::Incomplete;
+    }
+    
+    UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天未到期 (Progress=%d)"), DayIndex, Record.Progress);
     return ERewardState::Incomplete;
 }
 
@@ -578,30 +600,37 @@ void UDailyLoginPage::OnClaimAllButtonClicked()
 
 void UDailyLoginPage::ShowRewardOptionPopup(int32 DayIndex)
 {
-    // // UE_LOG(LogTemp, Warning, TEXT("=== ShowRewardOptionPopup 被调用，天数: %d ==="), DayIndex);
+    UE_LOG(LogTemp, Warning, TEXT("=== ShowRewardOptionPopup 被调用，天数: %d ==="), DayIndex);
     
     if (!ActivitySub) 
     {
-        // UE_LOG(LogTemp, Error, TEXT("ActivitySub 为空，返回"));
+        UE_LOG(LogTemp, Error, TEXT("ActivitySub 为空，返回"));
         return;
     }
 
     // 1. 获取玩家记录
     FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
     
-    // // UE_LOG(LogTemp, Warning, TEXT("当前领取计数: %d, 进度: %d"), Record.CurrentClaimCount, Record.Progress);
+    UE_LOG(LogTemp, Warning, TEXT("当前领取计数: %d, 进度: %d"), Record.CurrentClaimCount, Record.Progress);
 
-    // 2. 领取资格检查：进度达到且未领取即可
-    if (Record.Progress < DayIndex || Record.IsDayClaimed(DayIndex)) 
+    // 2. 领取资格检查：在Progress范围内的未领取天数
+    if (DayIndex > Record.Progress)
     {
-        // // UE_LOG(LogTemp, Warning, TEXT("领取资格检查失败：Progress(%d) < DayIndex(%d) 或 已领取"), 
-        //        Record.Progress, DayIndex);
+        UE_LOG(LogTemp, Warning, TEXT("领取资格检查失败：第%d天超出可领取范围，当前进度只到第%d天"), DayIndex, Record.Progress);
         return;
     }
+    
+    if (Record.IsDayClaimed(DayIndex)) 
+    {
+        UE_LOG(LogTemp, Warning, TEXT("领取资格检查失败：已领取第%d天"), DayIndex);
+        return;
+    }
+    
+    UE_LOG(LogTemp, Warning, TEXT("领取资格检查通过：第%d天可领取"), DayIndex);
 
     // 3. 获取指针数组 (TArray<FDailyLoginConfigRow*>)
     TArray<FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, DayIndex);
-    // // UE_LOG(LogTemp, Warning, TEXT("获取到 %d 个奖励配置指针"), OptionPtrs.Num());
+    UE_LOG(LogTemp, Warning, TEXT("获取到 %d 个奖励配置指针"), OptionPtrs.Num());
 
     // 4. 转换为值数组 (TArray<FDailyLoginConfigRow>)
     TArray<FDailyLoginConfigRow> ValueOptions;
@@ -610,51 +639,58 @@ void UDailyLoginPage::ShowRewardOptionPopup(int32 DayIndex)
         if (Ptr)
         {
             ValueOptions.Add(*Ptr); // 解引用存入
-            // UE_LOG(LogTemp, Log, TEXT("添加奖励配置: ID=%d, Count=%d, Type=%d"), 
-            //        Ptr->RewardItemID, Ptr->RewardCount, (int32)Ptr->RewardType);
+            UE_LOG(LogTemp, Log, TEXT("添加奖励配置: ID=%d, Count=%d, Type=%d"), 
+                   Ptr->RewardItemID, Ptr->RewardCount, (int32)Ptr->RewardType);
         }
     }
     
-    // // UE_LOG(LogTemp, Warning, TEXT("转换后值数组大小: %d"), ValueOptions.Num());
+    UE_LOG(LogTemp, Warning, TEXT("转换后值数组大小: %d"), ValueOptions.Num());
 
     // 5. 检查RewardOptionClass是否已设置
     if (!RewardOptionClass)
     {
-        // UE_LOG(LogTemp, Error, TEXT("错误：RewardOptionClass 未设置！请在蓝图中指定 WBP_RewardOptionWidget 类"));
+        UE_LOG(LogTemp, Error, TEXT("错误：RewardOptionClass 未设置！请在蓝图中指定 WBP_RewardOptionWidget 类"));
         return;
     }
     
-    // // UE_LOG(LogTemp, Warning, TEXT("RewardOptionClass 类型: %s"), *RewardOptionClass->GetName());
+    UE_LOG(LogTemp, Warning, TEXT("RewardOptionClass 类型: %s"), *RewardOptionClass->GetName());
 
     // 6. 创建并初始化弹窗
     UWorld* World = GetWorld();
     if (!World)
     {
-        // UE_LOG(LogTemp, Error, TEXT("无法获取世界上下文"));
+        UE_LOG(LogTemp, Error, TEXT("无法获取世界上下文"));
         return;
     }
     
-    // // UE_LOG(LogTemp, Warning, TEXT("准备创建 RewardOptionWidget"));
+    UE_LOG(LogTemp, Warning, TEXT("准备创建 RewardOptionWidget"));
     
     if (URewardOptionWidget* OptionPopup = CreateWidget<URewardOptionWidget>(World, RewardOptionClass))
     {
-        // // UE_LOG(LogTemp, Warning, TEXT("成功创建 RewardOptionWidget 实例"));
+        UE_LOG(LogTemp, Warning, TEXT("成功创建 RewardOptionWidget 实例"));
         
         // 传入转换后的值数组
         OptionPopup->InitSelection(ValueOptions); 
-        // // UE_LOG(LogTemp, Warning, TEXT("已完成 InitSelection 调用"));
+        UE_LOG(LogTemp, Warning, TEXT("已完成 InitSelection 调用"));
         
         OptionPopup->AddToViewport(11);
-        // // UE_LOG(LogTemp, Warning, TEXT("已添加到视口"));
+        UE_LOG(LogTemp, Warning, TEXT("已添加到视口"));
         
         // 清理可能存在的旧绑定，防止重复绑定
         OptionPopup->OnStoreToBag.Clear();
         OptionPopup->OnStoreToBag.AddDynamic(this, &UDailyLoginPage::HandleRewardOptionStore);
-        // // UE_LOG(LogTemp, Warning, TEXT("已绑定 OnStoreToBag 回调"));
+        UE_LOG(LogTemp, Warning, TEXT("已绑定 OnStoreToBag 回调"));
+        
+        // 绑定 OnOpenNow 事件
+        OptionPopup->OnOpenNow.Clear();
+        OptionPopup->OnOpenNow.AddDynamic(this, &UDailyLoginPage::OpenTreasureBox);
+        UE_LOG(LogTemp, Warning, TEXT("已绑定 OnOpenNow 回调"));
+        
+        UE_LOG(LogTemp, Warning, TEXT("RewardOptionWidget 创建和绑定完成"));
     }
     else
     {
-        // UE_LOG(LogTemp, Error, TEXT("创建 RewardOptionWidget 失败！"));
+        UE_LOG(LogTemp, Error, TEXT("创建 RewardOptionWidget 失败！"));
     }
 }
 
@@ -693,13 +729,13 @@ void UDailyLoginPage::ShowClaimSuccessPopup()
 
 void UDailyLoginPage::HandleRewardClick(int32 DayIndex, ELoginRewardType RewardType)
 {
-    // // UE_LOG(LogTemp, Warning, TEXT("=== HandleRewardClick 被调用 === 天数: %d, 类型: %d"), DayIndex, (int32)RewardType);
+    UE_LOG(LogTemp, Warning, TEXT("=== HandleRewardClick 被调用 === 天数: %d, 类型: %d"), DayIndex, (int32)RewardType);
     
     // 添加防重复调用保护
     static bool bAlreadyCalled = false;
     if (bAlreadyCalled)
     {
-        // // UE_LOG(LogTemp, Warning, TEXT("HandleRewardClick 已被调用过，忽略重复调用"));
+        UE_LOG(LogTemp, Warning, TEXT("HandleRewardClick 已被调用过，忽略重复调用"));
         return;
     }
     bAlreadyCalled = true;
@@ -733,13 +769,13 @@ void UDailyLoginPage::HandleRewardClick(int32 DayIndex, ELoginRewardType RewardT
     {
     case ELoginRewardType::Box:
         // 礼包/宝箱类型 - 显示选择弹窗
-        // UE_LOG(LogTemp, Warning, TEXT("处理礼包/宝箱奖励，显示选择弹窗"));
+        UE_LOG(LogTemp, Warning, TEXT("处理礼包/宝箱奖励，显示选择弹窗"));
         ShowRewardOptionPopup(DayIndex);
         break;
         
     default:
         // 其他类型 - 显示成功弹窗
-        // UE_LOG(LogTemp, Warning, TEXT("处理普通奖励，显示成功弹窗"));
+        UE_LOG(LogTemp, Warning, TEXT("处理普通奖励，显示成功弹窗"));
         ShowClaimSuccessPopup();
         break;
     }

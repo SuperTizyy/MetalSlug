@@ -20,14 +20,15 @@ void UDailyLoginCheatWidget::NativeConstruct()
 		FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
         
 		// 3. 将这个进度同步到你的输入框或显示文本上
-		// 注意：Progress=0表示第一天可领取，所以显示时要加1
+		// 注意：Progress=N表示第1到第N天可领取
 		if (DayInput)
 		{
-			FString CurrentDayStr = FString::FromInt(Record.Progress + 1);
+			FString CurrentDayStr = FString::FromInt(Record.Progress);
 			DayInput->SetText(FText::FromString(CurrentDayStr));
 		}
         
-		UE_LOG(LogTemp, Log, TEXT("CheatWidget: 成功同步当前存档天数: %d (显示为第%d天)"), Record.Progress, Record.Progress + 1);
+		UE_LOG(LogTemp, Log, TEXT("CheatWidget: 成功同步当前存档天数: Progress=%d (第1-%d天可领取)"), 
+			Record.Progress, Record.Progress);
 	}
 	
 	// 4. 绑定按钮点击事件
@@ -47,13 +48,13 @@ void UDailyLoginCheatWidget::OnApplyClicked()
 
 	// 1. 获取输入并限制范围
 	int32 NewDay = FCString::Atoi(*DayInput->GetText().ToString());
-	NewDay = FMath::Clamp(NewDay, 1, 8);
+	NewDay = FMath::Clamp(NewDay, 1, 7);
 
 	// 2. 直接修改底层数据
 	// 这个函数内部应该包含：修改 Record.Progress + SaveToDisk() + OnActivityDataChanged.Broadcast()
 	ActivitySub->Cheat_JumpToDay(101, NewDay);
 
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("成功跳转到第 %d 天并同步存档！"), NewDay));
+	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("成功跳转！输入%d表示第1-%d天可领取"), NewDay, NewDay));
 }
 
 void UDailyLoginCheatWidget::NotifyMainPageRefresh(int32 NewDay)
