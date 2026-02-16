@@ -6,7 +6,7 @@
 #include "RewardOptionWidget.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnStoreToBag, int32, DayIndex);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnOpenNow);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnOpenNow, int32, DayIndex);
 
 UCLASS()
 class METALSLUG01_API URewardOptionWidget : public UUserWidget

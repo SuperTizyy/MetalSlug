@@ -31,16 +31,56 @@ void UActivityConfirmPopupWidget::NativeConstruct()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("ActivityConfirmPopup: ConfirmButton未在蓝图中绑定"));
 	}
+
+	// 绑定HorizontalBox点击事件
+	if (RewardOptionsContainer)
+	{
+		// 注意：HorizontalBox本身不直接支持点击事件
+		// 这里提供几种处理方案：
+		// 1. 在容器内添加透明按钮覆盖整个区域
+		// 2. 监听子元素的点击事件
+		// 3. 通过自定义事件系统处理
+		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: RewardOptionsContainer绑定成功"));
+		
+		// 方案1：添加透明覆盖按钮
+		SetupHorizontalBoxClickHandler();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ActivityConfirmPopup: RewardOptionsContainer未在蓝图中绑定"));
+	}
 }
 
 void UActivityConfirmPopupWidget::InitializePopup(const TArray<FDailyLoginConfigRow>& InRewardOptions, int32 InSelectedIndex)
 {
 	RewardOptions = InRewardOptions;
 	SelectedIndex = InSelectedIndex;
-
+	
 	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 初始化弹窗，奖励选项数量: %d, 默认选中索引: %d"), 
 		RewardOptions.Num(), SelectedIndex);
+	
+	// 如果有奖励选项容器，创建奖励卡片
+	if (RewardOptionsContainer && RewardOptions.Num() > 0)
+	{
+		// 清空现有内容
+		RewardOptionsContainer->ClearChildren();
+		
+		// 为每个奖励选项创建卡片
+		for (int32 i = 0; i < FMath::Min(3, RewardOptions.Num()); ++i)
+		{
+			UWidget* RewardCard = CreateRewardCard(RewardOptions[i], i);
+			if (RewardCard)
+			{
+				RewardOptionsContainer->AddChildToHorizontalBox(RewardCard);
+			}
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 奖励卡片创建完成，共创建 %d 个卡片"), 
+			FMath::Min(3, RewardOptions.Num()));
+	}
 }
+
+
 
 void UActivityConfirmPopupWidget::SetSelectedIndex(int32 Index)
 {
@@ -130,6 +170,29 @@ void UActivityConfirmPopupWidget::OnConfirmClicked()
 {
 	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 确认按钮被点击，当前选中索引: %d"), SelectedIndex);
 	RemoveFromParent();
+}
+
+void UActivityConfirmPopupWidget::OnHorizontalBoxClicked()
+{
+	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: HorizontalBox容器被点击"));
+	// 这里可以添加容器级别的处理逻辑
+	// 例如：取消所有选中状态、显示帮助信息等
+}
+
+void UActivityConfirmPopupWidget::SetupHorizontalBoxClickHandler()
+{
+	// 创建透明覆盖按钮来捕获点击事件
+	UButton* OverlayButton = NewObject<UButton>(this);
+	if (OverlayButton && RewardOptionsContainer)
+	{
+		OverlayButton->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+		OverlayButton->OnClicked.AddDynamic(this, &UActivityConfirmPopupWidget::OnHorizontalBoxClicked);
+		
+		// 将按钮添加到HorizontalBox的第一个位置
+		RewardOptionsContainer->AddChildToHorizontalBox(OverlayButton);
+		
+		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: HorizontalBox点击处理器设置成功"));
+	}
 }
 
 void UActivityConfirmPopupWidget::OnRewardCardClicked_0()

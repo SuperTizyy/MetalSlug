@@ -26,6 +26,10 @@ public:
 	UPROPERTY(BlueprintReadWrite, meta = (BindWidget), Category = "UI Components")
 	class UButton* ConfirmButton;
 
+	/** 水平布局容器 - 用于放置奖励选项 */
+	UPROPERTY(BlueprintReadWrite, meta = (BindWidget), Category = "UI Components")
+	class UHorizontalBox* RewardOptionsContainer;
+
 	// ==================== 功能函数 ====================
 	
 	/**
@@ -80,6 +84,13 @@ private:
 	/** 确认按钮点击事件处理 */
 	UFUNCTION()
 	void OnConfirmClicked();
+
+	/** HorizontalBox容器点击事件处理 */
+	UFUNCTION()
+	void OnHorizontalBoxClicked();
+
+	/** 设置HorizontalBox点击处理器 */
+	void SetupHorizontalBoxClickHandler();
 
 	/** 奖励卡片1点击事件 */
 	UFUNCTION()

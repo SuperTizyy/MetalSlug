@@ -46,7 +46,7 @@ protected:
 	void HandleRewardOptionStore(int32 DayIndex);
 
 	UFUNCTION()
-	void OpenTreasureBox();
+	void OpenTreasureBox(int32 DayIndex = -1);
 
 	UFUNCTION()
 	void OnFinalClaimComplete();
@@ -75,6 +75,10 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
 	TSubclassOf<class UUserWidget> TreasureBoxClass;
 	
+	// 新增：ActivityConfirmPopupWidget类
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class UActivityConfirmPopupWidget> ActivityConfirmPopupClass;
+	
 	// 新增：领取成功弹窗类
 	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
 	TSubclassOf<class UUserWidget> ClaimSuccessPopClass;
@@ -89,4 +93,8 @@ private:
 	// 成员变量（ActivitySubsystem 指针）
 	UPROPERTY()
 	class UActivitySubsystem* ActivitySub;
+	
+	// 临时存储当前处理的天数
+	UPROPERTY()
+	int32 CurrentProcessingDay = -1;
 };

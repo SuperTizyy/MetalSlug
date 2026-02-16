@@ -96,7 +96,7 @@ void URewardOptionWidget::HandleStoreClicked()
 
 void URewardOptionWidget::HandleOpenClicked()
 {
-	UE_LOG(LogTemp, Warning, TEXT("=== HandleOpenClicked 被调用 ==="));
+	UE_LOG(LogTemp, Warning, TEXT("=== 🎯 HandleOpenClicked 被调用 ==="));
 	
 	// 添加防重复调用保护
 	if (bOpenClickedHandled)
@@ -106,12 +106,18 @@ void URewardOptionWidget::HandleOpenClicked()
 	}
 	bOpenClickedHandled = true;
 	
+	UE_LOG(LogTemp, Warning, TEXT("当前天数索引: %d"), CurrentDayIndex);
+	
 	// 先广播事件再关闭UI
 	if (OnOpenNow.IsBound())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("OnOpenNow 已绑定，准备广播事件"));
-		OnOpenNow.Broadcast();
-		UE_LOG(LogTemp, Warning, TEXT("事件广播完成"));
+		UE_LOG(LogTemp, Warning, TEXT("✅ OnOpenNow 已绑定，准备广播事件，天数: %d"), CurrentDayIndex);
+		OnOpenNow.Broadcast(CurrentDayIndex);
+		UE_LOG(LogTemp, Warning, TEXT("✅ 事件广播完成"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("❌ OnOpenNow 未绑定！无法触发跳转"));
 	}
 	
 	// 确保只调用一次RemoveFromParent，并添加额外的安全检查

@@ -14,6 +14,7 @@
 #include "UI/Activity/Pages/DailyLogin/Widgets/DailyLoginDayItemWidget.h"
 #include "UI/Activity/Pages/DailyLogin/Widgets/RewardOptionWidget.h"
 #include "UI/Activity/Pages/DailyLogin/DailyLoginCheatWidget.h"
+#include "UI/Activity/Pages/Widgets/ActivityConfirmPopupWidget.h"  // 添加这个头文件
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "UI/Activity/Pages/DailyLogin/Widgets/ClaimSuccessWidget.h"
@@ -52,6 +53,7 @@ void UDailyLoginPage::NativeConstruct()
 	UE_LOG(LogTemp, Warning, TEXT("  ItemClass: %s"), ItemClass ? *ItemClass->GetName() : TEXT("未设置"));
 	UE_LOG(LogTemp, Warning, TEXT("  RewardOptionClass: %s"), RewardOptionClass ? *RewardOptionClass->GetName() : TEXT("未设置"));
 	UE_LOG(LogTemp, Warning, TEXT("  TreasureBoxClass: %s"), TreasureBoxClass ? *TreasureBoxClass->GetName() : TEXT("未设置"));
+	UE_LOG(LogTemp, Warning, TEXT("  ActivityConfirmPopupClass: %s"), ActivityConfirmPopupClass ? *ActivityConfirmPopupClass->GetName() : TEXT("未设置"));
 	UE_LOG(LogTemp, Warning, TEXT("  ClaimSuccessPopClass: %s"), ClaimSuccessPopClass ? *ClaimSuccessPopClass->GetName() : TEXT("未设置"));
 
 	// CheatWidget相关代码保持不变
@@ -467,29 +469,90 @@ void UDailyLoginPage::HandleRewardOptionStore(int32 DayIndex)
 
 // 移除HandleStoreLogicWithDay函数，使用简单的HandleStoreLogic替代
 
-void UDailyLoginPage::OpenTreasureBox()
+void UDailyLoginPage::OpenTreasureBox(int32 DayIndex)
 {
     UE_LOG(LogTemp, Warning, TEXT("=== OpenTreasureBox 被调用 ==="));
     
-    if (TreasureBoxClass)
+    // 优先使用传入的参数，否则使用存储的天数，最后使用默认值
+    int32 CurrentDayIndex = -1;
+    if (DayIndex != -1)
     {
-        UE_LOG(LogTemp, Warning, TEXT("TreasureBoxClass 存在，准备创建 TreasureBoxWidget"));
-        UTreasureBoxWidget* BoxPopup = CreateWidget<UTreasureBoxWidget>(this, TreasureBoxClass);
-        if (BoxPopup)
+        CurrentDayIndex = DayIndex;
+    }
+    else if (CurrentProcessingDay != -1)
+    {
+        CurrentDayIndex = CurrentProcessingDay;
+        UE_LOG(LogTemp, Warning, TEXT("使用存储的处理天数: %d"), CurrentDayIndex);
+    }
+    else
+    {
+        CurrentDayIndex = 3; // 默认使用第3天
+        UE_LOG(LogTemp, Warning, TEXT("使用默认天数: %d"), CurrentDayIndex);
+    }
+    
+    // 获取当前天数的奖励配置数据
+    TArray<FDailyLoginConfigRow*> CurrentDayRewards = ActivitySub->GetRewardsByDay(101, CurrentDayIndex);
+    TArray<FDailyLoginConfigRow> ValueOptions;
+    for (FDailyLoginConfigRow* Ptr : CurrentDayRewards)
+    {
+        if (Ptr)
         {
-            UE_LOG(LogTemp, Warning, TEXT("成功创建 TreasureBoxWidget 实例"));
-            BoxPopup->OnClaimFinished.AddDynamic(this, &UDailyLoginPage::OnFinalClaimComplete);
-            BoxPopup->AddToViewport(12);
-            UE_LOG(LogTemp, Warning, TEXT("TreasureBoxWidget 已添加到视口"));
+            ValueOptions.Add(*Ptr);
+            UE_LOG(LogTemp, Log, TEXT("添加当前天数奖励配置: ID=%d, Count=%d"), Ptr->RewardItemID, Ptr->RewardCount);
+        }
+    }
+    
+    // 创建并显示ActivityConfirmPopupWidget
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogTemp, Error, TEXT("无法获取世界上下文"));
+        return;
+    }
+    
+    UE_LOG(LogTemp, Warning, TEXT("检查 ActivityConfirmPopupClass 是否设置: %s"), 
+           ActivityConfirmPopupClass ? *ActivityConfirmPopupClass->GetName() : TEXT("未设置"));
+    
+    if (ActivityConfirmPopupClass)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("开始创建 ActivityConfirmPopupWidget..."));
+        UActivityConfirmPopupWidget* ConfirmPopup = CreateWidget<UActivityConfirmPopupWidget>(World, ActivityConfirmPopupClass.Get());
+        if (ConfirmPopup)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建 ActivityConfirmPopupWidget 实例"));
+            
+            // 初始化弹窗数据
+            ConfirmPopup->InitializePopup(ValueOptions, 1); // 默认选中第二个选项
+            ConfirmPopup->AddToViewport(13); // 层级高于TreasureBox
+            
+            UE_LOG(LogTemp, Warning, TEXT("✅ ActivityConfirmPopupWidget 已添加到视口"));
         }
         else
         {
-            UE_LOG(LogTemp, Error, TEXT("创建 TreasureBoxWidget 失败！"));
+            UE_LOG(LogTemp, Error, TEXT("❌ 创建 ActivityConfirmPopupWidget 失败！"));
         }
     }
     else
     {
-        UE_LOG(LogTemp, Error, TEXT("TreasureBoxClass 未设置！"));
+        UE_LOG(LogTemp, Error, TEXT("❌ ActivityConfirmPopupClass 未设置！请在蓝图中指定 WBP_ActivityConfirmPopupWidget 类"));
+        
+        // 降级方案：如果ConfirmPopupClass未设置，仍然使用原来的TreasureBox
+        if (TreasureBoxClass)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("⚠️ 降级到TreasureBoxWidget"));
+            UTreasureBoxWidget* BoxPopup = CreateWidget<UTreasureBoxWidget>(this, TreasureBoxClass);
+            if (BoxPopup)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建 TreasureBoxWidget 实例"));
+                BoxPopup->OnClaimFinished.AddDynamic(this, &UDailyLoginPage::OnFinalClaimComplete);
+                BoxPopup->AddToViewport(12);
+                UE_LOG(LogTemp, Warning, TEXT("✅ TreasureBoxWidget 已添加到视口"));
+            }
+            else
+            {
+                UE_LOG(LogTemp, Error, TEXT("❌ 创建 TreasureBoxWidget 失败！"));
+            }
+        }
     }
 }
 
@@ -627,6 +690,10 @@ void UDailyLoginPage::ShowRewardOptionPopup(int32 DayIndex)
     }
     
     UE_LOG(LogTemp, Warning, TEXT("领取资格检查通过：第%d天可领取"), DayIndex);
+
+    // 存储当前处理的天数
+    CurrentProcessingDay = DayIndex;
+    UE_LOG(LogTemp, Warning, TEXT("设置当前处理天数: %d"), CurrentProcessingDay);
 
     // 3. 获取指针数组 (TArray<FDailyLoginConfigRow*>)
     TArray<FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, DayIndex);
