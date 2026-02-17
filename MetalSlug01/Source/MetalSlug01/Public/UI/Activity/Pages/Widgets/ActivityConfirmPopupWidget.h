@@ -99,13 +99,6 @@ private:
 	UFUNCTION()
 	void OnConfirmClicked();
 
-	/** HorizontalBox容器点击事件处理 */
-	UFUNCTION()
-	void OnHorizontalBoxClicked();
-
-	/** 设置HorizontalBox点击处理器 */
-	void SetupHorizontalBoxClickHandler();
-
 	/** 奖励卡片1点击事件 */
 	UFUNCTION()
 	void OnRewardCardClicked_0();
