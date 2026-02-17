@@ -76,6 +76,10 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
 	TSubclassOf<class UActivityConfirmPopupWidget> ActivityConfirmPopupClass;
 	
+	// 新增：RewardOptionCardWidget类
+	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
+	TSubclassOf<class URewardOptionCardWidget> RewardOptionCardClass;
+	
 	// 新增：领取成功弹窗类
 	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")
 	TSubclassOf<class UUserWidget> ClaimSuccessPopClass;

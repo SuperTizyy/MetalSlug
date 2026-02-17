@@ -4,6 +4,9 @@
 #include "Blueprint/UserWidget.h"
 #include "ActivityConfirmPopupWidget.generated.h"
 
+// 前置声明
+class URewardOptionCardWidget;
+
 /**
  * @brief 活动奖励确认弹窗 - 实现标准的活动奖励领取确认界面
  * @author AI Assistant
@@ -29,6 +32,10 @@ public:
 	/** 水平布局容器 - 用于放置奖励选项 */
 	UPROPERTY(BlueprintReadWrite, meta = (BindWidget), Category = "UI Components")
 	class UHorizontalBox* RewardOptionsContainer;
+
+	/** 奖励选项卡片类 - 用于动态创建奖励卡片 */
+	UPROPERTY(EditAnywhere, Category = "Reward Cards")
+	TSubclassOf<class URewardOptionCardWidget> RewardOptionCardClass;
 
 	// ==================== 功能函数 ====================
 	
@@ -70,6 +77,13 @@ private:
 	TArray<struct FDailyLoginConfigRow> RewardOptions;
 
 	/**
+	 * @brief 为指定的宝箱配置创建多个奖励卡片
+	 * @param Config 宝箱配置数据
+	 * @note 直接将创建的卡片添加到RewardOptionsContainer中
+	 */
+	void CreateRewardCardsForBox(const struct FDailyLoginConfigRow& Config);
+
+	/**
 	 * @brief 创建奖励卡片UI元素
 	 * @param Config 奖励配置数据
 	 * @param Index 卡片索引
@@ -109,4 +123,8 @@ private:
 	 * @param Index 被点击的卡片索引
 	 */
 	void InternalOnRewardCardClicked(int32 Index);
+	
+	/** 奖励卡片选中状态改变回调 */
+	UFUNCTION()
+	void OnRewardCardSelected(class URewardOptionCardWidget* CardWidget, bool bIsChecked);
 };

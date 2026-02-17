@@ -15,6 +15,7 @@
 #include "UI/Activity/Pages/DailyLogin/Widgets/RewardOptionWidget.h"
 #include "UI/Activity/Pages/DailyLogin/DailyLoginCheatWidget.h"
 #include "UI/Activity/Pages/Widgets/ActivityConfirmPopupWidget.h"  // 添加这个头文件
+#include "UI/Activity/Pages/Widgets/RewardOptionCardWidget.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "UI/Activity/Pages/DailyLogin/Widgets/ClaimSuccessWidget.h"

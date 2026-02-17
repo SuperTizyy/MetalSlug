@@ -91,6 +91,9 @@ public:
 	/** 根据宝箱ID获取宝箱物品配置 */
 	const FTreasureBoxItemRow* GetTreasureBoxItem(int32 BoxID) const;
 
+	/** 根据宝箱ID获取所有匹配的宝箱物品记录 */
+	TArray<const FTreasureBoxItemRow*> GetTreasureBoxItemsByBoxID(int32 BoxID) const;
+
 public:
 	// ================= 事件 =================
 	

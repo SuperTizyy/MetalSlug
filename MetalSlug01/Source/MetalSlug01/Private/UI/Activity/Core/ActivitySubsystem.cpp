@@ -449,3 +449,46 @@ const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) c
 	
 	return nullptr;
 }
+
+TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxID(int32 BoxID) const
+{
+	// 从TreasureBoxItemRow表加载指定BoxID的所有宝箱物品配置
+	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow");
+	UE_LOG(LogTemp, Warning, TEXT("🔍 GetTreasureBoxItemsByBoxID: 尝试加载路径 %s"), *ConfigPath);
+	
+	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
+	
+	TArray<const FTreasureBoxItemRow*> Result;
+	
+	if (ConfigTable)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载DT_TreasureBoxItemRow DataTable"));
+		static const FString ContextString(TEXT("ActivitySubsystem"));
+		TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
+		
+		UE_LOG(LogTemp, Warning, TEXT("📊 TreasureBox DataTable包含 %d 条记录"), RowMap.Num());
+		
+		for (const auto& Pair : RowMap)
+		{
+			const FTreasureBoxItemRow* Row = reinterpret_cast<const FTreasureBoxItemRow*>(Pair.Value);
+			if (Row)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("📋 宝箱记录: BoxID=%d, ItemID=%d"), Row->BoxID, Row->ItemID);
+				
+				if (Row->BoxID == BoxID)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的BoxID: %d, ItemID: %d"), BoxID, Row->ItemID);
+					Result.Add(Row);
+				}
+			}
+		}
+		
+		UE_LOG(LogTemp, Warning, TEXT("📦 找到 %d 个BoxID=%d的宝箱物品记录"), Result.Num(), BoxID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载TreasureBoxItem DataTable: %s"), *ConfigPath);
+	}
+	
+	return Result;
+}
