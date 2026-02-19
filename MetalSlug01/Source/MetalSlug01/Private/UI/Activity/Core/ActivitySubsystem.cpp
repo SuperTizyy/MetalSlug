@@ -508,41 +508,7 @@ TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxI
 	return Result;
 }
 
-// ==================== 动态表修改器接口实现 ====================
-
-UUniversalDataTableModifier* UActivitySubsystem::GetDataTableModifier() const
-{
-	return DataTableModifier;
-}
-
-bool UActivitySubsystem::InitializeDataTableModifier(UObject* WorldContext)
-{
-	if (!DataTableModifier)
-	{
-		DataTableModifier = NewObject<UUniversalDataTableModifier>(this);
-	}
-
-	FDataTableModificationConfig Config;
-	Config.bEnablePersistentModification = true;
-	Config.bAutoSaveChanges = true;
-	Config.AutoSaveInterval = 30.0f;
-	Config.MaxHistoryRecords = 100;
-	Config.bEnableTransactionSupport = true;
-
-	bool bSuccess = DataTableModifier->InitializeModifier(Config, WorldContext);
-	if (bSuccess)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态表修改器初始化成功"));
-		// 加载已保存的修改
-		DataTableModifier->LoadSavedModifications();
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 动态表修改器初始化失败"));
-	}
-
-	return bSuccess;
-}
+// ==================== 动态存档修改器接口实现 ====================
 
 // ==================== 动态存档修改器接口实现 ====================
 

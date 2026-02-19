@@ -13,11 +13,7 @@
 
 // ==================== 结构体实现 ====================
 
-FDailyLoginModificationRecord::FDailyLoginModificationRecord()
-	: ActivityID(0), ModificationTime(FDateTime::Now()), bIsSaved(false)
-{
-	ModificationId = FGuid::NewGuid();
-}
+// FDailyLoginModificationRecord的构造函数已在头文件中定义
 
 // ==================== 主类实现 ====================
 
