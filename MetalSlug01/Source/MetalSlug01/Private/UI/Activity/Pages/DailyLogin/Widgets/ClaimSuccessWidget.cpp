@@ -1,4 +1,5 @@
-﻿
+﻿//普通领取成功弹窗UI类
+
 #include "UI/Activity/Pages/DailyLogin/Widgets/ClaimSuccessWidget.h"
 
 #include "Components/Button.h"

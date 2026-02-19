@@ -1,6 +1,17 @@
+/*
+这个系统原本设计用于：
+活动自动上下架 - 根据时间自动控制活动显示/隐藏
+倒计时显示 - 在UI中显示活动开始/结束倒计时
+状态提示 - 预告即将开始或即将结束的活动
+红点系统 - 结合时间状态显示活动红点
+运营维护 - 手动控制活动状态进行紧急维护
+-------并未使用！！！！
+*/
+
 #include "UI/Activity/Core/ActivityTimeManager.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
+
 
 void UActivityTimeManager::InitializeManager(UActivitySubsystem* InSubsystem)
 {
