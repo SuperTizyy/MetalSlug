@@ -11,7 +11,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "UI/Activity/Pages/ActivityPageBase.h"
+#include "Blueprint/UserWidget.h"
 #include "DailyUpgradeRewardPage.generated.h"
 
 class UHorizontalBox;
@@ -26,7 +26,7 @@ class UScrollBox;
  * @details 提供每日升级奖励活动的UI展示和交互功能
  */
 UCLASS()
-class METALSLUG01_API UDailyUpgradeRewardPage : public UActivityPageBase
+class METALSLUG01_API UDailyUpgradeRewardPage : public UUserWidget
 {
 	GENERATED_BODY()
 
