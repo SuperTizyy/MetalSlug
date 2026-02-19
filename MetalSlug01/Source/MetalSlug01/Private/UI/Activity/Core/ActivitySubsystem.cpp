@@ -1,8 +1,5 @@
 ﻿#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Track/DailyLogin/DailyLoginTrack.h"
-#include "UI/Activity/Track/Treasure/TreasureTrack.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
