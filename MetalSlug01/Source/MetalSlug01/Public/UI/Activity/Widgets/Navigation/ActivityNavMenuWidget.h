@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "UI/Activity/Data/DailyLoginSave.h"  // 包含整合后的FActivityNavItem
-#include "ActivityNavItemWidget.h"  // 包含旧的导航项Widget
 #include "ActivityNavButton.h"      // 包含新的导航按钮Widget
 #include "ActivityConfirmPopupWidget.h"  // 包含新的确认弹窗Widget
 #include "ActivityNavMenuWidget.generated.h"
@@ -25,10 +24,6 @@ public:
 	/** 导航容器 - 在蓝图中绑定VerticalBox或ScrollBox */
 	UPROPERTY(BlueprintReadWrite, meta = (BindWidget))
 	class UPanelWidget* NavContainer;
-	
-	/** 导航项Widget模板类 - 在蓝图中指定WBP_ActivityNavItem */
-	UPROPERTY(BlueprintReadOnly, Category = "Navigation")
-	TSubclassOf<UActivityNavItemWidget> ItemTemplateClass;
 	
 	/** 页面显示容器 - 在蓝图中绑定用于显示活动页面的面板 */
 	UPROPERTY(BlueprintReadWrite, meta = (BindWidget))
