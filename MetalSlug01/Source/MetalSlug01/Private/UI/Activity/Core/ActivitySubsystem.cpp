@@ -45,13 +45,6 @@ void UActivitySubsystem::Deinitialize()
 	ActivityPageManager = nullptr;
 	ActivityTimeManager = nullptr;
 	
-	// 清理动态表修改器
-	if (DataTableModifier)
-	{
-		DataTableModifier->DestroyModifier();
-		DataTableModifier = nullptr;
-	}
-
 	// 清理动态存档修改器
 	if (SaveModifier)
 	{
@@ -549,98 +542,6 @@ bool UActivitySubsystem::InitializeDataTableModifier(UObject* WorldContext)
 	}
 
 	return bSuccess;
-}
-
-TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetModifiedDailyLoginConfigs(int32 ActivityID) const
-{
-	TArray<FDailyLoginConfigRow*> Result;
-	
-	// 先尝试从修改器获取修改后的数据
-	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow")))
-	{
-		TArray<uint8*> ModifiedRows;
-		if (DataTableModifier->GetAllModifiedRows(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow"), ModifiedRows))
-		{
-			for (uint8* RowData : ModifiedRows)
-			{
-				FDailyLoginConfigRow* Row = reinterpret_cast<FDailyLoginConfigRow*>(RowData);
-				if (Row && Row->ActivityID == ActivityID)
-				{
-					Result.Add(Row);
-				}
-			}
-		}
-	}
-	
-	// 如果没有修改或者修改器不可用，则使用原始数据
-	if (Result.Num() == 0)
-	{
-		return GetDailyLoginConfigs(ActivityID);
-	}
-	
-	return Result;
-}
-
-TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetModifiedRewardsByDay(int32 ActivityID, int32 Day) const
-{
-	TArray<FDailyLoginConfigRow*> Result;
-	
-	// 先尝试从修改器获取修改后的数据
-	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow")))
-	{
-		TArray<uint8*> ModifiedRows;
-		if (DataTableModifier->GetAllModifiedRows(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow"), ModifiedRows))
-		{
-			for (uint8* RowData : ModifiedRows)
-			{
-				FDailyLoginConfigRow* Row = reinterpret_cast<FDailyLoginConfigRow*>(RowData);
-				if (Row && Row->ActivityID == ActivityID && Row->DayIndex == Day)
-				{
-					Result.Add(Row);
-				}
-			}
-		}
-	}
-	
-	// 如果没有修改或者修改器不可用，则使用原始数据
-	if (Result.Num() == 0)
-	{
-		return GetRewardsByDay(ActivityID, Day);
-	}
-	
-	return Result;
-}
-
-const FItemDetailRow* UActivitySubsystem::GetModifiedItemDetail(int32 ItemID) const
-{
-	// 先尝试从修改器获取修改后的数据
-	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow")))
-	{
-		uint8* ModifiedRow = DataTableModifier->GetModifiedRow(TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow"), FName(*FString::FromInt(ItemID)));
-		if (ModifiedRow)
-		{
-			return reinterpret_cast<const FItemDetailRow*>(ModifiedRow);
-		}
-	}
-	
-	// 如果没有修改或者修改器不可用，则使用原始数据
-	return GetItemDetail(ItemID);
-}
-
-const FTreasureBoxItemRow* UActivitySubsystem::GetModifiedTreasureBoxItem(int32 BoxID) const
-{
-	// 先尝试从修改器获取修改后的数据
-	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow")))
-	{
-		uint8* ModifiedRow = DataTableModifier->GetModifiedRow(TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow"), FName(*FString::FromInt(BoxID)));
-		if (ModifiedRow)
-		{
-			return reinterpret_cast<const FTreasureBoxItemRow*>(ModifiedRow);
-		}
-	}
-	
-	// 如果没有修改或者修改器不可用，则使用原始数据
-	return GetTreasureBoxItem(BoxID);
 }
 
 // ==================== 动态存档修改器接口实现 ====================

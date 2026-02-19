@@ -237,12 +237,6 @@ private:
 	UPROPERTY()
 	UDailyLoginSaveGame* CachedSaveGame = nullptr;
 
-	// ================= 动态表修改器 =================
-	
-	/** 动态表修改器实例 */
-	UPROPERTY()
-	UUniversalDataTableModifier* DataTableModifier = nullptr;
-
 	// ================= 动态存档修改器 =================
 	
 	/** 每日登录存档修改器实例 */
