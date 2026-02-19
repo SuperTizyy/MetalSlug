@@ -11,23 +11,8 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
-	// ================= 创建 DailyLogin Track =================
-	DailyLoginTrack = NewObject<UDailyLoginTrack>(this);
-	if (DailyLoginTrack)
-	{
-		DailyLoginTrack->Initialize(7);
-	}
-
-	// ================= 创建 Treasure Track =================
-	TreasureTrack = NewObject<UTreasureTrack>(this);
-	if (TreasureTrack)
-	{
-		TreasureTrack->Init();
-	}
-
 	// ================= 初始化管理器 =================
 	RedDotManager = NewObject<URedDotManager>(this);
-	ActivityPageManager = NewObject<UActivityPageManager>(this);
 	ActivityTimeManager = NewObject<UActivityTimeManager>(this);
 
 	// ================= 初始化动态存档修改器 =================
@@ -40,11 +25,8 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UActivitySubsystem::Deinitialize()
 {
-	// Subsystem 销毁时，Track 和管理器会随 GC 自动回收
-	DailyLoginTrack = nullptr;
-	TreasureTrack = nullptr;
+	// Subsystem 销毁时，管理器会随 GC 自动回收
 	RedDotManager = nullptr;
-	ActivityPageManager = nullptr;
 	ActivityTimeManager = nullptr;
 	
 	// 清理动态存档修改器
@@ -59,24 +41,9 @@ void UActivitySubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
-UDailyLoginTrack* UActivitySubsystem::GetDailyLoginTrack() const
-{
-	return DailyLoginTrack;
-}
-
-UTreasureTrack* UActivitySubsystem::GetTreasureTrack() const
-{
-	return TreasureTrack;
-}
-
 URedDotManager* UActivitySubsystem::GetRedDotManager() const
 {
 	return RedDotManager;
-}
-
-UActivityPageManager* UActivitySubsystem::GetActivityPageManager() const
-{
-	return ActivityPageManager;
 }
 
 UActivityTimeManager* UActivitySubsystem::GetActivityTimeManager() const

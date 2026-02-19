@@ -7,15 +7,11 @@
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "ActivitySubsystem.generated.h"
 
-class UDailyLoginTrack;
-class UTreasureTrack;
 class URedDotManager;
-class UActivityPageManager;
 class UActivityTimeManager;
 
 /**
@@ -42,19 +38,10 @@ public:
 	virtual void Deinitialize() override;
 
 public:
-	// ================= Track 访问接口 =================
-
-	/** 获取每日登录 Track */
-	UDailyLoginTrack* GetDailyLoginTrack() const;
-
-	/** 获取宝箱 Track */
-	UTreasureTrack* GetTreasureTrack() const;
+	// ================= 管理器访问接口 =================
 
 	/** 获取红点管理器 */
 	URedDotManager* GetRedDotManager() const;
-
-	/** 获取活动页面管理器 */
-	UActivityPageManager* GetActivityPageManager() const;
 
 	/** 获取活动时间管理器 */
 	UActivityTimeManager* GetActivityTimeManager() const;
@@ -167,19 +154,10 @@ public:
 private:
 	// ================= Track 持有 =================
 
-	UPROPERTY()
-	UDailyLoginTrack* DailyLoginTrack = nullptr;
-
-	UPROPERTY()
-	UTreasureTrack* TreasureTrack = nullptr;
-
 	// ================= 管理器持有 =================
 		
 	UPROPERTY()
 	URedDotManager* RedDotManager = nullptr;
-		
-	UPROPERTY()
-	UActivityPageManager* ActivityPageManager = nullptr;
 		
 	UPROPERTY()
 	UActivityTimeManager* ActivityTimeManager = nullptr;
