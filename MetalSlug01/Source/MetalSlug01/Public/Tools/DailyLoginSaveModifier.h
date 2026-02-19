@@ -264,4 +264,14 @@ private:
 	 * @brief 清理旧的历史记录
 	 */
 	void CleanupOldHistory();
+
+	/**
+	 * @brief 注册控制台命令
+	 */
+	void RegisterConsoleCommands();
+
+	/**
+	 * @brief 注销控制台命令
+	 */
+	void UnregisterConsoleCommands();
 };

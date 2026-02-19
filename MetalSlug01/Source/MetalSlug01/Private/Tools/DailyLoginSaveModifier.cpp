@@ -10,6 +10,8 @@
 
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
+#include "Kismet/GameplayStatics.h"
 
 // ==================== 结构体实现 ====================
 
@@ -550,4 +552,113 @@ void UDailyLoginSaveModifier::CleanupOldHistory()
 	{
 		ModificationHistory.RemoveAt(0, ModificationHistory.Num() - MaxHistoryRecords);
 	}
+}
+
+// ==================== 控制台命令实现 ====================
+
+void UDailyLoginSaveModifier::RegisterConsoleCommands()
+{
+	if (!GEngine)
+	{
+		return;
+	}
+
+	// 注册控制台命令处理器
+	IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("DailyLogin.SetProgress"),
+		TEXT("设置每日登录进度: DailyLogin.SetProgress ActivityID ProgressValue"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		{
+			if (Args.Num() >= 2)
+			{
+				int32 ActivityID = FCString::Atoi(*Args[0]);
+				int32 Progress = FCString::Atoi(*Args[1]);
+				
+				bool bSuccess = ModifyPlayerProgress(ActivityID, Progress, true);
+				UE_LOG(LogTemp, Log, TEXT("DailyLogin控制台: 设置进度 ActivityID=%d Progress=%d %s"), 
+					ActivityID, Progress, bSuccess ? TEXT("成功") : TEXT("失败"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyLogin控制台: 用法 - DailyLogin.SetProgress ActivityID ProgressValue"));
+			}
+		}),
+		ECVF_Default
+	);
+
+	IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("DailyLogin.SetDayClaimed"),
+		TEXT("设置某天领取状态: DailyLogin.SetDayClaimed ActivityID DayIndex IsClaimed"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		{
+			if (Args.Num() >= 3)
+			{
+				int32 ActivityID = FCString::Atoi(*Args[0]);
+				int32 DayIndex = FCString::Atoi(*Args[1]);
+				bool bClaimed = FCString::Atoi(*Args[2]) != 0;
+				
+				bool bSuccess = ModifyDayClaimedStatus(ActivityID, DayIndex, bClaimed, true);
+				UE_LOG(LogTemp, Log, TEXT("DailyLogin控制台: 设置天数领取状态 ActivityID=%d DayIndex=%d Claimed=%s %s"), 
+					ActivityID, DayIndex, bClaimed ? TEXT("是") : TEXT("否"), bSuccess ? TEXT("成功") : TEXT("失败"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyLogin控制台: 用法 - DailyLogin.SetDayClaimed ActivityID DayIndex IsClaimed"));
+			}
+		}),
+		ECVF_Default
+	);
+
+	IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("DailyLogin.Reset"),
+		TEXT("重置每日登录数据: DailyLogin.Reset ActivityID"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		{
+			if (Args.Num() >= 1)
+			{
+				int32 ActivityID = FCString::Atoi(*Args[0]);
+				
+				bool bSuccess = ResetDailyLoginData(ActivityID);
+				UE_LOG(LogTemp, Log, TEXT("DailyLogin控制台: 重置数据 ActivityID=%d %s"), 
+					ActivityID, bSuccess ? TEXT("成功") : TEXT("失败"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyLogin控制台: 用法 - DailyLogin.Reset ActivityID"));
+			}
+		}),
+		ECVF_Default
+	);
+
+	IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("DailyLogin.ShowInfo"),
+		TEXT("显示每日登录信息: DailyLogin.ShowInfo ActivityID"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		{
+			if (Args.Num() >= 1)
+			{
+				int32 ActivityID = FCString::Atoi(*Args[0]);
+				DisplayDailyLoginInfo(ActivityID);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyLogin控制台: 用法 - DailyLogin.ShowInfo ActivityID"));
+			}
+		}),
+		ECVF_Default
+	);
+}
+
+void UDailyLoginSaveModifier::UnregisterConsoleCommands()
+{
+	if (!GEngine)
+	{
+		return;
+	}
+
+	// 注销控制台命令
+	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.SetProgress"));
+	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.SetDayClaimed"));
+	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.Reset"));
+	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.ShowInfo"));
 }

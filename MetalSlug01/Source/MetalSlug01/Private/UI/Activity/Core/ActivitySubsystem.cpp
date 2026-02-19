@@ -33,6 +33,8 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// ================= 初始化动态存档修改器 =================
 	SaveModifier = NewObject<UDailyLoginSaveModifier>(this);
 	SaveModifier->InitializeModifier(this);
+	// 注册控制台命令
+	SaveModifier->RegisterConsoleCommands();
 	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态存档修改器初始化完成"));
 }
 
