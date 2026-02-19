@@ -358,8 +358,8 @@ UButton* UDailyUpgradeRewardPage::CreateDayButton(int32 DayIndex)
 	// DayButton->SetText(FText::FromString(ButtonText)); // 需要获取按钮的文本块
 
 	// 直接在按钮创建时就设置好对应的天数索引
-	// 使用按钮的用户数据来存储天数信息
-	DayButton->SetUserData(TSharedPtr<int32>(new int32(DayIndex)));
+	// 使用按钮的名称来存储天数信息
+	DayButton->Rename(*FString::Printf(TEXT("DayButton_%d"), DayIndex));
 
 	// 绑定点击事件到同一个处理函数
 	DayButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::HandleDayButtonClicked);
