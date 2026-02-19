@@ -354,8 +354,8 @@ UButton* UDailyUpgradeRewardPage::CreateDayButton(int32 DayIndex)
 	FString ButtonText = FString::Printf(TEXT("Day %d"), DayIndex);
 	// DayButton->SetText(FText::FromString(ButtonText)); // 需要获取按钮的文本块
 
-	// 绑定点击事件
-	DayButton->OnClicked.AddDynamic(this, [this, DayIndex]()
+	// 使用Lambda绑定点击事件
+	DayButton->OnClicked.AddLambda([this, DayIndex]()
 	{
 		OnDayButtonClicked(DayIndex);
 	});
