@@ -9,6 +9,7 @@
 #include "UI/Activity/Core/RedDotManager.h"
 #include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
+#include "Tools/UniversalDataTableModifier.h"
 #include "ActivitySubsystem.generated.h"
 
 class UDailyLoginTrack;
@@ -95,6 +96,57 @@ public:
 	TArray<const FTreasureBoxItemRow*> GetTreasureBoxItemsByBoxID(int32 BoxID) const;
 
 public:
+	// ==================== 动态表修改器接口 ====================
+
+	/**
+	 * @brief 获取动态表修改器实例
+	 * @return 修改器实例
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	UUniversalDataTableModifier* GetDataTableModifier() const;
+
+	/**
+	 * @brief 初始化动态表修改器
+	 * @param WorldContext 世界上下文
+	 * @return 是否初始化成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	bool InitializeDataTableModifier(UObject* WorldContext);
+
+	/**
+	 * @brief 获取修改后的每日登录配置
+	 * @param ActivityID 活动ID
+	 * @return 配置数组
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	TArray<FDailyLoginConfigRow*> GetModifiedDailyLoginConfigs(int32 ActivityID) const;
+
+	/**
+	 * @brief 获取修改后的指定天数奖励
+	 * @param ActivityID 活动ID
+	 * @param Day 天数
+	 * @return 奖励配置数组
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	TArray<FDailyLoginConfigRow*> GetModifiedRewardsByDay(int32 ActivityID, int32 Day) const;
+
+	/**
+	 * @brief 获取修改后的物品详情
+	 * @param ItemID 物品ID
+	 * @return 物品详情
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	const FItemDetailRow* GetModifiedItemDetail(int32 ItemID) const;
+
+	/**
+	 * @brief 获取修改后的宝箱物品
+	 * @param BoxID 宝箱ID
+	 * @return 宝箱物品
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DataTable Modifier")
+	const FTreasureBoxItemRow* GetModifiedTreasureBoxItem(int32 BoxID) const;
+
+public:
 	// ================= 事件 =================
 	
 	/** 活动数据变更事件 */
@@ -126,6 +178,12 @@ private:
 		
 	UPROPERTY()
 	UDailyLoginSaveGame* CachedSaveGame = nullptr;
+
+	// ================= 动态表修改器 =================
+	
+	/** 动态表修改器实例 */
+	UPROPERTY()
+	UUniversalDataTableModifier* DataTableModifier = nullptr;
 };
 
 

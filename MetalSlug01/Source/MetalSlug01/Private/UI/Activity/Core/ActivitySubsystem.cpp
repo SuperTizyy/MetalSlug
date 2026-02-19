@@ -4,6 +4,7 @@
 #include "UI/Activity/Core/RedDotManager.h"
 #include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
+#include "Tools/UniversalDataTableModifier.h"
 #include "Kismet/GameplayStatics.h"
 
 void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -28,6 +29,17 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	RedDotManager = NewObject<URedDotManager>(this);
 	ActivityPageManager = NewObject<UActivityPageManager>(this);
 	ActivityTimeManager = NewObject<UActivityTimeManager>(this);
+
+	// ================= 初始化动态表修改器 =================
+	DataTableModifier = NewObject<UUniversalDataTableModifier>(this);
+	FDataTableModificationConfig Config;
+	Config.bEnablePersistentModification = true;
+	Config.bAutoSaveChanges = true;
+	Config.AutoSaveInterval = 30.0f; // 30秒自动保存一次
+	Config.MaxHistoryRecords = 100;
+	Config.bEnableTransactionSupport = true;
+	DataTableModifier->InitializeModifier(Config, this);
+	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态表修改器初始化完成"));
 }
 
 void UActivitySubsystem::Deinitialize()
@@ -38,6 +50,15 @@ void UActivitySubsystem::Deinitialize()
 	RedDotManager = nullptr;
 	ActivityPageManager = nullptr;
 	ActivityTimeManager = nullptr;
+	
+	// 清理动态表修改器
+	if (DataTableModifier)
+	{
+		DataTableModifier->DestroyModifier();
+		DataTableModifier = nullptr;
+	}
+
+	CachedSaveGame = nullptr;
 
 	Super::Deinitialize();
 }
@@ -491,4 +512,132 @@ TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxI
 	}
 	
 	return Result;
+}
+
+// ==================== 动态表修改器接口实现 ====================
+
+UUniversalDataTableModifier* UActivitySubsystem::GetDataTableModifier() const
+{
+	return DataTableModifier;
+}
+
+bool UActivitySubsystem::InitializeDataTableModifier(UObject* WorldContext)
+{
+	if (!DataTableModifier)
+	{
+		DataTableModifier = NewObject<UUniversalDataTableModifier>(this);
+	}
+
+	FDataTableModificationConfig Config;
+	Config.bEnablePersistentModification = true;
+	Config.bAutoSaveChanges = true;
+	Config.AutoSaveInterval = 30.0f;
+	Config.MaxHistoryRecords = 100;
+	Config.bEnableTransactionSupport = true;
+
+	bool bSuccess = DataTableModifier->InitializeModifier(Config, WorldContext);
+	if (bSuccess)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态表修改器初始化成功"));
+		// 加载已保存的修改
+		DataTableModifier->LoadSavedModifications();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 动态表修改器初始化失败"));
+	}
+
+	return bSuccess;
+}
+
+TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetModifiedDailyLoginConfigs(int32 ActivityID) const
+{
+	TArray<FDailyLoginConfigRow*> Result;
+	
+	// 先尝试从修改器获取修改后的数据
+	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow")))
+	{
+		TArray<uint8*> ModifiedRows;
+		if (DataTableModifier->GetAllModifiedRows(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow"), ModifiedRows))
+		{
+			for (uint8* RowData : ModifiedRows)
+			{
+				FDailyLoginConfigRow* Row = reinterpret_cast<FDailyLoginConfigRow*>(RowData);
+				if (Row && Row->ActivityID == ActivityID)
+				{
+					Result.Add(Row);
+				}
+			}
+		}
+	}
+	
+	// 如果没有修改或者修改器不可用，则使用原始数据
+	if (Result.Num() == 0)
+	{
+		return GetDailyLoginConfigs(ActivityID);
+	}
+	
+	return Result;
+}
+
+TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetModifiedRewardsByDay(int32 ActivityID, int32 Day) const
+{
+	TArray<FDailyLoginConfigRow*> Result;
+	
+	// 先尝试从修改器获取修改后的数据
+	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow")))
+	{
+		TArray<uint8*> ModifiedRows;
+		if (DataTableModifier->GetAllModifiedRows(TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow"), ModifiedRows))
+		{
+			for (uint8* RowData : ModifiedRows)
+			{
+				FDailyLoginConfigRow* Row = reinterpret_cast<FDailyLoginConfigRow*>(RowData);
+				if (Row && Row->ActivityID == ActivityID && Row->DayIndex == Day)
+				{
+					Result.Add(Row);
+				}
+			}
+		}
+	}
+	
+	// 如果没有修改或者修改器不可用，则使用原始数据
+	if (Result.Num() == 0)
+	{
+		return GetRewardsByDay(ActivityID, Day);
+	}
+	
+	return Result;
+}
+
+const FItemDetailRow* UActivitySubsystem::GetModifiedItemDetail(int32 ItemID) const
+{
+	// 先尝试从修改器获取修改后的数据
+	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow")))
+	{
+		uint8* ModifiedRow = DataTableModifier->GetModifiedRow(TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow"), FName(*FString::FromInt(ItemID)));
+		if (ModifiedRow)
+		{
+			return reinterpret_cast<const FItemDetailRow*>(ModifiedRow);
+		}
+	}
+	
+	// 如果没有修改或者修改器不可用，则使用原始数据
+	return GetItemDetail(ItemID);
+}
+
+const FTreasureBoxItemRow* UActivitySubsystem::GetModifiedTreasureBoxItem(int32 BoxID) const
+{
+	// 先尝试从修改器获取修改后的数据
+	if (DataTableModifier && DataTableModifier->IsTableModified(TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow")))
+	{
+		uint8* ModifiedRow = DataTableModifier->GetModifiedRow(TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow"), FName(*FString::FromInt(BoxID)));
+		if (ModifiedRow)
+		{
+			return reinterpret_cast<const FTreasureBoxItemRow*>(ModifiedRow);
+		}
+	}
+	
+	// 如果没有修改或者修改器不可用，则使用原始数据
+	return GetTreasureBoxItem(BoxID);
 }
