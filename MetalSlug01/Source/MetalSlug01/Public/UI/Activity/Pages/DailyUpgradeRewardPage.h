@@ -160,7 +160,7 @@ protected:
 	 * @param DayIndex 天数索引
 	 */
 	UFUNCTION()
-	void HandleDayButtonClicked(int32 DayIndex);
+	void HandleDayButtonClicked();
 
 	/**
 	 * @brief 处理任务完成状态变化

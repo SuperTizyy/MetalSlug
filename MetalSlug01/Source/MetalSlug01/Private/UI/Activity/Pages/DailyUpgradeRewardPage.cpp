@@ -305,16 +305,10 @@ void UDailyUpgradeRewardPage::OnReselectRewardClicked()
 	}
 }
 
-void UDailyUpgradeRewardPage::HandleDayButtonClicked(int32 UnusedParameter)
+void UDailyUpgradeRewardPage::HandleDayButtonClicked()
 {
-	// 从调用栈获取发送按钮（这种方法在UE中不可靠）
-	// 改为使用更简单的方法：通过按钮容器的子元素索引来确定天数
-	
-	// 简单起见，我们假设按钮按顺序添加，索引+1就是天数
-	// 在实际项目中，可以通过其他方式传递天数信息
-	
-	// 这里我们使用一个全局变量来跟踪当前点击的是哪个按钮
-	// 或者重新设计UI结构
+	// 由于UButton的点击事件不传递参数，我们需要通过其他方式获取天数
+	// 这里使用简单的索引方式作为示例
 	
 	UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 按钮点击事件触发"));
 	
@@ -364,8 +358,8 @@ UButton* UDailyUpgradeRewardPage::CreateDayButton(int32 DayIndex)
 	// DayButton->SetText(FText::FromString(ButtonText)); // 需要获取按钮的文本块
 
 	// 直接在按钮创建时就设置好对应的天数索引
-	// 使用按钮的Tag来存储天数信息
-	DayButton->SetTag(FName(*FString::Printf(TEXT("Day_%d"), DayIndex)));
+	// 使用按钮的用户数据来存储天数信息
+	DayButton->SetUserData(TSharedPtr<int32>(new int32(DayIndex)));
 
 	// 绑定点击事件到同一个处理函数
 	DayButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::HandleDayButtonClicked);
