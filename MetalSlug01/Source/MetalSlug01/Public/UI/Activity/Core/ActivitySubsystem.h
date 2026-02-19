@@ -9,7 +9,7 @@
 #include "UI/Activity/Core/RedDotManager.h"
 #include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
-#include "Tools/UniversalDataTableModifier.h"
+#include "Tools/DailyLoginSaveModifier.h"
 #include "ActivitySubsystem.generated.h"
 
 class UDailyLoginTrack;
@@ -94,6 +94,64 @@ public:
 
 	/** 根据宝箱ID获取所有匹配的宝箱物品记录 */
 	TArray<const FTreasureBoxItemRow*> GetTreasureBoxItemsByBoxID(int32 BoxID) const;
+
+public:
+	// ==================== 动态存档修改器接口 ====================
+
+	/**
+	 * @brief 获取每日登录存档修改器实例
+	 * @return 修改器实例
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	UDailyLoginSaveModifier* GetSaveModifier() const;
+
+	/**
+	 * @brief 初始化存档修改器
+	 * @param WorldContext 世界上下文
+	 * @return 是否初始化成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	bool InitializeSaveModifier(UObject* WorldContext);
+
+	/**
+	 * @brief 修改玩家进度
+	 * @param ActivityID 活动ID
+	 * @param NewProgress 新进度
+	 * @param bAutoSave 是否自动保存
+	 * @return 是否修改成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	bool ModifyPlayerProgress(int32 ActivityID, int32 NewProgress, bool bAutoSave = true);
+
+	/**
+	 * @brief 修改天数领取状态
+	 * @param ActivityID 活动ID
+	 * @param DayIndex 天数索引
+	 * @param bClaimed 是否已领取
+	 * @param bAutoSave 是否自动保存
+	 * @return 是否修改成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	bool ModifyDayClaimedStatus(int32 ActivityID, int32 DayIndex, bool bClaimed, bool bAutoSave = true);
+
+	/**
+	 * @brief 批量修改已领取天数
+	 * @param ActivityID 活动ID
+	 * @param ClaimedDays 已领取天数数组
+	 * @param bAutoSave 是否自动保存
+	 * @return 是否修改成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	bool ModifyClaimedDays(int32 ActivityID, const TArray<int32>& ClaimedDays, bool bAutoSave = true);
+
+	/**
+	 * @brief 重置玩家记录
+	 * @param ActivityID 活动ID
+	 * @param bAutoSave 是否自动保存
+	 * @return 是否重置成功
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
+	bool ResetPlayerRecord(int32 ActivityID, bool bAutoSave = true);
 
 public:
 	// ==================== 动态表修改器接口 ====================
@@ -184,6 +242,12 @@ private:
 	/** 动态表修改器实例 */
 	UPROPERTY()
 	UUniversalDataTableModifier* DataTableModifier = nullptr;
+
+	// ================= 动态存档修改器 =================
+	
+	/** 每日登录存档修改器实例 */
+	UPROPERTY()
+	UDailyLoginSaveModifier* SaveModifier = nullptr;
 };
 
 

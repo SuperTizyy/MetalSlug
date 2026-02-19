@@ -1,0 +1,557 @@
+/**
+ * @file DailyLoginSaveModifier.cpp
+ * @brief 每日登录存档动态修改器实现
+ * @author AI Assistant
+ * @date 2026
+ * @version 1.0
+ * 
+ * @details 实现每日登录存档动态修改器的核心功能
+ */
+
+#include "Tools/DailyLoginSaveModifier.h"
+#include "Engine/World.h"
+
+// ==================== 结构体实现 ====================
+
+FDailyLoginModificationRecord::FDailyLoginModificationRecord()
+	: ActivityID(0), ModificationTime(FDateTime::Now()), bIsSaved(false)
+{
+	ModificationId = FGuid::NewGuid();
+}
+
+// ==================== 主类实现 ====================
+
+UDailyLoginSaveModifier::UDailyLoginSaveModifier()
+	: CachedSaveGame(nullptr), bIsInitialized(false)
+{
+}
+
+bool UDailyLoginSaveModifier::InitializeModifier(UObject* WorldContext)
+{
+	if (!WorldContext)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: WorldContext为空"));
+		return false;
+	}
+
+	WorldContextObject = WorldContext;
+	bIsInitialized = true;
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 初始化成功"));
+	return true;
+}
+
+void UDailyLoginSaveModifier::DestroyModifier()
+{
+	if (!bIsInitialized)
+	{
+		return;
+	}
+
+	// 保存所有未保存的修改
+	SaveAllRecords();
+
+	// 清理资源
+	CachedSaveGame = nullptr;
+	WorldContextObject.Reset();
+	bIsInitialized = false;
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 已销毁"));
+}
+
+bool UDailyLoginSaveModifier::ModifyPlayerProgress(int32 ActivityID, int32 NewProgress, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
+		return false;
+	}
+
+	// 获取原始记录
+	FPlayerLoginRecord& Record = SaveGame->ActivityRecords.FindOrAdd(ActivityID);
+	int32 OriginalProgress = Record.Progress;
+
+	// 记录修改
+	AddModificationRecord(ActivityID, TEXT("Progress"), 
+		FString::FromInt(OriginalProgress), FString::FromInt(NewProgress));
+
+	// 执行修改
+	Record.Progress = NewProgress;
+	Record.LastUpdateTime = FDateTime::Now();
+
+	// 自动保存
+	if (bAutoSave)
+	{
+		return SaveActivityRecord(ActivityID);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 修改玩家进度成功 - ActivityID=%d, 原进度=%d, 新进度=%d"), 
+		ActivityID, OriginalProgress, NewProgress);
+
+	return true;
+}
+
+bool UDailyLoginSaveModifier::ModifyDayClaimedStatus(int32 ActivityID, int32 DayIndex, bool bClaimed, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
+		return false;
+	}
+
+	if (DayIndex <= 0 || DayIndex > 32)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 天数索引无效: %d"), DayIndex);
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
+		return false;
+	}
+
+	// 获取原始记录
+	FPlayerLoginRecord& Record = SaveGame->ActivityRecords.FindOrAdd(ActivityID);
+	bool bWasClaimed = Record.IsDayClaimed(DayIndex);
+
+	// 记录修改
+	AddModificationRecord(ActivityID, FString::Printf(TEXT("Day%d_Claimed"), DayIndex),
+		bWasClaimed ? TEXT("true") : TEXT("false"),
+		bClaimed ? TEXT("true") : TEXT("false"));
+
+	// 执行修改
+	Record.SetDayClaimed(DayIndex, bClaimed);
+	
+	// 更新ClaimedDays数组
+	if (bClaimed)
+	{
+		if (!Record.ClaimedDays.Contains(DayIndex))
+		{
+			Record.ClaimedDays.Add(DayIndex);
+		}
+	}
+	else
+	{
+		Record.ClaimedDays.Remove(DayIndex);
+	}
+
+	// 更新领取次数
+	if (bClaimed && !bWasClaimed)
+	{
+		Record.CurrentClaimCount++;
+	}
+	else if (!bClaimed && bWasClaimed)
+	{
+		Record.CurrentClaimCount = FMath::Max(0, Record.CurrentClaimCount - 1);
+	}
+
+	Record.LastUpdateTime = FDateTime::Now();
+
+	// 自动保存
+	if (bAutoSave)
+	{
+		return SaveActivityRecord(ActivityID);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 修改天数领取状态成功 - ActivityID=%d, Day=%d, 原状态=%s, 新状态=%s"), 
+		ActivityID, DayIndex, bWasClaimed ? TEXT("已领取") : TEXT("未领取"), bClaimed ? TEXT("已领取") : TEXT("未领取"));
+
+	return true;
+}
+
+bool UDailyLoginSaveModifier::ModifyClaimedDays(int32 ActivityID, const TArray<int32>& ClaimedDays, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
+		return false;
+	}
+
+	// 获取原始记录
+	FPlayerLoginRecord& Record = SaveGame->ActivityRecords.FindOrAdd(ActivityID);
+	TArray<int32> OriginalClaimedDays = Record.ClaimedDays;
+
+	// 记录修改
+	FString OriginalDaysStr, NewDaysStr;
+	for (int32 Day : OriginalClaimedDays)
+	{
+		OriginalDaysStr += FString::Printf(TEXT("%d,"), Day);
+	}
+	for (int32 Day : ClaimedDays)
+	{
+		NewDaysStr += FString::Printf(TEXT("%d,"), Day);
+	}
+
+	AddModificationRecord(ActivityID, TEXT("ClaimedDays"), OriginalDaysStr, NewDaysStr);
+
+	// 执行修改
+	Record.ClaimedDays = ClaimedDays;
+	Record.ClaimedHistoryMask = 0;
+	Record.CurrentClaimCount = ClaimedDays.Num();
+
+	// 更新掩码
+	for (int32 Day : ClaimedDays)
+	{
+		if (Day > 0 && Day <= 32)
+		{
+			Record.SetDayClaimed(Day, true);
+		}
+	}
+
+	Record.LastUpdateTime = FDateTime::Now();
+
+	// 自动保存
+	if (bAutoSave)
+	{
+		return SaveActivityRecord(ActivityID);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 批量修改已领取天数成功 - ActivityID=%d, 原天数=%d个, 新天数=%d个"), 
+		ActivityID, OriginalClaimedDays.Num(), ClaimedDays.Num());
+
+	return true;
+}
+
+bool UDailyLoginSaveModifier::ModifyCurrentClaimCount(int32 ActivityID, int32 NewCount, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
+		return false;
+	}
+
+	// 获取原始记录
+	FPlayerLoginRecord& Record = SaveGame->ActivityRecords.FindOrAdd(ActivityID);
+	int32 OriginalCount = Record.CurrentClaimCount;
+
+	// 记录修改
+	AddModificationRecord(ActivityID, TEXT("CurrentClaimCount"), 
+		FString::FromInt(OriginalCount), FString::FromInt(NewCount));
+
+	// 执行修改
+	Record.CurrentClaimCount = NewCount;
+	Record.LastUpdateTime = FDateTime::Now();
+
+	// 自动保存
+	if (bAutoSave)
+	{
+		return SaveActivityRecord(ActivityID);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 修改当前领取次数成功 - ActivityID=%d, 原次数=%d, 新次数=%d"), 
+		ActivityID, OriginalCount, NewCount);
+
+	return true;
+}
+
+bool UDailyLoginSaveModifier::ResetPlayerRecord(int32 ActivityID, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
+		return false;
+	}
+
+	// 记录修改
+	AddModificationRecord(ActivityID, TEXT("Reset"), TEXT("PlayerRecord"), TEXT("Reset"));
+
+	// 执行重置
+	FPlayerLoginRecord NewRecord;
+	NewRecord.ActivityID = ActivityID;
+	NewRecord.PlayerID = TEXT("Player1");
+	NewRecord.Progress = 1;  // 重置为第一天可领取
+	NewRecord.CurrentClaimCount = 0;
+	NewRecord.ClaimedHistoryMask = 0;
+	NewRecord.LastClaimTimestamp = 0;
+	NewRecord.LastUpdateTime = FDateTime::Now();
+
+	SaveGame->ActivityRecords.Add(ActivityID, NewRecord);
+
+	// 自动保存
+	if (bAutoSave)
+	{
+		return SaveActivityRecord(ActivityID);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 重置玩家记录成功 - ActivityID=%d"), ActivityID);
+
+	return true;
+}
+
+// ==================== 查询接口实现 ====================
+
+int32 UDailyLoginSaveModifier::GetPlayerProgress(int32 ActivityID) const
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		return 0;
+	}
+
+	const FPlayerLoginRecord* Record = CachedSaveGame->ActivityRecords.Find(ActivityID);
+	if (Record)
+	{
+		return Record->Progress;
+	}
+
+	return 0;
+}
+
+TArray<int32> UDailyLoginSaveModifier::GetClaimedDays(int32 ActivityID) const
+{
+	TArray<int32> Result;
+
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		return Result;
+	}
+
+	const FPlayerLoginRecord* Record = CachedSaveGame->ActivityRecords.Find(ActivityID);
+	if (Record)
+	{
+		Result = Record->ClaimedDays;
+	}
+
+	return Result;
+}
+
+bool UDailyLoginSaveModifier::IsDayClaimed(int32 ActivityID, int32 DayIndex) const
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		return false;
+	}
+
+	const FPlayerLoginRecord* Record = CachedSaveGame->ActivityRecords.Find(ActivityID);
+	if (Record)
+	{
+		return Record->IsDayClaimed(DayIndex);
+	}
+
+	return false;
+}
+
+int32 UDailyLoginSaveModifier::GetCurrentClaimCount(int32 ActivityID) const
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		return 0;
+	}
+
+	const FPlayerLoginRecord* Record = CachedSaveGame->ActivityRecords.Find(ActivityID);
+	if (Record)
+	{
+		return Record->CurrentClaimCount;
+	}
+
+	return 0;
+}
+
+// ==================== 历史记录接口实现 ====================
+
+TArray<FDailyLoginModificationRecord> UDailyLoginSaveModifier::GetModificationHistory(int32 MaxRecords) const
+{
+	TArray<FDailyLoginModificationRecord> Result;
+
+	int32 StartIndex = FMath::Max(0, ModificationHistory.Num() - MaxRecords);
+	for (int32 i = StartIndex; i < ModificationHistory.Num(); ++i)
+	{
+		Result.Add(ModificationHistory[i]);
+	}
+
+	return Result;
+}
+
+void UDailyLoginSaveModifier::ClearModificationHistory()
+{
+	ModificationHistory.Empty();
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 已清除修改历史记录"));
+}
+
+// ==================== 保存接口实现 ====================
+
+bool UDailyLoginSaveModifier::SaveActivityRecord(int32 ActivityID)
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法保存，存档实例无效"));
+		return false;
+	}
+
+	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	bool bSuccess = UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
+
+	if (bSuccess)
+	{
+		// 标记相关修改记录为已保存
+		for (FDailyLoginModificationRecord& Record : ModificationHistory)
+		{
+			if (Record.ActivityID == ActivityID)
+			{
+				Record.bIsSaved = true;
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 成功保存ActivityID=%d的记录"), ActivityID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 保存ActivityID=%d的记录失败"), ActivityID);
+	}
+
+	return bSuccess;
+}
+
+bool UDailyLoginSaveModifier::SaveAllRecords()
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		return false;
+	}
+
+	bool bAllSuccess = true;
+
+	// 保存所有活动记录
+	for (const auto& Pair : CachedSaveGame->ActivityRecords)
+	{
+		int32 ActivityID = Pair.Key;
+		if (!SaveActivityRecord(ActivityID))
+		{
+			bAllSuccess = false;
+		}
+	}
+
+	if (bAllSuccess)
+	{
+		UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 成功保存所有记录"));
+	}
+
+	return bAllSuccess;
+}
+
+bool UDailyLoginSaveModifier::LoadActivityRecord(int32 ActivityID)
+{
+	if (!bIsInitialized)
+	{
+		return false;
+	}
+
+	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
+	);
+
+	if (LoadedSaveGame)
+	{
+		CachedSaveGame = LoadedSaveGame;
+		UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 成功加载ActivityID=%d的记录"), ActivityID);
+		return true;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyLoginSaveModifier: 未找到ActivityID=%d的记录，将创建新记录"), ActivityID);
+		CachedSaveGame = GetOrCreateSaveGame(ActivityID);
+		return CachedSaveGame != nullptr;
+	}
+}
+
+// ==================== 内部方法实现 ====================
+
+UDailyLoginSaveGame* UDailyLoginSaveModifier::GetOrCreateSaveGame(int32 ActivityID)
+{
+	if (CachedSaveGame)
+	{
+		return CachedSaveGame;
+	}
+
+	// 尝试加载现有存档
+	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
+	);
+
+	if (!LoadedSaveGame)
+	{
+		// 创建新的存档
+		LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+			UGameplayStatics::CreateSaveGameObject(UDailyLoginSaveGame::StaticClass())
+		);
+
+		if (LoadedSaveGame)
+		{
+			// 初始化默认记录
+			FPlayerLoginRecord NewRecord;
+			NewRecord.ActivityID = ActivityID;
+			NewRecord.PlayerID = TEXT("Player1");
+			NewRecord.Progress = 1;  // 默认第一天可领取
+			NewRecord.CurrentClaimCount = 0;
+			NewRecord.ClaimedHistoryMask = 0;
+			NewRecord.LastClaimTimestamp = 0;
+			NewRecord.LastUpdateTime = FDateTime::Now();
+
+			LoadedSaveGame->ActivityRecords.Add(ActivityID, NewRecord);
+
+			// 保存新创建的记录
+			UGameplayStatics::SaveGameToSlot(LoadedSaveGame, SaveSlotName, 0);
+			UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 创建并保存新的存档实例 for ActivityID=%d"), ActivityID);
+		}
+	}
+
+	CachedSaveGame = LoadedSaveGame;
+	return LoadedSaveGame;
+}
+
+void UDailyLoginSaveModifier::AddModificationRecord(int32 ActivityID, const FString& FieldName, const FString& OriginalValue, const FString& ModifiedValue)
+{
+	FDailyLoginModificationRecord Record;
+	Record.ActivityID = ActivityID;
+	Record.FieldName = FieldName;
+	Record.OriginalValue = OriginalValue;
+	Record.ModifiedValue = ModifiedValue;
+	Record.ModificationTime = FDateTime::Now();
+	Record.bIsSaved = false;
+
+	ModificationHistory.Add(Record);
+	CleanupOldHistory();
+
+	UE_LOG(LogTemp, Verbose, TEXT("DailyLoginSaveModifier: 添加修改记录 - ActivityID=%d, Field=%s, %s -> %s"), 
+		ActivityID, *FieldName, *OriginalValue, *ModifiedValue);
+}
+
+void UDailyLoginSaveModifier::CleanupOldHistory()
+{
+	const int32 MaxHistoryRecords = 100;
+	if (ModificationHistory.Num() > MaxHistoryRecords)
+	{
+		ModificationHistory.RemoveAt(0, ModificationHistory.Num() - MaxHistoryRecords);
+	}
+}

@@ -4,7 +4,7 @@
 #include "UI/Activity/Core/RedDotManager.h"
 #include "UI/Activity/Core/ActivityPageManager.h"
 #include "UI/Activity/Core/ActivityTimeManager.h"
-#include "Tools/UniversalDataTableModifier.h"
+#include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
 
 void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -30,16 +30,10 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	ActivityPageManager = NewObject<UActivityPageManager>(this);
 	ActivityTimeManager = NewObject<UActivityTimeManager>(this);
 
-	// ================= 初始化动态表修改器 =================
-	DataTableModifier = NewObject<UUniversalDataTableModifier>(this);
-	FDataTableModificationConfig Config;
-	Config.bEnablePersistentModification = true;
-	Config.bAutoSaveChanges = true;
-	Config.AutoSaveInterval = 30.0f; // 30秒自动保存一次
-	Config.MaxHistoryRecords = 100;
-	Config.bEnableTransactionSupport = true;
-	DataTableModifier->InitializeModifier(Config, this);
-	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态表修改器初始化完成"));
+	// ================= 初始化动态存档修改器 =================
+	SaveModifier = NewObject<UDailyLoginSaveModifier>(this);
+	SaveModifier->InitializeModifier(this);
+	UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态存档修改器初始化完成"));
 }
 
 void UActivitySubsystem::Deinitialize()
@@ -56,6 +50,13 @@ void UActivitySubsystem::Deinitialize()
 	{
 		DataTableModifier->DestroyModifier();
 		DataTableModifier = nullptr;
+	}
+
+	// 清理动态存档修改器
+	if (SaveModifier)
+	{
+		SaveModifier->DestroyModifier();
+		SaveModifier = nullptr;
 	}
 
 	CachedSaveGame = nullptr;
@@ -640,4 +641,125 @@ const FTreasureBoxItemRow* UActivitySubsystem::GetModifiedTreasureBoxItem(int32 
 	
 	// 如果没有修改或者修改器不可用，则使用原始数据
 	return GetTreasureBoxItem(BoxID);
+}
+
+// ==================== 动态存档修改器接口实现 ====================
+
+UDailyLoginSaveModifier* UActivitySubsystem::GetSaveModifier() const
+{
+	return SaveModifier;
+}
+
+bool UActivitySubsystem::InitializeSaveModifier(UObject* WorldContext)
+{
+	if (!SaveModifier)
+	{
+		SaveModifier = NewObject<UDailyLoginSaveModifier>(this);
+	}
+
+	bool bSuccess = SaveModifier->InitializeModifier(WorldContext);
+	if (bSuccess)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 动态存档修改器初始化成功"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 动态存档修改器初始化失败"));
+	}
+
+	return bSuccess;
+}
+
+bool UActivitySubsystem::ModifyPlayerProgress(int32 ActivityID, int32 NewProgress, bool bAutoSave)
+{
+	if (!SaveModifier)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 存档修改器未初始化"));
+		return false;
+	}
+
+	bool bSuccess = SaveModifier->ModifyPlayerProgress(ActivityID, NewProgress, bAutoSave);
+	if (bSuccess)
+	{
+		// 广播数据变更事件
+		OnActivityDataChanged.Broadcast();
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功修改玩家进度 - ActivityID=%d, NewProgress=%d"), ActivityID, NewProgress);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 修改玩家进度失败 - ActivityID=%d"), ActivityID);
+	}
+
+	return bSuccess;
+}
+
+bool UActivitySubsystem::ModifyDayClaimedStatus(int32 ActivityID, int32 DayIndex, bool bClaimed, bool bAutoSave)
+{
+	if (!SaveModifier)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 存档修改器未初始化"));
+		return false;
+	}
+
+	bool bSuccess = SaveModifier->ModifyDayClaimedStatus(ActivityID, DayIndex, bClaimed, bAutoSave);
+	if (bSuccess)
+	{
+		// 广播数据变更事件
+		OnActivityDataChanged.Broadcast();
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功修改天数领取状态 - ActivityID=%d, Day=%d, Claimed=%s"), 
+			ActivityID, DayIndex, bClaimed ? TEXT("是") : TEXT("否"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 修改天数领取状态失败 - ActivityID=%d"), ActivityID);
+	}
+
+	return bSuccess;
+}
+
+bool UActivitySubsystem::ModifyClaimedDays(int32 ActivityID, const TArray<int32>& ClaimedDays, bool bAutoSave)
+{
+	if (!SaveModifier)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 存档修改器未初始化"));
+		return false;
+	}
+
+	bool bSuccess = SaveModifier->ModifyClaimedDays(ActivityID, ClaimedDays, bAutoSave);
+	if (bSuccess)
+	{
+		// 广播数据变更事件
+		OnActivityDataChanged.Broadcast();
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功批量修改已领取天数 - ActivityID=%d, DaysCount=%d"), 
+			ActivityID, ClaimedDays.Num());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 批量修改已领取天数失败 - ActivityID=%d"), ActivityID);
+	}
+
+	return bSuccess;
+}
+
+bool UActivitySubsystem::ResetPlayerRecord(int32 ActivityID, bool bAutoSave)
+{
+	if (!SaveModifier)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 存档修改器未初始化"));
+		return false;
+	}
+
+	bool bSuccess = SaveModifier->ResetPlayerRecord(ActivityID, bAutoSave);
+	if (bSuccess)
+	{
+		// 广播数据变更事件
+		OnActivityDataChanged.Broadcast();
+		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功重置玩家记录 - ActivityID=%d"), ActivityID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: 重置玩家记录失败 - ActivityID=%d"), ActivityID);
+	}
+
+	return bSuccess;
 }
