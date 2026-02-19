@@ -662,3 +662,81 @@ void UDailyLoginSaveModifier::UnregisterConsoleCommands()
 	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.Reset"));
 	IConsoleManager::Get().UnregisterConsoleObject(TEXT("DailyLogin.ShowInfo"));
 }
+
+// ==================== 公共接口实现 ====================
+
+bool UDailyLoginSaveModifier::ResetDailyLoginData(int32 ActivityID, bool bAutoSave)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 未初始化"));
+		return false;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		return false;
+	}
+
+	// 保存原始数据用于记录
+	FString OriginalProgress = FString::FromInt(SaveGame->PlayerRecord.CurrentProgress);
+	FString OriginalClaimedDays = "[";
+	for (int32 i = 0; i < SaveGame->PlayerRecord.ClaimedDays.Num(); ++i)
+	{
+		if (i > 0) OriginalClaimedDays += ", ";
+		OriginalClaimedDays += FString::FromInt(SaveGame->PlayerRecord.ClaimedDays[i]);
+	}
+	OriginalClaimedDays += "]";
+
+	// 重置数据
+	SaveGame->PlayerRecord.CurrentProgress = 0;
+	SaveGame->PlayerRecord.ClaimedDays.Empty();
+	SaveGame->PlayerRecord.LastLoginDate = FDateTime();
+
+	// 添加修改记录
+	AddModificationRecord(ActivityID, TEXT("CurrentProgress"), OriginalProgress, TEXT("0"));
+	AddModificationRecord(ActivityID, TEXT("ClaimedDays"), OriginalClaimedDays, TEXT("[]"));
+	AddModificationRecord(ActivityID, TEXT("LastLoginDate"), TEXT(""), TEXT("NULL"));
+
+	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 重置活动%d的数据"), ActivityID);
+
+	if (bAutoSave)
+	{
+		return SaveSingleRecord(ActivityID);
+	}
+
+	return true;
+}
+
+void UDailyLoginSaveModifier::DisplayDailyLoginInfo(int32 ActivityID)
+{
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 未初始化"));
+		return;
+	}
+
+	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	if (!SaveGame)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyLoginSaveModifier: 未找到活动%d的存档数据"), ActivityID);
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("===== 每日登录信息 (ActivityID: %d) ====="), ActivityID);
+	UE_LOG(LogTemp, Log, TEXT("当前进度: %d"), SaveGame->PlayerRecord.CurrentProgress);
+	UE_LOG(LogTemp, Log, TEXT("最后登录时间: %s"), *SaveGame->PlayerRecord.LastLoginDate.ToString());
+	
+	FString ClaimedDaysStr = "[";
+	for (int32 i = 0; i < SaveGame->PlayerRecord.ClaimedDays.Num(); ++i)
+	{
+		if (i > 0) ClaimedDaysStr += ", ";
+		ClaimedDaysStr += FString::FromInt(SaveGame->PlayerRecord.ClaimedDays[i]);
+	}
+	ClaimedDaysStr += "]";
+	UE_LOG(LogTemp, Log, TEXT("已领取天数: %s"), *ClaimedDaysStr);
+	
+	UE_LOG(LogTemp, Log, TEXT("修改历史记录数量: %d"), ModificationHistory.Num());
+	UE_LOG(LogTemp, Log, TEXT("====================================="));
+}
