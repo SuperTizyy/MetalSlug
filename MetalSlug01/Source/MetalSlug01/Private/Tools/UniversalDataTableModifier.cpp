@@ -15,6 +15,7 @@
 #include "HAL/FileManager.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
+#include "JsonObjectConverter.h"
 
 // ==================== 辅助结构体实现 ====================
 
@@ -677,7 +678,21 @@ FString UUniversalDataTableModifier::SerializeStructToJson(const uint8* StructPt
 		return FString();
 	}
 
+	// 使用 UE 提供的通用 JSON 转换器
 	TSharedRef<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
+	
+	if (FJsonObjectConverter::UStructToJsonObject(StructType, StructPtr, JsonObject, 0, 0))
+	{
+		FString OutputString;
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+		FJsonSerializer::Serialize(JsonObject, Writer);
+		return OutputString;
+	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("UniversalDataTableModifier: UStructToJsonObject 失败，回退到手动序列化"));
+	
+	// 回退方案：手动序列化（保持兼容性）
+	TSharedRef<FJsonObject> FallbackObject = MakeShareable(new FJsonObject);
 	
 	for (TFieldIterator<FProperty> PropIt(StructType); PropIt; ++PropIt)
 	{
@@ -692,29 +707,29 @@ FString UUniversalDataTableModifier::SerializeStructToJson(const uint8* StructPt
 		if (FStrProperty* StrProperty = CastField<FStrProperty>(Property))
 		{
 			FString Value = StrProperty->GetPropertyValue_InContainer(StructPtr);
-			JsonObject->SetStringField(PropertyName, Value);
+			FallbackObject->SetStringField(PropertyName, Value);
 		}
 		else if (FIntProperty* IntProperty = CastField<FIntProperty>(Property))
 		{
 			int32 Value = IntProperty->GetPropertyValue_InContainer(StructPtr);
-			JsonObject->SetNumberField(PropertyName, Value);
+			FallbackObject->SetNumberField(PropertyName, Value);
 		}
 		else if (FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property))
 		{
 			float Value = FloatProperty->GetPropertyValue_InContainer(StructPtr);
-			JsonObject->SetNumberField(PropertyName, Value);
+			FallbackObject->SetNumberField(PropertyName, Value);
 		}
 		else if (FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
 		{
 			bool Value = BoolProperty->GetPropertyValue_InContainer(StructPtr);
-			JsonObject->SetBoolField(PropertyName, Value);
+			FallbackObject->SetBoolField(PropertyName, Value);
 		}
 		// 可以继续添加其他属性类型的处理
 	}
 
 	FString OutputString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-	FJsonSerializer::Serialize(JsonObject, Writer);
+	FJsonSerializer::Serialize(FallbackObject, Writer);
 
 	return OutputString;
 }
@@ -726,12 +741,29 @@ bool UUniversalDataTableModifier::DeserializeStructFromJson(const FString& JsonS
 		return false;
 	}
 
+	// 使用 UE 提供的通用 JSON 转换器
 	TSharedPtr<FJsonObject> JsonObject;
 	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
 
-	if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
+	if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
 	{
-		return false;
+		if (FJsonObjectConverter::JsonObjectToUStruct(JsonObject.ToSharedRef(), StructType, StructPtr, 0, 0))
+		{
+			return true;
+		}
+		
+		UE_LOG(LogTemp, Warning, TEXT("UniversalDataTableModifier: JsonObjectToUStruct 失败，回退到手动反序列化"));
+	}
+
+	// 回退方案：手动反序列化（保持兼容性）
+	if (!JsonObject.IsValid())
+	{
+		JsonObject = MakeShareable(new FJsonObject());
+		TSharedRef<TJsonReader<>> FallbackReader = TJsonReaderFactory<>::Create(JsonString);
+		if (!FJsonSerializer::Deserialize(FallbackReader, JsonObject))
+		{
+			return false;
+		}
 	}
 
 	for (TFieldIterator<FProperty> PropIt(StructType); PropIt; ++PropIt)
