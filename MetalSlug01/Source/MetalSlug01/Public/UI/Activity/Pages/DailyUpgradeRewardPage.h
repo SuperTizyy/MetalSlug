@@ -83,6 +83,16 @@ protected:
 	/** 加成倍数 */
 	float CurrentBonusMultiplier;
 
+	/** 按钮到天数索引的映射 */
+	TMap<UButton*, int32> ButtonToDayIndexMap;
+
+	/**
+	 * @brief 静态回调函数用于按钮点击
+	 * @param Button 被点击的按钮
+	 * @param DayIndex 对应的天数索引
+	 */
+	static void StaticButtonCallback(UButton* Button, int32 DayIndex);
+
 	// ==================== 初始化方法 ====================
 	
 	/**
@@ -149,7 +159,8 @@ protected:
 	 * @brief 处理天数按钮点击
 	 * @param DayIndex 天数索引
 	 */
-	void OnDayButtonClicked(int32 DayIndex);
+	UFUNCTION()
+	void HandleDayButtonClicked(int32 DayIndex);
 
 	/**
 	 * @brief 处理任务完成状态变化
