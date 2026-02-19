@@ -91,6 +91,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin Save Modifier")
 	void DestroyModifier();
 
+	/**
+	 * @brief 构造函数
+	 */
+	UDailyLoginSaveModifier();
+
 	// ==================== 数据修改接口 ====================
 
 	/**
