@@ -7,7 +7,7 @@
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Core/ActivityTimeManager.h"
+#include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "ActivitySubsystem.generated.h"
 

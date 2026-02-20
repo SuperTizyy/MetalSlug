@@ -1,6 +1,6 @@
 ﻿#include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Core/ActivityTimeManager.h"
+#include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
 
