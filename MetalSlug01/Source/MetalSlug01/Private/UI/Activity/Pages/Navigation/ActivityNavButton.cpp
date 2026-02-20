@@ -1,4 +1,4 @@
-#include "UI/Activity/Pages/Widgets/ActivityNavButton.h"
+#include "UI/Activity/Pages/Navigation/ActivityNavButton.h"
 #include "Styling/SlateBrush.h"
 
 void UActivityNavButton::NativeConstruct()

@@ -1,5 +1,5 @@
 // RewardOptionCardWidget.cpp
-#include "UI/Activity/Pages/Widgets/RewardOptionCardWidget.h"
+#include "UI/Activity/Pages/SelectMultiplePopup/RewardOptionCardWidget.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
 

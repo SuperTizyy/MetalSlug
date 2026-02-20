@@ -8,7 +8,7 @@
  * @details 实现每日升级奖励活动页面的核心功能
  */
 
-#include "UI/Activity/Pages/DailyUpgradeRewardPage.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
 #include "Components/Button.h"

@@ -1,4 +1,4 @@
-#include "UI/Activity/Pages/Widgets/ActivityNavMenuWidget.h"
+#include "UI/Activity/Pages/Navigation/ActivityNavMenuWidget.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Data/DailyLoginSave.h"

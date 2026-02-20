@@ -11,14 +11,14 @@
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 
-#include "UI/Activity/Pages/DailyLogin/Widgets/DailyLoginDayItemWidget.h"
-#include "UI/Activity/Pages/DailyLogin/Widgets/RewardOptionWidget.h"
-#include "UI/Activity/Pages/DailyLogin/DailyLoginCheatWidget.h"
-#include "UI/Activity/Pages/Widgets/ActivityConfirmPopupWidget.h"  // 添加这个头文件
-#include "UI/Activity/Pages/Widgets/RewardOptionCardWidget.h"
+#include "UI/Activity/Pages/DailyLogin/DailyLoginDayItemWidget.h"
+#include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
+#include "UI/Activity/Pages/DemoWidget/DailyLoginCheatWidget.h"
+#include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"  // 添加这个头文件
+#include "UI/Activity/Pages/SelectMultiplePopup/RewardOptionCardWidget.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
-#include "UI/Activity/Pages/DailyLogin/Widgets/ClaimSuccessWidget.h"
+#include "UI/Activity/Pages/ClaimSuccess/ClaimSuccessWidget.h"
 // 移除重复的导航菜单包含，保持原有功能
 
 void UDailyLoginPage::NativeConstruct()

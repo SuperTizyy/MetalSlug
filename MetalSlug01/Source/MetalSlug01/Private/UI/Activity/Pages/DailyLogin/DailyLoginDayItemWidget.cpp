@@ -1,4 +1,4 @@
-#include "UI/Activity/Pages/DailyLogin/Widgets/DailyLoginDayItemWidget.h"
+#include "UI/Activity/Pages/DailyLogin/DailyLoginDayItemWidget.h"
 #include "Components/TextBlock.h"
 #include "Components/Button.h"
 #include "Components/Image.h"

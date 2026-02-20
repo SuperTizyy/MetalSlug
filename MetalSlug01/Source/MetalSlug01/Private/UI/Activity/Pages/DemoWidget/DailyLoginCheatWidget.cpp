@@ -1,4 +1,4 @@
-﻿#include "UI/Activity/Pages/DailyLogin/DailyLoginCheatWidget.h"
+﻿#include "UI/Activity/Pages/DemoWidget/DailyLoginCheatWidget.h"
 
 #include "Components/EditableText.h"
 #include "Components/Button.h"
