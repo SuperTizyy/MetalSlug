@@ -95,6 +95,19 @@ enum class ELoginRewardType : uint8
 	Box         UMETA(DisplayName = "礼包/宝箱")     // 礼包或宝箱类型奖励
 };
 
+/**
+ * @brief 游戏模式枚举
+ * @details 用于每日升级奖励活动中的游戏模式分类
+ * @note 包含团队竞技、个人竞技、枪王排位三种模式
+ */
+UENUM(BlueprintType)
+enum class EGameModeType : uint8
+{
+	TeamCombat     UMETA(DisplayName = "团队竞技"),     // 团队竞技模式
+	SoloCombat     UMETA(DisplayName = "个人竞技"),     // 个人竞技模式
+	GunKingRank    UMETA(DisplayName = "枪王排位")      // 枪王排位模式
+};
+
 
 
 /**
@@ -507,6 +520,84 @@ public:
 	{};
 };
 
+// ==================== 每日升级奖励活动表 ====================
+
+/**
+ * @brief 每日升级奖励活动表结构
+ * @details 用于定义每日升级奖励活动的详细配置信息
+ * @note 包含活动基本信息、任务配置、奖励配置和限时加成等完整信息
+ */
+USTRUCT(BlueprintType)
+struct FDailyUpgradeRewardConfigRow : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// ==================== 基础活动信息 ====================
+	
+	/** 活动唯一标识符 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Basic")
+	int32 ActivityID;
+
+	/** 天数标识（day1-day7） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Basic")
+	FString DayIdentifier;
+
+	// ==================== 任务配置 ====================
+	
+	/** 任务描述数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
+	TArray<FString> TaskDescriptions;
+
+	/** 游戏模式数组（枚举值） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
+	TArray<EGameModeType> GameModes;
+
+	/** 游玩次数数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
+	TArray<int32> PlayCounts;
+
+	// ==================== 奖励配置 ====================
+	
+	/** 奖励物品ID数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Reward")
+	TArray<int32> RewardItemIDs;
+
+	/** 奖励物品数量数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Reward")
+	TArray<int32> RewardItemCounts;
+
+	// ==================== 限时加成配置 ====================
+	
+	/** 限时加成描述 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Bonus")
+	FString BonusDescription;
+
+	/** 限时加成时限（小时） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Bonus")
+	int32 BonusDurationHours;
+
+	/** 限时加成次数 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Bonus")
+	int32 BonusCount;
+
+	/** 限时加成ID数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Bonus")
+	TArray<int32> BonusIDs;
+
+	/**
+	 * @brief 构造函数
+	 * @details 初始化默认每日升级奖励活动配置
+	 */
+	FDailyUpgradeRewardConfigRow() 
+		: ActivityID(0)
+		, DayIdentifier(TEXT("day1"))
+		, BonusDescription(TEXT(""))
+		, BonusDurationHours(0)
+		, BonusCount(0)
+	{};
+};
+
 // ==================== 文件末尾说明 ====================
 
 /**
@@ -516,4 +607,6 @@ public:
  * 已移除冗余的FActivityConfig嵌套结构，使职责更加单一明确
  * 新增FItemDetailRow结构用于统一管理物品详细信息
  * 新增FTreasureBoxItemRow结构用于管理宝箱物品配置
+ * 新增EGameModeType枚举用于游戏模式分类
+ * 新增FDailyUpgradeRewardConfigRow结构用于每日升级奖励活动配置
  */
