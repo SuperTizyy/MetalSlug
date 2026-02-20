@@ -1,4 +1,4 @@
-﻿#include "UI/Activity/Pages/DailyLogin/Widgets/RewardOptionWidget.h"
+﻿#include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Components/Button.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 
