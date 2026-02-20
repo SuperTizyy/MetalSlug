@@ -8,7 +8,7 @@
 -------并未使用！！！！
 */
 
-#include "UI/Activity/Core/ActivityTimeManager.h"
+#include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
 

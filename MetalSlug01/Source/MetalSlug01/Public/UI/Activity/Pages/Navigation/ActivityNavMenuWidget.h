@@ -4,7 +4,7 @@
 #include "Blueprint/UserWidget.h"
 #include "UI/Activity/Data/DailyLoginSave.h"  // 包含整合后的FActivityNavItem
 #include "ActivityNavButton.h"      // 包含新的导航按钮Widget
-#include "ActivityConfirmPopupWidget.h"  // 包含新的确认弹窗Widget
+#include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"  // 包含新的确认弹窗Widget
 #include "ActivityNavMenuWidget.generated.h"
 
 // 注意：FActivityNavItem结构体现在已在DailyLoginSave.h中统一管理
