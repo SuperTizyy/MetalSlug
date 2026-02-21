@@ -450,6 +450,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Visual")
 	TSoftObjectPtr<UTexture2D> ItemIcon;
 
+	/** 物品功能数值 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Item|Visual")
+	float ItemFunctionValue;
+
 	/** ==================== 快捷访问方法 ==================== */
 	
 	/**
@@ -470,6 +474,7 @@ public:
 	 */
 	FItemDetailRow() 
 		: ItemID(0)
+		, ItemFunctionValue(0.0f)
 	{};
 };
 
