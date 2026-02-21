@@ -108,6 +108,20 @@ enum class EGameModeType : uint8
 	GunKingRank    UMETA(DisplayName = "枪王排位")      // 枪王排位模式
 };
 
+/**
+ * @brief 任务类型枚举
+ * @details 用于每日升级奖励活动中的任务类型分类
+ * @note 包含游玩记录数、击杀数、对局排名第一、连续击杀3人四种类型
+ */
+UENUM(BlueprintType)
+enum class ETaskType : uint8
+{
+	PlayRecordCount    UMETA(DisplayName = "游玩记录数"),     // 游玩记录数任务
+	KillCount          UMETA(DisplayName = "击杀数"),         // 击杀数任务
+	FirstPlace         UMETA(DisplayName = "对局排名第一"),    // 对局排名第一任务
+	TripleKill         UMETA(DisplayName = "连续击杀3人")      // 连续击杀3人任务
+};
+
 
 
 /**
@@ -553,9 +567,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
 	TArray<EGameModeType> GameModes;
 
-	/** 游玩次数数组 */
+	/** 任务类型数组（枚举值） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
-	TArray<int32> PlayCounts;
+	TArray<ETaskType> TaskTypes;
+
+	/** 任务相关数值数组 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Task")
+	TArray<int32> TaskRelatedValues;
 
 	// ==================== 奖励配置 ====================
 	
