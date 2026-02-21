@@ -579,11 +579,11 @@ public:
 	
 	/** 奖励物品ID数组 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Reward")
-	TArray<int32> RewardItemIDs;
+	TArray<FString> RewardItemIDs;
 
 	/** 奖励物品数量数组 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|Reward")
-	TArray<int32> RewardItemCounts;
+	TArray<FString> RewardItemCounts;
 
 	// ==================== 限时加成配置 ====================
 	
