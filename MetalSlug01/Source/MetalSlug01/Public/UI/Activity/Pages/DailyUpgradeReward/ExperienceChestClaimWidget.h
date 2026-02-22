@@ -35,7 +35,6 @@ public:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
 
-protected:
 	// ==================== UI控件引用 ====================
 	
 	/** 宝箱领取按钮 */

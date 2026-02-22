@@ -389,12 +389,16 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			// 设置宝箱图标到ChestClaimButton
 			if (ChestWidget->ChestClaimButton)
 			{
-				// 获取按钮的样式
-				FSlateBrush ButtonBrush = ChestWidget->ChestClaimButton->WidgetStyle.Normal;
+				// 使用推荐的API设置按钮背景图片
+				FSlateBrush ButtonBrush;
 				ButtonBrush.SetResourceObject(BoxIcons[i].Get());
-				ChestWidget->ChestClaimButton->WidgetStyle.Normal = ButtonBrush;
-				ChestWidget->ChestClaimButton->WidgetStyle.Pressed = ButtonBrush;
-				ChestWidget->ChestClaimButton->WidgetStyle.Hovered = ButtonBrush;
+				ButtonBrush.DrawAs = ESlateBrushDrawType::Image;
+				
+				// 设置按钮的各种状态样式
+				ChestWidget->ChestClaimButton->SetStyle(ChestWidget->ChestClaimButton->GetStyle());
+				ChestWidget->ChestClaimButton->WidgetStyle.SetNormal(ButtonBrush);
+				ChestWidget->ChestClaimButton->WidgetStyle.SetPressed(ButtonBrush);
+				ChestWidget->ChestClaimButton->WidgetStyle.SetHovered(ButtonBrush);
 			}
 			
 			// 添加到ItemsScrollBox
