@@ -90,6 +90,9 @@ protected:
 	/** 按钮到天数索引的映射 */
 	TMap<UButton*, int32> ButtonToDayIndexMap;
 
+	/** 缓存的物品图标数据（全局变量） */
+	TArray<TSoftObjectPtr<UTexture2D>> CachedItemIcons;
+
 	/**
 	 * @brief 静态回调函数用于按钮点击
 	 * @param Button 被点击的按钮
@@ -175,4 +178,19 @@ protected:
 	 * @return 奖励数据
 	 */
 	TArray<int32> GetDayRewards(int32 DayIndex);
+
+private:
+	// ==================== 图标管理方法 ====================
+	
+	/**
+	 * @brief 初始化奖励物品图标数据
+	 * @details 从配置表读取数据并缓存ItemIcon到全局变量
+	 */
+	void InitializeRewardItemIcons();
+
+	/**
+	 * @brief 更新奖励物品图片显示
+	 * @details 使用缓存的图标数据显示RewardItemImage控件
+	 */
+	void UpdateRewardItemImage();
 };

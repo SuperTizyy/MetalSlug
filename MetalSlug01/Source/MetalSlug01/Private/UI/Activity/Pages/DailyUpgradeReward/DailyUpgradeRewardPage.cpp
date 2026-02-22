@@ -16,6 +16,9 @@
 #include "Components/VerticalBox.h"
 #include "Components/ScrollBox.h"
 #include "Kismet/GameplayStatics.h"
+#include "Engine/DataTable.h"
+#include "UI/Activity/Core/ActivitySubsystem.h"
+#include "UI/Activity/Data/DailyLoginConfig.h"
 
 bool UDailyUpgradeRewardPage::Initialize()
 {
@@ -29,6 +32,9 @@ bool UDailyUpgradeRewardPage::Initialize()
 	CurrentExperience = 0;
 	CurrentBonusMultiplier = 1.0f;
 
+	// 初始化奖励物品图标数据
+	InitializeRewardItemIcons();
+
 	return true;
 }
 
@@ -40,6 +46,140 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 void UDailyUpgradeRewardPage::NativeDestruct()
 {
 	Super::NativeDestruct();
+}
+
+void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
+{
+	// 全局变量存储ItemIcon数据
+	CachedItemIcons.Empty();
+
+	// 1. 从DailyUpgradeRewardConfigRow表获取数据
+	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow");
+	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
+
+	if (!ConfigTable)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法加载DT_DailyUpgradeRewardConfigRow表"));
+		return;
+	}
+
+	// 获取第一行数据作为默认显示
+	static const FString ContextString(TEXT("DailyUpgradeRewardPage"));
+	TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
+	
+	if (RowMap.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: DT_DailyUpgradeRewardConfigRow表为空"));
+		return;
+	}
+
+	// 获取第一个记录
+	auto FirstEntry = RowMap.CreateConstIterator();
+	if (!FirstEntry)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取表中第一条记录"));
+		return;
+	}
+
+	const FDailyUpgradeRewardConfigRow* FirstRow = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(FirstEntry->Value);
+	if (!FirstRow)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 第一条记录数据无效"));
+		return;
+	}
+
+	// 2. 检查RewardItemIDs数组是否为空
+	if (FirstRow->RewardItemIDs.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemIDs数组为空"));
+		return;
+	}
+
+	// 3. 获取最后一个索引的数据
+	FString LastRewardItemID = FirstRow->RewardItemIDs.Last();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 最后一个RewardItemID: %s"), *LastRewardItemID);
+
+	// 4. 将字符串转换为整数作为BoxID
+	int32 BoxID = FCString::Atoi(*LastRewardItemID);
+	if (BoxID <= 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无效的BoxID: %s"), *LastRewardItemID);
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 转换后的BoxID: %d"), BoxID);
+
+	// 5. 通过GameInstance获取ActivitySubsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+
+	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+	if (!ActivitySub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取ActivitySubsystem"));
+		return;
+	}
+
+	// 6. 根据BoxID遍历TreasureBoxItemRow表获取ItemID数据
+	TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+	if (TreasureBoxItems.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 未找到BoxID %d 的宝箱物品配置"), BoxID);
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 找到%d个BoxID=%d的宝箱物品记录"), TreasureBoxItems.Num(), BoxID);
+
+	// 7. 通过ItemID关联ItemDetailRow表获取ItemIcon数据
+	for (const FTreasureBoxItemRow* TreasureBoxItem : TreasureBoxItems)
+	{
+		if (TreasureBoxItem)
+		{
+			const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
+			if (ItemDetail && !ItemDetail->ItemIcon.IsNull())
+			{
+				CachedItemIcons.Add(ItemDetail->ItemIcon);
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 缓存ItemIcon - ItemID: %d, ItemName: %s"), 
+					ItemDetail->ItemID, *ItemDetail->ItemName.ToString());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ItemID %d 的ItemIcon无效或为空"), TreasureBoxItem->ItemID);
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 缓存了 %d 个ItemIcon"), CachedItemIcons.Num());
+
+	// 8. 更新RewardItemImage显示（默认显示第一个图标）
+	UpdateRewardItemImage();
+}
+
+void UDailyUpgradeRewardPage::UpdateRewardItemImage()
+{
+	if (!RewardItemImage)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemImage控件未绑定"));
+		return;
+	}
+
+	if (CachedItemIcons.Num() > 0)
+	{
+		// 默认显示第一个索引的图标
+		TSoftObjectPtr<UTexture2D> FirstIcon = CachedItemIcons[0];
+		RewardItemImage->SetBrushFromSoftTexture(FirstIcon);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 设置RewardItemImage显示第一个图标"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 没有可用的ItemIcon数据"));
+		// 可以设置默认图片或隐藏控件
+		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
+	}
 }
 
 
