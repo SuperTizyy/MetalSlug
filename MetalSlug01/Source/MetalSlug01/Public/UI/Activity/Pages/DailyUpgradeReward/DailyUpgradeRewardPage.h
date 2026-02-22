@@ -72,6 +72,10 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UScrollBox* ItemsScrollBox;
 
+	/** 宝箱数量文本 */
+	UPROPERTY(meta = (BindWidget))
+	UTextBlock* ChestCountText;
+
 	// ==================== 数据管理 ====================
 	
 	/** 当前选择的天数索引 */
