@@ -281,6 +281,16 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		return;
 	}
 
+	// 检查 ExperienceChestWidgetClass 是否设置
+	UE_LOG(LogTemp, Warning, TEXT("检查 ExperienceChestWidgetClass 设置:"));
+	UE_LOG(LogTemp, Warning, TEXT("  ExperienceChestWidgetClass: %s"), ExperienceChestWidgetClass ? *ExperienceChestWidgetClass->GetName() : TEXT("未设置"));
+	
+	if (ExperienceChestWidgetClass == nullptr)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ExperienceChestWidgetClass 未设置！请在蓝图中指定 WBP_ExperienceChestClaimWidget 类"));
+		return;
+	}
+
 	// 清空现有的子控件
 	ItemsScrollBox->ClearChildren();
 
@@ -384,7 +394,7 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 	{
 		// 创建ExperienceChestClaimWidget实例（使用蓝图类）
 		TSubclassOf<UExperienceChestClaimWidget> WidgetClass = (ExperienceChestWidgetClass != nullptr) ? ExperienceChestWidgetClass : UExperienceChestClaimWidget::StaticClass();
-		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(this, WidgetClass);
+		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(this, WidgetClass.Get());
 		if (ChestWidget && ChestWidget->Initialize())
 		{
 			// 设置宝箱图标到ChestClaimButton
