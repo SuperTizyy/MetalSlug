@@ -382,8 +382,9 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 	// 5. 创建ExperienceChestClaimWidget并设置图标
 	for (int32 i = 0; i < BoxIcons.Num(); ++i)
 	{
-		// 创建ExperienceChestClaimWidget实例
-		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(this, UExperienceChestClaimWidget::StaticClass());
+		// 创建ExperienceChestClaimWidget实例（使用蓝图类）
+		TSubclassOf<UExperienceChestClaimWidget> WidgetClass = ExperienceChestWidgetClass.IsValid() ? ExperienceChestWidgetClass : UExperienceChestClaimWidget::StaticClass();
+		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(this, WidgetClass);
 		if (ChestWidget && ChestWidget->Initialize())
 		{
 			// 设置宝箱图标到ChestClaimButton

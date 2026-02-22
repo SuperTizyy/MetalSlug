@@ -76,6 +76,10 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* ChestCountText;
 
+	/** ExperienceChestClaimWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<UExperienceChestClaimWidget> ExperienceChestWidgetClass;
+
 	// ==================== 数据管理 ====================
 	
 	/** 当前选择的天数索引 */
