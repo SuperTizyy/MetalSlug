@@ -78,7 +78,7 @@ protected:
 
 	/** ExperienceChestClaimWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
-	TSubclassOf<UExperienceChestClaimWidget> ExperienceChestWidgetClass;
+	TSubclassOf<class UExperienceChestClaimWidget> ExperienceChestWidgetClass;
 
 	// ==================== 数据管理 ====================
 	
