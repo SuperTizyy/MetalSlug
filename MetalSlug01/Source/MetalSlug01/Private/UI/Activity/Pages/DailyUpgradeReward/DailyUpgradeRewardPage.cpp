@@ -253,7 +253,8 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	FString LastRewardItemCount = TargetRow->RewardItemCounts.Last();
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 最后一个RewardItemCount: %s"), *LastRewardItemCount);
 
-	// 5. 显示在ChestCountText控件上
-	ChestCountText->SetText(FText::FromString(LastRewardItemCount));
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: %s"), *LastRewardItemCount);
+	// 5. 显示在ChestCountText控件上（拼接X前缀）
+	FString DisplayText = FString::Printf(TEXT("X%s"), *LastRewardItemCount);
+	ChestCountText->SetText(FText::FromString(DisplayText));
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: X%s"), *LastRewardItemCount);
 }
