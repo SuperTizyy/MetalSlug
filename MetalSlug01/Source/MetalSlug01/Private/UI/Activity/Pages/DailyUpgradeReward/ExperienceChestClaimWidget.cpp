@@ -1,21 +1,21 @@
 /**
- * @file ExperienceChestClaimPage.cpp
- * @brief 经验宝箱领取页面实现
+ * @file ExperienceChestClaimWidget.cpp
+ * @brief 经验宝箱领取Widget实现
  * @author AI Assistant
  * @date 2026
  * @version 1.0
  *
- * @details 实现经验宝箱领取页面的核心功能
+ * @details 实现经验宝箱领取Widget的核心功能
  */
 
-#include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimPage.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
 #include "Components/ProgressBar.h"
 #include "Kismet/GameplayStatics.h"
 
-bool UExperienceChestClaimPage::Initialize()
+bool UExperienceChestClaimWidget::Initialize()
 {
 	if (!Super::Initialize())
 	{
@@ -30,7 +30,7 @@ bool UExperienceChestClaimPage::Initialize()
 	// 绑定按钮点击事件
 	if (ChestClaimButton)
 	{
-		ChestClaimButton->OnClicked.AddDynamic(this, &UExperienceChestClaimPage::OnChestClaimButtonClicked);
+		ChestClaimButton->OnClicked.AddDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
 	}
 
 	// 初始化UI显示
@@ -42,23 +42,23 @@ bool UExperienceChestClaimPage::Initialize()
 	return true;
 }
 
-void UExperienceChestClaimPage::NativeConstruct()
+void UExperienceChestClaimWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
 }
 
-void UExperienceChestClaimPage::NativeDestruct()
+void UExperienceChestClaimWidget::NativeDestruct()
 {
 	// 解绑按钮事件
 	if (ChestClaimButton)
 	{
-		ChestClaimButton->OnClicked.RemoveDynamic(this, &UExperienceChestClaimPage::OnChestClaimButtonClicked);
+		ChestClaimButton->OnClicked.RemoveDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
 	}
 
 	Super::NativeDestruct();
 }
 
-void UExperienceChestClaimPage::OnChestClaimButtonClicked()
+void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 {
 	if (CurrentChestCount > 0)
 	{
@@ -89,7 +89,7 @@ void UExperienceChestClaimPage::OnChestClaimButtonClicked()
 	}
 }
 
-void UExperienceChestClaimPage::UpdateChestCount()
+void UExperienceChestClaimWidget::UpdateChestCount()
 {
 	if (ChestCountText)
 	{
@@ -98,7 +98,7 @@ void UExperienceChestClaimPage::UpdateChestCount()
 	}
 }
 
-void UExperienceChestClaimPage::UpdateExperienceDisplay()
+void UExperienceChestClaimWidget::UpdateExperienceDisplay()
 {
 	if (ExperienceText)
 	{
@@ -107,7 +107,7 @@ void UExperienceChestClaimPage::UpdateExperienceDisplay()
 	}
 }
 
-void UExperienceChestClaimPage::UpdateProgressBar()
+void UExperienceChestClaimWidget::UpdateProgressBar()
 {
 	if (ExperienceProgressBar)
 	{
@@ -116,7 +116,7 @@ void UExperienceChestClaimPage::UpdateProgressBar()
 	}
 }
 
-void UExperienceChestClaimPage::ShowSuccessEffect()
+void UExperienceChestClaimWidget::ShowSuccessEffect()
 {
 	if (SuccessText)
 	{
@@ -125,10 +125,10 @@ void UExperienceChestClaimPage::ShowSuccessEffect()
 
 	// 可以在这里添加动画效果或其他视觉反馈
 	FTimerHandle SuccessTimerHandle;
-	GetWorld()->GetTimerManager().SetTimer(SuccessTimerHandle, this, &UExperienceChestClaimPage::HideSuccessEffect, 2.0f, false);
+	GetWorld()->GetTimerManager().SetTimer(SuccessTimerHandle, this, &UExperienceChestClaimWidget::HideSuccessEffect, 2.0f, false);
 }
 
-void UExperienceChestClaimPage::HideSuccessEffect()
+void UExperienceChestClaimWidget::HideSuccessEffect()
 {
 	if (SuccessText)
 	{

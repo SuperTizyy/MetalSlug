@@ -19,6 +19,7 @@
 #include "Engine/DataTable.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 
 bool UDailyUpgradeRewardPage::Initialize()
 {
@@ -44,6 +45,9 @@ bool UDailyUpgradeRewardPage::Initialize()
 	{
 		// 在编辑器预览模式下静默处理，不输出日志
 	}
+
+	// 初始化ItemsScrollBox中的ExperienceChestClaimWidget
+	InitializeExperienceChestWidgets();
 
 	return true;
 }
@@ -267,4 +271,139 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	FString DisplayText = FString::Printf(TEXT("X%s"), *LastRewardItemCount);
 	ChestCountText->SetText(FText::FromString(DisplayText));
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: X%s"), *LastRewardItemCount);
+}
+
+void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
+{
+	if (!ItemsScrollBox)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ItemsScrollBox控件未绑定"));
+		return;
+	}
+
+	// 清空现有的子控件
+	ItemsScrollBox->ClearChildren();
+
+	// 1. 从DailyUpgradeRewardConfigRow表获取数据
+	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow");
+	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
+
+	if (!ConfigTable)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法加载DT_DailyUpgradeRewardConfigRow表"));
+		return;
+	}
+
+	// 获取ActivityID==110的数据
+	static const FString ContextString(TEXT("DailyUpgradeRewardPage"));
+	TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
+	
+	if (RowMap.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: DT_DailyUpgradeRewardConfigRow表为空"));
+		return;
+	}
+
+	const FDailyUpgradeRewardConfigRow* TargetRow = nullptr;
+	
+	// 查找ActivityID==110的记录
+	for (const auto& Pair : RowMap)
+	{
+		const FDailyUpgradeRewardConfigRow* Row = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(Pair.Value);
+		if (Row && Row->ActivityID == 110)
+		{
+			TargetRow = Row;
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 找到ActivityID=110的记录"));
+			break;
+		}
+	}
+
+	if (!TargetRow)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 未找到ActivityID=110的记录"));
+		return;
+	}
+
+	// 2. 检查RewardItemIDs数组是否为空
+	if (TargetRow->RewardItemIDs.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemIDs数组为空"));
+		return;
+	}
+
+	// 3. 通过GameInstance获取ActivitySubsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance，可能在编辑器预览模式下"));
+		return;
+	}
+
+	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+	if (!ActivitySub)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取ActivitySubsystem，可能在编辑器预览模式下"));
+		return;
+	}
+
+	// 4. 遍历RewardItemIDs数组，为每个ID创建ExperienceChestClaimWidget
+	TArray<TSoftObjectPtr<UTexture2D>> BoxIcons;
+	
+	for (const FString& RewardItemID : TargetRow->RewardItemIDs)
+	{
+		// 将字符串转换为整数作为BoxID
+		int32 BoxID = FCString::Atoi(*RewardItemID);
+		if (BoxID <= 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无效的BoxID: %s"), *RewardItemID);
+			continue;
+		}
+
+		// 根据BoxID获取TreasureBoxItemRow数据
+		TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+		if (TreasureBoxItems.Num() > 0)
+		{
+			// 获取第一个记录的BoxIcon（假设每个BoxID对应一个宝箱图标）
+			const FTreasureBoxItemRow* FirstItem = TreasureBoxItems[0];
+			if (FirstItem)
+			{
+				BoxIcons.Add(FirstItem->BoxIcon);
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取BoxID=%d的BoxIcon成功"), BoxID);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 未找到BoxID %d 的宝箱物品配置"), BoxID);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 共获取到 %d 个BoxIcon"), BoxIcons.Num());
+
+	// 5. 创建ExperienceChestClaimWidget并设置图标
+	for (int32 i = 0; i < BoxIcons.Num(); ++i)
+	{
+		// 创建ExperienceChestClaimWidget实例
+		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(this, UExperienceChestClaimWidget::StaticClass());
+		if (ChestWidget && ChestWidget->Initialize())
+		{
+			// 设置宝箱图标到ChestClaimButton
+			if (ChestWidget->ChestClaimButton)
+			{
+				// 获取按钮的样式
+				FSlateBrush ButtonBrush = ChestWidget->ChestClaimButton->WidgetStyle.Normal;
+				ButtonBrush.SetResourceObject(BoxIcons[i].Get());
+				ChestWidget->ChestClaimButton->WidgetStyle.Normal = ButtonBrush;
+				ChestWidget->ChestClaimButton->WidgetStyle.Pressed = ButtonBrush;
+				ChestWidget->ChestClaimButton->WidgetStyle.Hovered = ButtonBrush;
+			}
+			
+			// 添加到ItemsScrollBox
+			ItemsScrollBox->AddChild(ChestWidget);
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget"), i + 1);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 创建ExperienceChestClaimWidget失败"));
+		}
+	}
 }

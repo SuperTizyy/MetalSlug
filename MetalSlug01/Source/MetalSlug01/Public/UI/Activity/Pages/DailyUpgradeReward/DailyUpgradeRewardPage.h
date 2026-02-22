@@ -199,4 +199,10 @@ private:
 	 * @details 从DailyUpgradeRewardConfigRow表获取ActivityID==110数据的RewardItemCounts最后一个索引值
 	 */
 	void UpdateChestCountText();
+
+	/**
+	 * @brief 初始化ItemsScrollBox中的ExperienceChestClaimWidget
+	 * @details 根据RewardItemIDs创建多个ExperienceChestClaimWidget并设置对应的BoxIcon
+	 */
+	void InitializeExperienceChestWidgets();
 };

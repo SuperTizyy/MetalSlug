@@ -1,18 +1,18 @@
 /**
- * @file ExperienceChestClaimPage.h
- * @brief 经验宝箱领取页面
+ * @file ExperienceChestClaimWidget.h
+ * @brief 经验宝箱领取Widget
  * @author AI Assistant
  * @date 2026
  * @version 1.0
  *
- * @details 实现经验宝箱领取功能的UI页面
+ * @details 实现经验宝箱领取功能的UI Widget
  */
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "ExperienceChestClaimPage.generated.h"
+#include "ExperienceChestClaimWidget.generated.h"
 
 class UButton;
 class UTextBlock;
@@ -20,13 +20,13 @@ class UImage;
 class UProgressBar;
 
 /**
- * @brief 经验宝箱领取页面
- * @details 提供经验宝箱领取的核心UI功能
+ * @brief 经验宝箱领取Widget
+ * @details 提供经验宝箱领取的核心UI Widget功能
  */
 UCLASS()
-class METALSLUG01_API UExperienceChestClaimPage : public UUserWidget
+class METALSLUG01_API UExperienceChestClaimWidget : public UUserWidget
 {
-	GENERATED_BODY()
+ GENERATED_BODY()
 
 public:
 	// ==================== 生命周期 ====================
