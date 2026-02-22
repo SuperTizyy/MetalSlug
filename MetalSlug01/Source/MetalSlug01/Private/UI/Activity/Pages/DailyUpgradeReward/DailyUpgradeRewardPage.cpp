@@ -42,7 +42,7 @@ bool UDailyUpgradeRewardPage::Initialize()
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ChestCountText控件未绑定，跳过初始化"));
+		// 在编辑器预览模式下静默处理，不输出日志
 	}
 
 	return true;
@@ -128,8 +128,7 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance，可能在编辑器预览模式下"));
-		// 在编辑器预览模式下设置默认值
+		// 在编辑器预览模式下静默处理，不输出日志
 		CachedItemIcons.Empty();
 		UpdateRewardItemImage();
 		return;
@@ -138,8 +137,7 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
 	if (!ActivitySub)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取ActivitySubsystem，可能在编辑器预览模式下"));
-		// 在编辑器预览模式下设置默认值
+		// 在编辑器预览模式下静默处理，不输出日志
 		CachedItemIcons.Empty();
 		UpdateRewardItemImage();
 		return;
@@ -197,8 +195,7 @@ void UDailyUpgradeRewardPage::UpdateRewardItemImage()
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 没有可用的ItemIcon数据"));
-		// 可以设置默认图片或隐藏控件
+		// 在编辑器预览模式下静默处理，不输出日志
 		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
 	}
 }
