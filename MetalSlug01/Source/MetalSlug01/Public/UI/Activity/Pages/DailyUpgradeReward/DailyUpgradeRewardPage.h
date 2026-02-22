@@ -150,19 +150,6 @@ protected:
 	// ==================== 事件处理方法 ====================
 	
 	/**
-	 * @brief 处理重选奖励按钮点击
-	 */
-	UFUNCTION()
-	void OnReselectRewardClicked();
-
-	/**
-	 * @brief 处理天数按钮点击
-	 * @param DayIndex 天数索引
-	 */
-	UFUNCTION()
-	void HandleDayButtonClicked();
-
-	/**
 	 * @brief 处理任务完成状态变化
 	 * @param TaskIndex 任务索引
 	 * @param bCompleted 是否完成
@@ -171,27 +158,6 @@ protected:
 
 	// ==================== 辅助方法 ====================
 	
-	/**
-	 * @brief 创建天数按钮
-	 * @param DayIndex 天数索引
-	 * @return 创建的按钮
-	 */
-	UButton* CreateDayButton(int32 DayIndex);
-
-	/**
-	 * @brief 创建任务控件
-	 * @param TaskIndex 任务索引
-	 * @return 创建的任务控件
-	 */
-	UWidget* CreateTaskWidget(int32 TaskIndex);
-
-	/**
-	 * @brief 创建物品图标
-	 * @param ItemID 物品ID
-	 * @return 创建的图片控件
-	 */
-	UImage* CreateItemIcon(int32 ItemID);
-
 	/**
 	 * @brief 计算当前加成倍数
 	 * @param DayIndex 天数索引
