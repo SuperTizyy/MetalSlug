@@ -193,4 +193,10 @@ private:
 	 * @details 使用缓存的图标数据显示RewardItemImage控件
 	 */
 	void UpdateRewardItemImage();
+
+	/**
+	 * @brief 更新宝箱数量文本显示
+	 * @details 从DailyUpgradeRewardConfigRow表获取ActivityID==110数据的RewardItemCounts最后一个索引值
+	 */
+	void UpdateChestCountText();
 };

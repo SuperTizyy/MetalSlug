@@ -34,6 +34,9 @@ bool UDailyUpgradeRewardPage::Initialize()
 
 	// 初始化奖励物品图标数据
 	InitializeRewardItemIcons();
+	
+	// 初始化宝箱数量显示
+	UpdateChestCountText();
 
 	return true;
 }
@@ -178,6 +181,74 @@ void UDailyUpgradeRewardPage::UpdateRewardItemImage()
 		TSoftObjectPtr<UTexture2D> FirstIcon = CachedItemIcons[0];
 		RewardItemImage->SetBrushFromSoftTexture(FirstIcon);
 		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 设置RewardItemImage显示第一个图标"));
+	}
+	
+	void UDailyUpgradeRewardPage::UpdateChestCountText()
+	{
+		if (!ChestCountText)
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ChestCountText控件未绑定"));
+			return;
+		}
+	
+		// 1. 从DailyUpgradeRewardConfigRow表获取数据
+		FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow");
+		UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
+	
+		if (!ConfigTable)
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法加载DT_DailyUpgradeRewardConfigRow表"));
+			ChestCountText->SetText(FText::FromString(TEXT("数据加载失败")));
+			return;
+		}
+	
+		// 2. 获取ActivityID==110的数据
+		static const FString ContextString(TEXT("DailyUpgradeRewardPage"));
+		TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
+		
+		if (RowMap.Num() == 0)
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: DT_DailyUpgradeRewardConfigRow表为空"));
+			ChestCountText->SetText(FText::FromString(TEXT("无数据")));
+			return;
+		}
+	
+		const FDailyUpgradeRewardConfigRow* TargetRow = nullptr;
+		
+		// 查找ActivityID==110的记录
+		for (const auto& Pair : RowMap)
+		{
+			const FDailyUpgradeRewardConfigRow* Row = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(Pair.Value);
+			if (Row && Row->ActivityID == 110)
+			{
+				TargetRow = Row;
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 找到ActivityID=110的记录"));
+				break;
+			}
+		}
+	
+		if (!TargetRow)
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 未找到ActivityID=110的记录"));
+			ChestCountText->SetText(FText::FromString(TEXT("未找到记录")));
+			return;
+		}
+	
+		// 3. 检查RewardItemCounts数组是否为空
+		if (TargetRow->RewardItemCounts.Num() == 0)
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemCounts数组为空"));
+			ChestCountText->SetText(FText::FromString(TEXT("0")));
+			return;
+		}
+	
+		// 4. 获取最后一个索引的数据
+		FString LastRewardItemCount = TargetRow->RewardItemCounts.Last();
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 最后一个RewardItemCount: %s"), *LastRewardItemCount);
+	
+		// 5. 显示在ChestCountText控件上
+		ChestCountText->SetText(FText::FromString(LastRewardItemCount));
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: %s"), *LastRewardItemCount);
 	}
 	else
 	{
