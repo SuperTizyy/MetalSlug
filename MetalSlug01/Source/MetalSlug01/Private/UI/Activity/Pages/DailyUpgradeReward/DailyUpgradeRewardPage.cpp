@@ -63,7 +63,7 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 		return;
 	}
 
-	// 获取第一行数据作为默认显示
+	// 获取ActivityID==110的数据
 	static const FString ContextString(TEXT("DailyUpgradeRewardPage"));
 	TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
 	
@@ -73,30 +73,35 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 		return;
 	}
 
-	// 获取第一个记录
-	auto FirstEntry = RowMap.CreateConstIterator();
-	if (!FirstEntry)
+	const FDailyUpgradeRewardConfigRow* TargetRow = nullptr;
+	
+	// 查找ActivityID==110的记录
+	for (const auto& Pair : RowMap)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取表中第一条记录"));
-		return;
+		const FDailyUpgradeRewardConfigRow* Row = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(Pair.Value);
+		if (Row && Row->ActivityID == 110)
+		{
+			TargetRow = Row;
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 找到ActivityID=110的记录"));
+			break;
+		}
 	}
 
-	const FDailyUpgradeRewardConfigRow* FirstRow = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(FirstEntry->Value);
-	if (!FirstRow)
+	if (!TargetRow)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 第一条记录数据无效"));
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 未找到ActivityID=110的记录"));
 		return;
 	}
 
 	// 2. 检查RewardItemIDs数组是否为空
-	if (FirstRow->RewardItemIDs.Num() == 0)
+	if (TargetRow->RewardItemIDs.Num() == 0)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemIDs数组为空"));
 		return;
 	}
 
 	// 3. 获取最后一个索引的数据
-	FString LastRewardItemID = FirstRow->RewardItemIDs.Last();
+	FString LastRewardItemID = TargetRow->RewardItemIDs.Last();
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 最后一个RewardItemID: %s"), *LastRewardItemID);
 
 	// 4. 将字符串转换为整数作为BoxID
