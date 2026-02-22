@@ -394,11 +394,13 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 				ButtonBrush.SetResourceObject(BoxIcons[i].Get());
 				ButtonBrush.DrawAs = ESlateBrushDrawType::Image;
 				
-				// 设置按钮的各种状态样式
-				ChestWidget->ChestClaimButton->SetStyle(ChestWidget->ChestClaimButton->GetStyle());
-				ChestWidget->ChestClaimButton->WidgetStyle.SetNormal(ButtonBrush);
-				ChestWidget->ChestClaimButton->WidgetStyle.SetPressed(ButtonBrush);
-				ChestWidget->ChestClaimButton->WidgetStyle.SetHovered(ButtonBrush);
+				// 使用现代API设置按钮背景图片
+				FButtonStyle NewStyle = ChestWidget->ChestClaimButton->GetStyle();
+				NewStyle.SetNormal(ButtonBrush);
+				NewStyle.SetPressed(ButtonBrush);
+				NewStyle.SetHovered(ButtonBrush);
+				NewStyle.SetDisabled(ButtonBrush);
+				ChestWidget->ChestClaimButton->SetStyle(NewStyle);
 			}
 			
 			// 添加到ItemsScrollBox
