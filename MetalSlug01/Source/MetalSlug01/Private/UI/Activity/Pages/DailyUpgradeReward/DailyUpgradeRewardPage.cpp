@@ -35,8 +35,15 @@ bool UDailyUpgradeRewardPage::Initialize()
 	// 初始化奖励物品图标数据
 	InitializeRewardItemIcons();
 	
-	// 初始化宝箱数量显示
-	UpdateChestCountText();
+	// 初始化宝箱数量显示（添加错误处理）
+	if (ChestCountText)
+	{
+		UpdateChestCountText();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ChestCountText控件未绑定，跳过初始化"));
+	}
 
 	return true;
 }
@@ -121,14 +128,20 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance，可能在编辑器预览模式下"));
+		// 在编辑器预览模式下设置默认值
+		CachedItemIcons.Empty();
+		UpdateRewardItemImage();
 		return;
 	}
 
 	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
 	if (!ActivitySub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取ActivitySubsystem"));
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取ActivitySubsystem，可能在编辑器预览模式下"));
+		// 在编辑器预览模式下设置默认值
+		CachedItemIcons.Empty();
+		UpdateRewardItemImage();
 		return;
 	}
 
