@@ -225,6 +225,123 @@ public:
 	FActivityNavItem() = default;
 };
 
+/**
+ * @brief 升级奖励活动存档记录
+ * @details 存储玩家在升级奖励活动中的进度和状态信息
+ * @note 这是升级奖励活动的专属存档结构，用于持久化存储玩家数据
+ */
+USTRUCT(BlueprintType)
+struct FUpgradeRewardSaveRecord
+{
+	GENERATED_BODY()
+
+public:
+	// ==================== 基础信息 ====================
+	
+	/** 记录天数（1代表day1，2代表day2，以此类推） */
+	UPROPERTY(SaveGame)
+	int32 RecordDate;
+
+	/** 奖励图标显示下标（对应RewardItemIDs数组的索引） */
+	UPROPERTY(SaveGame)
+	int32 RewardIconIndex;
+
+	// ==================== 限时活动数据 ====================
+	
+	/** 限时活动开始时间（Unix时间戳，秒） */
+	UPROPERTY(SaveGame)
+	int64 LimitedActivityStartTime;
+
+	/** 限时活动完成次数 */
+	UPROPERTY(SaveGame)
+	int32 LimitedActivityCompleteCount;
+
+	// ==================== 任务数据 ====================
+	
+	/** 任务完成次数数组（与TaskTypes数组一一对应） */
+	UPROPERTY(SaveGame)
+	TArray<int32> TaskCompleteCounts;
+
+	/** 任务领取情况数组（与TaskTypes数组一一对应，0=未领取，1=已领取） */
+	UPROPERTY(SaveGame)
+	TArray<int32> TaskClaimStatus;
+
+	// ==================== 经验值数据 ====================
+	
+	/** 当前累计经验值 */
+	UPROPERTY(SaveGame)
+	int32 CurrentExperience;
+
+	// ==================== 宝箱数据 ====================
+	
+	/** 宝箱领取情况数组（与RewardItemIDs数组一一对应，0=未领取，1=已领取） */
+	UPROPERTY(SaveGame)
+	TArray<int32> ChestClaimStatus;
+
+	// ==================== 时间戳 ====================
+	
+	/** 记录创建时间 */
+	UPROPERTY(SaveGame)
+	FDateTime CreatedTime;
+
+	/** 最后更新时间 */
+	UPROPERTY(SaveGame)
+	FDateTime LastUpdateTime;
+
+	/**
+	 * @brief 构造函数
+	 * @details 初始化默认值并设置当前时间为创建和更新时间
+	 */
+	FUpgradeRewardSaveRecord()
+		: RecordDate(1), RewardIconIndex(0), LimitedActivityStartTime(0)
+		, LimitedActivityCompleteCount(0), CurrentExperience(0)
+	{
+		CreatedTime = FDateTime::Now();
+		LastUpdateTime = FDateTime::Now();
+	}
+	
+	/**
+	 * @brief 设置记录天数
+	 * @param DayNumber 天数编号（从1开始，1代表day1）
+	 */
+	void SetRecordDate(int32 DayNumber)
+	{
+		if (DayNumber >= 1)
+		{
+			RecordDate = DayNumber;
+			LastUpdateTime = FDateTime::Now();
+		}
+	}
+	
+	/**
+	 * @brief 获取记录天数
+	 * @return 天数编号（1代表day1）
+	 */
+	int32 GetDayNumber() const
+	{
+		return RecordDate;
+	}
+	
+	/**
+	 * @brief 获取天数字符串
+	 * @return 格式化的天数字符串（如"day1", "day2"）
+	 */
+	FString GetDayString() const
+	{
+		return FString::Printf(TEXT("day%d"), RecordDate);
+	}
+	
+	/**
+	 * @brief 检查是否为第一天记录
+	 * @return 是否为第一天
+	 * @details 直接比较RecordDate值是否为1
+	 */
+	bool IsToday() const
+	{
+		return RecordDate == 1;
+	}
+};
+
 // ==================== 存档管理类 ====================
 
 /**
@@ -243,6 +360,10 @@ public:
 	/** 玩家所有活动的进度记录映射表 */
 	UPROPERTY(SaveGame)
 	TMap<int32, FPlayerLoginRecord> ActivityRecords;
+
+	/** 升级奖励活动存档记录映射表（按日期存储） */
+	UPROPERTY(SaveGame)
+	TMap<int32, FUpgradeRewardSaveRecord> UpgradeRewardRecords;
 
 	// ==================== 运行时数据 ====================
 	

@@ -7,7 +7,9 @@
 #include "Components/VerticalBox.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
+#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
+#include "Engine/GameInstance.h"
 
 void UActivityConfirmPopupWidget::NativeConstruct()
 {
@@ -148,8 +150,20 @@ void UActivityConfirmPopupWidget::CreateRewardCardsForBox(const FDailyLoginConfi
 		URewardOptionCardWidget* RewardCard = CreateWidget<URewardOptionCardWidget>(this, RewardOptionCardClass);
 		if (RewardCard)
 		{
-			// 使用直接数据初始化方法，传入具体的记录
-			RewardCard->InitializeCardWithDirectData(ItemDetail, TreasureBoxItem);
+			// 通过GameInstance获取UpgradeActivitySubsystem以获取当前选中的RewardIconIndex
+			UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+			int32 CurrentRewardIconIndex = 0;
+			if (UpgradeSub)
+			{
+				CurrentRewardIconIndex = UpgradeSub->GetCurrentRewardIconIndex();
+				UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 当前RewardIconIndex为 %d"), CurrentRewardIconIndex);
+			}
+			
+			// 判断当前卡片是否应该被选中
+			bool bShouldBeSelected = (i == CurrentRewardIconIndex);
+			
+			// 使用带选中状态的初始化方法
+			RewardCard->InitializeCardWithDataTablesAndSelection(TreasureBoxItem->ItemID, Config.RewardItemID, i, bShouldBeSelected);
 			
 			// 绑定选中事件
 			RewardCard->OnRewardSelected.AddDynamic(this, &UActivityConfirmPopupWidget::OnRewardCardSelected);
@@ -255,11 +269,48 @@ void UActivityConfirmPopupWidget::OnCloseClicked()
 
 void UActivityConfirmPopupWidget::OnConfirmClicked()
 {
-	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 确认按钮被点击，当前选中索引: %d"), SelectedIndex);
+	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 确认按钮被点击"));
+	
+	// 使用临时选中状态而不是当前选中状态
+	int32 FinalSelectedIndex = PendingSelectedIndex;
+	if (FinalSelectedIndex == -1)
+	{
+		FinalSelectedIndex = SelectedIndex; // 如果没有临时选择，使用默认值
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 最终选中索引: %d"), FinalSelectedIndex);
+	
+	// 通过GameInstance获取UpgradeActivitySubsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (GameInstance)
+	{
+		UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+		if (UpgradeSub)
+		{
+			// 更新RewardIconIndex并保存到存档
+			// 这里才是真正更新数据的地方
+			if (UpgradeSub->UpdateRewardIconIndexAndSave(FinalSelectedIndex))
+			{
+				UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 成功更新RewardIconIndex为 %d 并保存"), FinalSelectedIndex);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("ActivityConfirmPopup: 更新RewardIconIndex失败"));
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("ActivityConfirmPopup: 无法获取UpgradeActivitySubsystem"));
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivityConfirmPopup: 无法获取GameInstance"));
+	}
+	
+	// 关闭弹窗
 	RemoveFromParent();
 }
-
-
 
 void UActivityConfirmPopupWidget::OnRewardCardClicked_0()
 {
@@ -289,6 +340,13 @@ void UActivityConfirmPopupWidget::OnRewardCardSelected(URewardOptionCardWidget* 
 {
 	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 奖励卡片选中状态改变 - ID: %d, 选中: %s"), 
 		CardWidget->RewardID, bIsChecked ? TEXT("是") : TEXT("否"));
+	
+	// 跟踪临时选中状态
+	if (bIsChecked && CardWidget)
+	{
+		PendingSelectedIndex = CardWidget->GetCardIndex();
+		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 记录临时选中索引: %d"), PendingSelectedIndex);
+	}
 	
 	// 这里可以处理选中逻辑
 	// 例如：单选模式下取消其他卡片的选中状态

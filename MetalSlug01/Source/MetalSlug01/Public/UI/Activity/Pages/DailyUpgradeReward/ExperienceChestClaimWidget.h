@@ -110,4 +110,10 @@ public:
 	 * @brief 隐藏领取成功效果
 	 */
 	void HideSuccessEffect();
+
+	/**
+	 * @brief 更新视觉状态（根据领取状态改变显示）
+	 * @param bIsClaimed 是否已领取
+	 */
+	void UpdateVisualStatus(bool bIsClaimed);
 };

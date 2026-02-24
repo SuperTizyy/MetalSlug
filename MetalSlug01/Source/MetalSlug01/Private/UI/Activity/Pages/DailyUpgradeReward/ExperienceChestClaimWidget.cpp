@@ -135,3 +135,35 @@ void UExperienceChestClaimWidget::HideSuccessEffect()
 		SuccessText->SetVisibility(ESlateVisibility::Hidden);
 	}
 }
+
+void UExperienceChestClaimWidget::UpdateVisualStatus(bool bIsClaimed)
+{
+	if (ChestClaimButton)
+	{
+		if (bIsClaimed)
+		{
+			// 已领取状态：禁用按钮，改变视觉样式
+			ChestClaimButton->SetIsEnabled(false);
+			ChestClaimButton->SetColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 0.7f)); // 灰色半透明
+			
+			// 可以添加其他视觉效果，比如添加已领取标签等
+			if (ChestCountText)
+			{
+				ChestCountText->SetColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f)); // 文本变灰
+			}
+		}
+		else
+		{
+			// 未领取状态：启用按钮，恢复正常样式
+			ChestClaimButton->SetIsEnabled(true);
+			ChestClaimButton->SetColorAndOpacity(FLinearColor::White);
+			
+			if (ChestCountText)
+			{
+				ChestCountText->SetColorAndOpacity(FLinearColor::White);
+			}
+		}
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 视觉状态已更新，已领取: %s"), bIsClaimed ? TEXT("是") : TEXT("否"));
+}

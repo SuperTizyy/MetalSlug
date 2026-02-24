@@ -72,6 +72,10 @@ private:
 	UPROPERTY()
 	int32 SelectedIndex = 1;
 
+	/** 临时选中状态跟踪 - 用于记录用户当前选择但尚未确认的索引 */
+	UPROPERTY()
+	int32 PendingSelectedIndex = -1;
+
 	/** 奖励选项数据 */
 	UPROPERTY()
 	TArray<struct FDailyLoginConfigRow> RewardOptions;

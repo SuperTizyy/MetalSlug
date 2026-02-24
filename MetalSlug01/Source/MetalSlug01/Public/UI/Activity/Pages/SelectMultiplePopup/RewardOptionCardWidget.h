@@ -48,6 +48,10 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "Reward Data")
 	bool bIsSelected;
 
+	/** 卡片在选项中的索引位置 */
+	UPROPERTY()
+	int32 CardIndex;
+
 	// ==================== 事件委托 ====================
 	
 	DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRewardSelected, URewardOptionCardWidget*, CardWidget, bool, bIsChecked);
@@ -77,12 +81,31 @@ public:
 	void InitializeCardWithDataTables(int32 InItemID, int32 InBoxID);
 	
 	/**
+	 * @brief 通过数据表初始化奖励卡片并设置选中状态
+	 * @param InItemID 物品ID（用于查询ItemDetailRow表的ItemIcon）
+	 * @param InBoxID 宝箱ID（用于查询TreasureBoxItemRow表的ItemCount）
+	 * @param InCardIndex 卡片在选项中的索引位置
+	 * @param bShouldBeSelected 是否应该被选中
+	 * @details 专为RewardOptionCardWidget的SelectionCheckBox控件设计，
+	 * 根据UpgradeActivitySubsystem中的RewardIconIndex设置选中状态
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Reward Card")
+	void InitializeCardWithDataTablesAndSelection(int32 InItemID, int32 InBoxID, int32 InCardIndex, bool bShouldBeSelected);
+	
+	/**
 	 * @brief 直接使用已获取的数据初始化奖励卡片
 	 * @param InItemDetail 物品详情记录
 	 * @param InTreasureBoxItem 宝箱物品记录
 	 */
 	void InitializeCardWithDirectData(const struct FItemDetailRow* InItemDetail, const struct FTreasureBoxItemRow* InTreasureBoxItem);
 
+	/**
+	 * @brief 获取卡片索引
+	 * @return 卡片在选项中的索引位置
+	 */
+	UFUNCTION(BlueprintPure, Category = "Reward Card")
+	int32 GetCardIndex() const { return CardIndex; }
+	
 	/**
 	 * @brief 设置选中状态
 	 * @param bInSelected 是否选中

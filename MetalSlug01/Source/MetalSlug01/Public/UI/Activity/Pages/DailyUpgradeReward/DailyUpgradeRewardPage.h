@@ -20,6 +20,7 @@ class UButton;
 class UTextBlock;
 class UVerticalBox;
 class UScrollBox;
+class UUpgradeActivitySubsystem;
 
 /**
  * @brief 每日升级奖励活动页面
@@ -79,6 +80,10 @@ protected:
 	/** ExperienceChestClaimWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UExperienceChestClaimWidget> ExperienceChestWidgetClass;
+
+	/** ActivityConfirmPopupWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UActivityConfirmPopupWidget> ActivityConfirmPopupWidgetClass;
 
 	// ==================== 数据管理 ====================
 	
@@ -199,6 +204,20 @@ private:
 	void UpdateRewardItemImage();
 
 	/**
+	 * @brief 切换到下一个奖励图标
+	 * @details 循环切换CachedItemIcons数组中的图标索引
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward")
+	void SwitchToNextRewardIcon();
+
+	/**
+	 * @brief 切换到上一个奖励图标
+	 * @details 循环切换CachedItemIcons数组中的图标索引
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward")
+	void SwitchToPreviousRewardIcon();
+
+	/**
 	 * @brief 更新宝箱数量文本显示
 	 * @details 从DailyUpgradeRewardConfigRow表获取ActivityID==110数据的RewardItemCounts最后一个索引值
 	 */
@@ -209,4 +228,33 @@ private:
 	 * @details 根据RewardItemIDs创建多个ExperienceChestClaimWidget并设置对应的BoxIcon
 	 */
 	void InitializeExperienceChestWidgets();
+
+	/**
+	 * @brief 刷新UI显示
+	 * @details 重新初始化所有UI组件以反映最新状态
+	 */
+	void RefreshUI();
+
+	/**
+	 * @brief 处理重选奖励按钮点击事件
+	 */
+	UFUNCTION()
+	void OnReselectRewardClicked();
+	
+	/**
+	 * @brief 订阅Subsystem事件
+	 */
+	void SubscribeToSubsystemEvents();
+	
+	/**
+	 * @brief 取消订阅Subsystem事件
+	 */
+	void UnsubscribeFromSubsystemEvents();
+	
+	/**
+	 * @brief 处理奖励图标索引更新事件
+	 * @param NewIndex 新的图标索引
+	 */
+	UFUNCTION()
+	void OnRewardIconIndexChanged(int32 NewIndex);
 };
