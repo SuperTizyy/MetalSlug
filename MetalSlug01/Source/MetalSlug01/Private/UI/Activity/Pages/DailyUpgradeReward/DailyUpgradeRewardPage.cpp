@@ -105,6 +105,7 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	InitializeRewardItemIcons();
 	UpdateChestCountText();
 	InitializeExperienceChestWidgets();
+	UpdateExperienceDisplay();
 }
 
 /**
@@ -359,65 +360,30 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 		return; // 静默返回，不输出日志
 	}
 
-	// 1. 从DailyUpgradeRewardConfigRow表获取数据
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow");
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-
-	if (!ConfigTable)
+	// 通过Subsystem获取宝箱数量
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法加载DT_DailyUpgradeRewardConfigRow表"));
-		ChestCountText->SetText(FText::FromString(TEXT("数据加载失败")));
-		return;
-	}
-
-	// 2. 获取ActivityID==110的数据
-	static const FString ContextString(TEXT("DailyUpgradeRewardPage"));
-	TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
-	
-	if (RowMap.Num() == 0)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: DT_DailyUpgradeRewardConfigRow表为空"));
-		ChestCountText->SetText(FText::FromString(TEXT("无数据")));
-		return;
-	}
-
-	const FDailyUpgradeRewardConfigRow* TargetRow = nullptr;
-	
-	// 查找ActivityID==110的记录
-	for (const auto& Pair : RowMap)
-	{
-		const FDailyUpgradeRewardConfigRow* Row = reinterpret_cast<const FDailyUpgradeRewardConfigRow*>(Pair.Value);
-		if (Row && Row->ActivityID == 110)
-		{
-			TargetRow = Row;
-			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 找到ActivityID=110的记录"));
-			break;
-		}
-	}
-
-	if (!TargetRow)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 未找到ActivityID=110的记录"));
-		ChestCountText->SetText(FText::FromString(TEXT("未找到记录")));
-		return;
-	}
-
-	// 3. 检查RewardItemCounts数组是否为空
-	if (TargetRow->RewardItemCounts.Num() == 0)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemCounts数组为空"));
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		ChestCountText->SetText(FText::FromString(TEXT("0")));
 		return;
 	}
 
-	// 4. 获取最后一个索引的数据
-	FString LastRewardItemCount = TargetRow->RewardItemCounts.Last();
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 最后一个RewardItemCount: %s"), *LastRewardItemCount);
+	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Sub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		ChestCountText->SetText(FText::FromString(TEXT("0")));
+		return;
+	}
 
-	// 5. 显示在ChestCountText控件上（拼接X前缀）
-	FString DisplayText = FString::Printf(TEXT("X%s"), *LastRewardItemCount);
+	// 调用Subsystem方法获取宝箱数量
+	FString ChestCount = Sub->GetChestCount();
+	
+	// 显示在ChestCountText控件上（拼接X前缀）
+	FString DisplayText = FString::Printf(TEXT("X%s"), *ChestCount);
 	ChestCountText->SetText(FText::FromString(DisplayText));
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: X%s"), *LastRewardItemCount);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: %s"), *DisplayText);
 }
 
 /**
@@ -466,6 +432,22 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		return;
 	}
 
+	// 调用UpgradeActivitySubsystem获取宝箱图标数据
+	TArray<TSoftObjectPtr<UTexture2D>> ChestBoxIcons = Sub->GetChestBoxIcons();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到 %d 个宝箱图标"), ChestBoxIcons.Num());
+	
+	// 调用UpgradeActivitySubsystem获取TaskRelatedValues数据
+	TArray<int32> TaskRelatedValues = Sub->GetTaskRelatedValues();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到 %d 个TaskRelatedValues"), TaskRelatedValues.Num());
+	
+	// 调用UpgradeActivitySubsystem获取当前经验值
+	int32 CurrentExpFromSubsystem = Sub->GetCurrentExperience();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到当前经验值: %d"), CurrentExpFromSubsystem);
+	
+	// 计算需要显示的Widget数量（刨除最后一个索引）
+	int32 DisplayWidgetCount = FMath::Min(Config->RewardItemIDs.Num() - 1, ChestBoxIcons.Num());
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 计划显示 %d 个ExperienceChestClaimWidget（刨除最后一个索引）"), DisplayWidgetCount);
+
 	auto& Record = Sub->GetRecord();
 
 	// 检查 ExperienceChestWidgetClass 是否设置
@@ -478,8 +460,8 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 	// 清空现有的子控件
 	ItemsScrollBox->ClearChildren();
 
-	// 遍历RewardItemIDs创建Widget
-	for (int32 i = 0; i < Config->RewardItemIDs.Num(); ++i)
+	// 遍历RewardItemIDs创建Widget（刨除最后一个索引）
+	for (int32 i = 0; i < DisplayWidgetCount; ++i)
 	{
 		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(GetWorld(), ExperienceChestWidgetClass.Get());
 		if (!ChestWidget)
@@ -505,8 +487,64 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			ChestWidget->ChestCountText->SetText(FText::FromString(DisplayText));
 		}
 		
+		// 设置宝箱图标到ChestClaimButton（刨除最后一个索引）
+		if (i < ChestBoxIcons.Num() && ChestWidget->ChestClaimButton)
+		{
+			UTexture2D* BoxIcon = ChestBoxIcons[i].LoadSynchronous();
+			if (BoxIcon)
+			{
+				ChestWidget->SetChestBoxIcon(BoxIcon);
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 为第%d个宝箱成功设置图标（刨除最后一个索引）"), i + 1);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 第%d个宝箱图标加载失败"), i + 1);
+			}
+		}
+		
+		// 设置ExperienceText显示TaskRelatedValues对应索引的数据
+		if (i < TaskRelatedValues.Num() && ChestWidget->ExperienceText)
+		{
+			FString ExperienceValue = FString::FromInt(TaskRelatedValues[i]);
+			ChestWidget->ExperienceText->SetText(FText::FromString(ExperienceValue));
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 为第%d个宝箱设置ExperienceText: %s"), i + 1, *ExperienceValue);
+			
+			// 根据条件控制HighlightFrameImage显示：
+			// ChestClaimStatus=0 且 TaskRelatedValues[i] < CurrentExperience 时显示高亮框
+			bool bShouldShowHighlight = false;
+			if (Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 0)
+			{
+				if (TaskRelatedValues[i] < CurrentExpFromSubsystem)
+				{
+					bShouldShowHighlight = true;
+				}
+			}
+			
+			if (ChestWidget->HighlightFrameImage)
+			{
+				ChestWidget->HighlightFrameImage->SetVisibility(bShouldShowHighlight ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱HighlightFrameImage显示状态: %s (ChestClaimStatus: %d, TaskRelatedValue: %d, CurrentExperience: %d)"), 
+					i + 1, bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"), 
+					Record.ChestClaimStatus.IsValidIndex(i) ? Record.ChestClaimStatus[i] : -1,
+					TaskRelatedValues[i], CurrentExpFromSubsystem);
+			}
+		}
+		else if (ChestWidget->ExperienceText)
+		{
+			// 如果索引超出范围，显示默认值0
+			ChestWidget->ExperienceText->SetText(FText::FromString(TEXT("0")));
+			UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 第%d个宝箱的TaskRelatedValues索引超出范围，显示默认值0"), i + 1);
+			
+			// 索引超出范围时隐藏高亮框
+			if (ChestWidget->HighlightFrameImage)
+			{
+				ChestWidget->HighlightFrameImage->SetVisibility(ESlateVisibility::Hidden);
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱索引超出范围，隐藏HighlightFrameImage"), i + 1);
+			}
+		}
+		
 		ItemsScrollBox->AddChild(ChestWidget);
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s"), i + 1, bIsClaimed ? TEXT("是") : TEXT("否"));
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s（刨除最后一个索引）"), i + 1, bIsClaimed ? TEXT("是") : TEXT("否"));
 	}
 }
 
@@ -538,6 +576,7 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	if (!GameInstance)
 	{
 		CurrentExpText->SetText(FText::FromString(TEXT("0")));
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		return;
 	}
 
@@ -545,14 +584,17 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	if (!Sub)
 	{
 		CurrentExpText->SetText(FText::FromString(TEXT("0")));
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		return;
 	}
 
-	auto& Record = Sub->GetRecord();
-	FString ExpText = FString::Printf(TEXT("%d"), Record.CurrentExperience);
+	// 调用UpgradeActivitySubsystem类中的方法，查询UpgradeRewardSaveRecord动态表，
+	// 获取最大RecordDate的CurrentExperience的值
+	int32 CurrentExp = Sub->GetCurrentExperience();
+	FString ExpText = FString::Printf(TEXT("%d"), CurrentExp);
 	CurrentExpText->SetText(FText::FromString(ExpText));
 	
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 经验值已更新为: %d"), Record.CurrentExperience);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: CurrentExpText已更新为: %d"), CurrentExp);
 }
 
 /**

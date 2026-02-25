@@ -14,6 +14,7 @@
 #include "Components/Image.h"
 #include "Components/ProgressBar.h"
 #include "Kismet/GameplayStatics.h"
+#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 
 bool UExperienceChestClaimWidget::Initialize()
 {
@@ -167,3 +168,52 @@ void UExperienceChestClaimWidget::UpdateVisualStatus(bool bIsClaimed)
 	
 	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 视觉状态已更新，已领取: %s"), bIsClaimed ? TEXT("是") : TEXT("否"));
 }
+
+void UExperienceChestClaimWidget::SetChestBoxIcon(UTexture2D* BoxIcon)
+{
+	if (!BoxIcon)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: 传入的BoxIcon为空"));
+		return;
+	}
+	
+	// 通过Button Style设置图标
+	if (ChestClaimButton)
+	{
+		// 获取当前按钮样式
+		FButtonStyle ButtonStyle = ChestClaimButton->GetStyle();
+		
+		// 设置正常状态的背景图片
+		FSlateBrush NormalBrush;
+		NormalBrush.SetResourceObject(BoxIcon);
+		NormalBrush.ImageSize = FVector2D(64, 64); // 设置图标大小
+		NormalBrush.DrawAs = ESlateBrushDrawType::Image;
+		ButtonStyle.Normal = NormalBrush;
+		
+		// 设置按下状态的背景图片
+		FSlateBrush PressedBrush;
+		PressedBrush.SetResourceObject(BoxIcon);
+		PressedBrush.ImageSize = FVector2D(64, 64);
+		PressedBrush.DrawAs = ESlateBrushDrawType::Image;
+		PressedBrush.TintColor = FSlateColor(FLinearColor(0.8f, 0.8f, 0.8f, 1.0f)); // 按下时稍微变暗
+		ButtonStyle.Pressed = PressedBrush;
+		
+		// 设置悬停状态的背景图片
+		FSlateBrush HoveredBrush;
+		HoveredBrush.SetResourceObject(BoxIcon);
+		HoveredBrush.ImageSize = FVector2D(64, 64);
+		HoveredBrush.DrawAs = ESlateBrushDrawType::Image;
+		HoveredBrush.TintColor = FSlateColor(FLinearColor(1.2f, 1.2f, 1.2f, 1.0f)); // 悬停时稍微变亮
+		ButtonStyle.Hovered = HoveredBrush;
+		
+		// 应用新的按钮样式
+		ChestClaimButton->SetStyle(ButtonStyle);
+		
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 成功通过Button Style设置宝箱图标"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: ChestClaimButton控件未绑定"));
+	}
+}
+

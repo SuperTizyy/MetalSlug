@@ -117,6 +117,37 @@ public:
      * @return 奖励物品图标数组
      */
     TArray<TSoftObjectPtr<UTexture2D>> GetRewardItemIcons();
+    	
+    /**
+     * @brief 获取宝箱图标数据
+     * @details 按照指定逻辑获取ItemsScrollBox中ExperienceChestClaimWidget的ChestClaimButton图标数据：
+     * 1. 找到DailyUpgradeRewardConfigRow表中ActivityID==110的数据
+     * 2. 获取其RewardItemIDs里面的全部内容
+     * 3. 依次关联TreasureBoxItemRow表的BoxID得到对应的BoxIcon数据
+     * @return 宝箱图标数组
+     */
+    TArray<TSoftObjectPtr<UTexture2D>> GetChestBoxIcons();
+    	
+    /**
+     * @brief 获取宝箱数量
+     * @details 获取DailyUpgradeRewardConfigRow表中ActivityID==110数据的RewardItemCounts最后一个索引值
+     * @return 宝箱数量字符串，失败时返回"0"
+     */
+    FString GetChestCount();
+    	
+    /**
+     * @brief 获取任务相关数值数组
+     * @details 获取DailyUpgradeRewardConfigRow表中ActivityID==110数据的TaskRelatedValues数组
+     * @return TaskRelatedValues数组，失败时返回空数组
+     */
+    TArray<int32> GetTaskRelatedValues();
+    	
+    /**
+     * @brief 获取当前经验值
+     * @details 获取UpgradeRewardSaveRecord动态表中RecordDate最大的数据的CurrentExperience字段
+     * @return 当前经验值
+     */
+    int32 GetCurrentExperience() const;
 
     /**
      * @brief 获取当前奖励图标索引

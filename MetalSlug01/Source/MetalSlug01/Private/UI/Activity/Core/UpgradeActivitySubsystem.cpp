@@ -724,8 +724,66 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetRewardItemIcons
         }
     }
     
-    UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 共获取到 %d 个奖励物品图标"), Result.Num());
-    return Result;
+   	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 共获取到 %d 个奖励物品图标"), Result.Num());
+   	return Result;
+   }
+   
+   TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetChestBoxIcons()
+   {
+   	TArray<TSoftObjectPtr<UTexture2D>> Result;
+   	
+   	// 1. 获取活动配置数据 (ActivityID=110)
+   	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+   	if (!Config || Config->RewardItemIDs.Num() == 0)
+   	{
+   		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取宝箱配置数据"));
+   		return Result;
+   	}
+   	
+   	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 开始获取宝箱图标数据，RewardItemIDs数量: %d"), Config->RewardItemIDs.Num());
+   	
+   	// 2. 通过GameInstance获取ActivitySubsystem
+   	UGameInstance* GameInstance = GetGameInstance();
+   	if (!GameInstance)
+   	{
+   		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取GameInstance"));
+   		return Result;
+   	}
+   	
+   	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+   	if (!ActivitySub)
+   	{
+   		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取ActivitySubsystem"));
+   		return Result;
+   	}
+   	
+   	// 3. 遍历RewardItemIDs，依次关联TreasureBoxItemRow表获取BoxIcon
+   	for (const FString& RewardItemID : Config->RewardItemIDs)
+   	{
+   		int32 BoxID = FCString::Atoi(*RewardItemID);
+   			
+   		if (BoxID <= 0)
+   		{
+   			UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无效的BoxID: %s"), *RewardItemID);
+   			continue;
+   		}
+   			
+   		// 根据BoxID获取TreasureBoxItemRow数据
+   		const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+   		if (TreasureBoxItem && !TreasureBoxItem->BoxIcon.IsNull())
+   		{
+   			Result.Add(TreasureBoxItem->BoxIcon);
+   			UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 添加宝箱图标 - BoxID: %d, ItemID: %d"), 
+   				BoxID, TreasureBoxItem->ItemID);
+   		}
+   		else
+   		{
+   			UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 未找到BoxID %d 的有效宝箱图标"), BoxID);
+   		}
+   	}
+   	
+   	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 共获取到 %d 个宝箱图标"), Result.Num());
+   	return Result;
 }
 
 /**
@@ -1007,4 +1065,59 @@ void UUpgradeActivitySubsystem::CreateInheritedRecord(const FUpgradeRewardSaveRe
     
     UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 创建继承记录完成 - 天数:%d, 任务数:%d, 宝箱数:%d"), 
            CurrentRecord.GetDayNumber(), TaskCount, CurrentRecord.ChestClaimStatus.Num());
+}
+
+FString UUpgradeActivitySubsystem::GetChestCount()
+{
+	// 1. 获取活动配置数据 (ActivityID=110)
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取活动配置数据"));
+		return TEXT("0");
+	}
+	
+	// 2. 检查RewardItemCounts数组是否为空
+	if (Config->RewardItemCounts.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: RewardItemCounts数组为空"));
+		return TEXT("0");
+	}
+	
+	// 3. 获取最后一个索引的数据
+	FString LastRewardItemCount = Config->RewardItemCounts.Last();
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 获取到最后一个RewardItemCount: %s"), *LastRewardItemCount);
+	
+	return LastRewardItemCount;
+}
+
+TArray<int32> UUpgradeActivitySubsystem::GetTaskRelatedValues()
+{
+	TArray<int32> Result;
+	
+	// 1. 获取活动配置数据 (ActivityID=110)
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取活动配置数据"));
+		return Result;
+	}
+	
+	// 2. 直接返回TaskRelatedValues数组
+	Result = Config->TaskRelatedValues;
+	
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 获取到TaskRelatedValues数组，元素数量: %d"), Result.Num());
+	
+	// 记录数组内容用于调试
+	for (int32 i = 0; i < Result.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: TaskRelatedValues[%d] = %d"), i, Result[i]);
+	}
+	
+	return Result;
+}
+
+int32 UUpgradeActivitySubsystem::GetCurrentExperience() const
+{
+	return CurrentRecord.CurrentExperience;
 }

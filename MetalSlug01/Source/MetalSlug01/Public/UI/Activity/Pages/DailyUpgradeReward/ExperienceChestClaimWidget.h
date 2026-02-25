@@ -64,6 +64,8 @@ public:
 	/** 经验值文本 */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* ExperienceText;
+	
+
 
 	// ==================== 数据管理 ====================
 	
@@ -116,4 +118,12 @@ public:
 	 * @param bIsClaimed 是否已领取
 	 */
 	void UpdateVisualStatus(bool bIsClaimed);
+	
+	/**
+	 * @brief 设置宝箱图标
+	 * @param BoxIcon 宝箱图标纹理
+	 * @details 通过Button Style设置ChestClaimButton的显示图标
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
+	void SetChestBoxIcon(UTexture2D* BoxIcon);
 };
