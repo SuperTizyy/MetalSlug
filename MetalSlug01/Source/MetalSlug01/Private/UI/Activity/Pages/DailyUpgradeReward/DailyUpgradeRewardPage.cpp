@@ -96,6 +96,12 @@ bool UDailyUpgradeRewardPage::Initialize()
  */
 void UDailyUpgradeRewardPage::NativeConstruct()
 {
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("🔄 DAILY_UPGRADE_REWARD_PAGE_CONSTRUCT_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 初始页面地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("⏰ 构造时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	
 	Super::NativeConstruct();
 	
 	// 订阅UpgradeActivitySubsystem的奖励图标索引更新事件
@@ -106,6 +112,11 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	UpdateChestCountText();
 	InitializeExperienceChestWidgets();
 	UpdateExperienceDisplay();
+	
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("✅ DAILY_UPGRADE_REWARD_PAGE_CONSTRUCT_END"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 最终页面地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
 /**
@@ -119,8 +130,8 @@ void UDailyUpgradeRewardPage::NativeConstruct()
  */
 void UDailyUpgradeRewardPage::NativeDestruct()
 {
-	// 取消订阅UpgradeActivitySubsystem的事件
-	UnsubscribeFromSubsystemEvents();
+	// 注意：不取消订阅Subsystem事件，让缓存的页面也能持续接收广播
+	// UnsubscribeFromSubsystemEvents(); // 已删除此行
 	
 	// 解绑重选奖励按钮事件
 	if (ReselectRewardButton)
@@ -608,12 +619,49 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
  */
 void UDailyUpgradeRewardPage::RefreshUI()
 {
-	// 重新初始化所有UI组件
-	InitializeExperienceChestWidgets();
-	UpdateChestCountText();
-	UpdateExperienceDisplay();
+	// 🆔 自我身份核对 - 显示页面唯一标识
+	FString PageIdentity = GetPageIdentity();
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("🔄 DAILY_UPGRADE_REWARD_PAGE_REFRESH_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 页面身份: %s"), *PageIdentity);
+	UE_LOG(LogTemp, Log, TEXT("📍 刷新时页面地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("⏰ 刷新时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 	
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: UI已刷新"));
+	// 执行全量刷新：重新初始化所有核心UI组件
+	
+	// 1. 重新初始化奖励物品图标缓存（最重要的数据源）
+	UE_LOG(LogTemp, Log, TEXT("[步骤1/5] 🎯 初始化奖励物品图标缓存..."));
+	InitializeRewardItemIcons();
+	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图标缓存已刷新 (缓存数量: %d)"), CachedItemIcons.Num());
+	
+	// 2. 重新初始化经验宝箱控件列表（核心显示组件）
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/5] 📦 初始化经验宝箱控件列表..."));
+	InitializeExperienceChestWidgets();
+	int32 ChestCount = ItemsScrollBox ? ItemsScrollBox->GetChildrenCount() : 0;
+	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件已刷新 (控件数量: %d)"), ChestCount);
+	
+	// 3. 更新宝箱数量显示
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/5] 📊 更新宝箱数量显示..."));
+	UpdateChestCountText();
+	UE_LOG(LogTemp, Log, TEXT("✅ 宝箱数量文本已刷新"));
+	
+	// 4. 更新经验值显示
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤4/5] ⭐ 更新经验值显示..."));
+	UpdateExperienceDisplay();
+	UE_LOG(LogTemp, Log, TEXT("✅ 经验值显示已刷新"));
+	
+	// 5. 更新奖励物品图像显示（基于最新的缓存数据）
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤5/5] 🖼️ 更新奖励物品图像显示..."));
+	UpdateRewardItemImage();
+	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图像已刷新"));
+	
+	// 🎉 刷新完成总结
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("🎉 DAILY_UPGRADE_REWARD_PAGE_REFRESH_COMPLETE"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 页面身份: %s"), *PageIdentity);
+	UE_LOG(LogTemp, Log, TEXT("📊 最终状态: 宝箱控件数=%d, 图标缓存数=%d"), ChestCount, CachedItemIcons.Num());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
 /**
@@ -735,10 +783,33 @@ void UDailyUpgradeRewardPage::SubscribeToSubsystemEvents()
 		return;
 	}
 	
+	// 记录Subsystem地址用于调试
+	UE_LOG(LogTemp, Log, TEXT("🔗 Subsystem地址绑定: %p -> Page地址: %p"), UpgradeSub, this);
+	
+	// 先解绑已存在的事件绑定，防止重复绑定（因为NativeConstruct会多次触发）
+	UpgradeSub->OnRewardIconIndexChanged.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnRewardIconIndexChanged);
+	UpgradeSub->OnGlobalRefresh.RemoveDynamic(this, &UDailyUpgradeRewardPage::RefreshUI);
+	
 	// 订阅奖励图标索引更新事件
 	UpgradeSub->OnRewardIconIndexChanged.AddDynamic(this, &UDailyUpgradeRewardPage::OnRewardIconIndexChanged);
 	
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已订阅Subsystem事件"));
+	// 订阅全局刷新事件
+	UpgradeSub->OnGlobalRefresh.AddDynamic(this, &UDailyUpgradeRewardPage::RefreshUI);
+	
+	UE_LOG(LogTemp, Log, TEXT("✅ 事件绑定完成:"));
+	UE_LOG(LogTemp, Log, TEXT("   OnRewardIconIndexChanged: %s"), UpgradeSub->OnRewardIconIndexChanged.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
+	UE_LOG(LogTemp, Log, TEXT("   OnGlobalRefresh: %s"), UpgradeSub->OnGlobalRefresh.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
+	UE_LOG(LogTemp, Log, TEXT("🔗 绑定关系: Subsystem[%p] <-> Page[%p]"), UpgradeSub, this);
+	
+	// 验证绑定是否真的成功
+	if (UpgradeSub->OnGlobalRefresh.IsBound())
+	{
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ✅ OnGlobalRefresh事件绑定成功"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ❌ OnGlobalRefresh事件绑定失败"));
+	}
 }
 
 void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()
@@ -759,6 +830,9 @@ void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()
 	// 取消订阅奖励图标索引更新事件
 	UpgradeSub->OnRewardIconIndexChanged.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnRewardIconIndexChanged);
 	
+	// 取消订阅全局刷新事件
+	UpgradeSub->OnGlobalRefresh.RemoveDynamic(this, &UDailyUpgradeRewardPage::RefreshUI);
+	
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已取消订阅Subsystem事件"));
 }
 
@@ -772,5 +846,21 @@ void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
 	// 更新奖励物品图像显示
 	UpdateRewardItemImage();
 	
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: UI已根据新索引更新完成"));
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 奖励图标索引更新完成"));
+}
+
+void UDailyUpgradeRewardPage::ManualRefreshUI()
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 手动刷新UI被调用 - 页面地址=%p"), this);
+	RefreshUI();
+}
+
+FString UDailyUpgradeRewardPage::GetPageIdentity() const
+{
+	// 生成页面唯一身份标识
+	FString AddressStr = FString::Printf(TEXT("0x%p"), this);
+	FString TimestampStr = FDateTime::Now().ToString(TEXT("MMdd-HHmmss"));
+	
+	// 返回格式化的身份字符串
+	return FString::Printf(TEXT("Page[%s]@%s"), *AddressStr, *TimestampStr);
 }

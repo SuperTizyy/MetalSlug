@@ -11,6 +11,13 @@
 
 void URewardOptionCardWidget::NativeConstruct()
 {
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("🔄 REWARD_OPTION_CARD_WIDGET_CONSTRUCT_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 卡片Widget地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("📋 卡片索引: %d"), CardIndex);
+	UE_LOG(LogTemp, Log, TEXT("⏰ 构造时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	
 	Super::NativeConstruct();
 
 	// 绑定复选框状态改变事件
@@ -18,6 +25,14 @@ void URewardOptionCardWidget::NativeConstruct()
 	{
 		SelectionCheckBox->OnCheckStateChanged.AddDynamic(this, &URewardOptionCardWidget::OnCheckBoxStateChanged);
 	}
+	
+	// 订阅UpgradeActivitySubsystem的奖励图标索引更新事件
+	SubscribeToRewardIconEvents();
+	
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("✅ REWARD_OPTION_CARD_WIDGET_CONSTRUCT_END"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 最终Widget地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
 void URewardOptionCardWidget::InitializeCard(int32 InRewardID, int32 InRewardCount, const FText& InRewardName, UTexture2D* InRewardIcon)
@@ -43,6 +58,47 @@ void URewardOptionCardWidget::InitializeCard(int32 InRewardID, int32 InRewardCou
 	if (SelectionCheckBox)
 	{
 		SelectionCheckBox->SetIsChecked(false);
+	}
+}
+
+void URewardOptionCardWidget::SubscribeToRewardIconEvents()
+{
+	// 通过GameInstance获取UpgradeActivitySubsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("RewardOptionCardWidget: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!UpgradeSub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("RewardOptionCardWidget: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// 订阅奖励图标索引更新事件
+	UpgradeSub->OnRewardIconIndexChanged.AddDynamic(this, &URewardOptionCardWidget::OnRewardIconIndexChanged);
+	
+	UE_LOG(LogTemp, Log, TEXT("RewardOptionCardWidget: 已订阅奖励图标索引更新事件 - 卡片索引: %d"), CardIndex);
+}
+
+void URewardOptionCardWidget::OnRewardIconIndexChanged(int32 NewIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("RewardOptionCardWidget: 收到奖励图标索引更新事件 - 新索引: %d, 当前卡片索引: %d"), 
+		NewIndex, CardIndex);
+	
+	// 检查当前卡片是否应该被选中
+	bool bShouldBeSelected = (CardIndex == NewIndex);
+	
+	if (bIsSelected != bShouldBeSelected)
+	{
+		UE_LOG(LogTemp, Log, TEXT("RewardOptionCardWidget: 更新选中状态 - 从 %s 变为 %s"), 
+			bIsSelected ? TEXT("选中") : TEXT("未选中"),
+			bShouldBeSelected ? TEXT("选中") : TEXT("未选中"));
+		
+		SetSelected(bShouldBeSelected);
 	}
 }
 

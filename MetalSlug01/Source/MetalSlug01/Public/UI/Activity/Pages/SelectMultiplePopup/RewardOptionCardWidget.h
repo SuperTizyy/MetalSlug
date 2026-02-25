@@ -124,6 +124,13 @@ protected:
 	virtual void NativeConstruct() override;
 
 private:
+	/** 订阅奖励图标索引更新事件 */
+	void SubscribeToRewardIconEvents();
+	
+	/** 奖励图标索引更新事件回调 */
+	UFUNCTION()
+	void OnRewardIconIndexChanged(int32 NewIndex);
+	
 	/** 复选框状态改变回调 */
 	UFUNCTION()
 	void OnCheckBoxStateChanged(bool bIsChecked);

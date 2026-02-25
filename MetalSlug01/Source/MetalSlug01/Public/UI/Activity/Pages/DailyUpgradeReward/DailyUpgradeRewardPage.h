@@ -37,6 +37,15 @@ public:
 	virtual bool Initialize() override;
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
+	
+	// ==================== 蓝图可调用函数 ====================
+	
+	/**
+	 * @brief 手动刷新UI - 用于调试测试
+	 * @note 可以在蓝图中调用此函数来测试UI刷新功能
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|Debug")
+	void ManualRefreshUI();
 
 protected:
 	// ==================== UI控件引用 ====================
@@ -127,6 +136,12 @@ protected:
 	void UnbindEventHandlers();
 
 	// ==================== UI更新方法 ====================
+	
+	/**
+	 * @brief 获取页面唯一身份标识
+	 * @return 页面身份字符串（包含地址和创建时间等信息）
+	 */
+	FString GetPageIdentity() const;
 	
 	/**
 	 * @brief 更新加成图标显示
@@ -233,6 +248,7 @@ private:
 	 * @brief 刷新UI显示
 	 * @details 重新初始化所有UI组件以反映最新状态
 	 */
+	UFUNCTION()
 	void RefreshUI();
 
 	/**

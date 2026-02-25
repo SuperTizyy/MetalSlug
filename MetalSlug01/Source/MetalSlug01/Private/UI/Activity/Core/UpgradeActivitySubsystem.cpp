@@ -19,6 +19,7 @@
 #include "Engine/Engine.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "Misc/DateTime.h"
+#include "Tools/UpgradeActivitySaveModifier.h"
 
 /**
  * @brief 子系统初始化函数
@@ -58,6 +59,12 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
         CreateTodayRecord();
     }
     
+    // 3. 初始化升级活动存档修改器
+    SaveModifier = NewObject<UUpgradeActivitySaveModifier>(this);
+    SaveModifier->InitializeModifier(this, this);  // 传入自身作为Subsystem
+    SaveModifier->RegisterConsoleCommands();
+    UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 存档修改器初始化完成"));
+    
     UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem initialized"));
 }
 
@@ -72,6 +79,14 @@ void UUpgradeActivitySubsystem::Deinitialize()
 {
     // 保存数据 - 在系统关闭前确保所有进度都被持久化
     SaveStatus();
+    
+    // 清理存档修改器
+    if (SaveModifier)
+    {
+        SaveModifier->UnregisterConsoleCommands();
+        SaveModifier->DestroyModifier();
+        SaveModifier = nullptr;
+    }
     
     Super::Deinitialize();
     
@@ -1121,3 +1136,4 @@ int32 UUpgradeActivitySubsystem::GetCurrentExperience() const
 {
 	return CurrentRecord.CurrentExperience;
 }
+

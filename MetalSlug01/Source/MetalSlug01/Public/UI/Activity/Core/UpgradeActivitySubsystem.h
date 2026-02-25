@@ -14,6 +14,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
+#include "Tools/UpgradeActivitySaveModifier.h"
 #include "UpgradeActivitySubsystem.generated.h"
 
 /**
@@ -21,6 +22,11 @@
  * @param NewIndex 新的奖励图标索引
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRewardIconIndexChanged, int32, NewIndex);
+
+/**
+ * @brief 全局刷新委托
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnGlobalRefresh);
 
 /**
  * @brief 升级奖励活动子系统
@@ -37,6 +43,10 @@ public:
     /** 奖励图标索引更新事件 */
     UPROPERTY(BlueprintAssignable, Category = "Upgrade Events")
     FOnRewardIconIndexChanged OnRewardIconIndexChanged;
+    
+    /** 全局刷新事件 */
+    UPROPERTY(BlueprintAssignable, Category = "Upgrade Events")
+    FOnGlobalRefresh OnGlobalRefresh;
     
     // ==================== 生命周期 ====================
     
@@ -210,11 +220,16 @@ public:
      */
     const FUpgradeRewardSaveRecord* GetLatestSaveRecord() const;
 
+
 private:
     // ==================== 私有成员 ====================
     
     /** 当前存档记录 */
     FUpgradeRewardSaveRecord CurrentRecord;
+    
+    /** 升级活动存档修改器 */
+    UPROPERTY()
+    UUpgradeActivitySaveModifier* SaveModifier;
     
     /** 缓存的配置表 */
     UPROPERTY()
