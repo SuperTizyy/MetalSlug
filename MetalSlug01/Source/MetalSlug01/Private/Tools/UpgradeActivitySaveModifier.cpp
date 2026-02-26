@@ -998,16 +998,76 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.CreateRecord"),
 		TEXT("创建新记录: Upgrade.CreateRecord RecordDate [InheritPrevious=1]"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 1)
 			{
 				int32 RecordDate = FCString::Atoi(*Args[0]);
 				bool bInherit = Args.Num() >= 2 ? (FCString::Atoi(*Args[1]) != 0) : true;
-				
-				bool bSuccess = CreateNewRecord(RecordDate, bInherit, true);
-				UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 创建记录 RecordDate=%d Inherit=%s %s"), 
-					RecordDate, bInherit ? TEXT("是") : TEXT("否"), bSuccess ? TEXT("成功") : TEXT("失败"));
+								
+				// 通过GameInstance获取最新的Subsystem实例
+				if (WorldContext.IsValid())
+				{
+					UWorld* World = WorldContext->GetWorld();
+					if (World)
+					{
+						UGameInstance* GameInstance = World->GetGameInstance();
+						if (GameInstance)
+						{
+							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+							if (Subsystem)
+							{
+								// 直接操作Subsystem创建新记录
+								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+								UE_LOG(LogTemp, Log, TEXT("🔧 SUBSYSTEM_CREATE_RECORD_START"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📊 创建记录: RecordDate=%d, Inherit=%s"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
+								UE_LOG(LogTemp, Log, TEXT("⏰ 操作时间: %s"), *FDateTime::Now().ToString());
+								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+												
+								// 调用Subsystem的创建方法（如果存在）或者直接操作
+								FUpgradeRewardSaveRecord NewRecord;
+								NewRecord.SetRecordDate(RecordDate);
+								NewRecord.CurrentExperience = 0;
+								NewRecord.RewardIconIndex = 0;
+								NewRecord.LimitedActivityCompleteCount = 0;
+												
+								// 初始化数组
+								for (int32 i = 0; i < MAX_CHEST_COUNT; ++i)
+								{
+									NewRecord.ChestClaimStatus[i] = 0;
+								}
+								for (int32 i = 0; i < MAX_TASK_COUNT; ++i)
+								{
+									NewRecord.TaskCompleteCounts[i] = 0;
+									NewRecord.TaskClaimStatus[i] = 0;
+								}
+												
+								NewRecord.LastUpdateTime = FDateTime::Now();
+												
+								// 更新Subsystem中的记录
+								Subsystem->GetRecord() = NewRecord;
+												
+								// 保存到磁盘
+								Subsystem->SaveStatus();
+												
+								// 触发UI刷新
+								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+								UE_LOG(LogTemp, Log, TEXT("🔊 BROADCAST_EVENT_TRIGGER_START"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 广播Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📢 触发事件: OnGlobalRefresh.Broadcast()"));
+								Subsystem->OnGlobalRefresh.Broadcast();
+								UE_LOG(LogTemp, Log, TEXT("✅ OnGlobalRefresh.Broadcast()调用完成"));
+								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+												
+								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 创建记录 RecordDate=%d Inherit=%s 成功"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
+								return;
+							}
+						}
+					}
+				}
+								
+				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
 			}
 			else
 			{
@@ -1020,15 +1080,77 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.Reset"),
 		TEXT("重置记录数据: Upgrade.Reset RecordDate"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 1)
 			{
 				int32 RecordDate = FCString::Atoi(*Args[0]);
-				
-				bool bSuccess = ResetRecordData(RecordDate, true);
-				UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 重置数据 RecordDate=%d %s"), 
-					RecordDate, bSuccess ? TEXT("成功") : TEXT("失败"));
+								
+				// 通过GameInstance获取最新的Subsystem实例
+				if (WorldContext.IsValid())
+				{
+					UWorld* World = WorldContext->GetWorld();
+					if (World)
+					{
+						UGameInstance* GameInstance = World->GetGameInstance();
+						if (GameInstance)
+						{
+							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+							if (Subsystem)
+							{
+								// 直接重置Subsystem热数据
+								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+								UE_LOG(LogTemp, Log, TEXT("🔧 SUBSYSTEM_RESET_DATA_START"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📊 重置记录: RecordDate=%d"), RecordDate);
+								UE_LOG(LogTemp, Log, TEXT("⏰ 操作时间: %s"), *FDateTime::Now().ToString());
+								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+												
+								// 获取原始数据用于日志记录
+								int32 OriginalExp = Subsystem->GetRecord().CurrentExperience;
+								int32 OriginalIcon = Subsystem->GetRecord().RewardIconIndex;
+												
+								// 重置数据
+								Subsystem->GetRecord().CurrentExperience = 0;
+								Subsystem->GetRecord().RewardIconIndex = 0;
+								Subsystem->GetRecord().LimitedActivityCompleteCount = 0;
+												
+								// 重置数组
+								for (int32 i = 0; i < MAX_CHEST_COUNT && i < Subsystem->GetRecord().ChestClaimStatus.Num(); ++i)
+								{
+									Subsystem->GetRecord().ChestClaimStatus[i] = 0;
+								}
+								for (int32 i = 0; i < MAX_TASK_COUNT && i < Subsystem->GetRecord().TaskCompleteCounts.Num(); ++i)
+								{
+									Subsystem->GetRecord().TaskCompleteCounts[i] = 0;
+									Subsystem->GetRecord().TaskClaimStatus[i] = 0;
+								}
+												
+								Subsystem->GetRecord().LastUpdateTime = FDateTime::Now();
+												
+								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 重置前数据 - 经验=%d, 图标=%d"), OriginalExp, OriginalIcon);
+								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 重置后数据 - 经验=0, 图标=0"));
+												
+								// 保存到磁盘
+								Subsystem->SaveStatus();
+												
+								// 触发UI刷新
+								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+								UE_LOG(LogTemp, Log, TEXT("🔊 BROADCAST_EVENT_TRIGGER_START"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 广播Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📢 触发事件: OnGlobalRefresh.Broadcast()"));
+								Subsystem->OnGlobalRefresh.Broadcast();
+								UE_LOG(LogTemp, Log, TEXT("✅ OnGlobalRefresh.Broadcast()调用完成"));
+								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+												
+								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 重置数据 RecordDate=%d 成功"), RecordDate);
+								return;
+							}
+						}
+					}
+				}
+								
+				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
 			}
 			else
 			{
@@ -1041,12 +1163,66 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.ShowInfo"),
 		TEXT("显示记录信息: Upgrade.ShowInfo RecordDate"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 1)
 			{
 				int32 RecordDate = FCString::Atoi(*Args[0]);
-				DisplayUpgradeActivityInfo(RecordDate);
+								
+				// 通过GameInstance获取最新的Subsystem实例
+				if (WorldContext.IsValid())
+				{
+					UWorld* World = WorldContext->GetWorld();
+					if (World)
+					{
+						UGameInstance* GameInstance = World->GetGameInstance();
+						if (GameInstance)
+						{
+							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+							if (Subsystem)
+							{
+								// 显示Subsystem中的实时数据
+								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+								UE_LOG(LogTemp, Log, TEXT("📋 SUBSYSTEM_DATA_DISPLAY_START"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📊 显示记录: RecordDate=%d"), RecordDate);
+								UE_LOG(LogTemp, Log, TEXT("⏰ 显示时间: %s"), *FDateTime::Now().ToString());
+								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+												
+								const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+												
+								UE_LOG(LogTemp, Log, TEXT("===== 升级活动信息 (RecordDate: %d) ====="), RecordDate);
+								UE_LOG(LogTemp, Log, TEXT("当前经验值: %d"), Record.CurrentExperience);
+								UE_LOG(LogTemp, Log, TEXT("奖励图标索引: %d"), Record.RewardIconIndex);
+								UE_LOG(LogTemp, Log, TEXT("限时活动完成次数: %d"), Record.LimitedActivityCompleteCount);
+								UE_LOG(LogTemp, Log, TEXT("最后更新时间: %s"), *Record.LastUpdateTime.ToString());
+												
+								// 显示宝箱状态
+								FString ChestStatus = TEXT("宝箱状态: ");
+								for (int32 i = 0; i < Record.ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
+								{
+									ChestStatus += FString::Printf(TEXT("[%d]=%d "), i, Record.ChestClaimStatus[i]);
+								}
+								UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
+												
+								// 显示任务状态
+								FString TaskStatus = TEXT("任务状态: ");
+								for (int32 i = 0; i < Record.TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
+								{
+									TaskStatus += FString::Printf(TEXT("[%d]完成=%d 领取=%d "), i, Record.TaskCompleteCounts[i], Record.TaskClaimStatus[i]);
+								}
+								UE_LOG(LogTemp, Log, TEXT("%s"), *TaskStatus);
+												
+								UE_LOG(LogTemp, Log, TEXT("修改器状态: 已启用热数据连接"));
+								UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("====================================="));
+								return;
+							}
+						}
+					}
+				}
+								
+				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
 			}
 			else
 			{
