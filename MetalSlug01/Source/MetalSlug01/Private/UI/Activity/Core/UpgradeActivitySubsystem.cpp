@@ -996,6 +996,21 @@ const FUpgradeRewardSaveRecord* UUpgradeActivitySubsystem::GetLatestSaveRecord()
     return LatestRecord;
 }
 
+UDailyLoginSaveGame* UUpgradeActivitySubsystem::GetSaveGameInstance() const
+{
+    // 加载存档数据
+    UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
+        UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+    
+    if (!LoadedSave)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法加载存档实例"));
+        return nullptr;
+    }
+    
+    return LoadedSave;
+}
+
 /**
  * @brief 检查日期是否为今天
  * @param DateToCheck 要检查的日期

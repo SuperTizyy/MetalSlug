@@ -1256,31 +1256,39 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 							UE_LOG(LogTemp, Log, TEXT("📊 显示所有记录信息"));
 							UE_LOG(LogTemp, Log, TEXT("⏰ 显示时间: %s"), *FDateTime::Now().ToString());
 							UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+																				
+							// 获取存档游戏实例来访问所有记录
+							UDailyLoginSaveGame* SaveGame = Subsystem->GetSaveGameInstance();
+							if (!SaveGame)
+							{
+								UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取存档实例"));
+								return;
+							}
 														
 							// 获取所有记录日期
 							TArray<int32> RecordDates;
-							for (const auto& Pair : Subsystem->GetAllRecords())
+							for (const auto& Pair : SaveGame->UpgradeRewardRecords)
 							{
 								RecordDates.Add(Pair.Key);
 							}
-								
+														
 							// 按日期排序
 							RecordDates.Sort([](int32 A, int32 B) { return A < B; });
-								
+														
 							if (RecordDates.Num() == 0)
 							{
 								UE_LOG(LogTemp, Log, TEXT("⚠️ 没有找到任何记录数据"));
 								return;
 							}
-								
+														
 							UE_LOG(LogTemp, Log, TEXT("===== 所有升级活动记录信息 ====="));
 							UE_LOG(LogTemp, Log, TEXT("总记录数: %d"), RecordDates.Num());
 							UE_LOG(LogTemp, Log, TEXT("====================================="));
-								
+														
 							// 显示每条记录的详细信息
 							for (int32 RecordDate : RecordDates)
 							{
-								const FUpgradeRewardSaveRecord* Record = Subsystem->GetAllRecords().Find(RecordDate);
+								const FUpgradeRewardSaveRecord* Record = SaveGame->UpgradeRewardRecords.Find(RecordDate);
 								if (Record)
 								{
 									UE_LOG(LogTemp, Log, TEXT("\n--- 第%d天记录 ---"), RecordDate);
@@ -1288,7 +1296,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 									UE_LOG(LogTemp, Log, TEXT("奖励图标索引: %d"), Record->RewardIconIndex);
 									UE_LOG(LogTemp, Log, TEXT("限时活动完成次数: %d"), Record->LimitedActivityCompleteCount);
 									UE_LOG(LogTemp, Log, TEXT("最后更新时间: %s"), *Record->LastUpdateTime.ToString());
-										
+																
 									// 显示宝箱状态
 									FString ChestStatus = TEXT("宝箱状态: ");
 									for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
@@ -1296,7 +1304,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 										ChestStatus += FString::Printf(TEXT("[%d]=%d "), i, Record->ChestClaimStatus[i]);
 									}
 									UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
-										
+																
 									// 显示任务状态
 									FString TaskStatus = TEXT("任务状态: ");
 									for (int32 i = 0; i < Record->TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)

@@ -219,6 +219,13 @@ public:
      * @details 从存档中找出CreatedTime最新的记录
      */
     const FUpgradeRewardSaveRecord* GetLatestSaveRecord() const;
+    
+    /**
+     * @brief 获取存档游戏实例
+     * @return 存档游戏实例指针，如果加载失败则返回nullptr
+     * @details 从磁盘加载存档游戏实例，用于访问所有记录数据
+     */
+    UDailyLoginSaveGame* GetSaveGameInstance() const;
 
 
 private:
