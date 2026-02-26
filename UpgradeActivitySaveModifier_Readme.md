@@ -1,316 +1,188 @@
-# UpgradeActivitySaveModifier 使用说明
+# UpgradeActivitySaveModifier 控制台命令手册
 
-## 概述
-UpgradeActivitySaveModifier是一个专门用于运行时修改UpgradeActivitySubsystem数据的独立工具类。它与Subsystem完全解耦，提供了灵活的数据修改、查询和持久化功能。
+## 可用控制台命令列表
 
-## 设计理念
-- **职责分离**: 修改器专注数据操作，Subsystem专注业务逻辑
-- **独立运行**: 可以单独使用，无需依赖Subsystem实例
-- **数据共享**: 与Subsystem操作相同的数据源，实现数据一致性
-- **开发友好**: 提供丰富的调试接口和详细的日志输出
+以下是所有可用的控制台调试命令，可以直接在Unreal Editor的控制台中使用。
 
-## 核心特性
-- **热数据连接**: 直接操作Subsystem内存中的活动数据，修改立即生效
-- **双重操作模式**: 优先修改热数据，可选同步保存到磁盘
-- **智能降级**: Subsystem不可用时自动回退到存档操作
-- **完全解耦**: 独立于UpgradeActivitySubsystem运行
-- **自动UI刷新**: 修改后自动调用Broadcast触发界面更新
-- **数据持久化**: 所有修改自动保存到.sav文件
-- **控制台命令**: 丰富的调试指令支持
-- **参数验证**: 完善的输入参数检查
-
-## 可用控制台命令
+## 完整控制台命令详解
 
 ### 1. 设置经验值
 ```
 Upgrade.SetExp [记录日期] [经验值]
 ```
-**功能**: 设置指定日期的经验值  
-**示例**: 
+- **功能**: 直接修改指定日期的经验值，立即生效并触发UI刷新
+- **参数说明**: 
+  - 记录日期: 整数，表示第几天的记录
+  - 经验值: 非负整数
+- **示例**: 
 ```
-Upgrade.SetExp 1 150
+Upgrade.SetExp 1 150     // 设置第1天经验为150
+Upgrade.SetExp 2 300     // 设置第2天经验为300
 ```
+- **效果**: 修改后自动保存到磁盘并广播刷新事件
 
 ### 2. 设置奖励图标索引
 ```
 Upgrade.SetIcon [记录日期] [图标索引]
 ```
-**功能**: 设置指定日期的奖励图标索引  
-**示例**: 
+- **功能**: 设置指定日期的奖励图标索引
+- **参数说明**: 
+  - 记录日期: 整数
+  - 图标索引: 非负整数
+- **示例**: 
 ```
-Upgrade.SetIcon 1 2
+Upgrade.SetIcon 1 2      // 设置第1天奖励图标索引为2
+Upgrade.SetIcon 1 0      // 设置第1天奖励图标索引为0(默认)
 ```
+- **效果**: 触发OnRewardIconIndexChanged事件
 
 ### 3. 设置宝箱领取状态
 ```
 Upgrade.SetChest [记录日期] [宝箱索引] [状态]
 ```
-**功能**: 设置指定宝箱的领取状态  
-**参数**: 状态(0=未领取, 1=已领取)  
-**示例**: 
+- **功能**: 设置指定宝箱的领取状态
+- **参数说明**: 
+  - 记录日期: 整数
+  - 宝箱索引: 从0开始的索引
+  - 状态: 0=未领取, 1=已领取
+- **示例**: 
 ```
-Upgrade.SetChest 1 0 1    // 设置第一个宝箱为已领取
+Upgrade.SetChest 1 0 1   // 设置第1天第1个宝箱为已领取
+Upgrade.SetChest 1 2 0   // 设置第1天第3个宝箱为未领取
 ```
+- **注意**: 宝箱索引不能超出数组边界
 
 ### 4. 创建新记录
 ```
 Upgrade.CreateRecord [记录日期] [继承前一天数据]
 ```
-**功能**: 创建指定日期的新记录  
-**参数**: 继承参数(0=不继承, 1=继承，默认为1)  
-**示例**: 
+- **功能**: 创建指定日期的新记录
+- **参数说明**: 
+  - 记录日期: 整数
+  - 继承参数: 0=不继承前一天数据, 1=继承前一天数据(默认)
+- **示例**: 
 ```
-Upgrade.CreateRecord 2 1    // 创建第2天记录并继承第1天数据
+Upgrade.CreateRecord 2 1     // 创建第2天记录，继承第1天数据
+Upgrade.CreateRecord 3 0     // 创建第3天记录，不继承数据
+Upgrade.CreateRecord 4       // 创建第4天记录，使用默认继承
 ```
+- **继承规则**: 
+  - 继承经验值和奖励图标索引
+  - 宝箱状态重置为未领取
+  - 任务状态重置为初始状态
 
 ### 5. 重置记录数据
 ```
 Upgrade.Reset [记录日期]
 ```
-**功能**: 重置指定日期的所有数据到初始状态  
-**示例**: 
+- **功能**: 将指定日期的所有数据重置到初始状态
+- **参数说明**: 记录日期: 整数
+- **示例**: 
 ```
-Upgrade.Reset 1
+Upgrade.Reset 1          // 重置第1天所有数据
+Upgrade.Reset 2          // 重置第2天所有数据
 ```
+- **重置内容**: 
+  - 经验值: 0
+  - 奖励图标索引: 0
+  - 宝箱状态: 全部未领取
+  - 任务状态: 全部未完成未领取
+  - 限时活动次数: 0
 
 ### 6. 显示记录信息
 ```
 Upgrade.ShowInfo [记录日期]
 ```
-**功能**: 显示指定日期的完整数据信息  
-**示例**: 
+- **功能**: 显示指定日期的完整数据信息
+- **参数说明**: 记录日期: 整数
+- **示例**: 
 ```
-Upgrade.ShowInfo 1
+Upgrade.ShowInfo 1       // 显示第1天详细信息
+Upgrade.ShowInfo 2       // 显示第2天详细信息
 ```
+- **显示内容**: 
+  - 当前经验值
+  - 奖励图标索引
+  - 限时活动完成次数
+  - 宝箱领取状态列表
+  - 任务完成和领取状态
+  - 最后更新时间
+  - Subsystem实例地址
 
-## C++ API接口
-
-### 初始化和销毁
-```cpp
-// 初始化修改器
-bool InitializeModifier(UObject* WorldContext);
-
-// 销毁修改器
-void DestroyModifier();
+### 7. 显示所有记录信息 ⭐ 新增
 ```
-
-### 数据修改接口
-```cpp
-// 修改经验值
-bool ModifyCurrentExperience(int32 RecordDate, int32 NewExp, bool bAutoSave = true);
-
-// 修改奖励图标索引
-bool ModifyRewardIconIndex(int32 RecordDate, int32 NewIndex, bool bAutoSave = true);
-
-// 修改宝箱领取状态
-bool ModifyChestClaimStatus(int32 RecordDate, int32 ChestIndex, int32 IsClaimed, bool bAutoSave = true);
-
-// 修改任务完成次数
-bool ModifyTaskCompleteCount(int32 RecordDate, int32 TaskIndex, int32 Count, bool bAutoSave = true);
-
-// 修改任务领取状态
-bool ModifyTaskClaimStatus(int32 RecordDate, int32 TaskIndex, int32 IsClaimed, bool bAutoSave = true);
-
-// 修改限时活动完成次数
-bool ModifyLimitedActivityCount(int32 RecordDate, int32 Count, bool bAutoSave = true);
-
-// 重置记录数据
-bool ResetRecordData(int32 RecordDate, bool bAutoSave = true);
-
-// 创建新记录
-bool CreateNewRecord(int32 RecordDate, bool bInheritPrevious = true, bool bAutoSave = true);
+Upgrade.ShowAllInfo
 ```
-
-### 数据查询接口
-```cpp
-// 获取经验值
-int32 GetCurrentExperience(int32 RecordDate) const;
-
-// 获取奖励图标索引
-int32 GetRewardIconIndex(int32 RecordDate) const;
-
-// 获取宝箱领取状态
-int32 GetChestClaimStatus(int32 RecordDate, int32 ChestIndex) const;
-
-// 获取任务完成次数
-int32 GetTaskCompleteCount(int32 RecordDate, int32 TaskIndex) const;
-
-// 获取任务领取状态
-int32 GetTaskClaimStatus(int32 RecordDate, int32 TaskIndex) const;
-
-// 获取限时活动完成次数
-int32 GetLimitedActivityCount(int32 RecordDate) const;
+- **功能**: 显示所有天数的记录信息，按日期顺序排列
+- **参数说明**: 无参数
+- **示例**: 
 ```
+Upgrade.ShowAllInfo      // 显示所有记录的详细信息
+```
+- **显示内容**: 
+  - 总记录数统计
+  - 每条记录的详细数据（按日期升序排列）
+  - 当前经验值、奖励图标索引、限时活动次数
+  - 宝箱和任务状态详情
+  - 最后更新时间
+  - Subsystem实例地址
+- **使用场景**: 
+  - 快速查看所有记录的整体状态
+  - 对比不同日期的数据变化
+  - 调试时全面了解系统数据状况
 
-### 保存接口
-```cpp
-// 保存指定记录
-bool SaveRecord(int32 RecordDate);
+## 使用技巧和注意事项
 
-// 保存所有记录
-bool SaveAllRecords();
+### 快速调试流程
+1. 打开Unreal Editor控制台 (波浪号键 `~`)
+2. 输入对应命令进行调试
+3. 使用 `Upgrade.ShowInfo` 验证修改结果
+4. 观察UI界面是否自动刷新
 
-// 加载记录
-bool LoadRecord(int32 RecordDate);
+### 常用调试组合
+```
+# 完整调试流程示例
+Upgrade.SetExp 1 500         // 设置高经验值
+Upgrade.SetIcon 1 3          // 设置奖励图标
+Upgrade.SetChest 1 0 1       // 领取第一个宝箱
+Upgrade.SetChest 1 1 1       // 领取第二个宝箱
+Upgrade.ShowInfo 1           // 查看单条记录结果
+Upgrade.ShowAllInfo          // 查看所有记录状态 ⭐ 新增
+
+# 重置后重新测试
+Upgrade.Reset 1              // 重置数据
+Upgrade.ShowInfo 1           // 确认重置成功
+
+# 多记录批量查看
+Upgrade.CreateRecord 2 1     // 创建第2天记录
+Upgrade.SetExp 2 800         // 设置第2天经验
+Upgrade.ShowAllInfo          // 同时查看第1天和第2天数据
 ```
 
-## 使用示例
+### 错误处理
+- **参数错误**: 命令会显示使用方法提示
+- **索引越界**: 会给出警告信息
+- **Subsystem未就绪**: 会提示无法获取实例
 
-### 基本使用流程
-```cpp
-// 1. 创建修改器实例
-UUpgradeActivitySaveModifier* Modifier = NewObject<UUpgradeActivitySaveModifier>();
+### 调试日志说明
+所有命令执行时都会输出详细的调试信息：
+- Subsystem实例内存地址
+- 操作前后的数据对比
+- 操作时间和执行状态
+- 广播事件触发情况
 
-// 2. 初始化 - 推荐方式：传入Subsystem实例
-UUpgradeActivitySubsystem* ActivitySubsystem = GetGameInstance()->GetSubsystem<UUpgradeActivitySubsystem>();
-Modifier->InitializeModifier(GetWorld(), ActivitySubsystem);
+### 最佳实践
+1. **按顺序操作**: 建议按经验→图标→宝箱的顺序进行设置
+2. **及时验证**: 每次修改后使用ShowInfo确认结果
+3. **合理重置**: 测试完成后及时重置数据保持环境清洁
+4. **注意继承**: 创建新记录时考虑是否需要继承前一天数据
 
-// 或者让修改器自动获取Subsystem
-// Modifier->InitializeModifier(GetWorld());
+## 版本信息
 
-// 3. 执行修改操作（直接修改内存数据）
-Modifier->ModifyCurrentExperience(1, 200);  // 立即生效
-Modifier->ModifyRewardIconIndex(1, 3);      // 立即生效
+- **当前版本**: 1.0
+- **适用引擎**: Unreal Engine 5.4+
+- **平台支持**: Windows 64-bit
+- **最后更新**: 2026年2月
 
-// 4. 查看结果
-int32 CurrentExp = Modifier->GetCurrentExperience(1);
-UE_LOG(LogTemp, Log, TEXT("当前经验值: %d"), CurrentExp);
-
-// 5. 销毁修改器
-Modifier->DestroyModifier();
-```
-
-### 控制台调试示例
-```bash
-# 设置第1天的经验值为150
-Upgrade.SetExp 1 150
-
-# 设置第1天的奖励图标为索引2
-Upgrade.SetIcon 1 2
-
-# 设置第1天第0个宝箱为已领取
-Upgrade.SetChest 1 0 1
-
-# 查看第1天的完整信息
-Upgrade.ShowInfo 1
-
-# 重置第1天数据
-Upgrade.Reset 1
-```
-
-## 重要说明
-
-### Broadcast机制
-修改器在每次修改数据后会自动调用`TargetSubsystem->OnGlobalRefresh.Broadcast()`，确保UI界面能够及时刷新显示最新数据。
-
-### 初始化要求
-UpgradeActivitySubsystem会在Initialize阶段自动创建并注册修改器：
-```cpp
-// 在UpgradeActivitySubsystem::Initialize中
-SaveModifier = NewObject<UUpgradeActivitySaveModifier>(this);
-SaveModifier->InitializeModifier(this, this);  // 传入自身作为Subsystem
-SaveModifier->RegisterConsoleCommands();
-```
-
-## 注意事项
-
-1. **数据独立性**: 修改器与Subsystem完全独立，修改不会直接影响Subsystem运行时状态
-2. **自动刷新**: 所有修改都会自动触发UI刷新，无需手动操作
-3. **存档管理**: 所有修改都会自动保存到独立的.sav文件中
-4. **参数范围**: 注意各参数的有效范围，超出范围会有警告提示
-5. **继承机制**: 创建新记录时可以选择是否继承前一天的部分数据
-
-## 文件结构
-```
-Source/MetalSlug01/
-├── Public/Tools/
-│   └── UpgradeActivitySaveModifier.h      # 头文件
-└── Private/Tools/
-    └── UpgradeActivitySaveModifier.cpp    # 实现文件
-```
-
-## 架构说明
-
-### 解耦设计
-原来的调试功能已从UpgradeActivitySubsystem中完全剥离，转移到独立的修改器类中：
-
-**旧架构**：
-```
-UpgradeActivitySubsystem (包含所有调试指令)
-```
-
-**新架构**：
-```
-UpgradeActivitySubsystem (专注业务逻辑)
-        ↑
-        |
-UpgradeActivitySaveModifier (独立调试功能)
-```
-
-### 功能迁移对照表
-
-| 原Subsystem方法 | 新修改器方法 | 功能说明 |
-|----------------|-------------|----------|
-| `SetCurrentExp()` | `ModifyCurrentExperience()` | 设置经验值 |
-| `SetRewardIconIndex()` | `ModifyRewardIconIndex()` | 设置奖励图标索引 |
-| `SetChestClaimStatus()` | `ModifyChestClaimStatus()` | 设置宝箱领取状态 |
-| `SetTaskCompleteCount()` | `ModifyTaskCompleteCount()` | 设置任务完成次数 |
-| `SetTaskClaimStatus()` | `ModifyTaskClaimStatus()` | 设置任务领取状态 |
-| `SetLimitedActivityCount()` | `ModifyLimitedActivityCount()` | 设置限时活动次数 |
-| `ShowCurrentRecordInfo()` | `DisplayUpgradeActivityInfo()` | 显示记录信息 |
-| `ResetAllData()` | `ResetUpgradeActivityData()` | 重置数据 |
-| `CreateRecordForDay()` | `CreateNewRecord()` | 创建新记录 |
-| `ShowAllSaveRecords()` | *(通过查询接口实现)* | 显示所有记录 |
-
-## 集成使用示例
-
-### 在Subsystem中启用修改器
-```cpp
-// UpgradeActivitySubsystem.h 中添加
-UPROPERTY()
-UUpgradeActivitySaveModifier* DebugModifier;
-
-UPROPERTY()
-bool bEnableDebugModifier;
-
-// 初始化时创建修改器
-void InitializeWithModifier();
-
-// 关闭时销毁修改器
-void ShutdownWithModifier();
-
-// 提供外部访问接口
-UFUNCTION(BlueprintCallable)
-UUpgradeActivitySaveModifier* GetDebugModifier() const;
-```
-
-### 条件编译最佳实践
-```cpp
-// 只在开发环境中启用
-#if WITH_EDITOR || UE_BUILD_DEVELOPMENT
-    bEnableDebugModifier = true;
-#else
-    bEnableDebugModifier = false;
-#endif
-
-// 或者使用配置变量
-if (GetDefault<UYourGameSettings>()->bEnableDebugTools)
-{
-    InitializeWithModifier();
-}
-```
-
-### 数据同步机制
-```cpp
-// 当修改器数据变化时，手动同步到Subsystem
-void SyncDataFromModifier(int32 RecordDate)
-{
-    if (DebugModifier)
-    {
-        int32 NewExp = DebugModifier->GetCurrentExperience(RecordDate);
-        CurrentRecord.CurrentExperience = NewExp;
-        SaveStatus();
-        OnGlobalRefresh.Broadcast();
-    }
-}
-```
+---
+*本文档仅包含控制台命令使用说明，如需了解完整API接口请参考源代码实现。*
