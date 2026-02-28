@@ -185,8 +185,8 @@ void UExperienceChestClaimWidget::UpdateProgressBar()
 			
 			if (ChestIndex == 0)
 			{
-				// 第一个进度条：0-45 对应 0%-100%
-				int32 LowerBound = 0;
+				// 第一个进度条：5-45 对应 0%-100%
+				int32 LowerBound = 5;
 				int32 UpperBound = 45;
 				int32 Range = UpperBound - LowerBound;
 				
