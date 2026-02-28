@@ -1,6 +1,7 @@
 ﻿#include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Components/Button.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
+#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 
 void URewardOptionWidget::NativeConstruct()
 {
@@ -79,6 +80,18 @@ void URewardOptionWidget::HandleStoreClicked()
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("OnStoreToBag 未绑定"));
+	}
+	
+	// 直接强制刷新相关页面
+	UGameInstance* GameInstance = GetGameInstance();
+	if (GameInstance)
+	{
+		UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+		if (Subsystem)
+		{
+			Subsystem->OnGlobalRefresh.Broadcast();
+			UE_LOG(LogTemp, Warning, TEXT("✅ 已强制刷新所有相关页面"));
+		}
 	}
 	
 	// 确保只调用一次RemoveFromParent，并添加额外的安全检查

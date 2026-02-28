@@ -21,6 +21,7 @@ class UTextBlock;
 class UVerticalBox;
 class UScrollBox;
 class UUpgradeActivitySubsystem;
+class URewardOptionWidget;
 
 /**
  * @brief 每日升级奖励活动页面
@@ -89,6 +90,10 @@ protected:
 	/** ExperienceChestClaimWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UExperienceChestClaimWidget> ExperienceChestWidgetClass;
+	
+	/** RewardOptionWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class URewardOptionWidget> RewardOptionWidgetClass;
 
 	/** ActivityConfirmPopupWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
@@ -258,6 +263,33 @@ private:
 	void OnReselectRewardClicked();
 	
 	/**
+	 * @brief 处理宝箱领取请求
+	 * @param ChestIndex 宝箱索引
+	 */
+	UFUNCTION()
+	void HandleChestClaimRequest(int32 ChestIndex);
+	
+	/**
+	 * @brief 处理奖励存储操作
+	 * @param DayIndex 天数索引
+	 */
+	UFUNCTION()
+	void HandleRewardStore(int32 DayIndex);
+	
+	/**
+	 * @brief 更新所有宝箱Widget的状态
+	 * @details 手动刷新ItemsScrollBox中所有ExperienceChestClaimWidget的视觉状态
+	 * 确保领取操作后所有Widget都能正确显示最新状态
+	 */
+	void UpdateAllChestWidgetStates();
+	
+	/**
+	 * @brief 更新经验宝箱控件状态
+	 * @details 更新现有ExperienceChestClaimWidget的状态而不重新创建
+	 */
+	void UpdateExperienceChestWidgetsState();
+
+	/**
 	 * @brief 订阅Subsystem事件
 	 */
 	void SubscribeToSubsystemEvents();
@@ -273,4 +305,10 @@ private:
 	 */
 	UFUNCTION()
 	void OnRewardIconIndexChanged(int32 NewIndex);
+	
+	/**
+	 * @brief 显示奖励选项Widget
+	 * @param ChestIndex 宝箱索引
+	 */
+	void ShowRewardOptionWidget(int32 ChestIndex);
 };

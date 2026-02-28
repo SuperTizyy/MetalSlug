@@ -39,6 +39,15 @@ bool UExperienceChestClaimWidget::Initialize()
 	UpdateExperienceDisplay();
 	UpdateProgressBar();
 	HideSuccessEffect();
+	
+	// 初始化SuccessText状态
+	UpdateSuccessTextVisibility();
+	
+	// 默认禁用按钮交互，保持蓝图默认外观
+	if (ChestClaimButton)
+	{
+		ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
+	}
 
 	return true;
 }
@@ -61,32 +70,61 @@ void UExperienceChestClaimWidget::NativeDestruct()
 
 void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 {
-	if (CurrentChestCount > 0)
+	// 检查领取条件
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
 	{
-		// 减少宝箱数量
-		CurrentChestCount--;
-		
-		// 增加经验值
-		CurrentExperience += 20;
-		if (CurrentExperience > MaxExperience)
-		{
-			CurrentExperience = MaxExperience;
-		}
-
-		// 更新UI显示
-		UpdateChestCount();
-		UpdateExperienceDisplay();
-		UpdateProgressBar();
-
-		// 显示领取成功效果
-		ShowSuccessEffect();
-
-		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimPage: 领取成功，剩余宝箱数: %d，当前经验值: %d"), 
-			CurrentChestCount, CurrentExperience);
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: 无法获取活动配置"));
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	
+	// 检查是否已领取
+	if (Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，无法重复领取"), ChestIndex);
+		return; // 已领取，不处理点击
+	}
+	
+	// 检查经验值条件
+	if (!Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: TaskRelatedValues索引%d无效"), ChestIndex);
+		return;
+	}
+	
+	int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+	if (Record.CurrentExperience < RequiredExp)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 经验值不足，当前:%d, 需要:%d"), Record.CurrentExperience, RequiredExp);
+		return; // 经验值不足，不处理点击
+	}
+	
+	// 条件满足，触发领取事件
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d条件满足，触发领取事件"), ChestIndex);
+	
+	if (OnChestClaimRequested.IsBound())
+	{
+		OnChestClaimRequested.Broadcast(ChestIndex);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimPage: 宝箱数量不足"));
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: OnChestClaimRequested事件未绑定"));
 	}
 }
 
@@ -139,34 +177,180 @@ void UExperienceChestClaimWidget::HideSuccessEffect()
 
 void UExperienceChestClaimWidget::UpdateVisualStatus(bool bIsClaimed)
 {
-	if (ChestClaimButton)
+	if (!ChestClaimButton)
 	{
-		if (bIsClaimed)
+		return;
+	}
+	
+	// 获取当前经验和配置数据来判断完整条件
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		// 默认禁用按钮
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		// 默认禁用按钮
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		// 默认禁用按钮
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	int32 CurrentExp = Record.CurrentExperience;
+	
+	// 判断按钮状态
+	if (bIsClaimed)
+	{
+		// 已领取状态
+		SetButtonClaimedState();
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮已领取 - 索引:%d"), ChestIndex);
+	}
+	else
+	{
+		// 未领取状态，检查经验值条件
+		bool bHasEnoughExp = false;
+		if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
 		{
-			// 已领取状态：禁用按钮，改变视觉样式
-			ChestClaimButton->SetIsEnabled(false);
-			ChestClaimButton->SetColorAndOpacity(FLinearColor(0.5f, 0.5f, 0.5f, 0.7f)); // 灰色半透明
-			
-			// 可以添加其他视觉效果，比如添加已领取标签等
-			if (ChestCountText)
-			{
-				ChestCountText->SetColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f, 1.0f)); // 文本变灰
-			}
+			int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+			bHasEnoughExp = (CurrentExp >= RequiredExp);
+		}
+		
+		if (bHasEnoughExp)
+		{
+			// 满足领取条件：启用按钮
+			SetButtonEnabledState();
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮启用 - 索引:%d, 当前经验:%d"), ChestIndex, CurrentExp);
 		}
 		else
 		{
-			// 未领取状态：启用按钮，恢复正常样式
-			ChestClaimButton->SetIsEnabled(true);
-			ChestClaimButton->SetColorAndOpacity(FLinearColor::White);
-			
-			if (ChestCountText)
-			{
-				ChestCountText->SetColorAndOpacity(FLinearColor::White);
-			}
+			// 不满足领取条件：禁用按钮但保持正常颜色
+			SetButtonDisabledState();
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮条件不足 - 索引:%d, 当前经验:%d"), ChestIndex, CurrentExp);
 		}
 	}
 	
-	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 视觉状态已更新，已领取: %s"), bIsClaimed ? TEXT("是") : TEXT("否"));
+	// 更新SuccessText显示状态
+	UpdateSuccessTextVisibility();
+}
+
+void UExperienceChestClaimWidget::SetButtonEnabledState()
+{
+	if (!ChestClaimButton)
+		return;
+	
+	// 启用按钮交互 - 保持Visible状态以接收点击
+	ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
+	
+	// 显示高亮框（如果有）
+	if (HighlightFrameImage)
+	{
+		HighlightFrameImage->SetVisibility(ESlateVisibility::Visible);
+	}
+}
+
+void UExperienceChestClaimWidget::SetButtonDisabledState()
+{
+	if (!ChestClaimButton)
+		return;
+	
+	// 保持Visible状态以接收点击，但在点击处理中会检查条件
+	ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
+	
+	// 隐藏高亮框
+	if (HighlightFrameImage)
+	{
+		HighlightFrameImage->SetVisibility(ESlateVisibility::Hidden);
+	}
+}
+
+void UExperienceChestClaimWidget::SetButtonClaimedState()
+{
+	if (!ChestClaimButton)
+		return;
+	
+	// 已领取状态 - 保持Visible状态以接收点击，但在点击处理中会检查条件
+	ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
+	
+	// 隐藏高亮框
+	if (HighlightFrameImage)
+	{
+		HighlightFrameImage->SetVisibility(ESlateVisibility::Hidden);
+	}
+}
+
+void UExperienceChestClaimWidget::UpdateButtonState()
+{
+	// 获取当前状态并更新按钮
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		SetButtonDisabledState();
+		UpdateSuccessTextVisibility(); // 更新SuccessText状态
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	
+	// 判断状态
+	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1;
+	
+	if (bIsClaimed)
+	{
+		SetButtonClaimedState();
+	}
+	else
+	{
+		// 检查经验值条件
+		bool bHasEnoughExp = false;
+		if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+		{
+			int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+			bHasEnoughExp = (Record.CurrentExperience >= RequiredExp);
+		}
+		
+		if (bHasEnoughExp)
+		{
+			SetButtonEnabledState();
+		}
+		else
+		{
+			SetButtonDisabledState();
+		}
+	}
+	
+	// 更新SuccessText显示状态
+	UpdateSuccessTextVisibility();
 }
 
 void UExperienceChestClaimWidget::SetChestBoxIcon(UTexture2D* BoxIcon)
@@ -217,3 +401,62 @@ void UExperienceChestClaimWidget::SetChestBoxIcon(UTexture2D* BoxIcon)
 	}
 }
 
+void UExperienceChestClaimWidget::SetChestIndex(int32 Index)
+{
+	ChestIndex = Index;
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 设置宝箱索引为 %d"), Index);
+	
+	// 设置索引后立即更新SuccessText状态
+	UpdateSuccessTextVisibility();
+}
+
+void UExperienceChestClaimWidget::UpdateSuccessTextVisibility()
+{
+	// 获取Subsystem数据来判断SuccessText显示状态
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		// 无法获取数据时隐藏SuccessText
+		if (SuccessText)
+		{
+			SuccessText->SetVisibility(ESlateVisibility::Hidden);
+		}
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		// 无法获取Subsystem时隐藏SuccessText
+		if (SuccessText)
+		{
+			SuccessText->SetVisibility(ESlateVisibility::Hidden);
+		}
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	
+	// 根据ChestClaimStatus数组数据控制SuccessText显示
+	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1;
+	
+	if (SuccessText)
+	{
+		if (bIsClaimed)
+		{
+			// 已领取状态：显示SuccessText
+			SuccessText->SetVisibility(ESlateVisibility::Visible);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，显示SuccessText"), ChestIndex);
+		}
+		else
+		{
+			// 未领取状态：隐藏SuccessText
+			SuccessText->SetVisibility(ESlateVisibility::Hidden);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d未领取，隐藏SuccessText"), ChestIndex);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: SuccessText控件未绑定"));
+	}
+}

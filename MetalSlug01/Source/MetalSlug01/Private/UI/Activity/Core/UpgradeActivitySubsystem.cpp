@@ -36,27 +36,29 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // 1. 预加载配置表 - 提前加载活动配置数据到内存中，提高运行时性能
     CachedConfigTable = LoadObject<UDataTable>(nullptr, TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow.DT_DailyUpgradeRewardConfigRow"));
 
-    // 2. 加载存档 - 从磁盘读取玩家的活动进度数据
+    // 2. 检查并创建初始记录 - 确保系统有第一天的记录
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
     {
         UDailyLoginSaveGame* Loaded = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
-        if (Loaded && Loaded->UpgradeRewardRecords.Contains(110))
+        if (Loaded && Loaded->UpgradeRewardRecords.Contains(1))
         {
-            // 成功加载到ActivityID=110的记录，恢复玩家进度
-            CurrentRecord = Loaded->UpgradeRewardRecords[110];
-            // 处理存档数据逻辑
-            ProcessSaveRecordLogic();
+            // 已存在第一天记录，加载最新的记录
+            ReloadLatestRecord();
         }
         else
         {
-            // 存档存在但没有该活动记录，创建新的今日记录
+            // 存档存在但没有第一天记录，或者需要强制创建第一天记录
+            UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 存档中缺少第一天记录，创建RecordDate=1的新记录"));
             CreateTodayRecord();
+            SaveStatus(); // 立即保存到磁盘
         }
     }
     else
     {
-        // 完全没有存档，创建全新的今日记录
+        // 完全没有存档，创建全新的第一天记录
+        UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 无存档文件，创建全新的第一天记录"));
         CreateTodayRecord();
+        SaveStatus(); // 立即保存到磁盘
     }
     
     // 3. 初始化升级活动存档修改器
@@ -104,16 +106,44 @@ void UUpgradeActivitySubsystem::Deinitialize()
  */
 void UUpgradeActivitySubsystem::LoadStatus()
 {
+    ReloadLatestRecord();
+}
+
+void UUpgradeActivitySubsystem::ReloadLatestRecord()
+{
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
     {
         UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
             UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
         
-        if (LoadedSave && LoadedSave->UpgradeRewardRecords.Contains(110))
+        if (LoadedSave && LoadedSave->UpgradeRewardRecords.Num() > 0)
         {
-            // 成功加载到有效的活动记录
-            CurrentRecord = LoadedSave->UpgradeRewardRecords[110];
-            UE_LOG(LogTemp, Log, TEXT("Upgrade reward status loaded"));
+            // 找到最新的记录
+            const FUpgradeRewardSaveRecord* LatestRecord = nullptr;
+            FDateTime LatestTime = FDateTime::MinValue();
+            
+            for (const auto& Pair : LoadedSave->UpgradeRewardRecords)
+            {
+                const FUpgradeRewardSaveRecord& Record = Pair.Value;
+                if (Record.CreatedTime > LatestTime)
+                {
+                    LatestTime = Record.CreatedTime;
+                    LatestRecord = &Record;
+                }
+            }
+            
+            if (LatestRecord)
+            {
+                // 成功加载到最新的活动记录
+                CurrentRecord = *LatestRecord;
+                UE_LOG(LogTemp, Log, TEXT("Upgrade reward status reloaded - RecordDate=%d"), LatestRecord->GetDayNumber());
+            }
+            else
+            {
+                // 没有找到有效记录
+                UE_LOG(LogTemp, Warning, TEXT("No valid records found, creating new one"));
+                CreateTodayRecord();
+            }
         }
         else
         {
@@ -382,8 +412,8 @@ void UUpgradeActivitySubsystem::SaveStatus()
         SaveGame = NewObject<UDailyLoginSaveGame>();
     }
     
-    // 更新或添加升级奖励记录
-    SaveGame->UpgradeRewardRecords.Add(110, CurrentRecord);
+    // 更新或添加升级奖励记录 - 使用当前记录的实际日期
+    SaveGame->UpgradeRewardRecords.Add(CurrentRecord.GetDayNumber(), CurrentRecord);
     // 保存到磁盘
     UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
     

@@ -231,10 +231,10 @@ private:
 	// ==================== 调试辅助函数 ====================
 	
 	/**
-	 * @brief 检查并通知所有可能的页面实例
-	 * @note 用于调试目的，强制查找并刷新所有相关页面
+	 * @brief 强制刷新所有页面，重新获取内存数据
+	 * @note 用于调试目的，强制所有UI组件重新获取最新内存数据
 	 */
-	void CheckAndNotifyAllPages();
+	void ForceRefreshAllPages();
 
 	/** 缓存的存档实例 */
 	UPROPERTY()

@@ -77,6 +77,9 @@ public:
 
 	/** 最大经验值 */
 	int32 MaxExperience;
+	
+	/** 宝箱索引 */
+	int32 ChestIndex;
 
 	// ==================== 事件处理 ====================
 	
@@ -92,6 +95,12 @@ public:
 	 * @brief 更新宝箱数量显示
 	 */
 	void UpdateChestCount();
+	
+	/**
+	 * @brief 更新SuccessText显示状态
+	 * @details 根据ChestClaimStatus数组数据控制SuccessText的显示/隐藏
+	 */
+	void UpdateSuccessTextVisibility();
 
 	/**
 	 * @brief 更新经验值显示
@@ -126,4 +135,35 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
 	void SetChestBoxIcon(UTexture2D* BoxIcon);
+	
+	/**
+	 * @brief 设置宝箱索引
+	 * @param Index 宝箱索引
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
+	void SetChestIndex(int32 Index);
+	
+	/**
+	 * @brief 宝箱领取事件委托
+	 */
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnChestClaimRequested, int32, ChestIndex);
+	
+	/** 宝箱领取请求事件 */
+	UPROPERTY(BlueprintAssignable, Category = "Events")
+	FOnChestClaimRequested OnChestClaimRequested;
+	
+public:
+	/** 设置按钮启用状态 */
+	void SetButtonEnabledState();
+	
+	/** 设置按钮禁用状态（未满足条件）*/
+	void SetButtonDisabledState();
+	
+	/** 设置按钮已领取状态 */
+	void SetButtonClaimedState();
+	
+	/** 根据当前数据更新按钮状态 */
+	void UpdateButtonState();
+	
+private:
 };

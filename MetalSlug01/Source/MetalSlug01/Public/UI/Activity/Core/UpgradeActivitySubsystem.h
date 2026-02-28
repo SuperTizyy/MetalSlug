@@ -193,6 +193,12 @@ public:
      * @brief 从硬盘加载数据
      */
     void LoadStatus();
+    
+    /**
+     * @brief 重新加载最新的记录
+     * @details 强制从存档中重新加载CreatedTime最新的记录
+     */
+    void ReloadLatestRecord();
 
     /**
      * @brief 检查今日记录是否存在

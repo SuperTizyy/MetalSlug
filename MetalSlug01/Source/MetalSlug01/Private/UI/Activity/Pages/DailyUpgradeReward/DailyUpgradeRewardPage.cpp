@@ -47,6 +47,7 @@
 #include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"
+#include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 
 /**
  * @brief 初始化每日升级奖励页面
@@ -481,9 +482,42 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			continue;
 		}
 		
-		// 关键：根据存档 Record.ChestClaimStatus[i] 来决定显示状态
+		// 设置宝箱索引
+		ChestWidget->SetChestIndex(i);
+		
+		// 关键：绑定事件
+		ChestWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
+		
+		// 关键：根据完整条件来决定显示状态
 		bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 1;
-		ChestWidget->UpdateVisualStatus(bIsClaimed);
+		bool bHasEnoughExp = false;
+		
+		// 检查经验值条件
+		if (!bIsClaimed && TaskRelatedValues.IsValidIndex(i))
+		{
+			int32 RequiredExp = TaskRelatedValues[i];
+			bHasEnoughExp = (CurrentExpFromSubsystem >= RequiredExp);
+		}
+		
+		// 根据完整条件设置按钮状态
+		if (bIsClaimed)
+		{
+			// 已领取状态
+			ChestWidget->SetButtonClaimedState();
+			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 已领取状态"), i);
+		}
+		else if (bHasEnoughExp)
+		{
+			// 满足条件，启用按钮
+			ChestWidget->SetButtonEnabledState();
+			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 满足条件，启用按钮"), i);
+		}
+		else
+		{
+			// 未满足条件，禁用但保持原外观
+			ChestWidget->SetButtonDisabledState();
+			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 条件不足，禁用按钮"), i);
+		}
 		
 		// 设置奖励数量
 		FString RewardCount = TEXT("0");
@@ -555,7 +589,9 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		}
 		
 		ItemsScrollBox->AddChild(ChestWidget);
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s（刨除最后一个索引）"), i + 1, bIsClaimed ? TEXT("是") : TEXT("否"));
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s，事件绑定: %s（刨除最后一个索引）"), 
+			i + 1, bIsClaimed ? TEXT("是") : TEXT("否"),
+			ChestWidget->OnChestClaimRequested.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
 	}
 }
 
@@ -635,11 +671,11 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	InitializeRewardItemIcons();
 	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图标缓存已刷新 (缓存数量: %d)"), CachedItemIcons.Num());
 	
-	// 2. 重新初始化经验宝箱控件列表（核心显示组件）
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/5] 📦 初始化经验宝箱控件列表..."));
-	InitializeExperienceChestWidgets();
+	// 2. 更新现有经验宝箱控件状态（不重新创建）
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/5] 📦 更新经验宝箱控件状态..."));
+	UpdateExperienceChestWidgetsState();
 	int32 ChestCount = ItemsScrollBox ? ItemsScrollBox->GetChildrenCount() : 0;
-	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件已刷新 (控件数量: %d)"), ChestCount);
+	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件状态已更新 (控件数量: %d)"), ChestCount);
 	
 	// 3. 更新宝箱数量显示
 	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/5] 📊 更新宝箱数量显示..."));
@@ -863,4 +899,189 @@ FString UDailyUpgradeRewardPage::GetPageIdentity() const
 	
 	// 返回格式化的身份字符串
 	return FString::Printf(TEXT("Page[%s]@%s"), *AddressStr, *TimestampStr);
+}
+
+// ==================== 事件处理函数 ====================
+
+void UDailyUpgradeRewardPage::HandleChestClaimRequest(int32 ChestIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("=========================================="));
+	UE_LOG(LogTemp, Log, TEXT("🎉 DailyUpgradeRewardPage: 接收到宝箱领取请求！"));
+	UE_LOG(LogTemp, Log, TEXT("📦 宝箱索引: %d"), ChestIndex);
+	UE_LOG(LogTemp, Log, TEXT("📍 页面地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("=========================================="));
+	
+	// 获取Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// 弹出RewardOptionWidget页面
+	ShowRewardOptionWidget(ChestIndex);
+	
+	// 注意：状态更新将在RewardOptionWidget的StoreBtn点击时执行
+}
+
+void UDailyUpgradeRewardPage::ShowRewardOptionWidget(int32 ChestIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 准备显示RewardOptionWidget，宝箱索引: %d"), ChestIndex);
+	
+	// 检查RewardOptionWidgetClass是否已设置
+	if (!RewardOptionWidgetClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardOptionWidgetClass未设置！请在蓝图中指定WBP_RewardOptionWidget类"));
+		return;
+	}
+	
+	// 创建RewardOptionWidget实例
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取世界上下文"));
+		return;
+	}
+	
+	URewardOptionWidget* RewardOptionWidget = CreateWidget<URewardOptionWidget>(World, RewardOptionWidgetClass.Get());
+	if (!RewardOptionWidget)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 创建RewardOptionWidget失败"));
+		return;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建RewardOptionWidget实例"));
+	
+	// 获取活动配置数据
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取活动配置数据"));
+		return;
+	}
+	
+	// 准备奖励选项数据
+	TArray<FDailyLoginConfigRow> RewardOptions;
+	FDailyLoginConfigRow TempRow;
+	TempRow.ActivityID = Config->ActivityID;
+	
+	// 使用对应的RewardItemID
+	if (Config->RewardItemIDs.IsValidIndex(ChestIndex))
+	{
+		FString RewardItemID = Config->RewardItemIDs[ChestIndex];
+		TempRow.RewardItemID = FCString::Atoi(*RewardItemID);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 使用RewardItemID: %d"), TempRow.RewardItemID);
+	}
+	
+	// 设置天数索引（用于后续状态更新）
+	TempRow.DayIndex = ChestIndex;
+	
+	RewardOptions.Add(TempRow);
+	
+	// 初始化弹窗
+	RewardOptionWidget->InitSelection(RewardOptions);
+	
+	// 添加到视口显示
+	RewardOptionWidget->AddToViewport(1000); // 使用高Z-order确保显示在最上层
+	
+	// 绑定StoreBtn事件
+	RewardOptionWidget->OnStoreToBag.Clear();
+	RewardOptionWidget->OnStoreToBag.AddDynamic(this, &UDailyUpgradeRewardPage::HandleRewardStore);
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: RewardOptionWidget已添加到视口并绑定事件"));
+}
+
+void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
+{
+	UE_LOG(LogTemp, Log, TEXT("UpdateExperienceChestWidgetsState 开始执行"));
+	
+	if (!ItemsScrollBox)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ItemsScrollBox 为空"));
+		return;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("ItemsScrollBox 子控件数量: %d"), ItemsScrollBox->GetChildrenCount());
+	
+	// 遍历所有子控件并更新状态
+	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = ItemsScrollBox->GetChildAt(i);
+		UExperienceChestClaimWidget* ChestWidget = Cast<UExperienceChestClaimWidget>(ChildWidget);
+		
+		if (ChestWidget)
+		{
+			UE_LOG(LogTemp, Log, TEXT("更新宝箱控件 %d 的状态"), i);
+			ChestWidget->UpdateButtonState();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("子控件 %d 不是 ExperienceChestClaimWidget 类型"), i);
+		}
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("UpdateExperienceChestWidgetsState 执行完成"));
+}
+
+void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 接收到奖励存储请求，宝箱索引: %d"), DayIndex);
+	
+	// 获取Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// DayIndex实际上就是ChestIndex
+	int32 ChestIndex = DayIndex;
+	
+	// 修改内存数据
+	FUpgradeRewardSaveRecord& Record = const_cast<FUpgradeRewardSaveRecord&>(Subsystem->GetRecord());
+	if (Record.ChestClaimStatus.IsValidIndex(ChestIndex))
+	{
+		Record.ChestClaimStatus[ChestIndex] = 1; // 标记为已领取
+		Record.LastUpdateTime = FDateTime::Now();
+		
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功更新宝箱%d状态为已领取"), ChestIndex);
+		
+		// 全局刷新活动页面
+		Subsystem->OnGlobalRefresh.Broadcast();
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已广播全局刷新事件"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ChestClaimStatus索引%d无效"), ChestIndex);
+	}
 }
