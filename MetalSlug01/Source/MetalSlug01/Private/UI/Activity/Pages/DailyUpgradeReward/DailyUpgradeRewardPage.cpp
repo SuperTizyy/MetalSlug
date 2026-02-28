@@ -680,6 +680,11 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	int32 ChestCount = ItemsScrollBox ? ItemsScrollBox->GetChildrenCount() : 0;
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件状态已更新 (控件数量: %d)"), ChestCount);
 	
+	// 2.1 额外刷新所有进度条显示
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.1/5] 📊 刷新经验进度条显示..."));
+	RefreshAllProgressBars();
+	UE_LOG(LogTemp, Log, TEXT("✅ 经验进度条已刷新"));
+	
 	// 3. 更新宝箱数量显示
 	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/5] 📊 更新宝箱数量显示..."));
 	UpdateChestCountText();
