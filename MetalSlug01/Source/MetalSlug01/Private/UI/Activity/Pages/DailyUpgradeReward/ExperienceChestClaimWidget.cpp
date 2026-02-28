@@ -43,6 +43,12 @@ bool UExperienceChestClaimWidget::Initialize()
 	// 初始化SuccessText状态
 	UpdateSuccessTextVisibility();
 	
+	// 初始化DiamondIcon颜色
+	UpdateDiamondIconColor();
+	
+	// 初始化ExperienceText颜色
+	UpdateExperienceTextColor();
+	
 	// 默认禁用按钮交互，保持蓝图默认外观
 	if (ChestClaimButton)
 	{
@@ -323,6 +329,12 @@ void UExperienceChestClaimWidget::UpdateVisualStatus(bool bIsClaimed)
 	
 	// 更新SuccessText显示状态
 	UpdateSuccessTextVisibility();
+	
+	// 更新DiamondIcon颜色
+	UpdateDiamondIconColor();
+	
+	// 更新ExperienceText颜色
+	UpdateExperienceTextColor();
 }
 
 void UExperienceChestClaimWidget::SetButtonEnabledState()
@@ -433,6 +445,12 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 	
 	// 更新SuccessText显示状态
 	UpdateSuccessTextVisibility();
+	
+	// 更新DiamondIcon颜色
+	UpdateDiamondIconColor();
+	
+	// 更新ExperienceText颜色
+	UpdateExperienceTextColor();
 }
 
 void UExperienceChestClaimWidget::SetChestBoxIcon(UTexture2D* BoxIcon)
@@ -540,5 +558,162 @@ void UExperienceChestClaimWidget::UpdateSuccessTextVisibility()
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: SuccessText控件未绑定"));
+	}
+}
+
+void UExperienceChestClaimWidget::UpdateDiamondIconColor()
+{
+	// 获取Subsystem数据来判断DiamondIconImage颜色
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		// 无法获取数据时设置默认黑色
+		if (DiamondIconImage)
+		{
+			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Black));
+		}
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		// 无法获取Subsystem时设置默认黑色
+		if (DiamondIconImage)
+		{
+			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Black));
+		}
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		// 无法获取配置时设置默认黑色
+		if (DiamondIconImage)
+		{
+			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Black));
+		}
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	int32 CurrentExp = Record.CurrentExperience;
+	
+	// 判断是否满足条件：CurrentExperience >= TaskRelatedValues[ChestIndex]
+	bool bConditionMet = false;
+	if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	{
+		int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+		bConditionMet = (CurrentExp >= RequiredExp);
+		
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 当前经验:%d, 需要经验:%d, 条件%s"), 
+			ChestIndex, CurrentExp, RequiredExp, bConditionMet ? TEXT("满足") : TEXT("不满足"));
+	}
+	
+	// 设置DiamondIconImage颜色
+	if (DiamondIconImage)
+	{
+		if (bConditionMet)
+		{
+			// 条件满足：显示黄色
+			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Yellow));
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: DiamondIcon设置为黄色"), ChestIndex);
+		}
+		else
+		{
+			// 条件不满足：显示黑色
+			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Black));
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: DiamondIcon设置为黑色"), ChestIndex);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: DiamondIconImage控件未绑定"));
+	}
+}
+
+void UExperienceChestClaimWidget::UpdateExperienceTextColor()
+{
+	// 获取Subsystem数据来判断ExperienceText颜色
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		// 无法获取数据时设置默认黄色
+		if (ExperienceText)
+		{
+			ExperienceText->SetColorAndOpacity(FLinearColor::Yellow);
+		}
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		// 无法获取Subsystem时设置默认黄色
+		if (ExperienceText)
+		{
+			ExperienceText->SetColorAndOpacity(FLinearColor::Yellow);
+		}
+		return;
+	}
+	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		// 无法获取配置时设置默认黄色
+		if (ExperienceText)
+		{
+			ExperienceText->SetColorAndOpacity(FLinearColor::Yellow);
+		}
+		return;
+	}
+	
+	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+	int32 CurrentExp = Record.CurrentExperience;
+	
+	// 检查CurrentExperience是否大于等于TaskRelatedValues中对应索引的值
+	bool bConditionMet = false;
+	
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 当前经验:%d, TaskRelatedValues数量:%d"), 
+		ChestIndex, CurrentExp, Config->TaskRelatedValues.Num());
+	
+	// 只检查对应索引的TaskRelatedValues值
+	if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	{
+		int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+		bConditionMet = (CurrentExp >= RequiredExp);
+		
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 经验值%d %s 需要值%d，条件%s"), 
+			ChestIndex, CurrentExp, 
+			bConditionMet ? TEXT(">=") : TEXT("<"), 
+			RequiredExp, 
+			bConditionMet ? TEXT("满足") : TEXT("不满足"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget[%d]: TaskRelatedValues索引%d无效"), 
+			ChestIndex, ChestIndex);
+	}
+	
+	// 设置ExperienceText颜色
+	if (ExperienceText)
+	{
+		if (bConditionMet)
+		{
+			// 条件满足：显示黑色
+			ExperienceText->SetColorAndOpacity(FLinearColor::Black);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: ExperienceText设置为黑色"), ChestIndex);
+		}
+		else
+		{
+			// 条件不满足：显示黄色
+			ExperienceText->SetColorAndOpacity(FLinearColor::Yellow);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: ExperienceText设置为黄色"), ChestIndex);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: ExperienceText控件未绑定"));
 	}
 }

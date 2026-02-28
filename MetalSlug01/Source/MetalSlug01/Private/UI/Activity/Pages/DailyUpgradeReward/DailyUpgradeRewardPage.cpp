@@ -595,6 +595,12 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s，事件绑定: %s（刨除最后一个索引）"), 
 			i + 1, bIsClaimed ? TEXT("是") : TEXT("否"),
 			ChestWidget->OnChestClaimRequested.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
+		
+		// 更新DiamondIcon颜色
+		ChestWidget->UpdateDiamondIconColor();
+		
+		// 更新ExperienceText颜色
+		ChestWidget->UpdateExperienceTextColor();
 	}
 }
 
@@ -1044,6 +1050,12 @@ void UDailyUpgradeRewardPage::RefreshAllProgressBars()
 		{
 			UE_LOG(LogTemp, Log, TEXT("刷新第 %d 个宝箱控件的进度条"), i);
 			ChestWidget->RefreshProgressBar();
+			
+			// 更新DiamondIcon颜色
+			ChestWidget->UpdateDiamondIconColor();
+			
+			// 更新ExperienceText颜色
+			ChestWidget->UpdateExperienceTextColor();
 			UpdatedCount++;
 		}
 		else
@@ -1077,6 +1089,12 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 		{
 			UE_LOG(LogTemp, Log, TEXT("更新宝箱控件 %d 的状态"), i);
 			ChestWidget->UpdateButtonState();
+			
+			// 更新DiamondIcon颜色
+			ChestWidget->UpdateDiamondIconColor();
+			
+			// 更新ExperienceText颜色
+			ChestWidget->UpdateExperienceTextColor();
 		}
 		else
 		{

@@ -169,5 +169,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
 	void RefreshProgressBar();
 	
+	/** 更新菱形图标颜色 */
+	void UpdateDiamondIconColor();
+	
+	/** 更新经验值文本颜色 */
+	void UpdateExperienceTextColor();
+	
 private:
 };
