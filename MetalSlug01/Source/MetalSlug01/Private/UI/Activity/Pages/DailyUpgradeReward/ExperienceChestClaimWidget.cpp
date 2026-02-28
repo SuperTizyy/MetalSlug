@@ -180,28 +180,34 @@ void UExperienceChestClaimWidget::UpdateProgressBar()
 		{
 			int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
 			
-			// 计算进度百分比
+			// 计算进度百分比 - 按照正确的区间规则
 			float Progress = 0.0f;
 			
 			if (ChestIndex == 0)
 			{
 				// 第一个进度条：0-45 对应 0%-100%
-				int32 MaxRange = 45;
-				Progress = FMath::Clamp((float)CurrentExp / (float)MaxRange, 0.0f, 1.0f);
-				UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 第一个进度条 当前经验:%d, 最大值:%d, 进度:%.2f%%"), 
-					ChestIndex, CurrentExp, MaxRange, Progress * 100);
+				int32 LowerBound = 0;
+				int32 UpperBound = 45;
+				int32 Range = UpperBound - LowerBound;
+				
+				if (Range > 0)
+				{
+					int32 CurrentInRange = FMath::Max(0, CurrentExp - LowerBound);
+					Progress = FMath::Clamp((float)CurrentInRange / (float)Range, 0.0f, 1.0f);
+					UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 第一个进度条 范围[0-45] 当前经验:%d, 范围内进度:%d/%d, 进度:%.2f%%"), 
+						ChestIndex, CurrentExp, CurrentInRange, Range, Progress * 100);
+				}
+				else
+				{
+					Progress = (CurrentExp >= LowerBound) ? 1.0f : 0.0f;
+				}
 			}
 			else
 			{
-				// 其他进度条：前一个的上限+1 到 当前要求值 对应 0%-100%
-				int32 PreviousUpperLimit = 0;
-				if (Config->TaskRelatedValues.IsValidIndex(ChestIndex - 1))
-				{
-					PreviousUpperLimit = Config->TaskRelatedValues[ChestIndex - 1];
-				}
-				
-				int32 LowerBound = PreviousUpperLimit + 1;
-				int32 UpperBound = RequiredExp;
+				// 其他进度条：每个区间跨度30
+				// 第2个：46-75，第3个：76-105，第4个：106-135...
+				int32 LowerBound = 46 + (ChestIndex - 1) * 30;
+				int32 UpperBound = LowerBound + 29; // 30个数字，所以是+29
 				int32 Range = UpperBound - LowerBound;
 				
 				if (Range > 0)
