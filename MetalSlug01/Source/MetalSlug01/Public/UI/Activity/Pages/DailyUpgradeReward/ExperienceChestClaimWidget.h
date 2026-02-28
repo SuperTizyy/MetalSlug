@@ -165,5 +165,9 @@ public:
 	/** 根据当前数据更新按钮状态 */
 	void UpdateButtonState();
 	
+	/** 手动刷新进度条显示 */
+	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
+	void RefreshProgressBar();
+	
 private:
 };

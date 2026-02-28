@@ -485,6 +485,9 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		// 设置宝箱索引
 		ChestWidget->SetChestIndex(i);
 		
+		// 立即更新进度条（使用正确的索引）
+		ChestWidget->UpdateProgressBar();
+		
 		// 关键：绑定事件
 		ChestWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
 		
@@ -1011,6 +1014,40 @@ void UDailyUpgradeRewardPage::ShowRewardOptionWidget(int32 ChestIndex)
 	RewardOptionWidget->OnStoreToBag.AddDynamic(this, &UDailyUpgradeRewardPage::HandleRewardStore);
 	
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: RewardOptionWidget已添加到视口并绑定事件"));
+}
+
+void UDailyUpgradeRewardPage::RefreshAllProgressBars()
+{
+	UE_LOG(LogTemp, Log, TEXT("RefreshAllProgressBars 开始执行"));
+	
+	if (!ItemsScrollBox)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ItemsScrollBox 为空，无法刷新进度条"));
+		return;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("ItemsScrollBox 子控件数量: %d"), ItemsScrollBox->GetChildrenCount());
+	
+	// 遍历所有子控件并刷新进度条
+	int32 UpdatedCount = 0;
+	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = ItemsScrollBox->GetChildAt(i);
+		UExperienceChestClaimWidget* ChestWidget = Cast<UExperienceChestClaimWidget>(ChildWidget);
+		
+		if (ChestWidget)
+		{
+			UE_LOG(LogTemp, Log, TEXT("刷新第 %d 个宝箱控件的进度条"), i);
+			ChestWidget->RefreshProgressBar();
+			UpdatedCount++;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("子控件 %d 不是 ExperienceChestClaimWidget 类型"), i);
+		}
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("RefreshAllProgressBars 执行完成，共刷新 %d 个进度条"), UpdatedCount);
 }
 
 void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()

@@ -150,8 +150,79 @@ void UExperienceChestClaimWidget::UpdateProgressBar()
 {
 	if (ExperienceProgressBar)
 	{
-		float Progress = (MaxExperience > 0) ? (float)CurrentExperience / (float)MaxExperience : 0.0f;
-		ExperienceProgressBar->SetPercent(Progress);
+		// 获取当前经验和配置数据来计算进度
+		UGameInstance* GameInstance = GetGameInstance();
+		if (!GameInstance)
+		{
+			ExperienceProgressBar->SetPercent(0.0f);
+			return;
+		}
+		
+		UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+		if (!Subsystem)
+		{
+			ExperienceProgressBar->SetPercent(0.0f);
+			return;
+		}
+		
+		const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+		if (!Config)
+		{
+			ExperienceProgressBar->SetPercent(0.0f);
+			return;
+		}
+		
+		const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
+		int32 CurrentExp = Record.CurrentExperience;
+		
+		// 根据宝箱索引计算进度条范围
+		if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+		{
+			int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+			
+			// 计算进度百分比
+			float Progress = 0.0f;
+			
+			if (ChestIndex == 0)
+			{
+				// 第一个进度条：0-45 对应 0%-100%
+				int32 MaxRange = 45;
+				Progress = FMath::Clamp((float)CurrentExp / (float)MaxRange, 0.0f, 1.0f);
+				UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 第一个进度条 当前经验:%d, 最大值:%d, 进度:%.2f%%"), 
+					ChestIndex, CurrentExp, MaxRange, Progress * 100);
+			}
+			else
+			{
+				// 其他进度条：前一个的上限+1 到 当前要求值 对应 0%-100%
+				int32 PreviousUpperLimit = 0;
+				if (Config->TaskRelatedValues.IsValidIndex(ChestIndex - 1))
+				{
+					PreviousUpperLimit = Config->TaskRelatedValues[ChestIndex - 1];
+				}
+				
+				int32 LowerBound = PreviousUpperLimit + 1;
+				int32 UpperBound = RequiredExp;
+				int32 Range = UpperBound - LowerBound;
+				
+				if (Range > 0)
+				{
+					int32 CurrentInRange = FMath::Max(0, CurrentExp - LowerBound);
+					Progress = FMath::Clamp((float)CurrentInRange / (float)Range, 0.0f, 1.0f);
+					UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 进度条范围[%d-%d] 当前经验:%d, 范围内进度:%d/%d, 进度:%.2f%%"), 
+						ChestIndex, LowerBound, UpperBound, CurrentExp, CurrentInRange, Range, Progress * 100);
+				}
+				else
+				{
+					Progress = (CurrentExp >= LowerBound) ? 1.0f : 0.0f;
+				}
+			}
+			
+			ExperienceProgressBar->SetPercent(Progress);
+		}
+		else
+		{
+			ExperienceProgressBar->SetPercent(0.0f);
+		}
 	}
 }
 
@@ -293,6 +364,11 @@ void UExperienceChestClaimWidget::SetButtonClaimedState()
 	}
 }
 
+void UExperienceChestClaimWidget::RefreshProgressBar()
+{
+	UpdateProgressBar();
+}
+
 void UExperienceChestClaimWidget::UpdateButtonState()
 {
 	// 获取当前状态并更新按钮
@@ -303,7 +379,7 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-	
+
 	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!Subsystem)
 	{
@@ -311,7 +387,7 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-	
+
 	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
 	if (!Config)
 	{
@@ -319,9 +395,9 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-	
+
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
-	
+
 	// 判断状态
 	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1;
 	

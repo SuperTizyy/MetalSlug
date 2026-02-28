@@ -288,6 +288,13 @@ private:
 	 * @details 更新现有ExperienceChestClaimWidget的状态而不重新创建
 	 */
 	void UpdateExperienceChestWidgetsState();
+	
+	/**
+	 * @brief 手动刷新所有ExperienceChestClaimWidget的进度条
+	 * @details 在经验值发生变化后调用此方法更新所有进度条显示
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Daily Upgrade Reward")
+	void RefreshAllProgressBars();
 
 	/**
 	 * @brief 订阅Subsystem事件
