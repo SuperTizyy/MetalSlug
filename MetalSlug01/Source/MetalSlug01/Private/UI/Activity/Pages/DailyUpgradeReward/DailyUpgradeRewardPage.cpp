@@ -38,6 +38,7 @@
 #include "Components/Image.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
+#include "Components/ProgressBar.h"
 #include "Components/VerticalBox.h"
 #include "Components/ScrollBox.h"
 #include "Kismet/GameplayStatics.h"
@@ -112,7 +113,13 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	InitializeRewardItemIcons();
 	UpdateChestCountText();
 	InitializeExperienceChestWidgets();
+	InitializeFixedPrizeWidget();  // 初始化固定奖励控件
 	UpdateExperienceDisplay();
+	
+	// 延迟执行居中显示，等待UI完全渲染完成
+	FTimerHandle CenterTimerHandle;
+	GetWorld()->GetTimerManager().SetTimer(CenterTimerHandle, this, &UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience, 0.2f, false);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已设置延迟居中显示定时器(0.2秒)"));
 	
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
 	UE_LOG(LogTemp, Log, TEXT("✅ DAILY_UPGRADE_REWARD_PAGE_CONSTRUCT_END"));
@@ -681,30 +688,40 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图标缓存已刷新 (缓存数量: %d)"), CachedItemIcons.Num());
 	
 	// 2. 更新现有经验宝箱控件状态（不重新创建）
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/5] 📦 更新经验宝箱控件状态..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/6] 📦 更新经验宝箱控件状态..."));
 	UpdateExperienceChestWidgetsState();
 	int32 ChestCount = ItemsScrollBox ? ItemsScrollBox->GetChildrenCount() : 0;
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件状态已更新 (控件数量: %d)"), ChestCount);
 	
 	// 2.1 额外刷新所有进度条显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.1/5] 📊 刷新经验进度条显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.1/6] 📊 刷新经验进度条显示..."));
 	RefreshAllProgressBars();
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验进度条已刷新"));
 	
+	// 2.2 根据当前经验值居中显示相关内容
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.2/6] 🎯 根据经验值居中显示内容..."));
+	CenterScrollBoxOnCurrentExperience();
+	UE_LOG(LogTemp, Log, TEXT("✅ ScrollBox已根据经验值居中定位"));
+	
 	// 3. 更新宝箱数量显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/5] 📊 更新宝箱数量显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/6] 📊 更新宝箱数量显示..."));
 	UpdateChestCountText();
 	UE_LOG(LogTemp, Log, TEXT("✅ 宝箱数量文本已刷新"));
 	
 	// 4. 更新经验值显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤4/5] ⭐ 更新经验值显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤4/6] ⭐ 更新经验值显示..."));
 	UpdateExperienceDisplay();
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验值显示已刷新"));
 	
 	// 5. 更新奖励物品图像显示（基于最新的缓存数据）
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤5/5] 🖼️ 更新奖励物品图像显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤5/6] 🖼️ 更新奖励物品图像显示..."));
 	UpdateRewardItemImage();
 	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图像已刷新"));
+	
+	// 6. 更新固定奖励控件状态
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤6/6] 🎁 更新固定奖励控件状态..."));
+	UpdateFixedPrizeWidget();
+	UE_LOG(LogTemp, Log, TEXT("✅ 固定奖励控件状态已刷新"));
 	
 	// 🎉 刷新完成总结
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
@@ -1139,9 +1156,418 @@ void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 		// 全局刷新活动页面
 		Subsystem->OnGlobalRefresh.Broadcast();
 		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已广播全局刷新事件"));
+		
+		// 特别更新FixedPrizeWidget状态
+		UpdateFixedPrizeWidget();
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget状态已更新"));
 	}
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ChestClaimStatus索引%d无效"), ChestIndex);
 	}
+	
+	// 关闭RewardOptionWidget弹窗
+	if (RewardOptionWidgetClass)
+	{
+		// 查找并移除现有的RewardOptionWidget
+		for (TObjectIterator<URewardOptionWidget> It; It; ++It)
+		{
+			URewardOptionWidget* ExistingWidget = *It;
+			if (ExistingWidget && ExistingWidget->IsInViewport())
+			{
+				ExistingWidget->RemoveFromParent();
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已关闭RewardOptionWidget弹窗"));
+				break;
+			}
+		}
+	}
+}
+
+void UDailyUpgradeRewardPage::InitializeFixedPrizeWidget()
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始初始化FixedPrizeWidget"));
+	
+	// 检查FixedPrizeWidget控件是否存在
+	if (!FixedPrizeWidget)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget控件未绑定"));
+		return;
+	}
+	
+	// 检查是否为编辑器预览模式
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		return; // 静默返回，不输出日志
+	}
+	
+	// 通过Subsystem获取必要数据
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Sub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// 使用Subsystem提供的接口获取数据
+	bool bShouldShowHighlight = Sub->ShouldShowFixedPrizeHighlight();
+	int32 ExperienceValue = Sub->GetFixedPrizeExperienceValue();
+	int32 FixedIndex = Sub->GetFixedPrizeIndex();
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget数据获取结果:"));
+	UE_LOG(LogTemp, Log, TEXT("  - Highlight显示状态: %s"), bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"));
+	UE_LOG(LogTemp, Log, TEXT("  - ExperienceValue(来自TaskRelatedValues最后一个索引): %d"), ExperienceValue);
+	UE_LOG(LogTemp, Log, TEXT("  - FixedIndex: %d"), FixedIndex);
+	UE_LOG(LogTemp, Log, TEXT("  - 当前经验值: %d"), Sub->GetCurrentExperience());
+	
+	// 设置HighlightFrameImage的显示状态
+	if (FixedPrizeWidget->HighlightFrameImage)
+	{
+		FixedPrizeWidget->HighlightFrameImage->SetVisibility(
+			bShouldShowHighlight ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget HighlightFrameImage已%s"), 
+			bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"));
+	}
+	
+	// 设置ExperienceText显示值
+	if (FixedPrizeWidget->ExperienceText)
+	{
+		FString ExperienceText = FString::FromInt(ExperienceValue);
+		FixedPrizeWidget->ExperienceText->SetText(FText::FromString(ExperienceText));
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget ExperienceText已设置为: %s (来自TaskRelatedValues最后一个索引)"), *ExperienceText);
+	}
+	
+	// 设置宝箱索引
+	if (FixedIndex >= 0)
+	{
+		FixedPrizeWidget->SetChestIndex(FixedIndex);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget索引已设置为: %d"), FixedIndex);
+	}
+	
+	// 更新按钮状态
+	FixedPrizeWidget->UpdateButtonState();
+	
+	// 更新钻石图标颜色
+	FixedPrizeWidget->UpdateDiamondIconColor();
+	
+	// 更新经验文本颜色 - 这里会根据CurrentExperience和TaskRelatedValues值判断颜色
+	FixedPrizeWidget->UpdateExperienceTextColor();
+	
+	// 绑定FixedPrizeWidget的领取事件
+	FixedPrizeWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget事件绑定完成"));
+	
+	// 设置FixedPrizeWidget的宝箱数量文本
+	FString ChestCount = Sub->GetFixedPrizeChestCount();
+	if (FixedPrizeWidget->ChestCountText)
+	{
+		FString DisplayText = FString::Printf(TEXT("X%s"), *ChestCount);
+		FixedPrizeWidget->ChestCountText->SetText(FText::FromString(DisplayText));
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget宝箱数量已设置为: %s"), *DisplayText);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget的ChestCountText控件未绑定"));
+	}
+	
+	// 更新FixedPrizeWidget专用进度条（调用Subsystem方法）
+	float Progress = Sub->CalculateFixedPrizeProgress();
+	if (FixedPrizeWidget->ExperienceProgressBar)
+	{
+		FixedPrizeWidget->ExperienceProgressBar->SetPercent(Progress);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget进度条已更新为 %.2f%%"), Progress * 100);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget的ExperienceProgressBar控件未绑定"));
+	}
+	
+	// 设置FixedPrizeWidget的宝箱图标
+	UTexture2D* BoxIcon = Sub->GetFixedPrizeBoxIcon();
+	if (BoxIcon)
+	{
+		// 使用ExperienceChestClaimWidget已有的SetChestBoxIcon方法
+		FixedPrizeWidget->SetChestBoxIcon(BoxIcon);
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget宝箱图标已设置"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取FixedPrizeWidget宝箱图标"));
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget初始化完成"));
+}
+
+void UDailyUpgradeRewardPage::UpdateFixedPrizeWidget()
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始更新FixedPrizeWidget状态"));
+	
+	// 直接调用初始化函数，因为它已经包含了完整的更新逻辑
+	InitializeFixedPrizeWidget();
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget状态更新完成"));
+}
+
+// 全局静态变量用于跨函数通信
+namespace
+{
+	bool GHasInvalidGeometryDetected = false;
+}
+
+void UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience()
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始根据当前经验值居中ScrollBox内容"));
+	
+	// 强制刷新布局，确保几何信息准确
+	if (ItemsScrollBox)
+	{
+		ItemsScrollBox->ForceLayoutPrepass();
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已强制刷新ScrollBox布局"));
+	}
+	
+	// 检查必要组件
+	if (!ItemsScrollBox)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ItemsScrollBox控件未绑定"));
+		return;
+	}
+	
+	if (ItemsScrollBox->GetChildrenCount() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ItemsScrollBox中没有子控件"));
+		return;
+	}
+	
+	// 通过Subsystem获取业务逻辑结果
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Sub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// 直接调用Subsystem的业务逻辑函数
+	int32 TargetIndex = Sub->GetTargetChestIndexForCurrentExperience();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 从Subsystem获取的目标宝箱索引: %d"), TargetIndex);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ItemsScrollBox子控件总数: %d"), ItemsScrollBox->GetChildrenCount());
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 目标索引有效性检查: %s"), 
+		(TargetIndex >= 0 && TargetIndex < ItemsScrollBox->GetChildrenCount()) ? TEXT("有效") : TEXT("无效"));
+	
+	if (TargetIndex >= 0 && TargetIndex < ItemsScrollBox->GetChildrenCount())
+	{
+		float ScrollOffset = 0.0f;
+		
+		// 检查是否为目标是最后一个控件（需要靠右显示）
+		if (TargetIndex == ItemsScrollBox->GetChildrenCount() - 1)
+		{
+			// 最后一个控件：使用最大滚动偏移量，使其靠右显示
+			ScrollOffset = CalculateMaxScrollOffset();
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 目标为最后一个控件，设置最大滚动偏移量: %.2f"), ScrollOffset);
+					
+			// 检查是否需要使用备选方案（几何信息无效或计算结果为0）
+			if (ScrollOffset <= 0.0f || GHasInvalidGeometryDetected)
+			{
+				// 备选方案：基于控件数量和估算宽度计算
+				float EstimatedWidgetWidth = 130.0f; // 使用实际测量的控件宽度
+				float EstimatedSpacing = 10.0f; // 估算间距
+				int32 WidgetCount = ItemsScrollBox->GetChildrenCount();
+						
+				float TotalEstimatedWidth = WidgetCount * EstimatedWidgetWidth + (WidgetCount - 1) * EstimatedSpacing;
+				float ViewportWidth = ItemsScrollBox->GetCachedGeometry().GetLocalSize().X;
+				float EstimatedMaxOffset = FMath::Max(0.0f, TotalEstimatedWidth - ViewportWidth);
+						
+				// 使用更大的估算值确保靠右效果
+				EstimatedMaxOffset += 50.0f; // 额外偏移确保完全靠右
+						
+				ScrollOffset = EstimatedMaxOffset;
+				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 使用备选方案估算值: %.2f (控件数:%d, 估算总宽:%.2f, 可视宽:%.2f, 额外偏移:50.00)"), 
+					EstimatedMaxOffset, WidgetCount, TotalEstimatedWidth, ViewportWidth);
+						
+				GHasInvalidGeometryDetected = false; // 重置状态
+			}
+		}
+		else
+		{
+			// 非最后一个控件：使用居中逻辑
+			ScrollOffset = CalculateCenterScrollOffset(TargetIndex);
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 目标为中间控件，设置居中滚动偏移量: %.2f"), ScrollOffset);
+		}
+		
+		// 设置滚动位置
+		ItemsScrollBox->SetScrollOffset(ScrollOffset);
+		
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已设置ScrollBox滚动偏移量为 %.2f，目标控件索引: %d"), 
+			ScrollOffset, TargetIndex);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 目标索引 %d 超出范围 [0, %d]"), 
+			TargetIndex, ItemsScrollBox->GetChildrenCount() - 1);
+	}
+}
+
+int32 UDailyUpgradeRewardPage::FindTargetChestIndexForExperience(int32 CurrentExp, const TArray<int32>& TaskRelatedValues)
+{
+	// 调用Subsystem的业务逻辑函数
+	UGameInstance* GameInstance = GetGameInstance();
+	if (GameInstance)
+	{
+		UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+		if (Sub)
+		{
+			return Sub->GetTargetChestIndexForCurrentExperience();
+		}
+	}
+	
+	// 降级方案：使用原来的本地逻辑
+	for (int32 i = 0; i < TaskRelatedValues.Num(); ++i)
+	{
+		if (TaskRelatedValues[i] > CurrentExp)
+		{
+			int32 TargetIndex = FMath::Max(0, i - 1);
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 降级方案 - 找到经验值分界点，索引 %d 的值 %d > 当前经验 %d，目标索引: %d"), 
+				i, TaskRelatedValues[i], CurrentExp, TargetIndex);
+			return TargetIndex;
+		}
+	}
+	
+	int32 LastIndex = FMath::Max(0, TaskRelatedValues.Num() - 1);
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 降级方案 - 当前经验 %d 超过了所有TaskRelatedValues，返回最后一个索引: %d"), 
+		CurrentExp, LastIndex);
+	return LastIndex;
+}
+
+float UDailyUpgradeRewardPage::CalculateCenterScrollOffset(int32 TargetIndex)
+{
+	// 计算使目标控件居中显示所需的滚动偏移量
+	
+	if (ItemsScrollBox->GetChildrenCount() == 0)
+		return 0.0f;
+	
+	// 获取ScrollBox的可视区域宽度
+	float ViewportWidth = ItemsScrollBox->GetCachedGeometry().GetLocalSize().X;
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ScrollBox可视区域宽度: %.2f"), ViewportWidth);
+	
+	// 计算目标控件的累计位置
+	float TargetPosition = 0.0f;
+	float TargetWidgetWidth = 0.0f;
+	
+	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = ItemsScrollBox->GetChildAt(i);
+		if (ChildWidget)
+		{
+			float WidgetWidth = ChildWidget->GetCachedGeometry().GetLocalSize().X;
+			
+			// 添加间距（假设有默认间距）
+			if (i > 0)
+			{
+				TargetPosition += 10.0f; // 假设10像素间距
+			}
+			
+			if (i == TargetIndex)
+			{
+				TargetWidgetWidth = WidgetWidth;
+				break; // 找到目标控件，停止累加
+			}
+			
+			TargetPosition += WidgetWidth;
+		}
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 目标控件累积位置: %.2f, 宽度: %.2f"), TargetPosition, TargetWidgetWidth);
+	
+	// 计算居中偏移量
+	float CenterOffset = TargetPosition + (TargetWidgetWidth / 2.0f) - (ViewportWidth / 2.0f);
+	
+	// 确保偏移量在有效范围内
+	float MaxOffset = CalculateMaxScrollOffset();
+	CenterOffset = FMath::Clamp(CenterOffset, 0.0f, MaxOffset);
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 计算得出的居中偏移量: %.2f (范围: 0.0 - %.2f)"), CenterOffset, MaxOffset);
+	
+	return CenterOffset;
+}
+
+float UDailyUpgradeRewardPage::CalculateMaxScrollOffset()
+{
+	// 计算ScrollBox的最大滚动偏移量
+	
+	if (ItemsScrollBox->GetChildrenCount() == 0)
+		return 0.0f;
+	
+	float TotalContentWidth = 0.0f;
+	
+	// 计算所有子控件的总宽度
+	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = ItemsScrollBox->GetChildAt(i);
+		if (ChildWidget)
+		{
+			TotalContentWidth += ChildWidget->GetCachedGeometry().GetLocalSize().X;
+			
+			// 添加间距
+			if (i < ItemsScrollBox->GetChildrenCount() - 1)
+			{
+				TotalContentWidth += 10.0f; // 假设10像素间距
+			}
+		}
+	}
+	
+	// 获取可视区域宽度
+	float ViewportWidth = ItemsScrollBox->GetCachedGeometry().GetLocalSize().X;
+	
+	// 最大偏移量 = 总内容宽度 - 可视区域宽度
+	float MaxOffset = FMath::Max(0.0f, TotalContentWidth - ViewportWidth);
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 总内容宽度: %.2f, 可视区域宽度: %.2f, 最大偏移量: %.2f"), 
+		TotalContentWidth, ViewportWidth, MaxOffset);
+	
+	// 详细调试信息
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 详细几何信息:"));
+	UE_LOG(LogTemp, Log, TEXT("  - ScrollBox实际宽度: %.2f"), ItemsScrollBox->GetCachedGeometry().GetLocalSize().X);
+	
+	// 检查所有子控件的信息
+	bool bHasInvalidGeometry = false;
+	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = ItemsScrollBox->GetChildAt(i);
+		if (ChildWidget)
+		{
+			FVector2D WidgetSize = ChildWidget->GetCachedGeometry().GetLocalSize();
+			FVector2D WidgetPosition = ChildWidget->GetCachedGeometry().LocalToAbsolute(FVector2D(0, 0));
+			UE_LOG(LogTemp, Log, TEXT("  - 控件[%d] 宽度: %.2f, 位置X: %.2f"), i, WidgetSize.X, WidgetPosition.X);
+			
+			// 检查是否有无效的几何信息
+			if (WidgetSize.X <= 0.0f || WidgetPosition.X <= 0.0f)
+			{
+				bHasInvalidGeometry = true;
+				UE_LOG(LogTemp, Log, TEXT("  ⚠️  控件[%d] 几何信息无效，将使用备选方案"), i);
+			}
+		}
+	}
+	
+	// 如果发现无效几何信息，提前标记需要使用备选方案
+	if (bHasInvalidGeometry)
+	{
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 检测到无效几何信息，准备使用备选计算方案"));
+		
+		// 设置全局标志，让滚动函数知道需要使用备选方案
+		GHasInvalidGeometryDetected = true;
+	}
+	
+	return MaxOffset;
 }

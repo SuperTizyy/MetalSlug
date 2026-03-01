@@ -22,6 +22,7 @@ class UVerticalBox;
 class UScrollBox;
 class UUpgradeActivitySubsystem;
 class URewardOptionWidget;
+class UExperienceChestClaimWidget;
 
 /**
  * @brief 每日升级奖励活动页面
@@ -90,10 +91,18 @@ protected:
 	/** ExperienceChestClaimWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UExperienceChestClaimWidget> ExperienceChestWidgetClass;
+
+	/** 固定奖励控件引用 */
+	UPROPERTY(meta = (BindWidget))
+	UExperienceChestClaimWidget* FixedPrizeWidget;
 	
 	/** RewardOptionWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class URewardOptionWidget> RewardOptionWidgetClass;
+
+	/** FixedPrizeWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UExperienceChestClaimWidget> FixedPrizeWidgetClass;
 
 	/** ActivityConfirmPopupWidget蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
@@ -318,4 +327,44 @@ private:
 	 * @param ChestIndex 宝箱索引
 	 */
 	void ShowRewardOptionWidget(int32 ChestIndex);
+	
+	/**
+	 * @brief 初始化固定奖励控件
+	 * @details 根据TaskRelatedValues最后一个索引值和ChestClaimStatus状态控制HighlightFrameImage显示
+	 */
+	void InitializeFixedPrizeWidget();
+	
+	/**
+	 * @brief 更新固定奖励控件状态
+	 * @details 根据当前经验和领取状态更新FixedPrizeWidget的显示状态
+	 */
+	void UpdateFixedPrizeWidget();
+	
+	/**
+	 * @brief 根据当前经验值居中显示ScrollBox内容
+	 * @details 读取UpgradeActivitySubsystem内存数据的CurrentExperience值，
+	 *          根据TaskRelatedValues数组计算应该居中的宝箱索引，并设置ScrollBox滚动位置
+	 */
+	void CenterScrollBoxOnCurrentExperience();
+	
+	/**
+	 * @brief 根据当前经验值找到目标宝箱索引
+	 * @param CurrentExp 当前经验值
+	 * @param TaskRelatedValues 任务相关经验值数组
+	 * @return 应该居中的宝箱索引
+	 */
+	int32 FindTargetChestIndexForExperience(int32 CurrentExp, const TArray<int32>& TaskRelatedValues);
+	
+	/**
+	 * @brief 计算使目标控件居中显示的滚动偏移量
+	 * @param TargetIndex 目标控件索引
+	 * @return 滚动偏移量
+	 */
+	float CalculateCenterScrollOffset(int32 TargetIndex);
+	
+	/**
+	 * @brief 计算ScrollBox的最大滚动偏移量
+	 * @return 最大滚动偏移量
+	 */
+	float CalculateMaxScrollOffset();
 };

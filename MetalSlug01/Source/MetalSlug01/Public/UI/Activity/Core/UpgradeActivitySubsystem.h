@@ -181,6 +181,61 @@ public:
      * 更新RewardIconIndex字段并保存到存档
      */
     bool UpdateRewardIconIndexAndSave(int32 NewIndex);
+    
+    /**
+     * @brief 检查固定奖励控件是否应该显示高亮
+     * @details 根据TaskRelatedValues最后一个索引值和ChestClaimStatus状态判断
+     * 显示条件：CurrentExperience <= TaskRelatedValues最后一个值 且 ChestClaimStatus = 0
+     * @return 是否应该显示高亮
+     */
+    bool ShouldShowFixedPrizeHighlight();
+    
+    /**
+     * @brief 获取固定奖励控件的经验值显示
+     * @details 返回TaskRelatedValues数组中最后一个索引的值
+     * @return 最后一个TaskRelatedValues值，失败时返回0
+     */
+    int32 GetFixedPrizeExperienceValue();
+    
+    /**
+     * @brief 获取固定奖励控件的索引
+     * @details 返回TaskRelatedValues数组的最后一个索引
+     * @return 最后一个索引值，失败时返回-1
+     */
+    int32 GetFixedPrizeIndex();
+    
+    /**
+     * @brief 获取固定奖励控件的宝箱图标
+     * @details 按照指定逻辑获取FixedPrizeWidget的ChestClaimButton图标数据：
+     * 1. 找到DailyUpgradeRewardConfigRow表中ActivityID==110的数据
+     * 2. 获取RewardItemIDs里面最后一个索引的内容
+     * 3. 关联TreasureBoxItemRow表的BoxID得到对应的BoxIcon数据
+     * @return 宝箱图标纹理，失败时返回nullptr
+     */
+    UTexture2D* GetFixedPrizeBoxIcon();
+    
+    /**
+     * @brief 获取固定奖励控件的宝箱数量
+     * @details 找到DailyUpgradeRewardConfigRow表中ActivityID==110的数据，
+     * 获取RewardItemCounts数组内最后一个索引数据
+     * @return 宝箱数量字符串，失败时返回"0"
+     */
+    FString GetFixedPrizeChestCount();
+    
+    /**
+     * @brief 计算固定奖励控件进度条百分比
+     * @details 根据CurrentExperience值映射到286-315区间计算进度百分比
+     * 数值区间286-315对应0%-100%进度显示
+     * @return 进度百分比(0.0f-1.0f)，失败时返回0.0f
+     */
+    float CalculateFixedPrizeProgress();
+    
+    /**
+     * @brief 根据当前经验值获取应该居中的宝箱索引
+     * @details 这是业务逻辑，与具体UI无关
+     * @return 应该居中的宝箱索引
+     */
+    int32 GetTargetChestIndexForCurrentExperience() const;
 
     // ==================== 数据持久化 ====================
     

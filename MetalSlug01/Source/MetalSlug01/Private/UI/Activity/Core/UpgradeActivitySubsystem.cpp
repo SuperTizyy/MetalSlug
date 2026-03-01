@@ -1182,3 +1182,243 @@ int32 UUpgradeActivitySubsystem::GetCurrentExperience() const
 	return CurrentRecord.CurrentExperience;
 }
 
+bool UUpgradeActivitySubsystem::ShouldShowFixedPrizeHighlight()
+{
+	// 获取TaskRelatedValues数组
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config || Config->TaskRelatedValues.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: TaskRelatedValues数组为空或配置无效"));
+		return false;
+	}
+	
+	// 获取最后一个索引的值
+	int32 LastTaskValue = Config->TaskRelatedValues.Last();
+	int32 CurrentExp = CurrentRecord.CurrentExperience;
+	
+	// 检查最后一个索引的领取状态
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	bool bIsLastChestClaimed = false;
+	if (CurrentRecord.ChestClaimStatus.IsValidIndex(LastIndex))
+	{
+		bIsLastChestClaimed = (CurrentRecord.ChestClaimStatus[LastIndex] == 1);
+	}
+	
+	// 判断显示条件：CurrentExperience <= LastTaskValue 且 ChestClaimStatus = 0
+	bool bShouldShow = (CurrentExp <= LastTaskValue) && !bIsLastChestClaimed;
+	
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget显示判断:"));
+	UE_LOG(LogTemp, Log, TEXT("  - 当前经验: %d"), CurrentExp);
+	UE_LOG(LogTemp, Log, TEXT("  - 最后Task值: %d"), LastTaskValue);
+	UE_LOG(LogTemp, Log, TEXT("  - 是否已领取: %s"), bIsLastChestClaimed ? TEXT("是") : TEXT("否"));
+	UE_LOG(LogTemp, Log, TEXT("  - 显示条件满足: %s"), bShouldShow ? TEXT("是") : TEXT("否"));
+	
+	return bShouldShow;
+}
+
+int32 UUpgradeActivitySubsystem::GetFixedPrizeExperienceValue()
+{
+	// 获取TaskRelatedValues数组
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config || Config->TaskRelatedValues.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: TaskRelatedValues数组为空或配置无效"));
+		return 0;
+	}
+	
+	// 返回最后一个索引的值
+	int32 LastTaskValue = Config->TaskRelatedValues.Last();
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget经验值: %d"), LastTaskValue);
+	
+	return LastTaskValue;
+}
+
+int32 UUpgradeActivitySubsystem::GetFixedPrizeIndex()
+{
+	// 获取TaskRelatedValues数组
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config || Config->TaskRelatedValues.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: TaskRelatedValues数组为空或配置无效"));
+		return -1;
+	}
+	
+	// 返回最后一个索引
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget索引: %d"), LastIndex);
+	
+	return LastIndex;
+}
+
+UTexture2D* UUpgradeActivitySubsystem::GetFixedPrizeBoxIcon()
+{
+	// 1. 找到DailyUpgradeRewardConfigRow表中ActivityID==110的数据
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config || Config->RewardItemIDs.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取DailyUpgradeRewardConfig配置数据"));
+		return nullptr;
+	}
+	
+	// 2. 获取RewardItemIDs里面最后一个索引的内容
+	FString LastRewardItemID = Config->RewardItemIDs.Last();
+	int32 BoxID = FCString::Atoi(*LastRewardItemID);
+	
+	if (BoxID <= 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无效的BoxID: %s"), *LastRewardItemID);
+		return nullptr;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 获取到BoxID: %d (来自RewardItemID: %s)"), BoxID, *LastRewardItemID);
+	
+	// 3. 通过GameInstance获取ActivitySubsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取GameInstance"));
+		return nullptr;
+	}
+	
+	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+	if (!ActivitySub)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取ActivitySubsystem"));
+		return nullptr;
+	}
+	
+	// 4. 关联TreasureBoxItemRow表的BoxID得到对应的BoxIcon数据
+	const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+	if (!TreasureBoxItem || TreasureBoxItem->BoxIcon.IsNull())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 未找到BoxID %d 的有效宝箱图标"), BoxID);
+		return nullptr;
+	}
+	
+	// 异步加载纹理资源
+	UTexture2D* BoxIcon = TreasureBoxItem->BoxIcon.LoadSynchronous();
+	if (BoxIcon)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 成功获取FixedPrizeWidget宝箱图标 - BoxID: %d"), BoxID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法加载BoxID %d 的宝箱图标"), BoxID);
+	}
+	
+	return BoxIcon;
+}
+
+FString UUpgradeActivitySubsystem::GetFixedPrizeChestCount()
+{
+	// 1. 找到DailyUpgradeRewardConfigRow表中ActivityID==110的数据
+	const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取DailyUpgradeRewardConfig配置数据"));
+		return TEXT("0");
+	}
+	
+	// 2. 检查RewardItemCounts数组是否为空
+	if (Config->RewardItemCounts.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: RewardItemCounts数组为空"));
+		return TEXT("0");
+	}
+	
+	// 3. 获取RewardItemCounts数组内最后一个索引数据
+	FString LastRewardItemCount = Config->RewardItemCounts.Last();
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 获取到FixedPrizeWidget宝箱数量: %s"), *LastRewardItemCount);
+	
+	return LastRewardItemCount;
+}
+
+float UUpgradeActivitySubsystem::CalculateFixedPrizeProgress()
+{
+	// 获取当前经验值
+	int32 CurrentExp = CurrentRecord.CurrentExperience;
+	
+	// FixedPrizeWidget专用逻辑：286-315区间对应0%-100%进度
+	int32 LowerBound = 286;
+	int32 UpperBound = 315;
+	int32 Range = UpperBound - LowerBound;
+	
+	float Progress = 0.0f;
+	
+	if (Range > 0)
+	{
+		// 计算在区间内的位置
+		int32 CurrentInRange = FMath::Max(0, CurrentExp - LowerBound);
+		Progress = FMath::Clamp((float)CurrentInRange / (float)Range, 0.0f, 1.0f);
+		
+		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget进度计算 - 当前经验:%d, 区间[%d-%d], 范围内进度:%d/%d, 进度:%.2f%%"), 
+			CurrentExp, LowerBound, UpperBound, CurrentInRange, Range, Progress * 100);
+	}
+	else
+	{
+		// 边界情况处理
+		Progress = (CurrentExp >= LowerBound) ? 1.0f : 0.0f;
+		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget进度计算 - 边界情况处理，当前经验:%d, 进度:%.2f%%"), 
+			CurrentExp, Progress * 100);
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget最终进度为 %.2f%%"), Progress * 100);
+	return Progress;
+}
+
+int32 UUpgradeActivitySubsystem::GetTargetChestIndexForCurrentExperience() const
+{
+	int32 CurrentExp = CurrentRecord.CurrentExperience;
+	const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
+	
+	if (!Config || Config->TaskRelatedValues.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySubsystem: 无法获取TaskRelatedValues配置数据"));
+		return 0;
+	}
+	
+	const TArray<int32>& TaskValues = Config->TaskRelatedValues;
+	
+	// 增强的日志输出，显示所有TaskValues
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 当前经验值: %d"), CurrentExp);
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: TaskRelatedValues数组内容:"));
+	for (int32 i = 0; i < TaskValues.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("  索引[%d] = %d"), i, TaskValues[i]);
+	}
+	
+	// 特殊处理：如果当前经验大于等于最大值的95%，返回倒数第二个索引（因为最后一个被刨除了）
+	int32 MaxValue = TaskValues.Last();
+	int32 Threshold = FMath::RoundToInt(MaxValue * 0.95f); // 95%阈值
+	
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 最大值: %d, 95%%阈值: %d"), MaxValue, Threshold);
+	
+	if (CurrentExp >= Threshold)
+	{
+		// 注意：由于页面初始化时刨除了最后一个索引，所以这里返回倒数第二个索引
+		int32 TargetIndex = TaskValues.Num() - 2; // 倒数第二个索引
+		TargetIndex = FMath::Max(0, TargetIndex); // 确保不为负数
+		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 当前经验 %d >= 阈值 %d，返回倒数第二个索引: %d (靠最右显示)"), 
+			CurrentExp, Threshold, TargetIndex);
+		return TargetIndex;
+	}
+	
+	// 核心算法：找到第一个TaskRelatedValue大于CurrentExp的索引，然后向前退一个
+	for (int32 i = 0; i < TaskValues.Num(); ++i)
+	{
+		if (TaskValues[i] > CurrentExp)
+		{
+			// 找到第一个超过当前经验的值，返回前一个索引
+			int32 TargetIndex = FMath::Max(0, i - 1);
+			UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 找到经验值分界点，索引 %d 的值 %d > 当前经验 %d，目标索引: %d"), 
+				i, TaskValues[i], CurrentExp, TargetIndex);
+			return TargetIndex;
+		}
+	}
+	
+	// 备用逻辑（理论上不应该到达这里）
+	int32 LastIndex = FMath::Max(0, TaskValues.Num() - 1);
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 备用逻辑 - 返回最后一个索引: %d"), LastIndex);
+	return LastIndex;
+}
+

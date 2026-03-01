@@ -100,21 +100,37 @@ void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 	
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
 	
-	// 检查是否已领取
-	if (Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1)
+	// 区分FixedPrizeWidget和普通ExperienceChestWidget的逻辑
+	int32 TargetIndex = ChestIndex; // 默认使用自身索引
+	
+	// 如果是FixedPrizeWidget（通常ChestIndex较大），使用最后一个索引
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	if (ChestIndex >= LastIndex && LastIndex >= 0)
 	{
-		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，无法重复领取"), ChestIndex);
+		TargetIndex = LastIndex; // FixedPrizeWidget使用最后一个索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 检测为FixedPrizeWidget，使用索引%d"), TargetIndex);
+	}
+	else
+	{
+		TargetIndex = ChestIndex; // 普通ExperienceChestWidget使用自身索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 检测为普通Widget，使用索引%d"), TargetIndex);
+	}
+	
+	// 检查是否已领取（读取目标索引的ChestClaimStatus）
+	if (Record.ChestClaimStatus.IsValidIndex(TargetIndex) && Record.ChestClaimStatus[TargetIndex] == 1)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，无法重复领取"), TargetIndex);
 		return; // 已领取，不处理点击
 	}
 	
-	// 检查经验值条件
-	if (!Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	// 检查经验值条件（读取TaskRelatedValues数组目标索引的数据）
+	if (!Config->TaskRelatedValues.IsValidIndex(TargetIndex))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: TaskRelatedValues索引%d无效"), ChestIndex);
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: TaskRelatedValues索引%d无效"), TargetIndex);
 		return;
 	}
 	
-	int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+	int32 RequiredExp = Config->TaskRelatedValues[TargetIndex];
 	if (Record.CurrentExperience < RequiredExp)
 	{
 		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 经验值不足，当前:%d, 需要:%d"), Record.CurrentExperience, RequiredExp);
@@ -122,11 +138,12 @@ void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 	}
 	
 	// 条件满足，触发领取事件
-	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d条件满足，触发领取事件"), ChestIndex);
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d条件满足，触发领取事件"), TargetIndex);
 	
 	if (OnChestClaimRequested.IsBound())
 	{
-		OnChestClaimRequested.Broadcast(ChestIndex);
+		// 传递目标索引作为ChestIndex
+		OnChestClaimRequested.Broadcast(TargetIndex);
 	}
 	else
 	{
@@ -397,7 +414,7 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-
+	
 	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!Subsystem)
 	{
@@ -405,7 +422,7 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-
+	
 	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
 	if (!Config)
 	{
@@ -413,33 +430,61 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		UpdateSuccessTextVisibility(); // 更新SuccessText状态
 		return;
 	}
-
+	
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
-
-	// 判断状态
-	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1;
+	int32 CurrentExp = Record.CurrentExperience;
+	
+	// 区分FixedPrizeWidget和普通ExperienceChestWidget的逻辑
+	int32 TargetIndex = ChestIndex; // 默认使用自身索引
+	
+	// 如果是FixedPrizeWidget（通常ChestIndex较大或者有特殊标识），使用最后一个索引
+	if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	{
+		// 检查是否为FixedPrizeWidget逻辑
+		int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+		// 如果当前索引接近或等于最后一个索引，则认为是FixedPrizeWidget
+		if (ChestIndex >= LastIndex && LastIndex >= 0)
+		{
+			TargetIndex = LastIndex; // FixedPrizeWidget使用最后一个索引
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 检测为FixedPrizeWidget，使用最后一个索引%d"), TargetIndex);
+		}
+		else
+		{
+			TargetIndex = ChestIndex; // 普通ExperienceChestWidget使用自身索引
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 检测为普通ExperienceChestWidget，使用索引%d"), TargetIndex);
+		}
+	}
+	
+	// 判断按钮状态
+	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(TargetIndex) && Record.ChestClaimStatus[TargetIndex] == 1;
 	
 	if (bIsClaimed)
 	{
+		// 已领取状态
 		SetButtonClaimedState();
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮已领取 - 索引:%d"), TargetIndex);
 	}
 	else
 	{
-		// 检查经验值条件
+		// 未领取状态，检查经验值条件
 		bool bHasEnoughExp = false;
-		if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+		if (Config->TaskRelatedValues.IsValidIndex(TargetIndex))
 		{
-			int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
-			bHasEnoughExp = (Record.CurrentExperience >= RequiredExp);
+			int32 RequiredExp = Config->TaskRelatedValues[TargetIndex];
+			bHasEnoughExp = (CurrentExp >= RequiredExp);
 		}
 		
 		if (bHasEnoughExp)
 		{
+			// 满足领取条件：启用按钮
 			SetButtonEnabledState();
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮启用 - 索引:%d, 当前经验:%d"), TargetIndex, CurrentExp);
 		}
 		else
 		{
+			// 不满足领取条件：禁用按钮但保持正常颜色
 			SetButtonDisabledState();
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 按钮条件不足 - 索引:%d, 当前经验:%d"), TargetIndex, CurrentExp);
 		}
 	}
 	
@@ -535,29 +580,63 @@ void UExperienceChestClaimWidget::UpdateSuccessTextVisibility()
 		return;
 	}
 	
+	const FDailyUpgradeRewardConfigRow* Config = Subsystem->GetActivityConfig();
+	if (!Config)
+	{
+		// 无法获取配置时隐藏SuccessText
+		if (SuccessText)
+		{
+			SuccessText->SetVisibility(ESlateVisibility::Hidden);
+		}
+		return;
+	}
+	
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
 	
-	// 根据ChestClaimStatus数组数据控制SuccessText显示
-	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(ChestIndex) && Record.ChestClaimStatus[ChestIndex] == 1;
+	// 区分FixedPrizeWidget和普通ExperienceChestWidget的逻辑
+	int32 TargetIndex = ChestIndex; // 默认使用自身索引
 	
-	if (SuccessText)
+	// 如果是FixedPrizeWidget（通常ChestIndex较大），使用最后一个索引
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	if (ChestIndex >= LastIndex && LastIndex >= 0)
 	{
-		if (bIsClaimed)
+		TargetIndex = LastIndex; // FixedPrizeWidget使用最后一个索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: SuccessText检测为FixedPrizeWidget，使用索引%d"), TargetIndex);
+	}
+	else
+	{
+		TargetIndex = ChestIndex; // 普通ExperienceChestWidget使用自身索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: SuccessText检测为普通Widget，使用索引%d"), TargetIndex);
+	}
+	
+	// 根据目标索引的ChestClaimStatus数据控制SuccessText显示
+	if (Record.ChestClaimStatus.IsValidIndex(TargetIndex))
+	{
+		bool bIsClaimed = (Record.ChestClaimStatus[TargetIndex] == 1);
+		
+		if (SuccessText)
 		{
-			// 已领取状态：显示SuccessText
-			SuccessText->SetVisibility(ESlateVisibility::Visible);
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，显示SuccessText"), ChestIndex);
-		}
-		else
-		{
-			// 未领取状态：隐藏SuccessText
-			SuccessText->SetVisibility(ESlateVisibility::Hidden);
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d未领取，隐藏SuccessText"), ChestIndex);
+			if (bIsClaimed)
+			{
+				// 已领取状态：显示SuccessText
+				SuccessText->SetVisibility(ESlateVisibility::Visible);
+				UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 索引%d已领取，显示SuccessText"), TargetIndex);
+			}
+			else
+			{
+				// 未领取状态：隐藏SuccessText
+				SuccessText->SetVisibility(ESlateVisibility::Hidden);
+				UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 索引%d未领取，隐藏SuccessText"), TargetIndex);
+			}
 		}
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: SuccessText控件未绑定"));
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: ChestClaimStatus索引%d无效"), TargetIndex);
+		if (SuccessText)
+		{
+			SuccessText->SetVisibility(ESlateVisibility::Hidden);
+		}
 	}
 }
 
@@ -600,15 +679,31 @@ void UExperienceChestClaimWidget::UpdateDiamondIconColor()
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
 	int32 CurrentExp = Record.CurrentExperience;
 	
-	// 判断是否满足条件：CurrentExperience >= TaskRelatedValues[ChestIndex]
-	bool bConditionMet = false;
-	if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	// 区分FixedPrizeWidget和普通ExperienceChestWidget的逻辑
+	int32 TargetIndex = ChestIndex; // 默认使用自身索引
+	
+	// 如果是FixedPrizeWidget（通常ChestIndex较大），使用最后一个索引
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	if (ChestIndex >= LastIndex && LastIndex >= 0)
 	{
-		int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+		TargetIndex = LastIndex; // FixedPrizeWidget使用最后一个索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: DiamondIcon检测为FixedPrizeWidget，使用索引%d"), TargetIndex);
+	}
+	else
+	{
+		TargetIndex = ChestIndex; // 普通ExperienceChestWidget使用自身索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: DiamondIcon检测为普通Widget，使用索引%d"), TargetIndex);
+	}
+	
+	// 判断是否满足条件：CurrentExperience >= TaskRelatedValues[TargetIndex]
+	bool bConditionMet = false;
+	if (Config->TaskRelatedValues.IsValidIndex(TargetIndex))
+	{
+		int32 RequiredExp = Config->TaskRelatedValues[TargetIndex];
 		bConditionMet = (CurrentExp >= RequiredExp);
 		
-		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 当前经验:%d, 需要经验:%d, 条件%s"), 
-			ChestIndex, CurrentExp, RequiredExp, bConditionMet ? TEXT("满足") : TEXT("不满足"));
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: 当前经验:%d, 需要经验:%d, 条件%s"), 
+			TargetIndex, CurrentExp, RequiredExp, bConditionMet ? TEXT("满足") : TEXT("不满足"));
 	}
 	
 	// 设置DiamondIconImage颜色
@@ -618,13 +713,13 @@ void UExperienceChestClaimWidget::UpdateDiamondIconColor()
 		{
 			// 条件满足：显示黄色
 			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Yellow));
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: DiamondIcon设置为黄色"), ChestIndex);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: DiamondIcon设置为黄色"), TargetIndex);
 		}
 		else
 		{
 			// 条件不满足：显示黑色
 			DiamondIconImage->SetBrushTintColor(FSlateColor(FLinearColor::Black));
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: DiamondIcon设置为黑色"), ChestIndex);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: DiamondIcon设置为黑色"), TargetIndex);
 		}
 	}
 	else
@@ -672,28 +767,43 @@ void UExperienceChestClaimWidget::UpdateExperienceTextColor()
 	const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
 	int32 CurrentExp = Record.CurrentExperience;
 	
-	// 检查CurrentExperience是否大于等于TaskRelatedValues中对应索引的值
+	// 区分FixedPrizeWidget和普通ExperienceChestWidget的逻辑
+	int32 TargetIndex = ChestIndex; // 默认使用自身索引
+	
+	// 如果是FixedPrizeWidget（通常ChestIndex较大），使用最后一个索引
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	if (ChestIndex >= LastIndex && LastIndex >= 0)
+	{
+		TargetIndex = LastIndex; // FixedPrizeWidget使用最后一个索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: ExperienceText检测为FixedPrizeWidget，使用索引%d"), TargetIndex);
+	}
+	else
+	{
+		TargetIndex = ChestIndex; // 普通ExperienceChestWidget使用自身索引
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: ExperienceText检测为普通Widget，使用索引%d"), TargetIndex);
+	}
+	
+	// 检查CurrentExperience是否大于等于TaskRelatedValues中目标索引的值
 	bool bConditionMet = false;
 	
-	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 当前经验:%d, TaskRelatedValues数量:%d"), 
-		ChestIndex, CurrentExp, Config->TaskRelatedValues.Num());
+	UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: 当前经验:%d, TaskRelatedValues数量:%d"), 
+		TargetIndex, CurrentExp, Config->TaskRelatedValues.Num());
 	
-	// 只检查对应索引的TaskRelatedValues值
-	if (Config->TaskRelatedValues.IsValidIndex(ChestIndex))
+	// 只检查目标索引的TaskRelatedValues值
+	if (Config->TaskRelatedValues.IsValidIndex(TargetIndex))
 	{
-		int32 RequiredExp = Config->TaskRelatedValues[ChestIndex];
+		int32 RequiredExp = Config->TaskRelatedValues[TargetIndex];
 		bConditionMet = (CurrentExp >= RequiredExp);
 		
-		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: 经验值%d %s 需要值%d，条件%s"), 
-			ChestIndex, CurrentExp, 
+		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: 经验值%d %s 需要值%d，条件%s"), 
+			TargetIndex, CurrentExp, 
 			bConditionMet ? TEXT(">=") : TEXT("<"), 
 			RequiredExp, 
 			bConditionMet ? TEXT("满足") : TEXT("不满足"));
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget[%d]: TaskRelatedValues索引%d无效"), 
-			ChestIndex, ChestIndex);
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget[索引%d]: TaskRelatedValues索引无效"), TargetIndex);
 	}
 	
 	// 设置ExperienceText颜色
@@ -703,13 +813,13 @@ void UExperienceChestClaimWidget::UpdateExperienceTextColor()
 		{
 			// 条件满足：显示黑色
 			ExperienceText->SetColorAndOpacity(FLinearColor::Black);
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: ExperienceText设置为黑色"), ChestIndex);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: ExperienceText设置为黑色"), TargetIndex);
 		}
 		else
 		{
 			// 条件不满足：显示黄色
 			ExperienceText->SetColorAndOpacity(FLinearColor::Yellow);
-			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[%d]: ExperienceText设置为黄色"), ChestIndex);
+			UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget[索引%d]: ExperienceText设置为黄色"), TargetIndex);
 		}
 	}
 	else
