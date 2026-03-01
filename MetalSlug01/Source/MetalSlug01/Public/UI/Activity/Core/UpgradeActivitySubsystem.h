@@ -185,7 +185,7 @@ public:
     /**
      * @brief 检查固定奖励控件是否应该显示高亮
      * @details 根据TaskRelatedValues最后一个索引值和ChestClaimStatus状态判断
-     * 显示条件：CurrentExperience <= TaskRelatedValues最后一个值 且 ChestClaimStatus = 0
+     * 显示条件：CurrentExperience >= TaskRelatedValues最后一个值 且 ChestClaimStatus = 0
      * @return 是否应该显示高亮
      */
     bool ShouldShowFixedPrizeHighlight();

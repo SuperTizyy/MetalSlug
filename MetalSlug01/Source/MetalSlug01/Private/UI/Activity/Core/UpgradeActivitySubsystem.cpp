@@ -36,19 +36,20 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // 1. 预加载配置表 - 提前加载活动配置数据到内存中，提高运行时性能
     CachedConfigTable = LoadObject<UDataTable>(nullptr, TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow.DT_DailyUpgradeRewardConfigRow"));
 
-    // 2. 检查并创建初始记录 - 确保系统有第一天的记录
+    // 2. 检查并创建初始记录 - 确保系统有最新的记录
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
     {
         UDailyLoginSaveGame* Loaded = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
-        if (Loaded && Loaded->UpgradeRewardRecords.Contains(1))
+        if (Loaded && Loaded->UpgradeRewardRecords.Num() > 0)
         {
-            // 已存在第一天记录，加载最新的记录
+            // 存档存在且包含记录，加载最新的记录（不管RecordDate是多少）
+            UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 发现存档，加载最新记录"));
             ReloadLatestRecord();
         }
         else
         {
-            // 存档存在但没有第一天记录，或者需要强制创建第一天记录
-            UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 存档中缺少第一天记录，创建RecordDate=1的新记录"));
+            // 存档存在但没有记录数据，创建第一天记录
+            UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: 存档中无记录数据，创建RecordDate=1的新记录"));
             CreateTodayRecord();
             SaveStatus(); // 立即保存到磁盘
         }
@@ -1204,8 +1205,8 @@ bool UUpgradeActivitySubsystem::ShouldShowFixedPrizeHighlight()
 		bIsLastChestClaimed = (CurrentRecord.ChestClaimStatus[LastIndex] == 1);
 	}
 	
-	// 判断显示条件：CurrentExperience <= LastTaskValue 且 ChestClaimStatus = 0
-	bool bShouldShow = (CurrentExp <= LastTaskValue) && !bIsLastChestClaimed;
+	// 判断显示条件：CurrentExperience >= LastTaskValue 且 ChestClaimStatus = 0
+	bool bShouldShow = (CurrentExp >= LastTaskValue) && !bIsLastChestClaimed;
 	
 	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySubsystem: FixedPrizeWidget显示判断:"));
 	UE_LOG(LogTemp, Log, TEXT("  - 当前经验: %d"), CurrentExp);

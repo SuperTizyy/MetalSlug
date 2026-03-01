@@ -290,4 +290,10 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Debug")
 	void ShowDailyUpgradePage();
+	
+	/**
+	 * @brief 游戏退出时自动保存
+	 * @details 在游戏关闭时调用，将所有内存修改保存到磁盘
+	 */
+	void AutoSaveOnGameExit();
 };

@@ -489,7 +489,11 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	}
 	SaveGame->UpgradeRewardRecords.Add(RecordDate, NewRecord);
 	
+	// 同时更新TargetSubsystem的CurrentRecord
+	TargetSubsystem->GetRecord() = NewRecord;
+	
 	UE_LOG(LogTemp, Log, TEXT("✅ 成功创建新记录 RecordDate=%d"), RecordDate);
+	UE_LOG(LogTemp, Log, TEXT("🔄 已同步更新TargetSubsystem的CurrentRecord"));
 	
 	// 强制刷新所有页面，重新获取内存数据
 	ForceRefreshAllPages();
@@ -1501,4 +1505,25 @@ void UUpgradeActivitySaveModifier::ShowDailyUpgradePage()
 	*/
 	
 	UE_LOG(LogTemp, Warning, TEXT("⚠️ 请在项目中实现ShowDailyUpgradePage功能"));
+}
+
+void UUpgradeActivitySaveModifier::AutoSaveOnGameExit()
+{
+	if (!TargetSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("⚠️ AutoSaveOnGameExit: TargetSubsystem为空，无需保存"));
+		return;
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("💾 AUTO_SAVE_ON_GAME_EXIT_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
+	UE_LOG(LogTemp, Log, TEXT("📊 执行游戏退出自动保存"));
+	UE_LOG(LogTemp, Log, TEXT("⏰ 保存时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	
+	// 保存当前内存数据到磁盘
+	TargetSubsystem->SaveStatus();
+	
+	UE_LOG(LogTemp, Log, TEXT("✅ 游戏退出自动保存完成 - 所有内存修改已持久化到磁盘"));
 }

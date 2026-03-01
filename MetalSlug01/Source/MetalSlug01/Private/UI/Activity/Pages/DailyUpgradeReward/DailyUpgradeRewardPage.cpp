@@ -565,15 +565,23 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 为第%d个宝箱设置ExperienceText: %s"), i + 1, *ExperienceValue);
 			
 			// 根据条件控制HighlightFrameImage显示：
-			// ChestClaimStatus=0 且 TaskRelatedValues[i] < CurrentExperience 时显示高亮框
+			// ChestClaimStatus=0 且 CurrentExperience >= TaskRelatedValues[i] 时显示高亮框
 			bool bShouldShowHighlight = false;
 			if (Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 0)
 			{
-				if (TaskRelatedValues[i] < CurrentExpFromSubsystem)
+				if (CurrentExpFromSubsystem >= TaskRelatedValues[i])
 				{
 					bShouldShowHighlight = true;
 				}
 			}
+			
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱详细判断:"), i + 1);
+			UE_LOG(LogTemp, Log, TEXT("  - 当前经验: %d"), CurrentExpFromSubsystem);
+			UE_LOG(LogTemp, Log, TEXT("  - 需要经验: %d"), TaskRelatedValues[i]);
+			UE_LOG(LogTemp, Log, TEXT("  - 是否已领取: %s"), (Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 1) ? TEXT("是") : TEXT("否"));
+			UE_LOG(LogTemp, Log, TEXT("  - 条件判断: %d >= %d = %s"), CurrentExpFromSubsystem, TaskRelatedValues[i], 
+				CurrentExpFromSubsystem >= TaskRelatedValues[i] ? TEXT("满足") : TEXT("不满足"));
+			UE_LOG(LogTemp, Log, TEXT("  - 最终显示状态: %s"), bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"));
 			
 			if (ChestWidget->HighlightFrameImage)
 			{
