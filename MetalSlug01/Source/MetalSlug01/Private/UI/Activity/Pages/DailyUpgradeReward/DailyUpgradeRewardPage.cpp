@@ -106,6 +106,7 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 {
 	// 初始化当前选中的天数索引为-1（表示未选择）
 	CurrentDayIndex = -1;
+	CurrentSelectedDay = 0; // 0表示没有临时高亮
 	
 	// 清空按钮映射表以避免重复添加
 	ButtonToDayIndexMap.Empty();
@@ -564,6 +565,7 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 {
 	if (!CurrentExpText)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("[UI_REFRESH_DEBUG] CurrentExpText is NULL!"));
 		return;
 	}
 
@@ -593,6 +595,7 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	int32 CurrentExp = Sub->GetCurrentExperience();
 	FString ExpText = FString::Printf(TEXT("%d"), CurrentExp);
 	CurrentExpText->SetText(FText::FromString(ExpText));
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] UpdateCurrentExperienceText: 设置经验值为 %d"), CurrentExp);
 	
 }
 
@@ -767,6 +770,22 @@ void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, i
 	// 存储当前选中的天数索引
 	CurrentDayIndex = DayIndex;
 		
+	// 从DayIdentifier提取天数（如从"day1"提取1）
+	int32 SelectedDayNumber = FCString::Atoi(*DayIdentifier.RightChop(3));
+		
+	// 存储当前选中的天数（用于临时高亮）
+	CurrentSelectedDay = SelectedDayNumber;
+	UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 设置CurrentSelectedDay为: %d"), CurrentSelectedDay);
+		
+	// 刷新每日任务高亮状态（确保点击DayButton后SelectionHighlightImage跟随）
+	RefreshDailyTaskHighlights();
+		
+	// 强制刷新UI
+	if (DayButtonsContainer)
+	{
+		DayButtonsContainer->InvalidateLayoutAndVolatility();
+	}
+	
 	// 更新限时加成信息文本
 	UpdateBonusInfoText(DayIdentifier);
 	
@@ -906,6 +925,16 @@ void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, i
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: TasksContainer 初始化完成，共创建%d个 TaskDetailWidget"), ProcessedDescriptions.Num());
+	
+	// 刷新每日任务高亮状态（确保点击DayButton后SelectionHighlightImage跟随）
+	RefreshDailyTaskHighlights();
+	
+	// 强制刷新UI
+	if (DayButtonsContainer)
+	{
+		DayButtonsContainer->InvalidateLayoutAndVolatility();
+	}
+	
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
@@ -925,11 +954,11 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	// 🆔 自我身份核对 - 显示页面唯一标识
 	FString PageIdentity = GetPageIdentity();
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔄 DAILY_UPGRADE_REWARD_PAGE_REFRESH_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 页面身份: %s"), *PageIdentity);
-	UE_LOG(LogTemp, Log, TEXT("📍 刷新时页面地址: %p"), this);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 刷新时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("📅 当前选中天数索引: %d"), CurrentDayIndex);
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] 🔄 DAILY_UPGRADE_REWARD_PAGE_REFRESH_START"));
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] 🆔 页面身份: %s"), *PageIdentity);
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] 📍 刷新时页面地址: %p"), this);
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] ⏰ 刷新时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("[UI_REFRESH_DEBUG] 📅 当前选中天数索引: %d"), CurrentDayIndex);
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 	
 	// 执行全量刷新：重新初始化所有核心UI组件
@@ -1001,12 +1030,16 @@ void UDailyUpgradeRewardPage::RefreshUI()
  */
 void UDailyUpgradeRewardPage::HandleDayButtonClicked()
 {
+	UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] HandleDayButtonClicked 被调用"));
+	
 	// 🔧 安全检查：确保 ButtonToDayIndexMap 不为空
 	if (ButtonToDayIndexMap.Num() == 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("⚠️ HandleDayButtonClicked: ButtonToDayIndexMap 为空"));
 		return;
 	}
+	
+	UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] ButtonToDayIndexMap 数量: %d"), ButtonToDayIndexMap.Num());
 	
 	// 遍历 ButtonToDayIndexMap 找到被点击的按钮
 	for (auto& Pair : ButtonToDayIndexMap)
@@ -1016,6 +1049,8 @@ void UDailyUpgradeRewardPage::HandleDayButtonClicked()
 		{
 			continue;
 		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 检查按钮是否悬停: %s"), Pair.Key->IsHovered() ? TEXT("是") : TEXT("否"));
 		
 		if (Pair.Key->IsHovered())
 		{
@@ -1029,6 +1064,8 @@ void UDailyUpgradeRewardPage::HandleDayButtonClicked()
 			return;
 		}
 	}
+	
+	UE_LOG(LogTemp, Warning, TEXT("[HIGHLIGHT_DEBUG] 未找到悬停的按钮！"));
 }
 
 
@@ -1226,6 +1263,7 @@ void UDailyUpgradeRewardPage::ManualRefreshUI()
 void UDailyUpgradeRewardPage::RefreshDailyTaskHighlights()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 刷新每日任务高亮状态"));
+	UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] RefreshDailyTaskHighlights 被调用, CurrentSelectedDay: %d"), CurrentSelectedDay);
 	
 	// 检查必要组件
 	if (!DayButtonsContainer)
@@ -1261,11 +1299,31 @@ void UDailyUpgradeRewardPage::RefreshDailyTaskHighlights()
 		
 		if (TaskWidget && TaskWidget->SelectionHighlightImage)
 		{
-			// 直接使用Subsystem提供的业务逻辑结果
+			// 结合自动高亮和临时高亮逻辑
 			bool bShouldHighlight = false;
+			
+			// 自动高亮：基于RecordDate最大值
 			if (i < HighlightStates.Num())
 			{
 				bShouldHighlight = HighlightStates[i];
+			}
+			
+			// 临时高亮：用户点击的天数（优先级更高）
+			if (CurrentSelectedDay > 0 && CurrentSelectedDay <= 7)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 当前选中天数: %d, 当前索引: %d"), CurrentSelectedDay, i);
+				// 用户点击的天数对应索引是 CurrentSelectedDay - 1
+				int32 SelectedIndex = CurrentSelectedDay - 1;
+				if (i == SelectedIndex)
+				{
+					bShouldHighlight = true; // 临时高亮覆盖自动高亮
+					UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 高亮索引 %d"), i);
+				}
+				else
+				{
+					bShouldHighlight = false; // 其他天数不显示高亮
+					UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 隐藏索引 %d"), i);
+				}
 			}
 			
 			// 设置高亮显示状态

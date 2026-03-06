@@ -704,40 +704,65 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 				// 直接使用已初始化的 TargetSubsystem
 				if (this->TargetSubsystem)
 				{
-					// 获取当前记录的副本以避免引用问题
-					FUpgradeRewardSaveRecord ModifiedRecord = this->TargetSubsystem->GetRecord();
+					// 获取指定 RecordDate 的记录
+					const FUpgradeRewardSaveRecord* RecordPtr = this->TargetSubsystem->GetRecordByDate(RecordDate);
+					FUpgradeRewardSaveRecord ModifiedRecord;
+										
+					if (RecordPtr)
+					{
+						// 使用现有记录
+						ModifiedRecord = *RecordPtr;
+					}
+					else
+					{
+						// 创建新记录
+						ModifiedRecord.SetRecordDate(RecordDate);
+						ModifiedRecord.CurrentExperience = 0;
+						ModifiedRecord.RewardIconIndex = 0;
+						ModifiedRecord.LimitedActivityCompleteCount = 0;
+						ModifiedRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+						ModifiedRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
+						ModifiedRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
+					}
+										
 					int32 OriginalExp = ModifiedRecord.CurrentExperience;
 					ModifiedRecord.CurrentExperience = Exp;
 					ModifiedRecord.LastUpdateTime = FDateTime::Now();
-																				
+																						
 					// 同步更新 AllRecords
 					this->TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
 											
+					// 如果修改的是当前记录，同步更新 CurrentRecord
+					if (this->TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+					{
+						this->TargetSubsystem->GetRecord() = ModifiedRecord;
+					}
+											
 					UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-					UE_LOG(LogTemp, Log, TEXT("MEMORY_DATA_MODIFICATION_START"));
-					UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), this->TargetSubsystem);
-					UE_LOG(LogTemp, Log, TEXT("经验值修改: %d -> %d"), OriginalExp, Exp);
-					UE_LOG(LogTemp, Log, TEXT("修改时间: %s"), *FDateTime::Now().ToString());
-					UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] MEMORY_DATA_MODIFICATION_START"));
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] Subsystem地址: %p"), this->TargetSubsystem);
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] 经验值修改: %d -> %d"), OriginalExp, Exp);
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] 修改时间: %s"), *FDateTime::Now().ToString());
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] 运行时模式: 仅内存操作，不写入磁盘"));
 					UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 											
 					// 强制刷新所有页面，重新获取内存数据
 					ForceRefreshAllPages();
 											
 					// 游戏关闭时才会保存到磁盘
-					UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] 标记为需要保存到磁盘（游戏关闭时执行）"));
 											
-					UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置经验值 RecordDate=%d Exp=%d 成功"), RecordDate, Exp);
+					UE_LOG(LogTemp, Log, TEXT("[SET_EXP_DEBUG] Upgrade控制台: 设置经验值 RecordDate=%d Exp=%d 成功"), RecordDate, Exp);
 				}
 				else
 				{
-					UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
+					UE_LOG(LogTemp, Error, TEXT("[SET_EXP_DEBUG] Upgrade控制台: 无法获取Subsystem实例"));
 				}
 
 			}
 			else
 			{
-				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.SetExp RecordDate ExperienceValue"));
+				UE_LOG(LogTemp, Warning, TEXT("[SET_EXP_DEBUG] Upgrade控制台: 用法 - Upgrade.SetExp RecordDate ExperienceValue"));
 			}
 		}),
 		ECVF_Default

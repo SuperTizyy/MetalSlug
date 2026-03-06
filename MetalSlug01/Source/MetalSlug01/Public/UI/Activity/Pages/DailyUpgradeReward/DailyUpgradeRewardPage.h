@@ -140,6 +140,9 @@ protected:
 	/** 当前选择的天数索引 */
 	int32 CurrentDayIndex;
 
+	/** 当前选中的天数（用于临时高亮） */
+	int32 CurrentSelectedDay;
+
 	/** 当前经验值 */
 	int32 CurrentExperience;
 

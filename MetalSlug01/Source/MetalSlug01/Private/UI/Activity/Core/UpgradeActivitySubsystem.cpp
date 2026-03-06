@@ -61,7 +61,14 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
     // 3. 初始化升级活动存档修改器
     SaveModifier = NewObject<UUpgradeActivitySaveModifier>(this);
-    SaveModifier->InitializeModifier(this, this);  // 传入自身作为Subsystem
+    if (GetWorld())
+    {
+    	SaveModifier->InitializeModifier(GetWorld(), this);  // 传入World和自身作为Subsystem
+    }
+    else
+    {
+    	SaveModifier->InitializeModifier(nullptr, this);  // 传入nullptr和自身作为Subsystem
+    }
     SaveModifier->RegisterConsoleCommands();
 }
 
@@ -430,8 +437,12 @@ void UUpgradeActivitySubsystem::SaveStatus()
         SaveGame = NewObject<UDailyLoginSaveGame>();
     }
 
-    // 更新或添加升级奖励记录 - 使用当前记录的实际日期
-    SaveGame->UpgradeRewardRecords.Add(CurrentRecord.GetDayNumber(), CurrentRecord);
+    // 更新或添加所有升级奖励记录 - 保存 AllRecords 中的所有数据
+    SaveGame->UpgradeRewardRecords.Empty();
+    for (const auto& Pair : AllRecords)
+    {
+        SaveGame->UpgradeRewardRecords.Add(Pair.Key, Pair.Value);
+    }
     // 保存到磁盘
     UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
 }
