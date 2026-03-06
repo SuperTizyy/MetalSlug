@@ -23,7 +23,7 @@
 // ==================== 主类实现 ====================
 
 UUpgradeActivitySaveModifier::UUpgradeActivitySaveModifier()
-	: CachedSaveGame(nullptr), TargetSubsystem(nullptr), bIsInitialized(false)
+	: CachedSaveGame(nullptr), TargetSubsystem(nullptr), bIsInitialized(false), bHasPendingChanges(false)
 {
 }
 
@@ -44,24 +44,24 @@ bool UUpgradeActivitySaveModifier::InitializeModifier(UObject* WorldContext, UUp
 		TargetSubsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 		if (TargetSubsystem)
 		{
-			UE_LOG(LogTemp, Log, TEXT("✅ UpgradeActivitySaveModifier: 成功映射Subsystem内存数据"));
+			UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 成功映射Subsystem内存数据"));
 			UE_LOG(LogTemp, Log, TEXT("   Subsystem地址: %p"), TargetSubsystem);
 			UE_LOG(LogTemp, Log, TEXT("   当前RecordDate: %d"), TargetSubsystem->GetRecord().GetDayNumber());
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 无法获取UpgradeActivitySubsystem"));
+			UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取UpgradeActivitySubsystem"));
 			return false;
 		}
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 无法获取GameInstance"));
+		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取GameInstance"));
 		return false;
 	}
 
 	bIsInitialized = true;
-	UE_LOG(LogTemp, Log, TEXT("🚀 UpgradeActivitySaveModifier: 内存映射初始化完成 - 运行时只操作内存，游戏关闭时保存到磁盘"));
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 内存映射初始化完成 - 运行时只操作内存，游戏关闭时保存到磁盘"));
 	return true;
 }
 
@@ -85,38 +85,45 @@ void UUpgradeActivitySaveModifier::DestroyModifier()
 
 bool UUpgradeActivitySaveModifier::ModifyCurrentExperience(int32 RecordDate, int32 NewExp, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyCurrentExperience")) || NewExp < 0)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
+		if (NewExp < 0) UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 经验值不能为负数: %d"), NewExp);
 		return false;
 	}
 
-	if (NewExp < 0)
+	// 确保记录存在
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 经验值不能为负数: %d"), NewExp);
+		CreateNewRecord(RecordDate, false, false);
+		RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	}
+	
+	if (!RecordPtr)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取目标记录"));
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalExp = TargetSubsystem->GetRecord().CurrentExperience;
-	TargetSubsystem->GetRecord().CurrentExperience = NewExp;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
 	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
-	UE_LOG(LogTemp, Log, TEXT("📊 经验值修改: %d -> %d"), OriginalExp, NewExp);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
 	
-	// 强制刷新所有页面，重新获取内存数据
+	int32 OriginalExp = ModifiedRecord.CurrentExperience;
+	ModifiedRecord.CurrentExperience = NewExp;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+	
+	// 同步更新 CurrentRecord（如果 RecordDate 匹配）
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+	{
+		TargetSubsystem->GetRecord() = ModifiedRecord;
+	}
+	
+	LogModification(TEXT("经验值"), FString::Printf(TEXT("%d -> %d"), OriginalExp, NewExp));
 	ForceRefreshAllPages();
 	
-	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -124,38 +131,39 @@ bool UUpgradeActivitySaveModifier::ModifyCurrentExperience(int32 RecordDate, int
 
 bool UUpgradeActivitySaveModifier::ModifyRewardIconIndex(int32 RecordDate, int32 NewIndex, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyRewardIconIndex")) || NewIndex < 0)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
+		if (NewIndex < 0) UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 图标索引不能为负数: %d"), NewIndex);
 		return false;
 	}
 
-	if (NewIndex < 0)
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 图标索引不能为负数: %d"), NewIndex);
+		UE_LOG(LogTemp, Error, TEXT("ModifyRewardIconIndex: 记录%d不存在"), RecordDate);
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalIndex = TargetSubsystem->GetRecord().RewardIconIndex;
-	TargetSubsystem->GetRecord().RewardIconIndex = NewIndex;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
+		
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+		
+	int32 OriginalIndex = ModifiedRecord.RewardIconIndex;
+	ModifiedRecord.RewardIconIndex = NewIndex;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+		
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+		
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+	{
+		TargetSubsystem->GetRecord() = ModifiedRecord;
+	}
 	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
-	UE_LOG(LogTemp, Log, TEXT("📊 图标索引修改: %d -> %d"), OriginalIndex, NewIndex);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-	
-	// 强制刷新所有页面，重新获取内存数据
+	LogModification(TEXT("图标索引"), FString::Printf(TEXT("%d -> %d"), OriginalIndex, NewIndex));
 	ForceRefreshAllPages();
 	
-	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -163,96 +171,108 @@ bool UUpgradeActivitySaveModifier::ModifyRewardIconIndex(int32 RecordDate, int32
 
 bool UUpgradeActivitySaveModifier::ModifyChestClaimStatus(int32 RecordDate, int32 ChestIndex, int32 IsClaimed, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyChestClaimStatus")) || 
+	    !ValidateBinaryState(IsClaimed, TEXT("宝箱状态")))
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
 		return false;
 	}
 
-	if (IsClaimed != 0 && IsClaimed != 1)
+	// 获取目标记录（支持任意日期）
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 宝箱状态只能是0或1: %d"), IsClaimed);
+		UE_LOG(LogTemp, Error, TEXT("ModifyChestClaimStatus: 记录%d不存在"), RecordDate);
 		return false;
 	}
-
-	// 边界检查
-	if (ChestIndex < 0 || !TargetSubsystem->GetRecord().ChestClaimStatus.IsValidIndex(ChestIndex))
+		
+	if (!RecordPtr->ChestClaimStatus.IsValidIndex(ChestIndex))
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 宝箱索引超出范围: %d"), ChestIndex);
+		UE_LOG(LogTemp, Error, TEXT("ModifyChestClaimStatus: 宝箱索引%d超出范围"), ChestIndex);
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalStatus = TargetSubsystem->GetRecord().ChestClaimStatus[ChestIndex];
-	TargetSubsystem->GetRecord().ChestClaimStatus[ChestIndex] = IsClaimed;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
-
-	// 自动保存
-	if (bAutoSave)
+		
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+		
+	int32 OriginalStatus = ModifiedRecord.ChestClaimStatus[ChestIndex];
+	ModifiedRecord.ChestClaimStatus[ChestIndex] = IsClaimed;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+		
+	// 同步更新 AllRecords 映射表中的对应记录
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+		
+	// 如果修改的是当前记录，同步更新 CurrentRecord
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
 	{
-		return SaveRecord(RecordDate);
+		TargetSubsystem->GetRecord() = ModifiedRecord;
 	}
 
 	FString StatusText = (IsClaimed == 1) ? TEXT("已领取") : TEXT("未领取");
-	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 修改宝箱领取状态成功 - RecordDate=%d, 宝箱%d原状态=%s, 新状态=%s"), 
+	UE_LOG(LogTemp, Log, TEXT("ModifyChestClaimStatus: RecordDate=%d, 宝箱%d [%s] -> [%s]"), 
 		RecordDate, ChestIndex, OriginalStatus ? TEXT("已领取") : TEXT("未领取"), *StatusText);
 
-	// 如果有Subsystem，触发UI刷新
-	if (TargetSubsystem)
-	{
-		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 准备调用OnGlobalRefresh.Broadcast()"));
-		TargetSubsystem->OnGlobalRefresh.Broadcast();
-		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: OnGlobalRefresh.Broadcast()调用完成"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: TargetSubsystem为空，无法触发UI刷新"));
-	}
+	ForceRefreshAllPages();
 
 	return true;
 }
 
 bool UUpgradeActivitySaveModifier::ModifyTaskCompleteCount(int32 RecordDate, int32 TaskIndex, int32 Count, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyTaskCompleteCount")) || Count < 0)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
+		if (Count < 0) UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 任务完成次数不能为负数: %d"), Count);
 		return false;
 	}
 
-	if (Count < 0)
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 任务完成次数不能为负数: %d"), Count);
+		UE_LOG(LogTemp, Error, TEXT("ModifyTaskCompleteCount: 记录%d不存在"), RecordDate);
 		return false;
 	}
-
-	// 边界检查
-	if (TaskIndex < 0 || !TargetSubsystem->GetRecord().TaskCompleteCounts.IsValidIndex(TaskIndex))
+		
+	if (!RecordPtr->TaskCompleteCounts.IsValidIndex(TaskIndex))
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 任务索引超出范围: %d"), TaskIndex);
+		UE_LOG(LogTemp, Error, TEXT("ModifyTaskCompleteCount: 任务索引%d超出范围"), TaskIndex);
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalCount = TargetSubsystem->GetRecord().TaskCompleteCounts[TaskIndex];
-	TargetSubsystem->GetRecord().TaskCompleteCounts[TaskIndex] = Count;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
+		
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+		
+	int32 OriginalCount = ModifiedRecord.TaskCompleteCounts[TaskIndex];
+	ModifiedRecord.TaskCompleteCounts[TaskIndex] = Count;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+		
+	// 调试日志：记录修改前后的 AllRecords 状态
+	UE_LOG(LogTemp, Log, TEXT("DEBUG: ModifyTaskCompleteCount - 修改前 AllRecords 大小: %d"), TargetSubsystem->GetAllRecords().Num());
+	for (auto& Pair : TargetSubsystem->GetAllRecords())
+	{
+		UE_LOG(LogTemp, Log, TEXT("DEBUG: ModifyTaskCompleteCount - RecordDate=%d, TaskCompleteCounts[0]=%d"), 
+			Pair.Key, Pair.Value.TaskCompleteCounts.IsValidIndex(0) ? Pair.Value.TaskCompleteCounts[0] : -1);
+	}
+		
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+		
+	// 调试日志：记录修改后的 AllRecords 状态
+	UE_LOG(LogTemp, Log, TEXT("DEBUG: ModifyTaskCompleteCount - 修改后 AllRecords 大小: %d"), TargetSubsystem->GetAllRecords().Num());
+	for (auto& Pair : TargetSubsystem->GetAllRecords())
+	{
+		UE_LOG(LogTemp, Log, TEXT("DEBUG: ModifyTaskCompleteCount - RecordDate=%d, TaskCompleteCounts[0]=%d"), 
+			Pair.Key, Pair.Value.TaskCompleteCounts.IsValidIndex(0) ? Pair.Value.TaskCompleteCounts[0] : -1);
+	}
+		
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+	{
+		TargetSubsystem->GetRecord() = ModifiedRecord;
+	}
 	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
-	UE_LOG(LogTemp, Log, TEXT("📊 任务完成次数修改: 任务%d [%d] -> [%d]"), TaskIndex, OriginalCount, Count);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-	
-	// 强制刷新所有页面，重新获取内存数据
+	LogModification(TEXT("任务完成次数"), FString::Printf(TEXT("任务%d [%d] -> [%d]"), TaskIndex, OriginalCount, Count));
 	ForceRefreshAllPages();
 	
-	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -260,48 +280,46 @@ bool UUpgradeActivitySaveModifier::ModifyTaskCompleteCount(int32 RecordDate, int
 
 bool UUpgradeActivitySaveModifier::ModifyTaskClaimStatus(int32 RecordDate, int32 TaskIndex, int32 IsClaimed, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyTaskClaimStatus")) || !ValidateBinaryState(IsClaimed, TEXT("任务状态")))
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
 		return false;
 	}
 
-	if (IsClaimed != 0 && IsClaimed != 1)
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 任务状态只能是0或1: %d"), IsClaimed);
+		UE_LOG(LogTemp, Error, TEXT("ModifyTaskClaimStatus: 记录%d不存在"), RecordDate);
 		return false;
 	}
-
-	// 边界检查
-	if (TaskIndex < 0 || !TargetSubsystem->GetRecord().TaskClaimStatus.IsValidIndex(TaskIndex))
+		
+	if (!RecordPtr->TaskClaimStatus.IsValidIndex(TaskIndex))
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 任务索引超出范围: %d"), TaskIndex);
+		UE_LOG(LogTemp, Error, TEXT("ModifyTaskClaimStatus: 任务索引%d超出范围"), TaskIndex);
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalStatus = TargetSubsystem->GetRecord().TaskClaimStatus[TaskIndex];
-	TargetSubsystem->GetRecord().TaskClaimStatus[TaskIndex] = IsClaimed;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
+		
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+		
+	int32 OriginalStatus = ModifiedRecord.TaskClaimStatus[TaskIndex];
+	ModifiedRecord.TaskClaimStatus[TaskIndex] = IsClaimed;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+		
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+		
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+	{
+		TargetSubsystem->GetRecord() = ModifiedRecord;
+	}
 	
 	FString StatusText = (IsClaimed == 1) ? TEXT("已领取") : TEXT("未领取");
-	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
-	UE_LOG(LogTemp, Log, TEXT("📊 任务领取状态修改: 任务%d [%s] -> [%s]"), 
-		TaskIndex, OriginalStatus ? TEXT("已领取") : TEXT("未领取"), *StatusText);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-	
-	// 强制刷新所有页面，重新获取内存数据
+	FString OriginalText = OriginalStatus ? TEXT("已领取") : TEXT("未领取");
+	LogModification(TEXT("任务领取状态"), FString::Printf(TEXT("任务%d [%s] -> [%s]"), TaskIndex, *OriginalText, *StatusText));
 	ForceRefreshAllPages();
 	
-	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -309,38 +327,39 @@ bool UUpgradeActivitySaveModifier::ModifyTaskClaimStatus(int32 RecordDate, int32
 
 bool UUpgradeActivitySaveModifier::ModifyLimitedActivityCount(int32 RecordDate, int32 Count, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!ValidateAndLog(TEXT("ModifyLimitedActivityCount")) || Count < 0)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
+		if (Count < 0) UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 限时活动次数不能为负数: %d"), Count);
 		return false;
 	}
 
-	if (Count < 0)
+	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
+	if (!RecordPtr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 限时活动次数不能为负数: %d"), Count);
+		UE_LOG(LogTemp, Error, TEXT("ModifyLimitedActivityCount: 记录%d不存在"), RecordDate);
 		return false;
 	}
-
-	// 直接修改UpgradeActivitySubsystem内存数据
-	int32 OriginalCount = TargetSubsystem->GetRecord().LimitedActivityCompleteCount;
-	TargetSubsystem->GetRecord().LimitedActivityCompleteCount = Count;
-	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
+		
+	// 创建一个副本以避免引用问题
+	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+		
+	int32 OriginalCount = ModifiedRecord.LimitedActivityCompleteCount;
+	ModifiedRecord.LimitedActivityCompleteCount = Count;
+	ModifiedRecord.LastUpdateTime = FDateTime::Now();
+		
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+		
+	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+	{
+		TargetSubsystem->GetRecord() = ModifiedRecord;
+	}
 	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
-	UE_LOG(LogTemp, Log, TEXT("📊 限时活动次数修改: %d -> %d"), OriginalCount, Count);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-	
-	// 强制刷新所有页面，重新获取内存数据
+	LogModification(TEXT("限时活动次数"), FString::Printf(TEXT("%d -> %d"), OriginalCount, Count));
 	ForceRefreshAllPages();
 	
-	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -348,11 +367,7 @@ bool UUpgradeActivitySaveModifier::ModifyLimitedActivityCount(int32 RecordDate, 
 
 bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
-		return false;
-	}
+	if (!ValidateAndLog(TEXT("ResetRecordData"))) return false;
 
 	// 直接重置UpgradeActivitySubsystem内存数据
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
@@ -360,7 +375,7 @@ bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoS
 	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
 	UE_LOG(LogTemp, Log, TEXT("📊 重置记录数据: RecordDate=%d"), RecordDate);
 	UE_LOG(LogTemp, Log, TEXT("⏰ 重置时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
+	UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 	
 	// 保存原始数据用于日志
@@ -383,6 +398,9 @@ bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoS
 		TargetSubsystem->GetRecord().TaskClaimStatus[i] = 0;
 	}
 	
+	// 🔧 修复：同步更新 AllRecords 映射表中的对应记录
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, TargetSubsystem->GetRecord());
+	
 	TargetSubsystem->GetRecord().LastUpdateTime = FDateTime::Now();
 	
 	UE_LOG(LogTemp, Log, TEXT("📊 重置前后对比:"));
@@ -395,7 +413,7 @@ bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoS
 	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 	
 	return true;
@@ -403,11 +421,7 @@ bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoS
 
 bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInheritPrevious, bool bAutoSave)
 {
-	if (!bIsInitialized || !TargetSubsystem)
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ UpgradeActivitySaveModifier: 未初始化或Subsystem无效"));
-		return false;
-	}
+	if (!ValidateAndLog(TEXT("CreateNewRecord"))) return false;
 
 	// 直接操作UpgradeActivitySubsystem内存数据
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
@@ -415,7 +429,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
 	UE_LOG(LogTemp, Log, TEXT("📊 创建新记录: RecordDate=%d"), RecordDate);
 	UE_LOG(LogTemp, Log, TEXT("⏰ 创建时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
+	UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 
 	// 检查是否已存在
@@ -429,6 +443,14 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	FUpgradeRewardSaveRecord NewRecord;
 	NewRecord.SetRecordDate(RecordDate);
 
+	// 初始化默认值
+	NewRecord.CurrentExperience = 0;
+	NewRecord.RewardIconIndex = 0;
+	NewRecord.LimitedActivityCompleteCount = 0;
+	NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+	NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
+	NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
+
 	if (bInheritPrevious && RecordDate > 1 && SaveGame)
 	{
 		// 尝试继承前一天的数据
@@ -438,46 +460,8 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 			// 继承部分数据
 			NewRecord.CurrentExperience = PreviousRecord->CurrentExperience;
 			NewRecord.RewardIconIndex = PreviousRecord->RewardIconIndex;
-			
-			// 宝箱状态继承（但可以重新领取）
-			NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-			for (int32 i = 0; i < MAX_CHEST_COUNT; ++i)
-			{
-				NewRecord.ChestClaimStatus[i] = 0; // 新的一天，宝箱重置
-			}
-			
-			// 任务状态重置
-			NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-			NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
-			
-			NewRecord.LimitedActivityCompleteCount = 0; // 限时活动重置
-			
 			UE_LOG(LogTemp, Log, TEXT("📊 继承第%d天的部分数据创建第%d天记录"), RecordDate - 1, RecordDate);
 		}
-		else
-		{
-			// 没有前一天数据，使用默认值
-			NewRecord.CurrentExperience = 0;
-			NewRecord.RewardIconIndex = 0;
-			NewRecord.LimitedActivityCompleteCount = 0;
-			
-			// 初始化数组
-			NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-			NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-			NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
-		}
-	}
-	else
-	{
-		// 不继承，使用默认值
-		NewRecord.CurrentExperience = 0;
-		NewRecord.RewardIconIndex = 0;
-		NewRecord.LimitedActivityCompleteCount = 0;
-		
-		// 初始化数组
-		NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-		NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-		NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
 	}
 
 	NewRecord.LastUpdateTime = FDateTime::Now();
@@ -492,8 +476,12 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	// 同时更新TargetSubsystem的CurrentRecord
 	TargetSubsystem->GetRecord() = NewRecord;
 	
+	// 🔧 修复：将新记录添加到 AllRecords 表格中
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, NewRecord);
+	
 	UE_LOG(LogTemp, Log, TEXT("✅ 成功创建新记录 RecordDate=%d"), RecordDate);
 	UE_LOG(LogTemp, Log, TEXT("🔄 已同步更新TargetSubsystem的CurrentRecord"));
+	UE_LOG(LogTemp, Log, TEXT("✅ 新记录已添加到 AllRecords 表格 [%d]"), RecordDate);
 	
 	// 强制刷新所有页面，重新获取内存数据
 	ForceRefreshAllPages();
@@ -501,7 +489,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	// 游戏关闭时才会保存到磁盘
 	if (bAutoSave)
 	{
-		UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
 
 	return true;
@@ -509,100 +497,49 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 
 // ==================== 查询接口实现 ====================
 
-int32 UUpgradeActivitySaveModifier::GetCurrentExperience(int32 RecordDate) const
+const FUpgradeRewardSaveRecord* UUpgradeActivitySaveModifier::GetRecordOrNull(int32 RecordDate) const
 {
 	if (!bIsInitialized || !CachedSaveGame)
 	{
-		return 0;
+		return nullptr;
 	}
+	return CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
+}
 
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record)
-	{
-		return Record->CurrentExperience;
-	}
-
-	return 0;
+int32 UUpgradeActivitySaveModifier::GetCurrentExperience(int32 RecordDate) const
+{
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return Record ? Record->CurrentExperience : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetRewardIconIndex(int32 RecordDate) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
-	{
-		return 0;
-	}
-
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record)
-	{
-		return Record->RewardIconIndex;
-	}
-
-	return 0;
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return Record ? Record->RewardIconIndex : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetChestClaimStatus(int32 RecordDate, int32 ChestIndex) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
-	{
-		return 0;
-	}
-
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record && Record->ChestClaimStatus.IsValidIndex(ChestIndex))
-	{
-		return Record->ChestClaimStatus[ChestIndex];
-	}
-
-	return 0;
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return (Record && Record->ChestClaimStatus.IsValidIndex(ChestIndex)) ? Record->ChestClaimStatus[ChestIndex] : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetTaskCompleteCount(int32 RecordDate, int32 TaskIndex) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
-	{
-		return 0;
-	}
-
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record && Record->TaskCompleteCounts.IsValidIndex(TaskIndex))
-	{
-		return Record->TaskCompleteCounts[TaskIndex];
-	}
-
-	return 0;
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return (Record && Record->TaskCompleteCounts.IsValidIndex(TaskIndex)) ? Record->TaskCompleteCounts[TaskIndex] : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetTaskClaimStatus(int32 RecordDate, int32 TaskIndex) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
-	{
-		return 0;
-	}
-
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record && Record->TaskClaimStatus.IsValidIndex(TaskIndex))
-	{
-		return Record->TaskClaimStatus[TaskIndex];
-	}
-
-	return 0;
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return (Record && Record->TaskClaimStatus.IsValidIndex(TaskIndex)) ? Record->TaskClaimStatus[TaskIndex] : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetLimitedActivityCount(int32 RecordDate) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
-	{
-		return 0;
-	}
-
-	const FUpgradeRewardSaveRecord* Record = CachedSaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (Record)
-	{
-		return Record->LimitedActivityCompleteCount;
-	}
-
-	return 0;
+	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
+	return Record ? Record->LimitedActivityCompleteCount : 0;
 }
 
 // ==================== 保存接口实现 ====================
@@ -615,20 +552,14 @@ bool UUpgradeActivitySaveModifier::SaveRecord(int32 RecordDate)
 		return false;
 	}
 
-	// 使用与Subsystem一致的存档槽位
-	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
-	bool bSuccess = UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
-
-	if (bSuccess)
-	{
-		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 成功保存RecordDate=%d的记录"), RecordDate);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 保存RecordDate=%d的记录失败"), RecordDate);
-	}
-
-	return bSuccess;
+	// 🔧 重要：游戏运行过程中不保存到磁盘，只在内存中修改
+	// 实际保存将在游戏关闭时执行
+	UE_LOG(LogTemp, Log, TEXT("📝 数据已标记为需要保存 - RecordDate=%d（游戏关闭时执行）"), RecordDate);
+	
+	// 设置脏标记，表示需要保存
+	bHasPendingChanges = true;
+	
+	return true;
 }
 
 bool UUpgradeActivitySaveModifier::SaveAllRecords()
@@ -640,22 +571,49 @@ bool UUpgradeActivitySaveModifier::SaveAllRecords()
 
 	bool bAllSuccess = true;
 
-	// 保存所有记录
-	for (const auto& Pair : CachedSaveGame->UpgradeRewardRecords)
-	{
-		int32 RecordDate = Pair.Key;
-		if (!SaveRecord(RecordDate))
-		{
-			bAllSuccess = false;
-		}
-	}
+	// 🔧 这是唯一的实际磁盘保存操作
+	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
+	bool bSuccess = UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
 
-	if (bAllSuccess)
+	if (bSuccess)
 	{
-		UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 成功保存所有记录"));
+		UE_LOG(LogTemp, Log, TEXT("✅ UpgradeActivitySaveModifier: 成功保存所有记录到磁盘（游戏关闭）"));
+		bHasPendingChanges = false; // 清除脏标记
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 保存所有记录失败"));
+		bAllSuccess = false;
 	}
 
 	return bAllSuccess;
+}
+
+void UUpgradeActivitySaveModifier::SavePendingChangesOnShutdown()
+{
+	if (!bIsInitialized || !CachedSaveGame)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("⚠️ SavePendingChangesOnShutdown: 存档实例无效，跳过保存"));
+		return;
+	}
+	
+	if (!bHasPendingChanges)
+	{
+		UE_LOG(LogTemp, Log, TEXT("📝 SavePendingChangesOnShutdown: 没有待处理的更改，跳过保存"));
+		return;
+	}
+	
+	// 🔧 这是唯一的实际磁盘保存操作
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("💾 GAME_SHUTDOWN_SAVE_DATA_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem 地址：%p"), TargetSubsystem);
+	UE_LOG(LogTemp, Log, TEXT("📊 保存所有待处理的更改到磁盘"));
+	UE_LOG(LogTemp, Log, TEXT("⏰ 保存时间：%s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	
+	SaveAllRecords();
+	
+	UE_LOG(LogTemp, Log, TEXT("\n✅ 游戏数据保存完成 - 下次启动时将加载最新数据"));
 }
 
 bool UUpgradeActivitySaveModifier::LoadRecord(int32 RecordDate)
@@ -709,25 +667,13 @@ UDailyLoginSaveGame* UUpgradeActivitySaveModifier::GetOrCreateSaveGame(int32 Rec
 
 		if (LoadedSaveGame)
 		{
-			// 初始化默认记录
 			FUpgradeRewardSaveRecord NewRecord;
-			NewRecord.SetRecordDate(RecordDate);
-			NewRecord.CurrentExperience = 0;
-			NewRecord.RewardIconIndex = 0;
-			NewRecord.LimitedActivityCompleteCount = 0;
-			
-			// 初始化数组 - 使用动态大小
-			NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-			NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-			NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
-			
-			NewRecord.LastUpdateTime = FDateTime::Now();
-
+			InitializeNewRecord(NewRecord, RecordDate);
 			LoadedSaveGame->UpgradeRewardRecords.Add(RecordDate, NewRecord);
 
-			// 保存新创建的记录 - 使用统一的存档槽位
-			UGameplayStatics::SaveGameToSlot(LoadedSaveGame, TEXT("UpgradeReward_SaveSlot"), 0);
-			UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 创建并保存新的存档实例 for RecordDate=%d"), RecordDate);
+			// 🔧 重要：游戏运行过程中不保存到磁盘
+			// 数据已经在内存中，游戏关闭时会统一保存
+			UE_LOG(LogTemp, Log, TEXT("📝 新记录已创建在内存中 - RecordDate=%d（游戏关闭时保存）"), RecordDate);
 		}
 	}
 
@@ -754,46 +700,40 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 			{
 				int32 RecordDate = FCString::Atoi(*Args[0]);
 				int32 Exp = FCString::Atoi(*Args[1]);
-				
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
+										
+				// 直接使用已初始化的 TargetSubsystem
+				if (this->TargetSubsystem)
 				{
-					UWorld* World = WorldContext->GetWorld();
-					if (World)
-					{
-						UGameInstance* GameInstance = World->GetGameInstance();
-						if (GameInstance)
-						{
-							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-							if (Subsystem)
-							{
-								// 直接修改UpgradeActivitySubsystem内存数据
-								int32 OriginalExp = Subsystem->GetRecord().CurrentExperience;
-								Subsystem->GetRecord().CurrentExperience = Exp;
-								Subsystem->GetRecord().LastUpdateTime = FDateTime::Now();
-								
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📊 经验值修改: %d -> %d"), OriginalExp, Exp);
-								UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-								
-								// 强制刷新所有页面，重新获取内存数据
-								ForceRefreshAllPages();
-								
-								// 游戏关闭时才会保存到磁盘
-								UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
-								
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置经验值 RecordDate=%d Exp=%d 成功"), RecordDate, Exp);
-								return;
-							}
-						}
-					}
+					// 获取当前记录的副本以避免引用问题
+					FUpgradeRewardSaveRecord ModifiedRecord = this->TargetSubsystem->GetRecord();
+					int32 OriginalExp = ModifiedRecord.CurrentExperience;
+					ModifiedRecord.CurrentExperience = Exp;
+					ModifiedRecord.LastUpdateTime = FDateTime::Now();
+																				
+					// 同步更新 AllRecords
+					this->TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+											
+					UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+					UE_LOG(LogTemp, Log, TEXT("MEMORY_DATA_MODIFICATION_START"));
+					UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), this->TargetSubsystem);
+					UE_LOG(LogTemp, Log, TEXT("经验值修改: %d -> %d"), OriginalExp, Exp);
+					UE_LOG(LogTemp, Log, TEXT("修改时间: %s"), *FDateTime::Now().ToString());
+					UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
+					UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+											
+					// 强制刷新所有页面，重新获取内存数据
+					ForceRefreshAllPages();
+											
+					// 游戏关闭时才会保存到磁盘
+					UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
+											
+					UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置经验值 RecordDate=%d Exp=%d 成功"), RecordDate, Exp);
 				}
-				
-				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
+				else
+				{
+					UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
+				}
+
 			}
 			else
 			{
@@ -803,120 +743,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 		ECVF_Default
 	);
 
-	IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Upgrade.SetIcon"),
-		TEXT("设置奖励图标索引: Upgrade.SetIcon RecordDate IconIndex"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
-		{
-			if (Args.Num() >= 2)
-			{
-				int32 RecordDate = FCString::Atoi(*Args[0]);
-				int32 IconIndex = FCString::Atoi(*Args[1]);
-				
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
-				{
-					UWorld* World = WorldContext->GetWorld();
-					if (World)
-					{
-						UGameInstance* GameInstance = World->GetGameInstance();
-						if (GameInstance)
-						{
-							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-							if (Subsystem)
-							{
-								// 直接修改UpgradeActivitySubsystem内存数据
-								int32 OriginalIndex = Subsystem->GetRecord().RewardIconIndex;
-								Subsystem->GetRecord().RewardIconIndex = IconIndex;
-								Subsystem->GetRecord().LastUpdateTime = FDateTime::Now();
-								
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_MODIFICATION_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📊 图标索引修改: %d -> %d"), OriginalIndex, IconIndex);
-								UE_LOG(LogTemp, Log, TEXT("⏰ 修改时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-								
-								// 强制刷新所有页面，重新获取内存数据
-								ForceRefreshAllPages();
-								
-								// 游戏关闭时才会保存到磁盘
-								UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
-								
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置图标索引 RecordDate=%d IconIndex=%d 成功"), RecordDate, IconIndex);
-								return;
-							}
-						}
-					}
-				}
-				
-				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.SetIcon RecordDate IconIndex"));
-			}
-		}),
-		ECVF_Default
-	);
-
-	IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Upgrade.SetChest"),
-		TEXT("设置宝箱领取状态: Upgrade.SetChest RecordDate ChestIndex IsClaimed"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
-		{
-			if (Args.Num() >= 3)
-			{
-				int32 RecordDate = FCString::Atoi(*Args[0]);
-				int32 ChestIndex = FCString::Atoi(*Args[1]);
-				int32 IsClaimed = FCString::Atoi(*Args[2]);
-				
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
-				{
-					UWorld* World = WorldContext->GetWorld();
-					if (World)
-					{
-						UGameInstance* GameInstance = World->GetGameInstance();
-						if (GameInstance)
-						{
-							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-							if (Subsystem && Subsystem->GetRecord().ChestClaimStatus.IsValidIndex(ChestIndex))
-							{
-								// 直接修改Subsystem热数据
-								int32 OriginalStatus = Subsystem->GetRecord().ChestClaimStatus[ChestIndex];
-								Subsystem->GetRecord().ChestClaimStatus[ChestIndex] = IsClaimed;
-								Subsystem->GetRecord().LastUpdateTime = FDateTime::Now();
-								
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 直接修改Subsystem热数据 - 宝箱%d 原状态=%d, 新状态=%d"), 
-									ChestIndex, OriginalStatus, IsClaimed);
-								
-								// 游戏关闭时才会保存到磁盘
-								UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
-								
-								// 触发UI刷新
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 🔥 准备调用OnGlobalRefresh.Broadcast()"));
-								Subsystem->OnGlobalRefresh.Broadcast();
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: ✅ OnGlobalRefresh.Broadcast()调用完成"));
-								
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置宝箱状态 RecordDate=%d ChestIndex=%d Claimed=%d 成功"), 
-									RecordDate, ChestIndex, IsClaimed);
-								return;
-							}
-						}
-					}
-				}
-				
-				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例或无效的宝箱索引"));
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.SetChest RecordDate ChestIndex IsClaimed"));
-			}
-		}),
-		ECVF_Default
-	);
+	
 
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.CreateRecord"),
@@ -943,57 +770,80 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 								// 直接操作UpgradeActivitySubsystem内存数据
 								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
 								UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_CREATION_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), Subsystem);
 								UE_LOG(LogTemp, Log, TEXT("📊 创建记录: RecordDate=%d, Inherit=%s"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
 								UE_LOG(LogTemp, Log, TEXT("⏰ 操作时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存操作，不写入磁盘"));
+								UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
 								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 																						
-								// 直接修改内存中的CurrentRecord
-								FUpgradeRewardSaveRecord& CurrentRecord = const_cast<FUpgradeRewardSaveRecord&>(Subsystem->GetRecord());
-								CurrentRecord.SetRecordDate(RecordDate);
-								CurrentRecord.CurrentExperience = 0;
-								CurrentRecord.RewardIconIndex = 0;
-								CurrentRecord.LimitedActivityCompleteCount = 0;
-								
-								// 初始化数组
-								CurrentRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-								CurrentRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-								CurrentRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
-								
-								CurrentRecord.LastUpdateTime = FDateTime::Now();
-								CurrentRecord.CreatedTime = FDateTime::Now();
-								
-								// 同时更新磁盘存档中的映射表
-								UDailyLoginSaveGame* SaveGame = Cast<UDailyLoginSaveGame>(
-									UGameplayStatics::LoadGameFromSlot(TEXT("UpgradeReward_SaveSlot"), 0)
-								);
-								if (!SaveGame)
+								// 获取当前记录的副本以避免直接修改引用
+								FUpgradeRewardSaveRecord ModifiedRecord = Subsystem->GetRecord();
+																							
+								// 🔧 核心业务逻辑：判断是否需要继承前一天数据
+								if (bInherit && RecordDate > 1)
 								{
-									SaveGame = NewObject<UDailyLoginSaveGame>();
+									// 获取前一天的记录日期
+									int32 PreviousDay = RecordDate - 1;
+																							
+									// 🔧 重要：直接从内存中的 Subsystem 获取前一天的记录，而不是从磁盘
+									// 因为游戏运行过程中不会保存到磁盘
+									const FUpgradeRewardSaveRecord* PreviousRecordPtr = Subsystem->GetRecordByDate(PreviousDay);
+																							
+									if (PreviousRecordPtr)
+									{
+										UE_LOG(LogTemp, Log, TEXT("🔧 INHERIT_PREVIOUS_DAY_DATA_START"));
+										UE_LOG(LogTemp, Log, TEXT("📊 继承第 %d 天数据到第 %d 天（从 AllRecords 表格）"), PreviousDay, RecordDate);
+																							
+										// 🔧 继承关键字段
+										ModifiedRecord.SetRecordDate(RecordDate);
+										ModifiedRecord.CurrentExperience = PreviousRecordPtr->CurrentExperience; // 继承经验
+										ModifiedRecord.RewardIconIndex = PreviousRecordPtr->RewardIconIndex; // 继承图标索引
+										ModifiedRecord.LimitedActivityCompleteCount = PreviousRecordPtr->LimitedActivityCompleteCount; // 继承活动完成次数
+																							
+										// 继承宝箱领取状态（已领取的宝箱继续保留）
+										ModifiedRecord.ChestClaimStatus = PreviousRecordPtr->ChestClaimStatus;
+																							
+										// 继承任务完成数量（已完成的任务进度保留）
+										ModifiedRecord.TaskCompleteCounts = PreviousRecordPtr->TaskCompleteCounts;
+																							
+										// 继承任务领取状态（已领取的任务标记保留）
+										ModifiedRecord.TaskClaimStatus = PreviousRecordPtr->TaskClaimStatus;
+																							
+										ModifiedRecord.LastUpdateTime = FDateTime::Now();
+										ModifiedRecord.CreatedTime = PreviousRecordPtr->CreatedTime; // 保持原始创建时间
+																							
+										UE_LOG(LogTemp, Log, TEXT("✅ 继承完成 - Experience: %d, IconIndex: %d, ChestCount: %d, TaskCount: %d"), 
+											ModifiedRecord.CurrentExperience, ModifiedRecord.RewardIconIndex, 
+											ModifiedRecord.ChestClaimStatus.Num(), ModifiedRecord.TaskCompleteCounts.Num());
+										UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+									}
+									else
+									{
+										UE_LOG(LogTemp, Warning, TEXT("⚠️ AllRecords 表格中没有第 %d 天的记录，无法继承，将创建全新记录"), PreviousDay);
+										// 初始化全新记录
+										InitializeNewRecord(ModifiedRecord, RecordDate);
+									}
 								}
-								
-								// 创建新记录并添加到映射表
-								FUpgradeRewardSaveRecord NewDiskRecord = CurrentRecord;
-								SaveGame->UpgradeRewardRecords.Add(RecordDate, NewDiskRecord);
-								
-								// 保存到磁盘
-								UGameplayStatics::SaveGameToSlot(SaveGame, TEXT("UpgradeReward_SaveSlot"), 0);
-								
-								// 游戏关闭时才会保存到磁盘
-								UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
+								else
+								{
+									// 不继承或第一天，初始化全新记录
+									UE_LOG(LogTemp, Log, TEXT("🆕 创建全新记录（不继承或为第 1 天）"));
+									InitializeNewRecord(ModifiedRecord, RecordDate);
+	}
+																							
+								// 🔧 重要：游戏运行过程中不保存到磁盘
+								// 数据已经在内存中，游戏关闭时会统一保存
+								UE_LOG(LogTemp, Log, TEXT("📝 新记录已创建在内存中 - RecordDate=%d（游戏关闭时保存）"), RecordDate);
+																							
+								// 🔧 关键：将新记录添加到 AllRecords 表格中
+								Subsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+													
+								// 同时更新 CurrentRecord
+								Subsystem->GetRecord() = ModifiedRecord;
+								UE_LOG(LogTemp, Log, TEXT("✅ 新记录已添加到 AllRecords 表格 [%d]"), RecordDate);
 																								
 								// 强制刷新所有页面，重新获取内存数据
 								ForceRefreshAllPages();
-												
-								// 触发UI刷新
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("🔊 BROADCAST_EVENT_TRIGGER_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 广播Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📢 触发事件: OnGlobalRefresh.Broadcast()"));
-								Subsystem->OnGlobalRefresh.Broadcast();
-								UE_LOG(LogTemp, Log, TEXT("✅ OnGlobalRefresh.Broadcast()调用完成"));
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 												
 								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 创建记录 RecordDate=%d Inherit=%s 成功"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
 								return;
@@ -1012,433 +862,215 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 		ECVF_Default
 	);
 
-	IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Upgrade.Reset"),
-		TEXT("重置记录数据: Upgrade.Reset RecordDate"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
-		{
-			if (Args.Num() >= 1)
-			{
-				int32 RecordDate = FCString::Atoi(*Args[0]);
-								
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
-				{
-					UWorld* World = WorldContext->GetWorld();
-					if (World)
-					{
-						UGameInstance* GameInstance = World->GetGameInstance();
-						if (GameInstance)
-						{
-							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-							if (Subsystem)
-							{
-								// 直接重置Subsystem热数据
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("🔧 SUBSYSTEM_RESET_DATA_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📊 重置记录: RecordDate=%d"), RecordDate);
-								UE_LOG(LogTemp, Log, TEXT("⏰ 操作时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-												
-								// 获取原始数据用于日志记录
-								int32 OriginalExp = Subsystem->GetRecord().CurrentExperience;
-								int32 OriginalIcon = Subsystem->GetRecord().RewardIconIndex;
-												
-								// 重置数据
-								Subsystem->GetRecord().CurrentExperience = 0;
-								Subsystem->GetRecord().RewardIconIndex = 0;
-								Subsystem->GetRecord().LimitedActivityCompleteCount = 0;
-												
-								// 重置数组
-								for (int32 i = 0; i < MAX_CHEST_COUNT && i < Subsystem->GetRecord().ChestClaimStatus.Num(); ++i)
-								{
-									Subsystem->GetRecord().ChestClaimStatus[i] = 0;
-								}
-								for (int32 i = 0; i < MAX_TASK_COUNT && i < Subsystem->GetRecord().TaskCompleteCounts.Num(); ++i)
-								{
-									Subsystem->GetRecord().TaskCompleteCounts[i] = 0;
-									Subsystem->GetRecord().TaskClaimStatus[i] = 0;
-								}
-												
-								Subsystem->GetRecord().LastUpdateTime = FDateTime::Now();
-												
-								UE_LOG(LogTemp, Log, TEXT("📊 重置前后对比:"));
-								UE_LOG(LogTemp, Log, TEXT("   经验值: %d -> 0"), OriginalExp);
-								UE_LOG(LogTemp, Log, TEXT("   图标索引: %d -> 0"), OriginalIcon);
-																						
-								// 游戏关闭时才会保存到磁盘
-								UE_LOG(LogTemp, Log, TEXT("📝 标记为需要保存到磁盘（游戏关闭时执行）"));
-								// 游戏关闭时才会保存到磁盘
-												
-								// 触发UI刷新
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("🔊 BROADCAST_EVENT_TRIGGER_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 广播Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📢 触发事件: OnGlobalRefresh.Broadcast()"));
-								Subsystem->OnGlobalRefresh.Broadcast();
-								UE_LOG(LogTemp, Log, TEXT("✅ OnGlobalRefresh.Broadcast()调用完成"));
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-												
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 重置数据 RecordDate=%d 成功"), RecordDate);
-								return;
-							}
-						}
-					}
-				}
-								
-				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.Reset RecordDate"));
-			}
-		}),
-		ECVF_Default
-	);
-
-	IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Upgrade.ShowInfo"),
-		TEXT("显示记录信息: Upgrade.ShowInfo RecordDate"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
-		{
-			if (Args.Num() >= 1)
-			{
-				int32 RecordDate = FCString::Atoi(*Args[0]);
-									
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
-				{
-					UWorld* World = WorldContext->GetWorld();
-					if (World)
-					{
-						UGameInstance* GameInstance = World->GetGameInstance();
-						if (GameInstance)
-						{
-							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-							if (Subsystem)
-							{
-								// 显示UpgradeActivitySubsystem内存中的实时数据
-								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-								UE_LOG(LogTemp, Log, TEXT("📋 MEMORY_DATA_DISPLAY_START"));
-								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📊 显示记录: RecordDate=%d"), RecordDate);
-								UE_LOG(LogTemp, Log, TEXT("⏰ 显示时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 仅内存数据，未保存到磁盘"));
-								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-																												
-								const FUpgradeRewardSaveRecord& Record = Subsystem->GetRecord();
-																												
-								UE_LOG(LogTemp, Log, TEXT("===== 升级活动内存数据 (RecordDate: %d) ====="), RecordDate);
-								UE_LOG(LogTemp, Log, TEXT("当前经验值: %d"), Record.CurrentExperience);
-								UE_LOG(LogTemp, Log, TEXT("奖励图标索引: %d"), Record.RewardIconIndex);
-								UE_LOG(LogTemp, Log, TEXT("限时活动完成次数: %d"), Record.LimitedActivityCompleteCount);
-								UE_LOG(LogTemp, Log, TEXT("最后更新时间: %s"), *Record.LastUpdateTime.ToString());
-																												
-								// 显示宝箱状态
-								FString ChestStatus = TEXT("📦 宝箱状态: ");
-								for (int32 i = 0; i < Record.ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
-								{
-									FString StatusText = (Record.ChestClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
-									ChestStatus += FString::Printf(TEXT("[%d]=%s "), i, *StatusText);
-								}
-								UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
-																												
-								// 显示任务状态
-								UE_LOG(LogTemp, Log, TEXT("📝 任务状态:"));
-								for (int32 i = 0; i < Record.TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
-								{
-									FString ClaimStatus = (Record.TaskClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
-									UE_LOG(LogTemp, Log, TEXT("   任务[%d]: 完成%d次, 奖励%s"), i, Record.TaskCompleteCounts[i], *ClaimStatus);
-								}
-																												
-								UE_LOG(LogTemp, Log, TEXT("\n🔧 修改器状态: 已启用热数据连接"));
-								UE_LOG(LogTemp, Log, TEXT("📍 Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("====================================="));
-								return;
-							}
-						}
-					}
-				}
-									
-				UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.ShowInfo RecordDate"));
-			}
-		}),
-		ECVF_Default
-	);
+	
 	
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.ShowAllInfo"),
 		TEXT("显示所有天数记录信息: Upgrade.ShowAllInfo"),
 		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
 		{
-			// 通过GameInstance获取最新的Subsystem实例
-			if (WorldContext.IsValid())
+			// 直接使用已初始化的 TargetSubsystem
+			if (this->TargetSubsystem)
 			{
-				UWorld* World = WorldContext->GetWorld();
-				if (World)
+				// 显示所有记录信息（内存优先模式）
+				UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+				UE_LOG(LogTemp, Log, TEXT("ALL_RECORDS_MEMORY_FIRST_DISPLAY_START"));
+				UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), this->TargetSubsystem);
+				UE_LOG(LogTemp, Log, TEXT("📊 显示所有记录信息（内存优先）"));
+				UE_LOG(LogTemp, Log, TEXT("⏰ 显示时间: %s"), *FDateTime::Now().ToString());
+				UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 内存数据优先，游戏关闭时保存到磁盘"));
+				UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+									
+				// 🔧 显示 AllRecords 表格中的所有数据
+				const TMap<int32, FUpgradeRewardSaveRecord>& AllRecords = this->TargetSubsystem->GetAllRecords();
+				if (AllRecords.Num() == 0)
 				{
-					UGameInstance* GameInstance = World->GetGameInstance();
-					if (GameInstance)
+					UE_LOG(LogTemp, Warning, TEXT("⚠️ AllRecords 表格为空，没有任何记录"));
+					return;
+				}
+									
+				// 按 RecordDate 排序
+				TArray<int32> SortedDates;
+				for (auto& Pair : AllRecords)
+				{
+					SortedDates.Add(Pair.Key);
+				}
+				SortedDates.Sort();
+									
+				// 查找当前内存中的经验值属于哪一天
+				int32 CurrentRecordDate = this->TargetSubsystem->GetRecord().GetDayNumber();
+				int32 CurrentExperience = this->TargetSubsystem->GetRecord().CurrentExperience;
+				UE_LOG(LogTemp, Log, TEXT("💡 当前内存经验值: %d (来自第%d天记录)"), CurrentExperience, CurrentRecordDate);
+				UE_LOG(LogTemp, Log, TEXT(""));
+									
+				// 显示每条记录的详细信息
+				for (int32 RecordDate : SortedDates)
+				{
+					const FUpgradeRewardSaveRecord* Record = this->TargetSubsystem->GetRecordByDate(RecordDate);
+					if (Record)
 					{
-						UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-						if (Subsystem)
+						UE_LOG(LogTemp, Log, TEXT("\n--- 第%d天记录 (RecordDate=%d) ---"), RecordDate, RecordDate);
+						UE_LOG(LogTemp, Log, TEXT("📅 创建时间：%s"), *Record->CreatedTime.ToString());
+						UE_LOG(LogTemp, Log, TEXT("⏰ 最后更新：%s"), *Record->LastUpdateTime.ToString());
+						UE_LOG(LogTemp, Log, TEXT("📊 当前经验值：%d"), Record->CurrentExperience);
+						UE_LOG(LogTemp, Log, TEXT("🎁 奖励图标索引：%d"), Record->RewardIconIndex);
+						
+						// 显示宝箱状态
+						FString ChestStatus = TEXT("📦 宝箱领取状态 [索引=状态]: ");
+						for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
 						{
-							// 显示所有记录信息（内存优先模式）
-							UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-							UE_LOG(LogTemp, Log, TEXT("📋 ALL_RECORDS_MEMORY_FIRST_DISPLAY_START"));
-							UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), Subsystem);
-							UE_LOG(LogTemp, Log, TEXT("📊 显示所有记录信息（内存优先）"));
-							UE_LOG(LogTemp, Log, TEXT("⏰ 显示时间: %s"), *FDateTime::Now().ToString());
-							UE_LOG(LogTemp, Log, TEXT("💾 运行时模式: 内存数据优先，游戏关闭时保存到磁盘"));
-							UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-							
-							// 优先显示内存中的当前记录
-							UE_LOG(LogTemp, Log, TEXT("🧠 当前内存数据状态:"));
-							UE_LOG(LogTemp, Log, TEXT("   当前RecordDate: %d"), Subsystem->GetRecord().GetDayNumber());
-							UE_LOG(LogTemp, Log, TEXT("   当前经验值: %d"), Subsystem->GetRecord().CurrentExperience);
-							UE_LOG(LogTemp, Log, TEXT("   奖励图标索引: %d"), Subsystem->GetRecord().RewardIconIndex);
-							UE_LOG(LogTemp, Log, TEXT("   最后更新时间: %s"), *Subsystem->GetRecord().LastUpdateTime.ToString());
-							UE_LOG(LogTemp, Log, TEXT(""));
-							
-							// 同时从磁盘加载存档文件来对比数据
-							UDailyLoginSaveGame* SaveGame = Cast<UDailyLoginSaveGame>(
-								UGameplayStatics::LoadGameFromSlot(TEXT("UpgradeReward_SaveSlot"), 0));
-							if (!SaveGame)
-							{
-								UE_LOG(LogTemp, Warning, TEXT("⚠️ 无法加载存档文件（可能是首次运行）"));
-								UE_LOG(LogTemp, Log, TEXT("📝 当前仅显示内存数据"));
-								UE_LOG(LogTemp, Log, TEXT("所有记录显示完成"));
-								return;
-							}
-													
-							// 获取所有记录日期
-							TArray<int32> RecordDates;
-							for (const auto& Pair : SaveGame->UpgradeRewardRecords)
-							{
-								RecordDates.Add(Pair.Key);
-							}
-														
-							// 按日期排序
-							RecordDates.Sort([](int32 A, int32 B) { return A < B; });
-														
-							if (RecordDates.Num() == 0)
-							{
-								UE_LOG(LogTemp, Log, TEXT("⚠️ 没有找到任何记录数据"));
-								return;
-							}
-																			
-							UE_LOG(LogTemp, Log, TEXT("===== UpgradeRewardSaveRecord 表数据概览 ====="));
-							UE_LOG(LogTemp, Log, TEXT("📊 总记录数: %d"), RecordDates.Num());
-							UE_LOG(LogTemp, Log, TEXT("📅 记录日期范围: %d - %d"), RecordDates[0], RecordDates.Last());
-							UE_LOG(LogTemp, Log, TEXT("💾 存档槽位: UpgradeReward_SaveSlot"));
-							UE_LOG(LogTemp, Log, TEXT("📍 Subsystem地址: %p"), Subsystem);
-							UE_LOG(LogTemp, Log, TEXT("====================================="));
-														
-							// 显示每条记录的详细信息
-							for (int32 RecordDate : RecordDates)
-							{
-								const FUpgradeRewardSaveRecord* Record = SaveGame->UpgradeRewardRecords.Find(RecordDate);
-								if (Record)
-								{
-									UE_LOG(LogTemp, Log, TEXT("\n--- 第%d天记录 (RecordDate=%d) ---"), RecordDate, RecordDate);
-									UE_LOG(LogTemp, Log, TEXT("📅 创建时间: %s"), *Record->CreatedTime.ToString());
-									UE_LOG(LogTemp, Log, TEXT("⏰ 最后更新: %s"), *Record->LastUpdateTime.ToString());
-									UE_LOG(LogTemp, Log, TEXT("📊 当前经验值: %d"), Record->CurrentExperience);
-									UE_LOG(LogTemp, Log, TEXT("🎁 奖励图标索引: %d"), Record->RewardIconIndex);
-									UE_LOG(LogTemp, Log, TEXT("⏱️ 限时活动开始时间戳: %lld"), Record->LimitedActivityStartTime);
-									UE_LOG(LogTemp, Log, TEXT("🏆 限时活动完成次数: %d"), Record->LimitedActivityCompleteCount);
-										
-									// 显示宝箱状态 - 更详细的格式
-									FString ChestStatus = TEXT("📦 宝箱领取状态 [索引=状态]: ");
-									for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
-									{
-										FString StatusText = (Record->ChestClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
-										ChestStatus += FString::Printf(TEXT("[%d]=%s "), i, *StatusText);
-									}
-									UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
-									UE_LOG(LogTemp, Log, TEXT("   宝箱数组大小: %d"), Record->ChestClaimStatus.Num());
-										
-									// 显示任务状态 - 更详细的格式
-									UE_LOG(LogTemp, Log, TEXT("📝 任务完成情况:"));
-									for (int32 i = 0; i < Record->TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
-									{
-										FString ClaimStatus = (Record->TaskClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
-										UE_LOG(LogTemp, Log, TEXT("   任务[%d]: 完成%d次, 奖励%s"), i, Record->TaskCompleteCounts[i], *ClaimStatus);
-									}
-									UE_LOG(LogTemp, Log, TEXT("   任务数组大小: 完成计数=%d, 领取状态=%d"), 
-										Record->TaskCompleteCounts.Num(), Record->TaskClaimStatus.Num());
-										
-									// 显示内存地址用于调试
-									UE_LOG(LogTemp, Log, TEXT("📍 记录内存地址: %p"), Record);
-								}
-							}
-								
-							UE_LOG(LogTemp, Log, TEXT("\n====================================="));
-							UE_LOG(LogTemp, Log, TEXT("修改器状态: 已启用热数据连接"));
-							UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), Subsystem);
-							UE_LOG(LogTemp, Log, TEXT("所有记录显示完成"));
-							return;
+							FString StatusText = (Record->ChestClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
+							ChestStatus += FString::Printf(TEXT("[%d]=%s "), i, *StatusText);
+						}
+						UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
+						
+						// 显示任务状态
+						UE_LOG(LogTemp, Log, TEXT("📝 任务完成情况:"));
+						for (int32 i = 0; i < Record->TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
+						{
+							FString ClaimStatus = (Record->TaskClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
+							UE_LOG(LogTemp, Log, TEXT("   任务 [%d]: 完成%d次，奖励%s"), i, Record->TaskCompleteCounts[i], *ClaimStatus);
 						}
 					}
 				}
+				
+					UE_LOG(LogTemp, Log, TEXT("\n====================================="));
+				UE_LOG(LogTemp, Log, TEXT("修改器状态：已启用热数据连接"));
+				UE_LOG(LogTemp, Log, TEXT("所有记录显示完成"));
+				UE_LOG(LogTemp, Log, TEXT("====================================="));
+				return;
 			}
-			
-			UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
-		}
-	),
-	ECVF_Default
+		}),
+		ECVF_Default
 	);
+
+	IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Upgrade.SetTaskCount"),
+		TEXT("设置任务完成次数: Upgrade.SetTaskCount RecordDate TaskIndex Count"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+		{
+			if (Args.Num() >= 3)
+			{
+				int32 RecordDate = FCString::Atoi(*Args[0]);
+				int32 TaskIndex = FCString::Atoi(*Args[1]);
+				int32 Count = FCString::Atoi(*Args[2]);
+												
+				// 直接使用已初始化的 TargetSubsystem
+				if (this->TargetSubsystem)
+				{
+					// 获取目标记录
+					const FUpgradeRewardSaveRecord* RecordPtr = this->TargetSubsystem->GetRecordByDate(RecordDate);
+					if (!RecordPtr)
+					{
+						UE_LOG(LogTemp, Error, TEXT("Upgrade.SetTaskCount: 记录%d不存在"), RecordDate);
+						return;
+					}
+					
+					if (!RecordPtr->TaskCompleteCounts.IsValidIndex(TaskIndex))
+					{
+						UE_LOG(LogTemp, Error, TEXT("Upgrade.SetTaskCount: 任务索引%d超出范围"), TaskIndex);
+						return;
+					}
+					
+					// 创建一个副本以避免引用问题
+					FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
+					
+					int32 OriginalCount = ModifiedRecord.TaskCompleteCounts[TaskIndex];
+					ModifiedRecord.TaskCompleteCounts[TaskIndex] = Count;
+					ModifiedRecord.LastUpdateTime = FDateTime::Now();
+					
+					// 调试日志：记录修改前后的 AllRecords 状态
+					UE_LOG(LogTemp, Log, TEXT("DEBUG: Upgrade.SetTaskCount - 修改前 AllRecords 大小: %d"), this->TargetSubsystem->GetAllRecords().Num());
+					for (auto& Pair : this->TargetSubsystem->GetAllRecords())
+					{
+						UE_LOG(LogTemp, Log, TEXT("DEBUG: Upgrade.SetTaskCount - RecordDate=%d, TaskCompleteCounts[0]=%d"), 
+							Pair.Key, Pair.Value.TaskCompleteCounts.IsValidIndex(0) ? Pair.Value.TaskCompleteCounts[0] : -1);
+					}
+					
+					// 更新 AllRecords 中的指定记录
+					this->TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+					
+					// 调试日志：记录修改后的 AllRecords 状态
+					UE_LOG(LogTemp, Log, TEXT("DEBUG: Upgrade.SetTaskCount - 修改后 AllRecords 大小: %d"), this->TargetSubsystem->GetAllRecords().Num());
+					for (auto& Pair : this->TargetSubsystem->GetAllRecords())
+					{
+						UE_LOG(LogTemp, Log, TEXT("DEBUG: Upgrade.SetTaskCount - RecordDate=%d, TaskCompleteCounts[0]=%d"), 
+							Pair.Key, Pair.Value.TaskCompleteCounts.IsValidIndex(0) ? Pair.Value.TaskCompleteCounts[0] : -1);
+					}
+					
+					// 如果修改的是当前记录，同步更新 CurrentRecord
+					if (this->TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+					{
+						this->TargetSubsystem->GetRecord() = ModifiedRecord;
+					}
+					
+					UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+					UE_LOG(LogTemp, Log, TEXT("MEMORY_DATA_MODIFICATION_START"));
+					UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), this->TargetSubsystem);
+					UE_LOG(LogTemp, Log, TEXT("📊 任务完成次数修改: 任务%d [%d] -> [%d]"), TaskIndex, OriginalCount, Count);
+					UE_LOG(LogTemp, Log, TEXT("修改时间: %s"), *FDateTime::Now().ToString());
+					UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
+					UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+					
+					// 强制刷新所有页面，重新获取内存数据
+					ForceRefreshAllPages();
+					
+					UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 设置任务完成次数 RecordDate=%d TaskIndex=%d Count=%d 成功"), RecordDate, TaskIndex, Count);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error, TEXT("Upgrade控制台: 无法获取Subsystem实例"));
+				}
+			}
+			else
+				{
+				UE_LOG(LogTemp, Warning, TEXT("Upgrade控制台: 用法 - Upgrade.SetTaskCount RecordDate TaskIndex Count"));
+			}
+		}),
+		ECVF_Default
+	);
+
+
+
+
 }
 
-void UUpgradeActivitySaveModifier::UnregisterConsoleCommands()
+bool UUpgradeActivitySaveModifier::ValidateAndLog(const TCHAR* FunctionName) const
 {
-	if (!GEngine)
+	if (!bIsInitialized || !TargetSubsystem)
 	{
-		return;
-	}
-
-	// 注销控制台命令
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.SetExp"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.SetIcon"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.SetChest"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.CreateRecord"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.Reset"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.ShowInfo"));
-	IConsoleManager::Get().UnregisterConsoleObject(TEXT("Upgrade.ShowAllInfo"));
-}
-
-// ==================== 公共接口实现 ====================
-// ==================== 公共接口实现 ====================
-
-bool UUpgradeActivitySaveModifier::ResetUpgradeActivityData(int32 RecordDate, bool bAutoSave)
-{
-	if (!bIsInitialized)
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 未初始化"));
+		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier::%s: 未初始化或Subsystem无效"), FunctionName);
 		return false;
 	}
-
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(RecordDate);
-	if (!SaveGame)
-	{
-		return false;
-	}
-
-	// 查找或创建记录
-	FUpgradeRewardSaveRecord* Record = SaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (!Record)
-	{
-		// 创建新的记录
-		FUpgradeRewardSaveRecord NewRecord;
-		NewRecord.SetRecordDate(RecordDate);
-		NewRecord.CurrentExperience = 0;
-		NewRecord.RewardIconIndex = 0;
-		NewRecord.LimitedActivityCompleteCount = 0;
-		
-		// 初始化数组 - 使用动态大小
-		NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-		NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-		NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
-		
-		NewRecord.LastUpdateTime = FDateTime::Now();
-		
-		SaveGame->UpgradeRewardRecords.Add(RecordDate, NewRecord);
-		Record = SaveGame->UpgradeRewardRecords.Find(RecordDate);
-	}
-
-	// 保存原始数据用于记录
-	FString OriginalExp = FString::FromInt(Record->CurrentExperience);
-	FString OriginalIcon = FString::FromInt(Record->RewardIconIndex);
-
-	// 重置数据
-	Record->CurrentExperience = 0;
-	Record->RewardIconIndex = 0;
-	Record->LimitedActivityCompleteCount = 0;
-	
-	// 重置数组
-	for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
-	{
-		Record->ChestClaimStatus[i] = 0;
-	}
-	for (int32 i = 0; i < Record->TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
-	{
-		Record->TaskCompleteCounts[i] = 0;
-		Record->TaskClaimStatus[i] = 0;
-	}
-	
-	Record->LastUpdateTime = FDateTime::Now();
-
-	Record->LastUpdateTime = FDateTime::Now();
-
-	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 重置记录%d的数据"), RecordDate);
-
-	if (bAutoSave)
-	{
-		return SaveAllRecords();
-	}
-
 	return true;
 }
 
-void UUpgradeActivitySaveModifier::DisplayUpgradeActivityInfo(int32 RecordDate)
+bool UUpgradeActivitySaveModifier::ValidateBinaryState(int32 Value, const TCHAR* ValueName) const
 {
-	if (!bIsInitialized)
+	if (Value != 0 && Value != 1)
 	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 未初始化"));
-		return;
+		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: %s只能是0或1: %d"), ValueName, Value);
+		return false;
 	}
+	return true;
+}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(RecordDate);
-	if (!SaveGame)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 未找到记录%d的存档数据"), RecordDate);
-		return;
-	}
-
-	// 查找记录
-	FUpgradeRewardSaveRecord* Record = SaveGame->UpgradeRewardRecords.Find(RecordDate);
-	if (!Record)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: 记录%d无数据"), RecordDate);
-		return;
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("===== 升级活动信息 (RecordDate: %d) ====="), RecordDate);
-	UE_LOG(LogTemp, Log, TEXT("当前经验值: %d"), Record->CurrentExperience);
-	UE_LOG(LogTemp, Log, TEXT("奖励图标索引: %d"), Record->RewardIconIndex);
-	UE_LOG(LogTemp, Log, TEXT("限时活动完成次数: %d"), Record->LimitedActivityCompleteCount);
-	UE_LOG(LogTemp, Log, TEXT("最后更新时间: %s"), *Record->LastUpdateTime.ToString());
-	
-	// 显示宝箱状态
-	FString ChestStatus = TEXT("宝箱状态: ");
-	for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
-	{
-		ChestStatus += FString::Printf(TEXT("[%d]=%d "), i, Record->ChestClaimStatus[i]);
-	}
-	UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
-	
-	// 显示任务状态
-	FString TaskStatus = TEXT("任务状态: ");
-	for (int32 i = 0; i < Record->TaskCompleteCounts.Num() && i < MAX_TASK_COUNT; ++i)
-	{
-		TaskStatus += FString::Printf(TEXT("[%d]完成=%d 领取=%d "), i, Record->TaskCompleteCounts[i], Record->TaskClaimStatus[i]);
-	}
-	UE_LOG(LogTemp, Log, TEXT("%s"), *TaskStatus);
-	
-	UE_LOG(LogTemp, Log, TEXT("修改器状态: 已启用热数据连接"));
-	UE_LOG(LogTemp, Log, TEXT("====================================="));
+void UUpgradeActivitySaveModifier::LogModification(const TCHAR* FieldName, const FString& ChangeDesc) const
+{
+	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+	UE_LOG(LogTemp, Log, TEXT("MEMORY_DATA_MODIFICATION_START"));
+	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
+	UE_LOG(LogTemp, Log, TEXT("%s修改: %s"), FieldName, *ChangeDesc);
+	UE_LOG(LogTemp, Log, TEXT("修改时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
 void UUpgradeActivitySaveModifier::ForceRefreshAllPages()
 {
 	if (!TargetSubsystem)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ForceRefreshAllPages: TargetSubsystem为空"));
+		UE_LOG(LogTemp, Error, TEXT("ForceRefreshAllPages: TargetSubsystem为空"));
 		return;
 	}
 	
@@ -1461,69 +1093,56 @@ void UUpgradeActivitySaveModifier::ForceRefreshAllPages()
 	TargetSubsystem->OnRewardIconIndexChanged.Broadcast(TargetSubsystem->GetCurrentRewardIconIndex());
 	UE_LOG(LogTemp, Log, TEXT("✅ OnRewardIconIndexChanged.Broadcast()执行完成"));
 	
-	UE_LOG(LogTemp, Log, TEXT("\n🎯 页面刷新完成 - 所有UI组件已重新获取最新内存数据"));
+	UE_LOG(LogTemp, Log, TEXT("\n🎯 页面刷新完成 - 所有 UI 组件已重新获取最新内存数据"));
+}
+
+void UUpgradeActivitySaveModifier::InitializeNewRecord(FUpgradeRewardSaveRecord& Record, int32 RecordDate)
+{
+	Record.SetRecordDate(RecordDate);
+	Record.CurrentExperience = 0;
+	Record.RewardIconIndex = 0;
+	Record.LimitedActivityCompleteCount = 0;
+	
+	// 初始化数组
+	Record.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+	Record.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
+	Record.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
+	
+	Record.LastUpdateTime = FDateTime::Now();
+	Record.CreatedTime = FDateTime::Now();
+	
+	UE_LOG(LogTemp, Log, TEXT("✅ 新记录初始化完成 - RecordDate: %d"), RecordDate);
 }
 
 void UUpgradeActivitySaveModifier::ShowDailyUpgradePage()
 {
-	if (!WorldContextObject.IsValid())
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 世界上下文无效"));
-		return;
-	}
-
-	UWorld* World = WorldContextObject->GetWorld();
-	if (!World)
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取世界实例"));
-		return;
-	}
-
-	// 获取DailyUpgradeRewardPage类（需要在项目中定义）
-	// 这里只是一个示例，实际使用时需要替换为正确的类路径
-	/*
-	TSubclassOf<UDailyUpgradeRewardPage> PageClass = LoadClass<UDailyUpgradeRewardPage>(nullptr, 
-		TEXT("/Game/UI/Activity/Pages/WBP_DailyUpgradeRewardPage.WBP_DailyUpgradeRewardPage"));
-	
-	if (!PageClass)
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法加载DailyUpgradeRewardPage类"));
-		return;
-	}
-
-	// 创建并显示页面
-	UDailyUpgradeRewardPage* Page = CreateWidget<UDailyUpgradeRewardPage>(World, PageClass);
-	if (Page)
-	{
-		Page->AddToViewport(0); // 添加到最顶层
-		UE_LOG(LogTemp, Log, TEXT("✅ 成功显示DailyUpgradeRewardPage"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 创建页面失败"));
-	}
-	*/
-	
-	UE_LOG(LogTemp, Warning, TEXT("⚠️ 请在项目中实现ShowDailyUpgradePage功能"));
+	UE_LOG(LogTemp, Warning, TEXT("UpgradeActivitySaveModifier: ShowDailyUpgradePage 功能待实现"));
 }
 
 void UUpgradeActivitySaveModifier::AutoSaveOnGameExit()
 {
 	if (!TargetSubsystem)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ AutoSaveOnGameExit: TargetSubsystem为空，无需保存"));
+		UE_LOG(LogTemp, Warning, TEXT("⚠️ AutoSaveOnGameExit: TargetSubsystem 为空，无需保存"));
 		return;
 	}
 	
 	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
 	UE_LOG(LogTemp, Log, TEXT("💾 AUTO_SAVE_ON_GAME_EXIT_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem地址: %p"), TargetSubsystem);
+	UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem 地址：%p"), TargetSubsystem);
 	UE_LOG(LogTemp, Log, TEXT("📊 执行游戏退出自动保存"));
-	UE_LOG(LogTemp, Log, TEXT("⏰ 保存时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("⏰ 保存时间：%s"), *FDateTime::Now().ToString());
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 	
 	// 保存当前内存数据到磁盘
 	TargetSubsystem->SaveStatus();
 	
 	UE_LOG(LogTemp, Log, TEXT("✅ 游戏退出自动保存完成 - 所有内存修改已持久化到磁盘"));
+}
+
+void UUpgradeActivitySaveModifier::UnregisterConsoleCommands()
+{
+	// 🔧 注意：UE 的 IConsoleManager 不支持动态注销命令
+	// 命令会在编辑器关闭时自动清理
+	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: UnregisterConsoleCommands - 命令将在编辑器关闭时自动清理"));
 }

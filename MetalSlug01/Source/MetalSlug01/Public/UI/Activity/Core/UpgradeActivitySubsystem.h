@@ -64,16 +64,159 @@ public:
     // ==================== 数据访问接口 ====================
     
     /**
+     * @brief 获取所有存档记录
+     * @return 所有记录的映射表（RecordDate -> Record）
+     */
+    const TMap<int32, FUpgradeRewardSaveRecord>& GetAllRecords() const { return AllRecords; }
+    
+    /**
+     * @brief 获取指定天数的记录
+     * @param RecordDate 天数（如 1, 2, 3...）
+     * @return 指定记录的引用，如果不存在则返回 nullptr
+     */
+    const FUpgradeRewardSaveRecord* GetRecordByDate(int32 RecordDate) const;
+    
+    /**
+     * @brief 添加或更新记录到表格
+     * @param RecordDate 天数
+     * @param Record 要添加的记录
+     */
+    void AddOrUpdateRecord(int32 RecordDate, const FUpgradeRewardSaveRecord& Record);
+    
+    /**
      * @brief 获取当前存档记录
      * @return 当前记录的引用
      */
     FUpgradeRewardSaveRecord& GetRecord() { return CurrentRecord; }
+    
+    /**
+     * @brief 获取当前存档记录的 TaskCompleteCounts 数组
+     * @return TaskCompleteCounts 数组的引用
+     */
+    const TArray<int32>& GetCurrentTaskCompleteCounts() const { return CurrentRecord.TaskCompleteCounts; }
+    
+    /**
+     * @brief 获取当前存档记录的 TaskClaimStatus 数组
+     * @return TaskClaimStatus 数组的引用
+     */
+    const TArray<int32>& GetCurrentTaskClaimStatus() const { return CurrentRecord.TaskClaimStatus; }
+    
+    /**
+     * @brief 根据 DayIdentifier 获取配置行
+     * @param DayIdentifier 天数标识（如"day1", "day2"）
+     * @return 配置行指针，找不到则返回 nullptr
+     */
+    const FDailyUpgradeRewardConfigRow* GetConfigRowForDay(const FString& DayIdentifier) const;
 
     /**
      * @brief 获取配置表行（封装了ID 110的查找逻辑）
      * @return 配置表行指针，找不到则返回nullptr
      */
     const FDailyUpgradeRewardConfigRow* GetActivityConfig();
+    
+    /**
+     * @brief 获取额外配置数据（ActivityID=102, DayIdentifier=day1）
+     * @return 额外配置数据指针
+     */
+    const FDailyUpgradeRewardConfigRow* GetExtraConfigForDay1();
+    
+    /**
+     * @brief 获取每日任务DayIdentifier数组
+     * @return DayIdentifier数组（如"day1", "day2", "day3"...）
+     * @details 从ActivityID=102的所有配置行中收集DayIdentifier字段
+     */
+    TArray<FString> GetDailyTaskDescriptions();
+    
+    /**
+     * @brief 获取最大记录日期
+     * @return 最大记录日期（1-7之间的数字）
+     * @details 遍历UpgradeRewardSaveRecord动态表数据，找到RecordDate字段的最大值
+     * 如果超出7则返回7，最小值为1
+     */
+    int32 GetMaxRecordDate() const;
+    
+    /**
+     * @brief 检查内存中是否存在指定天数的数据
+     * @param DayNumber 天数编号（例如：1, 2, 3...）
+     * @return 如果内存中存在该天数的数据则返回true，否则返回false
+     * @details 检查AllRecords映射表中是否存在指定天数的记录
+     */
+    UFUNCTION(BlueprintCallable, Category = "UpgradeActivity|Data")
+    bool HasDayDataInMemory(int32 DayNumber) const;
+    
+    /**
+     * @brief 获取指定天数的奖励图标数组
+     * @param DayIdentifier 天数标识符（如 "day1", "day2" 等）
+     * @return 图标纹理数组，用于显示在TaskRewardIconsContainer中
+     * @details 业务逻辑下沉：根据DayIdentifier获取RewardItemIDs，解析后关联TreasureBoxItemRow获取BoxIcon
+     */
+    UFUNCTION(BlueprintCallable, Category = "UpgradeActivity|Data")
+    TArray<UTexture2D*> GetRewardIconsForDay(const FString& DayIdentifier) const;
+    
+    /**
+     * @brief 获取指定天数的限时奖励图标数组
+     * @param DayIdentifier 天数标识符（如 "day1", "day2" 等）
+     * @return 图标纹理数组，用于显示在LimitedTimeRewardIconsContainer中
+     * @details 业务逻辑：根据DayIdentifier获取BonusIDs，关联ItemDetailRow表获取ItemIcon
+     */
+    UFUNCTION(BlueprintCallable, Category = "UpgradeActivity|Data")
+    TArray<UTexture2D*> GetLimitedTimeRewardIconsForDay(const FString& DayIdentifier) const;
+    
+    /**
+     * @brief 获取限时活动完成次数
+     * @return LimitedActivityCompleteCount值
+     */
+    UFUNCTION(BlueprintCallable, Category = "UpgradeActivity|Data")
+    int32 GetLimitedActivityCompleteCount() const;
+    
+    /**
+     * @brief 获取记录创建时间
+     * @return CreatedTime值
+     */
+    UFUNCTION(BlueprintCallable, Category = "UpgradeActivity|Data")
+    FDateTime GetRecordCreatedTime() const;
+    
+    /**
+     * @brief 获取每日任务高亮状态数组（核心业务逻辑）
+     * @return 布尔数组，每个元素对应一个任务按钮是否应该高亮显示
+     * @details 业务逻辑下沉：根据最大RecordDate值确定哪些天数按钮应该显示高亮
+     * 数组索引对应任务按钮索引（0=day1, 1=day2, ... 6=day7）
+     * @note 此方法封装了完整的业务判断逻辑，UI层只需使用结果
+     */
+    TArray<bool> GetDailyTaskHighlightStates() const;
+    
+    /**
+     * @brief 获取每日任务锁定状态数组（核心业务逻辑）
+     * @return 布尔数组，每个元素对应一个任务按钮是否应该显示锁定图标
+     * @details 业务逻辑下沉：根据最大 RecordDate 值确定哪些天数按钮应该显示锁定
+     * 数组索引对应任务按钮索引（0=day1, 1=day2, ... 6=day7）
+     * 显示锁定条件：DayText 数字 > RecordDate 最大值
+     * @note 此方法封装了完整的业务判断逻辑，UI 层只需使用结果
+     */
+    TArray<bool> GetDailyTaskLockStates() const;
+        
+    /**
+     * @brief 获取指定天数的处理后任务描述数组（核心业务逻辑）
+     * @param DayIdentifier 天数标识（如"day1", "day2"）
+     * @return 处理后的任务描述数组（已替换占位符）
+     * @details 业务逻辑下沉：从 ActivityID=102 且 DayIdentifier=指定的配置行中获取 TaskDescriptions
+     * 并对每个描述中的占位符进行替换：
+     * - 将"游玩匹配模式（a/b）局"中的 b 替换为 TaskRelatedValues 对应值
+     * - 将"游玩匹配模式（a/b）局"中的 a 替换为 TaskCompleteCounts 对应值
+     * @note 此方法封装了完整的文本处理逻辑，UI 层只需使用结果
+     */
+    TArray<FString> GetProcessedTaskDescriptionsForDay(const FString& DayIdentifier) const;
+    
+    /**
+     * @brief 获取当前天的处理后任务描述数组（核心业务逻辑）
+     * @return 处理后的任务描述数组（已替换占位符）
+     * @details 业务逻辑下沉：根据 CurrentRecord.RecordDate 获取对应天的配置并处理 TaskDescriptions
+     * 并对每个描述中的占位符进行替换：
+     * - 将"游玩匹配模式（a/b）局"中的 b 替换为 TaskRelatedValues 对应值
+     * - 将"游玩匹配模式（a/b）局"中的 a 替换为 TaskCompleteCounts 对应值
+     * @note 此方法封装了完整的文本处理逻辑，UI 层只需使用结果
+     */
+    TArray<FString> GetProcessedTaskDescriptionsForCurrentDay() const;
 
     // ==================== 核心业务接口 ====================
     
@@ -292,7 +435,10 @@ public:
 private:
     // ==================== 私有成员 ====================
     
-    /** 当前存档记录 */
+    /** 所有存档记录 - 表格形式存储每一天的数据 */
+    TMap<int32, FUpgradeRewardSaveRecord> AllRecords;
+    
+    /** 当前存档记录 - 页面加载时调取的那一行数据 */
     FUpgradeRewardSaveRecord CurrentRecord;
     
     /** 升级活动存档修改器 */
@@ -321,12 +467,6 @@ private:
      * @return 配置表路径
      */
     FName GetConfigTablePath() const;
-
-    /**
-     * @brief 获取额外配置数据（ActivityID=102, DayIdentifier=day1）
-     * @return 额外配置数据指针
-     */
-    const FDailyUpgradeRewardConfigRow* GetExtraConfigForDay1();
 
     /**
      * @brief 获取指定天数的额外配置数据（ActivityID=102, DayIdentifier=day + 天数）

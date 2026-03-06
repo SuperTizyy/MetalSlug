@@ -34,13 +34,16 @@
  */
 
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
+#include "Components/Border.h"
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
 #include "Components/ProgressBar.h"
 #include "Components/VerticalBox.h"
+#include "Components/VerticalBoxSlot.h"
 #include "Components/ScrollBox.h"
+#include "Styling/SlateTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/DataTable.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
@@ -48,6 +51,9 @@
 #include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/DailyTaskWidget.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/DayLockHintWidget.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 
 /**
@@ -76,11 +82,11 @@ bool UDailyUpgradeRewardPage::Initialize()
 	if (ReselectRewardButton)
 	{
 		ReselectRewardButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 重选奖励按钮事件已绑定"));
+		
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ReselectRewardButton未绑定"));
+		
 	}
 
 	return true;
@@ -98,11 +104,12 @@ bool UDailyUpgradeRewardPage::Initialize()
  */
 void UDailyUpgradeRewardPage::NativeConstruct()
 {
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("🔄 DAILY_UPGRADE_REWARD_PAGE_CONSTRUCT_START"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 初始页面地址: %p"), this);
-	UE_LOG(LogTemp, Log, TEXT("⏰ 构造时间: %s"), *FDateTime::Now().ToString());
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	// 初始化当前选中的天数索引为-1（表示未选择）
+	CurrentDayIndex = -1;
+	
+	// 清空按钮映射表以避免重复添加
+	ButtonToDayIndexMap.Empty();
+	
 	
 	Super::NativeConstruct();
 	
@@ -115,16 +122,14 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	InitializeExperienceChestWidgets();
 	InitializeFixedPrizeWidget();  // 初始化固定奖励控件
 	UpdateExperienceDisplay();
+	UpdateDailyTasks();  // 初始化每日任务列表
 	
 	// 延迟执行居中显示，等待UI完全渲染完成
 	FTimerHandle CenterTimerHandle;
 	GetWorld()->GetTimerManager().SetTimer(CenterTimerHandle, this, &UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience, 0.2f, false);
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已设置延迟居中显示定时器(0.2秒)"));
 	
-	UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
-	UE_LOG(LogTemp, Log, TEXT("✅ DAILY_UPGRADE_REWARD_PAGE_CONSTRUCT_END"));
-	UE_LOG(LogTemp, Log, TEXT("🆔 最终页面地址: %p"), this);
-	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+	
+	
 }
 
 /**
@@ -145,7 +150,7 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 	if (ReselectRewardButton)
 	{
 		ReselectRewardButton->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 重选奖励按钮事件已解绑"));
+		
 	}
 	
 	Super::NativeDestruct();
@@ -178,7 +183,6 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	if (!GameInstance)
 	{
 		// 在编辑器预览模式下静默处理
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance，使用空图标数组"));
 		UpdateRewardItemImage();
 		return;
 	}
@@ -187,7 +191,6 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	if (!UpgradeSub)
 	{
 		// 在编辑器预览模式下静默处理
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem，使用空图标数组"));
 		UpdateRewardItemImage();
 		return;
 	}
@@ -195,15 +198,6 @@ void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 	// 2. 调用Subsystem方法获取奖励物品图标数据
 	CachedItemIcons = UpgradeSub->GetRewardItemIcons();
 	
-	if (CachedItemIcons.Num() == 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 未获取到任何奖励物品图标"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功获取到 %d 个奖励物品图标"), CachedItemIcons.Num());
-	}
-
 	// 3. 更新RewardItemImage显示
 	UpdateRewardItemImage();
 }
@@ -221,7 +215,6 @@ void UDailyUpgradeRewardPage::UpdateRewardItemImage()
 {
 	if (!RewardItemImage)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: RewardItemImage控件未绑定"));
 		return;
 	}
 
@@ -239,28 +232,24 @@ void UDailyUpgradeRewardPage::UpdateRewardItemImage()
 				// 确保索引在有效范围内
 				if (CurrentIndex >= 0 && CurrentIndex < CachedItemIcons.Num())
 				{
-					RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[CurrentIndex]);
-					UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 设置RewardItemImage显示索引 %d 的图标"), CurrentIndex);
+					RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[CurrentIndex]);	
 				}
 				else
 				{
 					// 索引超出范围，显示第一个图标
 					RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-					UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 索引 %d 超出范围，显示第一个图标"), CurrentIndex);
 				}
 			}
 			else
 			{
 				// 无法获取Subsystem，显示第一个图标
 				RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-				UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem，显示第一个图标"));
 			}
 		}
 		else
 		{
 			// 无法获取GameInstance，显示第一个图标
 			RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-			UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance，显示第一个图标"));
 		}
 	}
 	else
@@ -278,7 +267,6 @@ void UDailyUpgradeRewardPage::SwitchToNextRewardIcon()
 {
 	if (CachedItemIcons.Num() <= 1)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 图标数量不足，无法切换"));
 		return;
 	}
 
@@ -286,14 +274,12 @@ void UDailyUpgradeRewardPage::SwitchToNextRewardIcon()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		return;
 	}
 
 	UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!UpgradeSub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		return;
 	}
 
@@ -304,12 +290,7 @@ void UDailyUpgradeRewardPage::SwitchToNextRewardIcon()
 	// 设置新的索引
 	if (UpgradeSub->SetCurrentRewardIconIndex(NextIndex))
 	{
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 切换到下一个图标索引 %d"), NextIndex);
 		UpdateRewardItemImage();
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 设置图标索引失败"));
 	}
 }
 
@@ -321,7 +302,6 @@ void UDailyUpgradeRewardPage::SwitchToPreviousRewardIcon()
 {
 	if (CachedItemIcons.Num() <= 1)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 图标数量不足，无法切换"));
 		return;
 	}
 
@@ -329,14 +309,12 @@ void UDailyUpgradeRewardPage::SwitchToPreviousRewardIcon()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		return;
 	}
 
 	UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!UpgradeSub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		return;
 	}
 
@@ -347,12 +325,7 @@ void UDailyUpgradeRewardPage::SwitchToPreviousRewardIcon()
 	// 设置新的索引
 	if (UpgradeSub->SetCurrentRewardIconIndex(PreviousIndex))
 	{
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 切换到上一个图标索引 %d"), PreviousIndex);
 		UpdateRewardItemImage();
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 设置图标索引失败"));
 	}
 }
 
@@ -369,7 +342,6 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 {
 	if (!ChestCountText)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ChestCountText控件未绑定"));
 		return;
 	}
 
@@ -383,7 +355,6 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		ChestCountText->SetText(FText::FromString(TEXT("0")));
 		return;
 	}
@@ -391,7 +362,6 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!Sub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		ChestCountText->SetText(FText::FromString(TEXT("0")));
 		return;
 	}
@@ -402,7 +372,6 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	// 显示在ChestCountText控件上（拼接X前缀）
 	FString DisplayText = FString::Printf(TEXT("X%s"), *ChestCount);
 	ChestCountText->SetText(FText::FromString(DisplayText));
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ChestCountText已更新为: %s"), *DisplayText);
 }
 
 /**
@@ -419,7 +388,6 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 {
 	if (!ItemsScrollBox)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ItemsScrollBox控件未绑定"));
 		return;
 	}
 
@@ -433,46 +401,37 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		return;
 	}
 
 	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!Sub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		return;
 	}
 
 	const auto* Config = Sub->GetActivityConfig();
 	if (!Config)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取活动配置"));
 		return;
 	}
 
 	// 调用UpgradeActivitySubsystem获取宝箱图标数据
 	TArray<TSoftObjectPtr<UTexture2D>> ChestBoxIcons = Sub->GetChestBoxIcons();
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到 %d 个宝箱图标"), ChestBoxIcons.Num());
 	
 	// 调用UpgradeActivitySubsystem获取TaskRelatedValues数据
 	TArray<int32> TaskRelatedValues = Sub->GetTaskRelatedValues();
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到 %d 个TaskRelatedValues"), TaskRelatedValues.Num());
 	
 	// 调用UpgradeActivitySubsystem获取当前经验值
 	int32 CurrentExpFromSubsystem = Sub->GetCurrentExperience();
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 获取到当前经验值: %d"), CurrentExpFromSubsystem);
 	
 	// 计算需要显示的Widget数量（刨除最后一个索引）
 	int32 DisplayWidgetCount = FMath::Min(Config->RewardItemIDs.Num() - 1, ChestBoxIcons.Num());
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 计划显示 %d 个ExperienceChestClaimWidget（刨除最后一个索引）"), DisplayWidgetCount);
-
 	auto& Record = Sub->GetRecord();
 
 	// 检查 ExperienceChestWidgetClass 是否设置
 	if (ExperienceChestWidgetClass == nullptr)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ExperienceChestWidgetClass 未设置！请在蓝图中指定 WBP_ExperienceChestClaimWidget 类"));
 		return;
 	}
 
@@ -485,7 +444,6 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		UExperienceChestClaimWidget* ChestWidget = CreateWidget<UExperienceChestClaimWidget>(GetWorld(), ExperienceChestWidgetClass.Get());
 		if (!ChestWidget)
 		{
-			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 创建ExperienceChestClaimWidget失败，索引: %d"), i);
 			continue;
 		}
 		
@@ -514,19 +472,16 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		{
 			// 已领取状态
 			ChestWidget->SetButtonClaimedState();
-			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 已领取状态"), i);
 		}
 		else if (bHasEnoughExp)
 		{
 			// 满足条件，启用按钮
 			ChestWidget->SetButtonEnabledState();
-			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 满足条件，启用按钮"), i);
 		}
 		else
 		{
 			// 未满足条件，禁用但保持原外观
 			ChestWidget->SetButtonDisabledState();
-			UE_LOG(LogTemp, Log, TEXT("宝箱%d: 条件不足，禁用按钮"), i);
 		}
 		
 		// 设置奖励数量
@@ -549,11 +504,6 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			if (BoxIcon)
 			{
 				ChestWidget->SetChestBoxIcon(BoxIcon);
-				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 为第%d个宝箱成功设置图标（刨除最后一个索引）"), i + 1);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 第%d个宝箱图标加载失败"), i + 1);
 			}
 		}
 		
@@ -562,7 +512,6 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		{
 			FString ExperienceValue = FString::FromInt(TaskRelatedValues[i]);
 			ChestWidget->ExperienceText->SetText(FText::FromString(ExperienceValue));
-			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 为第%d个宝箱设置ExperienceText: %s"), i + 1, *ExperienceValue);
 			
 			// 根据条件控制HighlightFrameImage显示：
 			// ChestClaimStatus=0 且 CurrentExperience >= TaskRelatedValues[i] 时显示高亮框
@@ -575,42 +524,25 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 				}
 			}
 			
-			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱详细判断:"), i + 1);
-			UE_LOG(LogTemp, Log, TEXT("  - 当前经验: %d"), CurrentExpFromSubsystem);
-			UE_LOG(LogTemp, Log, TEXT("  - 需要经验: %d"), TaskRelatedValues[i]);
-			UE_LOG(LogTemp, Log, TEXT("  - 是否已领取: %s"), (Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 1) ? TEXT("是") : TEXT("否"));
-			UE_LOG(LogTemp, Log, TEXT("  - 条件判断: %d >= %d = %s"), CurrentExpFromSubsystem, TaskRelatedValues[i], 
-				CurrentExpFromSubsystem >= TaskRelatedValues[i] ? TEXT("满足") : TEXT("不满足"));
-			UE_LOG(LogTemp, Log, TEXT("  - 最终显示状态: %s"), bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"));
-			
 			if (ChestWidget->HighlightFrameImage)
 			{
 				ChestWidget->HighlightFrameImage->SetVisibility(bShouldShowHighlight ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
-				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱HighlightFrameImage显示状态: %s (ChestClaimStatus: %d, TaskRelatedValue: %d, CurrentExperience: %d)"), 
-					i + 1, bShouldShowHighlight ? TEXT("显示") : TEXT("隐藏"), 
-					Record.ChestClaimStatus.IsValidIndex(i) ? Record.ChestClaimStatus[i] : -1,
-					TaskRelatedValues[i], CurrentExpFromSubsystem);
 			}
 		}
 		else if (ChestWidget->ExperienceText)
 		{
 			// 如果索引超出范围，显示默认值0
 			ChestWidget->ExperienceText->SetText(FText::FromString(TEXT("0")));
-			UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 第%d个宝箱的TaskRelatedValues索引超出范围，显示默认值0"), i + 1);
 			
 			// 索引超出范围时隐藏高亮框
 			if (ChestWidget->HighlightFrameImage)
 			{
 				ChestWidget->HighlightFrameImage->SetVisibility(ESlateVisibility::Hidden);
-				UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 第%d个宝箱索引超出范围，隐藏HighlightFrameImage"), i + 1);
 			}
 		}
 		
 		ItemsScrollBox->AddChild(ChestWidget);
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个ExperienceChestClaimWidget，已领取: %s，事件绑定: %s（刨除最后一个索引）"), 
-			i + 1, bIsClaimed ? TEXT("是") : TEXT("否"),
-			ChestWidget->OnChestClaimRequested.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
-		
+
 		// 更新DiamondIcon颜色
 		ChestWidget->UpdateDiamondIconColor();
 		
@@ -632,7 +564,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 {
 	if (!CurrentExpText)
 	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: CurrentExpText控件未绑定"));
 		return;
 	}
 
@@ -647,7 +578,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	if (!GameInstance)
 	{
 		CurrentExpText->SetText(FText::FromString(TEXT("0")));
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
 		return;
 	}
 
@@ -655,7 +585,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	if (!Sub)
 	{
 		CurrentExpText->SetText(FText::FromString(TEXT("0")));
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
 		return;
 	}
 
@@ -665,11 +594,325 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	FString ExpText = FString::Printf(TEXT("%d"), CurrentExp);
 	CurrentExpText->SetText(FText::FromString(ExpText));
 	
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: CurrentExpText已更新为: %d"), CurrentExp);
+}
+
+void UDailyUpgradeRewardPage::UpdateDailyTasks()
+{
+	// 确保在游戏世界中运行
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		return;
+	}
+
+	// 检查必要的组件是否存在
+	if (!DayButtonsContainer || !DailyTaskWidgetClass)
+	{
+		return;
+	}
+	
+
+
+	// 清空现有内容（保留BonusInfoBorder和BonusInfoText）
+	DayButtonsContainer->ClearChildren();
+	{
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] TasksContainer子控件数量: %d"), TasksContainer->GetChildrenCount());
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoBorder地址: %p"), BonusInfoBorder);
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText地址: %p"), BonusInfoText);
+		
+		TArray<UWidget*> ChildrenToRemove;
+		for (int32 i = 0; i < TasksContainer->GetChildrenCount(); ++i)
+		{
+			UWidget* Child = TasksContainer->GetChildAt(i);
+			UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 子控件[%d]地址: %p, 名称: %s"), i, Child, Child ? *Child->GetName() : TEXT("null"));
+			
+			// 只移除不是BonusInfoBorder且不是BonusInfoText的控件
+			if (Child && Child != BonusInfoBorder && Child != BonusInfoText)
+			{
+				ChildrenToRemove.Add(Child);
+				UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 标记为删除: %s"), *Child->GetName());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 保留控件: %s"), Child ? *Child->GetName() : TEXT("null"));
+			}
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 需要删除的控件数量: %d"), ChildrenToRemove.Num());
+		
+		// 移除TaskDetailWidget和其他动态控件
+		for (UWidget* WidgetToRemove : ChildrenToRemove)
+		{
+			TasksContainer->RemoveChild(WidgetToRemove);
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 清理后TasksContainer子控件数量: %d"), TasksContainer->GetChildrenCount());
+	}
+	
+	// 清空按钮映射表以避免重复添加
+	ButtonToDayIndexMap.Empty();
+
+	// 获取Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		return;
+	}
+
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	// 📥 调用 Subsystem 获取所有 DayIdentifier（day1-day7）
+	TArray<FString> DayIdentifiers = Subsystem->GetDailyTaskDescriptions();
+	if (DayIdentifiers.Num() == 0)
+	{
+		return;
+	}
+	
+	
+	// 📥 调用 Subsystem 获取每日任务高亮状态数组（业务逻辑完全在 Subsystem 中）
+	TArray<bool> HighlightStates = Subsystem->GetDailyTaskHighlightStates();
+	
+	// 📥 调用Subsystem获取每日任务锁定状态数组（业务逻辑完全在Subsystem中）
+	TArray<bool> LockStates = Subsystem->GetDailyTaskLockStates();
+
+	// 🖼️ UI 层：根据 DayIdentifier 数组动态生成 DailyTaskWidget（天数按钮）
+	for (int32 i = 0; i < DayIdentifiers.Num(); ++i)
+	{
+		UDailyTaskWidget* TaskWidget = CreateWidget<UDailyTaskWidget>(GetWorld(), DailyTaskWidgetClass);
+		if (TaskWidget)
+		{
+			DayButtonsContainer->AddChild(TaskWidget);
+			
+			// 设置天数显示文本
+			if (TaskWidget->DayText)
+			{
+				TaskWidget->DayText->SetText(FText::FromString(DayIdentifiers[i]));
+			}
+			
+			// 设置高亮显示逻辑（使用Subsystem提供的业务逻辑结果）
+			if (TaskWidget->SelectionHighlightImage)
+			{
+				// 直接使用Subsystem计算好的高亮状态
+				bool bShouldHighlight = false;
+				if (i < HighlightStates.Num())
+				{
+					bShouldHighlight = HighlightStates[i];
+				}
+				
+				TaskWidget->SelectionHighlightImage->SetVisibility(
+					bShouldHighlight ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
+				
+			}
+			
+			// 设置锁定图标显示逻辑（使用Subsystem提供的业务逻辑结果）
+			if (TaskWidget->LockIconImage)
+			{
+				// 直接使用Subsystem计算好的锁定状态
+				bool bShouldLock = false;
+				if (i < LockStates.Num())
+				{
+					bShouldLock = LockStates[i];
+				}
+				
+				TaskWidget->LockIconImage->SetVisibility(
+					bShouldLock ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
+				
+			}
+			
+		}
+	}
+		
+	// 🔧 核心业务逻辑：为每个 DayButton 绑定点击事件
+	for (int32 i = 0; i < DayIdentifiers.Num(); ++i)
+	{
+		UDailyTaskWidget* TaskWidget = Cast<UDailyTaskWidget>(DayButtonsContainer->GetChildAt(i));
+		if (TaskWidget && TaskWidget->DayButton)
+		{
+			FString CurrentDayIdentifier = DayIdentifiers[i];
+			int32 CurrentIndex = i;
+			
+			// 存储映射关系用于后续查找
+			ButtonToDayIndexMap.Add(TaskWidget->DayButton, CurrentIndex);
+			
+			// 绑定点击事件（使用 UFUNCTION 包装器）
+			TaskWidget->DayButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::HandleDayButtonClicked);
+			
+		}
+	}
+	
+	// 🔧 核心业务逻辑：默认显示最大RecordDate那天的任务详情
+	int32 MaxRecordDate = Subsystem->GetMaxRecordDate();
+	FString DefaultDayIdentifier = FString::Printf(TEXT("day%d"), MaxRecordDate);
+	int32 DefaultDayIndex = MaxRecordDate - 1;
+	
+	
+	// 设置当前选中的天数索引
+	CurrentDayIndex = DefaultDayIndex;
+	
+	// 调用OnDayButtonClicked显示默认天数的任务详情
+	OnDayButtonClicked(DefaultDayIdentifier, DefaultDayIndex);
 }
 
 /**
- * @brief 刷新整个页面UI
+ * @brief 处理天数按钮点击事件 - 在 TasksContainer 中动态生成 TaskDetailWidget
+ * @param DayIdentifier 天数标识（如"day1", "day2"）
+ * @param DayIndex 天数索引
+ */
+void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, int32 DayIndex)
+{
+	
+	// 存储当前选中的天数索引
+	CurrentDayIndex = DayIndex;
+		
+	// 更新限时加成信息文本
+	UpdateBonusInfoText(DayIdentifier);
+	
+	// 确保在游戏世界中运行
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		return;
+	}
+
+	// 更新限时加成信息文本
+	UpdateBonusInfoText(DayIdentifier);
+
+	// 检查必要的组件是否存在
+	if (!TasksContainer || !TaskDetailWidgetClass)
+	{
+		return;
+	}
+
+	// 清空现有内容（只清理动态创建的TaskDetailWidget，保留BonusInfoBorder和BonusInfoText）
+	{
+		TArray<UWidget*> ChildrenToRemove;
+		for (int32 i = 0; i < TasksContainer->GetChildrenCount(); ++i)
+		{
+			UWidget* Child = TasksContainer->GetChildAt(i);
+			// 只移除不是BonusInfoBorder且不是BonusInfoText的控件
+			if (Child && Child != BonusInfoBorder && Child != BonusInfoText)
+			{
+				ChildrenToRemove.Add(Child);
+			}
+		}
+		
+		// 移除TaskDetailWidget和其他动态控件
+		for (UWidget* WidgetToRemove : ChildrenToRemove)
+		{
+			TasksContainer->RemoveChild(WidgetToRemove);
+		}
+	}
+
+	// 获取 Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		return;
+	}
+
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	// 🔧 核心业务逻辑：使用 Subsystem 检查内存中是否有该天数的数据
+	int32 CheckDayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+	bool bHasDayData = Subsystem->HasDayDataInMemory(CheckDayNumber);
+	
+	if (!bHasDayData)
+	{
+		
+		if (DayLockHintWidgetClass && TasksContainer)
+		{
+			UDayLockHintWidget* LockHintWidget = CreateWidget<UDayLockHintWidget>(GetWorld(), DayLockHintWidgetClass);
+			if (LockHintWidget)
+			{
+				TasksContainer->AddChild(LockHintWidget);
+				
+				// 初始化锁定提示Widget（包含奖励图标生成）
+				LockHintWidget->InitializeWidget(DayIdentifier);
+			}
+		}	
+		return;
+	}
+	
+	// 📥 调用 Subsystem 的业务逻辑方法获取指定天的处理后任务描述
+	TArray<FString> ProcessedDescriptions = Subsystem->GetProcessedTaskDescriptionsForDay(DayIdentifier);
+	if (ProcessedDescriptions.Num() == 0)
+	{
+		return;
+	}
+
+	// 🖼️ UI 层：根据 TaskDescriptions 数组动态生成 TaskDetailWidget
+	for (int32 i = 0; i < ProcessedDescriptions.Num(); ++i)
+	{
+		UTaskDetailWidget* TaskDetailWidget = CreateWidget<UTaskDetailWidget>(GetWorld(), TaskDetailWidgetClass);
+		if (TaskDetailWidget)
+		{
+			TasksContainer->AddChild(TaskDetailWidget);
+			
+			// 设置任务需求说明文本（使用 Subsystem 处理后的结果）
+			if (TaskDetailWidget->TaskRequirementText)
+			{
+				TaskDetailWidget->TaskRequirementText->SetText(FText::FromString(ProcessedDescriptions[i]));
+				UE_LOG(LogTemp, Log, TEXT("🖼️ DailyUpgradeRewardPage: 设置第%d个 TaskDetailWidget 的 TaskRequirementText 为：%s"), i + 1, *ProcessedDescriptions[i]);
+			}
+			
+			// 🔧 核心业务逻辑：设置领取按钮状态
+			// 获取当前天的配置数据用于比较
+			const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+			
+			// 从指定天数的记录中获取任务完成数量
+			int32 DayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+			const FUpgradeRewardSaveRecord* DayRecord = Subsystem->GetRecordByDate(DayNumber);
+			
+			if (ConfigRow && i < ConfigRow->TaskRelatedValues.Num() && DayRecord && i < DayRecord->TaskCompleteCounts.Num())
+			{
+				int32 CompleteCount = DayRecord->TaskCompleteCounts[i];
+				int32 RequiredCount = ConfigRow->TaskRelatedValues[i];
+				
+				// 🔧 调试日志：确认从指定天数获取的任务完成数量
+				UE_LOG(LogTemp, Log, TEXT("🔍 DailyUpgradeRewardPage: 从天数 %s 获取任务%d的完成数量: %d"), *DayIdentifier, i + 1, CompleteCount);
+				
+				// 调用 TaskDetailWidget 的方法设置按钮状态
+				TaskDetailWidget->SetupClaimButton(DayIdentifier, i, CompleteCount, RequiredCount);
+				
+				// 🔧 核心业务逻辑：设置奖励展示容器
+				TaskDetailWidget->SetupRewardsContainer(DayIdentifier, i);
+				
+				UE_LOG(LogTemp, Log, TEXT("🔧 DailyUpgradeRewardPage: 设置第%d个 TaskDetailWidget 的 ClaimButton - Complete:%d, Required:%d"), 
+					i + 1, CompleteCount, RequiredCount);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("🔧 DailyUpgradeRewardPage: 无法获取第%d个任务的配置数据或索引越界"), i + 1);
+			}
+			
+			// 隐藏领取成功图标（默认状态）
+			if (TaskDetailWidget->ClaimSuccessImage)
+			{
+				TaskDetailWidget->ClaimSuccessImage->SetVisibility(ESlateVisibility::Hidden);
+			}
+			
+			UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功创建第%d个 TaskDetailWidget"), i + 1);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 创建第%d个 TaskDetailWidget 失败"), i + 1);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: TasksContainer 初始化完成，共创建%d个 TaskDetailWidget"), ProcessedDescriptions.Num());
+	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+}
+
+
+
+/**
+ * @brief 刷新整个页面 UI
  * @details 重新初始化所有UI组件，确保显示与数据同步
  * 主要功能：
  * 1. 重新初始化经验宝箱控件列表
@@ -686,6 +929,7 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	UE_LOG(LogTemp, Log, TEXT("🆔 页面身份: %s"), *PageIdentity);
 	UE_LOG(LogTemp, Log, TEXT("📍 刷新时页面地址: %p"), this);
 	UE_LOG(LogTemp, Log, TEXT("⏰ 刷新时间: %s"), *FDateTime::Now().ToString());
+	UE_LOG(LogTemp, Log, TEXT("📅 当前选中天数索引: %d"), CurrentDayIndex);
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 	
 	// 执行全量刷新：重新初始化所有核心UI组件
@@ -696,38 +940,51 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图标缓存已刷新 (缓存数量: %d)"), CachedItemIcons.Num());
 	
 	// 2. 更新现有经验宝箱控件状态（不重新创建）
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/6] 📦 更新经验宝箱控件状态..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2/7] 📦 更新经验宝箱控件状态..."));
 	UpdateExperienceChestWidgetsState();
 	int32 ChestCount = ItemsScrollBox ? ItemsScrollBox->GetChildrenCount() : 0;
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验宝箱控件状态已更新 (控件数量: %d)"), ChestCount);
 	
 	// 2.1 额外刷新所有进度条显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.1/6] 📊 刷新经验进度条显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.1/7] 📊 刷新经验进度条显示..."));
 	RefreshAllProgressBars();
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验进度条已刷新"));
 	
 	// 2.2 根据当前经验值居中显示相关内容
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.2/6] 🎯 根据经验值居中显示内容..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.2/7] 🎯 根据经验值居中显示内容..."));
 	CenterScrollBoxOnCurrentExperience();
 	UE_LOG(LogTemp, Log, TEXT("✅ ScrollBox已根据经验值居中定位"));
 	
 	// 3. 更新宝箱数量显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/6] 📊 更新宝箱数量显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/7] 📊 更新宝箱数量显示..."));
 	UpdateChestCountText();
 	UE_LOG(LogTemp, Log, TEXT("✅ 宝箱数量文本已刷新"));
 	
 	// 4. 更新经验值显示
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤4/6] ⭐ 更新经验值显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤4/7] ⭐ 更新经验值显示..."));
 	UpdateExperienceDisplay();
 	UE_LOG(LogTemp, Log, TEXT("✅ 经验值显示已刷新"));
 	
 	// 5. 更新奖励物品图像显示（基于最新的缓存数据）
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤5/6] 🖼️ 更新奖励物品图像显示..."));
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤5/7] 🖼️ 更新奖励物品图像显示..."));
 	UpdateRewardItemImage();
 	UE_LOG(LogTemp, Log, TEXT("✅ 奖励物品图像已刷新"));
 	
-	// 6. 更新固定奖励控件状态
-	UE_LOG(LogTemp, Log, TEXT("\n[步骤6/6] 🎁 更新固定奖励控件状态..."));
+	// 6. 更新每日任务列表和高亮状态
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤6/7] 📅 更新每日任务列表和高亮状态..."));
+	UpdateDailyTasks();
+	UE_LOG(LogTemp, Log, TEXT("✅ 每日任务列表和高亮状态已刷新"));
+	
+	// 6.1 如果当前有选中的天数，显示该天数的任务详情
+	if (CurrentDayIndex != -1)
+	{
+		FString SelectedDayIdentifier = FString::Printf(TEXT("day%d"), CurrentDayIndex + 1);
+		UE_LOG(LogTemp, Log, TEXT("🔄 刷新UI时显示天数 %s 的任务详情，索引: %d"), *SelectedDayIdentifier, CurrentDayIndex);
+		OnDayButtonClicked(SelectedDayIdentifier, CurrentDayIndex);
+	}
+	
+	// 7. 更新固定奖励控件状态
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤7/7] 🎁 更新固定奖励控件状态..."));
 	UpdateFixedPrizeWidget();
 	UE_LOG(LogTemp, Log, TEXT("✅ 固定奖励控件状态已刷新"));
 	
@@ -738,6 +995,42 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	UE_LOG(LogTemp, Log, TEXT("📊 最终状态: 宝箱控件数=%d, 图标缓存数=%d"), ChestCount, CachedItemIcons.Num());
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
+
+/**
+ * @brief 处理天数按钮点击事件（无参包装器）
+ */
+void UDailyUpgradeRewardPage::HandleDayButtonClicked()
+{
+	// 🔧 安全检查：确保 ButtonToDayIndexMap 不为空
+	if (ButtonToDayIndexMap.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("⚠️ HandleDayButtonClicked: ButtonToDayIndexMap 为空"));
+		return;
+	}
+	
+	// 遍历 ButtonToDayIndexMap 找到被点击的按钮
+	for (auto& Pair : ButtonToDayIndexMap)
+	{
+		// 🔧 安全检查：确保按钮有效且未被销毁
+		if (!Pair.Key || !Pair.Key->IsValidLowLevel())
+		{
+			continue;
+		}
+		
+		if (Pair.Key->IsHovered())
+		{
+			int32 DayIndex = Pair.Value;
+			FString DayIdentifier = FString::Printf(TEXT("day%d"), DayIndex + 1);
+			
+			UE_LOG(LogTemp, Log, TEXT("🖱️ HandleDayButtonClicked: 检测到按钮 %s (索引:%d) 被点击"), *DayIdentifier, DayIndex);
+			
+			// 调用实际的处理方法
+			OnDayButtonClicked(DayIdentifier, DayIndex);
+			return;
+		}
+	}
+}
+
 
 /**
  * @brief 重选奖励按钮点击事件处理
@@ -930,6 +1223,65 @@ void UDailyUpgradeRewardPage::ManualRefreshUI()
 	RefreshUI();
 }
 
+void UDailyUpgradeRewardPage::RefreshDailyTaskHighlights()
+{
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 刷新每日任务高亮状态"));
+	
+	// 检查必要组件
+	if (!DayButtonsContainer)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: DayButtonsContainer未设置"));
+		return;
+	}
+	
+	// 获取Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取GameInstance"));
+		return;
+	}
+	
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: 无法获取UpgradeActivitySubsystem"));
+		return;
+	}
+	
+	// 📥 调用Subsystem获取高亮状态数组（业务逻辑完全在Subsystem中）
+	TArray<bool> HighlightStates = Subsystem->GetDailyTaskHighlightStates();
+	UE_LOG(LogTemp, Log, TEXT("📥 DailyUpgradeRewardPage: 从Subsystem获取到%d个高亮状态用于刷新（业务逻辑已下沉）"), HighlightStates.Num());
+	
+	// 遍历所有DailyTaskWidget并更新高亮状态
+	for (int32 i = 0; i < DayButtonsContainer->GetChildrenCount(); ++i)
+	{
+		UWidget* ChildWidget = DayButtonsContainer->GetChildAt(i);
+		UDailyTaskWidget* TaskWidget = Cast<UDailyTaskWidget>(ChildWidget);
+		
+		if (TaskWidget && TaskWidget->SelectionHighlightImage)
+		{
+			// 直接使用Subsystem提供的业务逻辑结果
+			bool bShouldHighlight = false;
+			if (i < HighlightStates.Num())
+			{
+				bShouldHighlight = HighlightStates[i];
+			}
+			
+			// 设置高亮显示状态
+			TaskWidget->SelectionHighlightImage->SetVisibility(
+				bShouldHighlight ? ESlateVisibility::Visible : ESlateVisibility::Hidden);
+			
+			UE_LOG(LogTemp, Log, TEXT("🖼️ DailyUpgradeRewardPage: 刷新第%d个任务Widget高亮状态: %s (使用Subsystem业务逻辑结果)"), 
+				i + 1, bShouldHighlight ? TEXT("显示✅") : TEXT("隐藏❌"));
+		}
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 每日任务高亮状态刷新完成"));
+}
+
+
+
 FString UDailyUpgradeRewardPage::GetPageIdentity() const
 {
 	// 生成页面唯一身份标识
@@ -1101,9 +1453,7 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 		UE_LOG(LogTemp, Log, TEXT("ItemsScrollBox 为空"));
 		return;
 	}
-	
-	UE_LOG(LogTemp, Log, TEXT("ItemsScrollBox 子控件数量: %d"), ItemsScrollBox->GetChildrenCount());
-	
+		
 	// 遍历所有子控件并更新状态
 	for (int32 i = 0; i < ItemsScrollBox->GetChildrenCount(); ++i)
 	{
@@ -1112,7 +1462,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 		
 		if (ChestWidget)
 		{
-			UE_LOG(LogTemp, Log, TEXT("更新宝箱控件 %d 的状态"), i);
 			ChestWidget->UpdateButtonState();
 			
 			// 更新DiamondIcon颜色
@@ -1121,10 +1470,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 			// 更新ExperienceText颜色
 			ChestWidget->UpdateExperienceTextColor();
 		}
-		else
-		{
-			UE_LOG(LogTemp, Log, TEXT("子控件 %d 不是 ExperienceChestClaimWidget 类型"), i);
-		}
 	}
 	
 	UE_LOG(LogTemp, Log, TEXT("UpdateExperienceChestWidgetsState 执行完成"));
@@ -1132,7 +1477,6 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 
 void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 {
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 接收到奖励存储请求，宝箱索引: %d"), DayIndex);
 	
 	// 获取Subsystem
 	UGameInstance* GameInstance = GetGameInstance();
@@ -1152,14 +1496,21 @@ void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 	// DayIndex实际上就是ChestIndex
 	int32 ChestIndex = DayIndex;
 	
-	// 修改内存数据
-	FUpgradeRewardSaveRecord& Record = const_cast<FUpgradeRewardSaveRecord&>(Subsystem->GetRecord());
-	if (Record.ChestClaimStatus.IsValidIndex(ChestIndex))
+	// 修改内存数据 - 同时更新 CurrentRecord 和 AllRecords
+	FUpgradeRewardSaveRecord ModifiedRecord = Subsystem->GetRecord();
+	if (ModifiedRecord.ChestClaimStatus.IsValidIndex(ChestIndex))
 	{
-		Record.ChestClaimStatus[ChestIndex] = 1; // 标记为已领取
-		Record.LastUpdateTime = FDateTime::Now();
+		ModifiedRecord.ChestClaimStatus[ChestIndex] = 1; // 标记为已领取
+		ModifiedRecord.LastUpdateTime = FDateTime::Now();
 		
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功更新宝箱%d状态为已领取"), ChestIndex);
+		// 🔧 关键修复：同步更新 AllRecords 映射表
+		int32 CurrentDay = ModifiedRecord.GetDayNumber();
+		Subsystem->AddOrUpdateRecord(CurrentDay, ModifiedRecord);
+		
+		// 同时更新 CurrentRecord
+		Subsystem->GetRecord() = ModifiedRecord;
+		
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功更新宝箱%d状态为已领取，同步到AllRecords[Day=%d]"), ChestIndex, CurrentDay);
 		
 		// 全局刷新活动页面
 		Subsystem->OnGlobalRefresh.Broadcast();
@@ -1576,6 +1927,221 @@ float UDailyUpgradeRewardPage::CalculateMaxScrollOffset()
 		// 设置全局标志，让滚动函数知道需要使用备选方案
 		GHasInvalidGeometryDetected = true;
 	}
-	
+
 	return MaxOffset;
+}
+
+/**
+ * @brief 更新限时加成信息文本
+ * @param DayIdentifier 天数标识符
+ */
+void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
+{
+	if (!BonusInfoText)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: BonusInfoText控件未绑定"));
+		return;
+	}
+
+	// 调试：检查控件是否有效
+	if (!IsValid(BonusInfoText))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: BonusInfoText控件无效"));
+		return;
+	}
+
+	// 调试：检查Border控件
+	if (BonusInfoBorder && !IsValid(BonusInfoBorder))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: BonusInfoBorder控件无效"));
+		BonusInfoBorder = nullptr; // 设为null，使用兼容模式
+	}
+
+	// 调试：检查控件的父容器
+	UWidget* Parent = BonusInfoText->GetParent();
+	if (Parent)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText的父容器: %s"), *Parent->GetName());
+		if (!IsValid(Parent))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: BonusInfoText的父容器无效"));
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] BonusInfoText没有父容器"));
+		
+		// 如果没有父容器，说明需要在蓝图中设置
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 请在蓝图中将BonusInfoText设置为BonusInfoBorder的内容"));
+	}
+
+	// 获取 GameInstance 和 Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 无法获取GameInstance"));
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 无法获取UpgradeActivitySubsystem"));
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+
+	// 获取配置行
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+	if (!ConfigRow)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 未找到配置行 - Day:%s"), *DayIdentifier);
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+
+	if (ConfigRow->BonusDescription.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: BonusDescription为空 - Day:%s"), *DayIdentifier);
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+
+	// 检查内存中是否有该天数的数据
+	int32 DayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+	bool bHasDayData = Subsystem->HasDayDataInMemory(DayNumber);
+	
+	// 如果内存中没有该天数的数据，隐藏控件
+	if (!bHasDayData)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 内存中无天数数据 - Day:%s"), *DayIdentifier);
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+	
+	// 获取相关数据
+	int32 LimitedActivityCompleteCount = Subsystem->GetLimitedActivityCompleteCount();
+	int32 BonusCount = ConfigRow->BonusCount;
+	FDateTime CreatedTime = Subsystem->GetRecordCreatedTime();
+	int32 BonusDurationHours = ConfigRow->BonusDurationHours;
+
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: Day:%s, BonusDescription:%s, CompleteCount:%d, BonusCount:%d, CreatedTime:%s, DurationHours:%d"), 
+		*DayIdentifier, *ConfigRow->BonusDescription, LimitedActivityCompleteCount, BonusCount, *CreatedTime.ToString(), BonusDurationHours);
+
+	// 计算结束时间
+	FDateTime EndTime = CreatedTime + FTimespan::FromHours(BonusDurationHours);
+	FDateTime CurrentTime = FDateTime::Now();
+
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: CurrentTime:%s, EndTime:%s"), *CurrentTime.ToString(), *EndTime.ToString());
+
+	// 检查是否已过期
+	if (CurrentTime >= EndTime)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 活动已过期 - Day:%s"), *DayIdentifier);
+		// 已过期，隐藏控件
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		return;
+	}
+
+	// 计算剩余时长
+	FTimespan RemainingTime = EndTime - CurrentTime;
+	int32 RemainingHours = RemainingTime.GetHours();
+	int32 RemainingMinutes = RemainingTime.GetMinutes() % 60;
+
+	// 格式化显示文本
+	FString DisplayText = FString::Printf(TEXT("%s %d/%d 剩余时长：%dH %dM"), 
+		*ConfigRow->BonusDescription, 
+		LimitedActivityCompleteCount, 
+		BonusCount, 
+		RemainingHours, 
+		RemainingMinutes);
+
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 显示文本 - %s"), *DisplayText);
+
+	// 设置文本并显示
+	BonusInfoText->SetText(FText::FromString(DisplayText));
+	
+	// 强制设置字体大小以确保正确计算大小
+	FSlateFontInfo FontInfo = BonusInfoText->GetFont();
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText原始字体大小: %.2f"), FontInfo.Size);
+	if (FontInfo.Size <= 0)
+	{
+		// 如果字体大小未设置，使用默认大小
+		FontInfo.Size = 16.0f;
+		BonusInfoText->SetFont(FontInfo);
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 已设置字体大小为16"));
+	}
+	
+	BonusInfoText->SetVisibility(ESlateVisibility::Visible);
+	
+	// 设置背景颜色和尺寸（如果Border存在）
+	if (BonusInfoBorder)
+	{
+		// 设置内边距 (Left, Top, Right, Bottom)
+		FMargin BorderPadding(10.0f, 5.0f, 10.0f, 5.0f);
+		BonusInfoBorder->SetPadding(BorderPadding);
+		
+		// 强制设置Border的尺寸规则为自动
+		// 注意：这需要在父容器的Slot中设置，但我们可以尝试其他方法
+		
+		// 背景色建议在蓝图中设置，C++中主要控制可见性和尺寸
+		BonusInfoBorder->SetVisibility(ESlateVisibility::Visible);
+		
+		// 调试：检查Border的大小
+		FVector2D BorderSize = BonusInfoBorder->GetDesiredSize();
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoBorder控件大小: %.2f x %.2f"), BorderSize.X, BorderSize.Y);
+	}
+	
+	// 调试：检查文本是否为空
+	if (DisplayText.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] DisplayText为空！"));
+	}
+	
+	// 调试：检查控件的实际可见性
+	ESlateVisibility CurrentVisibility = BonusInfoText->GetVisibility();
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText控件设置后的可见性: %d"), (int32)CurrentVisibility);
+	
+	// 调试：检查控件的大小
+	FVector2D WidgetSize = BonusInfoText->GetDesiredSize();
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText控件大小: %.2f x %.2f"), WidgetSize.X, WidgetSize.Y);
+	
+	// 调试：强制设置文本颜色为红色以便确认是否显示
+	// 注意：这需要在蓝图中设置TextBlock的Style来支持颜色修改
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText控件已设置文本并设为可见"));
+	
+	// 强制刷新布局
+	if (BonusInfoBorder)
+	{
+		BonusInfoBorder->InvalidateLayoutAndVolatility();
+	}
+	if (BonusInfoText)
+	{
+		BonusInfoText->InvalidateLayoutAndVolatility();
+	}
 }

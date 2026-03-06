@@ -14,6 +14,7 @@
 #include "Blueprint/UserWidget.h"
 #include "DailyUpgradeRewardPage.generated.h"
 
+class UBorder;
 class UHorizontalBox;
 class UImage;
 class UButton;
@@ -23,6 +24,9 @@ class UScrollBox;
 class UUpgradeActivitySubsystem;
 class URewardOptionWidget;
 class UExperienceChestClaimWidget;
+class UDailyTaskWidget;
+class UTaskDetailWidget;
+class UDayLockHintWidget;
 
 /**
  * @brief 每日升级奖励活动页面
@@ -48,6 +52,13 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|Debug")
 	void ManualRefreshUI();
+	
+	/**
+	 * @brief 刷新每日任务高亮状态 - 可在蓝图中调用
+	 * @note 用于手动更新每日任务按钮的选中高亮显示
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|UI")
+	void RefreshDailyTaskHighlights();
 
 protected:
 	// ==================== UI控件引用 ====================
@@ -71,6 +82,10 @@ protected:
 	/** 加成信息时限文本 */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* BonusInfoText;
+
+	/** 加成信息背景边框 */
+	UPROPERTY(meta = (BindWidget))
+	UBorder* BonusInfoBorder;
 
 	/** 任务列表容器 */
 	UPROPERTY(meta = (BindWidget))
@@ -108,6 +123,18 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UActivityConfirmPopupWidget> ActivityConfirmPopupWidgetClass;
 
+	/** DailyTaskWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UDailyTaskWidget> DailyTaskWidgetClass;
+	
+	/** TaskDetailWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UTaskDetailWidget> TaskDetailWidgetClass;
+
+	/** DayLockHintWidget蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UDayLockHintWidget> DayLockHintWidgetClass;
+
 	// ==================== 数据管理 ====================
 	
 	/** 当前选择的天数索引 */
@@ -131,6 +158,22 @@ protected:
 	 * @param DayIndex 对应的天数索引
 	 */
 	static void StaticButtonCallback(UButton* Button, int32 DayIndex);
+	
+
+	
+	/**
+	 * @brief 处理天数按钮点击事件
+	 * @param DayIdentifier 天数标识
+	 * @param DayIndex 天数索引
+	 */
+	void OnDayButtonClicked(const FString& DayIdentifier, int32 DayIndex);
+
+	/**
+	 * @brief 处理天数按钮点击事件（无参包装器）
+	 * @note 用于绑定到 FOnButtonClickedEvent 委托
+	 */
+	UFUNCTION()
+	void HandleDayButtonClicked();
 
 	// ==================== 初始化方法 ====================
 	
@@ -192,6 +235,9 @@ protected:
 	 */
 	void UpdateItemsScrollBox();
 
+	/** 更新每日任务列表 */
+	void UpdateDailyTasks();
+
 	// ==================== 事件处理方法 ====================
 	
 	/**
@@ -225,12 +271,18 @@ private:
 	 * @details 从配置表读取数据并缓存ItemIcon到全局变量
 	 */
 	void InitializeRewardItemIcons();
-
+	
 	/**
 	 * @brief 更新奖励物品图片显示
 	 * @details 使用缓存的图标数据显示RewardItemImage控件
 	 */
 	void UpdateRewardItemImage();
+	
+	/**
+	 * @brief 更新限时加成信息文本
+	 * @param DayIdentifier 天数标识符
+	 */
+	void UpdateBonusInfoText(const FString& DayIdentifier);
 
 	/**
 	 * @brief 切换到下一个奖励图标
