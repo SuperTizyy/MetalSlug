@@ -767,6 +767,90 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 		}),
 		ECVF_Default
 	);
+	
+		// 注册设置 CreatedTime 的控制台命令
+		IConsoleManager::Get().RegisterConsoleCommand(
+			TEXT("Upgrade.SetCreatedTime"),
+			TEXT("设置创建时间: Upgrade.SetCreatedTime RecordDate Year Month Day Hour Minute Second"),
+			FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+			{
+				if (Args.Num() >= 7)
+				{
+					int32 RecordDate = FCString::Atoi(*Args[0]);
+					int32 Year = FCString::Atoi(*Args[1]);
+					int32 Month = FCString::Atoi(*Args[2]);
+					int32 Day = FCString::Atoi(*Args[3]);
+					int32 Hour = FCString::Atoi(*Args[4]);
+					int32 Minute = FCString::Atoi(*Args[5]);
+					int32 Second = FCString::Atoi(*Args[6]);
+									
+					// 直接使用已初始化的 TargetSubsystem
+					if (this->TargetSubsystem)
+					{
+						// 获取指定 RecordDate 的记录
+						const FUpgradeRewardSaveRecord* RecordPtr = this->TargetSubsystem->GetRecordByDate(RecordDate);
+						FUpgradeRewardSaveRecord ModifiedRecord;
+										
+						if (RecordPtr)
+						{
+							// 使用现有记录
+							ModifiedRecord = *RecordPtr;
+						}
+						else
+						{
+							// 创建新记录
+							ModifiedRecord.SetRecordDate(RecordDate);
+							ModifiedRecord.CurrentExperience = 0;
+							ModifiedRecord.RewardIconIndex = 0;
+							ModifiedRecord.LimitedActivityCompleteCount = 0;
+							ModifiedRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+							ModifiedRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
+							ModifiedRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
+						}
+										
+						// 设置新的 CreatedTime
+						FDateTime NewCreatedTime(Year, Month, Day, Hour, Minute, Second);
+						ModifiedRecord.CreatedTime = NewCreatedTime;
+						ModifiedRecord.LastUpdateTime = FDateTime::Now();
+										
+						// 同步更新 AllRecords
+						this->TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+										
+						// 如果修改的是当前记录，同步更新 CurrentRecord
+						if (this->TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
+						{
+							this->TargetSubsystem->GetRecord() = ModifiedRecord;
+						}
+										
+						UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] MEMORY_DATA_MODIFICATION_START"));
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] Subsystem地址: %p"), this->TargetSubsystem);
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] 创建时间修改: %s -> %s"), 
+							*ModifiedRecord.CreatedTime.ToString(), *NewCreatedTime.ToString());
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] 修改时间: %s"), *FDateTime::Now().ToString());
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] 运行时模式: 仅内存操作，不写入磁盘"));
+						UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+										
+						// 强制刷新所有页面，重新获取内存数据
+						ForceRefreshAllPages();
+										
+						// 游戏关闭时才会保存到磁盘
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] 标记为需要保存到磁盘（游戏关闭时执行）"));
+										
+						UE_LOG(LogTemp, Log, TEXT("[SET_CREATED_TIME_DEBUG] Upgrade控制台: 设置创建时间 RecordDate=%d 成功"), RecordDate);
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error, TEXT("[SET_CREATED_TIME_DEBUG] Upgrade控制台: 无法获取Subsystem实例"));
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[SET_CREATED_TIME_DEBUG] Upgrade控制台: 用法 - Upgrade.SetCreatedTime RecordDate Year Month Day Hour Minute Second"));
+				}
+			}),
+			ECVF_Default
+		);
 
 	
 
