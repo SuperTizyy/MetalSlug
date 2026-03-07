@@ -68,6 +68,11 @@ public:
 	UFUNCTION()
 	void HandleClaimButtonClickWrapper();
 	
+public:
+	/** WBP_RewardIcon 蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TaskDetail|UI")
+	TSubclassOf<class UUserWidget> RewardIconClass;
+
 private:
 	/** 当前绑定的天数标识（用于无参委托） */
 	FString CurrentDayIdentifier;

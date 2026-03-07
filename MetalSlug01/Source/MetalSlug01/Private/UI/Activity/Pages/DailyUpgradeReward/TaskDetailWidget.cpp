@@ -5,6 +5,7 @@
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
 #include "Components/Button.h"
+#include "Components/CanvasPanelSlot.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Kismet/GameplayStatics.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
@@ -182,135 +183,205 @@ void UTaskDetailWidget::HandleClaimButtonClickWrapper()
  */
 void UTaskDetailWidget::SetupRewardsContainer(const FString& DayIdentifier, int32 TaskIndex)
 {
-	if (!RewardsContainer)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: RewardsContainer 未设置"));
-		return;
-	}
-	
-	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 设置奖励容器 - Day:%s, TaskIndex:%d"), *DayIdentifier, TaskIndex);
-	
-	// 清空现有内容
-	RewardsContainer->ClearChildren();
-	
-	// 获取 Subsystem
-	UGameInstance* GameInstance = GetGameInstance();
-	if (!GameInstance)
-	{
-		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 GameInstance"));
-		return;
-	}
-	
-	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-	if (!Subsystem)
-	{
-		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 UpgradeActivitySubsystem"));
-		return;
-	}
-	
-	// 🔧 核心业务逻辑：获取配置行
-	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
-	if (!ConfigRow)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 未找到配置数据 - Day:%s"), *DayIdentifier);
-		return;
-	}
-	
-	// 🔧 核心业务逻辑：检查 TaskIndex 是否越界
-	if (TaskIndex >= ConfigRow->RewardItemIDs.Num())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: TaskIndex(%d) 超出 RewardItemIDs 数组范围 (%d)"), TaskIndex, ConfigRow->RewardItemIDs.Num());
-		return;
-	}
-	
-	// 🔧 核心业务逻辑：获取宝箱 ID 字符串（用逗号分隔）
-	FString BoxIDString = ConfigRow->RewardItemIDs[TaskIndex];
-	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 原始宝箱 ID 字符串：%s (TaskIndex=%d, RewardItemIDs.Num=%d)"), 
-		*BoxIDString, TaskIndex, ConfigRow->RewardItemIDs.Num());
-	
-	if (BoxIDString.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("🔧 UTaskDetailWidget: 宝箱 ID 字符串为空"));
-		return;
-	}
-	
-	// 🔧 核心业务逻辑：解析逗号分隔的宝箱 ID
-	TArray<FString> BoxIDArray;
-	BoxIDString.ParseIntoArray(BoxIDArray, TEXT(","));
-	
-	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 解析到%d个宝箱 ID"), BoxIDArray.Num());
-	for (int32 Idx = 0; Idx < BoxIDArray.Num(); ++Idx)
-	{
-		UE_LOG(LogTemp, Log, TEXT("  - BoxID[%d] = %s"), Idx, *BoxIDArray[Idx]);
-	}
-	
-	// 🔧 核心业务逻辑：遍历宝箱 ID，加载对应的宝箱图标并创建 RewardIcon Widget
-	for (int32 i = 0; i < BoxIDArray.Num(); ++i)
-	{
-		int32 BoxID = FCString::Atoi(*BoxIDArray[i]);
-		UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 处理宝箱 ID %d"), BoxID);
-		
-		if (BoxID <= 0)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 无效的 BoxID: %d"), BoxID);
-			continue;
-		}
-		
-		// 🔧 核心业务逻辑：通过 BoxID 查找 TreasureBoxItemRow 配置
-		UGameInstance* LocalGameInstance = GetGameInstance();
-		if (!LocalGameInstance)
-		{
-			UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 GameInstance"));
-			continue;
-		}
-		
-		UActivitySubsystem* ActivitySub = LocalGameInstance->GetSubsystem<UActivitySubsystem>();
-		if (!ActivitySub)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 无法获取 ActivitySubsystem"));
-			continue;
-		}
-		
-		const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
-		if (!TreasureBoxItem || TreasureBoxItem->BoxIcon.IsNull())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 未找到 BoxID %d 的有效宝箱图标"), BoxID);
-			continue;
-		}
-		
-		UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 获取到宝箱图标 - BoxID: %d, ItemID: %d"), 
-			BoxID, TreasureBoxItem->ItemID);
-		
-		// 🔧 核心业务逻辑：加载宝箱图标纹理
-		UTexture2D* BoxIconTexture = TreasureBoxItem->BoxIcon.LoadSynchronous();
-		if (!BoxIconTexture)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 宝箱图标加载失败 - BoxID: %d"), BoxID);
-			continue;
-		}
-		
-		// 🔧 核心业务逻辑：创建并配置 UImage控件
-		UImage* RewardImage = NewObject<UImage>(RewardsContainer);
-		if (!RewardImage)
-		{
-			UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 创建 UImage 失败"));
-			continue;
-		}
-		
-		RewardImage->SetBrushFromTexture(BoxIconTexture);
-		RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f)); // 设置默认尺寸
-		
-		// 🔧 重要：将 Image 添加到容器
-		UPanelSlot* AddedSlot = RewardsContainer->AddChild(RewardImage);
-		if (AddedSlot)
-		{
-			UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 成功添加奖励图标 %d/%d 到容器"), i + 1, BoxIDArray.Num());
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("🔧 UTaskDetailWidget: AddChild 返回空指针，图标未添加"));
-		}
-	}
-	
-	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 奖励容器设置完成"));
+    if (!RewardsContainer)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: RewardsContainer 未设置"));
+        return;
+    }
+    
+    UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 设置奖励容器 - Day:%s, TaskIndex:%d"), *DayIdentifier, TaskIndex);
+    
+    // 清空现有内容
+    RewardsContainer->ClearChildren();
+    
+    // 检查 RewardIconClass 是否设置
+    if (RewardIconClass == nullptr)
+    {
+        UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: RewardIconClass 未设置！请在蓝图中指定 WBP_RewardIcon 类"));
+        return;
+    }
+    
+    // 获取 Subsystem
+    UGameInstance* GameInstance = GetGameInstance();
+    if (!GameInstance)
+    {
+        UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 GameInstance"));
+        return;
+    }
+    
+    UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+    if (!Subsystem)
+    {
+        UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 UpgradeActivitySubsystem"));
+        return;
+    }
+    
+    // 🔧 核心业务逻辑：获取配置行
+    const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+    if (!ConfigRow)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 未找到配置数据 - Day:%s"), *DayIdentifier);
+        return;
+    }
+    
+    // 🔧 核心业务逻辑：检查 TaskIndex 是否越界
+    if (TaskIndex >= ConfigRow->RewardItemIDs.Num())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: TaskIndex(%d) 超出 RewardItemIDs 数组范围 (%d)"), TaskIndex, ConfigRow->RewardItemIDs.Num());
+        return;
+    }
+    
+    // 🔧 核心业务逻辑：获取宝箱 ID 字符串（用逗号分隔）
+    FString BoxIDString = ConfigRow->RewardItemIDs[TaskIndex];
+    UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 原始宝箱 ID 字符串：%s (TaskIndex=%d, RewardItemIDs.Num=%d)"), 
+        *BoxIDString, TaskIndex, ConfigRow->RewardItemIDs.Num());
+    
+    if (BoxIDString.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("🔧 UTaskDetailWidget: 宝箱 ID 字符串为空"));
+        return;
+    }
+    
+    // 🔧 核心业务逻辑：解析逗号分隔的宝箱 ID
+    TArray<FString> BoxIDArray;
+    BoxIDString.ParseIntoArray(BoxIDArray, TEXT(","));
+    
+    UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 解析到%d个宝箱 ID"), BoxIDArray.Num());
+    for (int32 Idx = 0; Idx < BoxIDArray.Num(); ++Idx)
+    {
+        UE_LOG(LogTemp, Log, TEXT("  - BoxID[%d] = %s"), Idx, *BoxIDArray[Idx]);
+    }
+
+    // 🔧 获取指定天数和任务索引的奖励数量数据
+    TArray<FString> TaskRewardCounts; // 当前任务的数量数组
+    
+    // 🔧 检查 TaskIndex 是否在 RewardItemCounts 范围内
+    if (TaskIndex < ConfigRow->RewardItemCounts.Num())
+    {
+        FString CountString = ConfigRow->RewardItemCounts[TaskIndex];
+        if (!CountString.IsEmpty())
+        {
+            CountString.ParseIntoArray(TaskRewardCounts, TEXT(","));
+        }
+    }
+    
+    UE_LOG(LogTemp, Log, TEXT("[REWARD_COUNT_DEBUG] UTaskDetailWidget: TaskIndex=%d, RewardItemCounts大小: %d"), TaskIndex, ConfigRow->RewardItemCounts.Num());
+    UE_LOG(LogTemp, Log, TEXT("[REWARD_COUNT_DEBUG] UTaskDetailWidget: 当前任务数量数组大小: %d"), TaskRewardCounts.Num());
+    
+    // 🔧 调试：输出当前任务的数量
+    for (int32 idx = 0; idx < TaskRewardCounts.Num(); ++idx)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[REWARD_COUNT_DEBUG] 数量[%d]: %s"), idx, *TaskRewardCounts[idx]);
+    }
+
+    // 🔧 核心业务逻辑：遍历宝箱 ID，加载对应的宝箱图标并创建 WBP_RewardIcon 蓝图组件
+    for (int32 i = 0; i < BoxIDArray.Num(); ++i)
+    {
+        int32 BoxID = FCString::Atoi(*BoxIDArray[i]);
+        UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 处理宝箱 ID %d"), BoxID);
+        
+        if (BoxID <= 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 无效的 BoxID: %d"), BoxID);
+            continue;
+        }
+        
+        // 🔧 核心业务逻辑：通过 BoxID 查找 TreasureBoxItemRow 配置
+        UGameInstance* LocalGameInstance = GetGameInstance();
+        if (!LocalGameInstance)
+        {
+            UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 GameInstance"));
+            continue;
+        }
+        
+        UActivitySubsystem* ActivitySub = LocalGameInstance->GetSubsystem<UActivitySubsystem>();
+        if (!ActivitySub)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 无法获取 ActivitySubsystem"));
+            continue;
+        }
+        
+        const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+        if (!TreasureBoxItem || TreasureBoxItem->BoxIcon.IsNull())
+        {
+            UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 未找到 BoxID %d 的有效宝箱图标"), BoxID);
+            continue;
+        }
+        
+        UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 获取到宝箱图标 - BoxID: %d, ItemID: %d"), 
+            BoxID, TreasureBoxItem->ItemID);
+        
+        // 🔧 核心业务逻辑：加载宝箱图标纹理
+        UTexture2D* BoxIconTexture = TreasureBoxItem->BoxIcon.LoadSynchronous();
+        if (!BoxIconTexture)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: 宝箱图标加载失败 - BoxID: %d"), BoxID);
+            continue;
+        }
+        
+        // 🔧 核心业务逻辑：创建 WBP_RewardIcon 蓝图组件
+        UUserWidget* IconWidget = CreateWidget<UUserWidget>(GetWorld(), RewardIconClass);
+        if (IconWidget)
+        {
+            // 获取图标控件
+            UImage* RewardImage = Cast<UImage>(IconWidget->GetWidgetFromName(TEXT("RewardImage")));
+            UTextBlock* CountText = Cast<UTextBlock>(IconWidget->GetWidgetFromName(TEXT("CountText")));
+            
+            if (RewardImage)
+            {
+                RewardImage->SetBrushFromTexture(BoxIconTexture);
+                RewardImage->SetVisibility(ESlateVisibility::Visible); // 确保RewardImage始终可见
+                
+                // 🔧 Canvas Panel中需要直接操作Slot来设置尺寸
+                if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(RewardImage->Slot))
+                {
+                    CanvasSlot->SetSize(FVector2D(80.0f, 80.0f));
+                    // 设置锚点为左上角
+                    CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
+                    CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+                }
+            }
+            
+            // 🔧 设置 CountText 控件的值（与DayLockHintWidget的TaskRewardIconsContainer逻辑一致）
+            if (CountText)
+            {
+                bool bHasValidCount = false;
+                FString CountValue = TEXT("");
+                
+                // 从展平后的数量数组中获取对应的数量
+                if (i < TaskRewardCounts.Num())
+                {
+                    CountValue = TaskRewardCounts[i];
+                    bHasValidCount = !CountValue.IsEmpty();
+                    
+                    UE_LOG(LogTemp, Log, TEXT("[REWARD_COUNT_DEBUG] UTaskDetailWidget: 第%d个图标，数量: '%s'"), i, *CountValue);
+                }
+                else
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("[REWARD_COUNT_DEBUG] UTaskDetailWidget: 第%d个图标，TaskRewardCounts[%d] 越界"), i, i);
+                }
+                
+                if (bHasValidCount)
+                {
+                    CountText->SetText(FText::FromString(CountValue));
+                    CountText->SetVisibility(ESlateVisibility::Visible);
+                }
+                else
+                {
+                    // 为空或越界时隐藏 CountText
+                    CountText->SetVisibility(ESlateVisibility::Collapsed);
+                }
+            }
+            
+            // 将图标添加到容器中
+            RewardsContainer->AddChild(IconWidget);
+            UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 成功添加奖励图标 %d/%d 到容器"), i + 1, BoxIDArray.Num());
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 创建 WBP_RewardIcon Widget 失败"));
+        }
+    }
+    
+    UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 奖励容器设置完成"));
 }
