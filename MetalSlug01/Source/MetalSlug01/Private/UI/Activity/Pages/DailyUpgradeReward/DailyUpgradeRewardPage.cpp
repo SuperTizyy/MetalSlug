@@ -2101,7 +2101,10 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 	// 获取相关数据
 	int32 LimitedActivityCompleteCount = Subsystem->GetLimitedActivityCompleteCount();
 	int32 BonusCount = ConfigRow->BonusCount;
-	FDateTime CreatedTime = Subsystem->GetRecordCreatedTime();
+	// 从指定天数的记录中获取 CreatedTime
+	int32 DayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+	const FUpgradeRewardSaveRecord* DayRecord = Subsystem->GetRecordByDate(DayNumber);
+	FDateTime CreatedTime = DayRecord ? DayRecord->CreatedTime : Subsystem->GetRecordCreatedTime();
 	int32 BonusDurationHours = ConfigRow->BonusDurationHours;
 
 	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: Day:%s, BonusDescription:%s, CompleteCount:%d, BonusCount:%d, CreatedTime:%s, DurationHours:%d"), 
