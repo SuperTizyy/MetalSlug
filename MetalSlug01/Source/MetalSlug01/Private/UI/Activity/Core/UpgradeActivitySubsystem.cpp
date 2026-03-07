@@ -1622,29 +1622,36 @@ TArray<UTexture2D*> UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay(c
     const FDailyUpgradeRewardConfigRow* ConfigRow = GetConfigRowForDay(DayIdentifier);
     if (!ConfigRow)
     {
-        UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 未找到配置数据 - Day:%s"), *DayIdentifier);
+        UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 未找到配置数据 - Day:%s"), *DayIdentifier);
         return Result;
     }
     
     // 2. 检查BonusIDs数组是否为空
     if (ConfigRow->BonusIDs.Num() == 0)
     {
-        UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: BonusIDs数组为空 - Day:%s"), *DayIdentifier);
+        UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: BonusIDs数组为空 - Day:%s"), *DayIdentifier);
         return Result;
+    }
+    
+    // 🔧 调试：输出所有BonusIDs
+    UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: Day:%s, BonusIDs数量: %d"), *DayIdentifier, ConfigRow->BonusIDs.Num());
+    for (int32 i = 0; i < ConfigRow->BonusIDs.Num(); ++i)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG]   - BonusIDs[%d]: %d"), i, ConfigRow->BonusIDs[i]);
     }
     
     // 3. 获取GameInstance和ActivitySubsystem
     UGameInstance* GameInstance = GetGameInstance();
     if (!GameInstance)
     {
-        UE_LOG(LogTemp, Error, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 GameInstance"));
+        UE_LOG(LogTemp, Error, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 GameInstance"));
         return Result;
     }
     
     UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
     if (!ActivitySub)
     {
-        UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 ActivitySubsystem"));
+        UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 ActivitySubsystem"));
         return Result;
     }
     
@@ -1653,15 +1660,21 @@ TArray<UTexture2D*> UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay(c
     {
         if (ItemID <= 0)
         {
-            UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无效的ItemID - ItemID: %d"), ItemID);
+            UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无效的ItemID - ItemID: %d"), ItemID);
             continue;
         }
         
         // 5. 通过ItemID查找ItemDetailRow配置
         const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(ItemID);
-        if (!ItemDetail || ItemDetail->ItemIcon.IsNull())
+        if (!ItemDetail)
         {
-            UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 未找到ItemDetail或ItemIcon为空 - ItemID: %d"), ItemID);
+            UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 未找到ItemDetail - ItemID: %d"), ItemID);
+            continue;
+        }
+        
+        if (ItemDetail->ItemIcon.IsNull())
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: ItemIcon为空 - ItemID: %d, ItemName: %s"), ItemID, *(ItemDetail->ItemName.ToString()));
             continue;
         }
         
@@ -1670,15 +1683,15 @@ TArray<UTexture2D*> UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay(c
         if (ItemIconTexture)
         {
             Result.Add(ItemIconTexture);
-            UE_LOG(LogTemp, Log, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 成功添加ItemIcon - ItemID: %d"), ItemID);
+            UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 成功添加ItemIcon - ItemID: %d, 纹理地址: %p, 名称: %s"), ItemID, ItemIconTexture, *ItemIconTexture->GetName());
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: ItemIcon加载失败 - ItemID: %d"), ItemID);
+            UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: ItemIcon加载失败 - ItemID: %d, ItemName: %s"), ItemID, *(ItemDetail->ItemName.ToString()));
         }
     }
     
-    UE_LOG(LogTemp, Log, TEXT("UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 最终返回%d个限时奖励图标"), Result.Num());
+    UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 最终返回%d个限时奖励图标"), Result.Num());
     return Result;
 }
 

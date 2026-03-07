@@ -5,6 +5,7 @@
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
+#include "Components/CanvasPanelSlot.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/Engine.h"
 
@@ -44,6 +45,11 @@ void UDayLockHintWidget::SetupTaskRewardIcons(const FString& DayIdentifier)
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("🔧 UDayLockHintWidget: 设置任务奖励图标容器 - Day:%s"), *DayIdentifier);
+	
+	// 🔧 调试：检查容器状态
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] TaskRewardIconsContainer 可见性: %d"), (int32)TaskRewardIconsContainer->GetVisibility());
+	FVector2D ContainerSize = TaskRewardIconsContainer->GetDesiredSize();
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] TaskRewardIconsContainer 尺寸: %fx%f"), ContainerSize.X, ContainerSize.Y);
 
 	// 清空现有内容
 	TaskRewardIconsContainer->ClearChildren();
@@ -67,7 +73,42 @@ void UDayLockHintWidget::SetupTaskRewardIcons(const FString& DayIdentifier)
 	// 获取指定天数的奖励图标
 	TArray<UTexture2D*> RewardIcons = Subsystem->GetRewardIconsForDay(DayIdentifier);
 
-	UE_LOG(LogTemp, Log, TEXT("🔧 UDayLockHintWidget: 获取到 %d 个奖励图标"), RewardIcons.Num());
+	// 🔧 获取指定天数的奖励数量数据
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+	TArray<FString> FlattenedRewardCounts; // 展平后的数量数组
+	
+	if (ConfigRow)
+	{
+		// 🔧 将 RewardItemCounts 数组展平为单个数量列表
+		// 例如：["1,1", "2,3,5", "1,1"] -> ["1", "1", "2", "3", "5", "1", "1"]
+		for (const FString& CountString : ConfigRow->RewardItemCounts)
+		{
+			if (!CountString.IsEmpty())
+			{
+				TArray<FString> CountArray;
+				CountString.ParseIntoArray(CountArray, TEXT(","));
+				for (const FString& Count : CountArray)
+				{
+					FlattenedRewardCounts.Add(Count);
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] UDayLockHintWidget: 获取到 %d 个奖励图标"), RewardIcons.Num());
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] UDayLockHintWidget: 展平后 RewardItemCounts 数组大小: %d"), FlattenedRewardCounts.Num());
+	
+	// 🔧 调试：输出所有奖励图标
+	for (int32 idx = 0; idx < RewardIcons.Num(); ++idx)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] 图标[%d]: %p"), idx, RewardIcons[idx]);
+	}
+	
+	// 🔧 调试：输出展平后的数量
+	for (int32 idx = 0; idx < FlattenedRewardCounts.Num(); ++idx)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] 数量[%d]: %s"), idx, *FlattenedRewardCounts[idx]);
+	}
 
 	// 检查 RewardIconClass 是否设置
 	if (RewardIconClass == nullptr)
@@ -77,8 +118,9 @@ void UDayLockHintWidget::SetupTaskRewardIcons(const FString& DayIdentifier)
 	}
 
 	// 动态生成 WBP_RewardIcon 蓝图组件
-	for (UTexture2D* IconTexture : RewardIcons)
+	for (int32 i = 0; i < RewardIcons.Num(); ++i)
 	{
+		UTexture2D* IconTexture = RewardIcons[i];
 		if (!IconTexture)
 		{
 			continue;
@@ -90,22 +132,66 @@ void UDayLockHintWidget::SetupTaskRewardIcons(const FString& DayIdentifier)
 		{
 			// 获取图标控件
 			UImage* RewardImage = Cast<UImage>(IconWidget->GetWidgetFromName(TEXT("RewardImage")));
+			UTextBlock* CountText = Cast<UTextBlock>(IconWidget->GetWidgetFromName(TEXT("CountText")));
 			
 			if (RewardImage)
 			{
 				RewardImage->SetBrushFromTexture(IconTexture);
-				RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f)); // 设置默认尺寸
+				// 🔧 Canvas Panel中需要直接操作Slot来设置尺寸
+				if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(RewardImage->Slot))
+				{
+					CanvasSlot->SetSize(FVector2D(128.0f, 128.0f));
+					// 设置锚点为左上角
+					CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
+					CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+				}
+			}
+
+			// 🔧 设置 CountText 控件的值
+			if (CountText)
+			{
+				bool bHasValidCount = false;
+				FString CountValue = TEXT("");
+				
+				// 从展平后的数量数组中获取对应的数量
+				if (i < FlattenedRewardCounts.Num())
+				{
+					CountValue = FlattenedRewardCounts[i];
+					bHasValidCount = !CountValue.IsEmpty();
+								
+					UE_LOG(LogTemp, Log, TEXT("[REWARD_COUNT_DEBUG] UDayLockHintWidget: 第%d个图标，数量: '%s'"), i, *CountValue);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[REWARD_COUNT_DEBUG] UDayLockHintWidget: 第%d个图标，FlattenedRewardCounts[%d] 越界"), i, i);
+				}
+				
+				if (bHasValidCount)
+				{
+					CountText->SetText(FText::FromString(CountValue));
+					CountText->SetVisibility(ESlateVisibility::Visible);
+				}
+				else
+				{
+					// 为空或越界时隐藏 CountText
+					CountText->SetVisibility(ESlateVisibility::Collapsed);
+				}
 			}
 
 			// 将图标添加到容器中
 			TaskRewardIconsContainer->AddChild(IconWidget);
-			UE_LOG(LogTemp, Log, TEXT("✅ UDayLockHintWidget: 成功添加奖励图标到TaskRewardIconsContainer"));
+			UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] ✅ UDayLockHintWidget: 成功添加奖励图标到TaskRewardIconsContainer (索引: %d, 图标地址: %p)"), i, IconTexture);
 		}
 		else
 		{
 			UE_LOG(LogTemp, Error, TEXT("UDayLockHintWidget: 创建 RewardIcon Widget 失败"));
 		}
 	}
+	
+	// 🔧 调试：检查添加子控件后的容器状态
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] 添加子控件后 - 子控件数量: %d"), TaskRewardIconsContainer->GetChildrenCount());
+	FVector2D FinalContainerSize = TaskRewardIconsContainer->GetDesiredSize();
+	UE_LOG(LogTemp, Log, TEXT("[REWARD_ICON_DEBUG] 添加子控件后 - 容器尺寸: %fx%f"), FinalContainerSize.X, FinalContainerSize.Y);
 }
 
 void UDayLockHintWidget::SetupLimitedTimeRewardIcons(const FString& DayIdentifier)
@@ -117,6 +203,11 @@ void UDayLockHintWidget::SetupLimitedTimeRewardIcons(const FString& DayIdentifie
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("🔧 UDayLockHintWidget: 设置限时奖励图标容器 - Day:%s"), *DayIdentifier);
+	
+	// 🔧 调试：检查容器状态
+	UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] LimitedTimeRewardIconsContainer 可见性: %d"), (int32)LimitedTimeRewardIconsContainer->GetVisibility());
+	FVector2D ContainerSize = LimitedTimeRewardIconsContainer->GetDesiredSize();
+	UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] LimitedTimeRewardIconsContainer 尺寸: %fx%f"), ContainerSize.X, ContainerSize.Y);
 
 	// 清空现有内容
 	LimitedTimeRewardIconsContainer->ClearChildren();
@@ -140,7 +231,13 @@ void UDayLockHintWidget::SetupLimitedTimeRewardIcons(const FString& DayIdentifie
 	// 获取指定天数的限时奖励图标
 	TArray<UTexture2D*> LimitedTimeRewardIcons = Subsystem->GetLimitedTimeRewardIconsForDay(DayIdentifier);
 
-	UE_LOG(LogTemp, Log, TEXT("🔧 UDayLockHintWidget: 获取到 %d 个限时奖励图标"), LimitedTimeRewardIcons.Num());
+	UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] UDayLockHintWidget: 获取到 %d 个限时奖励图标"), LimitedTimeRewardIcons.Num());
+	
+	// 🔧 调试：输出所有限时奖励图标
+	for (int32 idx = 0; idx < LimitedTimeRewardIcons.Num(); ++idx)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] 限时图标[%d]: %p"), idx, LimitedTimeRewardIcons[idx]);
+	}
 
 	// 检查 RewardIconClass 是否设置
 	if (RewardIconClass == nullptr)
@@ -163,20 +260,62 @@ void UDayLockHintWidget::SetupLimitedTimeRewardIcons(const FString& DayIdentifie
 		{
 			// 获取图标控件
 			UImage* RewardImage = Cast<UImage>(IconWidget->GetWidgetFromName(TEXT("RewardImage")));
+			UTextBlock* CountText = Cast<UTextBlock>(IconWidget->GetWidgetFromName(TEXT("CountText")));
 			
 			if (RewardImage)
 			{
 				RewardImage->SetBrushFromTexture(IconTexture);
-				RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f)); // 设置默认尺寸
+				RewardImage->SetVisibility(ESlateVisibility::Visible); // 确保RewardImage始终可见
+				// 🔧 Canvas Panel中需要直接操作Slot来设置尺寸
+				if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(RewardImage->Slot))
+				{
+					CanvasSlot->SetSize(FVector2D(90.0f, 90.0f));
+					// 设置锚点为左上角
+					CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
+					CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+				}
+								
+				// 🔧 调试：检查纹理是否有效
+				if (IconTexture)
+				{
+					UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] 图标纹理有效 - 地址: %p, 名称: %s, 尺寸: %dx%d"), 
+						IconTexture, *IconTexture->GetName(), IconTexture->GetSizeX(), IconTexture->GetSizeY());
+									
+					// 🔧 额外调试：检查Brush是否有效
+					const FSlateBrush& Brush = RewardImage->GetBrush();
+					if (Brush.GetResourceObject() == IconTexture)
+					{
+						UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] RewardImage Brush设置成功 - 纹理匹配"));
+					}
+					else
+					{
+						UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] RewardImage Brush设置失败 - 纹理不匹配"));
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] 图标纹理为空！"));
+				}
+			}
+
+			// 🔧 限时奖励图标没有对应的数量数据，隐藏 CountText
+			if (CountText)
+			{
+				CountText->SetVisibility(ESlateVisibility::Collapsed);
 			}
 
 			// 将图标添加到容器中
 			LimitedTimeRewardIconsContainer->AddChild(IconWidget);
-			UE_LOG(LogTemp, Log, TEXT("✅ UDayLockHintWidget: 成功添加限时奖励图标到LimitedTimeRewardIconsContainer"));
+			UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] ✅ UDayLockHintWidget: 成功添加限时奖励图标到LimitedTimeRewardIconsContainer (图标地址: %p)"), IconTexture);
 		}
 		else
 		{
 			UE_LOG(LogTemp, Error, TEXT("UDayLockHintWidget: 创建 RewardIcon Widget 失败"));
 		}
 	}
+	
+	// 🔧 调试：检查添加子控件后的容器状态
+	UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] 添加子控件后 - 子控件数量: %d"), LimitedTimeRewardIconsContainer->GetChildrenCount());
+	FVector2D FinalContainerSize = LimitedTimeRewardIconsContainer->GetDesiredSize();
+	UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG] 添加子控件后 - 容器尺寸: %fx%f"), FinalContainerSize.X, FinalContainerSize.Y);
 }
