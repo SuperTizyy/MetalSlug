@@ -447,9 +447,35 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	NewRecord.CurrentExperience = 0;
 	NewRecord.RewardIconIndex = 0;
 	NewRecord.LimitedActivityCompleteCount = 0;
+	
+	// 🔧 根据 ActivityID=102 且 DayIdentifier="day1"的 GameModes 数量动态确定数组长度
+	const FDailyUpgradeRewardConfigRow* ExtraConfig = TargetSubsystem->GetExtraConfigForDay1();
+	int32 TaskCount = MAX_TASK_COUNT; // 默认值
+	if (ExtraConfig && ExtraConfig->GameModes.Num() > 0)
+	{
+		TaskCount = ExtraConfig->GameModes.Num();
+		UE_LOG(LogTemp, Log, TEXT("📊 使用 ActivityID=102 day1 的 GameModes 数量: %d"), TaskCount);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("⚠️ 未找到 ActivityID=102 day1 的配置，使用默认任务数量: %d"), TaskCount);
+	}
+	
+	// 初始化数组为默认值（不继承前一天的任务数据）
 	NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
-	NewRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
-	NewRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
+	NewRecord.TaskCompleteCounts.SetNumZeroed(TaskCount);
+	NewRecord.TaskClaimStatus.SetNumZeroed(TaskCount);
+	
+	// 🔧 明确设置所有任务数据为 0，确保不会继承
+	for (int32 i = 0; i < TaskCount; ++i)
+	{
+		NewRecord.TaskCompleteCounts[i] = 0;
+		NewRecord.TaskClaimStatus[i] = 0;
+	}
+	for (int32 i = 0; i < MAX_CHEST_COUNT; ++i)
+	{
+		NewRecord.ChestClaimStatus[i] = 0;
+	}
 
 	if (bInheritPrevious && RecordDate > 1 && SaveGame)
 	{
@@ -457,14 +483,40 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 		const FUpgradeRewardSaveRecord* PreviousRecord = SaveGame->UpgradeRewardRecords.Find(RecordDate - 1);
 		if (PreviousRecord)
 		{
-			// 继承部分数据
+			// 只继承经验值和奖励图标索引，不继承任务数据
 			NewRecord.CurrentExperience = PreviousRecord->CurrentExperience;
 			NewRecord.RewardIconIndex = PreviousRecord->RewardIconIndex;
-			UE_LOG(LogTemp, Log, TEXT("📊 继承第%d天的部分数据创建第%d天记录"), RecordDate - 1, RecordDate);
+			// 🔧 注意：TaskCompleteCounts 和 TaskClaimStatus 保持为默认值 0，不继承
+			UE_LOG(LogTemp, Log, TEXT("📊 继承第%d天的部分数据创建第%d天记录（仅经验值和图标索引）"), RecordDate -1, RecordDate);
+			UE_LOG(LogTemp, Log, TEXT("  ✅ 继承经验值：%.0f"), NewRecord.CurrentExperience);
+			UE_LOG(LogTemp, Log, TEXT("  ✅ 继承图标索引：%d"), NewRecord.RewardIconIndex);
+			UE_LOG(LogTemp, Log, TEXT("  ❌ 不继承任务完成数（保持为 0）"));
+			UE_LOG(LogTemp, Log, TEXT("  ❌ 不继承任务领取状态（保持为 0）"));
 		}
 	}
 
 	NewRecord.LastUpdateTime = FDateTime::Now();
+	
+	// 🔧 最终验证：确保任务数据为 0
+	UE_LOG(LogTemp, Log, TEXT("\n🔍 最终验证新记录数据:"));
+	UE_LOG(LogTemp, Log, TEXT("  经验值：%.0f"), NewRecord.CurrentExperience);
+	UE_LOG(LogTemp, Log, TEXT("  图标索引：%d"), NewRecord.RewardIconIndex);
+	UE_LOG(LogTemp, Log, TEXT("  任务完成数数组大小：%d"), NewRecord.TaskCompleteCounts.Num());
+	for (int32 i = 0; i < NewRecord.TaskCompleteCounts.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    TaskCompleteCounts[%d]: %d"), i, NewRecord.TaskCompleteCounts[i]);
+	}
+	UE_LOG(LogTemp, Log, TEXT("  任务领取状态数组大小：%d"), NewRecord.TaskClaimStatus.Num());
+	for (int32 i = 0; i < NewRecord.TaskClaimStatus.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    TaskClaimStatus[%d]: %d"), i, NewRecord.TaskClaimStatus[i]);
+	}
+	UE_LOG(LogTemp, Log, TEXT("  宝箱领取状态数组大小：%d"), NewRecord.ChestClaimStatus.Num());
+	for (int32 i = 0; i < NewRecord.ChestClaimStatus.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    ChestClaimStatus[%d]: %d"), i, NewRecord.ChestClaimStatus[i]);
+	}
+	UE_LOG(LogTemp, Log, TEXT("\n✅ 验证完成：所有任务数据均为 0\n"));
 	
 	// 更新Subsystem中的记录
 	if (!SaveGame)
