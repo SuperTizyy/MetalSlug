@@ -168,7 +168,8 @@ void UDayLockHintWidget::SetupTaskRewardIcons(const FString& DayIdentifier)
 				
 				if (bHasValidCount)
 				{
-					CountText->SetText(FText::FromString(CountValue));
+					FString DisplayText = FString::Printf(TEXT("X%s"), *CountValue);
+					CountText->SetText(FText::FromString(DisplayText));
 					CountText->SetVisibility(ESlateVisibility::Visible);
 				}
 				else
@@ -272,7 +273,7 @@ void UDayLockHintWidget::SetupLimitedTimeRewardIcons(const FString& DayIdentifie
 					CanvasSlot->SetSize(FVector2D(90.0f, 90.0f));
 					// 设置锚点为左上角
 					CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
-					CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+					CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));																																																																																																							
 				}
 								
 				// 🔧 调试：检查纹理是否有效

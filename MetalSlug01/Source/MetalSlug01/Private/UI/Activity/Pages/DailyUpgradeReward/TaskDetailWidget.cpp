@@ -6,11 +6,14 @@
 #include "Components/Image.h"
 #include "Components/Button.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Styling/SlateTypes.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Kismet/GameplayStatics.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
+#include "UI/Activity/Data/DailyLoginConfig.h"
 
 // UE 会自动生成构造函数，无需手动实现
 
@@ -42,6 +45,7 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取 UpgradeActivitySubsystem"));
 		return;
 	}
+
 	
 	// 从指定天数的记录中获取任务领取状态
 	int32 DayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
@@ -51,30 +55,56 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 	// 检查索引是否越界
 	if (TaskIndex >= TaskClaimStatus.Num())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: TaskIndex(%d) 超出 TaskClaimStatus 数组范围 (%d)"), TaskIndex, TaskClaimStatus.Num());
-		ClaimButton->SetVisibility(ESlateVisibility::Hidden);
+		UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ⚠️ TaskIndex(%d) 超出 TaskClaimStatus 数组范围 (%d)"), TaskIndex, TaskClaimStatus.Num());
+		ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
 		if (ClaimHintText)
 		{
 			ClaimHintText->SetText(FText::FromString(TEXT("")));
+			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		if (ClaimSuccessImage)
+		{
+			ClaimSuccessImage->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ⚠️ UI状态已处理（越界情况）"));
 		return;
 	}
 	
 	int32 ClaimStatus = TaskClaimStatus[TaskIndex];
 	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: TaskClaimStatus[%d] = %d"), TaskIndex, ClaimStatus);
 	
-	// 🔧 核心业务逻辑：判断按钮状态
+	// 🔥 强制检查：如果已领取，立即设置UI状态
 	if (ClaimStatus == 1)
 	{
-		// ✅ 已领取：隐藏按钮和提示文本
-		ClaimButton->SetVisibility(ESlateVisibility::Hidden);
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 已领取状态检测到！ClaimStatus=1, Day=%s, TaskIndex=%d"), *DayIdentifier, TaskIndex);
+		// 隐藏按钮和提示文本（不占位）
+		if (ClaimButton)
+		{
+			ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
+		}
 		if (ClaimHintText)
 		{
 			ClaimHintText->SetText(FText::FromString(TEXT("")));
+			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
 		}
-		UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 按钮已隐藏（已领取）"));
+		// 显示成功图标
+		if (ClaimSuccessImage)
+		{
+			ClaimSuccessImage->SetVisibility(ESlateVisibility::Visible);
+			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ✅ ClaimSuccessImage 设置为 Visible"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针！"));
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 UI状态更新完成！"));
+		return;
 	}
-	else if (ClaimStatus == 0)
+	
+	// 🔧 核心业务逻辑：判断按钮状态
+	// ClaimStatus == 1 的情况已经在上面处理过了
+	if (ClaimStatus == 0)
 	{
 		// 未领取，继续检查完成度
 		bool bCanClaim = CompleteCount >= RequiredCount;
@@ -86,13 +116,17 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 			{
 				// ✅ 满足条件：显示“可领取”
 				ClaimHintText->SetText(FText::FromString(TEXT("可领取")));
-				UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: ClaimHintText 显示“可领取”"));
+				// 设置字体颜色为黑色
+				FSlateColor BlackColor(FLinearColor::Black);
+				ClaimHintText->SetColorAndOpacity(BlackColor);
+				UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🟢 ClaimHintText 显示“可领取”，字体颜色设为黑色"));
 			}
 			else
 			{
 				// ❌ 不满足条件：显示“去完成”
 				ClaimHintText->SetText(FText::FromString(TEXT("去完成")));
-				UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: ClaimHintText 显示“去完成”"));
+				// 可以保持默认颜色或设置其他颜色
+				UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🔴 ClaimHintText 显示“去完成”"));
 			}
 		}
 		
@@ -101,37 +135,71 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 			// ✅ 满足条件：设置按钮为黄色，启用点击事件
 			ClaimButton->SetVisibility(ESlateVisibility::Visible);
 			ClaimButton->SetIsEnabled(true);
-			
-			// 设置按钮颜色为黄色
-			ClaimButton->SetColorAndOpacity(FLinearColor::Yellow);
-			
+					
+			// 设置按钮颜色为黄色 - 使用GetStyle和SetStyle方法
+			FButtonStyle YellowStyle = ClaimButton->GetStyle();
+			YellowStyle.Normal.TintColor = FLinearColor::Yellow;
+			ClaimButton->SetStyle(YellowStyle);
+					
+			// 隐藏 ClaimSuccessImage
+			if (ClaimSuccessImage)
+			{
+				ClaimSuccessImage->SetVisibility(ESlateVisibility::Collapsed);
+				UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🟡 ClaimSuccessImage 已隐藏"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针（启用状态）！"));
+			}
+					
+			// 也存储到 RewardOptionWidget 的上下文中，用于事件处理
+			CurrentTaskIndexForReward = TaskIndex;
+					
 			// 存储参数到成员变量（用于无参委托）
 			CurrentDayIdentifier = DayIdentifier;
 			CurrentTaskIndex = TaskIndex;
-			
+							
 			// 绑定点击事件（使用无参 UFUNCTION 包装器）
 			ClaimButton->OnClicked.AddDynamic(this, &UTaskDetailWidget::HandleClaimButtonClickWrapper);
-			
-			UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 按钮已启用（黄色），可点击"));
+					
+			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🟡 按钮已启用（黄色），可点击"));
 		}
 		else
 		{
 			// ❌ 不满足条件：禁用按钮，设置为灰色
 			ClaimButton->SetVisibility(ESlateVisibility::Visible);
 			ClaimButton->SetIsEnabled(false);
-			ClaimButton->SetColorAndOpacity(FLinearColor::Gray);
-			
-			UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 按钮已禁用（灰色），条件不满足（%d/%d）"), CompleteCount, RequiredCount);
+			FButtonStyle GrayStyle = ClaimButton->GetStyle();
+			GrayStyle.Normal.TintColor = FLinearColor::Gray;
+			ClaimButton->SetStyle(GrayStyle);
+					
+			// 隐藏 ClaimSuccessImage
+			if (ClaimSuccessImage)
+			{
+				ClaimSuccessImage->SetVisibility(ESlateVisibility::Collapsed);
+				UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ⚪ ClaimSuccessImage 已隐藏"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针（禁用状态）！"));
+			}
+					
+			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ⚪ 按钮已禁用（灰色），条件不满足（%d/%d）"), CompleteCount, RequiredCount);
 		}
 	}
 	else
 	{
-		// 未知的 ClaimStatus 值
-		UE_LOG(LogTemp, Warning, TEXT("🔧 UTaskDetailWidget: 未知的 ClaimStatus 值：%d"), ClaimStatus);
-		ClaimButton->SetVisibility(ESlateVisibility::Hidden);
+		// ClaimStatus 既不是 0 也不是 1，可能是无效值
+		UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ⚠️ 无效的 ClaimStatus 值: %d"), ClaimStatus);
+		ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
 		if (ClaimHintText)
 		{
 			ClaimHintText->SetText(FText::FromString(TEXT("")));
+			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		if (ClaimSuccessImage)
+		{
+			ClaimSuccessImage->SetVisibility(ESlateVisibility::Collapsed);
 		}
 	}
 }
@@ -160,10 +228,64 @@ void UTaskDetailWidget::HandleClaimButtonClicked(const FString& DayIdentifier, i
 		return;
 	}
 	
-	// TODO: 调用 Subsystem 的方法获取奖励数据并弹出 RewardOptionWidget
-	// 这里需要根据 DayIdentifier 和 TaskIndex 查询配置表获取奖励信息
+	// 检查 RewardOptionWidgetClass 是否设置
+	if (!RewardOptionWidgetClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: RewardOptionWidgetClass 未设置！请在蓝图中指定 RewardOptionWidget 类"));
+		return;
+	}
 	
-	UE_LOG(LogTemp, Log, TEXT("🎁 UTaskDetailWidget: 准备弹出 RewardOptionWidget 弹窗（待实现）"));
+	// 获取配置数据
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+	if (!ConfigRow)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法获取配置数据 - Day:%s"), *DayIdentifier);
+		return;
+	}
+	
+	// 准备奖励选项数据
+	TArray<FDailyLoginConfigRow> RewardOptions;
+	FDailyLoginConfigRow TempRow;
+	TempRow.ActivityID = ConfigRow->ActivityID;
+	
+	// 设置任务索引（用于任务领取）
+	TempRow.DayIndex = TaskIndex;
+	
+	// 使用对应的RewardItemID
+	if (ConfigRow->RewardItemIDs.IsValidIndex(TaskIndex))
+	{
+		FString RewardItemIDString = ConfigRow->RewardItemIDs[TaskIndex];
+		// 解析逗号分隔的ID列表，取第一个作为示例
+		TArray<FString> IDArray;
+		RewardItemIDString.ParseIntoArray(IDArray, TEXT(","));
+		if (IDArray.Num() > 0)
+		{
+			TempRow.RewardItemID = FCString::Atoi(*IDArray[0]);
+			UE_LOG(LogTemp, Log, TEXT("UTaskDetailWidget: 使用RewardItemID: %d"), TempRow.RewardItemID);
+		}
+	}
+	
+	RewardOptions.Add(TempRow);
+	
+	// 创建 RewardOptionWidget 实例
+	URewardOptionWidget* RewardOptionWidget = CreateWidget<URewardOptionWidget>(GetWorld(), RewardOptionWidgetClass);
+	if (!RewardOptionWidget)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: 无法创建 RewardOptionWidget 实例"));
+		return;
+	}
+	
+	// 初始化弹窗
+	RewardOptionWidget->InitSelection(RewardOptions);
+	
+	// 绑定StoreBtn事件
+	RewardOptionWidget->OnStoreToBag.Clear();
+	RewardOptionWidget->OnStoreToBag.AddDynamic(this, &UTaskDetailWidget::HandleRewardStore);
+	
+	// 添加到视口并显示
+	RewardOptionWidget->AddToViewport(1000); // 使用高Z-order确保显示在最上层
+	
+	UE_LOG(LogTemp, Log, TEXT("🎁 UTaskDetailWidget: 成功弹出 RewardOptionWidget 弹窗"));
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 }
 
@@ -173,8 +295,120 @@ void UTaskDetailWidget::HandleClaimButtonClicked(const FString& DayIdentifier, i
 void UTaskDetailWidget::HandleClaimButtonClickWrapper()
 {
 	// 使用成员变量中存储的参数调用实际处理方法
-	HandleClaimButtonClicked(CurrentDayIdentifier, CurrentTaskIndex);
+	this->HandleClaimButtonClicked(CurrentDayIdentifier, CurrentTaskIndex);
 }
+
+
+/**
+ * @brief 处理奖励存储到背包事件
+ * @param TaskIndex 任务索引（从 RewardOptionWidget 传递）
+ */
+void UTaskDetailWidget::HandleRewardStore(int32 TaskIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 HandleRewardStore 被调用！TaskIndex=%d"), TaskIndex);
+	
+	// 获取 GameInstance
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ 无法获取 GameInstance"));
+		return;
+	}
+	
+	// 获取 UpgradeActivitySubsystem
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ 无法获取 UpgradeActivitySubsystem"));
+		return;
+	}
+	
+
+	
+	// 使用 CurrentTaskIndexForReward 确保正确的任务索引
+	int32 ActualTaskIndex = CurrentTaskIndexForReward;
+	UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 实际任务索引: %d"), ActualTaskIndex);
+	
+	// 直接更新 TaskClaimStatus 而不通过 ClaimTaskReward
+	const FUpgradeRewardSaveRecord* DayRecord = nullptr;
+	int32 DayNumber = FCString::Atoi(*CurrentDayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+	DayRecord = Subsystem->GetRecordByDate(DayNumber);
+	
+	bool bClaimSuccess = false;
+	
+	if (DayRecord)
+	{
+		// 创建可修改的记录副本
+		FUpgradeRewardSaveRecord MutableRecord = *DayRecord;
+	
+	// 确保 TaskClaimStatus 数组足够大
+	while (MutableRecord.TaskClaimStatus.Num() <= ActualTaskIndex)
+	{
+		MutableRecord.TaskClaimStatus.Add(0);
+	}
+	
+	// 设置为已领取
+	MutableRecord.TaskClaimStatus[ActualTaskIndex] = 1;
+	MutableRecord.LastUpdateTime = FDateTime::Now();
+	
+	// 更新到子系统
+	Subsystem->AddOrUpdateRecord(DayNumber, MutableRecord);
+	
+	// 如果这是当前记录，也更新 CurrentRecord
+	if (DayNumber == Subsystem->GetRecord().GetDayNumber())
+	{
+		Subsystem->GetRecord() = MutableRecord;
+	}
+	
+	// 注意：不在游戏运行时保存到本地磁盘，游戏关闭时统一保存
+
+	bClaimSuccess = true;
+	UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 直接更新成功！Day=%d, TaskIndex=%d"), DayNumber, ActualTaskIndex);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ 无法找到天数记录 Day=%d"), DayNumber);
+	}
+	
+	if (bClaimSuccess)
+	{
+		
+		// 强制更新 UI 状态
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 强制更新 UI 状态"));
+		
+		// 隐藏按钮和提示文本（不占位）
+		if (ClaimButton)
+		{
+			ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		if (ClaimHintText)
+		{
+			ClaimHintText->SetText(FText::FromString(TEXT("")));
+			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		
+		// 显示成功图标
+		if (ClaimSuccessImage)
+		{
+			ClaimSuccessImage->SetVisibility(ESlateVisibility::Visible);
+			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ✅ ClaimSuccessImage 设置为 Visible"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针！"));
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 UI 更新完成！"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ❌ 领取任务奖励失败 - TaskIndex:%d"), ActualTaskIndex);
+	}
+}
+
+/**
+
+
 
 /**
  * @brief 设置奖励展示容器内容
@@ -363,7 +597,8 @@ void UTaskDetailWidget::SetupRewardsContainer(const FString& DayIdentifier, int3
                 
                 if (bHasValidCount)
                 {
-                    CountText->SetText(FText::FromString(CountValue));
+                    FString DisplayText = FString::Printf(TEXT("X%s"), *CountValue);
+                    CountText->SetText(FText::FromString(DisplayText));
                     CountText->SetVisibility(ESlateVisibility::Visible);
                 }
                 else

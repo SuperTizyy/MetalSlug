@@ -162,8 +162,11 @@ void UActivityConfirmPopupWidget::CreateRewardCardsForBox(const FDailyLoginConfi
 			// 判断当前卡片是否应该被选中
 			bool bShouldBeSelected = (i == CurrentRewardIconIndex);
 			
-			// 使用带选中状态的初始化方法
-			RewardCard->InitializeCardWithDataTablesAndSelection(TreasureBoxItem->ItemID, Config.RewardItemID, i, bShouldBeSelected);
+			// 使用直接数据初始化方法，避免重复查询
+			RewardCard->InitializeCardWithDirectData(ItemDetail, TreasureBoxItem, i);
+			
+			// 设置选中状态
+			RewardCard->SetSelected(bShouldBeSelected);
 			
 			// 绑定选中事件
 			RewardCard->OnRewardSelected.AddDynamic(this, &UActivityConfirmPopupWidget::OnRewardCardSelected);

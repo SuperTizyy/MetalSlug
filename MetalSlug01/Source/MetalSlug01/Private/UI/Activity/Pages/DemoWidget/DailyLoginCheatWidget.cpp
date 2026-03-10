@@ -46,15 +46,18 @@ void UDailyLoginCheatWidget::OnApplyClicked()
 	UActivitySubsystem* ActivitySub = GetGameInstance()->GetSubsystem<UActivitySubsystem>();
 	if (!ActivitySub) return;
 
-	// 1. 获取输入并限制范围
+	// 1. 获取输入并限制范围（支持到第8天，包含大奖）
 	int32 NewDay = FCString::Atoi(*DayInput->GetText().ToString());
-	NewDay = FMath::Clamp(NewDay, 1, 7);
+	NewDay = FMath::Clamp(NewDay, 1, 8);
 
 	// 2. 直接修改底层数据
 	// 这个函数内部应该包含：修改 Record.Progress + SaveToDisk() + OnActivityDataChanged.Broadcast()
 	ActivitySub->Cheat_JumpToDay(101, NewDay);
 
 	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("成功跳转！输入%d表示第1-%d天可领取"), NewDay, NewDay));
+	
+	// 通知主页面刷新
+	NotifyMainPageRefresh(NewDay);
 }
 
 void UDailyLoginCheatWidget::NotifyMainPageRefresh(int32 NewDay)
@@ -63,11 +66,14 @@ void UDailyLoginCheatWidget::NotifyMainPageRefresh(int32 NewDay)
 	TArray<UUserWidget*> FoundWidgets;
 	UWidgetBlueprintLibrary::GetAllWidgetsOfClass(GetWorld(), FoundWidgets, UDailyLoginPage::StaticClass(), false);
 
+	UE_LOG(LogTemp, Warning, TEXT("NotifyMainPageRefresh: 找到 %d 个 DailyLoginPage 实例"), FoundWidgets.Num());
+
 	for (UUserWidget* Widget : FoundWidgets)
 	{
 		UDailyLoginPage* MainPage = Cast<UDailyLoginPage>(Widget);
 		if (MainPage)
 		{
+			UE_LOG(LogTemp, Warning, TEXT("NotifyMainPageRefresh: 调用 Cheat_SetDayAndRefresh(%d)"), NewDay);
 			// 假设你在 DailyLoginPage 中已经定义了设置当前天数并刷新的方法
 			// MainPage->SetTestCurrentDay(NewDay); 
 			MainPage->Cheat_SetDayAndRefresh(NewDay); // 重新生成 1-7 天并更新固定第 8 天

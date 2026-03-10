@@ -135,6 +135,10 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UDayLockHintWidget> DayLockHintWidgetClass;
 
+	/** WBP_RewardIcon蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
+	TSubclassOf<class UUserWidget> RewardIconWidgetClass;
+
 	// ==================== 数据管理 ====================
 	
 	/** 当前选择的天数索引 */
@@ -207,6 +211,12 @@ protected:
 	 * @brief 更新加成图标显示
 	 */
 	void UpdateBonusIcons();
+	
+	/**
+	 * @brief 更新限时加成图标容器
+	 * @details 根据活动时效性动态加载WBP_RewardIcon组件
+	 */
+	void UpdateBonusIconsContainer();
 
 	/**
 	 * @brief 更新奖励物品显示

@@ -96,8 +96,9 @@ public:
 	 * @brief 直接使用已获取的数据初始化奖励卡片
 	 * @param InItemDetail 物品详情记录
 	 * @param InTreasureBoxItem 宝箱物品记录
+	 * @param InCardIndex 卡片在选项中的索引位置
 	 */
-	void InitializeCardWithDirectData(const struct FItemDetailRow* InItemDetail, const struct FTreasureBoxItemRow* InTreasureBoxItem);
+	void InitializeCardWithDirectData(const struct FItemDetailRow* InItemDetail, const struct FTreasureBoxItemRow* InTreasureBoxItem, int32 InCardIndex);
 
 	/**
 	 * @brief 获取卡片索引

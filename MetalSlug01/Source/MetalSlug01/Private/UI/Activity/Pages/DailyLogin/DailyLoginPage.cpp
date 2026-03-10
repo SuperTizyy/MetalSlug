@@ -63,6 +63,11 @@ void UDailyLoginPage::NativeConstruct()
 
 	// 初次刷新
 	RefreshRewardList();
+	
+	// 延迟滚动以确保布局完成
+	GetWorld()->GetTimerManager().SetTimerForNextTick([this]() {
+		ScrollToCurrentDay();
+	});
 }
 
 void UDailyLoginPage::NativeDestruct()
@@ -92,17 +97,36 @@ void UDailyLoginPage::RefreshRewardList()
 
     DayListScroll->ClearChildren();
     FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
-    
+    	
     const FActivityInfoRow* Info = ActivitySub->GetActivityInfo(101);
     if (!Info) return;
-
+    
+    UE_LOG(LogTemp, Warning, TEXT("RefreshRewardList: TotalDays=%d, CurrentProgress=%d"), Info->TotalDays, Record.Progress);
+    
     // 存储大奖项控件
     UDailyLoginDayItemWidget* BigRewardItemWidget = nullptr;
     bool bHasBigReward = false;
-        
+    		
     for (int32 i = 1; i <= Info->TotalDays; ++i)
     {
-        ERewardState State = CalculateState(i);
+        // 使用一致的 Record.Progress 值计算状态，避免重复调用 GetOrInitPlayerRecord
+        ERewardState State;
+        if (Record.IsDayClaimed(i) || Record.ClaimedDays.Contains(i))
+        {
+            State = ERewardState::Claimed;
+        }
+        else if (i <= Record.Progress)
+        {
+            State = ERewardState::Claimable;
+        }
+        else if (i == Record.Progress + 1)
+        {
+            State = ERewardState::Incomplete; // 明日可领
+        }
+        else
+        {
+            State = ERewardState::Incomplete; // 未到期
+        }
         if (UWorld* World = GetWorld())
         {
             // 检查世界是否正在销毁
@@ -163,6 +187,8 @@ void UDailyLoginPage::RefreshRewardList()
     }
     }
     
+    UE_LOG(LogTemp, Warning, TEXT("RefreshRewardList: 完成创建 %d 个子项（普通奖励）"), DayListScroll->GetChildrenCount());
+    
     // 大奖项处理：基于 Is Special Reward 字段的特殊奖励显示控制
     // 通过 GetWidgetFromName 访问蓝图中的 BigRewardItem 控件
     FName BigRewardItemName(TEXT("BigRewardItem"));
@@ -187,7 +213,24 @@ void UDailyLoginPage::RefreshRewardList()
             // 直接使用找到的 BigRewardItem 控件，更新其数据
             // 使用与其它奖励项相同的逻辑初始化
             FPlayerLoginRecord& BigRewardRecord = ActivitySub->GetOrInitPlayerRecord(101);
-            ERewardState State = CalculateState(8); // 第8天
+            // 使用一致的 Progress 值计算状态，避免重复调用 GetOrInitPlayerRecord
+            ERewardState State;
+            if (BigRewardRecord.IsDayClaimed(8) || BigRewardRecord.ClaimedDays.Contains(8))
+            {
+                State = ERewardState::Claimed;
+            }
+            else if (8 <= BigRewardRecord.Progress)
+            {
+                State = ERewardState::Claimable;
+            }
+            else if (8 == BigRewardRecord.Progress + 1)
+            {
+                State = ERewardState::Incomplete; // 明日可领
+            }
+            else
+            {
+                State = ERewardState::Incomplete; // 未到期
+            }
             
             // 获取大奖项天数的奖励配置（基于 Is Special Reward 字段）
             TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, 8);
@@ -558,55 +601,63 @@ void UDailyLoginPage::Cheat_SetDayAndRefresh(int32 NewDay)
         // 修改完后立即执行页面刷新
         RefreshRewardList();
         
+        // 延迟滚动以确保布局完成
+        GetWorld()->GetTimerManager().SetTimerForNextTick([this]() {
+            ScrollToCurrentDay();
+        });
+        
         // // UE_LOG(LogTemp, Warning, TEXT("Cheat: 设置进度为 %d 并重刷列表"), NewDay);
     }
 }
 
 void UDailyLoginPage::ScrollToCurrentDay()
 {
-    if (!DayListScroll) return;
+    if (!DayListScroll || !ActivitySub) return;
 
-    TArray<UWidget*> AllItems = DayListScroll->GetAllChildren();
-    if (AllItems.IsValidIndex(3))
+    // 获取当前进度
+    FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
+    int32 CurrentProgress = Record.Progress;
+    
+    // 确保进度在有效范围内（1-8）
+    CurrentProgress = FMath::Clamp(CurrentProgress, 1, 8);
+    
+    // 计算目标索引
+    // 注意：滚动列表只包含普通奖励（第1-7天），大奖项（第8天）不在滚动列表中
+    int32 TargetIndex;
+    if (CurrentProgress >= 8)
     {
-        UWidget* TargetWidget = AllItems[3];
+        // 如果进度达到或超过8，滚动到滚动列表的最右边（第7天，索引6）
+        TargetIndex = 6; // 第7天的索引
+    }
+    else
+    {
+        // 否则滚动到对应的普通天数
+        TargetIndex = CurrentProgress - 1;
+    }
+    
+    TArray<UWidget*> AllItems = DayListScroll->GetAllChildren();
+    
+    UE_LOG(LogTemp, Warning, TEXT("ScrollToCurrentDay: 当前Progress=%d, 目标索引=%d, 子项数量=%d"), CurrentProgress, TargetIndex, AllItems.Num());
+    
+    if (AllItems.IsValidIndex(TargetIndex))
+    {
+        UWidget* TargetWidget = AllItems[TargetIndex];
         TargetWidget->ForceLayoutPrepass();
         DayListScroll->ScrollWidgetIntoView(TargetWidget, true, EDescendantScrollDestination::TopOrLeft, 0.0f);
+        UE_LOG(LogTemp, Log, TEXT("ScrollToCurrentDay: 滚动到第%d天（索引%d）"), CurrentProgress, TargetIndex);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("ScrollToCurrentDay: 无法滚动到第%d天，子项数量不足（当前有%d个子项）"), CurrentProgress, AllItems.Num());
+        
+        // 调试：输出所有子项信息
+        for (int32 i = 0; i < AllItems.Num(); ++i)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("  子项[%d]: %s"), i, AllItems[i] ? *AllItems[i]->GetName() : TEXT("null"));
+        }
     }
 }
 
-// 辅助函数：计算当前天数的状态
-ERewardState UDailyLoginPage::CalculateState(int32 DayIndex)
-{
-    if (!ActivitySub) return ERewardState::Incomplete;
-
-    // 获取玩家记录
-    FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
-    
-    // 1. 检查是否已领取（使用位掩码和数组双重检查）
-    if (Record.IsDayClaimed(DayIndex) || Record.ClaimedDays.Contains(DayIndex))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天已领取"), DayIndex);
-        return ERewardState::Claimed;
-    }
-
-    // 2. 检查是否可领取：Progress范围内的未领取天数
-    if (DayIndex <= Record.Progress)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天可领取 (Progress=%d)"), DayIndex, Record.Progress);
-        return ERewardState::Claimable;
-    }
-    
-    // 3. 检查是否为明日可领取（Progress+1）
-    if (DayIndex == Record.Progress + 1)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天为明日可领 (Progress=%d)"), DayIndex, Record.Progress);
-        return ERewardState::Incomplete;
-    }
-    
-    UE_LOG(LogTemp, Warning, TEXT("CalculateState: 第%d天未到期 (Progress=%d)"), DayIndex, Record.Progress);
-    return ERewardState::Incomplete;
-}
 
 void UDailyLoginPage::OnClaimAllButtonClicked()
 {

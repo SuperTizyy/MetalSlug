@@ -358,8 +358,8 @@ void UDailyLoginDayItemWidget::AddRewardIconFromBoxImage(const TSoftObjectPtr<UT
             UE_LOG(LogTemp, Warning, TEXT("开始异步加载BoxImage纹理"));
             // 使用UE官方异步加载方式
             RewardImage->SetBrushFromSoftTexture(BoxImage);
-            RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
-            RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+            //RewardImage->SetRenderScale(FVector2D(10.0f, 10.0f));
+            //RewardImage->SetDesiredSizeOverride(FVector2D(500.0f, 500.0f));
             UE_LOG(LogTemp, Warning, TEXT("✅ 已设置软引用纹理，UE会自动异步加载: %s"), 
                 *BoxImage.ToString());
         }
@@ -378,7 +378,12 @@ void UDailyLoginDayItemWidget::AddRewardIconFromBoxImage(const TSoftObjectPtr<UT
 
         if (CountText)
         {
-            CountText->SetText(FText::AsNumber(RewardCount));
+            FString DisplayText = FString::Printf(TEXT("X%d"), RewardCount);
+            CountText->SetText(FText::FromString(DisplayText));
+            // 增大文字大小
+            FSlateFontInfo FontInfo = CountText->GetFont();
+            FontInfo.Size = 40;
+            CountText->SetFont(FontInfo);
         }
     }
 }
@@ -446,8 +451,8 @@ void UDailyLoginDayItemWidget::AddRewardIconFromTreasureBox(int32 BoxID, int32 R
                             // 使用UMG原生异步接口 - 更优雅的方式
                             // 注意：即使资源处于IsPending状态(!IsNull() && !IsValid())，UMG也会正确处理
                             RewardImage->SetBrushFromSoftTexture(TreasureBoxItem->BoxIcon);
-                            RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
-                            RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                            //RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
+                            //RewardImage->SetDesiredSizeOverride(FVector2D(500.0f, 500.0f));
                             UE_LOG(LogTemp, Warning, TEXT("✅ 已设置软引用纹理，UMG会自动异步加载: BoxID %d"), BoxID);
                         }
                         else
@@ -487,7 +492,12 @@ void UDailyLoginDayItemWidget::AddRewardIconFromTreasureBox(int32 BoxID, int32 R
 
         if (CountText)
         {
-            CountText->SetText(FText::AsNumber(RewardCount));
+            FString DisplayText = FString::Printf(TEXT("X%d"), RewardCount);
+            CountText->SetText(FText::FromString(DisplayText));
+            // 增大文字大小
+            FSlateFontInfo FontInfo = CountText->GetFont();
+            FontInfo.Size = 24;
+            CountText->SetFont(FontInfo);
         }
     }
 }
@@ -580,8 +590,8 @@ void UDailyLoginDayItemWidget::AddRewardIcon(int32 RewardID, int32 RewardCount)
                                     // 使用UMG原生异步接口 - 更优雅的方式
                                     // 注意：即使资源处于IsPending状态(!IsNull() && !IsValid())，UMG也会正确处理
                                     RewardImage->SetBrushFromSoftTexture(ItemDetail->ItemIcon);
-                                    RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
-                                    RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                                    //RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
+                                    //RewardImage->SetDesiredSizeOverride(FVector2D(500.0f, 500.0f));
                                     UE_LOG(LogTemp, Warning, TEXT("✅ 已设置软引用纹理，UMG会自动异步加载: ID %d"), RewardID);
                                 }
                                 else
@@ -630,7 +640,12 @@ void UDailyLoginDayItemWidget::AddRewardIcon(int32 RewardID, int32 RewardCount)
         if (CountText)
         {
             // 设置奖励数量文本
-            CountText->SetText(FText::AsNumber(RewardCount));
+            FString DisplayText = FString::Printf(TEXT("X%d"), RewardCount);
+            CountText->SetText(FText::FromString(DisplayText));
+            // 增大文字大小
+            FSlateFontInfo FontInfo = CountText->GetFont();
+            FontInfo.Size = 24;
+            CountText->SetFont(FontInfo);
         }
     }
 }
@@ -650,7 +665,7 @@ void UDailyLoginDayItemWidget::OnTextureLoaded(const FSoftObjectPath& Path, UObj
                 {
                     RewardImage->SetBrushFromTexture(LoadedTexture);
                     RewardImage->SetRenderScale(FVector2D(2.5f, 7.0f));
-                    RewardImage->SetDesiredSizeOverride(FVector2D(64.0f, 64.0f));
+                    //RewardImage->SetDesiredSizeOverride(FVector2D(500.0f, 500.0f));
                     RewardImage->InvalidateLayoutAndVolatility();
                     // // UE_LOG(LogTemp, Log, TEXT("异步加载后更新UI"));
                 }

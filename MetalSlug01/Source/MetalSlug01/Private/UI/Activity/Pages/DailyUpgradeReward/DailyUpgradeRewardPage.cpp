@@ -36,6 +36,8 @@
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
 #include "Components/Border.h"
 #include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
+#include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
@@ -43,13 +45,14 @@
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "Components/ScrollBox.h"
+#include "Components/CanvasPanelSlot.h"
 #include "Styling/SlateTypes.h"
 #include "Kismet/GameplayStatics.h"
-#include "Engine/DataTable.h"
+#include "Engine/EngineTypes.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
+#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyTaskWidget.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
@@ -128,6 +131,12 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	// 延迟执行居中显示，等待UI完全渲染完成
 	FTimerHandle CenterTimerHandle;
 	GetWorld()->GetTimerManager().SetTimer(CenterTimerHandle, this, &UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience, 0.2f, false);
+	
+	// 检查RewardIconWidgetClass是否已设置
+	if (!RewardIconWidgetClass)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: RewardIconWidgetClass未设置，请在蓝图中指定WBP_RewardIcon类"));
+	}
 	
 	
 	
@@ -788,6 +797,9 @@ void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, i
 	
 	// 更新限时加成信息文本
 	UpdateBonusInfoText(DayIdentifier);
+		
+	// 更新限时加成图标容器
+	UpdateBonusIconsContainer();
 	
 	// 确保在游戏世界中运行
 	if (!GetWorld() || !GetWorld()->IsGameWorld())
@@ -797,6 +809,9 @@ void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, i
 
 	// 更新限时加成信息文本
 	UpdateBonusInfoText(DayIdentifier);
+	
+	// 更新限时加成图标容器
+	UpdateBonusIconsContainer();
 
 	// 检查必要的组件是否存在
 	if (!TasksContainer || !TaskDetailWidgetClass)
@@ -1003,6 +1018,11 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	UE_LOG(LogTemp, Log, TEXT("\n[步骤6/7] 📅 更新每日任务列表和高亮状态..."));
 	UpdateDailyTasks();
 	UE_LOG(LogTemp, Log, TEXT("✅ 每日任务列表和高亮状态已刷新"));
+	
+	// 6.1 更新限时加成图标容器
+	UE_LOG(LogTemp, Log, TEXT("\n[步骤6.1/7] 🎁 更新限时加成图标容器..."));
+	UpdateBonusIconsContainer();
+	UE_LOG(LogTemp, Log, TEXT("✅ 限时加成图标容器已刷新"));
 	
 	// 6.1 如果当前有选中的天数，显示该天数的任务详情
 	if (CurrentDayIndex != -1)
@@ -1987,6 +2007,188 @@ float UDailyUpgradeRewardPage::CalculateMaxScrollOffset()
 	}
 
 	return MaxOffset;
+}
+
+/**
+ * @brief 更新限时加成图标容器
+ * @details 根据活动时效性动态加载WBP_RewardIcon组件
+ */
+void UDailyUpgradeRewardPage::UpdateBonusIconsContainer()
+{
+	// [BONUS_DEBUG] 开始执行UpdateBonusIconsContainer
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 开始执行UpdateBonusIconsContainer"));
+	
+	// 检查必要组件
+	if (!BonusIconsContainer)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] BonusIconsContainer为空"));
+		return;
+	}
+
+	// 检查是否为编辑器预览模式
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 不在游戏世界中，跳过执行"));
+		return; // 静默返回，不输出日志
+	}
+
+	// [BONUS_DEBUG] 获取Subsystem
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] GameInstance为空"));
+		return;
+	}
+
+	UUpgradeActivitySubsystem* UpgradeActivitySubsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!UpgradeActivitySubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] UpgradeActivitySubsystem为空"));
+		return;
+	}
+
+	UActivitySubsystem* ActivitySubsystem = GameInstance->GetSubsystem<UActivitySubsystem>();
+	if (!ActivitySubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] ActivitySubsystem为空"));
+		return;
+	}
+
+	// 1. 查询UpgradeActivitySubsystem类内存数据的RecordDate的最大值（如超过5就取5的行数据做判断）
+	int32 MaxRecordDate = UpgradeActivitySubsystem->GetMaxRecordDate();
+	int32 TargetDayNumber = FMath::Min(MaxRecordDate, 5); // 超过5就取5
+	FString TargetDayIdentifier = FString::Printf(TEXT("day%d"), TargetDayNumber);
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] MaxRecordDate=%d, TargetDayNumber=%d, TargetDayIdentifier=%s"), MaxRecordDate, TargetDayNumber, *TargetDayIdentifier);
+
+	// 2. 查询此行数据的CreatedTime值
+	const FUpgradeRewardSaveRecord* TargetRecord = UpgradeActivitySubsystem->GetRecordByDate(TargetDayNumber);
+	if (!TargetRecord)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 未找到TargetRecord，TargetDayNumber=%d"), TargetDayNumber);
+		// 如果没有找到记录，清空容器
+		BonusIconsContainer->ClearChildren();
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 找到TargetRecord，CreatedTime=%s"), *TargetRecord->CreatedTime.ToString());
+
+	FDateTime CreatedTime = TargetRecord->CreatedTime;
+
+	// 3. 获取DailyUpgradeRewardConfigRow表对应天数的BonusDurationHours的值
+	const FDailyUpgradeRewardConfigRow* ConfigRow = UpgradeActivitySubsystem->GetConfigRowForDay(TargetDayIdentifier);
+	if (!ConfigRow)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 未找到ConfigRow，TargetDayIdentifier=%s"), *TargetDayIdentifier);
+		// 如果没有找到配置，清空容器
+		BonusIconsContainer->ClearChildren();
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 找到ConfigRow，BonusDurationHours=%d"), ConfigRow->BonusDurationHours);
+
+	int32 BonusDurationHours = ConfigRow->BonusDurationHours;
+
+	// 4. 检查CreatedTime是否小于当前时间 - BonusDurationHours
+	FDateTime CurrentTime = FDateTime::Now();
+	FDateTime ExpiryTime = CreatedTime + FTimespan::FromHours(BonusDurationHours);
+
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] CurrentTime=%s, ExpiryTime=%s, 过期检查结果=%s"), 
+		*CurrentTime.ToString(), *ExpiryTime.ToString(), (CurrentTime >= ExpiryTime) ? TEXT("已过期") : TEXT("未过期"));
+	
+	if (CurrentTime >= ExpiryTime)
+	{
+		// 已过期，不加载RewardIcon蓝图组件
+		BonusIconsContainer->ClearChildren();
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_ICONS] 活动已过期，不加载奖励图标 - Day: %s, CreatedTime: %s, ExpiryTime: %s, CurrentTime: %s"), 
+			*TargetDayIdentifier, *CreatedTime.ToString(), *ExpiryTime.ToString(), *CurrentTime.ToString());
+		return;
+	}
+
+	// 5. 未过期，查询DailyUpgradeRewardConfigRow表对应的天数行数据的BonusIDs数组
+	const TArray<int32>& BonusIDs = ConfigRow->BonusIDs;
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusIDs数量=%d"), BonusIDs.Num());
+	if (BonusIDs.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] BonusIDs为空，清空容器"));
+		// 没有BonusIDs，清空容器
+		BonusIconsContainer->ClearChildren();
+		return;
+	}
+
+	// 6. 清空现有子控件
+	BonusIconsContainer->ClearChildren();
+
+	// 7. 使用已配置的WBP_RewardIcon蓝图类
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] RewardIconWidgetClass是否有效=%s"), RewardIconWidgetClass ? TEXT("是") : TEXT("否"));
+	if (!RewardIconWidgetClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[BONUS_ICONS] RewardIconWidgetClass未设置，请在蓝图中指定WBP_RewardIcon类"));
+		return;
+	}
+
+	// 8. 遍历BonusIDs数组，创建RewardIcon组件
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 开始遍历BonusIDs，共%d个"), BonusIDs.Num());
+	for (int32 i = 0; i < BonusIDs.Num(); ++i)
+	{
+		int32 ItemID = BonusIDs[i];
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 处理ItemID=%d (%d/%d)"), ItemID, i + 1, BonusIDs.Num());
+
+		// 关联ItemDetailRow表的ItemID字段，得到对应的ItemIcon
+		// 使用ActivitySubsystem的GetItemDetail方法，它会遍历所有行查找ItemID匹配的记录
+		const FItemDetailRow* ItemDetailRow = ActivitySubsystem->GetItemDetail(ItemID);
+		if (!ItemDetailRow)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 无法找到ItemID %d 的ItemDetailRow"), ItemID);
+			continue;
+		}
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 找到ItemDetailRow，ItemIcon是否有效=%s"), ItemDetailRow->ItemIcon.IsNull() ? TEXT("否") : TEXT("是"));
+
+		// 创建WBP_RewardIcon实例
+		UUserWidget* RewardIconWidget = CreateWidget<UUserWidget>(GetWorld(), RewardIconWidgetClass);
+		if (!RewardIconWidget)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BONUS_DEBUG] 无法创建WBP_RewardIcon实例"));
+			continue;
+		}
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 成功创建WBP_RewardIcon实例"));
+
+		// 获取RewardImage控件并设置ItemIcon
+		UImage* RewardImage = Cast<UImage>(RewardIconWidget->GetWidgetFromName(TEXT("RewardImage")));
+		if (RewardImage && !ItemDetailRow->ItemIcon.IsNull())
+		{
+			RewardImage->SetBrushFromSoftTexture(ItemDetailRow->ItemIcon);
+			
+			// 🔧 Canvas Panel中需要直接操作Slot来设置尺寸（参考TaskDetailWidget实现）
+			if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(RewardImage->Slot))
+			{
+				CanvasSlot->SetSize(FVector2D(128.0f, 128.0f));
+				// 设置锚点为左上角
+				CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
+				CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+			}
+		}
+
+		// 隐藏CountText控件（根据项目规范）
+		UTextBlock* CountText = Cast<UTextBlock>(RewardIconWidget->GetWidgetFromName(TEXT("CountText")));
+		if (CountText)
+		{
+			CountText->SetVisibility(ESlateVisibility::Collapsed);
+		}
+
+		// 添加到BonusIconsContainer
+		BonusIconsContainer->AddChild(RewardIconWidget);
+
+		// 对于HorizontalBox，尺寸主要由子控件自身决定
+		// RewardImage的尺寸通过SetDesiredSizeOverride设置为128x128
+		if (UHorizontalBoxSlot* HorizontalBoxSlot = Cast<UHorizontalBoxSlot>(RewardIconWidget->Slot))
+		{
+			// 清除内边距以确保正确显示
+			HorizontalBoxSlot->SetPadding(FMargin(0.0f));
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("[BONUS_ICONS] 成功创建奖励图标 %d: ItemID=%d"), i + 1, ItemID);
+	}
+	
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UpdateBonusIconsContainer执行完成，容器子项数量=%d"), BonusIconsContainer->GetChildrenCount());
+	UE_LOG(LogTemp, Log, TEXT("[BONUS_ICONS] 限时加成图标容器更新完成，共创建 %d 个图标"), BonusIDs.Num());
 }
 
 /**

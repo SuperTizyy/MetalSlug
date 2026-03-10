@@ -61,6 +61,46 @@ void URewardOptionCardWidget::InitializeCard(int32 InRewardID, int32 InRewardCou
 	}
 }
 
+void URewardOptionCardWidget::InitializeCardWithDirectData(const FItemDetailRow* InItemDetail, const FTreasureBoxItemRow* InTreasureBoxItem, int32 InCardIndex)
+{
+	if (!InItemDetail || !InTreasureBoxItem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("RewardOptionCardWidget: InitializeCardWithDirectData - 传入的指针为空"));
+		return;
+	}
+
+	RewardID = InItemDetail->ItemID;
+	RewardCount = InTreasureBoxItem->ItemCount;
+	CardIndex = InCardIndex;
+	bIsSelected = false;
+
+	UE_LOG(LogTemp, Log, TEXT("RewardOptionCardWidget: 使用直接数据初始化卡片，ItemID: %d, ItemCount: %d, CardIndex: %d"), 
+		RewardID, RewardCount, CardIndex);
+
+	// 设置奖励文本 - 只显示数量
+	if (RewardText)
+	{
+		FString DisplayText = FString::Printf(TEXT("X%d"), RewardCount);
+		RewardText->SetText(FText::FromString(DisplayText));
+	}
+
+	// 设置奖励图标
+	if (RewardImage && !InItemDetail->ItemIcon.IsNull())
+	{
+		RewardImage->SetBrushFromSoftTexture(InItemDetail->ItemIcon);
+	}
+
+	// 初始化复选框状态
+	if (SelectionCheckBox)
+	{
+		SelectionCheckBox->SetIsChecked(false);
+		SelectionCheckBox->OnCheckStateChanged.AddDynamic(this, &URewardOptionCardWidget::OnCheckBoxStateChanged);
+	}
+
+	// 订阅奖励图标索引更新事件
+	SubscribeToRewardIconEvents();
+}
+
 void URewardOptionCardWidget::SubscribeToRewardIconEvents()
 {
 	// 通过GameInstance获取UpgradeActivitySubsystem
@@ -159,8 +199,8 @@ void URewardOptionCardWidget::InitializeCardWithDataTablesAndSelection(int32 InI
 		UE_LOG(LogTemp, Warning, TEXT("RewardOptionCardWidget: 设置奖励文本，ItemID: %d, ItemName: %s, ItemCount: %d"), 
 			InItemID, *ItemDetail->ItemName.ToString(), TreasureBoxItem->ItemCount);
 		
-		// 使用正确的格式：物品名称 x 数量
-		FString DisplayText = FString::Printf(TEXT("%s x%d"), *ItemDetail->ItemName.ToString(), TreasureBoxItem->ItemCount);
+		// 根据需求，RewardText只显示ItemCount字段数据（数字），前面加X
+		FString DisplayText = FString::Printf(TEXT("X%d"), TreasureBoxItem->ItemCount);
 		RewardText->SetText(FText::FromString(DisplayText));
 		RewardCount = TreasureBoxItem->ItemCount;
 	}
@@ -232,8 +272,8 @@ void URewardOptionCardWidget::InitializeCardWithDataTables(int32 InItemID, int32
 	const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(InBoxID);
 	if (TreasureBoxItem)
 	{
-		// 使用正确的格式：物品名称 x 数量
-		FString DisplayText = FString::Printf(TEXT("%s x%d"), *ItemDetail->ItemName.ToString(), TreasureBoxItem->ItemCount);
+		// 使用正确的格式：物品名称 X 数量
+		FString DisplayText = FString::Printf(TEXT("%s X%d"), *ItemDetail->ItemName.ToString(), TreasureBoxItem->ItemCount);
 		RewardText->SetText(FText::FromString(DisplayText));
 		RewardCount = TreasureBoxItem->ItemCount;
 	}
@@ -270,39 +310,4 @@ void URewardOptionCardWidget::OnCheckBoxStateChanged(bool bIsChecked)
 	
 	// 广播选中事件
 	OnRewardSelected.Broadcast(this, bIsChecked);
-}
-
-void URewardOptionCardWidget::InitializeCardWithDirectData(const FItemDetailRow* InItemDetail, const FTreasureBoxItemRow* InTreasureBoxItem)
-{
-	if (!InItemDetail || !InTreasureBoxItem)
-	{
-		UE_LOG(LogTemp, Error, TEXT("RewardOptionCardWidget: 初始化数据为空"));
-		return;
-	}
-	
-	RewardID = InTreasureBoxItem->ItemID;
-	RewardCount = InTreasureBoxItem->ItemCount;
-	bIsSelected = false;
-	
-	UE_LOG(LogTemp, Warning, TEXT("RewardOptionCardWidget: 直接初始化 - ItemID: %d, ItemName: %s, ItemCount: %d"), 
-		InTreasureBoxItem->ItemID, *InItemDetail->ItemName.ToString(), InTreasureBoxItem->ItemCount);
-	
-	// 设置奖励文本
-	if (RewardText)
-	{
-		FString DisplayText = FString::Printf(TEXT("%s x%d"), *InItemDetail->ItemName.ToString(), InTreasureBoxItem->ItemCount);
-		RewardText->SetText(FText::FromString(DisplayText));
-	}
-	
-	// 设置奖励图标
-	if (RewardImage)
-	{
-		RewardImage->SetBrushFromSoftTexture(InItemDetail->ItemIcon);
-	}
-	
-	// 初始化复选框状态
-	if (SelectionCheckBox)
-	{
-		SelectionCheckBox->SetIsChecked(false);
-	}
 }

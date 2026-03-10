@@ -90,7 +90,6 @@ protected:
 	class UWidget* MainLayout;
 	
 private:
-	ERewardState CalculateState(int32 DayIndex);
 	// 成员变量（ActivitySubsystem 指针）
 	UPROPERTY()
 	class UActivitySubsystem* ActivitySub;

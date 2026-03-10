@@ -68,10 +68,22 @@ public:
 	UFUNCTION()
 	void HandleClaimButtonClickWrapper();
 	
+
+	/**
+	 * @brief 处理奖励存储到背包事件
+	 * @param TaskIndex 任务索引
+	 */
+	UFUNCTION()
+	void HandleRewardStore(int32 TaskIndex);
+
 public:
 	/** WBP_RewardIcon 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TaskDetail|UI")
 	TSubclassOf<class UUserWidget> RewardIconClass;
+
+	/** RewardOptionWidget 蓝图类引用 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TaskDetail|UI")
+	TSubclassOf<class URewardOptionWidget> RewardOptionWidgetClass;
 
 private:
 	/** 当前绑定的天数标识（用于无参委托） */
@@ -79,4 +91,7 @@ private:
 	
 	/** 当前绑定的任务索引（用于无参委托） */
 	int32 CurrentTaskIndex;
+
+	/** 当前任务索引（用于奖励事件处理） */
+	int32 CurrentTaskIndexForReward;
 };
