@@ -13,19 +13,19 @@
 
 void UActivityNavMenuWidget::NativeConstruct()
 {
+	// 调用父类构造函数
 	Super::NativeConstruct();
+	// 初始化导航菜单
 	InitializeNavigation();
 	
 	// 设置定时刷新红点（每30秒刷新一次）
 	GetWorld()->GetTimerManager().SetTimer(
-		RedDotRefreshTimerHandle,
-		this,
-		&UActivityNavMenuWidget::RefreshRedDots,
+		RedDotRefreshTimerHandle,      // 定时器句柄
+		this,                         // 定时器所属对象
+		&UActivityNavMenuWidget::RefreshRedDots,  // 定时器回调函数
 		30.0f,  // 30秒间隔
 		true    // 循环执行
 	);
-	
-	UE_LOG(LogTemp, Warning, TEXT("✅ ActivityNavMenuWidget 初始化完成，已启动红点定时刷新"));
 }
 
 void UActivityNavMenuWidget::NativeDestruct()
@@ -34,97 +34,81 @@ void UActivityNavMenuWidget::NativeDestruct()
 	if (GetWorld() && RedDotRefreshTimerHandle.IsValid())
 	{
 		GetWorld()->GetTimerManager().ClearTimer(RedDotRefreshTimerHandle);
-		UE_LOG(LogTemp, Warning, TEXT("✅ 已清理红点刷新定时器"));
 	}
 	
-	// 清理页面缓存
+	// 清理页面缓存 - 遍历所有缓存的页面并从父级移除
 	for (auto& Pair : PageCache)
 	{
 		if (Pair.Value.IsValid())
 		{
+			// 将页面从小部件树中移除
 			Pair.Value->RemoveFromParent();
 		}
 	}
+	// 清空页面缓存
 	PageCache.Empty();
 	
 	// 清理当前页面引用
 	CurrentPage.Reset();
 	
+	// 调用父类析构函数
 	Super::NativeDestruct();
 }
 
 void UActivityNavMenuWidget::InitializeNavigation()
 {
-	// UE_LOG(LogTemp, Warning, TEXT("=== ActivityNavMenuWidget 初始化开�?==="));
+	// 初始化导航菜单界面
 	
 	// 检查蓝图绑定的组件是否存在
-	UE_LOG(LogTemp, Warning, TEXT("检查NavContainer..."));
 	if (!NavContainer)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ActivityNavMenuWidget: NavContainer未绑定，请在蓝图中设置VerticalBox容器"));
+		// 如果导航容器未绑定，则返回
 		return;
 	}
-	UE_LOG(LogTemp, Warning, TEXT("✅ NavContainer有效"));
 	
-	// 检查NavContainer的可见性和父级
-	// UE_LOG(LogTemp, Warning, TEXT("NavContainer存在，可见性: %d, 父级: %s"), 
-	// 	(int32)NavContainer->GetVisibility(), 
-	// 	NavContainer->GetParent() ? NavContainer->GetParent()->GetName() : TEXT("None"));
+	// 检查导航容器的可见性和父级
 	
-	// 检查PageContainer
-	UE_LOG(LogTemp, Warning, TEXT("检查PageContainer..."));
-	if (PageContainer)
+	// 检查页面容器
+	if (!PageContainer)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ PageContainer存在，可见性: %d"), (int32)PageContainer->GetVisibility());
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ PageContainer未绑定，请在蓝图中设置页面容器"));
+		// 如果页面容器未绑定，则返回
+		return;
 	}
 	
 	// 检查默认页面类
 	if (DefaultPageClass)
 	{
-		// UE_LOG(LogTemp, Warning, TEXT("DefaultPageClass已设�? %s"), *DefaultPageClass->GetName());
+		// 默认页面类已设置
 	}
 	else
 	{
-		// UE_LOG(LogTemp, Warning, TEXT("DefaultPageClass未设�?));
+		// 默认页面类未设置
 	}
 	
-	// 如果NavItems为空，尝试从ActivitySubsystem获取数据
-	UE_LOG(LogTemp, Warning, TEXT("检查NavItems数据..."));
+	// 如果导航项列表为空，尝试从ActivitySubsystem获取数据
 	if (NavItems.Num() == 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ NavItems为空，尝试从ActivitySubsystem获取数据"));
+		// 从子系统填充导航项
 		PopulateNavItemsFromSubsystem();
-		UE_LOG(LogTemp, Warning, TEXT("从Subsystem获取后NavItems数量: %d"), NavItems.Num());
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ NavItems已有数据: %d 项"), NavItems.Num());
 	}
 	
 	// 清理现有内容
-	UE_LOG(LogTemp, Warning, TEXT("清理NavContainer现有内容..."));
 	NavContainer->ClearChildren();
-	UE_LOG(LogTemp, Warning, TEXT("✅ NavContainer内容已清空"));
 	
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 准备创建 %d 个导航项"), NavItems.Num());
-	
-	// 创建导航�?
+	// 创建导航项
 	for (const FActivityNavItem& Item : NavItems)
 	{
+		// 创建导航按钮小部件
 		UActivityNavButton* NavButtonWidget = CreateNavItemButton(Item);
 		if (NavButtonWidget)
 		{
+			// 将导航按钮添加到容器
 			NavContainer->AddChild(NavButtonWidget);
-			// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 成功添加导航项[%s], Widget可见性: %d"), 
-			// 	*Item.ActivityId.ToString(), (int32)NavItemWidget->GetVisibility());
+			
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 创建导航项失败[%s]"), *Item.ActivityId.ToString());
+			// 创建导航按钮失败
 		}
 	}
 	
@@ -132,8 +116,8 @@ void UActivityNavMenuWidget::InitializeNavigation()
 	FName DefaultActivityId = GetDefaultSelectedActivityId();
 	if (!DefaultActivityId.IsNone())
 	{
+		// 设置默认选中的活动
 		SetSelectedActivity(DefaultActivityId);
-		UE_LOG(LogTemp, Warning, TEXT("🎯 设置默认活动 [%s] 并切换页面"), *DefaultActivityId.ToString());
 		
 		// 自动切换到默认页面
 		SwitchToActivityPage(DefaultActivityId);
@@ -142,8 +126,9 @@ void UActivityNavMenuWidget::InitializeNavigation()
 	{
 		// 如果没有设置默认选中项，则选择第一个
 		FName FirstActivityId = NavItems[0].ActivityId;
+		// 设置第一个活动为选中状态
 		SetSelectedActivity(FirstActivityId);
-		UE_LOG(LogTemp, Warning, TEXT("⚠️ 未找到默认选中项，选择第一个活动 [%s]"), *FirstActivityId.ToString());
+		// 切换到第一个活动页面
 		SwitchToActivityPage(FirstActivityId);
 	}
 	
@@ -153,9 +138,7 @@ void UActivityNavMenuWidget::InitializeNavigation()
 
 UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityNavItem& Item)
 {
-	UE_LOG(LogTemp, Warning, TEXT("=== 开始 CreateNavItemButton (ActivityNavButton版本) ==="));
-	UE_LOG(LogTemp, Warning, TEXT("输入参数 - ActivityId: %s, DisplayName: %s"), 
-		*Item.ActivityId.ToString(), *Item.GetDisplayName().ToString());
+	// 创建导航菜单项按钮
 	
 	UActivityNavButton* NavButtonWidget = nullptr;
 	
@@ -168,32 +151,35 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 	
 	if (ButtonTemplateClass)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载ActivityNavButton模板类: %s"), *ButtonTemplateClass->GetName());
+		// 蓝图类加载成功
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 加载ActivityNavButton模板类失败: %s"), *TemplatePath);
+		// 蓝图类加载失败，返回空指针
+		return nullptr;
 	}
 	
 	// 尝试使用ActivityNavButton模板类创建
 	if (ButtonTemplateClass)
 	{
+		// 创建导航按钮小部件实例
 		NavButtonWidget = CreateWidget<UActivityNavButton>(GetWorld(), ButtonTemplateClass);
 		
 		if (NavButtonWidget)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("✅ ActivityNavButton创建成功"));
+			// 导航按钮创建成功
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("❌ ActivityNavButton创建失败"));
+			// 导航按钮创建失败，返回空指针
+			return nullptr;
 		}
 	}
 	
 	// 如果模板创建失败，直接返回nullptr
 	if (!NavButtonWidget)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ActivityNavButton创建完全失败"));
+		// 按钮创建失败
 		return nullptr;
 	}
 	
@@ -207,16 +193,17 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 		FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
 		UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
 		
+		// 初始化显示标题和图标
 		FText DisplayTitle = FText::GetEmpty();
 		UTexture2D* IconTexture = nullptr;
 		
-		UE_LOG(LogTemp, Warning, TEXT("检查DataTable加载结果..."));
 		if (ActivityInfoTable)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("✅ DataTable加载成功"));
-		
+		{ 		
+			// 定义查找上下文字符串
 			static const FString ContextString(TEXT("NavMenuContext"));
+			// 将活动ID转换为整数
 			int32 TargetActivityId = FCString::Atoi(*Item.ActivityId.ToString());
+			// 创建行名
 			FName RowName(*FString::FromInt(TargetActivityId));
 			
 			// 查找活动信息
@@ -225,8 +212,10 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 			// 备用方案：全表遍历
 			if (!ActivityInfo)
 			{
+				// 获取所有行
 				TArray<FActivityInfoRow*> AllRows;
 				ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
+				// 遍历所有行寻找匹配的活动ID
 				for (FActivityInfoRow* Row : AllRows)
 				{
 					if (Row && Row->ActivityID == TargetActivityId)
@@ -239,117 +228,111 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 			
 			if (ActivityInfo)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("✅ 找到活动信息，开始设置显示内容"));
+				// 使用查找到的活动名称作为显示标题
 				DisplayTitle = ActivityInfo->DisplayName;
 				
 				// 加载图标纹理
 				if (ActivityInfo->IconTexture.Get())
 				{
+					// 同步加载纹理
 					ActivityInfo->IconTexture.LoadSynchronous();
+					// 获取纹理对象
 					IconTexture = Cast<UTexture2D>(ActivityInfo->IconTexture.Get());
 					if (IconTexture)
 					{
-						UE_LOG(LogTemp, Warning, TEXT("✅ 图标纹理加载成功"));
+						// 图标纹理加载成功
 					}
 				}
 				
-				UE_LOG(LogTemp, Warning, TEXT("✅ 从DataTable获取活动信息完成"));
 			}
 			else
 			{
-				UE_LOG(LogTemp, Warning, TEXT("❌ DataTable中未找到ActivityID=%d的配置"), TargetActivityId);
+				// 如果没有找到活动信息，使用默认显示名称
 				DisplayTitle = GetActivityDisplayName(Item.ActivityId);
 			}
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("❌ 无法加载ActivityInfo DataTable"));
+			// 如果数据表不存在，使用默认显示名称
 			DisplayTitle = GetActivityDisplayName(Item.ActivityId);
 		}
 		
 		// 如果仍然没有标题，使用备用方案
 		if (DisplayTitle.IsEmpty())
 		{
+			// 使用活动ID构建显示标题
 			DisplayTitle = FText::FromString(FString::Printf(TEXT("活动 %s"), *Item.ActivityId.ToString()));
 		}
 		
-		UE_LOG(LogTemp, Warning, TEXT("开始初始化ActivityNavButton..."));
+		// 初始化按钮（活动ID、显示标题、图标纹理）
 		NavButtonWidget->InitializeButton(Item.ActivityId, DisplayTitle, IconTexture);
-		UE_LOG(LogTemp, Warning, TEXT("✅ ActivityNavButton初始化完成，标题: %s"), *DisplayTitle.ToString());
 		
-		// 确保MainButton可见
+		// 确保主按钮可见
 		NavButtonWidget->MainButton->SetVisibility(ESlateVisibility::Visible);
-		UE_LOG(LogTemp, Log, TEXT("✅ ActivityNavButton: MainButton已设置为可见"));
 		
 		// 绑定点击事件
-		UE_LOG(LogTemp, Warning, TEXT("绑定点击事件..."));
 		
 		if (!IsValid(NavButtonWidget->MainButton))
 		{
-			UE_LOG(LogTemp, Error, TEXT("❌ NavButtonWidget->MainButton is null! 无法绑定点击事件"));
+			// 主按钮无效，但返回已创建的按钮
 			return NavButtonWidget;
 		}
 		
 		// 使用ActivityNavButton的普通委托绑定点击事件
 		FName ButtonActivityId = Item.ActivityId;  // 保存ActivityId用于lambda捕获
 		NavButtonWidget->OnButtonClicked.AddLambda([this, ButtonActivityId]() {
-			UE_LOG(LogTemp, Warning, TEXT("🎯 按钮点击 - 活动ID: %s"), *ButtonActivityId.ToString());
-			
 			// 先更新选中状态
 			SetSelectedActivity(ButtonActivityId);
 			
 			// 再切换到对应活动页面
 			SwitchToActivityPage(ButtonActivityId);
 		});
-		UE_LOG(LogTemp, Warning, TEXT("✅ 绑定到ActivityNavButton的普通委托"));
-		
-		UE_LOG(LogTemp, Warning, TEXT("✅ 点击事件绑定完成"));
-		UE_LOG(LogTemp, Warning, TEXT("按钮事件绑定成功 - ActivityId: %s"), *Item.ActivityId.ToString());
 		
 		NavButtonWidget->SetSelected(false); // 默认未选中
-		UE_LOG(LogTemp, Warning, TEXT("✅ ActivityNavButton: 设置选中状态[%s] 为未选中"), *Item.ActivityId.ToString());
-		
-		UE_LOG(LogTemp, Warning, TEXT("🎉 ActivityNavButton完整初始化流程完成"));
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ActivityNavButton创建完全失败"));
+		// 按钮或主按钮无效，返回空指针
+		return nullptr;
 	}
 	
-	UE_LOG(LogTemp, Warning, TEXT("=== CreateNavItemButton (ActivityNavButton版本) 执行结束 ==="));
 	return NavButtonWidget;
 }
 
 void UActivityNavMenuWidget::OnNavItemClicked(UButton* Button, FName ActivityId)
 {
+	// 设置选中的活动
 	SetSelectedActivity(ActivityId);
+	// 检查导航项选择事件是否已绑定
 	if (OnNavItemSelected.IsBound())
 	{
+		// 广播导航项选择事件
 		OnNavItemSelected.Broadcast(ActivityId);
 	}
 }
 
-// 新增：基础按钮点击处理函数
+// 基础按钮点击处理函数
 void UActivityNavMenuWidget::OnButtonClicked()
 {
-	UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 基础按钮点击处理函数被调用"));
-	// 这是一个备用处理函数，实际逻辑在带参数的版本中
+	// 这是一个备用处理函数，当没有指定活动ID时，默认处理第一个导航项
 	if (NavItems.Num() > 0)
 	{
+		// 调用带参数的按钮点击处理函数，传入第一个导航项的活动ID
 		OnButtonClickedWithId(NavItems[0].ActivityId);
 	}
 }
 
-// 新增：带参数的按钮点击处理函数
+// 带参数的按钮点击处理函数
 void UActivityNavMenuWidget::OnButtonClickedWithId(FName ActivityId)
 {
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 按钮点击 - 活动ID: %s"), *ActivityId.ToString());
 	
 	// 使用传入的ActivityId触发导航事件
 	if (OnNavItemSelected.IsBound())
 	{
+		// 广播导航项选择事件
 		OnNavItemSelected.Broadcast(ActivityId);
 	}
+	// 设置选中的活动
 	SetSelectedActivity(ActivityId);
 	
 	// 直接切换到对应活动页面
@@ -362,42 +345,41 @@ void UActivityNavMenuWidget::OnButtonClicked_Id1() { if (NavItems.IsValidIndex(1
 void UActivityNavMenuWidget::OnButtonClicked_Id2() { if (NavItems.IsValidIndex(2)) OnButtonClickedWithId(NavItems[2].ActivityId); }
 void UActivityNavMenuWidget::OnButtonClicked_Id3() { if (NavItems.IsValidIndex(3)) OnButtonClickedWithId(NavItems[3].ActivityId); }
 void UActivityNavMenuWidget::OnButtonClicked_Default() { 
-	UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 点击了默认按钮处理函数"));
 	if (NavItems.Num() > 0) OnButtonClickedWithId(NavItems[0].ActivityId); 
 }
 
 void UActivityNavMenuWidget::SetSelectedActivity(FName ActivityId)
 {
-	UE_LOG(LogTemp, Warning, TEXT("🎯 设置选中活动: %s"), *ActivityId.ToString());
-	
+	// 设置当前选中的活动ID
 	CurrentSelectedActivity = ActivityId;
 	
-	// 更新NavItems数组中的选中状态
+	// 遍历导航项数组，更新每个项的选中状态
 	for (FActivityNavItem& Item : NavItems)
 	{
+		// 如果活动ID匹配，则设置为选中状态，否则为非选中状态
 		Item.bIsSelected = (Item.ActivityId == ActivityId);
 	}
 	
-	// 更新所有按钮的视觉状态
+	// 更新所有按钮的视觉状态以反映新的选中状态
 	UpdateAllButtonsVisualState();
 }
 
 void UActivityNavMenuWidget::RefreshRedDots()
 {
-	UE_LOG(LogTemp, Warning, TEXT("🔄 刷新所有导航项红点状态"));
+	// 刷新所有导航项的红点状态
 	
 	// 通过GameInstance获取ActivitySubsystem
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法获取GameInstance"));
+		// 如果游戏实例不存在，则返回
 		return;
 	}
 	
 	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
 	if (!ActivitySub)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法获取ActivitySubsystem"));
+		// 如果活动子系统不存在，则返回
 		return;
 	}
 	
@@ -405,68 +387,72 @@ void UActivityNavMenuWidget::RefreshRedDots()
 	URedDotManager* RedDotManager = ActivitySub->GetRedDotManager();
 	if (!RedDotManager)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法获取RedDotManager"));
+		// 如果红点管理器不存在，则返回
 		return;
 	}
 	
-	// 刷新红点数据
+	// 刷新所有红点数据
 	RedDotManager->RefreshAllRedDots();
 	
-	// 更新所有按钮的红点显示
+	// 遍历导航容器中的所有子控件，更新每个按钮的红点显示
 	for (int32 i = 0; i < NavContainer->GetChildrenCount(); ++i)
 	{
+		// 获取子控件
 		UWidget* ChildWidget = NavContainer->GetChildAt(i);
+		// 尝试转换为活动导航按钮
 		UActivityNavButton* NavButton = Cast<UActivityNavButton>(ChildWidget);
 		
+		// 检查按钮是否有效且具有红点图像
 		if (NavButton && NavButton->RedDotImage)
 		{
+			// 获取按钮关联的活动ID
 			FName ButtonActivityId = NavButton->GetActivityId();
+			// 将活动ID转换为整数
 			int32 ActivityId = FCString::Atoi(*ButtonActivityId.ToString());
 			
-			// 获取该活动的红点数据
+			// 从红点管理器获取该活动的红点数据
 			FRedDotData RedDotData = RedDotManager->GetRedDotData(ActivityId);
 			
-			// 更新按钮的红点显示
+			// 根据红点数据确定是否显示红点
 			bool bShowRedDot = RedDotData.bShouldShow && RedDotData.DotType != ERedDotType::None;
+			// 设置按钮的红点显示状态和数值
 			NavButton->SetRedDot(bShowRedDot, RedDotData.DotValue);
 			
-			UE_LOG(LogTemp, Log, TEXT("按钮 [%s] 红点状态更新: 显示=%s, 类型=%d, 数值=%d"), 
-				*ButtonActivityId.ToString(), 
-				bShowRedDot ? TEXT("是") : TEXT("否"),
-				(int32)RedDotData.DotType,
-				RedDotData.DotValue);
 		}
 	}
 }
 
 void UActivityNavMenuWidget::UpdateNavItemRedDot(FName ActivityId, const FRedDotData& RedDotData)
 {
-	// 更新指定导航项的红点状�?
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 更新活动[%s]的红点状�?), *ActivityId.ToString());
+	// 更新指定导航项的红点状态
+	// 此函数目前未实现具体功能，待后续扩展
+	
 }
 
 void UActivityNavMenuWidget::RefreshTimeInfos()
 {
-	// 刷新所有导航项的时间信息显�?
-	// 这里应该从ActivitySubsystem获取最新的时间数据
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 刷新时间信息显示"));
+	// 刷新所有导航项的时间信息显示
+	// 从ActivitySubsystem获取最新的时间数据
+	// 此函数目前未实现具体功能，待后续扩展
+	
 }
 
 void UActivityNavMenuWidget::UpdateNavItemTimeInfo(FName ActivityId, const FActivityInfoRow& TimeInfo)
 {
 	// 更新指定导航项的时间信息
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 更新活动[%s]的时间信�?), *ActivityId.ToString());
+	// 此函数目前未实现具体功能，待后续扩展
+	
 }
-
-
 
 void UActivityNavMenuWidget::PopulateNavItemsFromSubsystem()
 {
+	// 从ActivitySubsystem获取导航项数据并填充到本地数组
+	
 	// 首先尝试获取GameInstance
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 无法获取GameInstance"));
+		// 如果游戏实例不存在，创建测试数据
 		CreateTestData();
 		return;
 	}
@@ -474,159 +460,170 @@ void UActivityNavMenuWidget::PopulateNavItemsFromSubsystem()
 	UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
 	if (!ActivitySub)
 	{
-		// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 无法获取ActivitySubsystem，尝试直接加载DataTable"));
+		// 如果活动子系统不存在
 		
 		// 备用方案：直接加载DataTable
 		LoadNavItemsFromDataTable();
 		return;
 	}
 	
-	// 获取所有活动配�?
+	// 获取所有活动配置
 	TArray<const FActivityInfoRow*> AllActivities = ActivitySub->GetAllNavItems();
 	
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 从Subsystem获取�?%d 个活�?), AllActivities.Num());
-	
+	// 清空现有的导航项数组
 	NavItems.Empty();
 	
+	// 遍历所有活动信息，创建对应的导航项
 	for (const FActivityInfoRow* ActivityInfo : AllActivities)
 	{
 		if (!ActivityInfo) continue;
 		
 		FActivityNavItem NavItem;
+		// 将活动ID转换为FName类型
 		NavItem.ActivityId = FName(*FString::FromInt(ActivityInfo->ActivityID));
+		// 设置链接的活动ID
 		NavItem.LinkedActivityId = NavItem.ActivityId;
 		// 注意：这里不再直接设置IconTexture，而是在创建Widget时从DataTable获取
 		
+		// 将新创建的导航项添加到数组
 		NavItems.Add(NavItem);
 		
-		// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 添加导航项 ActivityID=%d, NavId=%s, 标题=%s"), 
-            // 暂时注释掉有[[nodiscard]]问题的日志
 	}
 	
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 成功填充 %d 个导航项"), NavItems.Num());
 }
 
 void UActivityNavMenuWidget::LoadNavItemsFromDataTable()
 {
+	// 从数据表直接加载导航项数据
+	
 	// 先尝试直接加载DataTable
 	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
 	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
 	
 	if (!ActivityInfoTable)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 无法加载ActivityInfo DataTable: %s"), *InfoPath);
+		
 		// 如果加载失败，使用硬编码测试数据
 		CreateTestData();
 		return;
 	}
 	
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 成功加载ActivityInfo DataTable"));
 	
 	// 获取所有行数据
 	static const FString ContextString(TEXT("NavMenuContext"));
 	TArray<FActivityInfoRow*> AllRows;
 	ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
 	
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: DataTable中共�?%d 行数�?), AllRows.Num());
 	
+	// 清空现有的导航项数组
 	NavItems.Empty();
 	
-	// 筛选出导航项（CategoryHeader类型�?
+	// 筛选出导航项（CategoryHeader类型）
 	for (FActivityInfoRow* Row : AllRows)
 	{
 		if (Row && Row->ActivityType == EActivityType::CategoryHeader)
 		{
 			FActivityNavItem NavItem;
+			// 将活动ID转换为FName类型
 			NavItem.ActivityId = FName(*FString::FromInt(Row->ActivityID));
+			// 设置链接的活动ID
 			NavItem.LinkedActivityId = NavItem.ActivityId;
 			// 注意：图标纹理将在创建Widget时从DataTable获取
 			
+			// 将新创建的导航项添加到数组
 			NavItems.Add(NavItem);
 			
-			// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 添加导航项 ActivityID=%d, NavId=%s, 标题=%s"), 
-                // 暂时注释掉有[[nodiscard]]问题的日志
 		}
 	}
 	
-	// 按SortOrder排序
+	// 按ActivityID数字大小排序
 	NavItems.Sort([](const FActivityNavItem& A, const FActivityNavItem& B) {
-		// 这里需要通过ActivityId获取对应的ActivityInfo来比较SortOrder
 		// 简化处理：按ActivityId数字排序
 		return FCString::Atoi(*A.ActivityId.ToString()) < FCString::Atoi(*B.ActivityId.ToString());
 	});
 	
+	// 获取导航项数量（此变量当前未使用）
 	int32 NavItemCount = NavItems.Num();
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 直接加载完成，共 %d 个导航项"), NavItemCount);
 }
 
 void UActivityNavMenuWidget::LoadAllActivityItemsFromDataTable()
 {
+	// 从数据表加载所有活动项，而不仅仅是导航项
+	
 	// 直接加载DataTable
 	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
 	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
 	
 	if (!ActivityInfoTable)
 	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ActivityNavMenuWidget: 无法加载ActivityInfo DataTable: %s"), *InfoPath);
+		// 如果数据表加载失败，创建测试数据
 		CreateTestData();
 		return;
 	}
 	
-	UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载ActivityInfo DataTable"));
 	
 	// 获取所有行数据
 	static const FString ContextString(TEXT("NavMenuContext"));
 	TArray<FActivityInfoRow*> AllRows;
 	ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
 	
-	UE_LOG(LogTemp, Warning, TEXT("📊 DataTable中共有 %d 行数据"), AllRows.Num());
 	
+	// 清空现有的导航项数组
 	NavItems.Empty();
 	
-	// 为每一行创建导航项（显示所有活动）
+	// 为每一行创建导航项（显示所有活动，而不仅仅是CategoryHeader类型）
 	for (FActivityInfoRow* Row : AllRows)
 	{
 		if (Row)
 		{
 			FActivityNavItem NavItem;
+			// 将活动ID转换为FName类型
 			NavItem.ActivityId = FName(*FString::FromInt(Row->ActivityID));
+			// 设置链接的活动ID
 			NavItem.LinkedActivityId = NavItem.ActivityId;
 			
+			// 将新创建的导航项添加到数组
 			NavItems.Add(NavItem);
 			
-			UE_LOG(LogTemp, Warning, TEXT("添加导航项: ActivityID=%d, NavId=%s"), 
-				Row->ActivityID, *NavItem.ActivityId.ToString());
 		}
 	}
 	
-	// 按ActivityID排序
+	// 按ActivityID数字大小排序
 	NavItems.Sort([](const FActivityNavItem& A, const FActivityNavItem& B) {
+		// 按活动ID的数值进行升序排列
 		return FCString::Atoi(*A.ActivityId.ToString()) < FCString::Atoi(*B.ActivityId.ToString());
 	});
 	
-	UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载 %d 个导航项"), NavItems.Num());
+
 }
 
 FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 {
-	// 从DataTable获取活动显示名称
+	// 根据活动ID从DataTable获取活动的显示名称
+	
+	// 加载活动信息数据表
 	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
 	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
 	
 	if (ActivityInfoTable)
 	{
+		// 定义查找上下文字符串
 		static const FString ContextString(TEXT("NavMenuContext"));
+		// 将活动ID转换为整数
 		int32 TargetActivityId = FCString::Atoi(*ActivityId.ToString());
+		// 创建行名
 		FName RowName(*FString::FromInt(TargetActivityId));
 		
-		// 查找活动信息
+		// 尝试通过行名直接查找活动信息
 		FActivityInfoRow* ActivityInfo = ActivityInfoTable->FindRow<FActivityInfoRow>(RowName, ContextString);
 		
-		// 备用方案：全表遍历
+		// 备用方案：如果直接查找失败，则遍历整个表
 		if (!ActivityInfo)
 		{
+			// 获取所有行
 			TArray<FActivityInfoRow*> AllRows;
 			ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
+			// 遍历所有行寻找匹配的活动ID
 			for (FActivityInfoRow* Row : AllRows)
 			{
 				if (Row && Row->ActivityID == TargetActivityId)
@@ -637,124 +634,140 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 			}
 		}
 		
+		// 如果找到了活动信息且显示名称不为空，则返回该名称
 		if (ActivityInfo && !ActivityInfo->DisplayName.IsEmpty())
 		{
 			return ActivityInfo->DisplayName;
 		}
 	}
 	
-	// 如果找不到或为空，返回默认名称
+	// 如果找不到活动信息或名称为空，返回默认名称
 	return FText::FromString(FString::Printf(TEXT("活动 %s"), *ActivityId.ToString()));
 }
 
 FName UActivityNavMenuWidget::GetDefaultSelectedActivityId()
 {
-	// 从DataTable中查找设置了bIsDefaultSelected=true的活动
+	// 从DataTable中查找设置了bIsDefaultSelected=true的活动，返回其活动ID
 	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
 	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
 	
 	if (ActivityInfoTable)
 	{
+		// 定义查找上下文字符串
 		static const FString ContextString(TEXT("NavMenuContext"));
+		// 创建行数组存储所有数据
 		TArray<FActivityInfoRow*> AllRows;
+		// 获取数据表中的所有行
 		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
 		
+		// 遍历所有行，查找设置了默认选中的活动
 		for (FActivityInfoRow* Row : AllRows)
 		{
+			// 检查行是否有效且设置了默认选中标志
 			if (Row && Row->bIsDefaultSelected)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("✅ 找到默认选中活动: ID=%d, 标题=%s"), 
-					Row->ActivityID, *Row->DisplayName.ToString());
+				// 将活动ID转换为FName类型并返回
 				return FName(*FString::FromInt(Row->ActivityID));
 			}
 		}
 	}
 	
-	UE_LOG(LogTemp, Warning, TEXT("⚠️ 未找到设置为默认选中的活动"));
+	// 如果没有找到默认选中的活动，返回NAME_None
 	return NAME_None;
 }
 
 void UActivityNavMenuWidget::UpdateAllButtonsVisualState()
 {
-	UE_LOG(LogTemp, Warning, TEXT("🔄 更新所有按钮视觉状态"));
+	// 更新所有导航按钮的视觉状态，使其与内部数据状态保持一致
 	
 	// 遍历NavContainer中的所有子Widget
 	for (int32 i = 0; i < NavContainer->GetChildrenCount(); ++i)
 	{
+		// 获取子控件
 		UWidget* ChildWidget = NavContainer->GetChildAt(i);
+		// 尝试转换为活动导航按钮
 		UActivityNavButton* NavButton = Cast<UActivityNavButton>(ChildWidget);
 		
+		// 检查按钮是否有效且具有主按钮
 		if (NavButton && NavButton->MainButton)
 		{
 			// 根据NavItems中的状态更新按钮视觉
 			FName ButtonActivityId = NavButton->GetActivityId();
+			// 初始化选中状态为false
 			bool bShouldBeSelected = false;
 			
 			// 在NavItems中查找对应的选中状态
 			for (const FActivityNavItem& Item : NavItems)
 			{
+				// 查找与当前按钮匹配的活动项
 				if (Item.ActivityId == ButtonActivityId)
 				{
+					// 获取该项的选中状态
 					bShouldBeSelected = Item.bIsSelected;
+					// 找到匹配项后退出循环
 					break;
 				}
 			}
 			
 			// 更新按钮的选中状态
 			NavButton->SetSelected(bShouldBeSelected);
-			UE_LOG(LogTemp, Log, TEXT("按钮 [%s] 选中状态更新为: %s"), 
-				*ButtonActivityId.ToString(), bShouldBeSelected ? TEXT("选中") : TEXT("未选中"));
+			
 		}
 	}
 }
 
 void UActivityNavMenuWidget::CreateTestData()
 {
-	UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 使用测试数据"));
+	// 创建测试数据，用于在无法获取真实数据时提供基本功能演示
 	
+	// 清空现有的导航项数组
 	NavItems.Empty();
 	
 	// 创建测试导航项- 模拟实际的DataTable数据结构
 	FActivityNavItem TestItem1;
+	// 设置活动ID
 	TestItem1.ActivityId = FName(TEXT("101"));
+	// 设置链接的活动ID
 	TestItem1.LinkedActivityId = TestItem1.ActivityId;
+	// 设置初始选中状态为未选中
 	TestItem1.bIsSelected = false;
+	// 将测试项添加到导航项数组
 	NavItems.Add(TestItem1);
 	
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 创建了 %d 个测试导航项"), NavItems.Num());
 }
 
 // ==================== 页面管理实现 ====================
 
 void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 {
-	// UE_LOG(LogTemp, Warning, TEXT("=== SwitchToActivityPage 开始处�?ActivityId: %s ==="), *ActivityId.ToString());
+	// 根据活动ID切换到对应的活动页面
 	
 	// 检查PageContainer是否存在
 	if (!PageContainer)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: PageContainer未绑定，请在蓝图中设置页面容器"));
+		// 如果页面容器不存在，则返回
 		return;
 	}
 	else
 	{
-		// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: PageContainer存在，可见�? %d"), (int32)PageContainer->GetVisibility());
+		// PageContainer存在，可以继续执行
 	}
 	
 	// 从缓存中查找页面
 	UUserWidget* TargetPage = nullptr;
 	if (PageCache.Contains(ActivityId))
 	{
+		// 从缓存中获取页面
 		TargetPage = PageCache[ActivityId].Get();
 		if (!TargetPage)
 		{
 			// 如果缓存的对象已被销毁，从缓存中移除
 			PageCache.Remove(ActivityId);
-			// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 缓存页面已失效，移除缓存 [%s]"), *ActivityId.ToString());
+			
 		}
 		else
 		{
-			// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 从缓存加载页�?[%s]"), *ActivityId.ToString());
+			// 从缓存加载页面成功
 		}
 	}
 	
@@ -767,33 +780,37 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 		
 		if (!ActivityInfoTable)
 		{
-			UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 无法加载ActivityInfo DataTable: %s"), *InfoPath);
+			// 如果数据表加载失败
 			
-			// 回退到默认页�?
+			// 回退到默认页面
 			if (DefaultPageClass)
 			{
+				// 使用默认页面类创建页面
 				TargetPage = CreateActivityPage(DefaultPageClass);
 			}
 			else
 			{
-				UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 未设置DefaultPageClass"));
+				// 如果没有默认页面类，则返回
 				return;
 			}
 		}
 		else
 		{
-			// 从DataTable中查找对应ActivityID的配�?
+			// 从DataTable中查找对应ActivityID的配置
 			static const FString ContextString(TEXT("ActivityNavContext"));
 			TArray<FActivityInfoRow*> AllRows;
 			ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
 			
 			FActivityInfoRow* TargetConfig = nullptr;
+			// 将活动ID转换为整数
 			int32 TargetActivityId = FCString::Atoi(*ActivityId.ToString());
 			
+			// 遍历所有行，查找匹配的活动配置
 			for (FActivityInfoRow* Row : AllRows)
 			{
 				if (Row && Row->ActivityID == TargetActivityId)
 				{
+					// 找到目标配置
 					TargetConfig = Row;
 					break;
 				}
@@ -801,107 +818,117 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 			
 			if (!TargetConfig)
 			{
-				// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: DataTable中未找到ActivityID�?%d 的配置，使用默认页面"), TargetActivityId);
+				// 如果在DataTable中未找到活动配置
 				
-				// 回退到默认页�?
+				// 回退到默认页面
 				if (DefaultPageClass)
 				{
+					// 使用默认页面类创建页面
 					TargetPage = CreateActivityPage(DefaultPageClass);
 				}
 				else
 				{
-					UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 未设置DefaultPageClass"));
+					// 如果没有默认页面类，则返回
 					return;
 				}
 			}
 			else
 			{
-				// 使用DataTable中配置的目标页面�?
+				// 使用DataTable中配置的目标页面类
 				if (TargetConfig->TargetPageClass)
 				{
+					// 使用配置的页面类创建页面
 					TargetPage = CreateActivityPage(TargetConfig->TargetPageClass);
-					// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 使用DataTable配置的页面类 [%s]"), *TargetConfig->TargetPageClass->GetName());
+					
 				}
 				else
 				{
-					// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: ActivityID %d 未指定TargetPageClass，使用默认页�?), TargetActivityId);
+					// 如果活动ID未指定TargetPageClass
 					
-					// 回退到默认页�?
+					// 回退到默认页面
 					if (DefaultPageClass)
 					{
+						// 使用默认页面类创建页面
 						TargetPage = CreateActivityPage(DefaultPageClass);
 					}
 					else
 					{
-						UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 未设置DefaultPageClass"));
+						// 如果没有默认页面类，则返回
 						return;
 					}
 				}
 			}
 		}
 		
-		// 缓存新创建的页面
+		// 如果页面创建成功，缓存新创建的页面
 		if (TargetPage)
 		{
+			// 将页面添加到缓存中
 			PageCache.Add(ActivityId, TargetPage);
-			// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 创建并缓存页�?[%s]"), *ActivityId.ToString());
+			// 页面已创建并缓存
 		}
 	}
 	
 	// 显示页面
 	if (TargetPage)
 	{
+		// 在容器中显示页面
 		ShowPageInContainer(TargetPage);
-		// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 成功切换到页�?[%s]"), *ActivityId.ToString());
+		// 成功切换到目标页面
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 无法创建页面 [%s]"), *ActivityId.ToString());
+		// 目标页面为空，无法显示
 	}
 }
 
 UUserWidget* UActivityNavMenuWidget::CreateActivityPage(TSubclassOf<UUserWidget> PageClass)
 {
+	// 检查页面类是否有效
 	if (!PageClass)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: PageClass为空"));
+		// 如果页面类为空，返回空指针
 		return nullptr;
 	}
 	
+	// 使用指定的页面类创建新的页面小部件
 	UUserWidget* NewPage = CreateWidget<UUserWidget>(GetWorld(), PageClass);
 	if (NewPage)
 	{
-		// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 成功创建页面实例 [%s]"), *PageClass->GetName());
+		// 页面创建成功
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: 创建页面实例失败 [%s]"), *PageClass->GetName());
+		// 页面创建失败
 	}
 	
+	// 返回创建的页面，可能为nullptr
 	return NewPage;
 }
 
 void UActivityNavMenuWidget::ShowPageInContainer(UUserWidget* PageWidget)
 {
-	// UE_LOG(LogTemp, Warning, TEXT("=== ShowPageInContainer 开�?==="));
+	// 在容器中显示指定的页面小部件
 	
 	if (!PageContainer || !PageWidget)
 	{
-		UE_LOG(LogTemp, Error, TEXT("ActivityNavMenuWidget: PageContainer或PageWidget为空"));
+		// 如果页面容器或页面小部件为空，则返回
 		return;
 	}
 	else
 	{
-		// UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: PageContainer和PageWidget都存�?));
-		// UE_LOG(LogTemp, Warning, TEXT("PageContainer子项数量: %d"), PageContainer->GetChildrenCount());
+		// PageContainer和PageWidget都存在，可以继续执行
+		
 	}
 	
-	// 清理当前页面
+	// 清理当前页面，将其从父级移除
 	ClearCurrentPage();
 	
 	// 添加新页面到容器
 	PageContainer->AddChild(PageWidget);
+	// 设置页面可见性，允许用户交互
 	PageWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+	// 更新当前页面引用
 	CurrentPage = PageWidget;
 	
 	// 重要：设置Canvas Panel Slot填充全屏
@@ -915,24 +942,26 @@ void UActivityNavMenuWidget::ShowPageInContainer(UUserWidget* PageWidget)
 		// 设置Z轴顺序确保显示在最上层
 		CanvasSlot->SetZOrder(0);
 		
-		// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 成功设置Canvas Slot全屏锚点"));
+		// Canvas面板槽设置完成
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivityNavMenuWidget: 无法获取CanvasPanelSlot"));
+		// 页面小部件不是Canvas Panel类型，无法调整锚点
 	}
 	
-	// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 页面已添加到容器并设为可�?));
-	// UE_LOG(LogTemp, Warning, TEXT("PageContainer子项数量(添加�?: %d"), PageContainer->GetChildrenCount());
-	// UE_LOG(LogTemp, Warning, TEXT("新页面可见�? %d"), (int32)PageWidget->GetVisibility());
+	// 页面已添加到容器并设置为可见
+	
 }
 
 void UActivityNavMenuWidget::ClearCurrentPage()
 {
+	// 检查当前页面是否有效
 	if (CurrentPage.IsValid())
 	{
+		// 将当前页面从父级控件中移除
 		CurrentPage->RemoveFromParent();
+		// 重置当前页面引用
 		CurrentPage.Reset();
-		// UE_LOG(LogTemp, Log, TEXT("ActivityNavMenuWidget: 当前页面已清�?));
+		// 当前页面已清除
 	}
 }

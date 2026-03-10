@@ -3,31 +3,36 @@
 
 void UActivityNavButton::NativeConstruct()
 {
+	// 调用父类构造函数
 	Super::NativeConstruct();
 	
-	// 设置初始状态
+	// 设置初始状态为未选中
 	SetSelected(false);
 	
 	// 隐藏红点
 	if (RedDotImage)
 	{
+		// 将红点图片设置为隐藏状态
 		RedDotImage->SetVisibility(ESlateVisibility::Collapsed);
 	}
 	
 	// 绑定按钮点击事件
 	if (MainButton)
 	{
+		// 将按钮点击事件绑定到OnMainButtonClicked函数
 		MainButton->OnClicked.AddDynamic(this, &UActivityNavButton::OnMainButtonClicked);
 	}
 }
 
 void UActivityNavButton::InitializeButton(FName InActivityId, const FText& InTitle, UTexture2D* InIconTexture)
 {
+	// 设置活动ID
 	ActivityId = InActivityId;
 	
 	// 设置标题
 	if (TitleText)
 	{
+		// 将文本控件设置为传入的标题
 		TitleText->SetText(InTitle);
 	}
 	
@@ -37,40 +42,43 @@ void UActivityNavButton::InitializeButton(FName InActivityId, const FText& InTit
 	// 确保按钮可见
 	if (MainButton)
 	{
+		// 设置主按钮为可见状态
 		MainButton->SetVisibility(ESlateVisibility::Visible);
 	}
 	
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavButton: 初始化完成，活动ID: %s，图标设置需在蓝图中完成"), *ActivityId.ToString());
+	// 按钮初始化完成
 }
 
 void UActivityNavButton::SetSelected(bool bInIsSelected)
 {
+	// 设置按钮的选中状态
 	bIsSelected = bInIsSelected;
-	
+
 	// 更新选中状态指示器
 	if (SelectionIndicator)
 	{
+		// 根据选中状态设置指示器的可见性
 		SelectionIndicator->SetVisibility(bIsSelected ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
-	
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavButton: 设置选中状态 [%s] 为 %s"), 
-		   *ActivityId.ToString(), bIsSelected ? TEXT("选中") : TEXT("未选中"));
+
+	// 选中状态设置完成
 }
 
 void UActivityNavButton::SetRedDot(bool bShowRedDot, int32 RedDotValue)
 {
+	// 如果红点图片存在
 	if (RedDotImage)
 	{
+		// 根据是否显示红点的标志设置红点图片的可见性
 		RedDotImage->SetVisibility(bShowRedDot ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
 	
-	UE_LOG(LogTemp, Log, TEXT("ActivityNavButton: 设置红点状态 [%s] 显示:%s 数值:%d"), 
-		   *ActivityId.ToString(), bShowRedDot ? TEXT("是") : TEXT("否"), RedDotValue);
+	// 红点状态设置完成
 }
 
 void UActivityNavButton::OnMainButtonClicked()
 {
-	UE_LOG(LogTemp, Warning, TEXT("🎯 ActivityNavButton被点击，活动ID: %s"), *ActivityId.ToString());
+	// 按钮被点击时的处理函数
 	
 	// 触发普通委托（支持Lambda）
 	OnButtonClicked.Broadcast();
