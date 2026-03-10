@@ -488,7 +488,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 			NewRecord.RewardIconIndex = PreviousRecord->RewardIconIndex;
 			// 🔧 注意：TaskCompleteCounts 和 TaskClaimStatus 保持为默认值 0，不继承
 			UE_LOG(LogTemp, Log, TEXT("📊 继承第%d天的部分数据创建第%d天记录（仅经验值和图标索引）"), RecordDate -1, RecordDate);
-			UE_LOG(LogTemp, Log, TEXT("  ✅ 继承经验值：%.0f"), NewRecord.CurrentExperience);
+			UE_LOG(LogTemp, Log, TEXT("  ✅ 继承经验值：%d"), NewRecord.CurrentExperience);
 			UE_LOG(LogTemp, Log, TEXT("  ✅ 继承图标索引：%d"), NewRecord.RewardIconIndex);
 			UE_LOG(LogTemp, Log, TEXT("  ❌ 不继承任务完成数（保持为 0）"));
 			UE_LOG(LogTemp, Log, TEXT("  ❌ 不继承任务领取状态（保持为 0）"));
@@ -499,7 +499,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	
 	// 🔧 最终验证：确保任务数据为 0
 	UE_LOG(LogTemp, Log, TEXT("\n🔍 最终验证新记录数据:"));
-	UE_LOG(LogTemp, Log, TEXT("  经验值：%.0f"), NewRecord.CurrentExperience);
+	UE_LOG(LogTemp, Log, TEXT("  经验值：%d"), NewRecord.CurrentExperience);
 	UE_LOG(LogTemp, Log, TEXT("  图标索引：%d"), NewRecord.RewardIconIndex);
 	UE_LOG(LogTemp, Log, TEXT("  任务完成数数组大小：%d"), NewRecord.TaskCompleteCounts.Num());
 	for (int32 i = 0; i < NewRecord.TaskCompleteCounts.Num(); ++i)
