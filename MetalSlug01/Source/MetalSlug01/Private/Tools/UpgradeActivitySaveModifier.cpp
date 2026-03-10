@@ -478,14 +478,14 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	}
 	
 	UE_LOG(LogTemp, Log, TEXT("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-	UE_LOG(LogTemp, Log, TEXT("🔍 【初始化后验证】刚创建时的任务数据:"));
+	UE_LOG(LogTemp, Log, TEXT("【Upgrade.CreateRecord - 初始化后验证】刚创建时的任务数据:"));
 	UE_LOG(LogTemp, Log, TEXT("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-	UE_LOG(LogTemp, Log, TEXT("  📊 TaskCompleteCounts 数组内容 (应该全为 0):"));
+	UE_LOG(LogTemp, Log, TEXT("📊 TaskCompleteCounts 数组内容 (应该全为 0):"));
 	for (int32 i = 0; i < NewRecord.TaskCompleteCounts.Num(); ++i)
 	{
 		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.TaskCompleteCounts[i]);
 	}
-	UE_LOG(LogTemp, Log, TEXT("  📊 TaskClaimStatus 数组内容 (应该全为 0):"));
+	UE_LOG(LogTemp, Log, TEXT("📊 TaskClaimStatus 数组内容 (应该全为 0):"));
 	for (int32 i = 0; i < NewRecord.TaskClaimStatus.Num(); ++i)
 	{
 		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.TaskClaimStatus[i]);
@@ -498,12 +498,12 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 		if (PreviousRecord)
 		{
 			UE_LOG(LogTemp, Log, TEXT("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-			UE_LOG(LogTemp, Log, TEXT("🔄【继承检查】第%d天 → 第%d天"), RecordDate - 1, RecordDate);
+			UE_LOG(LogTemp, Log, TEXT("【Upgrade.CreateRecord - 继承检查】第%d天 → 第%d天"), RecordDate - 1, RecordDate);
 			UE_LOG(LogTemp, Log, TEXT("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 			
 			// 显示前一天的数据
 			UE_LOG(LogTemp, Log, TEXT("  📋 前一天 (第%d天) 的数据:"), RecordDate - 1);
-			UE_LOG(LogTemp, Log, TEXT("    经验值：%.0f"), PreviousRecord->CurrentExperience);
+			UE_LOG(LogTemp, Log, TEXT("    经验值：%d"), PreviousRecord->CurrentExperience);
 			UE_LOG(LogTemp, Log, TEXT("    图标索引：%d"), PreviousRecord->RewardIconIndex);
 			UE_LOG(LogTemp, Log, TEXT("    TaskCompleteCounts:"));
 			for (int32 i = 0; i < PreviousRecord->TaskCompleteCounts.Num(); ++i)
@@ -521,7 +521,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 			NewRecord.RewardIconIndex = PreviousRecord->RewardIconIndex;
 			
 			UE_LOG(LogTemp, Log, TEXT("\n  ✅ 继承操作:"));
-			UE_LOG(LogTemp, Log, TEXT("    ✓ 经验值：%.0f"), NewRecord.CurrentExperience);
+			UE_LOG(LogTemp, Log, TEXT("    ✓ 经验值：%d"), NewRecord.CurrentExperience);
 			UE_LOG(LogTemp, Log, TEXT("    ✓ 图标索引：%d"), NewRecord.RewardIconIndex);
 			UE_LOG(LogTemp, Log, TEXT("    ✗ 任务完成数：保持为 0 (不继承)"));
 			UE_LOG(LogTemp, Log, TEXT("    ✗ 任务领取状态：保持为 0 (不继承)"));
@@ -531,7 +531,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	NewRecord.LastUpdateTime = FDateTime::Now();
 	
 	UE_LOG(LogTemp, Log, TEXT("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-	UE_LOG(LogTemp, Log, TEXT("🔍 【最终验证】准备写入 SaveGame 前的完整数据:"));
+	UE_LOG(LogTemp, Log, TEXT("【Upgrade.CreateRecord - 最终验证】准备写入 SaveGame 前的完整数据:"));
 	UE_LOG(LogTemp, Log, TEXT("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 	UE_LOG(LogTemp, Log, TEXT("  📊 基础数据:"));
 	UE_LOG(LogTemp, Log, TEXT("    RecordDate: %d"), NewRecord.RecordDate);
@@ -565,7 +565,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	TargetSubsystem->GetRecord() = NewRecord;
 		
 	UE_LOG(LogTemp, Log, TEXT("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-	UE_LOG(LogTemp, Log, TEXT("🔍 【写入后验证】SaveGame.UpgradeRewardRecords 中的数据:"));
+	UE_LOG(LogTemp, Log, TEXT("【Upgrade.CreateRecord - 写入后验证】SaveGame.UpgradeRewardRecords 中的数据:"));
 	UE_LOG(LogTemp, Log, TEXT("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 	const FUpgradeRewardSaveRecord& RecordRef = SaveGame->UpgradeRewardRecords[RecordDate];
 	UE_LOG(LogTemp, Log, TEXT("  📊 TaskCompleteCounts:"));
@@ -980,85 +980,20 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 							UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 							if (Subsystem)
 							{
-								// 直接操作UpgradeActivitySubsystem内存数据
+								// 🔧 直接调用 CreateNewRecord 函数
 								UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
 								UE_LOG(LogTemp, Log, TEXT("🔧 MEMORY_DATA_CREATION_START"));
-								UE_LOG(LogTemp, Log, TEXT("Subsystem地址: %p"), Subsystem);
-								UE_LOG(LogTemp, Log, TEXT("📊 创建记录: RecordDate=%d, Inherit=%s"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
-								UE_LOG(LogTemp, Log, TEXT("⏰ 操作时间: %s"), *FDateTime::Now().ToString());
-								UE_LOG(LogTemp, Log, TEXT("运行时模式: 仅内存操作，不写入磁盘"));
+								UE_LOG(LogTemp, Log, TEXT("🆔 Subsystem 地址：%p"), Subsystem);
+								UE_LOG(LogTemp, Log, TEXT("📊 创建新记录：RecordDate=%d"), RecordDate);
+								UE_LOG(LogTemp, Log, TEXT("⏰ 创建时间：%s"), *FDateTime::Now().ToString());
+								UE_LOG(LogTemp, Log, TEXT("运行时模式：仅内存操作，不写入磁盘"));
 								UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-																						
-								// 获取当前记录的副本以避免直接修改引用
-								FUpgradeRewardSaveRecord ModifiedRecord = Subsystem->GetRecord();
-																							
-								// 🔧 核心业务逻辑：判断是否需要继承前一天数据
-								if (bInherit && RecordDate > 1)
-								{
-									// 获取前一天的记录日期
-									int32 PreviousDay = RecordDate - 1;
-																							
-									// 🔧 重要：直接从内存中的 Subsystem 获取前一天的记录，而不是从磁盘
-									// 因为游戏运行过程中不会保存到磁盘
-									const FUpgradeRewardSaveRecord* PreviousRecordPtr = Subsystem->GetRecordByDate(PreviousDay);
-																							
-									if (PreviousRecordPtr)
-									{
-										UE_LOG(LogTemp, Log, TEXT("🔧 INHERIT_PREVIOUS_DAY_DATA_START"));
-										UE_LOG(LogTemp, Log, TEXT("📊 继承第 %d 天数据到第 %d 天（从 AllRecords 表格）"), PreviousDay, RecordDate);
-																							
-										// 🔧 继承关键字段
-										ModifiedRecord.SetRecordDate(RecordDate);
-										ModifiedRecord.CurrentExperience = PreviousRecordPtr->CurrentExperience; // 继承经验
-										ModifiedRecord.RewardIconIndex = PreviousRecordPtr->RewardIconIndex; // 继承图标索引
-										ModifiedRecord.LimitedActivityCompleteCount = PreviousRecordPtr->LimitedActivityCompleteCount; // 继承活动完成次数
-																							
-										// 继承宝箱领取状态（已领取的宝箱继续保留）
-										ModifiedRecord.ChestClaimStatus = PreviousRecordPtr->ChestClaimStatus;
-																							
-										// 继承任务完成数量（已完成的任务进度保留）
-										ModifiedRecord.TaskCompleteCounts = PreviousRecordPtr->TaskCompleteCounts;
-																							
-										// 继承任务领取状态（已领取的任务标记保留）
-										ModifiedRecord.TaskClaimStatus = PreviousRecordPtr->TaskClaimStatus;
-																							
-										ModifiedRecord.LastUpdateTime = FDateTime::Now();
-										ModifiedRecord.CreatedTime = PreviousRecordPtr->CreatedTime; // 保持原始创建时间
-																							
-										UE_LOG(LogTemp, Log, TEXT("✅ 继承完成 - Experience: %d, IconIndex: %d, ChestCount: %d, TaskCount: %d"), 
-											ModifiedRecord.CurrentExperience, ModifiedRecord.RewardIconIndex, 
-											ModifiedRecord.ChestClaimStatus.Num(), ModifiedRecord.TaskCompleteCounts.Num());
-										UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
-									}
-									else
-									{
-										UE_LOG(LogTemp, Warning, TEXT("⚠️ AllRecords 表格中没有第 %d 天的记录，无法继承，将创建全新记录"), PreviousDay);
-										// 初始化全新记录
-										InitializeNewRecord(ModifiedRecord, RecordDate);
-									}
-								}
-								else
-								{
-									// 不继承或第一天，初始化全新记录
-									UE_LOG(LogTemp, Log, TEXT("🆕 创建全新记录（不继承或为第 1 天）"));
-									InitializeNewRecord(ModifiedRecord, RecordDate);
-	}
-																							
-								// 🔧 重要：游戏运行过程中不保存到磁盘
-								// 数据已经在内存中，游戏关闭时会统一保存
-								UE_LOG(LogTemp, Log, TEXT("📝 新记录已创建在内存中 - RecordDate=%d（游戏关闭时保存）"), RecordDate);
-																							
-								// 🔧 关键：将新记录添加到 AllRecords 表格中
-								Subsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
-													
-								// 同时更新 CurrentRecord
-								Subsystem->GetRecord() = ModifiedRecord;
-								UE_LOG(LogTemp, Log, TEXT("✅ 新记录已添加到 AllRecords 表格 [%d]"), RecordDate);
-																								
-								// 强制刷新所有页面，重新获取内存数据
+								
+								bool bSuccess = CreateNewRecord(RecordDate, bInherit, false);
+								
 								ForceRefreshAllPages();
-												
-								UE_LOG(LogTemp, Log, TEXT("Upgrade控制台: 创建记录 RecordDate=%d Inherit=%s 成功"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
+								
+								UE_LOG(LogTemp, Log, TEXT("✅ Upgrade 控制台：创建记录 RecordDate=%d Inherit=%s 成功"), RecordDate, bInherit ? TEXT("是") : TEXT("否"));
 								return;
 							}
 						}
