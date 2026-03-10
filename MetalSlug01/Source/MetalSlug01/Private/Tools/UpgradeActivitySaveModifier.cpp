@@ -476,6 +476,18 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	{
 		NewRecord.ChestClaimStatus[i] = 0;
 	}
+	
+	UE_LOG(LogTemp, Log, TEXT("\n🔍 初始化后验证:"));
+	UE_LOG(LogTemp, Log, TEXT("  TaskCompleteCounts 数组内容:"));
+	for (int32 i = 0; i < NewRecord.TaskCompleteCounts.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.TaskCompleteCounts[i]);
+	}
+	UE_LOG(LogTemp, Log, TEXT("  TaskClaimStatus 数组内容:"));
+	for (int32 i = 0; i < NewRecord.TaskClaimStatus.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.TaskClaimStatus[i]);
+	}
 
 	if (bInheritPrevious && RecordDate > 1 && SaveGame)
 	{
@@ -525,8 +537,21 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	}
 	SaveGame->UpgradeRewardRecords.Add(RecordDate, NewRecord);
 	
-	// 同时更新TargetSubsystem的CurrentRecord
+	// 同时更新 TargetSubsystem 的 CurrentRecord
 	TargetSubsystem->GetRecord() = NewRecord;
+		
+	UE_LOG(LogTemp, Log, TEXT("\n🔍 写入 AllRecords 前的数据:"));
+	const FUpgradeRewardSaveRecord& RecordRef = SaveGame->UpgradeRewardRecords[RecordDate];
+	UE_LOG(LogTemp, Log, TEXT("  TaskCompleteCounts:"));
+	for (int32 i = 0; i < RecordRef.TaskCompleteCounts.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, RecordRef.TaskCompleteCounts[i]);
+	}
+	UE_LOG(LogTemp, Log, TEXT("  TaskClaimStatus:"));
+	for (int32 i = 0; i < RecordRef.TaskClaimStatus.Num(); ++i)
+	{
+		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, RecordRef.TaskClaimStatus[i]);
+	}
 	
 	// 🔧 修复：将新记录添加到 AllRecords 表格中
 	TargetSubsystem->AddOrUpdateRecord(RecordDate, NewRecord);
