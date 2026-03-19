@@ -22,6 +22,11 @@ class METALSLUG01_API UAccountSubsystem : public UGameInstanceSubsystem
 	GENERATED_BODY()
 
 public:
+	
+	// 【新增】：标记玩家是不是刚从房间里退出来
+	UPROPERTY(BlueprintReadWrite, Category = "State")
+	bool bIsReturningFromRoom = false;
+	
 	// 重写子系统的初始化生命周期函数，游戏刚启动时自动触发
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 
@@ -38,6 +43,39 @@ public:
 	// 传入玩家想要注册的账号和密码，如果账号已存在返回 false，成功注册返回 true
 	UFUNCTION(BlueprintCallable, Category = "Account")
 	bool TryRegister(const FString& Username, const FString& Password);
+	
+	// 【新增】检查某个账号是否已经在线
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	bool IsAccountOnline(const FString& Username);
+
+	// 【新增】执行登出操作（解除状态锁）
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	void Logout();
+
+	// 【新增】重写子系统销毁函数（当玩家点右上角X关闭游戏时自动触发）
+	virtual void Deinitialize() override;
+	
+	// 【新增】获取当前登录的玩家账号名
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	FString GetCurrentLoggedInUser() const { return CurrentLoggedInUser; }
+	
+	// ==========================================
+	// 战备偏好记忆功能
+	// ==========================================
+	
+	// 获取当前账号上次选中的角色名
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	FString GetLastSelectedCharacter();
+
+	// 实时保存当前账号选中的角色名到硬盘
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	void SaveLastSelectedCharacter(const FString& CharacterName);
+	
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	FString GetLastSelectedWeapon(int32 BackpackSlot); // 传入 1 或 2
+
+	UFUNCTION(BlueprintCallable, Category = "Account")
+	void SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName);
 
 private:
 	// ==========================================
@@ -57,4 +95,7 @@ private:
 
 	// 私有底层工具：将当前内存中的 AccountData 数据，物理写入到硬盘的 .sav 文件中
 	void SaveDataToDisk();
+	
+	// 【新增】记录当前这个游戏窗口登录的账号名
+	FString CurrentLoggedInUser;
 };

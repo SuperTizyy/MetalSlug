@@ -4,10 +4,13 @@
 #include "Components/Button.h"
 #include "Components/EditableTextBox.h"
 #include "Components/TextBlock.h"
+#include "Kismet/KismetSystemLibrary.h" // 核心：包含 QuitGame 退出游戏的函数
 // 包含提供游戏基础静态函数的头文件
 #include "Kismet/GameplayStatics.h"
-// 【关键新增】包含我们刚刚写好的全局账号子系统，用于真实的存取逻辑
+// 包含我们刚刚写好的全局账号子系统，用于真实的存取逻辑
 #include "UI/Login/Core/AccountSubsystem.h"
+// 包含玩家控制器的头文件
+#include "GameFramework/PlayerController.h"
 
 // 实现初始化函数，绑定 UI 按钮事件
 bool ULoginPage::Initialize()
@@ -34,6 +37,35 @@ bool ULoginPage::Initialize()
 	if (Text_Hint)
 	{
 		Text_Hint->SetVisibility(ESlateVisibility::Hidden);
+	}
+	
+	// 如果有密码框，设置为暗文
+	if (Input_Password) Input_Password->SetIsPassword(true);
+
+	// ==========================================
+	// 【关键修复】：强行抢夺鼠标控制权并显示光标！
+	// ==========================================
+	
+	// 获取当前世界的第一个玩家控制器 (也就是你自己)
+	APlayerController* PC = GetWorld()->GetFirstPlayerController();
+	if (PC)
+	{
+		// 1. 让鼠标光标显形
+		PC->SetShowMouseCursor(true);
+
+		// 2. 创建一个“纯 UI 输入模式”的数据结构
+		FInputModeUIOnly InputMode;
+		// 设置鼠标不要被死死锁在游戏窗口里（方便你双开测试时鼠标能移到外面）
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		
+		// 3. 把这个输入模式强行塞给玩家控制器
+		PC->SetInputMode(InputMode);
+	}
+	
+	// 【新增】：绑定退出游戏按钮
+	if (Btn_QuitGame)
+	{
+		Btn_QuitGame->OnClicked.AddDynamic(this, &ULoginPage::OnQuitGameClicked);
 	}
 
 	return true;
@@ -62,46 +94,53 @@ void ULoginPage::OnLoginButtonClicked()
 	{
 		// 从游戏实例中，获取我们自己写的账号大管家 (AccountSubsystem)
 		UAccountSubsystem* AccountSubsystem = GameInstance->GetSubsystem<UAccountSubsystem>();
-		
-		// 确保子系统存在，并调用它的 TryLogin 接口，把脏活累活全交给子系统去判断
-		if (AccountSubsystem && AccountSubsystem->TryLogin(Username, Password))
+		if (AccountSubsystem)
 		{
-			// 如果 TryLogin 返回 true，说明密码完全匹配，登录成功！
-			Text_Hint->SetText(FText::FromString(TEXT("登录成功！正在进入游戏...")));
-			Text_Hint->SetVisibility(ESlateVisibility::Visible);
-
-			// 【下一步解开注释即可进入游戏】
-			// 使用 UGameplayStatics 跳转到你的主战斗地图（假设叫 Test01 或 NewMap）
-			// UGameplayStatics::OpenLevel(GetWorld(), FName("Test01")); 
-			
-			//动态生成大厅 UI 并销毁登录 UI
-			// 检查我们是否在蓝图里配置了大厅菜单的类
-			if (GameMenuClass)
+			// ==========================================
+			// 【新增拦截】：先问大管家，这个号是不是被别人登了？
+			// ==========================================
+			if (AccountSubsystem->IsAccountOnline(Username))
 			{
-				// 使用 CreateWidget 在内存中生成大厅菜单的实例
-				UUserWidget* GameMenuWidget = CreateWidget<UUserWidget>(GetWorld(), GameMenuClass);
-				
-				// 确保生成成功
-				if (GameMenuWidget)
+				Text_Hint->SetText(FText::FromString(TEXT("该账号已在其他地方登录！")));
+				Text_Hint->SetVisibility(ESlateVisibility::Visible);
+				return; // 直接拦截，不往下走
+			}
+			// 确保子系统存在，并调用它的 TryLogin 接口，把脏活累活全交给子系统去判断
+			if (AccountSubsystem->TryLogin(Username, Password))
+			{
+				// 如果 TryLogin 返回 true，说明密码完全匹配，登录成功！
+				Text_Hint->SetText(FText::FromString(TEXT("登录成功！正在进入游戏...")));
+				Text_Hint->SetVisibility(ESlateVisibility::Visible);
+
+				// 【下一步解开注释即可进入游戏】
+				// 使用 UGameplayStatics 跳转到你的主战斗地图（假设叫 Test01 或 NewMap）
+				// UGameplayStatics::OpenLevel(GetWorld(), FName("Test01")); 
+			
+				//动态生成大厅 UI 并销毁登录 UI
+				// 检查我们是否在蓝图里配置了大厅菜单的类
+				if (GameMenuClass)
 				{
-					// 将大厅菜单添加到玩家的屏幕上
-					GameMenuWidget->AddToViewport();
+					// 使用 CreateWidget 在内存中生成大厅菜单的实例
+					UUserWidget* GameMenuWidget = CreateWidget<UUserWidget>(GetWorld(), GameMenuClass);
+				
+					// 确保生成成功
+					if (GameMenuWidget)
+					{
+						// 将大厅菜单添加到玩家的屏幕上
+						GameMenuWidget->AddToViewport();
 					
-					// 【过河拆桥】把自己（当前的登录页面）从屏幕上彻底销毁！
-					this->RemoveFromParent();
+						// 【过河拆桥】把自己（当前的登录页面）从屏幕上彻底销毁！
+						this->RemoveFromParent();
+					}
 				}
+				
 			}
 			else
 			{
-				// 防呆设计：如果你忘了在蓝图里配置，就在屏幕上打印红字警告你
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, TEXT("警告：GameMenuClass 未配置！请去 WBP_LoginMenu 蓝图里设置！"));
+				// 如果 TryLogin 返回 false，说明账号没找到或者密码错了
+				Text_Hint->SetText(FText::FromString(TEXT("账号不存在或密码错误！")));
+				Text_Hint->SetVisibility(ESlateVisibility::Visible);
 			}
-		}
-		else
-		{
-			// 如果 TryLogin 返回 false，说明账号没找到或者密码错了
-			Text_Hint->SetText(FText::FromString(TEXT("账号不存在或密码错误！")));
-			Text_Hint->SetVisibility(ESlateVisibility::Visible);
 		}
 	}
 }
@@ -145,4 +184,30 @@ void ULoginPage::OnRegisterButtonClicked()
 			Text_Hint->SetVisibility(ESlateVisibility::Visible);
 		}
 	}
+}
+
+void ULoginPage::OnQuitGameClicked()
+{
+	// ==========================================
+	// 1. 执行最后的数据保存逻辑
+	// ==========================================
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		{
+			// 【说明】：我们在切换武器/角色时，其实已经调用了 SaveLastSelectedCharacter 等函数存进硬盘了。
+			// 如果你的 AccountSubsystem 里有统一的类似 SaveAllData() 的函数，可以在这里调用一次做最后的兜底。
+			
+			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Green, TEXT("正在保存本地数据..."));
+		}
+	}
+
+	// ==========================================
+	// 2. 执行退出游戏指令
+	// ==========================================
+	// 获取当前的玩家控制器
+	APlayerController* SpecificPlayer = GetWorld()->GetFirstPlayerController();
+	
+	// 调用虚幻引擎底层的退出函数 (参数：当前上下文，控制器，退出方式，是否忽略未保存的关卡直接退)
+	UKismetSystemLibrary::QuitGame(this, SpecificPlayer, EQuitPreference::Quit, true);
 }

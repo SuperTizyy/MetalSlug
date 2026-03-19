@@ -8,9 +8,10 @@ public class MetalSlug01 : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "UMG", "Paper2D", "EnhancedInput", "GameplayTags", "Json", "JsonUtilities" });
-
-		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
+		PublicDependencyModuleNames.AddRange(new string[] { 
+			"Core", "CoreUObject", "Engine", "InputCore", "UMG", "Paper2D", 
+			"EnhancedInput", "GameplayTags", "Json", "JsonUtilities","Slate", 
+			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils" });
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });

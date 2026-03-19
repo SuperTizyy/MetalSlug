@@ -5,6 +5,7 @@
 #include "Components/TextBlock.h"
 // 包含场景跳转的工具头文件
 #include "Kismet/GameplayStatics.h"
+#include "UI/Login/Core/AccountSubsystem.h"
 
 // 实现初始化，绑定事件
 bool UGameMenuPage::Initialize()
@@ -42,13 +43,25 @@ void UGameMenuPage::OnSinglePlayerClicked()
 
 void UGameMenuPage::OnMultiplePlayerClicked()
 {
-	// 【局域网联机预留口】
-	// 未来在这里写创建监听服务器 (Listen Server) 或加入房间的代码
-	if (Text_Hint)
+	
+	// 【核心跳转逻辑】：动态生成局域网大厅 UI 并销毁当前主菜单
+	// 检查我们是否在蓝图里配置了局域网大厅的类
+	if (LANRoomClass)
 	{
-		Text_Hint->SetText(FText::FromString(TEXT("多人联机模式开发中，敬请期待！")));
-		Text_Hint->SetVisibility(ESlateVisibility::Visible);
+		// 使用 CreateWidget 在内存中生成局域网大厅菜单的实例
+		UUserWidget* LANRoomWidget = CreateWidget<UUserWidget>(GetWorld(), LANRoomClass);
+		
+		// 确保生成成功
+		if (LANRoomWidget)
+		{
+			// 将局域网大厅添加到玩家的屏幕上
+			LANRoomWidget->AddToViewport();
+			
+			// 【过河拆桥】把自己（当前的主菜单页面）从屏幕上彻底销毁！
+			this->RemoveFromParent();
+		}
 	}
+	
 }
 
 void UGameMenuPage::OnLeaderboardClicked()
@@ -63,7 +76,24 @@ void UGameMenuPage::OnLeaderboardClicked()
 
 void UGameMenuPage::OnBackToLoginClicked()
 {
+	// ==========================================
+	// 【新增防线】：点完瞬间把按钮禁用，彻底物理隔绝玩家的连环夺命点！
+	// ==========================================
+	if (Btn_BackToLogin)
+	{
+		Btn_BackToLogin->SetIsEnabled(false);
+	}
+	
+	// 获取子系统并执行登出解锁！
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UAccountSubsystem* AccountSubsystem = GI->GetSubsystem<UAccountSubsystem>())
+		{
+			AccountSubsystem->Logout();
+		}
+	}
+	
 	// 玩家点击返回，直接重新加载登录地图，瞬间回到解放前！
 	// 注意：这里的 "Map_Login" 必须替换为你实际的登录关卡名字
-	UGameplayStatics::OpenLevel(GetWorld(), FName("Map_Login")); 
+	UGameplayStatics::OpenLevel(GetWorld(), FName("L_Login")); 
 }

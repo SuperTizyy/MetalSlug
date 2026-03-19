@@ -53,6 +53,10 @@ protected:
 	// 绑定蓝图中的提示文本组件，用于给玩家显示“密码错误”、“注册成功”等信息
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* Text_Hint; 
+	
+	// 【新增】：关闭游戏按钮
+	UPROPERTY(meta = (BindWidget))
+	class UButton* Btn_QuitGame;
 
 private:
 	// ==========================================
@@ -67,4 +71,8 @@ private:
 	// 当玩家点击“注册”按钮时触发的函数
 	UFUNCTION()
 	void OnRegisterButtonClicked();
+	
+	// 关闭游戏按钮的点击响应函数
+	UFUNCTION()
+	void OnQuitGameClicked();
 };

@@ -20,6 +20,13 @@ class METALSLUG01_API UGameMenuPage : public UUserWidget
 {
 	GENERATED_BODY()
 
+public:
+	
+	// 暴露给蓝图的变量，用于在编辑器中选择你要跳转的局域网大厅蓝图类（WBP_LANRoom）
+	// EditDefaultsOnly 表示只能在蓝图的“类默认值”面板中修改
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<class UUserWidget> LANRoomClass;
+	
 protected:
 	// 重写初始化函数，用于绑定各个按钮的点击事件
 	virtual bool Initialize() override;

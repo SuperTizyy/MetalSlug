@@ -28,12 +28,35 @@ public:
 	UPROPERTY(SaveGame)
 	FString Password;
 	
+	// 在线状态锁，防止同一个账号被多开登录
+	UPROPERTY(SaveGame)
+	bool bIsOnline;
+	
+	// ==========================================
+	// 【新增】：记录该账号最后一次选择的战备角色
+	// ==========================================
+	UPROPERTY()
+	FString LastSelectedCharacter;
+	
+	// ==========================================
+	// 【新增】：记录该账号的武器背包配置
+	// ==========================================
+	UPROPERTY()
+	FString LastSelectedWeapon1; // 背包 1 的武器 ID (RowName)
+
+	UPROPERTY()
+	FString LastSelectedWeapon2; // 背包 2 的武器 ID (RowName)
+	
 	// 结构体的默认构造函数
 	FAccountRecord()
 	{
 		// 默认初始化为空字符串
 		Username = TEXT("");
 		Password = TEXT("");
+		bIsOnline = false; // 默认不在线
+		LastSelectedCharacter = TEXT("");
+		LastSelectedWeapon1 = TEXT("");
+		LastSelectedWeapon2 = TEXT("");
 	}
 
 	// 带有参数的构造函数，方便我们在注册时一行代码完成打包
@@ -41,5 +64,9 @@ public:
 	{
 		Username = InUsername;
 		Password = InPassword;
+		bIsOnline = false; // 注册时默认不在线
+		LastSelectedCharacter = TEXT("");
+		LastSelectedWeapon1 = TEXT("");
+		LastSelectedWeapon2 = TEXT("");
 	}
 };
