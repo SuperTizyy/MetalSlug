@@ -18,6 +18,12 @@ UCLASS()
 class METALSLUG01_API ULoginPage : public UUserWidget
 {
 	GENERATED_BODY()
+	
+public:	
+	// 暴露给蓝图的变量，用于在编辑器中选择你要跳转的大厅菜单蓝图类（WBP_GameMenu）
+	// EditDefaultsOnly 表示只能在蓝图的“类默认值”面板中修改
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<class UUserWidget> GameMenuClass;
 
 protected:
 	// 重写 UserWidget 的初始化函数，这是 UI 创建时最先调用的地方，我们在这里绑定按钮事件
