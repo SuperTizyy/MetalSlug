@@ -4,6 +4,9 @@
 #include "GameFramework/HUD.h"
 #include "MyGameHUD.generated.h"
 
+class UUserWidget;
+class UGameHUDWidget;
+
 UCLASS()
 class METALSLUG01_API AMyGameHUD : public AHUD
 {
@@ -12,11 +15,26 @@ class METALSLUG01_API AMyGameHUD : public AHUD
 protected:
 	virtual void BeginPlay() override;
 
-	// 你当前要看的页面
+public:
+	// 获取游戏HUD Widget（供角色调用）
+	UGameHUDWidget* GetGameHUDWidget() const { return GameHUDWidget; }
+
+protected:
+	// 主菜单Widget类
 	UPROPERTY(EditAnywhere, Category = "UI")
 	TSubclassOf<class UUserWidget> MainWidgetClass;
+
+	// 游戏HUD Widget类
+	UPROPERTY(EditAnywhere, Category = "UI")
+	TSubclassOf<UGameHUDWidget> GameHUDWidgetClass;
 
 private:
 	UPROPERTY()
 	UUserWidget* MainWidget;
+
+	UPROPERTY()
+	UGameHUDWidget* GameHUDWidget;
+
+	// 创建游戏HUD
+	void CreateGameHUD();
 };

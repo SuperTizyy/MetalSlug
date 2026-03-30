@@ -311,8 +311,11 @@ void URoomInsidePage::OnLeaveRoomClicked()
 
 void URoomInsidePage::OnStartGameClicked()
 {
-	// 只有房主能点！之后这里会调用 ServerTravel("真实战斗地图")
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Yellow, TEXT("点击了开始游戏"));
+	// 只有房主能点到这个按钮，所以我们直接呼叫对讲机，让服务器去执行严格的“查房”逻辑
+	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	{
+		PC->Server_RequestStartGame();
+	}
 }
 
 void URoomInsidePage::OnJoinRedTeamClicked()

@@ -6,6 +6,18 @@
 // 你的 .generated.h 必须放在最后一行
 #include "StaticTable.generated.h"
 
+class ABaseWeapon;
+
+// ==========================================
+// 【新增】：定义房间的状态机枚举
+// ==========================================
+UENUM(BlueprintType)
+enum class ERoomState : uint8
+{
+	WaitingInRoom UMETA(DisplayName = "大厅等待选人状态"),
+	BattleInProgress UMETA(DisplayName = "战斗进行状态")
+};
+
 // ==========================================
 // 角色信息配置表 (Data-Driven 核心底座)
 // ==========================================
@@ -53,7 +65,7 @@ public:
 	// 3. 真实的 3D 武器蓝图类 (用于传送到战斗地图后，真正生成并装备给玩家的武器)
 	// 如果你已经写了 ABaseWeapon 基类，可以把 AActor 换成 ABaseWeapon
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")
-	TSubclassOf<class AActor> WeaponBlueprint; 
+	TSubclassOf<class ABaseWeapon> WeaponBlueprint; 
 	
 	//轻击头部伤害
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")

@@ -35,16 +35,16 @@ public:
 	// ==========================================
 	// 【新增】：记录该账号最后一次选择的战备角色
 	// ==========================================
-	UPROPERTY()
+	UPROPERTY(SaveGame)
 	FString LastSelectedCharacter;
 	
 	// ==========================================
 	// 【新增】：记录该账号的武器背包配置
 	// ==========================================
-	UPROPERTY()
+	UPROPERTY(SaveGame)
 	FString LastSelectedWeapon1; // 背包 1 的武器 ID (RowName)
 
-	UPROPERTY()
+	UPROPERTY(SaveGame)
 	FString LastSelectedWeapon2; // 背包 2 的武器 ID (RowName)
 	
 	// 结构体的默认构造函数

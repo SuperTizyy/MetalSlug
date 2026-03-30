@@ -15,19 +15,24 @@ void ARoomPlayerController::BeginPlay()
 	// 但 UI 只能给“本地真实的玩家”生成！所以必须加 IsLocalPlayerController() 判断！
 	if (IsLocalPlayerController())
 	{
-		// 1. 让鼠标显示出来
-		bShowMouseCursor = true;
-		SetInputMode(FInputModeUIOnly());
+		// // 1. 让鼠标显示出来
+		// bShowMouseCursor = true;
+		// SetInputMode(FInputModeUIOnly());
+		
+		// 【测试阶段临时修改】：先把鼠标隐藏，把输入模式改回游戏！
+		bShowMouseCursor = false;
+		SetInputMode(FInputModeGameOnly());
 
-		// 2. 动态生成房间 UI 并显示在屏幕上
-		if (RoomUIClass)
-		{
-			RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
-			if (RoomUIWidget)
-			{
-				RoomUIWidget->AddToViewport();
-			}
-		}
+		// // 2. 动态生成房间 UI 并显示在屏幕上
+		// if (RoomUIClass)
+		// {
+		// 	RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
+		// 	if (RoomUIWidget)
+		// 	{
+		// 		RoomUIWidget->AddToViewport();
+		// 	}
+		// }
+		
 		// ==========================================
 		// 【核心修复】：不要立刻发 RPC！延迟 0.5 秒再发！
 		// 等待引擎底层彻底把客户端和服务器连接完毕！
@@ -35,6 +40,8 @@ void ARoomPlayerController::BeginPlay()
 		FTimerHandle DelayHandle;
 		GetWorld()->GetTimerManager().SetTimer(DelayHandle, this, &ARoomPlayerController::DelayedSendPlayerInfo, 2.0f, false);
 		
+		// 【新增】：立刻向服务器请求生成 3D 角色和武器！
+		Server_RequestSpawn();
 	}
 }
 
@@ -307,6 +314,79 @@ void ARoomPlayerController::Client_UpdateRoomUI_Implementation(const TArray<FStr
 	{
 		// 将房主名字一起传给 UI 页面
 		RoomUIWidget->UpdateTeamLists(RedTeam, BlueTeam, HostName);
+	}
+}
+
+void ARoomPlayerController::Server_RequestStartGame_Implementation()
+{
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	{
+		bool bAllRealPlayersReady = true;
+
+		// ==========================================
+		// 【终极检验】：遍历房间里所有连接的“真实玩家”！
+		// （注意：GetPlayerControllerIterator 天然只获取真人，完美避开 AI！）
+		// ==========================================
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
+			if (TargetPC)
+			{
+				// 房主自己（也就是发送请求的这个人）不需要准备，直接跳过检查
+				if (TargetPC == this) continue;
+
+				// 在 GameMode 的字典里查找这个真实玩家是否已准备
+				bool* bIsReady = GM->PlayerReadyStates.Find(TargetPC->MyPlayerName);
+				
+				// 如果字典里找不到他，或者他的状态是 false，说明有人没准备！
+				if (!bIsReady || !(*bIsReady))
+				{
+					bAllRealPlayersReady = false;
+					break; // 只要发现一个没准备的，立刻跳出循环，绝不留情！
+				}
+			}
+		}
+
+		if (bAllRealPlayersReady)
+		{
+			// ==========================================
+			// 所有人均已准备，执行开始游戏逻辑！
+			// ==========================================
+			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, TEXT("所有人均已准备，服务器即将开始游戏！"));
+			
+			// TODO: 在这里调用你真实的切换地图逻辑，例如：
+			// GetWorld()->ServerTravel(TEXT("/Game/Maps/你的战斗地图名字?listen"));
+		}
+		else
+		{
+			// ==========================================
+			// 有人没准备，给房主客户端发回一条系统提示！
+			// ==========================================
+			Client_ReceiveSystemMessage(TEXT("系统提示：房间内有玩家未准备无法开始游戏！"));
+		}
+	}
+}
+
+void ARoomPlayerController::Client_ReceiveSystemMessage_Implementation(const FString& Message)
+{
+	// 拿到服务器发来的警告后，命令大厅 UI 在聊天框里打印黄字！
+	if (RoomUIWidget)
+	{
+		RoomUIWidget->AddSystemMessageToChat(Message);
+	}
+}
+
+// ----------------------------------------------------
+// 【新增】战斗生成逻辑实现
+// ----------------------------------------------------
+void ARoomPlayerController::Server_RequestSpawn_Implementation()
+{
+	// 找咱们的服务器大脑 (RoomGameMode) 报到！
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	{
+		// 告诉大脑：这是我的对讲机，给我发枪！（我们下一步就去 RoomGameMode 里写这个函数）
+		// 传两个空字符串，GameMode 就会自动识别出我们要用“测试白模”
+		GM->HandlePlayerRequestSpawn(this, TEXT(""), TEXT(""));
 	}
 }
 

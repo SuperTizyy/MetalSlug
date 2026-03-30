@@ -49,6 +49,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RoomUI")
 	void UpdatePlayerReadyStateUI(const FString& PlayerName, bool bIsPlayerReady);
 	
+	// 点击开始游戏按钮
+	UFUNCTION() void OnStartGameClicked();
+	
+	// 【新增】：往聊天框发送系统提示
+	void AddSystemMessageToChat(const FString& Message);
+	
 protected:
 	
 	// 房间名称展示控件 (蓝图里务必命名为 Text_RoomName)
@@ -220,7 +226,7 @@ protected:
 private:
 	// 按钮点击事件
 	UFUNCTION() void OnLeaveRoomClicked();
-	UFUNCTION() void OnStartGameClicked();
+	
 	UFUNCTION() void OnJoinRedTeamClicked();
 	UFUNCTION() void OnJoinBlueTeamClicked();
 	UFUNCTION() void OnToggleReadyClicked();
@@ -297,6 +303,4 @@ private:
 	// 记忆上次确认添加的队伍
 	FString LastConfirmedAITeam;
 	
-	// 【新增】：往聊天框发送系统提示
-	void AddSystemMessageToChat(const FString& Message);
 };

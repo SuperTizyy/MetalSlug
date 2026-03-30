@@ -2,8 +2,11 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "RoomGameMode.generated.h"
 
+class ABaseCharacter;
+class ABaseWeapon;
 
 /**
  * 房间大厅的专属 GameMode（只在服务器/房主端运行）
@@ -52,7 +55,62 @@ public:
 	// 【新增】：更新某个人的准备状态并广播
 	void UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady);
 	
+	// ==========================================
+	// 【新增】：状态机与测试开关
+	// ==========================================
+	
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Game State")
+	ERoomState CurrentRoomState;
+
+	// 核心开关：勾选后进图直接开打，无视房间大厅！(纯测试刀战阶段极其好用)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Game State|Test")
+	bool bSkipRoomPhaseForTesting;
+
+	// ==========================================
+	// 【新增】：开发测试模式：默认发放的角色与武器
+	// ==========================================
+	UPROPERTY(EditDefaultsOnly, Category = "Game Data|Test Bypass")
+	TSubclassOf<ABaseCharacter> TestCharacterClass;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Game Data|Test Bypass")
+	TSubclassOf<ABaseWeapon> TestWeaponClass;
+
+	// ==========================================
+	// 【新增】：核心战斗生成接口
+	// ==========================================
+	// 处理玩家的生成请求
+	void HandlePlayerRequestSpawn(class APlayerController* PC, FString CharRowName, FString WeaponRowName);
+	
+	// AI 向上帝申请一个目标
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	class ABaseCharacter* RequestTargetForAI(class ABaseCharacter* RequestingAI);
+	
+	// 辅助函数 - 查一查这个倒霉蛋现在正被几个 AI 盯着？
+	int32 GetAttackerCount(ABaseCharacter* TargetEnemy);
+
+	// 释放记录 (参数改为请求释放的 AI)
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	void ReleaseTarget(ABaseCharacter* RequestingAI);
+	
 private:
 	// 【新增】：AI 的唯一编号生成器，防止同名 AI 无法精准踢出
 	int32 AINextID = 1;
+	
+protected:
+	// 真正执行生成和发枪的内部函数
+	void SpawnAndEquip(APlayerController* PC, TSubclassOf<ABaseCharacter> CharClass, TSubclassOf<ABaseWeapon> WeaponClass);
+	
+	// 记录目前哪些玩家正在被 AI 追杀（防止扎堆）
+	// Key = 猎物 (玩家), Value = 猎人 (追他的 AI)
+	UPROPERTY()
+	TMap<ABaseCharacter*, ABaseCharacter*> LockedTargets;
+	
+	// 遍历全场，找出对这个 AI 来说所有活着的敌人
+	TArray<class ABaseCharacter*> GetAllAliveEnemiesFor(class ABaseCharacter* RequestingAI);
+	
+	// 现在的账本记录的是：哪个 AI (Key) 正在追杀哪个敌人 (Value)
+	// 这样的好处是：一个敌人可以被多个 AI 追，我们只要数一数 Value 出现的次数就行了！
+	UPROPERTY()
+	TMap<ABaseCharacter*, ABaseCharacter*> AIHuntingMap;
+	
 };

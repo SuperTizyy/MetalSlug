@@ -2,8 +2,18 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
-#include "GameFramework/CharacterMovementComponent.h"
+#include "InputActionValue.h" // 增强输入系统所需
 #include "BaseCharacter.generated.h"
+
+
+// 前置声明，避免在此处引入不必要的头文件导致互相包含报错
+class UInputMappingContext;
+class USpringArmComponent;	
+class UInputAction;
+class UCameraComponent;
+class USkeletalMeshComponent;
+class ABaseWeapon; // 我们新建的武器基类
+class UGameHUDWidget;
 
 UCLASS()
 class METALSLUG01_API ABaseCharacter : public ACharacter
@@ -11,282 +21,335 @@ class METALSLUG01_API ABaseCharacter : public ACharacter
 	GENERATED_BODY()
 
 public:
-	// 构造函数
 	ABaseCharacter();
 
+	// 必须重写这个函数来同步网络变量（如生命值）
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	
+	// 当前的攻击动作是否锁死了移动？
+	UPROPERTY(BlueprintReadOnly, Category = "Combat")
+	bool bIsMovementLocked = false;
+	
+	// 暴露给外部或蓝图调用的生死状态获取接口
+	UFUNCTION(BlueprintCallable, Category = "Stats")
+	bool GetIsDead() const { return bIsDead; }
+	
+	// ==========================================
+	// 阵营系统 (0=人类, 1=丧尸)
+	// ==========================================
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Team")
+	uint8 TeamID = 0; // 默认是人类
+
+	// 提供给 AI 和 GameMode 调用的公开接口
+	UFUNCTION(BlueprintCallable, Category = "Combat|Team")
+	uint8 GetTeamID() const { return TeamID; }
+	
+	// 开放给外部检查生死的只读接口
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "State")
+	bool IsDead() const { return bIsDead; }
+
 protected:
-	// 游戏开始时调用
 	virtual void BeginPlay() override;
 
 public:	
-	// 每帧调用
 	virtual void Tick(float DeltaTime) override;
-
-	// 初始化组件
-	virtual void PostInitializeComponents() override;
-
-	// 输入绑定
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
-
-	// 移动输入处理
-	void MoveForward(float Value);
-	void MoveRight(float Value);
-
-	// 跳跃输入处理
-	void JumpInput();
-	void StopJumping();
-
-	// 基础移动能力
-	UFUNCTION(BlueprintCallable, Category = "Movement")
-	virtual void BasicMove(const FVector& Direction);
-
-	// 预留复杂移动接口 - 爬墙功能
-	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Advanced Movement")
-	void WallClimb();
-	virtual void WallClimb_Implementation();
-
-	// 预留复杂移动接口 - 滑铲功能
-	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Advanced Movement")
-	void Slide();
-	virtual void Slide_Implementation();
-
-	// 预留复杂移动接口 - 潜水功能
-	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Advanced Movement")
-	void Dive();
-	virtual void Dive_Implementation();
-
-	// 获取移动速度
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE float GetMovementSpeed() const { return MovementSpeed; }
-
-	// 设置移动速度
-	UFUNCTION(BlueprintCallable, Category = "Movement")
-	virtual void SetMovementSpeed(float NewSpeed);
-
-	// 获取最大生命值
-	UFUNCTION(BlueprintPure, Category = "Health")
-	FORCEINLINE float GetMaxHealth() const { return MaxHealth; }
-
-	// 获取当前生命值
-	UFUNCTION(BlueprintPure, Category = "Health")
-	FORCEINLINE float GetCurrentHealth() const { return CurrentHealth; }
-
-	// 设置当前生命值
-	UFUNCTION(BlueprintCallable, Category = "Health")
-	void SetCurrentHealth(float NewHealth);
-
-	// 受伤函数
-	UFUNCTION(BlueprintCallable, Category = "Combat")
+	
 	virtual float TakeDamage(float DamageAmount, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, AActor* DamageCauser) override;
 
-	// 死亡函数
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	virtual void Die();
-
-	// 是否存活
-	UFUNCTION(BlueprintPure, Category = "Combat")
-	FORCEINLINE bool IsAlive() const { return bIsAlive; }
-
-	// 获取角色等级
-	//UFUNCTION(BlueprintPure, Category = "Character Stats")
-	FORCEINLINE int32 GetLevel() const { return Level; }
-
-	// 提升角色等级
-	UFUNCTION(BlueprintCallable, Category = "Character Stats")
-	void LevelUp();
-
-	// 获取当前动画状态
-	UFUNCTION(BlueprintPure, Category = "Animation")
-	FORCEINLINE ECharacterAnimationState GetAnimationState() const { return AnimationState; }
-
-	// 设置动画状态 - 用于蓝图中切换动画
-	UFUNCTION(BlueprintCallable, Category = "Animation")
-	void SetAnimationState(ECharacterAnimationState NewState);
-
-	// 获取角色类型
-	UFUNCTION(BlueprintPure, Category = "Character Info")
-	FORCEINLINE ECharacterType GetCharacterType() const { return CharacterType; }
-
-	// 设置角色类型
-	UFUNCTION(BlueprintCallable, Category = "Character Info")
-	void SetCharacterType(ECharacterType NewType);
-
-	// 获取移动状态
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE EMovementState GetMovementState() const { return MovementState; }
-
-	// 更新移动状态
-	UFUNCTION(BlueprintCallable, Category = "Movement")
-	void UpdateMovementState();
-
-	// 获取当前移动速度
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE float GetCurrentMovementSpeed() const { return CurrentMovementSpeed; }
-
-	// 检查是否在地面
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE bool IsOnGround() const { return GetCharacterMovement()->IsMovingOnGround(); }
-
-	// 检查是否在空中
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE bool IsInAir() const { return !GetCharacterMovement()->IsMovingOnGround(); }
-
-	// 检查是否在水中
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE bool IsInWater() const { return GetCharacterMovement()->IsSwimming(); }
-
-	// 检查是否在爬墙
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE bool IsClimbing() const { return GetCharacterMovement()->GetCurrentAcceleration().Size() > 0 && 
-										  GetCharacterMovement()->IsCrouching(); }
-
-	// 检查是否在滑行
-	UFUNCTION(BlueprintPure, Category = "Movement")
-	FORCEINLINE bool IsSliding() const { return GetCharacterMovement()->Velocity.Size() > MovementSpeed * 1.5f && 
-										 GetCharacterMovement()->IsCrouching(); }
-
-	// 获取角色ID
-	UFUNCTION(BlueprintPure, Category = "Character Control")
-	FORCEINLINE EControlledCharacterID GetCharacterID() const { return CharacterID; }
-
-	// 设置角色ID
-	UFUNCTION(BlueprintCallable, Category = "Character Control")
-	void SetCharacterID(EControlledCharacterID NewID);
-
-	// 获取玩家索引
-	UFUNCTION(BlueprintPure, Category = "Player Control")
-	FORCEINLINE EPlayerIndex GetPlayerIndex() const { return PlayerIndex; }
-
-	// 设置玩家索引
-	UFUNCTION(BlueprintCallable, Category = "Player Control")
-	void SetPlayerIndex(EPlayerIndex NewPlayerIndex);
-
-	// 检查是否为指定玩家控制的角色
-	UFUNCTION(BlueprintPure, Category = "Player Control")
-	FORCEINLINE bool IsControlledByPlayer(EPlayerIndex CheckPlayerIndex) const { return PlayerIndex == CheckPlayerIndex; }
-
-	// 获取玩家ID（从控制器获取）
-	UFUNCTION(BlueprintPure, Category = "Player Control")
-	int32 GetPlayerID() const;
-
-	// 切换到下一个角色
-	UFUNCTION(BlueprintCallable, Category = "Character Control")
-	void SwitchToNextCharacter();
-
-	// 切换到上一个角色
-	UFUNCTION(BlueprintCallable, Category = "Character Control")
-	void SwitchToPreviousCharacter();
-
-	// 检查是否为当前控制的角色
-	UFUNCTION(BlueprintPure, Category = "Character Control")
-	FORCEINLINE bool IsCurrentControlled() const { return bIsCurrentControlled; }
-
-	// 设置为当前控制的角色
-	UFUNCTION(BlueprintCallable, Category = "Character Control")
-	void SetAsCurrentControlled(bool bNewValue);
-
-	// 检查是否为本地玩家控制的角色
-	//UFUNCTION(BlueprintPure, Category = "Player Control")
-	FORCEINLINE bool IsLocallyControlled() const { return Controller && Controller->IsLocalPlayerController(); }
-
-	// 检查是否为远程玩家控制的角色
-	UFUNCTION(BlueprintPure, Category = "Player Control")
-	FORCEINLINE bool IsRemotelyControlled() const { return Controller && !Controller->IsLocalPlayerController(); }
-
-	// 获取相机偏移
-	UFUNCTION(BlueprintPure, Category = "Camera")
-	FVector GetCameraOffset() const;
-
+	// ==========================================
+	// 1. 核心组件 (第三人称视角)
+	// ==========================================
 protected:
-	// 移动速度变量
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = 0.0f))
-	float MovementSpeed;
+	// 第三人称专属的“自拍杆” (弹簧臂)，防止相机穿墙
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Camera")
+	USpringArmComponent* CameraBoom;
 
-	// 当前移动速度（实际使用的速度）
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Movement")
-	float CurrentMovementSpeed;
-
-	// 最大生命值
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Health", meta = (ClampMin = 0.0f))
+	// 挂在自拍杆后面的跟随摄像机
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Camera")
+	UCameraComponent* FollowCamera;
+	
+	// ==========================================
+	// 2. 战斗属性 (网络同步)
+	// ==========================================
+protected:
+	// 最大血量 (暴露给蓝图，可以随时修改)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats")
 	float MaxHealth;
 
-	// 当前生命值
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Health")
+	// 当前生命值 (ReplicatedUsing 表示当服务器改变这个值时，会自动通知客户端执行 OnRep_Health)
+	UPROPERTY(ReplicatedUsing = OnRep_Health, VisibleAnywhere, BlueprintReadOnly, Category = "Stats")
 	float CurrentHealth;
 
-	// 角色等级
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Stats", meta = (ClampMin = 1))
-	int32 Level;
+	// 生命值改变时，客户端自动调用的回调函数 (用来刷新屏幕上的血条UI)
+	UFUNCTION()
+	void OnRep_Health();
 
-	// 是否存活
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat")
-	bool bIsAlive;
+	// ==========================================
+	// 能量系统 (网络同步)
+	// ==========================================
+	// 最大能量值
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Energy")
+	float MaxEnergy;
 
-	// 当前动画状态 - 用于蓝图中切换动画
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation", meta = (AllowPrivateAccess = "true"))
-	ECharacterAnimationState AnimationState;
+	// 当前能量值
+	UPROPERTY(ReplicatedUsing = OnRep_Energy, VisibleAnywhere, BlueprintReadOnly, Category = "Stats|Energy")
+	float CurrentEnergy;
 
-	// 角色类型
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Info", meta = (AllowPrivateAccess = "true"))
-	ECharacterType CharacterType;
+	// 能量改变时的回调
+	UFUNCTION()
+	void OnRep_Energy();
 
-	// 角色ID - 用于区分可控制的角色（角色1、2、3）
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Control", meta = (AllowPrivateAccess = "true"))
-	EControlledCharacterID CharacterID;
+	// 消耗能量（释放技能时调用）
+	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
+	bool ConsumeEnergy(float Amount);
 
-	// 玩家索引 - 用于分屏游戏中区分不同玩家
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Player Control", meta = (AllowPrivateAccess = "true"))
-	EPlayerIndex PlayerIndex;
+	// 增加能量
+	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
+	void AddEnergy(float Amount);
 
-	// 移动状态
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Movement", meta = (AllowPrivateAccess = "true"))
-	EMovementState MovementState;
+	// 获取当前能量百分比
+	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
+	float GetEnergyPercent() const { return (MaxEnergy > 0.0f) ? (CurrentEnergy / MaxEnergy) : 0.0f; }
 
-	// 是否为当前控制的角色
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Character Control")
-	bool bIsCurrentControlled;
+	// ==========================================
+	// 生命/能量回复系统
+	// ==========================================
+protected:
+	// 停止移动后开始回复的时间（秒）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
+	float RegenerationDelay = 2.0f;
 
-	// 移动组件引用
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Movement")
-	class UCharacterMovementComponent* CharacterMovementComp;
+	// 生命回复速度（每秒）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
+	float HealthRegenRate = 5.0f;
 
-	// 相机组件引用
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
-	class USpringArmComponent* SpringArmComp;
+	// 能量回复速度（每秒）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
+	float EnergyRegenRate = 10.0f;
 
-	// 相机跟随组件
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
-	class UCameraComponent* CameraComp;
+	// 最后移动时间
+	float LastMoveTime;
 
-	// 角色网格体组件
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mesh")
-	class USkeletalMeshComponent* CharacterMesh;
+	// 是否正在回复
+	bool bIsRegenerating;
 
-	// 更新动画状态的函数
-	UFUNCTION(BlueprintImplementableEvent, Category = "Animation")
-	void OnAnimationStateChanged(ECharacterAnimationState NewState);
+	// 开始回复
+	void StartRegeneration();
 
-	// 更新移动状态的函数
-	UFUNCTION(BlueprintImplementableEvent, Category = "Movement")
-	void OnMovementStateChanged(EMovementState NewState);
+	// 停止回复
+	void StopRegeneration();
+	
+	// 死亡状态锁 (防止鞭尸)
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats")
+	bool bIsDead = false;
+	
+	// 死亡动画蒙太奇
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat")
+	UAnimMontage* DeathMontage;
 
-	// 角色切换的函数
-	UFUNCTION(BlueprintImplementableEvent, Category = "Character Control")
-	void OnCharacterSwitched(bool bNowControlled);
+	// 死亡逻辑与布娃娃定时器
+	void Die();
+	void EnableRagdoll();
+	FTimerHandle RagdollTimerHandle;
 
-	// 玩家控制状态变化的函数
-	UFUNCTION(BlueprintImplementableEvent, Category = "Player Control")
-	void OnPlayerControlChanged();
+	// 网络多播死亡（让所有玩家都看到你变成布娃娃）
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_Die();
 
-	// 获取下一个角色ID
-	UFUNCTION(BlueprintPure, Category = "Character Control")
-	EControlledCharacterID GetNextCharacterID() const;
+	// ==========================================
+	// 击杀奖励系统
+	// ==========================================
+public:
+	// 击杀奖励接口
+	UFUNCTION(BlueprintCallable, Category = "Stats")
+	void OnKill(ABaseCharacter* KilledCharacter);
 
-	// 获取上一个角色ID
-	UFUNCTION(BlueprintPure, Category = "Character Control")
-	EControlledCharacterID GetPreviousCharacterID() const;
+	// 击杀增加的血量
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|KillReward")
+	float HealthRewardPerKill = 10.0f;
 
-	// 获取相机偏移位置
-	UFUNCTION(BlueprintPure, Category = "Camera")
-	FVector GetDesiredCameraOffset() const;
+	// 击杀增加的能量
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|KillReward")
+	float EnergyRewardPerKill = 25.0f;
+
+	// ==========================================
+	// UI连接
+	// ==========================================
+protected:
+	// 游戏HUD引用
+	UPROPERTY()
+	UGameHUDWidget* GameHUDWidget;
+
+	// ==========================================
+	// 3. 增强输入系统 (UE5 标配)
+	// ==========================================
+protected:
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputMappingContext* DefaultMappingContext;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* MoveAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* LookAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* JumpAction;
+	
+	//下蹲输入动作
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* CrouchAction;
+
+	// 刀战核心输入
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* LightAttackAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* HeavyAttackAction;
+
+	// 释放技能输入动作
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* UseSkillAction;
+
+	// 基础输入回调
+	void Move(const FInputActionValue& Value);
+	void Look(const FInputActionValue& Value);
+	
+	// 下蹲回调
+	void StartCrouch();
+	void StopCrouch();
+
+	// ==========================================
+	// 4. 武器与自动连斩系统核心变量
+	// ==========================================
+protected:
+	// 角色手里当前拿着的武器！(通过它来获取动画和执行判定)
+	UPROPERTY(Replicated,VisibleAnywhere, BlueprintReadOnly, Category = "Combat")
+	class ABaseWeapon* CurrentWeapon;
+
+	bool bIsAttacking;            // 全局攻击锁：正在挥刀吗？
+	bool bCanReceiveInput;        // 绿灯亮起：现在处于输入区间内吗？
+	bool bSaveAttack;             // 缓存区：玩家在这个区间内点击过鼠标吗？
+	bool bIsHoldingLightAttack;   // 按住状态：玩家是一直死死按着左键没松吗？
+	int32 ComboIndex;             // 当前连招段数 (1 或 2)
+
+	// 连招核心执行逻辑
+	void ExecuteComboSequence();
+	
+	// 轻击长按/松开事件
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void LightAttack_Pressed();
+	
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void LightAttack_Released();
+	
+	// 重击事件（单击）
+	void HeavyAttack();
+
+	// 释放技能事件
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void UseSkill();
+
+	// ==========================================
+	// 5. 动画通知 (Anim Notify) 专用接口
+	// ==========================================
+public:
+	// 供动画蓝图区间 (Anim Notify State) 调用的接口
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void EnableComboWindow(); // 区间开始时触发
+
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void CheckCombo();        // 区间结束时触发
+
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void EndAttackState();    // 动画彻底结束时触发
+	
+	
+	// ==========================================
+	// 6. 战斗 RPC (网络动作同步)
+	// ==========================================
+protected:
+	// 客户端向服务器请求挥刀（带着连击序号，告诉大家播第几个动作）
+	UFUNCTION(Server, Reliable)
+	void Server_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
+
+	// 服务器向所有客户端广播：“大家都播放这个人的挥刀动画！”
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
+	
+	// ==========================================
+	// 供上帝 (GameMode) 调用的装备武器接口
+	// ==========================================
+public:
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	void EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip);
+	
+	// ==========================================
+	// 公开获取当前武器的接口，给动画系统用
+	// ==========================================
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	class ABaseWeapon* GetCurrentWeapon() const { return CurrentWeapon; }
+	
+protected:
+	// --- 溶解系统配置 ---
+
+	// 死亡多久后开始融化 (默认10秒)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
+	float DissolveDelay = 5.0f;
+
+	// 融化的速度
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
+	float DissolveSpeed = 0.5f;
+
+	// 动态材质实例数组（因为一个模型可能有多个材质槽）
+	UPROPERTY()
+	TArray<class UMaterialInstanceDynamic*> DynamicMaterials;
+
+	// 内部标记
+	bool bStartDissolving = false;
+	float CurrentDissolveValue = 0.0f; // 0=正常, 1=完全融化
+
+	// 定时器回调
+	void StartDissolveProcess();
+	
+	// ==========================================
+	// 3A 级摄像机减震系统
+	// ==========================================
+
+	// 重写虚幻原生自带的下蹲与起立回调
+	virtual void OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
+	virtual void OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
+
+	// 摄像机平滑过渡的速度 (越大越快，越小越像慢动作)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
+	float CrouchCameraSmoothSpeed = 12.0f;
+
+	// ==========================================
+	// AC/ACE系统 (类似CS中的得分系统)
+	// ==========================================
+public:
+	// AC值（总分）
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats|AC")
+	int32 ACValue;
+
+	// ACE值（连续获胜回合数）
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats|AC")
+	int32 ACEValue;
+
+	// 增加AC
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	void AddAC(int32 Amount);
+
+	// 重置ACE
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	void ResetACE();
+
+	// 获取AC值
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	int32 GetAC() const { return ACValue; }
+
+	// 获取ACE值
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	int32 GetACE() const { return ACEValue; }
 };

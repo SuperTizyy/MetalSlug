@@ -97,6 +97,22 @@ public:
 	UFUNCTION(Client, Reliable)
 	void Client_ReceiveChatMessage(const FString& SenderName, bool bIsHost, const FString& Message, bool bIsSystemMsg);
 
+	// 房主专属：向服务器请求开始游戏
+	UFUNCTION(Server, Reliable)
+	void Server_RequestStartGame();
+
+	// 接收服务器打回的系统警告文本
+	UFUNCTION(Client, Reliable)
+	void Client_ReceiveSystemMessage(const FString& Message);
+	
+	// ==========================================
+	// 【新增】：战斗与生成系统 RPC
+	// ==========================================
+	
+	// 客户端向服务器呼叫：“我进地图了，别管UI了，直接给我发人发枪！”
+	UFUNCTION(Server, Reliable)
+	void Server_RequestSpawn();
+	
 private:
 	// 【新增】：真正执行断网和跳地图的底层逻辑
 	void ExecuteLeaveRoom();
