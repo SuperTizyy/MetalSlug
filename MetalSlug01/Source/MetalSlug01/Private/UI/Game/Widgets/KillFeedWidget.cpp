@@ -2,6 +2,9 @@
 #include "Components/VerticalBox.h"
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
+#include "Components/Overlay.h"
+#include "Components/HorizontalBox.h"
+#include "Components/Widget.h"
 #include "Kismet/GameplayStatics.h"
 
 void UKillFeedWidget::AddKillInfo(const FString& KillerName, const FString& VictimName, bool bIsHeadshot)
@@ -11,7 +14,7 @@ void UKillFeedWidget::AddKillInfo(const FString& KillerName, const FString& Vict
 		return;
 	}
 
-	UUserWidget* MessageWidget = CreateKillMessage(KillerName, VictimName, bIsHeadshot);
+	UWidget* MessageWidget = CreateKillMessage(KillerName, VictimName, bIsHeadshot);
 	if (MessageWidget)
 	{
 		VB_KillFeed->AddChild(MessageWidget);
@@ -31,7 +34,7 @@ void UKillFeedWidget::AddSystemMessage(const FString& Message)
 		return;
 	}
 
-	UUserWidget* MessageWidget = CreateSystemMessage(Message);
+	UWidget* MessageWidget = CreateSystemMessage(Message);
 	if (MessageWidget)
 	{
 		VB_KillFeed->AddChild(MessageWidget);
@@ -72,72 +75,78 @@ bool UKillFeedWidget::Initialize()
 	return true;
 }
 
-UUserWidget* UKillFeedWidget::CreateKillMessage(const FString& KillerName, const FString& VictimName, bool bIsHeadshot)
+UWidget* UKillFeedWidget::CreateKillMessage(const FString& KillerName, const FString& VictimName, bool bIsHeadshot)
 {
-	// 创建消息容器面板
-	UCanvasPanel* MessagePanel = NewObject<UCanvasPanel>(this);
-	if (!MessagePanel)
+	UOverlay* MessageContainer = NewObject<UOverlay>(this);
+	if (!MessageContainer)
 	{
 		return nullptr;
 	}
 
 	// 创建击杀者名称文本
-	UTextBlock* KillerText = NewObject<UTextBlock>(MessagePanel);
+	UTextBlock* KillerText = NewObject<UTextBlock>(MessageContainer);
 	if (KillerText)
 	{
 		KillerText->SetText(FText::FromString(KillerName));
-		KillerText->SetColorAndOpacity(FLinearColor::Cyan);
+		KillerText->SetColorAndOpacity(FSlateColor(FLinearColor(0.0f, 1.0f, 1.0f, 1.0f))); // Cyan color
 		KillerText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-		MessagePanel->AddChild(KillerText);
+		MessageContainer->AddChild(KillerText);
 	}
 
 	// 创建 " → " 分隔符
-	UTextBlock* ArrowText = NewObject<UTextBlock>(MessagePanel);
+	UTextBlock* ArrowText = NewObject<UTextBlock>(MessageContainer);
 	if (ArrowText)
 	{
 		ArrowText->SetText(NSLOCTEXT("KillFeed", "KillArrow", " → "));
 		ArrowText->SetColorAndOpacity(FLinearColor::White);
 		ArrowText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-		MessagePanel->AddChild(ArrowText);
+		MessageContainer->AddChild(ArrowText);
 	}
 
 	// 创建被击杀者名称文本
-	UTextBlock* VictimText = NewObject<UTextBlock>(MessagePanel);
+	UTextBlock* VictimText = NewObject<UTextBlock>(MessageContainer);
 	if (VictimText)
 	{
 		VictimText->SetText(FText::FromString(VictimName));
-		VictimText->SetColorAndOpacity(FLinearColor::Orange);
+		VictimText->SetColorAndOpacity(FSlateColor(FLinearColor(1.0f, 0.5f, 0.0f, 1.0f))); // Orange color
 		VictimText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-		MessagePanel->AddChild(VictimText);
+		MessageContainer->AddChild(VictimText);
 	}
 
 	// 如果是爆头，添加爆头标识
 	if (bIsHeadshot)
 	{
-		UTextBlock* HeadshotText = NewObject<UTextBlock>(MessagePanel);
+		UTextBlock* HeadshotText = NewObject<UTextBlock>(MessageContainer);
 		if (HeadshotText)
 		{
 			HeadshotText->SetText(NSLOCTEXT("KillFeed", "Headshot", " [HEADSHOT]"));
 			HeadshotText->SetColorAndOpacity(FLinearColor::Red);
 			HeadshotText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-			MessagePanel->AddChild(HeadshotText);
+			MessageContainer->AddChild(HeadshotText);
 		}
 	}
 
-	return MessagePanel;
+	return MessageContainer;
 }
 
-UUserWidget* UKillFeedWidget::CreateSystemMessage(const FString& Message)
+UWidget* UKillFeedWidget::CreateSystemMessage(const FString& Message)
 {
-	UTextBlock* MessageText = NewObject<UTextBlock>(this);
+	UOverlay* Container = NewObject<UOverlay>(this);
+	if (!Container)
+	{
+		return nullptr;
+	}
+
+	UTextBlock* MessageText = NewObject<UTextBlock>(Container);
 	if (MessageText)
 	{
 		MessageText->SetText(FText::FromString(Message));
 		MessageText->SetColorAndOpacity(FLinearColor::Yellow);
 		MessageText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
+		Container->AddChild(MessageText);
 	}
 
-	return MessageText;
+	return Container;
 }
 
 void UKillFeedWidget::RemoveExpiredMessages()

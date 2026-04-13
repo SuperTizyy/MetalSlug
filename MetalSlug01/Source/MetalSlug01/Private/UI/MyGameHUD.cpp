@@ -6,16 +6,16 @@ void AMyGameHUD::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (!MainWidgetClass)
-	{
-		return;
-	}
+	// if (!MainWidgetClass)
+	// {
+	// 	return;
+	// }
 
-	MainWidget = CreateWidget<UUserWidget>(GetWorld(), MainWidgetClass);
-	if (MainWidget)
-	{
-		MainWidget->AddToViewport();
-	}
+	// MainWidget = CreateWidget<UUserWidget>(GetWorld(), MainWidgetClass);
+	// if (MainWidget)
+	// {
+	// 	MainWidget->AddToViewport();
+	// }
 
 	// 创建游戏HUD
 	CreateGameHUD();

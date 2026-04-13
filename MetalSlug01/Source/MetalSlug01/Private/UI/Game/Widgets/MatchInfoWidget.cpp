@@ -102,7 +102,7 @@ void UMatchInfoWidget::AddAttackerIcon(UTexture2D* Icon)
 	{
 		NewIcon->SetBrushFromTexture(Icon);
 		NewIcon->SetDesiredSizeOverride(FVector2D(20.0f, 20.0f));
-		NewIcon->SetBrushSize(FVector2D(20.0f, 20.0f));
+		// NewIcon->SetBrushSize(FVector2D(20.0f, 20.0f)); // Deprecated, already set with SetDesiredSizeOverride
 		HB_AttackerIcons->AddChild(NewIcon);
 	}
 }
@@ -126,7 +126,7 @@ void UMatchInfoWidget::AddDefenderIcon(UTexture2D* Icon)
 	{
 		NewIcon->SetBrushFromTexture(Icon);
 		NewIcon->SetDesiredSizeOverride(FVector2D(20.0f, 20.0f));
-		NewIcon->SetBrushSize(FVector2D(20.0f, 20.0f));
+		// NewIcon->SetBrushSize(FVector2D(20.0f, 20.0f)); // Deprecated, already set with SetDesiredSizeOverride
 		HB_DefenderIcons->AddChild(NewIcon);
 	}
 }

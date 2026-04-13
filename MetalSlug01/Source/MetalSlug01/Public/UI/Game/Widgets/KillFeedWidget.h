@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/Widget.h"
 #include "KillFeedWidget.generated.h"
 
 class UVerticalBox;
@@ -44,10 +45,10 @@ private:
 	UVerticalBox* VB_KillFeed;
 
 	// 创建单条击杀消息
-	UUserWidget* CreateKillMessage(const FString& KillerName, const FString& VictimName, bool bIsHeadshot);
+	UWidget* CreateKillMessage(const FString& KillerName, const FString& VictimName, bool bIsHeadshot);
 
 	// 创建单条系统消息
-	UUserWidget* CreateSystemMessage(const FString& Message);
+	UWidget* CreateSystemMessage(const FString& Message);
 
 	// 移除过期消息（定时调用）
 	UFUNCTION()

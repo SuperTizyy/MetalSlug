@@ -23,15 +23,15 @@ void ARoomPlayerController::BeginPlay()
 		bShowMouseCursor = false;
 		SetInputMode(FInputModeGameOnly());
 
-		// // 2. 动态生成房间 UI 并显示在屏幕上
-		// if (RoomUIClass)
-		// {
-		// 	RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
-		// 	if (RoomUIWidget)
-		// 	{
-		// 		RoomUIWidget->AddToViewport();
-		// 	}
-		// }
+		// 2. 动态生成房间 UI 并显示在屏幕上
+		if (RoomUIClass)
+		{
+			RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
+			if (RoomUIWidget)
+			{
+				RoomUIWidget->AddToViewport();
+			}
+		}
 		
 		// ==========================================
 		// 【核心修复】：不要立刻发 RPC！延迟 0.5 秒再发！

@@ -16,6 +16,7 @@ class UOverlay;
 class UTextBlock;
 class UComboBoxString;
 class UImage;
+class UDataTable;
 class URoomLabelWidget; // 【新增】前向声明我们刚才写的房间条目类
 
 /**
@@ -105,7 +106,22 @@ protected:
 	UPROPERTY(meta = (BindWidget)) 
 	UTextBlock* Text_CreateRoomHint;
 	
+	// ==========================================
+	// 3. 游戏模式与地图选择 (Create Room Overlay)
+	// ==========================================
 	
+	// 游戏模式选择下拉框
+	UPROPERTY(meta = (BindWidget)) 
+	UComboBoxString* ComboBox_GameMode;
+	
+	// 地图选择下拉框
+	UPROPERTY(meta = (BindWidget)) 
+	UComboBoxString* ComboBox_MapSelect;
+	
+	// 地图信息数据表 (用于填充地图下拉框)
+	UPROPERTY(EditDefaultsOnly, Category = "Data Config")
+	UDataTable* MapInfoDataTable;
+
 
 private:
 	// ==========================================
@@ -142,6 +158,10 @@ private:
 	// 暂存玩家想创建的房间名和密码（为了在销毁旧房间后能继续创建）
 	FString PendingRoomName;
 	FString PendingRoomPassword;
+	
+	// 暂存玩家选择的游戏模式和地图
+	FString PendingGameMode;
+	FName PendingMapLevelName;
 
 	// 1. 创房相关
 	void HostRealSession(); // 真正执行创房的内部代码

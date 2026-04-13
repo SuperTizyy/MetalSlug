@@ -83,3 +83,30 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")
 	FString Description;
 };
+
+
+//数据驱动地图表
+USTRUCT(BlueprintType)
+struct FMapInfoRow : public FTableRowBase
+{
+	GENERATED_BODY()
+
+	// 1. 真实关卡名 (极其重要：必须和 .umap 文件名一模一样，用于底层 OpenLevel)
+	// 比如填 "L_DesertMap"
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
+	FName LevelName;
+
+	// 2. 玩家在 UI 上看到的展示名 (支持多语言)
+	// 比如填 "黄沙废墟"
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
+	FText DisplayName;
+
+	// 3. 地图缩略图 (UI 上展示的漂亮图片)
+	// 推荐使用 TSoftObjectPtr (软引用)，防止一开游戏就把所有地图图片全加载进内存爆掉！
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
+	TSoftObjectPtr<UTexture2D> MapThumbnail;
+
+	// 4. (可选) 地图描述、最大支持人数等
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
+	FText MapDescription;
+};

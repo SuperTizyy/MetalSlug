@@ -29,9 +29,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void UpdateHealth(float Current, float Max);
 
+	// 公开接口：刷新玩家血量文本
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateHealthText(int32 Current, int32 Max);
+
 	// 公开接口：刷新玩家能量
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void UpdateEnergy(float Current, float Max);
+
+	// 公开接口：刷新玩家能量文本
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateEnergyText(int32 Current, int32 Max);
 
 	// 公开接口：更新连杀数
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")

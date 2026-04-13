@@ -1,4 +1,4 @@
-﻿#include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
+#include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "Components/VerticalBox.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
@@ -188,6 +188,9 @@ void URoomInsidePage::NativeConstruct()
 		// 默认给个保底名字，万一底层没读到也不至于空着
 		FString DisplayRoomName = TEXT("未命名房间");
 
+		// 【修复】：完美拼接"房间名称-游戏模式"格式
+		FString DisplayGameMode = TEXT("默认模式");
+
 		// 呼叫在线子系统，获取当前所在的房间 (Session)
 		IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
 		if (OnlineSub)
@@ -198,15 +201,16 @@ void URoomInsidePage::NativeConstruct()
 				FNamedOnlineSession* Session = Sessions->GetNamedSession(NAME_GameSession);
 				if (Session)
 				{
-					// 【核心魔法】：我们在 LANRoomPage 创房时写进去的 ROOM_NAME，在这里完美提取出来！
+					// 【核心魔法 1】：提取房间名称
 					Session->SessionSettings.Get(FName("ROOM_NAME"), DisplayRoomName);
+					
+					// 【核心魔法 2】：提取游戏模式
+					Session->SessionSettings.Get(FName("GAME_MODE"), DisplayGameMode);
 				}
 			}
 		}
-		// 【修改】：使用 Printf 完美拼接前缀和房间名！
-		// 最终效果例如："房间名称：绝地大反击"
-		// ==========================================
-		FString FinalDisplayText = FString::Printf(TEXT("房间名称：%s"), *DisplayRoomName);
+		// 【修复】：完美拼接"房间名称-游戏模式"格式
+		FString FinalDisplayText = FString::Printf(TEXT("%s-%s"), *DisplayRoomName, *DisplayGameMode);
 		// 把提取到的名字刷到 UI 文本上
 		Text_RoomName->SetText(FText::FromString(FinalDisplayText));
 	}

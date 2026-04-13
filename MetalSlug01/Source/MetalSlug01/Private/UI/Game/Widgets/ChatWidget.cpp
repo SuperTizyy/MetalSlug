@@ -4,6 +4,10 @@
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
 #include "Components/CanvasPanel.h"
+#include "Components/HorizontalBox.h"
+#include "Components/Overlay.h"
+#include "Components/Widget.h"
+#include "GameFramework/PlayerState.h"
 
 bool UChatWidget::Initialize()
 {
@@ -34,7 +38,7 @@ void UChatWidget::AddChatMessage(const FString& PlayerName, const FString& Messa
 		return;
 	}
 
-	UUserWidget* MessageWidget = CreateChatMessageWidget(PlayerName, Message);
+	UWidget* MessageWidget = CreateChatMessageWidget(PlayerName, Message);
 	if (MessageWidget)
 	{
 		SB_ChatMessages->AddChild(MessageWidget);
@@ -126,35 +130,35 @@ void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type Comm
 	}
 }
 
-UUserWidget* UChatWidget::CreateChatMessageWidget(const FString& PlayerName, const FString& Message)
+UWidget* UChatWidget::CreateChatMessageWidget(const FString& PlayerName, const FString& Message)
 {
-	UCanvasPanel* MessagePanel = NewObject<UCanvasPanel>(this);
-	if (!MessagePanel)
+	UOverlay* MessageContainer = NewObject<UOverlay>(this);
+	if (!MessageContainer)
 	{
 		return nullptr;
 	}
-
+	
 	// 玩家名称
-	UTextBlock* NameText = NewObject<UTextBlock>(MessagePanel);
+	UTextBlock* NameText = NewObject<UTextBlock>(MessageContainer);
 	if (NameText)
 	{
 		NameText->SetText(FText::FromString(PlayerName + TEXT(": ")));
-		NameText->SetColorAndOpacity(FLinearColor::Cyan);
+		NameText->SetColorAndOpacity(FSlateColor(FLinearColor(0.0f, 1.0f, 1.0f, 1.0f))); // Cyan color
 		NameText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-		MessagePanel->AddChild(NameText);
+		MessageContainer->AddChild(NameText);
 	}
-
+	
 	// 消息内容
-	UTextBlock* MessageText = NewObject<UTextBlock>(MessagePanel);
+	UTextBlock* MessageText = NewObject<UTextBlock>(MessageContainer);
 	if (MessageText)
 	{
 		MessageText->SetText(FText::FromString(Message));
 		MessageText->SetColorAndOpacity(FLinearColor::White);
 		MessageText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
-		MessagePanel->AddChild(MessageText);
+		MessageContainer->AddChild(MessageText);
 	}
-
-	return MessagePanel;
+	
+	return MessageContainer;
 }
 
 void UChatWidget::ScrollToBottom()

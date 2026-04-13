@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/Widget.h"
 #include "ChatWidget.generated.h"
 
 class UScrollBox;
@@ -58,7 +59,7 @@ private:
 	UButton* Btn_Send;
 
 	// 创建单条聊天消息
-	UUserWidget* CreateChatMessageWidget(const FString& PlayerName, const FString& Message);
+	UWidget* CreateChatMessageWidget(const FString& PlayerName, const FString& Message);
 
 	// 滚动到底部
 	UFUNCTION()

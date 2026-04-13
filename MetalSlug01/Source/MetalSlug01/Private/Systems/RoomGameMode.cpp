@@ -13,10 +13,14 @@
 #include "Weapons/BaseWeapon.h"
 #include "Kismet/GameplayStatics.h"
 #include "Characters/BaseCharacter.h"
+#include "UI/MyGameHUD.h"
 
 ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
+	// // 告诉引擎使用你的 HUD 类
+	// HUDClass = AMyGameHUD::StaticClass();
+	
 	// 【强行关闭无缝漫游】：在基础局域网测试中，开启它纯属自找麻烦！
 	bUseSeamlessTravel = false;
 	

@@ -32,6 +32,22 @@ void UGameHUDWidget::UpdateEnergy(float Current, float Max)
 	}
 }
 
+void UGameHUDWidget::UpdateHealthText(int32 Current, int32 Max)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateHealthText(Current, Max);
+	}
+}
+
+void UGameHUDWidget::UpdateEnergyText(int32 Current, int32 Max)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateEnergyText(Current, Max);
+	}
+}
+
 void UGameHUDWidget::UpdateKillStreak(int32 Kills)
 {
 	if (Widget_KillStreak)

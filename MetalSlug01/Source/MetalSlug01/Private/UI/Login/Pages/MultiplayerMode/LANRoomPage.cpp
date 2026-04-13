@@ -1,4 +1,4 @@
-﻿#include "UI/Login/Pages/MultiplayerMode/LANRoomPage.h"
+#include "UI/Login/Pages/MultiplayerMode/LANRoomPage.h"
 #include "UI/Login/Pages/MultiplayerMode/RoomLabelWidget.h"
 // 【新增】必须包含的在线子系统核心头文件
 #include "OnlineSubsystem.h"
@@ -11,9 +11,11 @@
 #include "Components/ComboBoxString.h"
 #include "Components/Overlay.h"
 #include "Components/TextBlock.h"
+#include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
 #include "UI/Login/Core/AccountSubsystem.h"
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
+#include "UI/Login/Data/StaticTable.h"
 
 bool ULANRoomPage::Initialize()
 {
@@ -67,6 +69,44 @@ bool ULANRoomPage::Initialize()
 	
 	// 【修改】开启定时器，每 3 秒自动执行一次 FindLANRooms，并且一进来就立刻执行一次
 	GetWorld()->GetTimerManager().SetTimer(SearchTimerHandle, this, &ULANRoomPage::FindLANRooms, 3.0f, true, 0.0f);
+	
+	// ==========================================
+	// 3. 初始化游戏模式与地图选择下拉框
+	// ==========================================
+	if (ComboBox_GameMode)
+	{
+		// 添加游戏模式选项
+		ComboBox_GameMode->AddOption(TEXT("刀战模式"));
+		ComboBox_GameMode->AddOption(TEXT("生化模式"));
+		// 默认选中第一个
+		ComboBox_GameMode->SetSelectedIndex(0);
+	}
+	
+	if (ComboBox_MapSelect && MapInfoDataTable)
+	{
+		// 清空旧选项
+		ComboBox_MapSelect->ClearOptions();
+		
+		static const FString ContextString(TEXT("MapInfo Context"));
+		TArray<FMapInfoRow*> AllMaps;
+		MapInfoDataTable->GetAllRows<FMapInfoRow>(ContextString, AllMaps);
+		
+		// 遍历地图表，提取 DisplayName 填充下拉框
+		for (FMapInfoRow* MapInfo : AllMaps)
+		{
+			if (MapInfo)
+			{
+				ComboBox_MapSelect->AddOption(MapInfo->DisplayName.ToString());
+			}
+		}
+		
+		// 如果表里有数据，默认选中第一个
+		if (ComboBox_MapSelect->GetOptionCount() > 0)
+		{
+			ComboBox_MapSelect->SetSelectedIndex(0);
+		}
+	}
+	
 	return true;
 }
 
@@ -417,6 +457,37 @@ void ULANRoomPage::OnConfirmCreateRoomClicked()
 	PendingRoomPassword = Input_RoomPassword->GetText().ToString();
 	
 	// ==========================================
+	// 2. 获取选择的游戏模式和地图
+	// ==========================================
+	if (ComboBox_GameMode)
+	{
+		PendingGameMode = ComboBox_GameMode->GetSelectedOption();
+	}
+	
+	if (ComboBox_MapSelect)
+	{
+		// 获取选中的地图显示名称
+		FString SelectedMapDisplayName = ComboBox_MapSelect->GetSelectedOption();
+		
+		// 从MapInfoDataTable中查找对应的LevelName
+		if (MapInfoDataTable)
+		{
+			static const FString ContextString(TEXT("MapInfo Context"));
+			TArray<FMapInfoRow*> AllMaps;
+			MapInfoDataTable->GetAllRows<FMapInfoRow>(ContextString, AllMaps);
+			
+			for (FMapInfoRow* MapInfo : AllMaps)
+			{
+				if (MapInfo && MapInfo->DisplayName.ToString() == SelectedMapDisplayName)
+				{
+					PendingMapLevelName = MapInfo->LevelName;
+					break;
+				}
+			}
+		}
+	}
+
+	// ==========================================
 	// 【核心校验 1】：房间名是否为空？
 	// ==========================================
 	if (PendingRoomName.IsEmpty())
@@ -507,6 +578,7 @@ void ULANRoomPage::HostRealSession()
 		SessionSettings.bAllowJoinInProgress = true; // 允许中途加入
 		// 【极其关键】把玩家输入的“房间名称”存进这个 Session 的自定义数据里，以后别人搜到房间时就能读取到这个名字！
 		SessionSettings.Set(FName("ROOM_NAME"), PendingRoomName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+		SessionSettings.Set(FName("GAME_MODE"), PendingGameMode, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 		
 		// ==========================================
 		// 【新增】：创房时必须打好这两个默认标签，防止大厅读取失败！
@@ -588,7 +660,6 @@ void ULANRoomPage::OnToggleReadyClicked()
 	// 翻转状态
 	bIsReady = !bIsReady;
 }
-
 
 
 

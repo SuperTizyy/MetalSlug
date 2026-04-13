@@ -47,7 +47,7 @@ protected:
 
 private:
 	// ==========================================
-	// 人数显示
+	// 对局赢局显示
 	// ==========================================
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* Text_AttackerCount;
