@@ -566,27 +566,33 @@ void ULANRoomPage::HostRealSession()
 	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
 	{
 		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-		// 绑定我们写的回调函数，当创房结束（无论成功失败）时通知我们
+		
+		// 绑定回调：创房结束（无论成功失败）时通知 UI
 		CreateSessionCompleteDelegateHandle = Sessions->AddOnCreateSessionCompleteDelegate_Handle(
 			FOnCreateSessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnCreateSessionComplete));
 
 		FOnlineSessionSettings SessionSettings;
-		SessionSettings.bIsLANMatch = true; // 开启局域网模式
-		SessionSettings.NumPublicConnections = 10; // 房间最大人数
-		SessionSettings.bShouldAdvertise = true; // 允许别的玩家搜索到这个房间
-		SessionSettings.bUsesPresence = true; // 开启大厅存在状态
-		SessionSettings.bAllowJoinInProgress = true; // 允许中途加入
-		// 【极其关键】把玩家输入的“房间名称”存进这个 Session 的自定义数据里，以后别人搜到房间时就能读取到这个名字！
+		SessionSettings.bIsLANMatch = true;          // 开启局域网模式
+		SessionSettings.NumPublicConnections = 10;   // 房间最大人数
+		SessionSettings.bShouldAdvertise = true;     // 允许局域网广播被搜到
+		SessionSettings.bUsesPresence = true;        // 开启在线状态存在(Presence)
+		SessionSettings.bAllowJoinInProgress = true; // 允许中途加入（JIP）
+
+		// ==========================================
+		// 【架构规范】：将用户选择的所有核心元数据写入 SessionSettings。
+		// EOnlineDataAdvertisementType::ViaOnlineServiceAndPing 确保这些数据会随着心跳包被其他客户端搜到。
+		// ==========================================
 		SessionSettings.Set(FName("ROOM_NAME"), PendingRoomName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 		SessionSettings.Set(FName("GAME_MODE"), PendingGameMode, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 		
-		// ==========================================
-		// 【新增】：创房时必须打好这两个默认标签，防止大厅读取失败！
-		// ==========================================
-		SessionSettings.Set(FName("ROOM_STATE"), false, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // 默认等待中
-		SessionSettings.Set(FName("TOTAL_PLAYERS_WITH_AI"), 1, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // 默认至少有房主 1 个人
+		// 【核心修复】：必须将地图名称存入 Session，供大厅 UI 查询
+		SessionSettings.Set(FName("MAP_NAME"), PendingMapLevelName.ToString(), EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 		
-		// 执行底层创建命令 (NAME_GameSession 是默认的全局宏)
+		// 默认状态标签
+		SessionSettings.Set(FName("ROOM_STATE"), false, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // false=等待中
+		SessionSettings.Set(FName("TOTAL_PLAYERS_WITH_AI"), 1, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // 默认人数
+		
+		// 执行底层创建命令，NAME_GameSession 是引擎默认的当前游戏会话宏
 		Sessions->CreateSession(0, NAME_GameSession, SessionSettings);
 	}
 }
@@ -596,7 +602,9 @@ void ULANRoomPage::HostRealSession()
 // ==========================================
 void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessful)
 {
-	// 无论成功失败，第一件事就是获取子系统，把刚才绑定的回调事件注销掉，防止内存泄漏
+	// ==========================================
+	// 【内存管理规范】：无论结果如何，第一时间注销委托句柄，防止内存泄漏或野指针触发
+	// ==========================================
 	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
 	if (OnlineSub)
 	{
@@ -609,20 +617,41 @@ void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessfu
 
 	if (bWasSuccessful)
 	{
-		bIsHost = true; // 【新增】我创的房，我就是天！
+		bIsHost = true; // 确立房主权威身份
 		
-		// ==========================================
-		// 【核心修复 1】：发免死金牌！告诉底层的 NativeDestruct，我们是去新关卡，不要销毁房间！
-		// ==========================================
+		// 发放免死金牌！告诉 NativeDestruct 我们是进行关卡跳转，禁止误杀 Session
 		bIsTraveling = true;
 		
-		// 使用 OpenLevel，第三个参数为 true (绝对跳转)，第四个参数严谨写上 "listen"
-		UGameplayStatics::OpenLevel(GetWorld(), FName("L_Room"), true, TEXT("?listen"));
+		// ==========================================
+		// 【核心修复】：摒弃硬编码，使用玩家在 UI 选择的数据驱动关卡名
+		// 增加防呆设计：如果解析出的名字为空，则回退到保底大厅 "L_Room"
+		// ==========================================
+		FName TargetMapName = PendingMapLevelName.IsNone() ? FName("L_Room") : PendingMapLevelName;
 		
+		// ==========================================
+		// 构建网络传输的 URL Options
+		// ?listen : 告诉引擎以 Listen Server（监听服务器）模式打开此关卡
+		// ==========================================
+		FString URLOptions = TEXT("?listen");
+		
+		/* * 【高级架构扩展建议】：
+		 * 如果你需要根据 PendingGameMode 强行替换当前地图的 GameMode，可以拼接到 URL 中：
+		 * 例如: URLOptions += FString::Printf(TEXT("?game=%s"), *TargetGameModeClassPath);
+		 * 目前若你的地图已经在编辑器 World Settings 里配置了正确的 GameMode，则无需这行。
+		 */
+
+		// 日志追踪：帮助快速定位多端跳转问题
+		if (GEngine) 
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, FString::Printf(TEXT("创房成功！正在作为服务器跳转至关卡: %s"), *TargetMapName.ToString()));
+		}
+
+		// 执行绝对跳转 (TRAVEL_Absolute)
+		UGameplayStatics::OpenLevel(GetWorld(), TargetMapName, true, URLOptions);
 	}
 	else
 	{
-		// 创房失败 (可能是底层网络端口占用，或者已经有一个同名 Session 在运行)
+		// 失败提示处理保持不变
 		if (Text_CreateRoomHint)
 		{
 			Text_CreateRoomHint->SetText(FText::FromString(TEXT("创建房间失败，请检查网络或重启游戏重试！")));

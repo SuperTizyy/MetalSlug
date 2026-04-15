@@ -20,10 +20,6 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_ToggleReady(bool bIsReady);
 	
-	// 服务器下发：“某某某玩家的准备状态变了，大家快刷新 UI！”
-	UFUNCTION(Client, Reliable)
-	void Client_UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady);
-	
 	// ==========================================
 	// 【新增】AI 管理相关 RPC
 	// ==========================================
@@ -54,9 +50,6 @@ public:
 	// ==========================================
 	// 2. 服务器 -> 客户端的 RPC (Server to Client)
 	// ==========================================
-	// 服务器算好红蓝队人数后，下发给各个客户端：“这是最新的红蓝名单，马上刷新你们的UI！”
-	UFUNCTION(Client, Reliable)
-	void Client_UpdateRoomUI(const TArray<FString>& RedTeam, const TArray<FString>& BlueTeam, const FString& HostName);
 
 	// 延迟发送玩家信息，避开网络抢跑期
 	void DelayedSendPlayerInfo();
@@ -116,6 +109,21 @@ public:
 	// 客户端向服务器呼叫：“我进地图了，别管UI了，直接给我发人发枪！”
 	UFUNCTION(Server, Reliable)
 	void Server_RequestSpawn();
+	
+	// ==========================================
+	// 装备与选角系统
+	// ==========================================
+
+	// 本地记录玩家在 UI 上点击选择的配置
+	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
+	FString MySelectedCharacter;
+
+	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
+	FString MySelectedWeapon;
+
+	// 客户端 UI 选择完毕后，通知服务器保存这个决定
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_SelectLoadout(const FString& CharacterRowName, const FString& WeaponRowName);
 	
 private:
 	// 【新增】：真正执行断网和跳地图的底层逻辑

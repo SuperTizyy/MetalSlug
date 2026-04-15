@@ -30,13 +30,6 @@ public:
 	virtual bool Initialize() override;
 
 	// ==========================================
-	// 【核心新增】：供对讲机 (PlayerController) 调用的刷新接口！
-	// 当服务器下发新名单时，对讲机会调用这个函数来重绘 UI
-	// ==========================================
-	UFUNCTION(BlueprintCallable, Category = "RoomUI")
-	void UpdateTeamLists(const TArray<FString>& RedTeamNames, const TArray<FString>& BlueTeamNames, const FString& HostName);
-
-	// ==========================================
 	// 供对讲机调用的接口：往聊天框里塞入一条新消息
 	// ==========================================
 	UFUNCTION(BlueprintCallable, Category = "RoomUI")
@@ -44,10 +37,6 @@ public:
 	
 	// 供小格子调用的公开接口
 	void OnWeaponItemSelectedInGrid(FName WeaponRowName);
-	
-	// 【新增】：专门用来刷新某个特定玩家的准备状态 UI
-	UFUNCTION(BlueprintCallable, Category = "RoomUI")
-	void UpdatePlayerReadyStateUI(const FString& PlayerName, bool bIsPlayerReady);
 	
 	// 点击开始游戏按钮
 	UFUNCTION() void OnStartGameClicked();
@@ -63,7 +52,8 @@ protected:
 	
 	// 【新增】：重写 UI 构造函数，这里才是读表最安全的地方！
 	virtual void NativeConstruct() override;
-	
+	void NativeDestruct();
+
 	// ==========================================
 	// 从原先 LANRoomPage 搬过来的 UI 控件
 	// ==========================================
@@ -302,5 +292,24 @@ private:
 	FString LastConfirmedAIWeapon;
 	// 记忆上次确认添加的队伍
 	FString LastConfirmedAITeam;
+	
+	// ==========================================
+	// 【全新架构】：UI 自动订阅与刷新引擎
+	// ==========================================
+	
+	// 定时器句柄：用于周期性检查是否有新人加入/离开
+	FTimerHandle PlayerCheckTimerHandle;
+
+	// 记忆数组：UI 当前已经认识并订阅了的玩家状态，用于对比差异
+	UPROPERTY()
+	TArray<class ARoomPlayerState*> KnownPlayerStates;
+
+	// 探头函数：每 0.5 秒运行一次，扫描 GameState 找新人
+	UFUNCTION()
+	void CheckForNewPlayers();
+
+	// 核心刷新函数：只有当人员变动，或者某个玩家触发 OnStateChanged 时，才执行重绘！
+	UFUNCTION()
+	void RefreshRoomUI();
 	
 };

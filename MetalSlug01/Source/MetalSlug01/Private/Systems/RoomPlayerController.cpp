@@ -6,6 +6,7 @@
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystem.h"
 #include "Interfaces/OnlineSessionInterface.h"
+#include "UI/Login/Core/RoomPlayerState.h"
 
 
 void ARoomPlayerController::BeginPlay()
@@ -27,7 +28,7 @@ void ARoomPlayerController::BeginPlay()
 		FTimerHandle DelayHandle;
 		GetWorld()->GetTimerManager().SetTimer(DelayHandle, this, &ARoomPlayerController::DelayedSendPlayerInfo, 2.0f, false);
 		
-		Server_RequestSpawn();
+		//Server_RequestSpawn();
 	}
 }
 
@@ -58,7 +59,7 @@ bool ARoomPlayerController::Server_SendPlayerInfo_Validate(const FString& InPlay
 }
 
 
-// 服务器真正执行的逻辑（只有房主的电脑会运行这段代码）
+// 1. 发送玩家信息
 void ARoomPlayerController::Server_SendPlayerInfo_Implementation(const FString& InPlayerName)
 {
 	// 【新增这行】：让服务器端的这个对讲机记住自己的名字！
@@ -66,11 +67,10 @@ void ARoomPlayerController::Server_SendPlayerInfo_Implementation(const FString& 
 	
 	// 这段代码只会在房主（服务器）的电脑上运行
 	// 获取咱们刚才写的服务器大脑 (RoomGameMode)
-	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	if (GM)
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 让大脑把这个玩家加入名单，并自动广播给所有人
-		GM->AddPlayerToRoom(InPlayerName);
+		// 传递 this (当前 Controller)，而不是传字符串名字！
+		GM->AddPlayerToRoom(this, InPlayerName);
 	}
 }
 
@@ -93,14 +93,13 @@ void ARoomPlayerController::Client_EnterBattleState_Implementation()
 // 验证函数直接返回 true
 bool ARoomPlayerController::Server_RequestChangeTeam_Validate(bool bToRedTeam) { return true; }
 
+// 2. 切换队伍
 void ARoomPlayerController::Server_RequestChangeTeam_Implementation(bool bToRedTeam)
 {
-	// 获取大脑
-	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	if (GM)
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 告诉大脑：把 "我(MyPlayerName)" 换到请求的队伍里去！
-		GM->ChangePlayerTeam(MyPlayerName, bToRedTeam);
+		// 【修复】：传递 this
+		GM->ChangePlayerTeam(this, bToRedTeam);
 	}
 }
 
@@ -182,12 +181,13 @@ void ARoomPlayerController::ExecuteLeaveRoom()
 // ----------------------------------------------------
 bool ARoomPlayerController::Server_LeaveRoom_Validate() { return true; }
 
+// 4. 离开房间
 void ARoomPlayerController::Server_LeaveRoom_Implementation()
 {
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 这里的 MyPlayerName 是咱们上一步加队时存下来的名字
-		GM->RemovePlayerFromRoom(MyPlayerName); 
+		// 【修复】：传递 this
+		GM->RemovePlayerFromRoom(this); 
 	}
 }
 
@@ -247,128 +247,76 @@ void ARoomPlayerController::Server_AddAI_Implementation(bool bToRedTeam, const F
 	}
 }
 
-// ----------------------------------------------------
-// 【修改】房主专用的踢人逻辑 (兼容 AI)
-// ----------------------------------------------------
+
+// 5. 房主踢人 (这里需要把查找到的 TargetPC 传给大脑)
 void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& PlayerNameToKick)
 {
 	if (!HasAuthority()) return;
-
-	// 1. 判断是不是踢的 AI
-	// 我们之前规定了 AI 的名字以 "[AI]" 开头
 	bool bIsAI = PlayerNameToKick.StartsWith(TEXT("[AI]"));
 
 	if (!bIsAI)
 	{
-		// 2. 如果是真人，执行你原有的狙击逻辑
 		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 		{
 			ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
 			if (TargetPC && TargetPC->MyPlayerName == PlayerNameToKick)
 			{
 				TargetPC->Client_BeKicked();
+				
+				// 【修复】：将被踢人的 Controller 传过去
+				if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+				{
+					GM->RemovePlayerFromRoom(TargetPC);
+				}
 				break;
 			}
 		}
-	}
-
-	// 3. 呼叫大脑（GameMode），把名字从大名单抹除，并触发房间 UI 刷新广播！
-	// 无论真人还是 AI，统一由 GameMode 负责从数组里删除
-	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-	{
-		GM->RemovePlayerFromRoom(PlayerNameToKick);
 	}
 }
 
 bool ARoomPlayerController::Server_ToggleReady_Validate(bool bIsReady) { return true; }
 
+// 3. 切换准备状态
 void ARoomPlayerController::Server_ToggleReady_Implementation(bool bIsReady)
 {
-	// 服务器收到请求后，交给大脑 (GameMode) 处理
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		GM->UpdatePlayerReadyState(MyPlayerName, bIsReady);
+		GM->UpdatePlayerReadyState(this, bIsReady);
 	}
 }
 
-void ARoomPlayerController::Client_UpdatePlayerReadyState_Implementation(const FString& PlayerName, bool bIsReady)
-{
-	// 本地客户端收到服务器的指令，立刻让 UI 刷新那条数据！
-	if (RoomUIWidget)
-	{
-		RoomUIWidget->UpdatePlayerReadyStateUI(PlayerName, bIsReady);
-	}
-}
-
-void ARoomPlayerController::Client_UpdateRoomUI_Implementation(const TArray<FString>& RedTeam, const TArray<FString>& BlueTeam, const FString& HostName)
-{
-	if (RoomUIWidget)
-	{
-		// 将房主名字一起传给 UI 页面
-		RoomUIWidget->UpdateTeamLists(RedTeam, BlueTeam, HostName);
-	}
-}
-
+// 6. 开始游戏时的全员就绪检测（超级精简版！）
 void ARoomPlayerController::Server_RequestStartGame_Implementation()
 {
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		bool bAllRealPlayersReady = true;
-
-		// ==========================================
-		// 【终极检验】：遍历房间里所有连接的“真实玩家”！
-		// （注意：GetPlayerControllerIterator 天然只获取真人，完美避开 AI！）
-		// ==========================================
-		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		if (GM->CheckAllPlayersReady())
 		{
-			ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
-			if (TargetPC)
-			{
-				// 房主自己（也就是发送请求的这个人）不需要准备，直接跳过检查
-				if (TargetPC == this) continue;
-
-				// 在 GameMode 的字典里查找这个真实玩家是否已准备
-				bool* bIsReady = GM->PlayerReadyStates.Find(TargetPC->MyPlayerName);
-				
-				// 如果字典里找不到他，或者他的状态是 false，说明有人没准备！
-				if (!bIsReady || !(*bIsReady))
-				{
-					bAllRealPlayersReady = false;
-					break; // 只要发现一个没准备的，立刻跳出循环，绝不留情！
-				}
-			}
-		}
-
-		if (bAllRealPlayersReady)
-		{
-			// ==========================================
-			// 所有人均已准备，执行开始游戏逻辑！
-			// ==========================================
 			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, TEXT("所有人均已准备，服务器即将开始游戏！"));
 			
-			// 1. 【防错逻辑】更新服务器大脑的内部状态为战斗态
-			// 你原先定义的是 ERoomState::WaitingInRoom，这里如果有个 InGame 状态就设为 InGame
-			// GM->CurrentRoomState = ERoomState::InGame; 
-
-			// 2. 【核心爆点】：拿着大喇叭，给全频道所有控制器下达“全军出击”指令！
 			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 			{
 				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
 				{
-					// 让每个客户端本地去切 UI 和隐藏鼠标
+					// 让客户端关闭大厅 UI
 					PC->Client_EnterBattleState();
 					
-					// 3. 【正规化发枪】：既然开打了，服务器直接给他们发 3D 肉体和武器！
-					// 这会调用你在 RoomGameMode 里写的 SpawnAndEquip 逻辑
-					GM->HandlePlayerRequestSpawn(PC, TEXT(""), TEXT(""));
+					// 【核心修复】：不要传空字符串覆盖玩家的选择！
+					// 去玩家自己的 PlayerState 里把选择读取出来，然后再命令生成！
+					FString TargetChar = TEXT("");
+					FString TargetWeapon = TEXT("");
+					if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+					{
+						TargetChar = PS->SelectedCharacterRowName;
+						TargetWeapon = PS->SelectedWeaponRowName;
+					}
+					
+					GM->HandlePlayerRequestSpawn(PC, TargetChar, TargetWeapon);
 				}
 			}
 		}
 		else
 		{
-			// ==========================================
-			// 有人没准备，给房主客户端发回一条系统提示！
-			// ==========================================
 			Client_ReceiveSystemMessage(TEXT("系统提示：房间内有玩家未准备无法开始游戏！"));
 		}
 	}
@@ -430,6 +378,20 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 		}
 
 		// TODO未来扩展：在这里生成战斗血条、准星等 GameHUD UI
+	}
+}
+
+// 处理装备与选角请求
+bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& WeaponRowName) { return true; }
+
+void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& WeaponRowName)
+{
+	// 工业级规范：将配置长久保存在服务器的 PlayerState 中
+	// 这样即便角色死亡、切换地图，服务器依然记得该玩家选了什么！
+	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
+	{
+		PS->SelectedCharacterRowName = CharacterRowName;
+		PS->SelectedWeaponRowName = WeaponRowName;
 	}
 }
 

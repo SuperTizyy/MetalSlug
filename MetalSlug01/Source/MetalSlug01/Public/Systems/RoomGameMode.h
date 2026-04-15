@@ -21,21 +21,15 @@ public:
 	// 构造函数
 	ARoomGameMode(const FObjectInitializer& ObjectInitializer);
 	
-	// 服务器上保存的权威名单
-	TArray<FString> RedTeamNames;
-	TArray<FString> BlueTeamNames;
 
 	// 处理新玩家加入的逻辑
-	void AddPlayerToRoom(const FString& PlayerName);
-
-	// 把最新名单广播给房间里的所有玩家
-	void BroadcastRoomUpdate();
+	void AddPlayerToRoom(AController* RequestingController, const FString& PlayerName);
 	
 	// 处理玩家主动请求换队伍
-	void ChangePlayerTeam(const FString& PlayerName, bool bToRedTeam);
+	void ChangePlayerTeam(AController* RequestingController, bool bToRedTeam);
 	
 	// 处理玩家离开房间
-	void RemovePlayerFromRoom(const FString& PlayerName);
+	void RemovePlayerFromRoom(AController* RequestingController);
 	
 	// 广播玩家聊天
 	void BroadcastChatMessage(const FString& SenderName, const FString& Message);
@@ -45,15 +39,8 @@ public:
 	// 【新增】：添加 AI 玩家
 	void AddAIToRoom(bool bToRedTeam, const FString& CharacterName, int32 Count);
 	
-	// 【新增】：全频道广播函数（每当名单有变动，立刻通知所有人刷新UI）
-	void BroadcastRoomUIUpdate();
-	
-	// 【新增】：用一个字典(Map)记录所有人的准备状态 (名字 -> 是否准备)
-	UPROPERTY()
-	TMap<FString, bool> PlayerReadyStates;
-
 	// 【新增】：更新某个人的准备状态并广播
-	void UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady);
+	void UpdatePlayerReadyState(AController* RequestingController, bool bIsReady);
 	
 	// ==========================================
 	// 【新增】：状态机与测试开关
@@ -76,10 +63,16 @@ public:
 	TSubclassOf<ABaseWeapon> TestWeaponClass;
 
 	// ==========================================
-	// 【新增】：核心战斗生成接口
+	// 【数据驱动配置】：在蓝图 BP_RoomGameMode 中配置对应的 DataTable 资产
 	// ==========================================
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Data")
+	class UDataTable* CharacterDataTable;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Data")
+	class UDataTable* WeaponDataTable;
+	
 	// 处理玩家的生成请求
-	void HandlePlayerRequestSpawn(class APlayerController* PC, FString CharRowName, FString WeaponRowName);
+	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponRowName);
 	
 	// AI 向上帝申请一个目标
 	UFUNCTION(BlueprintCallable, Category = "AI")
@@ -87,6 +80,7 @@ public:
 	
 	// 辅助函数 - 查一查这个倒霉蛋现在正被几个 AI 盯着？
 	int32 GetAttackerCount(ABaseCharacter* TargetEnemy);
+	bool CheckAllPlayersReady();
 
 	// 释放记录 (参数改为请求释放的 AI)
 	UFUNCTION(BlueprintCallable, Category = "AI")
@@ -97,9 +91,6 @@ private:
 	int32 AINextID = 1;
 	
 protected:
-	// 真正执行生成和发枪的内部函数
-	void SpawnAndEquip(APlayerController* PC, TSubclassOf<ABaseCharacter> CharClass, TSubclassOf<ABaseWeapon> WeaponClass);
-	
 	// 记录目前哪些玩家正在被 AI 追杀（防止扎堆）
 	// Key = 猎物 (玩家), Value = 猎人 (追他的 AI)
 	UPROPERTY()
@@ -112,5 +103,15 @@ protected:
 	// 这样的好处是：一个敌人可以被多个 AI 追，我们只要数一数 Value 出现的次数就行了！
 	UPROPERTY()
 	TMap<ABaseCharacter*, ABaseCharacter*> AIHuntingMap;
+	
+	// ==========================================
+	// 覆盖 UE 原生生命周期函数
+	// ==========================================
+	
+	// 1. 核心决策：决定当前 Controller 应该生成什么 Class 的实体
+	virtual UClass* GetDefaultPawnClassForController_Implementation(AController* InController) override;
+
+	// 2. 核心生成：玩家实体生成并附身完成后的钩子（在这里安全地派发武器）
+	virtual void RestartPlayer(AController* NewPlayer) override;
 	
 };
