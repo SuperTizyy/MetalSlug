@@ -25,4 +25,17 @@ protected:
 	// 局域网大厅界面的蓝图类
 	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
 	TSubclassOf<UUserWidget> LANRoomUIClass;
+	
+	// 监听全局状态变化的事件回调
+	UFUNCTION()
+	void OnFlowStateChanged(EMatchState NewState);
+	
+private:
+	// 缓存当前创建的登录 UI
+	UPROPERTY(Transient)
+	UUserWidget* ActiveLoginWidget = nullptr;
+
+	// 缓存当前创建的大厅 UI
+	UPROPERTY(Transient)
+	UUserWidget* ActiveLobbyWidget = nullptr;
 };

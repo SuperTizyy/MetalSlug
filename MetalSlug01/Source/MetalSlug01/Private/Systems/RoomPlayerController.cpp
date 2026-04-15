@@ -1,6 +1,7 @@
 ﻿#include "Systems/RoomPlayerController.h"
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "Systems/RoomGameMode.h"
+#include "Systems/GameFlowSubsystem.h"
 #include "UI/Login/Core/AccountSubsystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "OnlineSubsystem.h"
@@ -11,36 +12,21 @@ void ARoomPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 【极其重要】：控制器在服务器和客户端都会生成。
-	// 但 UI 只能给“本地真实的玩家”生成！所以必须加 IsLocalPlayerController() 判断！
 	if (IsLocalPlayerController())
 	{
-		// // 1. 让鼠标显示出来
-		// bShowMouseCursor = true;
-		// SetInputMode(FInputModeUIOnly());
-		
-		// 【测试阶段临时修改】：先把鼠标隐藏，把输入模式改回游戏！
-		bShowMouseCursor = false;
-		SetInputMode(FInputModeGameOnly());
-
-		// 2. 动态生成房间 UI 并显示在屏幕上
-		if (RoomUIClass)
+		// 【新架构：向大管家报到】
+		if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
 		{
-			RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
-			if (RoomUIWidget)
-			{
-				RoomUIWidget->AddToViewport();
-			}
+			FlowSubsystem->OnStateChanged.AddDynamic(this, &ARoomPlayerController::OnFlowStateChanged);
+			
+			// 主动同步状态：刚加载进战斗地图时，强制进入房间态
+			FlowSubsystem->TransitToState(EMatchState::InRoom);
 		}
-		
-		// ==========================================
-		// 【核心修复】：不要立刻发 RPC！延迟 0.5 秒再发！
-		// 等待引擎底层彻底把客户端和服务器连接完毕！
-		// ==========================================
+
+		// 延迟 0.5 秒再发，等待底层网络连接稳固
 		FTimerHandle DelayHandle;
 		GetWorld()->GetTimerManager().SetTimer(DelayHandle, this, &ARoomPlayerController::DelayedSendPlayerInfo, 2.0f, false);
 		
-		// 【新增】：立刻向服务器请求生成 3D 角色和武器！
 		Server_RequestSpawn();
 	}
 }
@@ -151,11 +137,11 @@ void ARoomPlayerController::Client_ForceLeaveRoom_Implementation()
 }
 
 // ----------------------------------------------------
-// 【新增】真正执行断网和跳地图的底层逻辑
+// 真正执行断网和跳地图的底层逻辑
 // ----------------------------------------------------
 void ARoomPlayerController::ExecuteLeaveRoom()
 {
-	// 1. 销毁本地的 Session（通知底层解散）
+	// 1. 销毁本地的 Session（通知底层解散局域网）
 	if (IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get())
 	{
 		if (IOnlineSessionPtr SessionInterface = OnlineSub->GetSessionInterface())
@@ -163,25 +149,20 @@ void ARoomPlayerController::ExecuteLeaveRoom()
 			SessionInterface->DestroySession(NAME_GameSession);
 		}
 	}
-	
-	// 2. 买好返程车票
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			AccountSub->bIsReturningFromRoom = true;
-		}
-	}
 
-	// =========================================================================
-	// 【核心修复 2】：绝不能瞬间切地图！
-	// 开启一个 0.5 秒的定时器，给 Windows 操作系统足够的时间去安全释放 7777 端口！
-	// 只有端口释放干净了，下一次创房别人才能进得来！
-	// =========================================================================
+	// ==========================================
+	// 【架构精进】：彻底删掉 AccountSub->bIsReturningFromRoom 和 OpenLevel！
+	// 开启 0.5 秒定时器给操作系统释放 7777 端口后，
+	// 优雅地交给大管家，呼叫 TransitToState 即可！
+	// ==========================================
 	FTimerHandle TravelTimer;
 	GetWorld()->GetTimerManager().SetTimer(TravelTimer, [this]()
 	{
-		UGameplayStatics::OpenLevel(this, FName("L_Login"), true, TEXT("?offline")); 
+		if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+		{
+			// 告诉管家：我要回大厅！管家会自动调用带着 ?offline 的 OpenLevel 把你送回去。
+			FlowSubsystem->TransitToState(EMatchState::MainLobby);
+		}
 	}, 0.5f, false);
 }
 
@@ -387,6 +368,42 @@ void ARoomPlayerController::Server_RequestSpawn_Implementation()
 		// 告诉大脑：这是我的对讲机，给我发枪！（我们下一步就去 RoomGameMode 里写这个函数）
 		// 传两个空字符串，GameMode 就会自动识别出我们要用“测试白模”
 		GM->HandlePlayerRequestSpawn(this, TEXT(""), TEXT(""));
+	}
+}
+
+void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
+{
+	// 【状态 A：正在房间内等待】
+	if (NewState == EMatchState::InRoom)
+	{
+		// 房间里需要用鼠标点 UI
+		bShowMouseCursor = true;
+		SetInputMode(FInputModeUIOnly());
+
+		if (RoomUIClass && !RoomUIWidget)
+		{
+			RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
+			if (RoomUIWidget)
+			{
+				RoomUIWidget->AddToViewport();
+			}
+		}
+	}
+	// 【状态 B：房主点击了“开始游戏”，真正打起来了！】
+	else if (NewState == EMatchState::Battleing)
+	{
+		// 战斗时隐藏鼠标，准星锁定屏幕中心
+		bShowMouseCursor = false;
+		SetInputMode(FInputModeGameOnly());
+
+		// 将烦人的房间 UI 销毁掉！
+		if (RoomUIWidget)
+		{
+			RoomUIWidget->RemoveFromParent();
+			RoomUIWidget = nullptr;
+		}
+
+		// TODO未来扩展：在这里生成战斗血条、准星等 GameHUD UI
 	}
 }
 

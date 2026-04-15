@@ -121,6 +121,10 @@ private:
 	FTimerHandle HostLeaveTimer;
 	
 protected:
+	// 监听全局状态变化的事件回调
+	UFUNCTION()
+	void OnFlowStateChanged(EMatchState NewState);
+	
 	// 暴露给蓝图，用于选择你刚做好的 WBP_RoomInside
 	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
 	TSubclassOf<URoomInsidePage> RoomUIClass;

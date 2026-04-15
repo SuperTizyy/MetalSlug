@@ -19,6 +19,7 @@
 #include "OnlineSubsystem.h"
 #include "Interfaces/OnlineSessionInterface.h"
 #include "OnlineSessionSettings.h"
+#include "Systems/GameFlowSubsystem.h"
 
 bool URoomInsidePage::Initialize()
 {
