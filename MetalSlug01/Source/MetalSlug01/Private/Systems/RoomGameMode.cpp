@@ -13,13 +13,13 @@
 #include "Weapons/BaseWeapon.h"
 #include "Kismet/GameplayStatics.h"
 #include "Characters/BaseCharacter.h"
+#include "Systems/RoomGameState.h"
 #include "UI/MyGameHUD.h"
+#include "UI/Login/Core/RoomPlayerState.h"
 
 ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	// // 告诉引擎使用你的 HUD 类
-	// HUDClass = AMyGameHUD::StaticClass();
 	
 	// 【强行关闭无缝漫游】：在基础局域网测试中，开启它纯属自找麻烦！
 	bUseSeamlessTravel = false;
@@ -27,110 +27,69 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	// 【新增初始化】：默认大厅等待，但强行开启跳过测试开关！
 	CurrentRoomState = ERoomState::WaitingInRoom;
 	bSkipRoomPhaseForTesting = true;
+	
+	// 配置引擎的标准框架类
+	GameStateClass = ARoomGameState::StaticClass();
+	PlayerStateClass = ARoomPlayerState::StaticClass();
 }
 
-void ARoomGameMode::AddPlayerToRoom(const FString& PlayerName)
+void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FString& PlayerName)
 {
-	// 【智能分配算法】：红队人少就去红队，否则去蓝队
-	if (RedTeamNames.Num() <= BlueTeamNames.Num())
+	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
 	{
-		RedTeamNames.Add(PlayerName);
+		// 谁第一个进房间（房主建房时），谁的名字就刻在 GameState 上！
+		if (GS->HostPlayerName.IsEmpty())
+		{
+			GS->HostPlayerName = PlayerName;
+		}
 	}
-	else
+	
+	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
-		BlueTeamNames.Add(PlayerName);
+		// 引擎底层会自动同步名字
+		PS->SetPlayerName(PlayerName);
+		
+		// 智能分配算法：向 GameState 查询目前哪边人少？
+		if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+		{
+			int32 RedCount = GS->GetPlayersInTeam(ERoomTeam::Red).Num();
+			int32 BlueCount = GS->GetPlayersInTeam(ERoomTeam::Blue).Num();
+			
+			// 修改队伍，引擎会自动将这个改动广播给全服！
+			PS->CurrentTeam = (RedCount <= BlueCount) ? ERoomTeam::Red : ERoomTeam::Blue;
+		}
 	}
-	// 【新增】：向全服播报绿字提示！
 	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】加入了房间"), *PlayerName));
-	
-	// 名单更新了，立刻通知全房间的人刷新 UI！
-	BroadcastRoomUpdate();
 }
 
-void ARoomGameMode::BroadcastRoomUpdate()
+// ==========================================
+// 切换队伍逻辑
+// ==========================================
+void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bToRedTeam)
 {
-	// 1. 【核心修复】：必须在 for 循环外面先声明并获取 HostName！
-	FString HostName = TEXT("");
-	if (ARoomPlayerController* HostPC = Cast<ARoomPlayerController>(GetWorld()->GetFirstPlayerController()))
+	// 不再按名字去找，直接获取发请求的那个人的 PlayerState
+	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
-		HostName = HostPC->MyPlayerName;
-	}
-	
-	// ==========================================
-	// 【新增核心逻辑】：把最新的总人数更新到大厅广告牌上！
-	// ==========================================
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub)
-	{
-		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-		if (Sessions.IsValid())
-		{
-			// 拿到当前正在运行的房间 (NAME_GameSession)
-			FNamedOnlineSession* Session = Sessions->GetNamedSession(NAME_GameSession);
-			if (Session)
-			{
-				// 计算当前房间里的绝对总人数（红队 + 蓝队，包含了真人和 AI）
-				int32 CurrentTotalPlayers = RedTeamNames.Num() + BlueTeamNames.Num();
-				
-				// 覆写那个名为 TOTAL_PLAYERS_WITH_AI 的标签！
-				Session->SessionSettings.Set(FName("TOTAL_PLAYERS_WITH_AI"), CurrentTotalPlayers, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-				
-				// 提交更新！这一步会让局域网里的其他玩家立刻搜到新的人数！
-				Sessions->UpdateSession(NAME_GameSession, Session->SessionSettings, true);
-			}
-		}
-	}
-
-	// 2. 遍历当前世界（房间）里的所有玩家控制器
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get());
-		if (PC)
-		{
-			// 呼叫对讲机的 Client RPC，把服务器的名单和房主名字硬塞给他们
-			PC->Client_UpdateRoomUI(RedTeamNames, BlueTeamNames, HostName);
-            
-			// 【顺带补上】：名单刷新后，紧接着把字典里保存的所有人的准备状态重新刷一遍！
-			for (const auto& Pair : PlayerReadyStates)
-			{
-				PC->Client_UpdatePlayerReadyState(Pair.Key, Pair.Value);
-			}
-		}
+		// 服务器直接修改它的值
+		PS->CurrentTeam = bToRedTeam ? ERoomTeam::Red : ERoomTeam::Blue;
+		
+		// 只要改了这行代码，UE 引擎底层会自动在下一个 Tick 将这个变量打包，
+		// 顺着网线发给房间里所有的客户端，并触发他们本地的 OnRep_Team()！
+		// 你再也不用手动写 Broadcast 广播了！
+		
+		// （可选）：如果你需要在服务端也立刻触发逻辑，可以手动调一次
+		// PS->OnRep_Team(); 
 	}
 }
 
-void ARoomGameMode::ChangePlayerTeam(const FString& PlayerName, bool bToRedTeam)
+void ARoomGameMode::RemovePlayerFromRoom(AController* RequestingController)
 {
-	// 1. 简单粗暴：先把这个玩家从两个队伍里都踢出去（防止分身）
-	RedTeamNames.Remove(PlayerName);
-	BlueTeamNames.Remove(PlayerName);
-
-	// 2. 根据他的请求，把他加进对应的队伍
-	if (bToRedTeam)
+	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
-		RedTeamNames.AddUnique(PlayerName); // AddUnique 防止重复添加
+		BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】退出了房间"), *PS->GetPlayerName()));
 	}
-	else
-	{
-		BlueTeamNames.AddUnique(PlayerName);
-	}
-
-	// 3. 名单发生变化，立刻广播给全房间的所有人！
-	BroadcastRoomUpdate();
-}
-
-void ARoomGameMode::RemovePlayerFromRoom(const FString& PlayerName)
-{
-	// 1. 无脑从两个队伍里把这个名字删掉
-	RedTeamNames.Remove(PlayerName);
-	BlueTeamNames.Remove(PlayerName);
-	
-	// 【新增】：向全服播报绿字提示！
-	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】退出了房间"), *PlayerName));
-
-	// 2. 广播给房间里剩下的人，让他们刷新 UI（这步极其关键，否则别人屏幕上还有你）
-	BroadcastRoomUpdate();
-	
+	// 架构优势：我们不需要再手动从任何 Array 里 Remove 名字了！
+	// 当玩家断开连接时，引擎会自动把他的 PlayerState 从 GameState 中销毁并移除。
 }
 
 void ARoomGameMode::BroadcastChatMessage(const FString& SenderName, const FString& Message)
@@ -169,83 +128,21 @@ void ARoomGameMode::BroadcastSystemMessage(const FString& Message)
 }
 
 // ----------------------------------------------------
-// 【新增】：给 AI 发放唯一身份证并加入名单
+// 给 AI 发放唯一身份证并加入名单
 // ----------------------------------------------------
 void ARoomGameMode::AddAIToRoom(bool bToRedTeam, const FString& CharacterName, int32 Count)
 {
-	for (int32 i = 0; i < Count; ++i)
-	{
-		// 核心防同名魔法：给 AI 名字加上自增编号！
-		FString UniqueAIName = FString::Printf(TEXT("[AI] %s_%d"), *CharacterName, AINextID);
-		
-		// 编号自增，确保下一个绝对不重名
-		AINextID++;
-
-		// 塞进对应的队伍数组里
-		if (bToRedTeam)
-		{
-			RedTeamNames.AddUnique(UniqueAIName);
-		}
-		else
-		{
-			BlueTeamNames.AddUnique(UniqueAIName);
-		}
-	}
-
-	// 【体验优化】：向全服播报绿字提示，告诉大家房主加了几个 AI！
-	FString TeamStr = bToRedTeam ? TEXT("红队") : TEXT("蓝队");
-	BroadcastSystemMessage(FString::Printf(TEXT("房主向【%s】部署了 %d 名 AI 士兵 [%s]"), *TeamStr, Count, *CharacterName));
-
-	// 【核心修复】：名字必须和你上面写好的广播函数一模一样！
-	BroadcastRoomUpdate();
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Yellow, TEXT("注意：AI 添加逻辑将在 PlayerState 彻底接管后重构！"));
+	// 真正的工业级做法是：直接在这里 Spawn 一个带有 PlayerState 的 AIController。
 }
 
-// ----------------------------------------------------
-// 【终极广播核心】：强行让所有客户端的 UI 和服务器的数组保持一致！
-// ----------------------------------------------------
-void ARoomGameMode::BroadcastRoomUIUpdate()
+// 切换准备逻辑
+void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bool bIsReady)
 {
-	// ==========================================
-	// 1. 必须在最前面声明并获取 HostName！
-	// ==========================================
-	FString HostName = TEXT("");
-	if (ARoomPlayerController* HostPC = Cast<ARoomPlayerController>(GetWorld()->GetFirstPlayerController()))
+	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
-		HostName = HostPC->MyPlayerName;
-	}
-
-	// ==========================================
-	// 2. 然后才能在下面的循环里使用 HostName！
-	// ==========================================
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get());
-		if (PC)
-		{
-			// 此时编译器已经认识 HostName 了，绝对不会再报 C2065！
-			PC->Client_UpdateRoomUI(RedTeamNames, BlueTeamNames, HostName);
-			
-			// 紧接着把字典里保存的所有人的准备状态重新刷一遍！
-			for (const auto& Pair : PlayerReadyStates)
-			{
-				PC->Client_UpdatePlayerReadyState(Pair.Key, Pair.Value);
-			}
-		}
-	}
-}
-
-void ARoomGameMode::UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady)
-{
-	// 写入服务器的记忆字典里
-	PlayerReadyStates.Add(PlayerName, bIsReady);
-
-	// 全频道广播！通知所有人的 UI 更新这个人！
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-	{
-		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
-		{
-			PC->Client_UpdatePlayerReadyState(PlayerName, bIsReady);
-		}
+		// 服务器直接修改它的值，引擎会自动同步给全网！
+		PS->bIsReady = bIsReady;
 	}
 }
 
@@ -415,4 +312,27 @@ int32 ARoomGameMode::GetAttackerCount(ABaseCharacter* TargetEnemy)
 		}
 	}
 	return Count;
+}
+
+
+// 检查是否所有人准备就绪
+bool ARoomGameMode::CheckAllPlayersReady()
+{
+	// 直接问全局的 GameState
+	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+	{
+		for (APlayerState* GenericPS : GS->PlayerArray)
+		{
+			if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(GenericPS))
+			{
+				// 假设未分配队伍的人不算在内，且房主(Host)默认随时Ready
+				// (这里可以根据你的具体业务逻辑微调)
+				if (PS->CurrentTeam != ERoomTeam::None && !PS->bIsReady)
+				{
+					return false; // 有人没准备！
+				}
+			}
+		}
+	}
+	return true;
 }

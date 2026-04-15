@@ -21,21 +21,15 @@ public:
 	// 构造函数
 	ARoomGameMode(const FObjectInitializer& ObjectInitializer);
 	
-	// 服务器上保存的权威名单
-	TArray<FString> RedTeamNames;
-	TArray<FString> BlueTeamNames;
 
 	// 处理新玩家加入的逻辑
-	void AddPlayerToRoom(const FString& PlayerName);
-
-	// 把最新名单广播给房间里的所有玩家
-	void BroadcastRoomUpdate();
+	void AddPlayerToRoom(AController* RequestingController, const FString& PlayerName);
 	
 	// 处理玩家主动请求换队伍
-	void ChangePlayerTeam(const FString& PlayerName, bool bToRedTeam);
+	void ChangePlayerTeam(AController* RequestingController, bool bToRedTeam);
 	
 	// 处理玩家离开房间
-	void RemovePlayerFromRoom(const FString& PlayerName);
+	void RemovePlayerFromRoom(AController* RequestingController);
 	
 	// 广播玩家聊天
 	void BroadcastChatMessage(const FString& SenderName, const FString& Message);
@@ -45,15 +39,8 @@ public:
 	// 【新增】：添加 AI 玩家
 	void AddAIToRoom(bool bToRedTeam, const FString& CharacterName, int32 Count);
 	
-	// 【新增】：全频道广播函数（每当名单有变动，立刻通知所有人刷新UI）
-	void BroadcastRoomUIUpdate();
-	
-	// 【新增】：用一个字典(Map)记录所有人的准备状态 (名字 -> 是否准备)
-	UPROPERTY()
-	TMap<FString, bool> PlayerReadyStates;
-
 	// 【新增】：更新某个人的准备状态并广播
-	void UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady);
+	void UpdatePlayerReadyState(AController* RequestingController, bool bIsReady);
 	
 	// ==========================================
 	// 【新增】：状态机与测试开关
@@ -87,6 +74,7 @@ public:
 	
 	// 辅助函数 - 查一查这个倒霉蛋现在正被几个 AI 盯着？
 	int32 GetAttackerCount(ABaseCharacter* TargetEnemy);
+	bool CheckAllPlayersReady();
 
 	// 释放记录 (参数改为请求释放的 AI)
 	UFUNCTION(BlueprintCallable, Category = "AI")

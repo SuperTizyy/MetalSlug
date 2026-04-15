@@ -20,10 +20,6 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_ToggleReady(bool bIsReady);
 	
-	// 服务器下发：“某某某玩家的准备状态变了，大家快刷新 UI！”
-	UFUNCTION(Client, Reliable)
-	void Client_UpdatePlayerReadyState(const FString& PlayerName, bool bIsReady);
-	
 	// ==========================================
 	// 【新增】AI 管理相关 RPC
 	// ==========================================
@@ -54,9 +50,6 @@ public:
 	// ==========================================
 	// 2. 服务器 -> 客户端的 RPC (Server to Client)
 	// ==========================================
-	// 服务器算好红蓝队人数后，下发给各个客户端：“这是最新的红蓝名单，马上刷新你们的UI！”
-	UFUNCTION(Client, Reliable)
-	void Client_UpdateRoomUI(const TArray<FString>& RedTeam, const TArray<FString>& BlueTeam, const FString& HostName);
 
 	// 延迟发送玩家信息，避开网络抢跑期
 	void DelayedSendPlayerInfo();

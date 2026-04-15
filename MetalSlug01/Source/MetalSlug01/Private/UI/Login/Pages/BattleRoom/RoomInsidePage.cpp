@@ -20,6 +20,8 @@
 #include "Interfaces/OnlineSessionInterface.h"
 #include "OnlineSessionSettings.h"
 #include "Systems/GameFlowSubsystem.h"
+#include "Systems/RoomGameState.h"
+#include "UI/Login/Core/RoomPlayerState.h"
 
 bool URoomInsidePage::Initialize()
 {
@@ -67,6 +69,12 @@ bool URoomInsidePage::Initialize()
 void URoomInsidePage::NativeConstruct()
 {
 	Super::NativeConstruct();
+	
+	// 【架构新生】：启动 0.5 秒一次的低频监控探头！
+	GetWorld()->GetTimerManager().SetTimer(PlayerCheckTimerHandle, this, &URoomInsidePage::CheckForNewPlayers, 0.5f, true);
+	
+	// 刚进来时强制刷一次
+	RefreshRoomUI();
 	
 	// 只要调用 HasAuthority()，就能瞬间判定当前操作这块 UI 的玩家是不是真正的房主（服务器主机）
 	bool bIsHost = GetOwningPlayer()->HasAuthority();
@@ -239,57 +247,14 @@ void URoomInsidePage::NativeConstruct()
 	}
 }
 
-
-// ==========================================
-// 【核心逻辑】：根据服务器发来的数据刷新 UI
-// ==========================================
-void URoomInsidePage::UpdateTeamLists(const TArray<FString>& RedTeamNames, const TArray<FString>& BlueTeamNames, const FString& HostName)
+void URoomInsidePage::NativeDestruct()
 {
-	// 1. 清空旧数据 (保持原逻辑)
-	if (Box_RedTeam) Box_RedTeam->ClearChildren();
-	if (Box_BlueTeam) Box_BlueTeam->ClearChildren();
+	// 【内存安全】：UI 被销毁时，必须拔掉探头定时器，防止崩溃！
+	GetWorld()->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
 
-	if (!PlayerLabelClass) return;
-
-	// 定义一个内部小助手，用来生成并配置标签
-	auto PopulateTeam = [&](const TArray<FString>& Names, UVerticalBox* TargetBox)
-	{
-		for (const FString& PlayerName : Names)
-		{
-			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
-			if (PlayerLabel)
-			{
-				// 先设置基础名字
-				PlayerLabel->SetPlayerName(PlayerName);
-				
-				// 【核心判定】：身份归类！
-				// ==========================================
-				if (PlayerName.StartsWith(TEXT("[AI]")))
-				{
-					// 情况 A：这是 AI！
-					PlayerLabel->SetAsAI();
-				}
-				else if (PlayerName == HostName)
-				{
-					// 情况 B：这是房主！
-					PlayerLabel->SetAsHost(true);
-				}
-				
-				// 踢人按钮可见性判定 (房主且不是自己时显示)
-				bool bAmIHost = GetOwningPlayer()->HasAuthority();
-				FString MyName = TEXT(""); // 从子系统获取本地名字...
-				// (此处复用你之前的踢人按钮逻辑)
-				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && PlayerName != HostName);
-
-				TargetBox->AddChild(PlayerLabel);
-			}
-		}
-	};
-
-	// 分别填充红蓝队
-	PopulateTeam(RedTeamNames, Box_RedTeam);
-	PopulateTeam(BlueTeamNames, Box_BlueTeam);
+	Super::NativeDestruct();
 }
+
 
 // ==========================================
 // 按钮点击响应 (目前先写个壳子，之后连上对讲机发 RPC)
@@ -928,29 +893,6 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 	}
 }
 
-void URoomInsidePage::UpdatePlayerReadyStateUI(const FString& PlayerName, bool bIsPlayerReady)
-{
-	// 定义一个Lambda小助手，用来遍历队伍容器找人
-	auto FindAndSetReady = [&](UVerticalBox* TeamBox)
-	{
-		if (!TeamBox) return;
-		for (UWidget* Child : TeamBox->GetAllChildren())
-		{
-			if (UPlayerLabelWidget* Label = Cast<UPlayerLabelWidget>(Child))
-			{
-				if (Label->GetPlayerName() == PlayerName)
-				{
-					Label->SetReadyState(bIsPlayerReady); // 找到了，设置状态！
-				}
-			}
-		}
-	};
-
-	// 去红蓝两队里搜寻这个人，并刷新他的状态
-	FindAndSetReady(Box_RedTeam);
-	FindAndSetReady(Box_BlueTeam);
-}
-
 void URoomInsidePage::AddSystemMessageToChat(const FString& Message)
 {
 	if (!ScrollBox_ChatList) return;
@@ -971,5 +913,109 @@ void URoomInsidePage::AddSystemMessageToChat(const FString& Message)
 		// 塞进聊天列表，并让滚动条自动滚到最底部
 		ScrollBox_ChatList->AddChild(SystemMsgText);
 		ScrollBox_ChatList->ScrollToEnd();
+	}
+}
+
+// ==========================================
+// 监控探头：自动发现人员进出，并挂载监听器
+// ==========================================
+void URoomInsidePage::CheckForNewPlayers()
+{
+	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
+	if (!GS) return;
+
+	bool bNeedsRefresh = false;
+
+	// 1. 扫描：有没有新面孔？
+	for (APlayerState* GenericPS : GS->PlayerArray)
+	{
+		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
+		{
+			// 如果这个玩家不在我们的记忆数组里，说明是刚加入的！
+			if (!KnownPlayerStates.Contains(RoomPS))
+			{
+				KnownPlayerStates.Add(RoomPS);
+				
+				// 【核心魔法】：主动订阅这个玩家的动态！只要他改队伍/改准备，自动通知我们！
+				RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
+				
+				bNeedsRefresh = true; // 有新人，必须刷新UI
+			}
+		}
+	}
+
+	// 2. 清理：有没有人偷偷退出了？
+	for (int32 i = KnownPlayerStates.Num() - 1; i >= 0; --i)
+	{
+		ARoomPlayerState* TrackedPS = KnownPlayerStates[i];
+		// 如果玩家实体已销毁，或者 GameState 里没他了，说明他走了
+		if (!IsValid(TrackedPS) || !GS->PlayerArray.Contains(TrackedPS))
+		{
+			KnownPlayerStates.RemoveAt(i);
+			bNeedsRefresh = true; // 有人走了，必须刷新UI
+		}
+	}
+
+	// 3. 只有名单发生人员增减时，才触发整体重绘！性能极其优异！
+	if (bNeedsRefresh)
+	{
+		RefreshRoomUI();
+	}
+}
+
+// ==========================================
+// 核心重绘逻辑（仅在人员变动或状态变动时触发）
+// ==========================================
+void URoomInsidePage::RefreshRoomUI()
+{
+	if (Box_RedTeam) Box_RedTeam->ClearChildren();
+	if (Box_BlueTeam) Box_BlueTeam->ClearChildren();
+	if (!PlayerLabelClass) return;
+
+	// 获取全局房主名字
+	FString CurrentHostName = TEXT("");
+	if (ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>())
+	{
+		CurrentHostName = GS->HostPlayerName;
+	}
+
+	// 遍历我们认识的所有玩家，画出他们的条目
+	for (ARoomPlayerState* PS : KnownPlayerStates)
+	{
+		if (!IsValid(PS)) continue;
+
+		// 他在哪个队？
+		UVerticalBox* TargetBox = nullptr;
+		if (PS->CurrentTeam == ERoomTeam::Red) TargetBox = Box_RedTeam;
+		else if (PS->CurrentTeam == ERoomTeam::Blue) TargetBox = Box_BlueTeam;
+
+		// 如果他已经选好了队伍，就生成 UI
+		if (TargetBox)
+		{
+			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
+			if (PlayerLabel)
+			{
+				// 直接从 PlayerState 中读取他的最新数据！
+				FString PName = PS->GetPlayerName();
+				PlayerLabel->SetPlayerName(PName);
+				PlayerLabel->SetReadyState(PS->bIsReady);
+
+				// 身份判定
+				if (PName.StartsWith(TEXT("[AI]")))
+				{
+					PlayerLabel->SetAsAI();
+				}
+				else if (PName == CurrentHostName)
+				{
+					PlayerLabel->SetAsHost(true);
+				}
+
+				// 只有本地真正的大房主，才有权限看到踢人按钮
+				bool bAmIHost = GetOwningPlayer()->HasAuthority();
+				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && PName != CurrentHostName);
+
+				TargetBox->AddChild(PlayerLabel);
+			}
+		}
 	}
 }
