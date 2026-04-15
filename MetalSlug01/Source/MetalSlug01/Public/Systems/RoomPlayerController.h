@@ -46,6 +46,10 @@ public:
 	// Reliable 表示必定送达，WithValidation 是 UE 网络安全的防作弊校验规范
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_SendPlayerInfo(const FString& InPlayerName);
+	
+	// 服务器下达的终极指令：“全军出击！”
+	UFUNCTION(Client, Reliable)
+	void Client_EnterBattleState();
 
 	// ==========================================
 	// 2. 服务器 -> 客户端的 RPC (Server to Client)

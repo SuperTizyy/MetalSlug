@@ -74,6 +74,17 @@ void ARoomPlayerController::Server_SendPlayerInfo_Implementation(const FString& 
 	}
 }
 
+void ARoomPlayerController::Client_EnterBattleState_Implementation()
+{
+	// 每个玩家（客户端）收到服务器的开打指令后，立刻向本地的流程大管家报到！
+	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+	{
+		// 管家收到指令，会自动触发 OnFlowStateChanged
+		// 继而销毁你的 RoomInsidePage，隐藏鼠标，并呼出战斗准星！
+		FlowSubsystem->TransitToState(EMatchState::Battleing);
+	}
+}
+
 // ----------------------------------------------------
 // Client RPC 实现区
 // ----------------------------------------------------
@@ -335,8 +346,23 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 			// ==========================================
 			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, TEXT("所有人均已准备，服务器即将开始游戏！"));
 			
-			// TODO: 在这里调用你真实的切换地图逻辑，例如：
-			// GetWorld()->ServerTravel(TEXT("/Game/Maps/你的战斗地图名字?listen"));
+			// 1. 【防错逻辑】更新服务器大脑的内部状态为战斗态
+			// 你原先定义的是 ERoomState::WaitingInRoom，这里如果有个 InGame 状态就设为 InGame
+			// GM->CurrentRoomState = ERoomState::InGame; 
+
+			// 2. 【核心爆点】：拿着大喇叭，给全频道所有控制器下达“全军出击”指令！
+			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+			{
+				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
+				{
+					// 让每个客户端本地去切 UI 和隐藏鼠标
+					PC->Client_EnterBattleState();
+					
+					// 3. 【正规化发枪】：既然开打了，服务器直接给他们发 3D 肉体和武器！
+					// 这会调用你在 RoomGameMode 里写的 SpawnAndEquip 逻辑
+					GM->HandlePlayerRequestSpawn(PC, TEXT(""), TEXT(""));
+				}
+			}
 		}
 		else
 		{
