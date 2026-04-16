@@ -62,14 +62,27 @@ bool ARoomPlayerController::Server_SendPlayerInfo_Validate(const FString& InPlay
 // 1. 发送玩家信息
 void ARoomPlayerController::Server_SendPlayerInfo_Implementation(const FString& InPlayerName)
 {
-	// 【新增这行】：让服务器端的这个对讲机记住自己的名字！
+	// 1. 记录在 Controller 自己的变量中（备用）
 	MyPlayerName = InPlayerName;
 	
-	// 这段代码只会在房主（服务器）的电脑上运行
-	// 获取咱们刚才写的服务器大脑 (RoomGameMode)
+	// ==========================================
+	// 【工业级修复】：强制覆写底层 PlayerState 名称！
+	// 虚幻引擎默认会把本地玩家名字设为操作系统计算机名 (如 YiYuanDesktop-XXXX)。
+	// 只有显式调用 SetPlayerName，UI 层 PS->GetPlayerName() 才能拿到真实的账号名！
+	// ==========================================
+	if (APlayerState* PS = GetPlayerState<APlayerState>())
+	{
+		PS->SetPlayerName(InPlayerName);
+		UE_LOG(LogTemp, Log, TEXT("[RoomPlayerController] 成功将玩家底层名称同步为: %s"), *InPlayerName);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 警告：尚未获取到 PlayerState！名称同步可能失败。"));
+	}
+
+	// 2. 将控制权转交给服务器大脑（GameMode）处理注册逻辑
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 传递 this (当前 Controller)，而不是传字符串名字！
 		GM->AddPlayerToRoom(this, InPlayerName);
 	}
 }

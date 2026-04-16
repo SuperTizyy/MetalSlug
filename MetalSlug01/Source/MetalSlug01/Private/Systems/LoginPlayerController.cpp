@@ -15,12 +15,35 @@ void ALoginPlayerController::BeginPlay()
 	// 获取全局流程管家，并监听状态变化
 	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
 	{
+		// 1. 订阅管家的广播频道
 		FlowSubsystem->OnStateChanged.AddDynamic(this, &ALoginPlayerController::OnFlowStateChanged);
 		
-		// 游戏刚启动时，如果在登录地图，主动推动管家进入 Login 状态
+		// 2. 确保在 L_Login 地图中才执行 UI 挂载逻辑
 		if (GetWorld()->GetMapName().Contains(TEXT("L_Login")))
 		{
-			FlowSubsystem->TransitToState(EMatchState::Login);
+			// ==========================================
+			// 【核心架构修复】：读取全局真实状态，绕过 TransitToState 的拦截
+			// ==========================================
+			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
+
+			if (CurrentState == EMatchState::MainLobby)
+			{
+				// 玩家正常退房回到大厅：手动强制调出大厅 UI
+				OnFlowStateChanged(EMatchState::MainLobby);
+				UE_LOG(LogTemp, Log, TEXT("[LoginPlayerController] 对齐状态：恢复大厅(MainLobby)界面。"));
+			}
+			else if (CurrentState == EMatchState::Login)
+			{
+				// 玩家注销账号返回登录页：手动强制调出登录 UI
+				OnFlowStateChanged(EMatchState::Login);
+				UE_LOG(LogTemp, Log, TEXT("[LoginPlayerController] 对齐状态：注销返回，恢复登录(Login)界面。"));
+			}
+			else
+			{
+				// 游戏第一次冷启动：推动管家进入 Login 状态
+				FlowSubsystem->TransitToState(EMatchState::Login);
+				UE_LOG(LogTemp, Log, TEXT("[LoginPlayerController] 初始化阶段，推入登录(Login)界面。"));
+			}
 		}
 	}
 }

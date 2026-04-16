@@ -926,37 +926,68 @@ void URoomInsidePage::CheckForNewPlayers()
 
 	bool bNeedsRefresh = false;
 
-	// 1. 扫描：有没有新面孔？
+	// 1. 扫描：探测是否有新玩家进入房间
 	for (APlayerState* GenericPS : GS->PlayerArray)
 	{
 		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
 		{
-			// 如果这个玩家不在我们的记忆数组里，说明是刚加入的！
 			if (!KnownPlayerStates.Contains(RoomPS))
 			{
 				KnownPlayerStates.Add(RoomPS);
-				
-				// 【核心魔法】：主动订阅这个玩家的动态！只要他改队伍/改准备，自动通知我们！
+				// 监听玩家状态变化（注意：此机制对服务器房主无效，仅对客户端生效）
 				RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
-				
-				bNeedsRefresh = true; // 有新人，必须刷新UI
+				bNeedsRefresh = true; 
 			}
 		}
 	}
 
-	// 2. 清理：有没有人偷偷退出了？
+	// 2. 清理：探测是否有人悄悄退房
 	for (int32 i = KnownPlayerStates.Num() - 1; i >= 0; --i)
 	{
 		ARoomPlayerState* TrackedPS = KnownPlayerStates[i];
-		// 如果玩家实体已销毁，或者 GameState 里没他了，说明他走了
 		if (!IsValid(TrackedPS) || !GS->PlayerArray.Contains(TrackedPS))
 		{
 			KnownPlayerStates.RemoveAt(i);
-			bNeedsRefresh = true; // 有人走了，必须刷新UI
+			bNeedsRefresh = true; 
 		}
 	}
 
-	// 3. 只有名单发生人员增减时，才触发整体重绘！性能极其优异！
+	// ==========================================
+	// 3. 【核心架构修复：跨越 OnRep 缺陷的深度脏校验】
+	// 专门解决房主（服务器）修改队伍属性时不会触发 UI 更新的问题。
+	// 我们不再只查“总人数”，而是精准核对“红蓝队兵力分布”。
+	// ==========================================
+	
+	int32 ExpectedRedCount = 0;
+	int32 ExpectedBlueCount = 0;
+
+	// A. 统计底层 PlayerState 数据中，真正属于红蓝队的人数
+	for (ARoomPlayerState* PS : KnownPlayerStates)
+	{
+		if (IsValid(PS))
+		{
+			if (PS->CurrentTeam == ERoomTeam::Red) ExpectedRedCount++;
+			else if (PS->CurrentTeam == ERoomTeam::Blue) ExpectedBlueCount++;
+		}
+	}
+
+	// B. 统计当前 UI 界面上，各个框里实际塞了多少个标签
+	int32 UIRedCount = Box_RedTeam ? Box_RedTeam->GetChildrenCount() : 0;
+	int32 UIBlueCount = Box_BlueTeam ? Box_BlueTeam->GetChildrenCount() : 0;
+	int32 RenderedTotalCount = UIRedCount + UIBlueCount;
+
+	// C. 触发重绘的三大绝对条件（短路运算，性能极高）：
+	// 条件 1: UI 渲染总数 和 名册总数 不等（解决刚进房 2 秒内的渲染缺失）
+	if (RenderedTotalCount != KnownPlayerStates.Num() || 
+	// 条件 2: 理论红队人数 和 UI 红队人数 不等（解决某人切到了红队，或者离开了红队）
+		ExpectedRedCount != UIRedCount || 
+	// 条件 3: 理论蓝队人数 和 UI 蓝队人数 不等
+		ExpectedBlueCount != UIBlueCount)
+	{
+		bNeedsRefresh = true;
+	}
+
+	// 4. 只有确信数据不一致时，才执行耗时的重绘操作
 	if (bNeedsRefresh)
 	{
 		RefreshRoomUI();
@@ -968,52 +999,76 @@ void URoomInsidePage::CheckForNewPlayers()
 // ==========================================
 void URoomInsidePage::RefreshRoomUI()
 {
+	// 1. 清理现有队伍列表中的旧UI，准备重新生成
 	if (Box_RedTeam) Box_RedTeam->ClearChildren();
 	if (Box_BlueTeam) Box_BlueTeam->ClearChildren();
-	if (!PlayerLabelClass) return;
+	
+	// 【防御性编程】：蓝图类判空
+	if (!PlayerLabelClass)
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[严重错误] PlayerLabelClass 未配置！"));
+		return;
+	}
 
-	// 获取全局房主名字
+	// 2. 获取当前的全局房主名字
 	FString CurrentHostName = TEXT("");
 	if (ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>())
 	{
 		CurrentHostName = GS->HostPlayerName;
 	}
 
-	// 遍历我们认识的所有玩家，画出他们的条目
+	// 3. 遍历当前已知的（UI已主动订阅的）所有玩家状态
 	for (ARoomPlayerState* PS : KnownPlayerStates)
 	{
 		if (!IsValid(PS)) continue;
 
-		// 他在哪个队？
+		// 4. 判断该玩家属于哪个队伍
 		UVerticalBox* TargetBox = nullptr;
 		if (PS->CurrentTeam == ERoomTeam::Red) TargetBox = Box_RedTeam;
 		else if (PS->CurrentTeam == ERoomTeam::Blue) TargetBox = Box_BlueTeam;
 
-		// 如果他已经选好了队伍，就生成 UI
+		// 如果分配了队伍，开始生成 UI
 		if (TargetBox)
 		{
 			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
 			if (PlayerLabel)
 			{
-				// 直接从 PlayerState 中读取他的最新数据！
+				// 获取我们在 Controller 中刚修复好的真实玩家名
 				FString PName = PS->GetPlayerName();
+				
+				// 赋予基础属性
 				PlayerLabel->SetPlayerName(PName);
 				PlayerLabel->SetReadyState(PS->bIsReady);
 
-				// 身份判定
-				if (PName.StartsWith(TEXT("[AI]")))
+				// ==========================================
+				// 【核心重构：身份判定三板斧】
+				// ==========================================
+				bool bIsAI = PName.StartsWith(TEXT("[AI]"));
+				
+				// 严谨比对：这个正在被渲染的标签，是不是房主本人？
+				bool bIsThisLabelTheHost = (PName == CurrentHostName);
+
+				// 身份 A：AI 玩家
+				if (bIsAI)
 				{
 					PlayerLabel->SetAsAI();
 				}
-				else if (PName == CurrentHostName)
+				// 身份 B：房主本人
+				else if (bIsThisLabelTheHost)
 				{
+					// 执行房主专属的 UI 清理逻辑
 					PlayerLabel->SetAsHost(true);
 				}
 
-				// 只有本地真正的大房主，才有权限看到踢人按钮
+				// ==========================================
+				// 逻辑闭环：谁能看到“移除玩家（踢人）”按钮？
+				// 条件 1: 我(当前看屏幕的玩家)必须是这局游戏的最高权限者 (HasAuthority)。
+				// 条件 2: 正在被渲染的这个标签，不能是我自己 ( !bIsThisLabelTheHost )。
+				// ==========================================
 				bool bAmIHost = GetOwningPlayer()->HasAuthority();
-				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && PName != CurrentHostName);
+				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && !bIsThisLabelTheHost);
 
+				// 挂载到对应的队伍 UI 容器下
 				TargetBox->AddChild(PlayerLabel);
 			}
 		}

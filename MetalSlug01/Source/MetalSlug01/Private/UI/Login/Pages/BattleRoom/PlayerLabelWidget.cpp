@@ -85,19 +85,35 @@ void UPlayerLabelWidget::SetAsHost(bool bIsHost)
 {
 	if (bIsHost)
 	{
-		// 1. 拼接名字：账户名（房主）
+		// 1. 拼接房主专属后缀
 		FString BaseName = GetPlayerName();
-		// 防止重复拼接（比如刷新UI时再次调用）
+		// 防重复拼接判定
 		if (!BaseName.Contains(TEXT("（房主）")))
 		{
 			FString NewName = FString::Printf(TEXT("%s（房主）"), *BaseName);
-			if (Text_PlayerName) Text_PlayerName->SetText(FText::FromString(NewName));
+			if (Text_PlayerName)
+			{
+				Text_PlayerName->SetText(FText::FromString(NewName));
+			}
 		}
 
-		// 2. 房主不需要显示“准备/未准备”文本，直接折叠隐藏
+		// ==========================================
+		// 2. 【彻底清理多余状态】
+		// 房主自带“随时发车”属性，不需要显示准备状态，直接将其折叠(Collapsed)。
+		// ==========================================
 		if (Text_IsReady)
 		{
 			Text_IsReady->SetVisibility(ESlateVisibility::Collapsed);
+		}
+
+		// ==========================================
+		// 3. 【绝对防御机制】
+		// 就算外部的权限控制失效，内部的 SetAsHost 也必须保证：
+		// 只要你是房主，你的组件里就绝对不应该出现踢自己的按钮！
+		// ==========================================
+		if (Btn_RemovePlayer)
+		{
+			Btn_RemovePlayer->SetVisibility(ESlateVisibility::Collapsed);
 		}
 	}
 }
