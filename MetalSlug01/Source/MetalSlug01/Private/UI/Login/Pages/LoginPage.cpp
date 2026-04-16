@@ -9,6 +9,8 @@
 #include "Kismet/GameplayStatics.h"
 // 包含我们刚刚写好的全局账号子系统，用于真实的存取逻辑
 #include "UI/Login/Core/AccountSubsystem.h"
+// 包含游戏流程管理子系统
+#include "Systems/GameFlowSubsystem.h"
 // 包含玩家控制器的头文件
 #include "GameFramework/PlayerController.h"
 
@@ -112,9 +114,14 @@ void ULoginPage::OnLoginButtonClicked()
 				Text_Hint->SetText(FText::FromString(TEXT("登录成功！正在进入游戏...")));
 				Text_Hint->SetVisibility(ESlateVisibility::Visible);
 
-				// 【下一步解开注释即可进入游戏】
-				// 使用 UGameplayStatics 跳转到你的主战斗地图（假设叫 Test01 或 NewMap）
-				// UGameplayStatics::OpenLevel(GetWorld(), FName("Test01")); 
+				// ==========================================
+				// 【关键修复】：登录成功后必须切换到 MainLobby 状态！
+				// 否则状态一直是 Login (1)，点击返回登录时会被拦截！
+				// ==========================================
+				if (UGameFlowSubsystem* FlowSubsystem = GameInstance->GetSubsystem<UGameFlowSubsystem>())
+				{
+					FlowSubsystem->TransitToState(EMatchState::MainLobby);
+				}
 			
 				//动态生成大厅 UI 并销毁登录 UI
 				// 检查我们是否在蓝图里配置了大厅菜单的类

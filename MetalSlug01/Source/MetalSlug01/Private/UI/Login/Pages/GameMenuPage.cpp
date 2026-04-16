@@ -13,16 +13,34 @@ bool UGameMenuPage::Initialize()
 {
 	if (!Super::Initialize()) return false;
 
+	// 【调试】：检查所有按钮绑定状态
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Orange, TEXT("[GameMenuPage] Initialize 被调用！"));
+
 	// 如果按钮存在，则将其与对应的 C++ 函数绑定
-	if (Btn_SinglePlayer) Btn_SinglePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnSinglePlayerClicked);
+	if (Btn_SinglePlayer)
+	{
+		Btn_SinglePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnSinglePlayerClicked);
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Cyan, TEXT("[GameMenuPage] Btn_SinglePlayer 绑定成功！"));
+	}
+	else
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_SinglePlayer 为空！请检查蓝图绑定！"));
+	}
+
 	if (Btn_MultiplePlayer) Btn_MultiplePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnMultiplePlayerClicked);
 	if (Btn_Leaderboard) Btn_Leaderboard->OnClicked.AddDynamic(this, &UGameMenuPage::OnLeaderboardClicked);
+
 	// 绑定返回登录按钮事件
 	if (Btn_BackToLogin)
 	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Cyan, TEXT("[GameMenuPage] Btn_BackToLogin 绑定成功！"));
 		// 【防呆设计】：确保先清理旧的绑定，防止多重绑定导致触发多次
 		Btn_BackToLogin->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
 		Btn_BackToLogin->OnClicked.AddDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
+	}
+	else
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_BackToLogin 为空！请检查蓝图变量名是否完全匹配（区分大小写）！"));
 	}
 
 	// 初始状态下隐藏提示文本
@@ -90,7 +108,7 @@ void UGameMenuPage::OnBackToLoginClicked()
 	{
 		Btn_BackToLogin->SetIsEnabled(false);
 	}
-	
+
 	// 【雷达追踪 1】：只要你点下去了，屏幕左上角必出显眼的绿字！
 	// 如果你连这行绿字都没看到，说明蓝图里的按钮没绑定成功（请看下方的排查清单）
 	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, TEXT("[系统雷达]：已成功触发返回登录按钮点击事件！"));
@@ -107,9 +125,21 @@ void UGameMenuPage::OnBackToLoginClicked()
 		// 步骤 B：全局状态机流转
 		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 		{
+			// 【调试】：先输出当前状态
+			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
+			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::White, FString::Printf(TEXT("[系统雷达] 当前状态: %d，准备切换到 Login"), (int32)CurrentState));
+
 			FlowSubsystem->TransitToState(EMatchState::Login);
 			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow, TEXT("[系统雷达]：已通知管家切换为 Login 状态！"));
 		}
+		else
+		{
+			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[系统雷达 致命错误] GameFlowSubsystem 为空！"));
+		}
+	}
+	else
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[系统雷达 致命错误] GameInstance 为空！"));
 	}
 
 	// ==========================================
