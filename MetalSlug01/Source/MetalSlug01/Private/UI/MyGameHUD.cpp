@@ -7,11 +7,11 @@ void AMyGameHUD::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 创建游戏HUD
+	// 提前在后台创建所有游戏HUD并隐藏，避免战斗瞬间卡顿（对象池/预加载思维）
 	CreateGameHUD();
 
 	// ==========================================
-	// 【核心】：向管家订阅状态改变的“报纸”
+	// 向管家订阅状态改变的“报纸”
 	// ==========================================
 	if (UGameInstance* GI = GetGameInstance())
 	{
@@ -27,18 +27,42 @@ void AMyGameHUD::BeginPlay()
 
 void AMyGameHUD::CreateGameHUD()
 {
-	if (!GameHUDWidgetClass)
+	// 【工业规范】：UI的创建必须严格绑定到真实的玩家控制器，而不是宽泛的 GetWorld()
+	APlayerController* PC = GetOwningPlayerController();
+	if (!PC)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("GameHUDWidgetClass is not set in MyGameHUD"));
+		UE_LOG(LogTemp, Error, TEXT("[MyGameHUD] 严重错误：未获取到本地 PlayerController！"));
 		return;
 	}
 
-	GameHUDWidget = CreateWidget<UGameHUDWidget>(GetWorld(), GameHUDWidgetClass);
-	if (GameHUDWidget)
+	// 1. 创建并隐藏主 HUD
+	if (GameHUDWidgetClass)
 	{
-		// 游戏HUD添加到视口（默认先完全隐藏，等战斗态再切出来）
-		GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
-		GameHUDWidget->AddToViewport();
+		GameHUDWidget = CreateWidget<UGameHUDWidget>(PC, GameHUDWidgetClass);
+		if (GameHUDWidget)
+		{
+			GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
+			GameHUDWidget->AddToViewport(0); // Z-Order为0，贴在屏幕底层
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] GameHUDWidgetClass 蓝图中未配置！"));
+	}
+
+	// 2. 【修复】：创建并隐藏准星
+	if (CrosshairWidgetClass)
+	{
+		CrosshairWidget = CreateWidget<UUserWidget>(PC, CrosshairWidgetClass);
+		if (CrosshairWidget)
+		{
+			CrosshairWidget->SetVisibility(ESlateVisibility::Collapsed);
+			CrosshairWidget->AddToViewport(1); // Z-Order为1，确保准星压在血条等元素上方
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] CrosshairWidgetClass 蓝图中未配置！"));
 	}
 }
 
@@ -61,30 +85,29 @@ void AMyGameHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
 // ==========================================
 void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 {
-	// 只有进入战斗状态，才显示血条/准星 HUD
+	// 【架构重构】：HUD 只负责 UI 元素的展示与隐藏。
+	// 已将鼠标控制权交还给 PlayerController，避免代码职责互相覆盖。
+
 	if (NewState == EMatchState::Battleing)
 	{
 		if (GameHUDWidget)
 		{
-			// HitTestInvisible: 允许鼠标穿透它点击到后面的 3D 世界
-			GameHUDWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
-		}
-
-		// 【极其关键】：交出鼠标控制权给玩家，准备打架！
-		if (APlayerController* PC = GetOwningPlayerController())
-		{
-			PC->SetShowMouseCursor(false);
-			PC->SetInputMode(FInputModeGameOnly());
+			// 规范：使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
+			GameHUDWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 		}
 		
-		UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] 切换至战斗UI，已隐藏鼠标！"));
+		if (CrosshairWidget)
+		{
+			// 准星必须是纯穿透，否则会阻挡鼠标射线导致无法开火
+			CrosshairWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
+		}
+		
+		UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] 切换至战斗UI，成功展示主HUD与准星"));
 	}
 	else 
 	{
-		// 如果是房间态 (InRoom) 或其他状态，则隐藏战斗 HUD
-		if (GameHUDWidget)
-		{
-			GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
-		}
+		// 如果是房间态或其它状态，隐藏所有战斗 UI
+		if (GameHUDWidget) GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
+		if (CrosshairWidget) CrosshairWidget->SetVisibility(ESlateVisibility::Collapsed);
 	}
 }

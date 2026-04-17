@@ -1226,15 +1226,6 @@ void UDailyUpgradeRewardPage::SubscribeToSubsystemEvents()
 	UE_LOG(LogTemp, Log, TEXT("   OnGlobalRefresh: %s"), UpgradeSub->OnGlobalRefresh.IsBound() ? TEXT("✅ 已绑定") : TEXT("❌ 未绑定"));
 	UE_LOG(LogTemp, Log, TEXT("🔗 绑定关系: Subsystem[%p] <-> Page[%p]"), UpgradeSub, this);
 	
-	// 验证绑定是否真的成功
-	if (UpgradeSub->OnGlobalRefresh.IsBound())
-	{
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: ✅ OnGlobalRefresh事件绑定成功"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyUpgradeRewardPage: ❌ OnGlobalRefresh事件绑定失败"));
-	}
 }
 
 void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()

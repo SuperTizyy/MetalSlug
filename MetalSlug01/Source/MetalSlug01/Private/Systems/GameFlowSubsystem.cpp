@@ -4,10 +4,7 @@
 
 void UGameFlowSubsystem::TransitToState(EMatchState NewState)
 {
-	UE_LOG(LogTemp, Log, TEXT("[GameFlowSubsystem] TransitToState CALLED: %d -> %d"), (int32)CurrentState, (int32)NewState);
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Yellow, 
-		FString::Printf(TEXT("[GameFlowSubsystem] TransitToState 被调用: %d -> %d"), (int32)CurrentState, (int32)NewState));
-
+	
 	// 【安全防御】防止同一状态被重复调用，导致地图无限重启或死循环
 	if (CurrentState == NewState)
 	{
@@ -17,16 +14,12 @@ void UGameFlowSubsystem::TransitToState(EMatchState NewState)
 		return;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[GameFlowSubsystem] State Transiting: %d -> %d"), (int32)CurrentState, (int32)NewState);
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, TEXT("[GameFlowSubsystem] 状态切换正常，准备广播！"));
-	
 	// 更新当前状态
 	CurrentState = NewState;
 
 	// 1. 广播状态改变事件（通知 Controller 准备切换 UI）
 	OnStateChanged.Broadcast(CurrentState);
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, TEXT("[GameFlowSubsystem] 广播已发送！"));
-
+	
 	// 2. 执行地图物理切换逻辑
 	HandleStateEntry(CurrentState);
 }

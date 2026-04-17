@@ -23,32 +23,12 @@ void UActivityConfirmPopupWidget::NativeConstruct()
 	if (CloseButton)
 	{
 		CloseButton->OnClicked.AddDynamic(this, &UActivityConfirmPopupWidget::OnCloseClicked);
-		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 关闭按钮事件绑定成功"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivityConfirmPopup: CloseButton未在蓝图中绑定"));
 	}
 
 	// 绑定确认按钮事件
 	if (ConfirmButton)
 	{
 		ConfirmButton->OnClicked.AddDynamic(this, &UActivityConfirmPopupWidget::OnConfirmClicked);
-		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 确认按钮事件绑定成功"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivityConfirmPopup: ConfirmButton未在蓝图中绑定"));
-	}
-
-	// RewardOptionsContainer已在蓝图中绑定，用于放置奖励选项卡片
-	if (RewardOptionsContainer)
-	{
-		UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: RewardOptionsContainer绑定成功"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("ActivityConfirmPopup: RewardOptionsContainer未在蓝图中绑定"));
 	}
 }
 

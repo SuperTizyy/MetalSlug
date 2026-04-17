@@ -12,23 +12,17 @@ void ALoginPlayerController::BeginPlay()
 	SetInputMode(FInputModeUIOnly());
 
 	FString CurrentMap = GetWorld()->GetMapName();
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Yellow, FString::Printf(TEXT("[LoginPC Debug] 当前地图: %s"), *CurrentMap));
 
 	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
 	{
 		// 1. 订阅管家的广播频道
 		FlowSubsystem->OnStateChanged.AddDynamic(this, &ALoginPlayerController::OnFlowStateChanged);
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Cyan, TEXT("[LoginPC Debug] 已订阅 OnStateChanged 事件！"));
 
 		// 2. 确保在 L_Login 地图中才执行 UI 挂载逻辑
 		if (GetWorld()->GetMapName().Contains(TEXT("L_Login")))
 		{
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, TEXT("[LoginPC Debug] 在 L_Login 地图中，执行 UI 挂载逻辑"));
-
+			
 			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
-
-			// 【雷达 4】：证明控制器已经成功重生
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Magenta, FString::Printf(TEXT("[系统雷达 4] LoginPC 醒来，当前管家状态: %d"), (int32)CurrentState));
 
 			// ==========================================
 			// 【终极架构修复】：引入 0.2 秒安全延时！
@@ -64,9 +58,6 @@ void ALoginPlayerController::BeginPlay()
 
 void ALoginPlayerController::OnFlowStateChanged(EMatchState NewState)
 {
-	// 【雷达 5】：证明 UI 渲染器已被成功触发
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Orange, FString::Printf(TEXT("[系统雷达 5] 正在执行 UI 重绘，目标状态: %d"), (int32)NewState));
-
 	// ==========================================
 	// 状态 1：登录阶段
 	// ==========================================
@@ -79,25 +70,16 @@ void ALoginPlayerController::OnFlowStateChanged(EMatchState NewState)
 		// 【关键校验点】：检查蓝图类是否有效！
 		if (LoginUIClass)
 		{
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Cyan, TEXT("[LoginPC Debug] LoginUIClass 有效，准备创建 Login Widget！"));
-
+			
 			ActiveLoginWidget = CreateWidget<UUserWidget>(this, LoginUIClass);
 			if (ActiveLoginWidget)
 			{
 				ActiveLoginWidget->AddToViewport(9999);
-				
-				// 【雷达 6】：完美成功
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, TEXT("[系统雷达 6] 成功挂载 Login 页面！完美收官！"));
 			}
 			else
 			{
 				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] CreateWidget 返回空！"));
 			}
-		}
-		else
-		{
-			// 【雷达 7】：致命配置丢失
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[系统雷达 7 - 致命错误] LoginUIClass 为空！请立刻打开 BP_LoginPlayerController 重新选中 WBP_LoginPage！"));
 		}
 	}
 	// ==========================================

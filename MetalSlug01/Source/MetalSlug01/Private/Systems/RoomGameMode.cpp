@@ -32,6 +32,9 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	// 配置引擎的标准框架类
 	GameStateClass = ARoomGameState::StaticClass();
 	PlayerStateClass = ARoomPlayerState::StaticClass();
+	
+	//必须从底层硬编码绑定默认的 HUD 类，确保 MyGameHUD 会伴随玩家生出。
+	HUDClass = AMyGameHUD::StaticClass();
 }
 
 void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FString& PlayerName)
