@@ -13,6 +13,7 @@
 #include "Weapons/BaseWeapon.h"
 #include "Kismet/GameplayStatics.h"
 #include "Characters/BaseCharacter.h"
+#include "Systems/GameFlowSubsystem.h"
 #include "Systems/RoomGameState.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Login/Core/RoomPlayerState.h"
@@ -263,22 +264,44 @@ int32 ARoomGameMode::GetAttackerCount(ABaseCharacter* TargetEnemy)
 // 检查是否所有人准备就绪
 bool ARoomGameMode::CheckAllPlayersReady()
 {
-	// 直接问全局的 GameState
-	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+	ARoomGameState* GS = GetGameState<ARoomGameState>();
+	if (!GS) return false;
+
+	// 【防呆设计】：如果房间里没有任何人（理论上不可能），直接拦截
+	if (GS->PlayerArray.Num() == 0) return false;
+
+	// 【底层溯源】：在 Listen Server 架构下，服务器的 FirstPlayerController 必定是本机的房主！
+	APlayerController* HostPC = Cast<APlayerController>(GetWorld()->GetFirstPlayerController());
+
+	for (APlayerState* GenericPS : GS->PlayerArray)
 	{
-		for (APlayerState* GenericPS : GS->PlayerArray)
+		if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(GenericPS))
 		{
-			if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(GenericPS))
+			// 【架构精进】：通过比对 Controller 引用，精准鉴别当前遍历的 PlayerState 是不是房主的
+			bool bIsHost = (PS->GetPlayerController() == HostPC);
+
+			// 🌟 核心修复 1 & 2：房主拥有特权，豁免准备状态校验！
+			// 因为房主自己主宰游戏什么时候开始，不需要点击准备。
+			if (bIsHost)
 			{
-				// 假设未分配队伍的人不算在内，且房主(Host)默认随时Ready
-				// (这里可以根据你的具体业务逻辑微调)
-				if (PS->CurrentTeam != ERoomTeam::None && !PS->bIsReady)
-				{
-					return false; // 有人没准备！
-				}
+				continue; // 直接跳过房主的校验，检查下一个人
+			}
+
+			// 对于非房主的普通玩家，严格校验其准备状态
+			if (PS->CurrentTeam != ERoomTeam::None && !PS->bIsReady)
+			{
+				// 工业规范：输出日志，方便后期在后台查出是哪个玩家卡住了进程
+				UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] 拦截开局：普通玩家 【%s】 尚未准备！"), *PS->GetPlayerName());
+				return false; // 只要有一个人没准备，立刻阻断开局！
 			}
 		}
 	}
+
+	// 走到这里意味着：
+	// 情景 A：房间里只有房主 1 个人，循环直接 continue 结束 -> 返回 true 允许开局（解决 Bug 1）
+	// 情景 B：房间里有多人，且除房主外的所有人都 bIsReady == true -> 返回 true 允许开局（解决 Bug 2）
+	
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] 准备状态全部校验通过，准许开局！"));
 	return true;
 }
 
@@ -372,4 +395,98 @@ void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 			}
 		}
 	}
+}
+
+
+void ARoomGameMode::RequestStartGame(AController* RequestingController)
+{
+	// 工业级防呆：任何涉及指针的操作必须先做安全校验
+	if (!IsValid(RequestingController))
+	{
+		return;
+	}
+
+	// 1. 【身份鉴权】：判断发起请求的人是否为房主
+	// 在 Listen Server (局域网) 架构中，World 的 FirstPlayerController 就是本机的房主
+	AController* HostController = GetWorld()->GetFirstPlayerController();
+	if (RequestingController != HostController)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] 拒绝开局请求：该玩家不是房主！"));
+		return; 
+	}
+
+	// 2. 【测试开关短路拦截】：如果开启了无视大厅直接测试，强制开局
+	if (bSkipRoomPhaseForTesting)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] 测试模式开启，无视准备状态，强制开局！"));
+		PerformGameStart();
+		return;
+	}
+
+	// 3. 【业务逻辑校验】：检查是否全员准备就绪
+	if (!CheckAllPlayersReady())
+	{
+		// 校验失败：向全房间广播系统红字/绿字提示
+		BroadcastSystemMessage(TEXT("无法开始游戏：还有玩家未准备就绪！"));
+		return;
+	}
+
+	// 4. 校验全部通过，移交权限给核心执行器
+	PerformGameStart();
+}
+
+void ARoomGameMode::PerformGameStart()
+{
+	// 1. 更新房间状态
+	CurrentRoomState = ERoomState::BattleInProgress;
+
+	// 2. 下发 Client RPC 给所有客户端，让他们立刻切 UI（进入阶段三）
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
+		{
+			// 通知客户端立刻隐藏房间UI，打开准星血条HUD
+			PC->Client_TransitToMatchState(EMatchState::Battleing);
+		}
+	}
+
+	// 3. 【核心更新】：开启服务器倒计时，延迟生成角色，给客户端 UI 切换留出时间
+	BroadcastSystemMessage(FString::Printf(TEXT("游戏将在 %.1f 秒后开始..."), MatchStartDelay));
+	
+	GetWorld()->GetTimerManager().SetTimer(
+		MatchStartTimerHandle,
+		this,
+		&ARoomGameMode::SpawnAllPlayersIntoBattle,
+		MatchStartDelay,
+		false // 只执行一次
+	);
+}
+
+void ARoomGameMode::SpawnAllPlayersIntoBattle()
+{
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] 倒计时结束，开始降生玩家物理实体！"));
+
+	// 遍历当前的 GameState 中所有成功建立连接的 PlayerState
+	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+	{
+		for (APlayerState* GenericPS : GS->PlayerArray)
+		{
+			if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(GenericPS))
+			{
+				// 获取这个 PlayerState 对应的 Controller
+				if (AController* PlayerController = Cast<AController>(PS->GetOwner()))
+				{
+					// 【防呆设计】：如果玩家忘了选角色，给一个默认值
+					FString FinalChar = PS->SelectedCharacterRowName.IsEmpty() ? TEXT("Warrior") : PS->SelectedCharacterRowName;
+					FString FinalWeapon = PS->SelectedWeaponRowName.IsEmpty() ? TEXT("Knife") : PS->SelectedWeaponRowName;
+
+					// 调用您已经写好的 HandlePlayerRequestSpawn 进行生成！
+					// 这个函数会触发底层 RestartPlayer -> GetDefaultPawnClassForController -> SpawnActor
+					HandlePlayerRequestSpawn(PlayerController, FinalChar, FinalWeapon);
+				}
+			}
+		}
+	}
+	
+	BroadcastSystemMessage(TEXT("战斗开始！"));
 }

@@ -50,9 +50,14 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* Text_RoomName;
 	
-	// 【新增】：重写 UI 构造函数，这里才是读表最安全的地方！
+	// 重写 UI 构造函数，这里才是读表最安全的地方！
 	virtual void NativeConstruct() override;
-	void NativeDestruct();
+	void NativeDestruct() override;
+	
+	// 监听状态改变的回调函数
+	UFUNCTION()
+	void OnGameFlowStateChanged(EMatchState NewState);
+
 
 	// ==========================================
 	// 从原先 LANRoomPage 搬过来的 UI 控件

@@ -14,6 +14,9 @@ class METALSLUG01_API AMyGameHUD : public AHUD
 
 protected:
 	virtual void BeginPlay() override;
+	
+	// 工业级防泄漏，在 Actor 销毁时解绑委托
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 public:
 	// 获取游戏HUD Widget（供角色调用）
@@ -28,6 +31,7 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "UI")
 	TSubclassOf<UGameHUDWidget> GameHUDWidgetClass;
 
+
 private:
 	UPROPERTY()
 	UUserWidget* MainWidget;
@@ -37,4 +41,8 @@ private:
 
 	// 创建游戏HUD
 	void CreateGameHUD();
+	
+	// 状态机响应回调
+	UFUNCTION()
+	void OnGameFlowStateChanged(EMatchState NewState);
 };

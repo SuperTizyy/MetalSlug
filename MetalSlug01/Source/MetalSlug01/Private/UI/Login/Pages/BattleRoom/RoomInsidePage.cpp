@@ -245,6 +245,18 @@ void URoomInsidePage::NativeConstruct()
 			Btn_StartGame->SetVisibility(ESlateVisibility::Collapsed); 
 		}
 	}
+	
+	// ==========================================
+	//向全局管家订阅状态改变的“报纸”
+	// ==========================================
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			// 绑定委托，当状态机发生变化时，通知本 UI
+			FlowSubsystem->OnStateChanged.AddDynamic(this, &URoomInsidePage::OnGameFlowStateChanged);
+		}
+	}
 }
 
 void URoomInsidePage::NativeDestruct()
@@ -252,6 +264,17 @@ void URoomInsidePage::NativeDestruct()
 	// 【内存安全】：UI 被销毁时，必须拔掉探头定时器，防止崩溃！
 	GetWorld()->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
 
+	// ==========================================
+	// UI 销毁前必须解绑委托，否则会引起野指针崩溃
+	// ==========================================
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			FlowSubsystem->OnStateChanged.RemoveDynamic(this, &URoomInsidePage::OnGameFlowStateChanged);
+		}
+	}
+	
 	Super::NativeDestruct();
 }
 
@@ -1072,5 +1095,20 @@ void URoomInsidePage::RefreshRoomUI()
 				TargetBox->AddChild(PlayerLabel);
 			}
 		}
+	}
+}
+
+// ==========================================
+// 状态机响应：UI 的自我救赎
+// ==========================================
+void URoomInsidePage::OnGameFlowStateChanged(EMatchState NewState)
+{
+	// 一旦发现服务器下令进入了战斗状态 (Battleing)
+	if (NewState == EMatchState::Battleing)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[RoomInsidePage] 收到战斗开始指令，大厅UI开始自我销毁！"));
+		
+		// 核心魔法：将自己从屏幕上彻底移除！
+		this->RemoveFromParent();
 	}
 }

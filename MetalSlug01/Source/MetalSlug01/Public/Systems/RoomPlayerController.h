@@ -125,6 +125,13 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_SelectLoadout(const FString& CharacterRowName, const FString& WeaponRowName);
 	
+	/**
+	 * @brief 接收来自服务器的指令，强制本地客户端切换游戏状态流程 (Client RPC)
+	 * @param NewState 目标状态 (如 EMatchState::Battleing)
+	 */
+	UFUNCTION(Client, Reliable, Category = "MetalSlug|Network")
+	void Client_TransitToMatchState(EMatchState NewState);
+	
 private:
 	// 【新增】：真正执行断网和跳地图的底层逻辑
 	void ExecuteLeaveRoom();

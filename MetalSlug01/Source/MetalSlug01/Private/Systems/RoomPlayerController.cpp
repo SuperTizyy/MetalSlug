@@ -408,3 +408,18 @@ void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& C
 	}
 }
 
+void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchState NewState)
+{
+	// 【客户端专属逻辑】：这行代码只会在对应的那个客户端本地电脑上执行！
+	
+	// 1. 获取当前客户端本地的 GameInstance 及其挂载的 GameFlowSubsystem
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			// 2. 调用您之前写好的状态机，利用事件多播 (OnStateChanged) 去驱动 UI 切换！
+			FlowSubsystem->TransitToState(NewState);
+		}
+	}
+}
+

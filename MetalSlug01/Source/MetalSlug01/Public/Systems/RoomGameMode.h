@@ -86,6 +86,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	void ReleaseTarget(ABaseCharacter* RequestingAI);
 	
+	// ==========================================
+	// 核心比赛流程控制
+	// ==========================================
+	
+	/**
+	 * @brief 接收并处理玩家请求开始游戏的指令 (仅服务器运行)
+	 * @param RequestingController 发起请求的玩家控制器
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Room|Match")
+	void RequestStartGame(AController* RequestingController);
+	
 private:
 	// 【新增】：AI 的唯一编号生成器，防止同名 AI 无法精准踢出
 	int32 AINextID = 1;
@@ -113,5 +124,26 @@ protected:
 
 	// 2. 核心生成：玩家实体生成并附身完成后的钩子（在这里安全地派发武器）
 	virtual void RestartPlayer(AController* NewPlayer) override;
+	
+	/**
+	 * @brief 权威校验通过后，真正执行开局指令下发与状态流转
+	 */
+	void PerformGameStart();
+	
+	// ==========================================
+	// 比赛流程控制与实体生成
+	// ==========================================
+
+	// 开局倒计时的定时器句柄
+	FTimerHandle MatchStartTimerHandle;
+
+	// 倒计时时间（秒），可以暴露给蓝图配置
+	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
+	float MatchStartDelay = 3.0f;
+
+	/**
+	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色
+	 */
+	void SpawnAllPlayersIntoBattle();
 	
 };
