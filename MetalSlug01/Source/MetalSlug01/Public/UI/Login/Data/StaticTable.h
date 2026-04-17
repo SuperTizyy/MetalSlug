@@ -18,6 +18,15 @@ enum class ERoomState : uint8
 	BattleInProgress UMETA(DisplayName = "战斗进行状态")
 };
 
+// 【规范】：使用强类型枚举定义队伍，比 bool 或 int 更具可读性和扩展性
+UENUM(BlueprintType)
+enum class ERoomTeam : uint8
+{
+	None UMETA(DisplayName = "未分配"),
+	Red  UMETA(DisplayName = "红队"),
+	Blue UMETA(DisplayName = "蓝队")
+};
+
 // ==========================================
 // 角色信息配置表 (Data-Driven 核心底座)
 // ==========================================
@@ -38,11 +47,13 @@ public:
 
 	// 3. 真实的 3D 角色蓝图类 (用于 ServerTravel 传送到战斗地图后，真正生成出来的 3D 小人)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Data")
-	TSubclassOf<ACharacter> CharacterBlueprint; 
+	TSoftClassPtr<class ABaseCharacter> CharacterBlueprint;
 
 	// 4. 技能描述
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Data")
 	FString SkillDescription;
+	
+
 };
 
 // ==========================================

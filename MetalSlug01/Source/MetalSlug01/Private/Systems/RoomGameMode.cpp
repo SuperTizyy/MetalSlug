@@ -332,25 +332,30 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 // ==========================================
 UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AController* InController)
 {
-	if (ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>())
+	ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>();
+	if (PS && CharacterDataTable) 
 	{
-		// 确保玩家有选择，且我们在蓝图里配置了角色数据表
-		if (!PS->SelectedCharacterRowName.IsEmpty() && CharacterDataTable)
+		// 1. 获取玩家选择的角色ID
+		FString CharID = PS->GetSelectedCharacterID();
+		
+		// 2. 查表获取配置行
+		static const FString ContextString(TEXT("CharacterSpawnContext"));
+		// 【注意】这里必须使用 FCharacterInfo，因为你表里的结构体叫这个名字
+		FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharID), ContextString);
+		
+		// 如果是软引用，需要在生成前执行一下同步加载（LoadSynchronous）将路径转换为真实的类
+		if (Info && !Info->CharacterBlueprint.IsNull())
 		{
-			// 【精准定位】：使用您项目真实的 FCharacterInfo 进行查表
-			FName RowName = FName(*PS->SelectedCharacterRowName);
-			FString ContextString = TEXT("Character Spawn Context");
-			
-			FCharacterInfo* CharInfo = CharacterDataTable->FindRow<FCharacterInfo>(RowName, ContextString);
-			if (CharInfo && CharInfo->CharacterBlueprint)
-			{
-				// 返回查到的真实 3D 角色类
-				return CharInfo->CharacterBlueprint;
-			}
+			// 将软指针加载为硬指针类返回给引擎去 Spawn
+			return Info->CharacterBlueprint.LoadSynchronous(); 
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] 未找到 ID 为 %s 的角色，或 CharacterBlueprint 为空，使用默认 Pawn"), *CharID);
 		}
 	}
-	
-	// 如果查表失败，保底返回默认的 PawnClass
+
+	// 如果查表失败或没拿到数据，执行父类默认的生成逻辑，防止服务器崩溃
 	return Super::GetDefaultPawnClassForController_Implementation(InController);
 }
 

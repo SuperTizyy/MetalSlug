@@ -12,6 +12,7 @@
 #include "Weapons/BaseWeapon.h"
 #include "UI/Game/GameHUDWidget.h"
 #include "Kismet/GameplayStatics.h"
+#include "UI/Login/Core/RoomPlayerState.h"
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -739,4 +740,22 @@ void ABaseCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightA
 	{
 		CameraBoom->TargetOffset.Z -= HalfHeightAdjust;
 	}
+}
+
+void ABaseCharacter::PossessedBy(AController* NewController)
+{
+	Super::PossessedBy(NewController);
+
+	// 仅在服务器执行
+	if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
+	{
+		SpawnAndEquipWeapon(PS->GetSelectedWeaponID());
+	}
+}
+
+void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
+{
+	// 1. 查 DT_WeaponInfo 表获取 WeaponClass
+	// 2. SpawnActor<ABaseWeapon>(Info->WeaponClass)
+	// 3. Weapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, TEXT("WeaponSocket"));
 }

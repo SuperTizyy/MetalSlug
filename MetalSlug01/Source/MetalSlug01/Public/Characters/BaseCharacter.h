@@ -320,6 +320,8 @@ protected:
 	// 重写虚幻原生自带的下蹲与起立回调
 	virtual void OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
 	virtual void OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust) override;
+	void PossessedBy(AController* NewController);
+	void SpawnAndEquipWeapon(FString WeaponID);
 
 	// 摄像机平滑过渡的速度 (越大越快，越小越像慢动作)
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")

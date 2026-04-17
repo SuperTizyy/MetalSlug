@@ -2,16 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerState.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "RoomPlayerState.generated.h"
 
-// 【规范】：使用强类型枚举定义队伍，比 bool 或 int 更具可读性和扩展性
-UENUM(BlueprintType)
-enum class ERoomTeam : uint8
-{
-	None UMETA(DisplayName = "未分配"),
-	Red  UMETA(DisplayName = "红队"),
-	Blue UMETA(DisplayName = "蓝队")
-};
+
 
 // 声明一个动态多播委托，用于通知 UI 刷新
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnRoomPlayerStateChanged);
@@ -27,6 +21,14 @@ class METALSLUG01_API ARoomPlayerState : public APlayerState
 
 public:
 	ARoomPlayerState();
+	
+	// 获取角色/武器 ID (供服务器 GameMode 使用)
+	FString GetSelectedCharacterID() const { return SelectedCharacterID; }
+	FString GetSelectedWeaponID() const { return SelectedWeaponID; }
+
+	// 服务器修改接口
+	UFUNCTION(Server, Reliable)
+	void Server_SetPlayerLoadout(const FString& InCharID, const FString& InWeaponID);
 
 	// 【核心规范】：必须重写此函数，注册需要网络同步的变量
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
@@ -69,4 +71,13 @@ public:
 
 	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
 	FString SelectedWeaponRowName;
+	
+protected:
+	// 使用 Replicated 确保所有客户端知道每个人的配置（用于显示队友信息）
+	UPROPERTY(Replicated)
+	FString SelectedCharacterID;
+
+	UPROPERTY(Replicated)
+	FString SelectedWeaponID;
+	
 };

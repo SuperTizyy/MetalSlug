@@ -84,6 +84,9 @@ public:
 	//执行伪登录，跳过验证并分配一个临时身份
 	UFUNCTION(BlueprintCallable, Category = "Account|Debug")
 	void MockLoginForTesting();
+	
+	// 获取玩家档案的安全只读指针
+	const FAccountRecord* GetAccountRecord(const FString& AccountName) const;
 
 private:
 	// ==========================================

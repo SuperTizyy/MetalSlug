@@ -35,18 +35,32 @@ void ARoomPlayerController::BeginPlay()
 // 延迟 0.5 秒后真正执行的函数
 void ARoomPlayerController::DelayedSendPlayerInfo()
 {
-	// 3. 获取自己的名字
 	FString MyName = TEXT("未知玩家");
+	
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
 		{
+			// 1. 获取本地登录的玩家名
 			MyName = AccountSub->GetCurrentLoggedInUser();
+			
+			// 2. 查大账本，获取该玩家在登录页选好的角色和武器
+			const FAccountRecord* MyRecord = AccountSub->GetAccountRecord(MyName);
+			if (MyRecord)
+			{
+				if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
+				{
+					// 3. 【核心修复】：使用你结构体中真实存在的 LastSelectedWeapon1！
+					// 如果你的 Server_SetPlayerLoadout 支持双武器，你可以把 Weapon2 也传进去
+					PS->Server_SetPlayerLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1);
+				}
+			}
 		}
 	}
 
-	// 4. 呼叫服务器：“报告老大，网络通了，这是我的名字！”
+	// 4. 呼叫服务器报到，触发你原本进房间的后续逻辑
 	Server_SendPlayerInfo(MyName);
+	
 }
 
 // ----------------------------------------------------

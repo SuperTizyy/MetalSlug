@@ -232,3 +232,8 @@ void UAccountSubsystem::MockLoginForTesting()
 		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, FString::Printf(TEXT("[测试模式] 分配临时身份：%s"), *MockName));
 	}
 }
+
+const FAccountRecord* UAccountSubsystem::GetAccountRecord(const FString& AccountName) const
+{
+	return AccountData.Find(AccountName);
+}

@@ -10,6 +10,9 @@ ARoomPlayerState::ARoomPlayerState()
 	
 	// 确保 PlayerState 开启网络同步
 	bReplicates = true;
+	
+	SelectedCharacterID = TEXT("Default");
+	SelectedWeaponID = TEXT("Default");
 }
 
 void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -17,8 +20,8 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	// 【核心规范】：在这里注册变量。DOREPLIFETIME 会让引擎底层接管这些变量的网络同步
-	DOREPLIFETIME(ARoomPlayerState, CurrentTeam);
-	DOREPLIFETIME(ARoomPlayerState, bIsReady);
+	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
+	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID);
 }
 
 // 只有客户端会在变量改变时自动执行这些 OnRep 函数
@@ -32,4 +35,10 @@ void ARoomPlayerState::OnRep_IsReady()
 {
 	// 准备状态发生变化，通知 UI 刷新
 	OnStateChanged.Broadcast();
+}
+
+void ARoomPlayerState::Server_SetPlayerLoadout_Implementation(const FString& InCharID, const FString& InWeaponID)
+{
+	SelectedCharacterID = InCharID;
+	SelectedWeaponID = InWeaponID;
 }
