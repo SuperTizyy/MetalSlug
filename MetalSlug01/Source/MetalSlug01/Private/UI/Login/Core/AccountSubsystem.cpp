@@ -202,3 +202,33 @@ void UAccountSubsystem::SaveLastSelectedWeapon(int32 BackpackSlot, const FString
 		SaveDataToDisk(); // 立刻存盘
 	}
 }
+
+// 执行伪装登录逻辑，专供跳过登录页面的测试使用
+void UAccountSubsystem::MockLoginForTesting()
+{
+	// 1. 生成一个四位随机十六进制后缀的名字，例如 "TestUser_A3F1"
+	// 这样多开客户端时，每个窗口都会获得不同的身份，联机逻辑(如踢人)就不会因重名而崩溃
+	FString MockName = FString::Printf(TEXT("TestUser_%04X"), FMath::RandRange(0, 0xFFFF));
+
+	// 2. 构造一个临时的档案袋，注入内存大账本中
+	if (!AccountData.Contains(MockName))
+	{
+		FAccountRecord DummyRecord(MockName, TEXT("DebugPassword"));
+		DummyRecord.bIsOnline = true; // 直接强制上锁为在线状态
+		// 赋予一个默认角色，防止进入对战读取偏好时崩溃
+		DummyRecord.LastSelectedCharacter = TEXT("BaseWarrior"); 
+		
+		AccountData.Add(MockName, DummyRecord);
+	}
+
+	// 3. 将当前窗口的登录人设置为这个临时账号
+	CurrentLoggedInUser = MockName;
+
+	// 4. 【核心细节】：我们故意【不调用】SaveDataToDisk()！
+	// 这样临时测试账号只存在于本次运行的内存中，关闭游戏后自动销毁，绝不污染真实存档
+	
+	if (GEngine) 
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, FString::Printf(TEXT("[测试模式] 分配临时身份：%s"), *MockName));
+	}
+}

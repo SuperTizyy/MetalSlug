@@ -1,6 +1,7 @@
 ﻿#include "Systems/LoginPlayerController.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "Blueprint/UserWidget.h"
+#include "Tools/MetalSlugTestSettings.h"
 #include "UI/Login/Core/AccountSubsystem.h"
 
 void ALoginPlayerController::BeginPlay()
@@ -18,17 +19,54 @@ void ALoginPlayerController::BeginPlay()
 		// 1. 订阅管家的广播频道
 		FlowSubsystem->OnStateChanged.AddDynamic(this, &ALoginPlayerController::OnFlowStateChanged);
 
-		// 2. 确保在 L_Login 地图中才执行 UI 挂载逻辑
+		// 2. 确保在 L_Login 地图中才执行逻辑
 		if (GetWorld()->GetMapName().Contains(TEXT("L_Login")))
 		{
+			// ==========================================
+			// 【架构拦截点】：检查是否开启了开发测试模式
+			// ==========================================
+			// GetDefault 性能极高，直接获取类的默认对象 (CDO)
+			const UMetalSlugTestSettings* TestConfig = GetDefault<UMetalSlugTestSettings>();
 			
+			// 如果配置存在，且勾选了"直通大厅"
+			if (TestConfig && TestConfig->bSkipLoginDirectToLobby)
+			{
+				// 1. 处理伪登录：加入判空逻辑。如果玩家已经有名字了（说明是从房间退回来的），就不再重新生成随机名。
+				if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
+				{
+					if (AccountSub->GetCurrentLoggedInUser().IsEmpty())
+					{
+						AccountSub->MockLoginForTesting();
+					}
+				}
+
+				// 2. 【核心修复】：引入 0.2 秒安全延时，并处理 GameInstance 的状态残留问题
+				FTimerHandle TestInitHandle;
+				GetWorld()->GetTimerManager().SetTimer(TestInitHandle, FTimerDelegate::CreateLambda([this, FlowSubsystem]()
+				{
+					// 检查管家目前是不是已经是大厅状态（退房后残留的状态）
+					if (FlowSubsystem->GetCurrentState() == EMatchState::MainLobby)
+					{
+						// 如果状态没变，TransitToState 不会工作，必须强制手动拉起大厅 UI
+						OnFlowStateChanged(EMatchState::MainLobby);
+					}
+					else
+					{
+						// 如果是游戏刚启动，走标准的状态切换流程
+						FlowSubsystem->TransitToState(EMatchState::MainLobby);
+					}
+				}), 0.2f, false);
+
+				// 【极度关键】：直接 return！切断后续正常的 UI 挂载和状态初始化逻辑
+				return;
+			}
+			
+			// ==========================================
+			// 正常的线上业务逻辑：走到这里说明没开作弊开关
+			// ==========================================
 			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
 
-			// ==========================================
-			// 【终极架构修复】：引入 0.2 秒安全延时！
-			// 彻底解决 UE 底层的"视口未就绪 (Viewport Not Ready)"导致的 UI 吞噬问题。
-			// 确保地图和摄像机完全准备完毕后，再进行 UI 挂载。
-			// ==========================================
+			// 0.2 秒安全延时，解决"视口未就绪"导致的 UI 吞噬问题
 			FTimerHandle InitHandle;
 			GetWorld()->GetTimerManager().SetTimer(InitHandle, FTimerDelegate::CreateLambda([this, CurrentState]()
 			{

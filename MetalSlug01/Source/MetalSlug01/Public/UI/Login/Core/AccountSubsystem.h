@@ -76,6 +76,14 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Account")
 	void SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName);
+	
+	// ==========================================
+	// 开发与测试专用接口
+	// ==========================================
+	
+	//执行伪登录，跳过验证并分配一个临时身份
+	UFUNCTION(BlueprintCallable, Category = "Account|Debug")
+	void MockLoginForTesting();
 
 private:
 	// ==========================================

@@ -6,13 +6,12 @@ public class MetalSlug01 : ModuleRules
 {
 	public MetalSlug01(ReadOnlyTargetRules Target) : base(Target)
 	{
-		PrivateDependencyModuleNames.AddRange(new string[] { "AIModule" });
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
 		PublicDependencyModuleNames.AddRange(new string[] { 
 			"Core", "CoreUObject", "Engine", "InputCore", "UMG", "Paper2D", 
 			"EnhancedInput", "GameplayTags", "Json", "JsonUtilities","Slate", 
-			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils" });
+			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils","DeveloperSettings","AIModule" });
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
