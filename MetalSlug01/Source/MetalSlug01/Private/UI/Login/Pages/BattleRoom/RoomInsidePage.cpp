@@ -67,7 +67,7 @@ bool URoomInsidePage::Initialize()
 }
 
 void URoomInsidePage::NativeConstruct()
-{
+{	
 	Super::NativeConstruct();
 	
 	// 启动探头定时器
@@ -84,10 +84,7 @@ void URoomInsidePage::NativeConstruct()
 		// 规范 1：必须留下底层 Log 记录，便于自动化测试和崩溃定位
 		UE_LOG(LogTemp, Error, TEXT("[URoomInsidePage] 严重错误：未绑定 CharacterDataTable！请检查 WBP_RoomInsidePage 的细节面板。"));
 		
-		if (GEngine) 
-		{
-			GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：CharacterDataTable 缺失！"));
-		}
+		if (GEngine) {GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：CharacterDataTable 缺失！"));}
 
 		// 规范 2：容错处理。数据缺失时，不要让玩家点击空列表，锁死 UI 控件
 		if (ComboBox_CharacterSelect)
@@ -95,21 +92,23 @@ void URoomInsidePage::NativeConstruct()
 			ComboBox_CharacterSelect->ClearOptions();
 			ComboBox_CharacterSelect->AddOption(TEXT("数据丢失"));
 			ComboBox_CharacterSelect->SetSelectedIndex(0);
-			ComboBox_CharacterSelect->SetIsEnabled(false); // 禁用交互
+			ComboBox_CharacterSelect->SetIsEnabled(false); 
 		}
-		return; 
+		return;
 	}
 
+	// ==========================================
+	// 核心修复：干净利落的单次填充与精准映射
+	// ==========================================
 	if (ComboBox_CharacterSelect)
 	{
 		ComboBox_CharacterSelect->ClearOptions();
-
-		// 规范 3：使用静态只读字符串作为 Context，减少每次调用的内存开销
+		CachedCharacterIDs.Empty(); // 清空缓存，准备建立全新的 1:1 映射
+		
 		static const FString ContextString(TEXT("RoomUI_CharacterInit"));
-		TArray<FCharacterInfo*> AllCharacters;
-		CharacterDataTable->GetAllRows<FCharacterInfo>(ContextString, AllCharacters);
-
-		if (AllCharacters.IsEmpty()) // UE5.6 推荐使用 IsEmpty() 替代 Num() == 0，语义更清晰且针对某些容器效率更高
+		TArray<FName> RowNames = CharacterDataTable->GetRowNames();
+		
+		if (RowNames.IsEmpty())
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[URoomInsidePage] 数据表为空，无法初始化角色列表！"));
 			ComboBox_CharacterSelect->AddOption(TEXT("无可用角色"));
@@ -117,45 +116,51 @@ void URoomInsidePage::NativeConstruct()
 		}
 		else
 		{
-			for (const FCharacterInfo* CharInfo : AllCharacters) // 规范 4：使用 const 指针遍历只读数据，保证安全性
+			// 1. 唯一遍历：同时填充 UI 显示名 和 内存 ID 缓存
+			for (const FName& RowName : RowNames)
 			{
-				if (CharInfo && !CharInfo->CharacterName.IsEmpty())
+				FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(RowName, ContextString);
+				// 规范：不仅检查指针，还要检查名字是否为空白
+				if (Info && !Info->CharacterName.IsEmpty())
 				{
-					ComboBox_CharacterSelect->AddOption(CharInfo->CharacterName.ToString());
+					// UI 给玩家看的是：马可
+					ComboBox_CharacterSelect->AddOption(Info->CharacterName.ToString());
+					// 内存里记的是：Char_01
+					CachedCharacterIDs.Add(RowName); 
 				}
 			}
 
-			// ==========================================
-			// 智能选中逻辑与账户子系统交互
-			// ==========================================
+			// 2. 智能选中逻辑：用 ID 找 Index
 			if (ComboBox_CharacterSelect->GetOptionCount() > 0)
 			{
-				FString SavedCharacter = TEXT("");
-				
+				FString SavedCharacterID = TEXT("");
 				if (UGameInstance* GI = GetGameInstance())
 				{
-					// 规范 5：安全获取子系统
 					if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
 					{
-						SavedCharacter = AccountSub->GetLastSelectedCharacter();
+						// 获取存盘的 ID (如 "Char_01")
+						SavedCharacterID = AccountSub->GetLastSelectedCharacter();
 					}
 				}
 
-				int32 FoundIndex = ComboBox_CharacterSelect->FindOptionIndex(SavedCharacter);
+				// 【重磅修复】：不要去 ComboBox 里找文字，去 CachedCharacterIDs 里找真实的 ID 索引！
+				int32 FoundIndex = CachedCharacterIDs.IndexOfByKey(FName(*SavedCharacterID));
 
-				if (FoundIndex != INDEX_NONE) // 规范 6：使用虚幻标准宏 INDEX_NONE 替代硬编码的 -1
+				if (FoundIndex != INDEX_NONE) 
 				{
 					ComboBox_CharacterSelect->SetSelectedIndex(FoundIndex);
-					UpdateCharacterDisplayImage(SavedCharacter);
+					// 更新图片（由于 UpdateCharacterDisplayImage 原本接受的是文字，这里从 UI 取回文字传给它）
+					UpdateCharacterDisplayImage(ComboBox_CharacterSelect->GetOptionAtIndex(FoundIndex));
 				}
 				else 
 				{
+					// 找不到（或是第一次进游戏），默认选第一个
 					ComboBox_CharacterSelect->SetSelectedIndex(0);
 					UpdateCharacterDisplayImage(ComboBox_CharacterSelect->GetOptionAtIndex(0));
 				}
 			}
 			
-			// 绑定委托
+			// 3. 一切就绪后，再绑定委托（防止初始化期间误触发）
 			ComboBox_CharacterSelect->OnSelectionChanged.AddDynamic(this, &URoomInsidePage::OnCharacterSelectionChanged);
 		}
 	}
@@ -1134,14 +1139,17 @@ void URoomInsidePage::SyncLoadoutToServer()
 		// 从本地大管家那里获取目前最新的完整装配信息
 		if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
 		{
-			FString CurrentChar = AccountSub->GetLastSelectedCharacter();
+			// 获取当前选中的索引
+			int32 SelectedIndex = ComboBox_CharacterSelect->GetSelectedIndex();
+			
+			// 从缓存数组中取出真实的 RowName ID
+			FString CurrentCharID = (SelectedIndex != INDEX_NONE) ? CachedCharacterIDs[SelectedIndex].ToString() : TEXT("Default");
+            
 			FString CurrentWeapon1 = AccountSub->GetLastSelectedWeapon(1);
 			FString CurrentWeapon2 = AccountSub->GetLastSelectedWeapon(2);
-
-			// 呼叫对讲机：报告服务器！这是我最新的三件套！
-			PC->Server_SelectLoadout(CurrentChar, CurrentWeapon1, CurrentWeapon2);
 			
-			UE_LOG(LogTemp, Log, TEXT("[RoomInsidePage] 已向服务器同步战备数据: Char=%s, Wep1=%s, Wep2=%s"), *CurrentChar, *CurrentWeapon1, *CurrentWeapon2);
+			// 发送给服务器的是 RowName ID 了！
+			PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
 		}
 	}
 }

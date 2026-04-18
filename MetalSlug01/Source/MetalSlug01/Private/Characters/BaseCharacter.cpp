@@ -12,6 +12,7 @@
 #include "Weapons/BaseWeapon.h"
 #include "UI/Game/GameHUDWidget.h"
 #include "Kismet/GameplayStatics.h"
+#include "Systems/RoomGameMode.h"
 #include "UI/Login/Core/RoomPlayerState.h"
 
 ABaseCharacter::ABaseCharacter()
@@ -756,7 +757,39 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 
 void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 {
-	// 1. 查 DT_WeaponInfo 表获取 WeaponClass
-	// 2. SpawnActor<ABaseWeapon>(Info->WeaponClass)
-	// 3. Weapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, TEXT("WeaponSocket"));
+	// 工业级规范：指针与有效性校验
+	if (WeaponID.IsEmpty() || WeaponID == TEXT("Default")) return;
+
+	// 1. 从 GameMode 那里“借”一下数据表（或者在 Character 里配置）
+	// 这里建议在 Character 蓝图里也配一个 WeaponDataTable 变量，或者通过 GameMode 获取
+	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
+	if (!GM || !GM->WeaponDataTable) return;
+
+	static const FString ContextString(TEXT("WeaponSpawnContext"));
+	FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponID), ContextString);
+
+	if (WeaponInfo && WeaponInfo->WeaponBlueprint)
+	{
+		// 2. 在服务器上生成武器
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.Owner = this;
+		SpawnParams.Instigator = this;
+
+		ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
+			WeaponInfo->WeaponBlueprint, 
+			GetActorLocation(), 
+			GetActorRotation(), 
+			SpawnParams
+		);
+
+		if (NewWeapon)
+		{
+			// 3. 将武器焊接到角色的插槽上
+			// 确保你的 Skeleton 上有 "WeaponSocket_R" 这个名字的插槽
+			NewWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, FName("WeaponSocket_R"));
+            
+			// 4. 更新 CurrentWeapon 指针，这会触发网络同步
+			CurrentWeapon = NewWeapon;
+		}
+	}
 }

@@ -336,28 +336,21 @@ UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AControll
 	ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>();
 	if (PS && CharacterDataTable) 
 	{
-		// 1. 获取玩家选择的角色ID
+		// 这里现在拿到的是正确的 RowName ID（如 "Char_01"）
 		FString CharID = PS->GetSelectedCharacterID();
-		
-		// 2. 查表获取配置行
+        
 		static const FString ContextString(TEXT("CharacterSpawnContext"));
-		// 【注意】这里必须使用 FCharacterInfo，因为你表里的结构体叫这个名字
 		FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharID), ContextString);
-		
-		// 如果是软引用，需要在生成前执行一下同步加载（LoadSynchronous）将路径转换为真实的类
+        
 		if (Info && !Info->CharacterBlueprint.IsNull())
 		{
-			// 将软指针加载为硬指针类返回给引擎去 Spawn
+			// 软引用同步加载
 			return Info->CharacterBlueprint.LoadSynchronous(); 
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] 未找到 ID 为 %s 的角色，或 CharacterBlueprint 为空，使用默认 Pawn"), *CharID);
 		}
 	}
 
-	// 如果查表失败或没拿到数据，执行父类默认的生成逻辑，防止服务器崩溃
-	return Super::GetDefaultPawnClassForController_Implementation(InController);
+	// 兜底方案：如果没选，返回一个默认类
+	return DefaultPawnClass;
 }
 
 //3. 生成完毕后，查表并派发武器
