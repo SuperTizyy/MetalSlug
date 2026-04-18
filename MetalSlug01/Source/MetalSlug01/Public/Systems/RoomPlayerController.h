@@ -123,7 +123,7 @@ public:
 
 	// 客户端 UI 选择完毕后，通知服务器保存这个决定
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_SelectLoadout(const FString& CharacterRowName, const FString& WeaponRowName);
+	void Server_SelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName);
 	
 	/**
 	 * @brief 接收来自服务器的指令，强制本地客户端切换游戏状态流程 (Client RPC)

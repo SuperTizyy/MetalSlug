@@ -24,11 +24,11 @@ public:
 	
 	// 获取角色/武器 ID (供服务器 GameMode 使用)
 	FString GetSelectedCharacterID() const { return SelectedCharacterID; }
-	FString GetSelectedWeaponID() const { return SelectedWeaponID; }
+	FString GetSelectedWeapon1ID() const { return SelectedWeaponID1; }
+	FString GetSelectedWeapon2ID() const { return SelectedWeaponID2; }
 
-	// 服务器修改接口
-	UFUNCTION(Server, Reliable)
-	void Server_SetPlayerLoadout(const FString& InCharID, const FString& InWeaponID);
+	// 将原本的设置接口改为 Controller 专用的 Setter（去掉此处的 Server RPC，统一由 Controller 转发）
+	void SetPlayerLoadout(const FString& InCharID, const FString& InWeapon1ID, const FString& InWeapon2ID);
 
 	// 【核心规范】：必须重写此函数，注册需要网络同步的变量
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
@@ -63,21 +63,25 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Room|Events")
 	FOnRoomPlayerStateChanged OnStateChanged;
 	
-	// 装备与选角配置
-	// 用于持久化记录该玩家选择的英雄和武器
-	
-	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
-	FString SelectedCharacterRowName;
-
-	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
-	FString SelectedWeaponRowName;
+	// // 装备与选角配置
+	// // 用于持久化记录该玩家选择的英雄和武器
+	//
+	// UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
+	// FString SelectedCharacterRowName;
+	//
+	// UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
+	// FString SelectedWeaponRowName;
 	
 protected:
 	// 使用 Replicated 确保所有客户端知道每个人的配置（用于显示队友信息）
 	UPROPERTY(Replicated)
 	FString SelectedCharacterID;
 
-	UPROPERTY(Replicated)
-	FString SelectedWeaponID;
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Loadout")
+	FString SelectedWeaponID1;
+
+	// 支持二号位武器的数据同步
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Loadout")
+	FString SelectedWeaponID2;
 	
 };

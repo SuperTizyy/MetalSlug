@@ -431,12 +431,12 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 	}
 	
 	// ==========================================
-	// 【新增】：玩家每次点击下拉菜单，立刻更新头像！
+	// 玩家每次点击下拉菜单，立刻更新头像！
 	// ==========================================
 	UpdateCharacterDisplayImage(SelectedItem);
 	
 	// ==========================================
-	// 2. 【新增】：每次切换，立刻悄悄存进硬盘！
+	// 每次切换，立刻悄悄存进硬盘！
 	// ==========================================
 	if (UGameInstance* GI = GetGameInstance())
 	{
@@ -446,10 +446,13 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 		}
 	}
 	
+	//立刻通知服务器！
+	SyncLoadoutToServer();
+	
 }
 
 // ==========================================
-// 【新增】：根据名字查表，并更换 Image 贴图
+// 根据名字查表，并更换 Image 贴图
 // ==========================================
 void URoomInsidePage::UpdateCharacterDisplayImage(const FString& SelectedCharacterName)
 {
@@ -501,6 +504,9 @@ void URoomInsidePage::OnConfirmWeaponChangeClicked()
 		UpdateWeaponDisplayImage(ActiveBackpackSlot);
 
 		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green, FString::Printf(TEXT("背包 %d 已装备武器：%s"), ActiveBackpackSlot, *TempSelectedWeaponRow.ToString()));
+	
+		//立刻通知服务器！
+		SyncLoadoutToServer();
 	}
 
 	// 确认完毕后，同样把面板关掉
@@ -1116,5 +1122,26 @@ void URoomInsidePage::OnGameFlowStateChanged(EMatchState NewState)
 		
 		// 核心魔法：将自己从屏幕上彻底移除！
 		this->RemoveFromParent();
+	}
+}
+
+// 1. 实现助手函数
+void URoomInsidePage::SyncLoadoutToServer()
+{
+	// 获取玩家拥有的对讲机 (Controller)
+	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	{
+		// 从本地大管家那里获取目前最新的完整装配信息
+		if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
+		{
+			FString CurrentChar = AccountSub->GetLastSelectedCharacter();
+			FString CurrentWeapon1 = AccountSub->GetLastSelectedWeapon(1);
+			FString CurrentWeapon2 = AccountSub->GetLastSelectedWeapon(2);
+
+			// 呼叫对讲机：报告服务器！这是我最新的三件套！
+			PC->Server_SelectLoadout(CurrentChar, CurrentWeapon1, CurrentWeapon2);
+			
+			UE_LOG(LogTemp, Log, TEXT("[RoomInsidePage] 已向服务器同步战备数据: Char=%s, Wep1=%s, Wep2=%s"), *CurrentChar, *CurrentWeapon1, *CurrentWeapon2);
+		}
 	}
 }

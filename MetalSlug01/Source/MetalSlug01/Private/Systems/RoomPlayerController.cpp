@@ -41,24 +41,16 @@ void ARoomPlayerController::DelayedSendPlayerInfo()
 	{
 		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
 		{
-			// 1. 获取本地登录的玩家名
 			MyName = AccountSub->GetCurrentLoggedInUser();
 			
-			// 2. 查大账本，获取该玩家在登录页选好的角色和武器
 			const FAccountRecord* MyRecord = AccountSub->GetAccountRecord(MyName);
 			if (MyRecord)
 			{
-				if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
-				{
-					// 3. 【核心修复】：使用你结构体中真实存在的 LastSelectedWeapon1！
-					// 如果你的 Server_SetPlayerLoadout 支持双武器，你可以把 Weapon2 也传进去
-					PS->Server_SetPlayerLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1);
-				}
+				// 【修复 1】：直接呼叫自身的 RPC，将初始数据推送到服务器！
+				Server_SelectLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1, MyRecord->LastSelectedWeapon2);
 			}
 		}
 	}
-
-	// 4. 呼叫服务器报到，触发你原本进房间的后续逻辑
 	Server_SendPlayerInfo(MyName);
 	
 }
@@ -312,30 +304,29 @@ void ARoomPlayerController::Server_ToggleReady_Implementation(bool bIsReady)
 	}
 }
 
-// 6. 开始游戏时的全员就绪检测（超级精简版！）
+// 开局时提取正确的数据传给 GameMode
 void ARoomPlayerController::Server_RequestStartGame_Implementation()
 {
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		if (GM->CheckAllPlayersReady())
 		{
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, TEXT("所有人均已准备，服务器即将开始游戏！"));
-			
 			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 			{
 				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
 				{
-					// 让客户端关闭大厅 UI
 					PC->Client_EnterBattleState();
 					
-					// 【核心修复】：不要传空字符串覆盖玩家的选择！
-					// 去玩家自己的 PlayerState 里把选择读取出来，然后再命令生成！
 					FString TargetChar = TEXT("");
 					FString TargetWeapon = TEXT("");
+
+					// 【核心修复】：去玩家自己的 PlayerState 里读取具有唯一真理的数据
 					if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
 					{
-						TargetChar = PS->SelectedCharacterRowName;
-						TargetWeapon = PS->SelectedWeaponRowName;
+						TargetChar = PS->GetSelectedCharacterID();
+						// 注意：这里默认将主武器（武器1）传给 GameMode。
+						// 如果你的 HandlePlayerRequestSpawn 支持双武器，你可以把 GetSelectedWeapon2ID() 也传进去。
+						TargetWeapon = PS->GetSelectedWeapon1ID(); 
 					}
 					
 					GM->HandlePlayerRequestSpawn(PC, TargetChar, TargetWeapon);
@@ -407,17 +398,16 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 	}
 }
 
-// 处理装备与选角请求
-bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& WeaponRowName) { return true; }
+// 验证函数
+bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName) { return true; }
 
-void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& WeaponRowName)
+// 正确赋值给 PlayerState 的唯一真理数据
+void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName)
 {
-	// 工业级规范：将配置长久保存在服务器的 PlayerState 中
-	// 这样即便角色死亡、切换地图，服务器依然记得该玩家选了什么！
+	// 工业级规范：指针校验
 	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SelectedCharacterRowName = CharacterRowName;
-		PS->SelectedWeaponRowName = WeaponRowName;
+		PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
 	}
 }
 

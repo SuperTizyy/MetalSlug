@@ -318,8 +318,9 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	// 将玩家的选择持久化存储在 PlayerState 中，防止死亡后丢失
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SelectedCharacterRowName = CharRowName;
-		PS->SelectedWeaponRowName = WeaponRowName;
+		// 【修复】：使用我们刚封装好的 Setter 接口进行安全赋值。
+		// 由于这个函数没有传入二号武器，我们先保留它原本的二号武器即可
+		PS->SetPlayerLoadout(CharRowName, WeaponRowName, PS->GetSelectedWeapon2ID());
 	}
 
 	// 【大厂规范】：交出控制权！调用 UE 原生生成流程
@@ -370,10 +371,11 @@ void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 	{
 		if (ARoomPlayerState* PS = NewPlayer->GetPlayerState<ARoomPlayerState>())
 		{
-			if (!PS->SelectedWeaponRowName.IsEmpty() && WeaponDataTable)
+			// 【修复】：使用 Getter 获取真理数据
+			if (!PS->GetSelectedWeapon1ID().IsEmpty() && WeaponDataTable)
 			{
-				// 【精准定位】：使用您项目真实的 FWeaponInfo 进行查表
-				FName RowName = FName(*PS->SelectedWeaponRowName);
+				// 【修复】：使用 Getter
+				FName RowName = FName(*PS->GetSelectedWeapon1ID());
 				FString ContextString = TEXT("Weapon Spawn Context");
 				
 				FWeaponInfo* WeaponInfo = WeaponDataTable->FindRow<FWeaponInfo>(RowName, ContextString);
@@ -484,9 +486,9 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 				// 获取这个 PlayerState 对应的 Controller
 				if (AController* PlayerController = Cast<AController>(PS->GetOwner()))
 				{
-					// 【防呆设计】：如果玩家忘了选角色，给一个默认值
-					FString FinalChar = PS->SelectedCharacterRowName.IsEmpty() ? TEXT("Warrior") : PS->SelectedCharacterRowName;
-					FString FinalWeapon = PS->SelectedWeaponRowName.IsEmpty() ? TEXT("Knife") : PS->SelectedWeaponRowName;
+					// 【修复】：全面使用 Getter 替换被删除的本地变量！
+					FString FinalChar = PS->GetSelectedCharacterID().IsEmpty() ? TEXT("Warrior") : PS->GetSelectedCharacterID();
+					FString FinalWeapon = PS->GetSelectedWeapon1ID().IsEmpty() ? TEXT("Knife") : PS->GetSelectedWeapon1ID();
 
 					// 调用您已经写好的 HandlePlayerRequestSpawn 进行生成！
 					// 这个函数会触发底层 RestartPlayer -> GetDefaultPawnClassForController -> SpawnActor

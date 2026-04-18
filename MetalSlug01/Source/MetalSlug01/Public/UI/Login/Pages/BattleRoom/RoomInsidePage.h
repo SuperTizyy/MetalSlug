@@ -317,4 +317,7 @@ private:
 	UFUNCTION()
 	void RefreshRoomUI();
 	
+	// 工业级规范：将重复的网络同步逻辑封装成私有助手函数，保持代码整洁
+	void SyncLoadoutToServer();
+	
 };

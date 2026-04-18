@@ -749,7 +749,8 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	// 仅在服务器执行
 	if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
 	{
-		SpawnAndEquipWeapon(PS->GetSelectedWeaponID());
+		//使用新的 Getter 方法获取一号位武器
+		SpawnAndEquipWeapon(PS->GetSelectedWeapon1ID());
 	}
 }
 

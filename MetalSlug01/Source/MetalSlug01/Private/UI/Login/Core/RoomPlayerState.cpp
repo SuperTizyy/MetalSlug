@@ -12,7 +12,9 @@ ARoomPlayerState::ARoomPlayerState()
 	bReplicates = true;
 	
 	SelectedCharacterID = TEXT("Default");
-	SelectedWeaponID = TEXT("Default");
+	//使用新的变量名，并初始化双武器
+	SelectedWeaponID1 = TEXT("Default"); 
+	SelectedWeaponID2 = TEXT("Default");
 }
 
 void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -21,7 +23,8 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 
 	// 【核心规范】：在这里注册变量。DOREPLIFETIME 会让引擎底层接管这些变量的网络同步
 	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
-	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID);
+	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID1);
+	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID2); // 注册新变量的网络同步
 }
 
 // 只有客户端会在变量改变时自动执行这些 OnRep 函数
@@ -37,8 +40,14 @@ void ARoomPlayerState::OnRep_IsReady()
 	OnStateChanged.Broadcast();
 }
 
-void ARoomPlayerState::Server_SetPlayerLoadout_Implementation(const FString& InCharID, const FString& InWeaponID)
+// 供服务端 PlayerController 调用的本地 Setter，不再需要是 RPC，因为 RPC 在 Controller 里已经走过了
+void ARoomPlayerState::SetPlayerLoadout(const FString& InCharID, const FString& InWeapon1ID, const FString& InWeapon2ID)
 {
-	SelectedCharacterID = InCharID;
-	SelectedWeaponID = InWeaponID;
+	// 只有服务器有权限修改带有 Replicated 的变量
+	if (HasAuthority())
+	{
+		SelectedCharacterID = InCharID;
+		SelectedWeaponID1 = InWeapon1ID;
+		SelectedWeaponID2 = InWeapon2ID;
+	}
 }
