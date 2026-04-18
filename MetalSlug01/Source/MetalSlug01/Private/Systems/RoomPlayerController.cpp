@@ -36,23 +36,28 @@ void ARoomPlayerController::BeginPlay()
 void ARoomPlayerController::DelayedSendPlayerInfo()
 {
 	FString MyName = TEXT("未知玩家");
-	
+
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
 		{
 			MyName = AccountSub->GetCurrentLoggedInUser();
-			
+
 			const FAccountRecord* MyRecord = AccountSub->GetAccountRecord(MyName);
 			if (MyRecord)
 			{
+				UE_LOG(LogTemp, Warning, TEXT("[Room] DelayedSendPlayerInfo: Char='%s', W1='%s', W2='%s'"),
+					*MyRecord->LastSelectedCharacter, *MyRecord->LastSelectedWeapon1, *MyRecord->LastSelectedWeapon2);
 				// 【修复 1】：直接呼叫自身的 RPC，将初始数据推送到服务器！
 				Server_SelectLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1, MyRecord->LastSelectedWeapon2);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[Room] DelayedSendPlayerInfo: No record for '%s'"), *MyName);
 			}
 		}
 	}
 	Server_SendPlayerInfo(MyName);
-	
 }
 
 // ----------------------------------------------------
@@ -307,6 +312,7 @@ void ARoomPlayerController::Server_ToggleReady_Implementation(bool bIsReady)
 // 开局时提取正确的数据传给 GameMode
 void ARoomPlayerController::Server_RequestStartGame_Implementation()
 {
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		if (GM->CheckAllPlayersReady())
@@ -316,7 +322,7 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
 				{
 					PC->Client_EnterBattleState();
-					
+
 					FString TargetChar = TEXT("");
 					FString TargetWeapon = TEXT("");
 
@@ -326,9 +332,11 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 						TargetChar = PS->GetSelectedCharacterID();
 						// 注意：这里默认将主武器（武器1）传给 GameMode。
 						// 如果你的 HandlePlayerRequestSpawn 支持双武器，你可以把 GetSelectedWeapon2ID() 也传进去。
-						TargetWeapon = PS->GetSelectedWeapon1ID(); 
+						TargetWeapon = PS->GetSelectedWeapon1ID();
+						UE_LOG(LogTemp, Warning, TEXT("[Spawn] PC='%s' sending to GM: Char='%s', Weapon='%s'"),
+							*PC->MyPlayerName, *TargetChar, *TargetWeapon);
 					}
-					
+
 					GM->HandlePlayerRequestSpawn(PC, TargetChar, TargetWeapon);
 				}
 			}
@@ -401,10 +409,11 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 // 验证函数
 bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName) { return true; }
 
-// 正确赋值给 PlayerState 的唯一真理数据
 void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName)
 {
 	// 工业级规范：指针校验
+	UE_LOG(LogTemp, Warning, TEXT("[Room] Server_SelectLoadout: Char='%s', W1='%s', W2='%s'"),
+		*CharacterRowName, *Weapon1RowName, *Weapon2RowName);
 	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
 	{
 		PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);

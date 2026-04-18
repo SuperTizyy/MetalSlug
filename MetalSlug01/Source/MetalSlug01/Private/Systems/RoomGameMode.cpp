@@ -315,17 +315,73 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 {
 	if (!PlayerToSpawn) return;
 
-	// 将玩家的选择持久化存储在 PlayerState 中，防止死亡后丢失
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] HandlePlayerRequestSpawn called. Char='%s', Weapon='%s'"),
+		*CharRowName, *WeaponRowName);
+
+	// 同时写入 PlayerState（保证其他逻辑能用）
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		// 【修复】：使用我们刚封装好的 Setter 接口进行安全赋值。
-		// 由于这个函数没有传入二号武器，我们先保留它原本的二号武器即可
 		PS->SetPlayerLoadout(CharRowName, WeaponRowName, PS->GetSelectedWeapon2ID());
 	}
 
-	// 【大厂规范】：交出控制权！调用 UE 原生生成流程
-	// 这行代码会自动触发底层的 FindPlayerStart -> SpawnDefaultPawnFor -> Possess
-	RestartPlayer(PlayerToSpawn);
+	// ==========================================
+	// 【核心修复】：绕过 RestartPlayer 的时序问题，手动完成整个生成流程
+	// ==========================================
+
+	// Step 1：查表获取角色类
+	TSubclassOf<ABaseCharacter> CharClassToSpawn = nullptr;
+	if (!CharRowName.IsEmpty() && CharRowName != TEXT("Default") && CharacterDataTable)
+	{
+		static const FString CharCtx(TEXT("ManualSpawn"));
+		if (FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharRowName), CharCtx))
+		{
+			if (!Info->CharacterBlueprint.IsNull())
+			{
+				CharClassToSpawn = Info->CharacterBlueprint.LoadSynchronous();
+				UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualChar lookup '%s' -> %s"),
+					*CharRowName, *GetNameSafe(CharClassToSpawn));
+			}
+		}
+	}
+	if (!CharClassToSpawn) CharClassToSpawn = DefaultPawnClass;
+
+	// Step 2：找出生点
+	AActor* BestStart = FindPlayerStart(PlayerToSpawn, TEXT(""));
+	FVector SpawnLoc = FVector::ZeroVector;
+	FRotator SpawnRot = FRotator::ZeroRotator;
+	if (BestStart)
+	{
+		SpawnLoc = BestStart->GetActorLocation();
+		SpawnRot = BestStart->GetActorRotation();
+	}
+
+	// Step 3：手动 Spawn 角色
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = PlayerToSpawn;
+	SpawnParams.Instigator = PlayerToSpawn->GetPawn();
+
+	// 【关键】：先销毁旧 Pawn，防止重复生成（旧的默认角色遗留问题）
+	if (APawn* OldPawn = PlayerToSpawn->GetPawn())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] Destroying old Pawn: %s"), *OldPawn->GetName());
+		OldPawn->Destroy();
+	}
+
+	ABaseCharacter* SpawnedChar = GetWorld()->SpawnActor<ABaseCharacter>(
+		CharClassToSpawn, SpawnLoc, SpawnRot, SpawnParams);
+
+	if (SpawnedChar)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualSpawn success: %s at %s"),
+			*SpawnedChar->GetName(), *SpawnLoc.ToString());
+
+		// Step 4：Possess（会触发 PossessedBy -> SpawnAndEquipWeapon 自动装备武器）
+		PlayerToSpawn->Possess(SpawnedChar);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[Spawn] ManualSpawn FAILED for Char='%s'"), *CharRowName);
+	}
 }
 
 // ==========================================
@@ -333,70 +389,67 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 // ==========================================
 UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AController* InController)
 {
-	ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>();
-	if (PS && CharacterDataTable) 
+	FString CharID = TEXT("(no cache)");
+	if (!InController) return DefaultPawnClass;
+
+	// 【核心修复】：优先从 GameMode 本地缓存读取角色 ID（绕过 PlayerState 复制时序问题）
+	FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(InController->GetUniqueID());
+	if (CachedData && !CachedData->CharID.IsEmpty())
 	{
-		// 这里现在拿到的是正确的 RowName ID（如 "Char_01"）
-		FString CharID = PS->GetSelectedCharacterID();
-        
+		CharID = CachedData->CharID;
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] GetDefaultPawnClass (from cache) ControllerID=%d, CharID='%s'"),
+			InController->GetUniqueID(), *CharID);
+	}
+	else
+	{
+		// 兜底：从 PlayerState 读
+		if (ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>())
+		{
+			CharID = PS->GetSelectedCharacterID();
+		}
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] GetDefaultPawnClass (from PS fallback) ControllerID=%d, CharID='%s'"),
+			InController->GetUniqueID(), *CharID);
+	}
+
+	if (!CharID.IsEmpty() && CharID != TEXT("Default") && CharacterDataTable)
+	{
 		static const FString ContextString(TEXT("CharacterSpawnContext"));
 		FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharID), ContextString);
-        
+
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] FindRow('%s') -> Info=%s, Blueprint=%s"),
+			*CharID,
+			Info ? TEXT("FOUND") : TEXT("NULL"),
+			(Info && !Info->CharacterBlueprint.IsNull()) ? TEXT("SET") : TEXT("NULL"));
+
 		if (Info && !Info->CharacterBlueprint.IsNull())
 		{
-			// 软引用同步加载
-			return Info->CharacterBlueprint.LoadSynchronous(); 
+			return Info->CharacterBlueprint.LoadSynchronous();
 		}
 	}
 
 	// 兜底方案：如果没选，返回一个默认类
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Falling back to DefaultPawnClass=%s"),
+		DefaultPawnClass ? *DefaultPawnClass->GetName() : TEXT("NULL"));
 	return DefaultPawnClass;
 }
 
-//3. 生成完毕后，查表并派发武器
+//3. 生成完毕后，查表并派发武器（仅用于死亡复活流程，手动生成已在上方完成）
 void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 {
-	// 先让底层完成生成和附身
-	Super::RestartPlayer(NewPlayer);
+	// 只有在没有缓存数据时才走父类流程（死亡复活）
+	FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(NewPlayer->GetUniqueID());
+	if (!CachedData)
+	{
+		// 死亡复活：调用父类标准流程
+		Super::RestartPlayer(NewPlayer);
+		return;
+	}
 
-	// 此时角色已经安全降生在地图上
+	// 有缓存数据但仍要走 Possess 后的武器装备流程
 	if (NewPlayer && NewPlayer->GetPawn())
 	{
-		if (ARoomPlayerState* PS = NewPlayer->GetPlayerState<ARoomPlayerState>())
-		{
-			// 【修复】：使用 Getter 获取真理数据
-			if (!PS->GetSelectedWeapon1ID().IsEmpty() && WeaponDataTable)
-			{
-				// 【修复】：使用 Getter
-				FName RowName = FName(*PS->GetSelectedWeapon1ID());
-				FString ContextString = TEXT("Weapon Spawn Context");
-				
-				FWeaponInfo* WeaponInfo = WeaponDataTable->FindRow<FWeaponInfo>(RowName, ContextString);
-				if (WeaponInfo && WeaponInfo->WeaponBlueprint)
-				{
-					// 【实战武器生成】：获取当前附身的角色
-					ACharacter* MyChar = Cast<ACharacter>(NewPlayer->GetPawn());
-					if (MyChar)
-					{
-						// 在服务器生成真实的 3D 武器实例
-						FActorSpawnParameters SpawnParams;
-						SpawnParams.Owner = MyChar;
-						SpawnParams.Instigator = MyChar;
-						
-						ABaseWeapon* SpawnedWeapon = GetWorld()->SpawnActor<ABaseWeapon>(WeaponInfo->WeaponBlueprint, MyChar->GetActorLocation(), MyChar->GetActorRotation(), SpawnParams);
-						
-						if (SpawnedWeapon)
-						{
-							/* * 工业级提醒：这里调用您角色身上实际的装备武器函数。
-							 * 假设您的 Character 里有类似 EquipWeapon 的接口，可以这样调用：
-							 * MyChar->EquipWeapon(SpawnedWeapon); 
-							 */
-							if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("成功为玩家装备武器: %s"), *WeaponInfo->WeaponName.ToString()));
-						}
-					}
-				}
-			}
-		}
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer (cached): Pawn=%s, WeaponID='%s'"),
+			*NewPlayer->GetPawn()->GetName(), *CachedData->WeaponID);
 	}
 }
 
@@ -467,15 +520,21 @@ void ARoomGameMode::PerformGameStart()
 
 void ARoomGameMode::SpawnAllPlayersIntoBattle()
 {
-	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] 倒计时结束，开始降生玩家物理实体！"));
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] SpawnAllPlayersIntoBattle called!"));
 
 	// 遍历当前的 GameState 中所有成功建立连接的 PlayerState
 	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
 	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] PlayerArray has %d players"), GS->PlayerArray.Num());
 		for (APlayerState* GenericPS : GS->PlayerArray)
 		{
 			if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(GenericPS))
 			{
+				UE_LOG(LogTemp, Warning, TEXT("[Spawn] PS='%s', Owner=%s, CharID='%s', WeaponID='%s'"),
+					*PS->GetPlayerName(),
+					*GetNameSafe(PS->GetOwner()),
+					*PS->GetSelectedCharacterID(),
+					*PS->GetSelectedWeapon1ID());
 				// 获取这个 PlayerState 对应的 Controller
 				if (AController* PlayerController = Cast<AController>(PS->GetOwner()))
 				{
@@ -487,9 +546,13 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 					// 这个函数会触发底层 RestartPlayer -> GetDefaultPawnClassForController -> SpawnActor
 					HandlePlayerRequestSpawn(PlayerController, FinalChar, FinalWeapon);
 				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[Spawn] WARNING: PS->GetOwner() is NULL for '%s'!"), *PS->GetPlayerName());
+				}
 			}
 		}
 	}
-	
+
 	BroadcastSystemMessage(TEXT("战斗开始！"));
 }

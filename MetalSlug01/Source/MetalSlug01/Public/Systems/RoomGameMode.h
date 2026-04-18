@@ -145,5 +145,16 @@ protected:
 	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色
 	 */
 	void SpawnAllPlayersIntoBattle();
-	
+
+	// ==========================================
+	// 角色/武器生成缓存（绕过 PlayerState 复制时序问题）
+	// ==========================================
+	struct FPlayerSpawnData
+	{
+		FString CharID;
+		FString WeaponID;
+	};
+	// Key = PlayerState unique ID (GetUniqueID())，确保每个玩家独立
+	TMap<uint32, FPlayerSpawnData> PlayerSpawnDataCache;
+
 };

@@ -131,34 +131,70 @@ void URoomInsidePage::NativeConstruct()
 			}
 
 			// 2. 智能选中逻辑：用 ID 找 Index
-			if (ComboBox_CharacterSelect->GetOptionCount() > 0)
+			FString SavedCharacterID = TEXT("");
+			UAccountSubsystem* AccountSub = nullptr;
+			if (UGameInstance* GI = GetGameInstance())
 			{
-				FString SavedCharacterID = TEXT("");
-				if (UGameInstance* GI = GetGameInstance())
+				AccountSub = GI->GetSubsystem<UAccountSubsystem>();
+				if (AccountSub)
 				{
-					if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-					{
-						// 获取存盘的 ID (如 "Char_01")
-						SavedCharacterID = AccountSub->GetLastSelectedCharacter();
-					}
+					// 获取存盘的 ID (如 "Char_01")
+					SavedCharacterID = AccountSub->GetLastSelectedCharacter();
 				}
+			}
 
 				// 【重磅修复】：不要去 ComboBox 里找文字，去 CachedCharacterIDs 里找真实的 ID 索引！
 				int32 FoundIndex = CachedCharacterIDs.IndexOfByKey(FName(*SavedCharacterID));
+				UE_LOG(LogTemp, Warning, TEXT("[Room] NativeConstruct: SavedCharID='%s', FoundIndex=%d, CachedCount=%d"),
+					*SavedCharacterID, FoundIndex, CachedCharacterIDs.Num());
 
-				if (FoundIndex != INDEX_NONE) 
+				FString CharIDToSync = TEXT("");
+				if (FoundIndex != INDEX_NONE)
 				{
 					ComboBox_CharacterSelect->SetSelectedIndex(FoundIndex);
 					// 更新图片（由于 UpdateCharacterDisplayImage 原本接受的是文字，这里从 UI 取回文字传给它）
 					UpdateCharacterDisplayImage(ComboBox_CharacterSelect->GetOptionAtIndex(FoundIndex));
+					CharIDToSync = CachedCharacterIDs[FoundIndex].ToString();
 				}
-				else 
+				else
 				{
 					// 找不到（或是第一次进游戏），默认选第一个
 					ComboBox_CharacterSelect->SetSelectedIndex(0);
 					UpdateCharacterDisplayImage(ComboBox_CharacterSelect->GetOptionAtIndex(0));
+					CharIDToSync = CachedCharacterIDs.Num() > 0 ? CachedCharacterIDs[0].ToString() : TEXT("");
 				}
-			}
+
+				// 【核心修复】：程序化 SetSelectedIndex 不会触发 OnSelectionChanged，必须手动同步
+				UE_LOG(LogTemp, Warning, TEXT("[Room] Syncing char='%s' to server (FoundIndex=%d)"), *CharIDToSync, FoundIndex);
+				if (AccountSub)
+				{
+					AccountSub->SaveLastSelectedCharacter(CharIDToSync);
+				}
+
+				// 【新增】：初始化武器（如果玩家从未选择过武器，默认给第一把）
+				if (WeaponDataTable && AccountSub)
+				{
+					TArray<FName> WeaponRows = WeaponDataTable->GetRowNames();
+					FString DefaultWeapon = TEXT("");
+					if (WeaponRows.Num() > 0) DefaultWeapon = WeaponRows[0].ToString();
+
+					for (int32 WSlot = 1; WSlot <= 2; WSlot++)
+					{
+						FString SavedWeapon = AccountSub->GetLastSelectedWeapon(WSlot);
+						if (SavedWeapon.IsEmpty())
+						{
+							AccountSub->SaveLastSelectedWeapon(WSlot, DefaultWeapon);
+							UE_LOG(LogTemp, Warning, TEXT("[Room] Init weapon slot %d -> '%s'"), WSlot, *DefaultWeapon);
+						}
+					}
+				}
+
+				if (ARoomPlayerController* PC2 = Cast<ARoomPlayerController>(GetOwningPlayer()))
+				{
+					FString W1 = AccountSub ? AccountSub->GetLastSelectedWeapon(1) : TEXT("");
+					FString W2 = AccountSub ? AccountSub->GetLastSelectedWeapon(2) : TEXT("");
+					PC2->Server_SelectLoadout(CharIDToSync, W1, W2);
+				}
 			
 			// 3. 一切就绪后，再绑定委托（防止初始化期间误触发）
 			ComboBox_CharacterSelect->OnSelectionChanged.AddDynamic(this, &URoomInsidePage::OnCharacterSelectionChanged);
@@ -440,17 +476,18 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 	// ==========================================
 	UpdateCharacterDisplayImage(SelectedItem);
 	
-	// ==========================================
-	// 每次切换，立刻悄悄存进硬盘！
-	// ==========================================
+	// 从 AccountSubsystem 中读取并保存的是 RowName ID（如 "Char_01"），不是显示名！
+	// 【修复】：必须用 CachedCharacterIDs 数组中对应的 RowName，而不是 SelectedItem（显示名）
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountSubsystem* AccSub = GI->GetSubsystem<UAccountSubsystem>())
 		{
-			AccountSub->SaveLastSelectedCharacter(SelectedItem);
+			int32 SelectedIdx = ComboBox_CharacterSelect->GetSelectedIndex();
+			FString CurrentCharID = (SelectedIdx != INDEX_NONE) ? CachedCharacterIDs[SelectedIdx].ToString() : TEXT("Default");
+			AccSub->SaveLastSelectedCharacter(CurrentCharID);
 		}
 	}
-	
+
 	//立刻通知服务器！
 	SyncLoadoutToServer();
 	
