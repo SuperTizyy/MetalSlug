@@ -70,88 +70,94 @@ void URoomInsidePage::NativeConstruct()
 {
 	Super::NativeConstruct();
 	
-	// 【架构新生】：启动 0.5 秒一次的低频监控探头！
+	// 启动探头定时器
 	GetWorld()->GetTimerManager().SetTimer(PlayerCheckTimerHandle, this, &URoomInsidePage::CheckForNewPlayers, 0.5f, true);
-	
-	// 刚进来时强制刷一次
 	RefreshRoomUI();
 	
-	// 只要调用 HasAuthority()，就能瞬间判定当前操作这块 UI 的玩家是不是真正的房主（服务器主机）
 	bool bIsHost = GetOwningPlayer()->HasAuthority();
 
 	// ==========================================
-	// 测谎仪：如果蓝图里没配置数据表，直接在屏幕上飘红字报警！
+	// 工业级规范：数据与 UI 的强健绑定校验
 	// ==========================================
 	if (!CharacterDataTable)
 	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：CharacterDataTable 为空！你忘记在蓝图里配置数据表了！"));
+		// 规范 1：必须留下底层 Log 记录，便于自动化测试和崩溃定位
+		UE_LOG(LogTemp, Error, TEXT("[URoomInsidePage] 严重错误：未绑定 CharacterDataTable！请检查 WBP_RoomInsidePage 的细节面板。"));
+		
+		if (GEngine) 
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：CharacterDataTable 缺失！"));
+		}
+
+		// 规范 2：容错处理。数据缺失时，不要让玩家点击空列表，锁死 UI 控件
+		if (ComboBox_CharacterSelect)
+		{
+			ComboBox_CharacterSelect->ClearOptions();
+			ComboBox_CharacterSelect->AddOption(TEXT("数据丢失"));
+			ComboBox_CharacterSelect->SetSelectedIndex(0);
+			ComboBox_CharacterSelect->SetIsEnabled(false); // 禁用交互
+		}
 		return; 
 	}
 
-	// ==========================================
-	// 读表并生成下拉框选项
-	// ==========================================
 	if (ComboBox_CharacterSelect)
 	{
 		ComboBox_CharacterSelect->ClearOptions();
 
-		static const FString ContextString(TEXT("Character Context"));
+		// 规范 3：使用静态只读字符串作为 Context，减少每次调用的内存开销
+		static const FString ContextString(TEXT("RoomUI_CharacterInit"));
 		TArray<FCharacterInfo*> AllCharacters;
 		CharacterDataTable->GetAllRows<FCharacterInfo>(ContextString, AllCharacters);
 
-		// 如果表里没数据，也报个警
-		if (AllCharacters.Num() == 0)
+		if (AllCharacters.IsEmpty()) // UE5.6 推荐使用 IsEmpty() 替代 Num() == 0，语义更清晰且针对某些容器效率更高
 		{
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Yellow, TEXT("【警告】：数据表是空的！请去 DT_CharacterList 里添加几行数据！"));
+			UE_LOG(LogTemp, Warning, TEXT("[URoomInsidePage] 数据表为空，无法初始化角色列表！"));
+			ComboBox_CharacterSelect->AddOption(TEXT("无可用角色"));
+			ComboBox_CharacterSelect->SetIsEnabled(false);
 		}
-
-		for (FCharacterInfo* CharInfo : AllCharacters)
+		else
 		{
-			if (CharInfo)
+			for (const FCharacterInfo* CharInfo : AllCharacters) // 规范 4：使用 const 指针遍历只读数据，保证安全性
 			{
-				ComboBox_CharacterSelect->AddOption(CharInfo->CharacterName.ToString());
-			}
-		}
-
-		if (ComboBox_CharacterSelect->GetOptionCount() > 0)
-		{
-			ComboBox_CharacterSelect->SetSelectedIndex(0);
-		}
-		
-		// 4. 智能选中逻辑：查阅账号历史记录！
-		if (ComboBox_CharacterSelect->GetOptionCount() > 0)
-		{
-			FString SavedCharacter = TEXT("");
-			
-			// 向账号管家询问：他上次选了啥？
-			if (UGameInstance* GI = GetGameInstance())
-			{
-				if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+				if (CharInfo && !CharInfo->CharacterName.IsEmpty())
 				{
-					SavedCharacter = AccountSub->GetLastSelectedCharacter();
+					ComboBox_CharacterSelect->AddOption(CharInfo->CharacterName.ToString());
 				}
 			}
 
-			// 尝试在目前的下拉菜单里，寻找他上次选的那个角色
-			int32 FoundIndex = ComboBox_CharacterSelect->FindOptionIndex(SavedCharacter);
+			// ==========================================
+			// 智能选中逻辑与账户子系统交互
+			// ==========================================
+			if (ComboBox_CharacterSelect->GetOptionCount() > 0)
+			{
+				FString SavedCharacter = TEXT("");
+				
+				if (UGameInstance* GI = GetGameInstance())
+				{
+					// 规范 5：安全获取子系统
+					if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+					{
+						SavedCharacter = AccountSub->GetLastSelectedCharacter();
+					}
+				}
 
-			if (FoundIndex != -1) 
-			{
-				// 情况 A：找到了历史记录！还原他的选择！
-				ComboBox_CharacterSelect->SetSelectedIndex(FoundIndex);
-				UpdateCharacterDisplayImage(SavedCharacter);
+				int32 FoundIndex = ComboBox_CharacterSelect->FindOptionIndex(SavedCharacter);
+
+				if (FoundIndex != INDEX_NONE) // 规范 6：使用虚幻标准宏 INDEX_NONE 替代硬编码的 -1
+				{
+					ComboBox_CharacterSelect->SetSelectedIndex(FoundIndex);
+					UpdateCharacterDisplayImage(SavedCharacter);
+				}
+				else 
+				{
+					ComboBox_CharacterSelect->SetSelectedIndex(0);
+					UpdateCharacterDisplayImage(ComboBox_CharacterSelect->GetOptionAtIndex(0));
+				}
 			}
-			else 
-			{
-				// 情况 B：没记录（第一次玩），或者那个角色从数据表里被删除了，默认选第 0 个！
-				ComboBox_CharacterSelect->SetSelectedIndex(0);
-				FString FirstOption = ComboBox_CharacterSelect->GetOptionAtIndex(0);
-				UpdateCharacterDisplayImage(FirstOption);
-			}
+			
+			// 绑定委托
+			ComboBox_CharacterSelect->OnSelectionChanged.AddDynamic(this, &URoomInsidePage::OnCharacterSelectionChanged);
 		}
-
-		// 绑定切换事件（如果你之前在 Initialize 里绑过了，记得把它删掉，只在这里绑一次）
-		ComboBox_CharacterSelect->OnSelectionChanged.AddDynamic(this, &URoomInsidePage::OnCharacterSelectionChanged);
 	}
 	
 	// 刚进入房间时，强制隐藏武器选择面板 (Collapsed 意味着隐藏且不占用布局空间)
@@ -257,7 +263,7 @@ void URoomInsidePage::NativeConstruct()
 			FlowSubsystem->OnStateChanged.AddDynamic(this, &URoomInsidePage::OnGameFlowStateChanged);
 		}
 	}
-}
+}                                                           
 
 void URoomInsidePage::NativeDestruct()
 {
