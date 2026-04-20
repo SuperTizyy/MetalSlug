@@ -71,6 +71,13 @@ public:
 	 * @note 用于显示系统级别的提示信息，如操作失败、状态变更等
 	 */
 	void AddSystemMessageToChat(const FString& Message);
+
+	/**
+	 * @brief 激活聊天输入框（供 PlayerController 快捷键调用）
+	 * @note 在房间等待状态下，按下聊天快捷键时呼出输入框
+	 */
+	UFUNCTION(BlueprintCallable, Category = "RoomUI")
+	void ActivateChatInput();
 	
 protected:
 	

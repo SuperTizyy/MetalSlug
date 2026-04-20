@@ -4,6 +4,7 @@
 #include "GameFramework/PlayerController.h"
 #include "RoomPlayerController.generated.h"
 
+class UInputAction;
 class URoomInsidePage;
 class UGameHUDWidget;
 
@@ -121,6 +122,13 @@ public:
 	// 保存生成出来的 UI 界面指针，方便后续刷新
 	UPROPERTY()
 	URoomInsidePage* RoomUIWidget;
+	
+	// ==========================================
+	// 增强输入系统 (Enhanced Input)
+	// ==========================================
+	// 在蓝图 WBP_RoomPlayerController 中配置这个变量，绑定你的 T 键和 回车键
+	UPROPERTY(EditDefaultsOnly, Category = "Input")
+	UInputAction* IA_ToggleChat;
 
 protected:
 	// 游戏开始时触发
@@ -129,6 +137,13 @@ protected:
 	// 监听全局状态变化的事件回调
 	UFUNCTION()
 	void OnFlowStateChanged(EMatchState NewState);
+	
+	// 重写输入组件绑定函数
+	virtual void SetupInputComponent() override;
+
+	// 处理唤醒聊天的按键事件
+	UFUNCTION()
+	void OnToggleChatAction();
 
 private:
 	// 延迟发送玩家信息，避开网络抢跑期

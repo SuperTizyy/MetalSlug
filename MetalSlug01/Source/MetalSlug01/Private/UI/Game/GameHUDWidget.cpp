@@ -200,3 +200,12 @@ void UGameHUDWidget::AddSystemMessage(const FString& Message)
 		Widget_Chat->AddSystemMessage(Message);
 	}
 }
+
+void UGameHUDWidget::ActivateChatInput()
+{
+	// 通过已绑定的 Widget_Chat 成员变量激活聊天输入框
+	if (Widget_Chat && !Widget_Chat->IsInputFocused())
+	{
+		Widget_Chat->SetInputFocused(true);
+	}
+}

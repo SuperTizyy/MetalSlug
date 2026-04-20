@@ -100,6 +100,9 @@ public:
 	// 接收服务器广播的系统消息（由 Controller 调用）
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void AddSystemMessage(const FString& Message);
+	
+	UFUNCTION(BlueprintCallable, Category = "Chat")
+	void ActivateChatInput();
 
 protected:
 	// 尝试绑定到 GameState（带重试逻辑，解决时序问题）

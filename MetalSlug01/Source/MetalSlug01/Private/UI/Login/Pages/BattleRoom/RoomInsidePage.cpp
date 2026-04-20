@@ -1016,6 +1016,26 @@ void URoomInsidePage::AddSystemMessageToChat(const FString& Message)
 	}
 }
 
+void URoomInsidePage::ActivateChatInput()
+{
+	// 工业级规范：安全校验，防止空指针
+	if (!Input_Chat) return;
+
+	// 激活输入框：设置可见性 + 切 GameAndUI 模式 + 锁定鼠标
+	Input_Chat->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+	Input_Chat->SetKeyboardFocus();
+
+	// 配置输入模式：允许同时操作游戏和 UI，并将焦点锁定到聊天输入框
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		FInputModeGameAndUI InputMode;
+		InputMode.SetWidgetToFocus(Input_Chat->TakeWidget());
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		PC->SetInputMode(InputMode);
+		PC->bShowMouseCursor = true;
+	}
+}
+
 /**
  * @brief 定时器回调函数：每0.5秒检查一次房间内的玩家变化
  * @note 扫描GameState中的玩家列表，检测新加入或离开的玩家，并订阅状态变化事件

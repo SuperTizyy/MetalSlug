@@ -1,4 +1,6 @@
 ﻿#include "Systems/RoomPlayerController.h"
+
+#include "EnhancedInputComponent.h"
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
@@ -510,6 +512,53 @@ void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchStat
 		{
 			// 2. 调用您之前写好的状态机，利用事件多播 (OnStateChanged) 去驱动 UI 切换！
 			FlowSubsystem->TransitToState(NewState);
+		}
+	}
+}
+
+void ARoomPlayerController::SetupInputComponent()
+{
+	Super::SetupInputComponent();
+
+	// 强制转换为增强输入组件
+	if (UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(InputComponent))
+	{
+		// 绑定聊天唤醒按键
+		if (IA_ToggleChat)
+		{
+			EnhancedInputComponent->BindAction(IA_ToggleChat, ETriggerEvent::Started, this, &ARoomPlayerController::OnToggleChatAction);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleChat，聊天快捷键无法使用！"));
+		}
+	}
+}
+
+void ARoomPlayerController::OnToggleChatAction()
+{
+	// 工业级做法：根据当前游戏管家的状态，将聊天唤醒指令下发给正确的 UI 面板
+	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+	{
+		EMatchState CurrentState = FlowSubsystem->GetCurrentState();
+
+		if (CurrentState == EMatchState::Battleing)
+		{
+			// 战斗状态下，让战斗 HUD 激活聊天
+			if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+			{
+				// 此函数需要在 GameHUDWidget 中暴露，供 Controller 调用
+				HUDWidget->ActivateChatInput();
+			}
+		}
+		else if (CurrentState == EMatchState::InRoom)
+		{
+			// 房间等待状态下，让房间界面激活聊天
+			if (RoomUIWidget)
+			{
+				// 此函数需要在 RoomInsidePage 中暴露，供 Controller 调用
+				RoomUIWidget->ActivateChatInput(); 
+			}
 		}
 	}
 }

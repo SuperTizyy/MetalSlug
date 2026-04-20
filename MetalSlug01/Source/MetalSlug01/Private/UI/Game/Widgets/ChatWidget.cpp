@@ -41,20 +41,38 @@ void UChatWidget::SetInputFocused(bool bFocused)
 	{
 		if (bFocused)
 		{
-			// 激活输入框：清空内容 + 设置焦点
+			// 激活输入框：清空内容 + 设置可见性
 			ETB_ChatInput->SetText(FText::GetEmpty());
 			ETB_ChatInput->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
-			ETB_ChatInput->SetUserFocus(GetOwningPlayer());
+			
+			// 切为 GameAndUI，并将输入法强制锁定到该输入框
+			if (APlayerController* PC = GetOwningPlayer())
+			{
+				FInputModeGameAndUI InputMode;
+				InputMode.SetWidgetToFocus(ETB_ChatInput->TakeWidget());
+				InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+				PC->SetInputMode(InputMode);
+				PC->bShowMouseCursor = true;
+			}
+			
+			// 设置输入焦点
+			ETB_ChatInput->SetKeyboardFocus();
 
 			// 缓存 Slate 指针用于焦点路径检查
-			TSharedPtr<SWidget> SlateWidget = ETB_ChatInput->GetCachedWidget();
-			ChatInputSlateWidget = SlateWidget;
+			ChatInputSlateWidget = ETB_ChatInput->GetCachedWidget();
 		}
 		else
 		{
 			// 隐藏输入框并清空内容
 			ETB_ChatInput->SetText(FText::GetEmpty());
 			ETB_ChatInput->SetVisibility(ESlateVisibility::Collapsed);
+			
+			// 退出时，确保交还给游戏
+			if (APlayerController* PC = GetOwningPlayer())
+			{
+				PC->SetInputMode(FInputModeGameOnly());
+				PC->bShowMouseCursor = false;
+			}
 		}
 	}
 }
@@ -135,12 +153,13 @@ void UChatWidget::OnSendClicked()
 
 void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type CommitMethod)
 {
+	// 确保是回车键提交
 	if (CommitMethod == ETextCommit::OnEnter)
 	{
 		FString Message = Text.ToString();
 		if (!Message.IsEmpty())
 		{
-			// 从 PlayerState 获取玩家名称
+			// 从 PlayerState 获取玩家名称 (建议在生产环境做空指针安全检查)
 			FString PlayerName = TEXT("Player");
 			if (APlayerController* PC = GetOwningPlayer())
 			{
@@ -150,24 +169,13 @@ void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type Comm
 				}
 			}
 
-			// 广播消息，由外部（Controller）处理网络发送
+			// 广播消息给业务逻辑层
 			OnChatMessageReady.Broadcast(PlayerName, Message);
-
-			// 本地显示
-			AddChatMessage(PlayerName, Message);
+			
 		}
 
-		// 发送完毕后：清空输入框、退出输入模式、恢复游戏输入
-		if (ETB_ChatInput)
-		{
-			ETB_ChatInput->SetText(FText::GetEmpty());
-		}
+		// 发送完毕后，直接调用统一接口退出输入模式
 		SetInputFocused(false);
-		if (APlayerController* PC = GetOwningPlayer())
-		{
-			PC->SetInputMode(FInputModeGameOnly());
-			PC->bShowMouseCursor = false;
-		}
 	}
 }
 
@@ -175,34 +183,11 @@ FReply UChatWidget::NativeOnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 {
 	const FKey Key = InKeyEvent.GetKey();
 
-	// T 键：切换聊天输入框
-	if (Key == EKeys::T)
+	// 仅处理在输入状态下，按 Escape 退出聊天的逻辑
+	// 注意：激活聊天的逻辑已经剥离到 PlayerController 中！
+	if (Key == EKeys::Escape && bIsInputFocused)
 	{
-		if (!bIsInputFocused)
-		{
-			SetInputFocused(true);
-			// 切换到 GameAndUI 模式，让游戏和 UI 同时接收输入
-			if (APlayerController* PC = GetOwningPlayer())
-			{
-				PC->SetInputMode(FInputModeGameAndUI());
-				PC->bShowMouseCursor = true;
-			}
-		}
-		return FReply::Handled();
-	}
-
-	// Escape 键：关闭聊天输入
-	if (Key == EKeys::Escape)
-	{
-		if (bIsInputFocused)
-		{
-			SetInputFocused(false);
-			if (APlayerController* PC = GetOwningPlayer())
-			{
-				PC->SetInputMode(FInputModeGameOnly());
-				PC->bShowMouseCursor = false;
-			}
-		}
+		SetInputFocused(false);
 		return FReply::Handled();
 	}
 
