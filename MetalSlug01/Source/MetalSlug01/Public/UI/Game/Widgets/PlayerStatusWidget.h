@@ -69,6 +69,10 @@ public:
 
 protected:
 	virtual bool Initialize() override;
+	virtual void NativeConstruct() override;
+
+	// Widget 构造完毕后主动从角色拉取初始数据，解决 UI 创建晚于角色初始化导致的初始值为 0 的问题
+	void PullInitialDataFromCharacter();
 
 private:
 	// ==========================================

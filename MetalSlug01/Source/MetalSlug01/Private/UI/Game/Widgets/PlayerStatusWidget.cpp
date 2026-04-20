@@ -3,6 +3,40 @@
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
 #include "Components/HorizontalBox.h"
+#include "Characters/BaseCharacter.h"
+#include "Kismet/GameplayStatics.h"
+
+void UPlayerStatusWidget::NativeConstruct()
+{
+	Super::NativeConstruct();
+
+	// 主动从角色拉取初始数据，解决 UI 创建晚于角色数据初始化导致的初始值为 0 的问题
+	PullInitialDataFromCharacter();
+}
+
+void UPlayerStatusWidget::PullInitialDataFromCharacter()
+{
+	// 通过 PlayerController 获取当前被操控的角色
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		if (ABaseCharacter* Character = Cast<ABaseCharacter>(PC->GetPawn()))
+		{
+			// 拉取初始 AC 值（此时角色可能在服务端已经初始化过 AC）
+			UpdateACValue(Character->GetAC());
+
+			// 拉取初始 ACE 值
+			UpdateACEValue(Character->GetACE());
+
+			// 拉取初始血量
+			UpdateHealth(Character->GetCurrentHealth(), Character->GetMaxHealth());
+			UpdateHealthText(FMath::CeilToInt(Character->GetCurrentHealth()), FMath::CeilToInt(Character->GetMaxHealth()));
+
+			// 拉取初始能量
+			UpdateEnergy(Character->GetCurrentEnergy(), Character->GetMaxEnergy());
+			UpdateEnergyText(FMath::CeilToInt(Character->GetCurrentEnergy()), FMath::CeilToInt(Character->GetMaxEnergy()));
+		}
+	}
+}
 
 bool UPlayerStatusWidget::Initialize()
 {

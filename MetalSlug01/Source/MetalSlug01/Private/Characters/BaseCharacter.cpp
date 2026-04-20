@@ -232,6 +232,9 @@ void ABaseCharacter::OnRep_ACEValue()
 {
 	if (IsLocallyControlled() && GameHUDWidget)
 	{
+		// 刷新 ACE 数值（独立于排名的更新）
+		GameHUDWidget->UpdateACEValue(ACEValue);
+
 		// ACE 变化时也需要查询排名（因为其他玩家的 ACE 变化也会影响你的排名）
 		RefreshACEWithRank();
 	}
@@ -904,6 +907,12 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
 		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
 		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
+		
+		// 设置初始 AC 值（若尚未初始化，则设为满值）
+		if (ACValue == 0)
+		{
+			ACValue = MaxAC;
+		}
 		GameHUDWidget->UpdateACValue(ACValue);
 		RefreshACEWithRank();
 	}

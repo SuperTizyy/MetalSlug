@@ -112,6 +112,25 @@ protected:
 	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
 	float GetEnergyPercent() const { return (MaxEnergy > 0.0f) ? (CurrentEnergy / MaxEnergy) : 0.0f; }
 
+public:
+	// 获取当前血量（供 UI 直接访问）
+	UFUNCTION(BlueprintCallable, Category = "Stats")
+	float GetCurrentHealth() const { return CurrentHealth; }
+
+	// 获取最大血量（供 UI 直接访问）
+	UFUNCTION(BlueprintCallable, Category = "Stats")
+	float GetMaxHealth() const { return MaxHealth; }
+
+	// 获取当前能量（供 UI 直接访问）
+	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
+	float GetCurrentEnergy() const { return CurrentEnergy; }
+
+	// 获取最大能量（供 UI 直接访问）
+	UFUNCTION(BlueprintCallable, Category = "Stats|Energy")
+	float GetMaxEnergy() const { return MaxEnergy; }
+
+protected:
+
 	// ==========================================
 	// 生命/能量回复系统
 	// ==========================================
