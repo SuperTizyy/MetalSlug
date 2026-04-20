@@ -10,7 +10,7 @@ class ABaseWeapon;
 
 /**
  * 房间大厅的专属 GameMode（只在服务器/房主端运行）
- * 负责管理权威的红蓝队名单，并广播给所有人
+ * 负责管理权威的攻守方名单，并广播给所有人
  */
 UCLASS()
 class METALSLUG01_API ARoomGameMode : public AGameModeBase
@@ -26,7 +26,7 @@ public:
 	void AddPlayerToRoom(AController* RequestingController, const FString& PlayerName);
 	
 	// 处理玩家主动请求换队伍
-	void ChangePlayerTeam(AController* RequestingController, bool bToRedTeam);
+	void ChangePlayerTeam(AController* RequestingController, bool bToAttackTeam);
 	
 	// 处理玩家离开房间
 	void RemovePlayerFromRoom(AController* RequestingController);
@@ -37,7 +37,7 @@ public:
 	void BroadcastSystemMessage(const FString& Message);
 	
 	// 【新增】：添加 AI 玩家
-	void AddAIToRoom(bool bToRedTeam, const FString& CharacterName, int32 Count);
+	void AddAIToRoom(bool bToAttackTeam, const FString& CharacterName, int32 Count);
 	
 	// 【新增】：更新某个人的准备状态并广播
 	void UpdatePlayerReadyState(AController* RequestingController, bool bIsReady);

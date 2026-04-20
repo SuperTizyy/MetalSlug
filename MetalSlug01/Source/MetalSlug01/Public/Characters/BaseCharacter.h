@@ -331,27 +331,67 @@ protected:
 	// AC/ACE系统 (类似CS中的得分系统)
 	// ==========================================
 public:
-	// AC值（总分）
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats|AC")
+	// 最大AC值（蓝图可配置，默认100）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|AC", meta = (ClampMin = "1"))
+	int32 MaxAC = 100;
+
+	// 当前AC值（网络同步）
+	UPROPERTY(ReplicatedUsing = OnRep_ACValue, BlueprintReadOnly, Category = "Stats|AC")
 	int32 ACValue;
 
-	// ACE值（连续获胜回合数）
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats|AC")
+	// ACE值（连续获胜回合数，网络同步）
+	UPROPERTY(ReplicatedUsing = OnRep_ACEValue, BlueprintReadOnly, Category = "Stats|AC")
 	int32 ACEValue;
 
-	// 增加AC
+	// 增加AC值
 	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
 	void AddAC(int32 Amount);
 
-	// 重置ACE
+	// 扣除AC值（用于结算时扣分）
 	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
-	void ResetACE();
+	void TakeAC(int32 Amount);
 
-	// 获取AC值
+	// 重置AC到0（同时重置ACE）
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	void ResetAC();
+
+	// 获取当前AC值
 	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
 	int32 GetAC() const { return ACValue; }
+
+	// 获取最大AC值
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	int32 GetMaxAC() const { return MaxAC; }
+
+	// 获取AC百分比（0.0~1.0）
+	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
+	float GetACPercent() const { return MaxAC > 0 ? static_cast<float>(ACValue) / static_cast<float>(MaxAC) : 0.0f; }
 
 	// 获取ACE值
 	UFUNCTION(BlueprintCallable, Category = "Stats|AC")
 	int32 GetACE() const { return ACEValue; }
+
+	// 根据当前 PlayerState 的 SelectedCharacterID，从 CharacterDataTable 查出头像并刷新 HUD
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
+	void RefreshCharacterIcon();
+
+	// 查询当前 ACE 排名并刷新 HUD 上的 ACE 文字颜色
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
+	void RefreshACEWithRank();
+
+private:
+	// HUD 还未就绪时延迟刷新的辅助方法
+	void RetryRefreshHUD();
+
+protected:
+	// 从 CharacterDataTable 查指定角色 ID 的头像贴图
+	class UTexture2D* GetCharacterAvatarFromTable(const FString& CharID);
+
+protected:
+	// AC/ACE 改变时的回调（网络复制通知）
+	UFUNCTION()
+	void OnRep_ACValue();
+
+	UFUNCTION()
+	void OnRep_ACEValue();
 };

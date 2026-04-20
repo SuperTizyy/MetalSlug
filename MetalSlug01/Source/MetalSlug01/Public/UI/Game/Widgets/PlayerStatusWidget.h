@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "PlayerStatusWidget.generated.h"
 
 class UProgressBar;
@@ -43,6 +44,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void UpdateACEValue(int32 Value);
 
+	// 更新ACE值并根据排名设置文字颜色
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
+	void SetACEValueWithRank(int32 Value, EACERankType RankType);
+
 	// 更新角色图标
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void UpdateCharacterIcon(UTexture2D* Icon);
@@ -54,6 +59,13 @@ public:
 	// 设置技能冷却状态
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void SetSkillCooldown(int32 SkillIndex, float CooldownPercent);
+
+	// ==========================================
+	// AC 图标变色接口
+	// ==========================================
+	// 根据 AC 值查表得到对应颜色并应用
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
+	void RefreshACIconColor(int32 CurrentAC);
 
 protected:
 	virtual bool Initialize() override;

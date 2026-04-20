@@ -93,6 +93,44 @@ void UPlayerStatusWidget::UpdateACValue(int32 Value)
 	{
 		Text_ACValue->SetText(FText::AsNumber(Value));
 	}
+
+	// AC 值变化时同步刷新防护服图标颜色
+	RefreshACIconColor(Value);
+}
+
+void UPlayerStatusWidget::RefreshACIconColor(int32 CurrentAC)
+{
+	if (!Image_ACIcon)
+	{
+		return;
+	}
+
+	FLinearColor IconColor;
+
+	// AC 值越高，防护服越亮（蓝白色）；AC 值越低，防护服越暗（红黑色）
+	// 分档：0-25 低 / 26-50 中 / 51-75 良好 / 76+ 最佳
+	if (CurrentAC >= 76)
+	{
+		// 最佳状态：明亮的蓝白色（防护服完好）
+		IconColor = FLinearColor(0.6f, 0.85f, 1.0f, 1.0f);
+	}
+	else if (CurrentAC >= 51)
+	{
+		// 良好状态：黄色（防护服轻微受损）
+		IconColor = FLinearColor(1.0f, 0.9f, 0.2f, 1.0f);
+	}
+	else if (CurrentAC >= 26)
+	{
+		// 中等状态：橙色（防护服明显受损）
+		IconColor = FLinearColor(1.0f, 0.55f, 0.1f, 1.0f);
+	}
+	else
+	{
+		// 危急状态：深红色（防护服濒临崩溃）
+		IconColor = FLinearColor(0.9f, 0.1f, 0.1f, 1.0f);
+	}
+
+	Image_ACIcon->SetColorAndOpacity(IconColor);
 }
 
 void UPlayerStatusWidget::UpdateACEValue(int32 Value)
@@ -100,7 +138,34 @@ void UPlayerStatusWidget::UpdateACEValue(int32 Value)
 	if (Text_ACEValue)
 	{
 		Text_ACEValue->SetText(FText::AsNumber(Value));
+		Text_ACEValue->SetColorAndOpacity(FLinearColor::White);
 	}
+}
+
+void UPlayerStatusWidget::SetACEValueWithRank(int32 Value, EACERankType RankType)
+{
+	if (!Text_ACEValue)
+	{
+		return;
+	}
+
+	Text_ACEValue->SetText(FText::AsNumber(Value));
+
+	FLinearColor TextColor;
+	switch (RankType)
+	{
+	case EACERankType::Gold:
+		TextColor = FLinearColor(1.0f, 0.85f, 0.2f, 1.0f); // 金色
+		break;
+	case EACERankType::White:
+		TextColor = FLinearColor(1.0f, 1.0f, 1.0f, 1.0f); // 白色
+		break;
+	default:
+		TextColor = FLinearColor(0.5f, 0.5f, 0.5f, 1.0f); // 灰色（无ACE时）
+		break;
+	}
+
+	Text_ACEValue->SetColorAndOpacity(TextColor);
 }
 
 void UPlayerStatusWidget::UpdateCharacterIcon(UTexture2D* Icon)

@@ -67,6 +67,14 @@ public:
 	// 因为数据分散在每个人自己的 PlayerState 里了，所以我们需要遍历查询
 	UFUNCTION(BlueprintCallable, Category = "Room|Query")
 	TArray<class ARoomPlayerState*> GetPlayersInTeam(ERoomTeam TargetTeam) const;
+
+	// 查询指定队伍中 AC 最高的玩家的 PlayerState（忽略死亡或无pawn的玩家）
+	UFUNCTION(BlueprintCallable, Category = "Room|Query")
+	class ARoomPlayerState* GetTeamTopACPlayer(ERoomTeam TargetTeam) const;
+
+	// 查询全场所有玩家中 AC 最高的玩家的 PlayerState（忽略死亡或无pawn的玩家）
+	UFUNCTION(BlueprintCallable, Category = "Room|Query")
+	class ARoomPlayerState* GetOverallTopACPlayer() const;
 	
 	// 记录当前房间的房主名称，全服同步！
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Global")

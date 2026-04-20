@@ -143,15 +143,15 @@ void ARoomPlayerController::Client_EnterBattleState_Implementation()
 
 
 // 验证函数直接返回 true
-bool ARoomPlayerController::Server_RequestChangeTeam_Validate(bool bToRedTeam) { return true; }
+bool ARoomPlayerController::Server_RequestChangeTeam_Validate(bool bToAttackTeam) { return true; }
 
 // 2. 切换队伍
-void ARoomPlayerController::Server_RequestChangeTeam_Implementation(bool bToRedTeam)
+void ARoomPlayerController::Server_RequestChangeTeam_Implementation(bool bToAttackTeam)
 {
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		// 【修复】：传递 this
-		GM->ChangePlayerTeam(this, bToRedTeam);
+		GM->ChangePlayerTeam(this, bToAttackTeam);
 	}
 }
 
@@ -285,9 +285,9 @@ void ARoomPlayerController::Client_ReceiveChatMessage_Implementation(const FStri
 // ----------------------------------------------------
 // 【新增】处理添加 AI 请求
 // ----------------------------------------------------
-bool ARoomPlayerController::Server_AddAI_Validate(bool bToRedTeam, const FString& CharacterName, int32 Count) { return true; }
+bool ARoomPlayerController::Server_AddAI_Validate(bool bToAttackTeam, const FString& CharacterName, int32 Count) { return true; }
 
-void ARoomPlayerController::Server_AddAI_Implementation(bool bToRedTeam, const FString& CharacterName, int32 Count)
+void ARoomPlayerController::Server_AddAI_Implementation(bool bToAttackTeam, const FString& CharacterName, int32 Count)
 {
 	// 只有房主才有权限加 AI
 	if (!HasAuthority()) return;
@@ -295,7 +295,7 @@ void ARoomPlayerController::Server_AddAI_Implementation(bool bToRedTeam, const F
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		// 让 GameMode 去处理具体的添加逻辑
-		GM->AddAIToRoom(bToRedTeam, CharacterName, Count);
+		GM->AddAIToRoom(bToAttackTeam, CharacterName, Count);
 	}
 }
 

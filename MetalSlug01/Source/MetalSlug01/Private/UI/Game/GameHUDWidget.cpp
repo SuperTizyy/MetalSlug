@@ -134,3 +134,35 @@ void UGameHUDWidget::OnMatchModeChangedForHUD(ERoomMatchMode NewMode)
 		Widget_MatchInfo->SetVisibilityByMode(NewMode);
 	}
 }
+
+void UGameHUDWidget::UpdateACValue(int32 Value)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateACValue(Value);
+	}
+}
+
+void UGameHUDWidget::UpdateACEValue(int32 Value)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateACEValue(Value);
+	}
+}
+
+void UGameHUDWidget::UpdateACEWithRank(int32 Value, EACERankType RankType)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->SetACEValueWithRank(Value, RankType);
+	}
+}
+
+void UGameHUDWidget::UpdateCharacterIcon(UTexture2D* Icon)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateCharacterIcon(Icon);
+	}
+}

@@ -56,11 +56,11 @@ void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FSt
 		// 智能分配算法：向 GameState 查询目前哪边人少？
 		if (ARoomGameState* GS = GetGameState<ARoomGameState>())
 		{
-			int32 RedCount = GS->GetPlayersInTeam(ERoomTeam::Red).Num();
-			int32 BlueCount = GS->GetPlayersInTeam(ERoomTeam::Blue).Num();
+			int32 AttackCount = GS->GetPlayersInTeam(ERoomTeam::Attack).Num();
+			int32 DefenseCount = GS->GetPlayersInTeam(ERoomTeam::Defense).Num();
 			
 			// 修改队伍，引擎会自动将这个改动广播给全服！
-			PS->CurrentTeam = (RedCount <= BlueCount) ? ERoomTeam::Red : ERoomTeam::Blue;
+			PS->CurrentTeam = (AttackCount <= DefenseCount) ? ERoomTeam::Attack : ERoomTeam::Defense;
 		}
 	}
 	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】加入了房间"), *PlayerName));
@@ -69,13 +69,13 @@ void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FSt
 // ==========================================
 // 切换队伍逻辑
 // ==========================================
-void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bToRedTeam)
+void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bToAttackTeam)
 {
 	// 不再按名字去找，直接获取发请求的那个人的 PlayerState
 	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
 		// 服务器直接修改它的值
-		PS->CurrentTeam = bToRedTeam ? ERoomTeam::Red : ERoomTeam::Blue;
+		PS->CurrentTeam = bToAttackTeam ? ERoomTeam::Attack : ERoomTeam::Defense;
 		
 		// 只要改了这行代码，UE 引擎底层会自动在下一个 Tick 将这个变量打包，
 		// 顺着网线发给房间里所有的客户端，并触发他们本地的 OnRep_Team()！
@@ -134,7 +134,7 @@ void ARoomGameMode::BroadcastSystemMessage(const FString& Message)
 // ----------------------------------------------------
 // 给 AI 发放唯一身份证并加入名单
 // ----------------------------------------------------
-void ARoomGameMode::AddAIToRoom(bool bToRedTeam, const FString& CharacterName, int32 Count)
+void ARoomGameMode::AddAIToRoom(bool bToAttackTeam, const FString& CharacterName, int32 Count)
 {
 	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Yellow, TEXT("注意：AI 添加逻辑将在 PlayerState 彻底接管后重构！"));
 	// 真正的工业级做法是：直接在这里 Spawn 一个带有 PlayerState 的 AIController。

@@ -26,7 +26,7 @@ public:
 
 	// 客户端请求服务器添加 AI
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_AddAI(bool bToRedTeam, const FString& CharacterName, int32 Count);
+	void Server_AddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count);
 	
 	// 【新增】：记住这个对讲机代表的玩家名字（服务器端需要用它）
 	UPROPERTY()
@@ -54,9 +54,9 @@ public:
 	// 延迟发送玩家信息，避开网络抢跑期
 	void DelayedSendPlayerInfo();
 	
-	// 【新增】：向服务器请求换队伍 (true=去红队, false=去蓝队)
+	// 【新增】：向服务器请求换队伍 (true=去攻方, false=去守方)
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_RequestChangeTeam(bool bToRedTeam);
+	void Server_RequestChangeTeam(bool bToAttackTeam);
 	
 	// 【新增】：UI 按钮调用的本地退出逻辑
 	UFUNCTION(BlueprintCallable, Category = "RoomUI")

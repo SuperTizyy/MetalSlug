@@ -22,9 +22,9 @@ enum class ERoomState : uint8
 UENUM(BlueprintType)
 enum class ERoomTeam : uint8
 {
-	None UMETA(DisplayName = "未分配"),
-	Red  UMETA(DisplayName = "红队"),
-	Blue UMETA(DisplayName = "蓝队")
+	None    UMETA(DisplayName = "未分配"),
+	Attack  UMETA(DisplayName = "攻方"),
+	Defense UMETA(DisplayName = "守方")
 };
 
 /** * @enum ERoomMatchMode
@@ -131,4 +131,15 @@ struct FMapInfoRow : public FTableRowBase
 	// 4. (可选) 地图描述、最大支持人数等
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
 	FText MapDescription;
+};
+
+// ==========================================
+// ACE 排名类型枚举（决定 HUD 上 ACE 文字颜色）
+// ==========================================
+UENUM(BlueprintType)
+enum class EACERankType : uint8
+{
+	None    UMETA(DisplayName = "无ACE（不显示金色或白色）"),
+	White   UMETA(DisplayName = "队内第一（白色）"),
+	Gold    UMETA(DisplayName = "全场第一（金色）")
 };

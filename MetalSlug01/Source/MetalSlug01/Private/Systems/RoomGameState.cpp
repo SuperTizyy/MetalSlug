@@ -2,6 +2,7 @@
 
 #include "Net/UnrealNetwork.h"
 #include "UI/Login/Core/RoomPlayerState.h"
+#include "Characters/BaseCharacter.h"
 
 ARoomGameState::ARoomGameState()
 {
@@ -26,6 +27,63 @@ TArray<ARoomPlayerState*> ARoomGameState::GetPlayersInTeam(ERoomTeam TargetTeam)
 	}
 
 	return TeamMembers;
+}
+
+ARoomPlayerState* ARoomGameState::GetTeamTopACPlayer(ERoomTeam TargetTeam) const
+{
+	ARoomPlayerState* TopPlayer = nullptr;
+	int32 TopAC = -1;
+
+	for (APlayerState* PS : PlayerArray)
+	{
+		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
+		{
+			if (RoomPS->CurrentTeam != TargetTeam)
+			{
+				continue;
+			}
+
+			ABaseCharacter* Char = Cast<ABaseCharacter>(RoomPS->GetPawn());
+			if (!Char || Char->GetIsDead())
+			{
+				continue;
+			}
+
+			if (Char->GetAC() > TopAC)
+			{
+				TopAC = Char->GetAC();
+				TopPlayer = RoomPS;
+			}
+		}
+	}
+
+	return TopPlayer;
+}
+
+ARoomPlayerState* ARoomGameState::GetOverallTopACPlayer() const
+{
+	ARoomPlayerState* TopPlayer = nullptr;
+	int32 TopAC = -1;
+
+	for (APlayerState* PS : PlayerArray)
+	{
+		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
+		{
+			ABaseCharacter* Char = Cast<ABaseCharacter>(RoomPS->GetPawn());
+			if (!Char || Char->GetIsDead())
+			{
+				continue;
+			}
+
+			if (Char->GetAC() > TopAC)
+			{
+				TopAC = Char->GetAC();
+				TopPlayer = RoomPS;
+			}
+		}
+	}
+
+	return TopPlayer;
 }
 
 void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const

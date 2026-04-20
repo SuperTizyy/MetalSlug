@@ -10,10 +10,13 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "TimerManager.h" // 为了使用定时器
 #include "Weapons/BaseWeapon.h"
-#include "UI/Game/GameHUDWidget.h"
-#include "Kismet/GameplayStatics.h"
-#include "Systems/RoomGameMode.h"
+#include "UI/MyGameHUD.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/RoomGameState.h"
+#include "Systems/RoomGameMode.h"
+#include "Kismet/GameplayStatics.h"
+#include "UI/Game/GameHUDWidget.h"
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -57,6 +60,7 @@ ABaseCharacter::ABaseCharacter()
 	CurrentEnergy = MaxEnergy;
 
 	// 初始化AC/ACE系统
+	MaxAC = 100;
 	ACValue = 0;
 	ACEValue = 0;
 
@@ -188,6 +192,7 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 同步能量值
 	DOREPLIFETIME(ABaseCharacter, CurrentEnergy);
 	// 同步AC/ACE值
+	DOREPLIFETIME(ABaseCharacter, MaxAC);
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
 }
@@ -210,6 +215,132 @@ void ABaseCharacter::OnRep_Energy()
 		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
 		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
 	}
+}
+
+void ABaseCharacter::OnRep_ACValue()
+{
+	if (IsLocallyControlled() && GameHUDWidget)
+	{
+		GameHUDWidget->UpdateACValue(ACValue);
+
+		// AC 变化时重新查询排名并刷新 ACE 颜色
+		RefreshACEWithRank();
+	}
+}
+
+void ABaseCharacter::OnRep_ACEValue()
+{
+	if (IsLocallyControlled() && GameHUDWidget)
+	{
+		// ACE 变化时也需要查询排名（因为其他玩家的 ACE 变化也会影响你的排名）
+		RefreshACEWithRank();
+	}
+}
+
+void ABaseCharacter::RefreshCharacterIcon()
+{
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
+
+	if (!GameHUDWidget)
+	{
+		return;
+	}
+
+	// 1. 从 PlayerState 获取当前选中的角色 ID
+	FString CharID;
+	if (APlayerState* PS = GetPlayerState<APlayerState>())
+	{
+		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
+		{
+			CharID = RoomPS->GetSelectedCharacterID();
+		}
+	}
+
+	if (CharID.IsEmpty())
+	{
+		CharID = TEXT("Warrior"); // 兜底默认角色
+	}
+
+	// 2. 从 RoomGameMode 的 CharacterDataTable 查出头像
+	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(CharID))
+	{
+		if (GameHUDWidget)
+		{
+			GameHUDWidget->UpdateCharacterIcon(Avatar);
+		}
+	}
+}
+
+UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
+{
+	if (CharID.IsEmpty()) return nullptr;
+
+	// 通过 GameMode 获取数据表
+	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
+	if (!GM || !GM->CharacterDataTable) return nullptr;
+
+	static const FString ContextString(TEXT("CharacterAvatarLookup"));
+	FCharacterInfo* Info = GM->CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharID), ContextString);
+	if (Info && Info->AvatarIcon)
+	{
+		return Info->AvatarIcon;
+	}
+
+	return nullptr;
+}
+
+void ABaseCharacter::RefreshACEWithRank()
+{
+	if (!IsLocallyControlled() || !GameHUDWidget)
+	{
+		return;
+	}
+
+	// 1. 获取自己的 RoomPlayerState
+	ARoomPlayerState* MyPS = nullptr;
+	if (APlayerState* PS = GetPlayerState<APlayerState>())
+	{
+		MyPS = Cast<ARoomPlayerState>(PS);
+	}
+	if (!MyPS)
+	{
+		return;
+	}
+
+	// 2. 获取 GameState 查询排名
+	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
+	if (!GS)
+	{
+		return;
+	}
+
+	// 3. 获取我的队伍
+	ERoomTeam MyTeam = MyPS->CurrentTeam;
+
+	// 4. 查询队内 AC 最高者
+	ARoomPlayerState* TeamTop = GS->GetTeamTopACPlayer(MyTeam);
+
+	// 5. 查询全场 AC 最高者
+	ARoomPlayerState* OverallTop = GS->GetOverallTopACPlayer();
+
+	// 6. 确定 ACE 排名类型
+	EACERankType RankType = EACERankType::None;
+
+	// 优先判断是否是全场第一（金色），因为"全场第一"优先级高于"队内第一"
+	if (OverallTop && OverallTop == MyPS)
+	{
+		RankType = EACERankType::Gold;
+	}
+	else if (TeamTop && TeamTop == MyPS)
+	{
+		RankType = EACERankType::White;
+	}
+
+	// 7. 刷新 HUD（数字用 ACEValue，排名决定颜色）
+	GameHUDWidget->UpdateACEWithRank(ACEValue, RankType);
 }
 
 bool ABaseCharacter::ConsumeEnergy(float Amount)
@@ -256,29 +387,33 @@ void ABaseCharacter::OnKill(ABaseCharacter* KilledCharacter)
 	AddEnergy(EnergyRewardPerKill);
 	CurrentHealth = FMath::Clamp(CurrentHealth + HealthRewardPerKill, 0.0f, MaxHealth);
 
-	// 增加AC
+	// 增加AC（AddAC 内部已 Clamp 到 MaxAC）
 	AddAC(1);
-
-	// 增加连杀数（如果有HUD的话可以在这里更新）
-	if (IsLocallyControlled() && GameHUDWidget)
-	{
-		// TODO: 增加连杀计数
-	}
 }
 
 void ABaseCharacter::AddAC(int32 Amount)
 {
 	if (HasAuthority())
 	{
-		ACValue += Amount;
-		ACEValue += Amount; // ACE也同时增加
+		ACValue = FMath::Clamp(ACValue + Amount, 0, MaxAC);
+		// ACE 代表连续击杀，每次击杀都 +1
+		ACEValue += Amount;
 	}
 }
 
-void ABaseCharacter::ResetACE()
+void ABaseCharacter::TakeAC(int32 Amount)
 {
 	if (HasAuthority())
 	{
+		ACValue = FMath::Clamp(ACValue - Amount, 0, MaxAC);
+	}
+}
+
+void ABaseCharacter::ResetAC()
+{
+	if (HasAuthority())
+	{
+		ACValue = 0;
 		ACEValue = 0;
 	}
 }
@@ -615,6 +750,12 @@ void ABaseCharacter::Multicast_Die_Implementation()
 {
 	// 【所有人都会执行这个函数，包括发起死亡的服务器和所有客户端】
 	bIsDead = true;
+
+	// 死亡时重置AC和ACE（HasAuthority确保只在服务器执行，避免重复复制冲突）
+	if (HasAuthority())
+	{
+		ResetAC();
+	}
 	
 	// ==========================================
     // 【终极重构】：武器脱手掉落系统
@@ -747,12 +888,62 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
 
+	// 通过 PlayerController 获取 HUD 实例并缓存
+	if (APlayerController* PC = Cast<APlayerController>(NewController))
+	{
+		if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
+		{
+			GameHUDWidget = HUD->GetGameHUDWidget();
+		}
+	}
+
+	if (GameHUDWidget && GameHUDWidget->GetWidget_PlayerStatus())
+	{
+		// 初始化时刷新一次当前值（解决 HUD 显示时初始值不刷新的问题）
+		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
+		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
+		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
+		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
+		GameHUDWidget->UpdateACValue(ACValue);
+		RefreshACEWithRank();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] HUD 或 Widget_PlayerStatus 未就绪，延迟刷新。GameHUDWidget=%s, Widget_PlayerStatus=%s"),
+			*GetNameSafe(GameHUDWidget),
+			GameHUDWidget ? TEXT("NULL") : TEXT("GameHUDWidget NULL"));
+
+		// HUD 还未完全初始化（Widget_PlayerStatus BindWidget 失败），延迟重试
+		FTimerHandle DummyHandle;
+		GetWorld()->GetTimerManager().SetTimer(DummyHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
+	}
+
+	// 刷新角色头像（仅本地玩家需要）
+	RefreshCharacterIcon();
+
 	// 仅在服务器执行
 	if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
 	{
-		//使用新的 Getter 方法获取一号位武器
 		SpawnAndEquipWeapon(PS->GetSelectedWeapon1ID());
 	}
+}
+
+void ABaseCharacter::RetryRefreshHUD()
+{
+	if (!GameHUDWidget || !GameHUDWidget->GetWidget_PlayerStatus())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] HUD 刷新成功"));
+	GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
+	GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
+	GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
+	GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
+	GameHUDWidget->UpdateACValue(ACValue);
+	RefreshACEWithRank();
 }
 
 void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)

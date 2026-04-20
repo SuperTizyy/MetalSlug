@@ -65,9 +65,29 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void UpdateRemainingRoundsText(int32 RemainingRounds);
 
+	// 更新AC值
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateACValue(int32 Value);
+
+	// 更新ACE值
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateACEValue(int32 Value);
+
+	// 更新ACE值并根据排名设置文字颜色（白=队内第一，金=全场第一）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateACEWithRank(int32 Value, EACERankType RankType);
+
+	// 更新角色图标
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateCharacterIcon(UTexture2D* Icon);
+
 	// 根据游戏模式切换 Text_RemainingRounds 的可见性
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void OnMatchModeChangedForHUD(ERoomMatchMode NewMode);
+
+	// 获取玩家状态Widget（供其他类安全访问）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	UPlayerStatusWidget* GetWidget_PlayerStatus() { return Widget_PlayerStatus; }
 
 protected:
 	// 尝试绑定到 GameState（带重试逻辑，解决时序问题）

@@ -9,7 +9,7 @@ class UTextBlock;
 class UButton;
 
 /**
- * 房间内的单个玩家条目 UI（用于显示在红蓝队伍列表中）
+ * 房间内的单个玩家条目 UI（用于显示在攻守方队伍列表中）
  */
 UCLASS()
 class METALSLUG01_API UPlayerLabelWidget : public UUserWidget
