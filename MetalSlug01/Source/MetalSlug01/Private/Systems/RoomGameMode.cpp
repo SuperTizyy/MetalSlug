@@ -496,7 +496,11 @@ void ARoomGameMode::PerformGameStart()
 	// 1. 更新房间状态
 	CurrentRoomState = ERoomState::BattleInProgress;
 
-	// 2. 下发 Client RPC 给所有客户端，让他们立刻切 UI（进入阶段三）
+	// 2. 【核心更新】：先开启倒计时，把 MatchRemainingTime 同步到所有客户端
+	//    这样当 Client_TransitToMatchState 触发 HUD 显示时，值已经是正确的了
+	StartMatchTimer();
+
+	// 3. 下发 Client RPC 给所有客户端，让他们立刻切 UI（此时倒计时已经广播完毕）
 	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 	{
 		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
@@ -506,9 +510,9 @@ void ARoomGameMode::PerformGameStart()
 		}
 	}
 
-	// 3. 【核心更新】：开启服务器倒计时，延迟生成角色，给客户端 UI 切换留出时间
+	// 4. 延迟生成角色，给客户端 UI 切换留出时间
 	BroadcastSystemMessage(FString::Printf(TEXT("游戏将在 %.1f 秒后开始..."), MatchStartDelay));
-	
+
 	GetWorld()->GetTimerManager().SetTimer(
 		MatchStartTimerHandle,
 		this,
@@ -555,4 +559,132 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 	}
 
 	BroadcastSystemMessage(TEXT("战斗开始！"));
+}
+
+void ARoomGameMode::StartMatchTimer()
+{
+	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
+	if (!RoomGS) return;
+
+	// 先通知 UI 当前是什么模式，让 MatchInfoWidget 决定 Text_RemainingRounds 的显示/隐藏
+	RoomGS->OnMatchModeChanged.Broadcast(RoomGS->CurrentMatchMode);
+
+	// 根据当前模式设置初始时间（转换为秒）
+	switch (RoomGS->CurrentMatchMode)
+	{
+	case ERoomMatchMode::Melee:
+		RoomGS->MatchRemainingTime = 30 * 60; // 30分钟 = 1800秒
+		RoomGS->CurrentRound = 0; // 刀战只有一整局，不显示回合数
+		break;
+	case ERoomMatchMode::Zombie:
+		RoomGS->MatchRemainingTime = 10 * 60; // 10分钟 = 600秒
+		RoomGS->CurrentRound = ZombieTotalRounds; // 初始化为总回合数，每回合结束后递减
+		break;
+	default:
+		RoomGS->MatchRemainingTime = 0;
+		RoomGS->CurrentRound = 0;
+		break;
+	}
+
+	// 服务器广播初始值（本地房主/单机时也要触发 OnRep）
+	RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+	RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
+
+	// 启动一个1秒执行一次的循环定时器
+	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ARoomGameMode::OnMatchTimerTick, 1.0f, true);
+}
+
+void ARoomGameMode::OnMatchTimerTick()
+{
+	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
+	if (!RoomGS) return;
+
+	// 扣减时间
+	RoomGS->MatchRemainingTime--;
+
+	// 服务器本地通知UI（客户端会通过 OnRep_MatchRemainingTime 自动通知）
+	if (GetNetMode() != NM_DedicatedServer)
+	{
+		RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+	}
+
+	// 检查是否倒计时结束
+	if (RoomGS->MatchRemainingTime <= 0)
+	{
+		// 停止计时器
+		GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+		
+		// 触发超时结算逻辑
+		HandleMatchTimeOut();
+	}
+}
+
+void ARoomGameMode::HandleMatchTimeOut()
+{
+	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
+	if (!RoomGS) return;
+
+	// 停止计时器
+	GetWorldTimerManager().ClearTimer(MatchTimerHandle);
+
+	UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] Match Time Out! Mode: %d"), (int32)RoomGS->CurrentMatchMode);
+
+	if (RoomGS->CurrentMatchMode == ERoomMatchMode::Melee)
+	{
+		// 刀战模式：直接结束一整局游戏
+		UE_LOG(LogTemp, Log, TEXT("刀战模式结束，准备进入全局结算..."));
+		BroadcastSystemMessage(TEXT("刀战模式结束！"));
+		// TODO: 调用结算接口，例如通知 GameFlowSubsystem 切换到 PostBattle 状态
+	}
+	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
+	{
+		// 生化模式：回合结束处理
+		HandleZombieRoundEnd();
+	}
+}
+
+void ARoomGameMode::HandleZombieRoundEnd()
+{
+	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
+	if (!RoomGS) return;
+
+	RoomGS->CurrentRound--;
+	RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
+
+	if (RoomGS->CurrentRound <= 0)
+	{
+		// 所有回合结束，整局游戏结束
+		UE_LOG(LogTemp, Log, TEXT("生化模式全部 %d 回合结束，准备进入全局结算..."), ZombieTotalRounds);
+		BroadcastSystemMessage(FString::Printf(TEXT("生化模式结束！共 %d 回合！"), ZombieTotalRounds));
+		// TODO: 调用结算接口
+	}
+	else
+	{
+		// 还有剩余回合，等待 StartNextZombieRound 被调用
+		BroadcastSystemMessage(FString::Printf(TEXT("第 %d/%d 回合结束！"), ZombieTotalRounds - RoomGS->CurrentRound, ZombieTotalRounds));
+	}
+}
+
+void ARoomGameMode::StartNextZombieRound()
+{
+	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
+	if (!RoomGS || RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie) return;
+
+	if (RoomGS->CurrentRound <= 0)
+	{
+		// 已经全部结束，不再开始新回合
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] Starting next zombie round. Round=%d"), RoomGS->CurrentRound);
+	BroadcastSystemMessage(FString::Printf(TEXT("第 %d/%d 回合开始！"), ZombieTotalRounds - RoomGS->CurrentRound + 1, ZombieTotalRounds));
+
+	// 重置每回合时间
+	RoomGS->MatchRemainingTime = 10 * 60;
+	RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+
+	// TODO: 重置玩家位置、复活等场景清理工作...
+
+	// 重新启动定时器
+	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ARoomGameMode::OnMatchTimerTick, 1.0f, true);
 }

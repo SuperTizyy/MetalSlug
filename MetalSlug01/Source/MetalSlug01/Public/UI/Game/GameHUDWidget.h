@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "GameHUDWidget.generated.h"
 
 class UWidgetSwitcher;
@@ -24,6 +25,13 @@ class METALSLUG01_API UGameHUDWidget : public UUserWidget
 public:
 	// 初始化UI绑定
 	virtual bool Initialize() override;
+
+	// Widget 构造完毕并加入视口后调用，最适合做订阅绑定
+	virtual void NativeConstruct() override;
+
+	// ==========================================
+	// 公开接口（可被其他类调用）
+	// ==========================================
 
 	// 公开接口：刷新玩家血量
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
@@ -53,7 +61,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void ShowKillIcon();
 
+	// 更新倒计时文本的接口
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateRemainingTimeText(int32 RemainingSeconds);
+
+	// 更新剩余局数文本的接口
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void UpdateRemainingRoundsText(int32 RemainingRounds);
+
+	// 根据游戏模式切换 Text_RemainingRounds 的可见性
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void OnMatchModeChangedForHUD(ERoomMatchMode NewMode);
+
 protected:
+	// 尝试绑定到 GameState（带重试逻辑，解决时序问题）
+	void TryBindToGameState();
+
 	// ==========================================
 	// UI组件绑定
 	// ==========================================

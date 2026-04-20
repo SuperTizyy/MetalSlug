@@ -141,6 +141,14 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
 	float MatchStartDelay = 3.0f;
 
+	// 总局数（每边达到这个胜局数时比赛结束）
+	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
+	int32 TotalRounds = 10;
+
+	// 生化模式总回合数
+	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
+	int32 ZombieTotalRounds = 5;
+
 	/**
 	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色
 	 */
@@ -156,5 +164,26 @@ protected:
 	};
 	// Key = PlayerState unique ID (GetUniqueID())，确保每个玩家独立
 	TMap<uint32, FPlayerSpawnData> PlayerSpawnDataCache;
+	
+	// 比赛计时器句柄
+	FTimerHandle MatchTimerHandle;
+
+public:
+	// 核心函数：根据模式初始化并开启倒计时
+	void StartMatchTimer();
+
+	// 核心函数：每秒触发一次，扣减时间
+	UFUNCTION()
+	void OnMatchTimerTick();
+
+	// 核心函数：处理时间耗尽的宏观逻辑（结束本局或进下一回合）
+	void HandleMatchTimeOut();
+
+	// 生化模式回合结束处理
+	void HandleZombieRoundEnd();
+
+	// 生化模式进入下一回合
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Match")
+	void StartNextZombieRound();
 
 };

@@ -27,6 +27,17 @@ enum class ERoomTeam : uint8
 	Blue UMETA(DisplayName = "蓝队")
 };
 
+/** * @enum ERoomMatchMode
+ * @brief 房间比赛模式枚举 
+ */
+UENUM(BlueprintType)
+enum class ERoomMatchMode : uint8
+{
+	None		UMETA(DisplayName = "None"),
+	Melee		UMETA(DisplayName = "刀战模式"), // 30分钟
+	Zombie		UMETA(DisplayName = "生化模式")  // 10分钟
+};
+
 // ==========================================
 // 角色信息配置表 (Data-Driven 核心底座)
 // ==========================================

@@ -5,7 +5,8 @@
 
 ARoomGameState::ARoomGameState()
 {
-	// 暂无特殊初始化
+	// 确保GameState本身开启同步
+	bReplicates = true;
 }
 
 TArray<ARoomPlayerState*> ARoomGameState::GetPlayersInTeam(ERoomTeam TargetTeam) const
@@ -30,5 +31,21 @@ TArray<ARoomPlayerState*> ARoomGameState::GetPlayersInTeam(ERoomTeam TargetTeam)
 void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-	DOREPLIFETIME(ARoomGameState, HostPlayerName); // 别忘了加这行！
+
+	// 注册同步变量
+	DOREPLIFETIME(ARoomGameState, CurrentMatchMode);
+	DOREPLIFETIME(ARoomGameState, MatchRemainingTime);
+	DOREPLIFETIME(ARoomGameState, HostPlayerName);
+	DOREPLIFETIME(ARoomGameState, CurrentRound);
+}
+
+void ARoomGameState::OnRep_MatchRemainingTime()
+{
+	// 当客户端收到服务器同步的最新的倒计时后，广播给 UI 刷新文本
+	OnMatchTimeUpdated.Broadcast(MatchRemainingTime);
+}
+
+void ARoomGameState::OnRep_CurrentRound()
+{
+	OnCurrentRoundUpdated.Broadcast(CurrentRound);
 }

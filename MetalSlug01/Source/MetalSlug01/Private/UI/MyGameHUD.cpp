@@ -1,6 +1,7 @@
 #include "UI/MyGameHUD.h"
 #include "Blueprint/UserWidget.h"
 #include "Systems/GameFlowSubsystem.h"
+#include "Systems/RoomGameState.h"
 #include "UI/Game/GameHUDWidget.h"
 
 void AMyGameHUD::BeginPlay()
@@ -85,6 +86,8 @@ void AMyGameHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
 // ==========================================
 void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 {
+	UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] OnGameFlowStateChanged called: NewState=%d"), (int32)NewState);
+
 	// 【架构重构】：HUD 只负责 UI 元素的展示与隐藏。
 	// 已将鼠标控制权交还给 PlayerController，避免代码职责互相覆盖。
 
@@ -92,8 +95,27 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 	{
 		if (GameHUDWidget)
 		{
+			UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] Setting HUD visible..."));
+
 			// 规范：使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
 			GameHUDWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+
+			// 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
+			if (UWorld* World = GetWorld())
+			{
+				if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+				{
+					UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] Refreshing HUD: Time=%d, Round=%d, Mode=%d"),
+						RoomGS->MatchRemainingTime, RoomGS->CurrentRound, (int32)RoomGS->CurrentMatchMode);
+					GameHUDWidget->UpdateRemainingTimeText(RoomGS->MatchRemainingTime);
+					GameHUDWidget->UpdateRemainingRoundsText(RoomGS->CurrentRound);
+					GameHUDWidget->OnMatchModeChangedForHUD(RoomGS->CurrentMatchMode);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] RoomGameState is NULL when refreshing HUD!"));
+				}
+			}
 		}
 		
 		if (CrosshairWidget)

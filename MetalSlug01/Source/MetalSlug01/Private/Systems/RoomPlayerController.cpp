@@ -1,6 +1,7 @@
 ﻿#include "Systems/RoomPlayerController.h"
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "Systems/RoomGameMode.h"
+#include "Systems/RoomGameState.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "UI/Login/Core/AccountSubsystem.h"
 #include "Kismet/GameplayStatics.h"
@@ -100,6 +101,35 @@ void ARoomPlayerController::Server_SendPlayerInfo_Implementation(const FString& 
 
 void ARoomPlayerController::Client_EnterBattleState_Implementation()
 {
+	// 0. 在切换状态前，先确保倒计时被初始化（解决测试时 PerformGameStart 未被调用的兜底逻辑）
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			if (RoomGS->MatchRemainingTime <= 0)
+			{
+				switch (RoomGS->CurrentMatchMode)
+				{
+				case ERoomMatchMode::Melee:
+					RoomGS->MatchRemainingTime = 30 * 60;
+					RoomGS->CurrentRound = 0;
+					break;
+				case ERoomMatchMode::Zombie:
+					RoomGS->MatchRemainingTime = 10 * 60;
+					RoomGS->CurrentRound = 5;
+					break;
+				default:
+					break;
+				}
+				UE_LOG(LogTemp, Log, TEXT("[Client] Initialized MatchRemainingTime=%d, Mode=%d"),
+					RoomGS->MatchRemainingTime, (int32)RoomGS->CurrentMatchMode);
+				RoomGS->OnMatchModeChanged.Broadcast(RoomGS->CurrentMatchMode);
+				RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+				RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
+			}
+		}
+	}
+
 	// 每个玩家（客户端）收到服务器的开打指令后，立刻向本地的流程大管家报到！
 	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
 	{
@@ -340,6 +370,9 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 					GM->HandlePlayerRequestSpawn(PC, TargetChar, TargetWeapon);
 				}
 			}
+
+			// 【核心修复】：启动服务器倒计时，确保 OnMatchTimerTick 每秒递减 MatchRemainingTime
+			GM->StartMatchTimer();
 		}
 		else
 		{
@@ -423,7 +456,35 @@ void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& C
 void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchState NewState)
 {
 	// 【客户端专属逻辑】：这行代码只会在对应的那个客户端本地电脑上执行！
-	
+
+	// 0. 在切换状态前，先确保 MatchRemainingTime 被初始化
+	//    （防止测试时 PerformGameStart 未被调用导致倒计时一直是 0）
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			if (RoomGS->MatchRemainingTime <= 0)
+			{
+				switch (RoomGS->CurrentMatchMode)
+				{
+				case ERoomMatchMode::Melee:
+					RoomGS->MatchRemainingTime = 30 * 60;
+					RoomGS->CurrentRound = 0;
+					break;
+				case ERoomMatchMode::Zombie:
+					RoomGS->MatchRemainingTime = 10 * 60;
+					RoomGS->CurrentRound = 5;
+					break;
+				default:
+					break;
+				}
+				RoomGS->OnMatchModeChanged.Broadcast(RoomGS->CurrentMatchMode);
+				RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+				RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
+			}
+		}
+	}
+
 	// 1. 获取当前客户端本地的 GameInstance 及其挂载的 GameFlowSubsystem
 	if (UGameInstance* GI = GetGameInstance())
 	{

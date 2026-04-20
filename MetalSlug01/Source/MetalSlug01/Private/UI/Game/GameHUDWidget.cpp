@@ -1,4 +1,6 @@
 #include "UI/Game/GameHUDWidget.h"
+
+#include "Systems/RoomGameState.h"
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
 #include "UI/Game/Widgets/WeaponPanelWidget.h"
 #include "UI/Game/Widgets/MatchInfoWidget.h"
@@ -14,6 +16,55 @@ bool UGameHUDWidget::Initialize()
 	}
 
 	return true;
+}
+
+void UGameHUDWidget::NativeConstruct()
+{
+	Super::NativeConstruct();
+
+	// 尝试绑定 GameState，成功则立即刷新；否则定时器重试（最多5次，每次间隔0.5秒）
+	TryBindToGameState();
+}
+
+void UGameHUDWidget::TryBindToGameState()
+{
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			// 绑定事件：当 GameState 的模式切换时，UI 决定各控件的显示/隐藏
+			RoomGS->OnMatchModeChanged.AddDynamic(this, &UGameHUDWidget::OnMatchModeChangedForHUD);
+
+			// 绑定事件：当 GameState 的时间变化时，自动调用本 UI 的刷新函数
+			RoomGS->OnMatchTimeUpdated.AddDynamic(this, &UGameHUDWidget::UpdateRemainingTimeText);
+
+			// 初始化时先刷一次，防止错过初始同步
+			UpdateRemainingTimeText(RoomGS->MatchRemainingTime);
+
+			// 绑定事件：当 GameState 的当前回合数变化时（生化模式），刷新 Text_RemainingRounds
+			RoomGS->OnCurrentRoundUpdated.AddDynamic(this, &UGameHUDWidget::UpdateRemainingRoundsText);
+
+			// 初始化时先刷一次
+			UpdateRemainingRoundsText(RoomGS->CurrentRound);
+
+			// 绑定成功，不再重试
+			return;
+		}
+	}
+
+	// GameState 还未生成，定时器重试（最多5次，每次间隔0.5秒）
+	static int32 RetryCount = 0;
+	if (RetryCount < 5)
+	{
+		RetryCount++;
+		FTimerHandle DummyHandle;
+		GetWorld()->GetTimerManager().SetTimer(DummyHandle, this, &UGameHUDWidget::TryBindToGameState, 0.5f, false);
+	}
+	else
+	{
+		RetryCount = 0;
+		UE_LOG(LogTemp, Warning, TEXT("[GameHUDWidget] Failed to bind to GameState after 5 retries"));
+	}
 }
 
 void UGameHUDWidget::UpdateHealth(float Current, float Max)
@@ -69,5 +120,35 @@ void UGameHUDWidget::ShowKillIcon()
 	if (Widget_KillStreak)
 	{
 		Widget_KillStreak->ShowIcon(ECKillIconType::NormalKill);
+	}
+}
+
+void UGameHUDWidget::UpdateRemainingTimeText(int32 RemainingSeconds)
+{
+	// 防御性编程：防止时间为负数
+	RemainingSeconds = FMath::Max(0, RemainingSeconds);
+
+	if (Widget_MatchInfo)
+	{
+		// 调用 MatchInfoWidget 的 UpdateRoundCountdown，内部会格式化为 MM:SS 并处理红色警告
+		Widget_MatchInfo->UpdateRoundCountdown(RemainingSeconds);
+	}
+}
+
+void UGameHUDWidget::UpdateRemainingRoundsText(int32 RemainingRounds)
+{
+	RemainingRounds = FMath::Max(0, RemainingRounds);
+
+	if (Widget_MatchInfo)
+	{
+		Widget_MatchInfo->UpdateRemainingRounds(RemainingRounds);
+	}
+}
+
+void UGameHUDWidget::OnMatchModeChangedForHUD(ERoomMatchMode NewMode)
+{
+	if (Widget_MatchInfo)
+	{
+		Widget_MatchInfo->SetVisibilityByMode(NewMode);
 	}
 }

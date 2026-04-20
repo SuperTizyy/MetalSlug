@@ -83,6 +83,17 @@ void UMatchInfoWidget::UpdateRemainingRounds(int32 Rounds)
 	}
 }
 
+void UMatchInfoWidget::SetVisibilityByMode(ERoomMatchMode Mode)
+{
+	if (Text_RemainingRounds)
+	{
+		// 刀战模式隐藏剩余局数，生化模式显示
+		Text_RemainingRounds->SetVisibility(Mode == ERoomMatchMode::Zombie
+			? ESlateVisibility::Visible
+			: ESlateVisibility::Collapsed);
+	}
+}
+
 void UMatchInfoWidget::AddAttackerIcon(UTexture2D* Icon)
 {
 	if (!HB_AttackerIcons || !Icon)

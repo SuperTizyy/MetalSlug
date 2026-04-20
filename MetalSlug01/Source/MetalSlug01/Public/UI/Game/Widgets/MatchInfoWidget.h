@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "MatchInfoWidget.generated.h"
 
 class UTextBlock;
@@ -33,6 +34,11 @@ public:
 	// 更新剩余局数
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
 	void UpdateRemainingRounds(int32 Rounds);
+
+	// 根据游戏模式设置 Text_RemainingRounds 的显示状态
+	// 刀战模式（Melee）下隐藏，生化模式（Zombie）下显示
+	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
+	void SetVisibilityByMode(ERoomMatchMode Mode);
 
 	// 添加攻方人数图标
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
