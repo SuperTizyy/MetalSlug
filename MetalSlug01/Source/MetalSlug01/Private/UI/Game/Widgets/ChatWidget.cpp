@@ -7,6 +7,8 @@
 #include "Components/HorizontalBox.h"
 #include "Components/Overlay.h"
 #include "Components/Widget.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 
 bool UChatWidget::Initialize()
@@ -43,6 +45,10 @@ void UChatWidget::SetInputFocused(bool bFocused)
 			ETB_ChatInput->SetText(FText::GetEmpty());
 			ETB_ChatInput->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 			ETB_ChatInput->SetUserFocus(GetOwningPlayer());
+
+			// 缓存 Slate 指针用于焦点路径检查
+			TSharedPtr<SWidget> SlateWidget = ETB_ChatInput->GetCachedWidget();
+			ChatInputSlateWidget = SlateWidget;
 		}
 		else
 		{
@@ -91,9 +97,9 @@ void UChatWidget::AddSystemMessage(const FString& Message)
 	UTextBlock* SystemText = NewObject<UTextBlock>(this);
 	if (SystemText)
 	{
-		SystemText->SetText(FText::FromString(Message));
+		SystemText->SetText(FText::AsCultureInvariant(Message));
 		SystemText->SetColorAndOpacity(FLinearColor::Yellow);
-		SystemText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
+		SystemText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 14));
 
 		SB_ChatMessages->AddChild(SystemText);
 
@@ -151,13 +157,76 @@ void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type Comm
 			AddChatMessage(PlayerName, Message);
 		}
 
-		// 发送完毕后：清空输入框并退出输入模式（把控制权交还游戏）
+		// 发送完毕后：清空输入框、退出输入模式、恢复游戏输入
 		if (ETB_ChatInput)
 		{
 			ETB_ChatInput->SetText(FText::GetEmpty());
 		}
 		SetInputFocused(false);
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			PC->SetInputMode(FInputModeGameOnly());
+			PC->bShowMouseCursor = false;
+		}
 	}
+}
+
+FReply UChatWidget::NativeOnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+{
+	const FKey Key = InKeyEvent.GetKey();
+
+	// T 键：切换聊天输入框
+	if (Key == EKeys::T)
+	{
+		if (!bIsInputFocused)
+		{
+			SetInputFocused(true);
+			// 切换到 GameAndUI 模式，让游戏和 UI 同时接收输入
+			if (APlayerController* PC = GetOwningPlayer())
+			{
+				PC->SetInputMode(FInputModeGameAndUI());
+				PC->bShowMouseCursor = true;
+			}
+		}
+		return FReply::Handled();
+	}
+
+	// Escape 键：关闭聊天输入
+	if (Key == EKeys::Escape)
+	{
+		if (bIsInputFocused)
+		{
+			SetInputFocused(false);
+			if (APlayerController* PC = GetOwningPlayer())
+			{
+				PC->SetInputMode(FInputModeGameOnly());
+				PC->bShowMouseCursor = false;
+			}
+		}
+		return FReply::Handled();
+	}
+
+	return Super::NativeOnKeyDown(MyGeometry, InKeyEvent);
+}
+
+void UChatWidget::NativeOnFocusChanging(const FWeakWidgetPath& OldWidgetPath, const FWidgetPath& NewWidgetPath, const FFocusEvent& InFocusEvent)
+{
+	// 如果输入框正在激活状态，且焦点要移出输入框，则退出输入模式
+	if (bIsInputFocused && IsValid(ETB_ChatInput))
+	{
+		// 检查新的焦点路径中是否包含输入框
+		if (ChatInputSlateWidget.IsValid() && !NewWidgetPath.ContainsWidget(ChatInputSlateWidget.Pin().Get()))
+		{
+			SetInputFocused(false);
+			if (APlayerController* PC = GetOwningPlayer())
+			{
+				PC->SetInputMode(FInputModeGameOnly());
+				PC->bShowMouseCursor = false;
+			}
+		}
+	}
+
+	Super::NativeOnFocusChanging(OldWidgetPath, NewWidgetPath, InFocusEvent);
 }
 
 UWidget* UChatWidget::CreateChatMessageWidget(const FString& PlayerName, const FString& Message)
@@ -167,27 +236,29 @@ UWidget* UChatWidget::CreateChatMessageWidget(const FString& PlayerName, const F
 	{
 		return nullptr;
 	}
-	
+
+	FSlateFontInfo Font = FSlateFontInfo(FSlateFontInfo().FontObject, 14);
+
 	// 玩家名称
 	UTextBlock* NameText = NewObject<UTextBlock>(MessageContainer);
 	if (NameText)
 	{
-		NameText->SetText(FText::FromString(PlayerName + TEXT(": ")));
-		NameText->SetColorAndOpacity(FSlateColor(FLinearColor(0.0f, 1.0f, 1.0f, 1.0f))); // Cyan color
-		NameText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
+		NameText->SetText(FText::AsCultureInvariant(FString::Printf(TEXT("%s: "), *PlayerName)));
+		NameText->SetColorAndOpacity(FLinearColor(0.0f, 1.0f, 1.0f, 1.0f)); // Cyan
+		NameText->SetFont(Font);
 		MessageContainer->AddChild(NameText);
 	}
-	
+
 	// 消息内容
 	UTextBlock* MessageText = NewObject<UTextBlock>(MessageContainer);
 	if (MessageText)
 	{
-		MessageText->SetText(FText::FromString(Message));
+		MessageText->SetText(FText::AsCultureInvariant(Message));
 		MessageText->SetColorAndOpacity(FLinearColor::White);
-		MessageText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 12));
+		MessageText->SetFont(Font);
 		MessageContainer->AddChild(MessageText);
 	}
-	
+
 	return MessageContainer;
 }
 

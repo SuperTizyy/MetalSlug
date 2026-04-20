@@ -59,6 +59,12 @@ protected:
 	UFUNCTION()
 	void OnChatInputCommitted(const FText& Text, ETextCommit::Type CommitMethod);
 
+	// Native键盘事件：捕获 T 键打开聊天，Escape 关闭聊天
+	virtual FReply NativeOnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+
+	// 当焦点从输入框移开时，自动退出输入模式
+	virtual void NativeOnFocusChanging(const FWeakWidgetPath& OldWidgetPath, const FWidgetPath& NewWidgetPath, const FFocusEvent& InFocusEvent) override;
+
 private:
 	// 最大显示的聊天消息数量
 	static constexpr int32 MaxChatMessages = 50;
@@ -77,6 +83,9 @@ private:
 	// 发送按钮
 	UPROPERTY(meta = (BindWidgetOptional))
 	UButton* Btn_Send;
+
+	// 缓存的 Slate 输入框指针（用于焦点路径检查）
+	TWeakPtr<SWidget> ChatInputSlateWidget;
 
 	// 创建单条聊天消息
 	UWidget* CreateChatMessageWidget(const FString& PlayerName, const FString& Message);

@@ -2,7 +2,6 @@
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
-#include "UI/Game/Widgets/ChatWidget.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/GameFlowSubsystem.h"
@@ -471,67 +470,6 @@ UGameHUDWidget* ARoomPlayerController::GetGameHUDWidget() const
 		return HUD->GetGameHUDWidget();
 	}
 	return nullptr;
-}
-
-void ARoomPlayerController::SetupInputComponent()
-{
-	Super::SetupInputComponent();
-
-	// 在战斗状态下，捕获 T 键来打开聊天输入框
-	InputComponent->BindKey(EKeys::T, IE_Pressed, this, &ARoomPlayerController::OnChatKeyPressed);
-}
-
-void ARoomPlayerController::PlayerTick(float DeltaTime)
-{
-	Super::PlayerTick(DeltaTime);
-
-	bool bEscapePressed = IsInputKeyDown(EKeys::Escape);
-
-	// 边缘触发：只在从"未按下"变为"按下"的瞬间处理
-	if (bEscapePressed && !bLastEscapeDown)
-	{
-		if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
-		{
-			if (UChatWidget* ChatWidget = HUDWidget->GetWidget_Chat())
-			{
-				if (ChatWidget->IsInputFocused())
-				{
-					ChatWidget->SetInputFocused(false);
-				}
-			}
-		}
-	}
-	bLastEscapeDown = bEscapePressed;
-}
-
-void ARoomPlayerController::OnChatKeyPressed()
-{
-	UGameHUDWidget* HUDWidget = GetGameHUDWidget();
-	if (!HUDWidget)
-	{
-		return;
-	}
-
-	UChatWidget* ChatWidget = HUDWidget->GetWidget_Chat();
-	if (!ChatWidget)
-	{
-		return;
-	}
-
-	if (!ChatWidget->IsInputFocused())
-	{
-		ChatWidget->ToggleChatInput();
-		SetInputMode(FInputModeUIOnly());
-		SetIgnoreLookInput(true);
-		bShowMouseCursor = true;
-	}
-	else
-	{
-		ChatWidget->SetInputFocused(false);
-		SetInputMode(FInputModeGameOnly());
-		SetIgnoreLookInput(false);
-		bShowMouseCursor = false;
-	}
 }
 
 void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchState NewState)

@@ -130,12 +130,6 @@ protected:
 	UFUNCTION()
 	void OnFlowStateChanged(EMatchState NewState);
 
-	// 通过 InputComponent 捕获键盘事件
-	virtual void SetupInputComponent() override;
-
-	// 每帧检测 Escape 键以取消聊天输入
-	virtual void PlayerTick(float DeltaTime) override;
-
 private:
 	// 延迟发送玩家信息，避开网络抢跑期
 	void DelayedSendPlayerInfo();
@@ -145,10 +139,4 @@ private:
 
 	// 定时器，让子弹飞一会儿
 	FTimerHandle HostLeaveTimer;
-
-	// T 键按下时调用：切换聊天输入框
-	void OnChatKeyPressed();
-
-	// Escape 边缘触发状态
-	bool bLastEscapeDown = false;
 };
