@@ -1,5 +1,8 @@
 ﻿#include "Systems/RoomPlayerController.h"
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
+#include "UI/MyGameHUD.h"
+#include "UI/Game/GameHUDWidget.h"
+#include "UI/Game/Widgets/ChatWidget.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/GameFlowSubsystem.h"
@@ -275,8 +278,13 @@ void ARoomPlayerController::Server_SendChatMessage_Implementation(const FString&
 
 void ARoomPlayerController::Client_ReceiveChatMessage_Implementation(const FString& SenderName, bool bIsHost, const FString& Message, bool bIsSystemMsg)
 {
-	// 收到了服务器广播来的消息，立刻命令 UI 画在屏幕上！
-	if (RoomUIWidget)
+	// 优先使用 GameHUDWidget（战斗状态）
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		HUDWidget->AddChatMessage(SenderName, bIsHost, Message);
+	}
+	// 回退到 RoomUIWidget（房间状态）
+	else if (RoomUIWidget)
 	{
 		RoomUIWidget->AddChatMessage(SenderName, bIsHost, Message, bIsSystemMsg);
 	}
@@ -381,8 +389,13 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 
 void ARoomPlayerController::Client_ReceiveSystemMessage_Implementation(const FString& Message)
 {
-	// 拿到服务器发来的警告后，命令大厅 UI 在聊天框里打印黄字！
-	if (RoomUIWidget)
+	// 优先使用 GameHUDWidget（战斗状态）
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		HUDWidget->AddSystemMessage(Message);
+	}
+	// 回退到 RoomUIWidget（房间状态）
+	else if (RoomUIWidget)
 	{
 		RoomUIWidget->AddSystemMessageToChat(Message);
 	}
@@ -448,6 +461,76 @@ void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& C
 	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
 	{
 		PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+	}
+}
+
+UGameHUDWidget* ARoomPlayerController::GetGameHUDWidget() const
+{
+	if (AMyGameHUD* HUD = Cast<AMyGameHUD>(GetHUD()))
+	{
+		return HUD->GetGameHUDWidget();
+	}
+	return nullptr;
+}
+
+void ARoomPlayerController::SetupInputComponent()
+{
+	Super::SetupInputComponent();
+
+	// 在战斗状态下，捕获 T 键来打开聊天输入框
+	InputComponent->BindKey(EKeys::T, IE_Pressed, this, &ARoomPlayerController::OnChatKeyPressed);
+}
+
+void ARoomPlayerController::PlayerTick(float DeltaTime)
+{
+	Super::PlayerTick(DeltaTime);
+
+	bool bEscapePressed = IsInputKeyDown(EKeys::Escape);
+
+	// 边缘触发：只在从"未按下"变为"按下"的瞬间处理
+	if (bEscapePressed && !bLastEscapeDown)
+	{
+		if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+		{
+			if (UChatWidget* ChatWidget = HUDWidget->GetWidget_Chat())
+			{
+				if (ChatWidget->IsInputFocused())
+				{
+					ChatWidget->SetInputFocused(false);
+				}
+			}
+		}
+	}
+	bLastEscapeDown = bEscapePressed;
+}
+
+void ARoomPlayerController::OnChatKeyPressed()
+{
+	UGameHUDWidget* HUDWidget = GetGameHUDWidget();
+	if (!HUDWidget)
+	{
+		return;
+	}
+
+	UChatWidget* ChatWidget = HUDWidget->GetWidget_Chat();
+	if (!ChatWidget)
+	{
+		return;
+	}
+
+	if (!ChatWidget->IsInputFocused())
+	{
+		ChatWidget->ToggleChatInput();
+		SetInputMode(FInputModeUIOnly());
+		SetIgnoreLookInput(true);
+		bShowMouseCursor = true;
+	}
+	else
+	{
+		ChatWidget->SetInputFocused(false);
+		SetInputMode(FInputModeGameOnly());
+		SetIgnoreLookInput(false);
+		bShowMouseCursor = false;
 	}
 }
 

@@ -89,9 +89,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UPlayerStatusWidget* GetWidget_PlayerStatus() { return Widget_PlayerStatus; }
 
+	// 获取聊天Widget（供外部访问）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	UChatWidget* GetWidget_Chat() { return Widget_Chat; }
+
+	// 接收服务器广播的聊天消息（由 Controller 调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void AddChatMessage(const FString& PlayerName, bool bIsHost, const FString& Message);
+
+	// 接收服务器广播的系统消息（由 Controller 调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void AddSystemMessage(const FString& Message);
+
 protected:
 	// 尝试绑定到 GameState（带重试逻辑，解决时序问题）
 	void TryBindToGameState();
+
+	// 接收 Widget_Chat 的消息并转发到服务器
+	UFUNCTION()
+	void OnChatMessageReadyFromWidget(const FString& PlayerName, const FString& Message);
 
 	// ==========================================
 	// UI组件绑定

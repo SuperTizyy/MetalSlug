@@ -1,4 +1,5 @@
 #include "UI/Game/GameHUDWidget.h"
+#include "Systems/RoomPlayerController.h"
 
 #include "Systems/RoomGameState.h"
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
@@ -22,8 +23,25 @@ void UGameHUDWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
 
+	// 绑定聊天消息事件：当 Widget_Chat 有消息时，发送到服务器
+	if (Widget_Chat)
+	{
+		Widget_Chat->OnChatMessageReady.AddDynamic(this, &UGameHUDWidget::OnChatMessageReadyFromWidget);
+	}
+
 	// 尝试绑定 GameState，成功则立即刷新；否则定时器重试（最多5次，每次间隔0.5秒）
 	TryBindToGameState();
+}
+
+void UGameHUDWidget::OnChatMessageReadyFromWidget(const FString& PlayerName, const FString& Message)
+{
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		if (ARoomPlayerController* RoomPC = Cast<ARoomPlayerController>(PC))
+		{
+			RoomPC->Server_SendChatMessage(Message);
+		}
+	}
 }
 
 void UGameHUDWidget::TryBindToGameState()
@@ -164,5 +182,21 @@ void UGameHUDWidget::UpdateCharacterIcon(UTexture2D* Icon)
 	if (Widget_PlayerStatus)
 	{
 		Widget_PlayerStatus->UpdateCharacterIcon(Icon);
+	}
+}
+
+void UGameHUDWidget::AddChatMessage(const FString& PlayerName, bool bIsHost, const FString& Message)
+{
+	if (Widget_Chat)
+	{
+		Widget_Chat->AddChatMessage(PlayerName, Message);
+	}
+}
+
+void UGameHUDWidget::AddSystemMessage(const FString& Message)
+{
+	if (Widget_Chat)
+	{
+		Widget_Chat->AddSystemMessage(Message);
 	}
 }

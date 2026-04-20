@@ -31,6 +31,33 @@ bool UChatWidget::Initialize()
 	return true;
 }
 
+void UChatWidget::SetInputFocused(bool bFocused)
+{
+	bIsInputFocused = bFocused;
+
+	if (ETB_ChatInput)
+	{
+		if (bFocused)
+		{
+			// 激活输入框：清空内容 + 设置焦点
+			ETB_ChatInput->SetText(FText::GetEmpty());
+			ETB_ChatInput->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+			ETB_ChatInput->SetUserFocus(GetOwningPlayer());
+		}
+		else
+		{
+			// 隐藏输入框并清空内容
+			ETB_ChatInput->SetText(FText::GetEmpty());
+			ETB_ChatInput->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+}
+
+void UChatWidget::ToggleChatInput()
+{
+	SetInputFocused(!bIsInputFocused);
+}
+
 void UChatWidget::AddChatMessage(const FString& PlayerName, const FString& Message)
 {
 	if (!SB_ChatMessages)
@@ -95,11 +122,7 @@ void UChatWidget::OnSendClicked()
 		FString Message = ETB_ChatInput->GetText().ToString();
 		if (!Message.IsEmpty())
 		{
-			// 发送消息事件（实际发送逻辑需要在Controller或GameMode中实现）
 			OnChatInputCommitted(FText::FromString(Message), ETextCommit::OnEnter);
-
-			// 清空输入框
-			ETB_ChatInput->SetText(FText::GetEmpty());
 		}
 	}
 }
@@ -111,7 +134,7 @@ void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type Comm
 		FString Message = Text.ToString();
 		if (!Message.IsEmpty())
 		{
-			// 本地显示玩家消息（玩家名称从Controller获取）
+			// 从 PlayerState 获取玩家名称
 			FString PlayerName = TEXT("Player");
 			if (APlayerController* PC = GetOwningPlayer())
 			{
@@ -121,12 +144,19 @@ void UChatWidget::OnChatInputCommitted(const FText& Text, ETextCommit::Type Comm
 				}
 			}
 
-			// 添加到聊天列表
-			AddChatMessage(PlayerName, Message);
+			// 广播消息，由外部（Controller）处理网络发送
+			OnChatMessageReady.Broadcast(PlayerName, Message);
 
-			// TODO: 通过网络发送消息到服务器
-			// Server_SendChatMessage(PlayerName, Message);
+			// 本地显示
+			AddChatMessage(PlayerName, Message);
 		}
+
+		// 发送完毕后：清空输入框并退出输入模式（把控制权交还游戏）
+		if (ETB_ChatInput)
+		{
+			ETB_ChatInput->SetText(FText::GetEmpty());
+		}
+		SetInputFocused(false);
 	}
 }
 

@@ -19,6 +19,23 @@ class METALSLUG01_API UChatWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
+	// 设置输入框是否激活（激活时显示输入界面，回车发送）
+	UFUNCTION(BlueprintCallable, Category = "Chat")
+	void SetInputFocused(bool bFocused);
+
+	// 切换聊天输入框的激活状态（按 T 时调用）
+	UFUNCTION(BlueprintCallable, Category = "Chat")
+	void ToggleChatInput();
+
+	// 是否有输入焦点
+	bool IsInputFocused() const { return bIsInputFocused; }
+
+	// 当玩家提交聊天消息时广播（供外部接收以发送网络消息）
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnChatMessageReady, const FString&, PlayerName, const FString&, Message);
+	UPROPERTY(BlueprintAssignable, Category = "Chat")
+	FOnChatMessageReady OnChatMessageReady;
+
+public:
 	// 添加聊天消息
 	UFUNCTION(BlueprintCallable, Category = "Chat")
 	void AddChatMessage(const FString& PlayerName, const FString& Message);
@@ -45,6 +62,9 @@ protected:
 private:
 	// 最大显示的聊天消息数量
 	static constexpr int32 MaxChatMessages = 50;
+
+	// 当前是否处于输入焦点状态
+	bool bIsInputFocused = false;
 
 	// 聊天消息滚动容器
 	UPROPERTY(meta = (BindWidget))
