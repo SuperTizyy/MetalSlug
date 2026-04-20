@@ -34,8 +34,7 @@ public:
 	DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnChatMessageReady, const FString&, PlayerName, const FString&, Message);
 	UPROPERTY(BlueprintAssignable, Category = "Chat")
 	FOnChatMessageReady OnChatMessageReady;
-
-public:
+	
 	// 添加聊天消息
 	UFUNCTION(BlueprintCallable, Category = "Chat")
 	void AddChatMessage(const FString& PlayerName, const FString& Message);
@@ -65,6 +64,28 @@ protected:
 	// 当焦点从输入框移开时，自动退出输入模式
 	virtual void NativeOnFocusChanging(const FWeakWidgetPath& OldWidgetPath, const FWidgetPath& NewWidgetPath, const FFocusEvent& InFocusEvent) override;
 
+	// ==========================================
+	// 工业级规范：将UI表现层数据暴露给蓝图配置
+	// ==========================================
+	
+	// 玩家名称和聊天内容的字体设置
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Chat|Style")
+	FSlateFontInfo ChatFont;
+
+	// 玩家名称的颜色
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Chat|Style")
+	FLinearColor PlayerNameColor = FLinearColor(0.0f, 1.0f, 1.0f, 1.0f); // 默认 Cyan
+
+	// 聊天内容的颜色
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Chat|Style")
+	FLinearColor ChatMessageColor = FLinearColor::White;
+
+	// 系统消息的颜色
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Chat|Style")
+	FLinearColor SystemMessageColor = FLinearColor::Yellow;
+	
+	virtual void NativePreConstruct() override; // 新增：用于在编辑器中初始化默认字体
+	
 private:
 	// 最大显示的聊天消息数量
 	static constexpr int32 MaxChatMessages = 50;

@@ -107,26 +107,24 @@ void UChatWidget::AddChatMessage(const FString& PlayerName, const FString& Messa
 
 void UChatWidget::AddSystemMessage(const FString& Message)
 {
-	if (!SB_ChatMessages)
-	{
-		return;
-	}
+	if (!SB_ChatMessages) return;
 
 	UTextBlock* SystemText = NewObject<UTextBlock>(this);
 	if (SystemText)
 	{
-		SystemText->SetText(FText::AsCultureInvariant(Message));
-		SystemText->SetColorAndOpacity(FLinearColor::Yellow);
-		SystemText->SetFont(FSlateFontInfo(FSlateFontInfo().FontObject, 14));
+		// 玩家输入的通常用 FromString，AsCultureInvariant 一般用于数字或非本地化ID
+		SystemText->SetText(FText::FromString(Message));
+		SystemText->SetColorAndOpacity(SystemMessageColor);
+		
+		// 【核心修复】：应用蓝图中配置的支持中文的字体
+		SystemText->SetFont(ChatFont);
 
 		SB_ChatMessages->AddChild(SystemText);
 
-		// 超过最大数量时移除最早的
 		while (SB_ChatMessages->GetChildrenCount() > MaxChatMessages)
 		{
 			SB_ChatMessages->RemoveChildAt(0);
 		}
-
 		ScrollToBottom();
 	}
 }
@@ -217,31 +215,37 @@ void UChatWidget::NativeOnFocusChanging(const FWeakWidgetPath& OldWidgetPath, co
 UWidget* UChatWidget::CreateChatMessageWidget(const FString& PlayerName, const FString& Message)
 {
 	UOverlay* MessageContainer = NewObject<UOverlay>(this);
-	if (!MessageContainer)
-	{
-		return nullptr;
-	}
-
-	FSlateFontInfo Font = FSlateFontInfo(FSlateFontInfo().FontObject, 14);
+	if (!MessageContainer) return nullptr;
 
 	// 玩家名称
 	UTextBlock* NameText = NewObject<UTextBlock>(MessageContainer);
 	if (NameText)
 	{
-		NameText->SetText(FText::AsCultureInvariant(FString::Printf(TEXT("%s: "), *PlayerName)));
-		NameText->SetColorAndOpacity(FLinearColor(0.0f, 1.0f, 1.0f, 1.0f)); // Cyan
-		NameText->SetFont(Font);
+		NameText->SetText(FText::FromString(FString::Printf(TEXT("%s: "), *PlayerName)));
+		NameText->SetColorAndOpacity(PlayerNameColor);
+		// 【核心修复】：应用蓝图中配置的支持中文的字体
+		NameText->SetFont(ChatFont);
 		MessageContainer->AddChild(NameText);
 	}
 
-	// 消息内容
-	UTextBlock* MessageText = NewObject<UTextBlock>(MessageContainer);
-	if (MessageText)
+	// 消息内容 (你原本的代码可能会让玩家名和消息内容重叠，因为都加到了 Overlay 且没有设置 Padding)
+	// 这里顺手用 HorizontalBox 帮你优化一下排列，防止文字重叠！
+	UHorizontalBox* HBox = NewObject<UHorizontalBox>(MessageContainer);
+	if (HBox)
 	{
-		MessageText->SetText(FText::AsCultureInvariant(Message));
-		MessageText->SetColorAndOpacity(FLinearColor::White);
-		MessageText->SetFont(Font);
-		MessageContainer->AddChild(MessageText);
+		HBox->AddChild(NameText);
+
+		UTextBlock* MessageText = NewObject<UTextBlock>(HBox);
+		if (MessageText)
+		{
+			MessageText->SetText(FText::FromString(Message));
+			MessageText->SetColorAndOpacity(ChatMessageColor);
+			// 【核心修复】：应用蓝图中配置的支持中文的字体
+			MessageText->SetFont(ChatFont);
+			HBox->AddChild(MessageText);
+		}
+		
+		MessageContainer->AddChild(HBox);
 	}
 
 	return MessageContainer;
@@ -254,3 +258,16 @@ void UChatWidget::ScrollToBottom()
 		SB_ChatMessages->ScrollToEnd();
 	}
 }
+
+// 在蓝图编译或初始化前，给一个安全的默认值
+void UChatWidget::NativePreConstruct()
+{
+	Super::NativePreConstruct();
+	
+	// 设置字体的默认大小，防止蓝图中未配置时字体太小看不见
+	if (ChatFont.Size == 0)
+	{
+		ChatFont.Size = 14;
+	}
+}
+
