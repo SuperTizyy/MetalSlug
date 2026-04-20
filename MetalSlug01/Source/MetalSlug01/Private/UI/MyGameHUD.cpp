@@ -105,9 +105,6 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 			{
 				if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 				{
-					UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] Refreshing HUD: Time=%d, Round=%d, Mode=%d"),
-						RoomGS->MatchRemainingTime, RoomGS->CurrentRound, (int32)RoomGS->CurrentMatchMode);
-					GameHUDWidget->UpdateRemainingTimeText(RoomGS->MatchRemainingTime);
 					GameHUDWidget->UpdateRemainingRoundsText(RoomGS->CurrentRound);
 					GameHUDWidget->OnMatchModeChangedForHUD(RoomGS->CurrentMatchMode);
 				}

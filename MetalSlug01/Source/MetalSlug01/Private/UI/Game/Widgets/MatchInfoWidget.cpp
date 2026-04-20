@@ -2,6 +2,8 @@
 #include "Components/TextBlock.h"
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
+#include "Kismet/GameplayStatics.h"
+#include "Systems/RoomGameState.h"
 
 bool UMatchInfoWidget::Initialize()
 {
@@ -23,7 +25,8 @@ bool UMatchInfoWidget::Initialize()
 
 	if (Text_RoundCountdown)
 	{
-		Text_RoundCountdown->SetText(FText::AsNumber(0));
+		Text_RoundCountdown->SetText(FText::FromString(TEXT("00:00")));
+		Text_RoundCountdown->SetColorAndOpacity(NormalTimeColor);
 	}
 
 	if (Text_RemainingRounds)
@@ -32,6 +35,51 @@ bool UMatchInfoWidget::Initialize()
 	}
 
 	return true;
+}
+
+void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+
+	// 步骤 1: 缓存 GameState 提高性能。如果为空则尝试获取一次。
+	if (!CachedGameState)
+	{
+		CachedGameState = Cast<ARoomGameState>(UGameplayStatics::GetGameState(this));
+	}
+
+	// 步骤 2: 实施安全拦截
+	if (!CachedGameState || !Text_RoundCountdown)
+	{
+		return;
+	}
+
+	// 步骤 3: 获取由客户端运算预测的最新剩余时间
+	int32 CurrentSeconds = CachedGameState->GetMatchRemainingSeconds();
+
+	// 步骤 4: 性能优化防御编程（Dirty Flag机制）
+	// 避免每一帧 (如 60FPS 下每秒60次) 都去重设文本导致底层的 Slate 重绘 (InvalidateLayout)
+	if (CurrentSeconds != LastRenderedSeconds)
+	{
+		LastRenderedSeconds = CurrentSeconds;
+
+		// 步骤 5: 利用底层的 FTimespan 标准结构处理时间，避免手工 % 60 的隐式陷阱
+		FTimespan TimeLeft = FTimespan::FromSeconds(CurrentSeconds);
+		
+		// 采用更安全规范的 FText::Format (如果未来需要做更复杂的本地化占位符替换，这是唯一规范)
+		// 也可以保持格式为 mm:ss，但避免将可变数字暴露在硬编码宏中
+		FString TimeString = FString::Printf(TEXT("%02d:%02d"), TimeLeft.GetMinutes(), TimeLeft.GetSeconds());
+		Text_RoundCountdown->SetText(FText::FromString(TimeString));
+
+		// 步骤 6: 使用暴露给设计人员的属性判断阈值，而不再使用魔法硬编码
+		if (CurrentSeconds <= WarningTimeThreshold)
+		{
+			Text_RoundCountdown->SetColorAndOpacity(WarningTimeColor);
+		}
+		else
+		{
+			Text_RoundCountdown->SetColorAndOpacity(NormalTimeColor);
+		}
+	}
 }
 
 void UMatchInfoWidget::UpdateAttackerCount(int32 Count)
@@ -50,27 +98,6 @@ void UMatchInfoWidget::UpdateDefenderCount(int32 Count)
 	}
 }
 
-void UMatchInfoWidget::UpdateRoundCountdown(int32 Seconds)
-{
-	if (Text_RoundCountdown)
-	{
-		// 格式化为 MM:SS
-		int32 Minutes = Seconds / 60;
-		int32 Secs = Seconds % 60;
-		FString TimeString = FString::Printf(TEXT("%02d:%02d"), Minutes, Secs);
-		Text_RoundCountdown->SetText(FText::FromString(TimeString));
-
-		// 低于10秒显示红色警告
-		if (Seconds <= 10)
-		{
-			Text_RoundCountdown->SetColorAndOpacity(FLinearColor::Red);
-		}
-		else
-		{
-			Text_RoundCountdown->SetColorAndOpacity(FLinearColor::White);
-		}
-	}
-}
 
 void UMatchInfoWidget::UpdateRemainingRounds(int32 Rounds)
 {

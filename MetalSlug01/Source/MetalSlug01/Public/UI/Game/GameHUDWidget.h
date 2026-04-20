@@ -60,11 +60,7 @@ public:
 	// 公开接口：显示普通击杀图标
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void ShowKillIcon();
-
-	// 更新倒计时文本的接口
-	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void UpdateRemainingTimeText(int32 RemainingSeconds);
-
+	
 	// 更新剩余局数文本的接口
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void UpdateRemainingRoundsText(int32 RemainingRounds);

@@ -106,25 +106,23 @@ void ARoomPlayerController::Client_EnterBattleState_Implementation()
 	{
 		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 		{
-			if (RoomGS->MatchRemainingTime <= 0)
+			if (RoomGS->GetMatchRemainingSeconds() <= 0)
 			{
 				switch (RoomGS->CurrentMatchMode)
 				{
 				case ERoomMatchMode::Melee:
-					RoomGS->MatchRemainingTime = 30 * 60;
+					RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (30 * 60);
 					RoomGS->CurrentRound = 0;
 					break;
 				case ERoomMatchMode::Zombie:
-					RoomGS->MatchRemainingTime = 10 * 60;
+					RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
 					RoomGS->CurrentRound = 5;
 					break;
 				default:
 					break;
 				}
-				UE_LOG(LogTemp, Log, TEXT("[Client] Initialized MatchRemainingTime=%d, Mode=%d"),
-					RoomGS->MatchRemainingTime, (int32)RoomGS->CurrentMatchMode);
+			
 				RoomGS->OnMatchModeChanged.Broadcast(RoomGS->CurrentMatchMode);
-				RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
 				RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
 			}
 		}
@@ -463,23 +461,22 @@ void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchStat
 	{
 		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 		{
-			if (RoomGS->MatchRemainingTime <= 0)
+			if (RoomGS->GetMatchRemainingSeconds() <= 0)
 			{
 				switch (RoomGS->CurrentMatchMode)
 				{
 				case ERoomMatchMode::Melee:
-					RoomGS->MatchRemainingTime = 30 * 60;
+					RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (30 * 60);
 					RoomGS->CurrentRound = 0;
 					break;
 				case ERoomMatchMode::Zombie:
-					RoomGS->MatchRemainingTime = 10 * 60;
+					RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
 					RoomGS->CurrentRound = 5;
 					break;
 				default:
 					break;
 				}
 				RoomGS->OnMatchModeChanged.Broadcast(RoomGS->CurrentMatchMode);
-				RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
 				RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
 			}
 		}

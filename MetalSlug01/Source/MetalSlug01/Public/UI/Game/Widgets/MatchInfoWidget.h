@@ -5,6 +5,7 @@
 #include "UI/Login/Data/StaticTable.h"
 #include "MatchInfoWidget.generated.h"
 
+class ARoomGameState;
 class UTextBlock;
 class UHorizontalBox;
 class UImage;
@@ -26,11 +27,7 @@ public:
 	// 更新守方人数
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
 	void UpdateDefenderCount(int32 Count);
-
-	// 更新单局倒计时
-	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
-	void UpdateRoundCountdown(int32 Seconds);
-
+	
 	// 更新剩余局数
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
 	void UpdateRemainingRounds(int32 Rounds);
@@ -50,6 +47,19 @@ public:
 
 protected:
 	virtual bool Initialize() override;
+	
+	// UE 标准做法：如果 UI 频繁更新状态，使用 NativeTick。如果需要优化，可改用内部 Timer
+	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+
+	// 【架构重构】：暴露设计参数供 UMG 编辑器（蓝图）配置，彻底解耦 C++ 表现
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Style")
+	int32 WarningTimeThreshold = 10;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Style")
+	FSlateColor NormalTimeColor = FSlateColor(FLinearColor::White);
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Style")
+	FSlateColor WarningTimeColor = FSlateColor(FLinearColor::Red);
 
 private:
 	// ==========================================
@@ -81,4 +91,11 @@ private:
 
 	// 最大图标显示数量（超出后不再添加）
 	int32 MaxIconDisplayCount = 10;
+	
+	// 缓存 GameState 引用以避免每帧执行 Cast 或 Get 操作，提升性能
+    	UPROPERTY(Transient)
+    	ARoomGameState* CachedGameState;
+	
+	// 用于记录上一秒的值，避免每帧都在重复更新 Text 和渲染（UI重绘开销很大）
+	int32 LastRenderedSeconds = -1;
 };

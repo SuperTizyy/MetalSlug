@@ -38,17 +38,14 @@ public:
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Match")
 	ERoomMatchMode CurrentMatchMode = ERoomMatchMode::Melee;
 
-	// 比赛剩余时间（秒）。使用 RepNotify 机制，当服务器更新时间同步到客户端时，自动触发 UI 刷新
-	UPROPERTY(ReplicatedUsing = OnRep_MatchRemainingTime, BlueprintReadOnly, Category = "Room|Match")
-	int32 MatchRemainingTime = 0;
+	// 【架构重构】：只同步比赛结束的绝对时间戳，避免每秒网络通信的极大开销
+	// 当服务器决定开始倒计时，设置此变量为：GetServerWorldTimeSeconds() + 倒计时总时长
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Match")
+	float MatchEndTime = 0.0f;
 	
-	// 客户端接到时间同步时的回调
-	UFUNCTION()
-	void OnRep_MatchRemainingTime();
-	
-	// UI 监听的委托
-	UPROPERTY(BlueprintAssignable, Category = "Room|Match")
-	FOnMatchTimeUpdated OnMatchTimeUpdated;
+	// 提供一个接口供 UI 查询剩余时间（秒），在客户端调用时能自适应网络延迟计算
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Match")
+	int32 GetMatchRemainingSeconds() const;
 
 	// 剩余局数（生化模式：剩余回合数，刀战模式：隐藏此字段）
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentRound, BlueprintReadOnly, Category = "Room|Match")

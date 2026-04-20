@@ -573,21 +573,21 @@ void ARoomGameMode::StartMatchTimer()
 	switch (RoomGS->CurrentMatchMode)
 	{
 	case ERoomMatchMode::Melee:
-		RoomGS->MatchRemainingTime = 30 * 60; // 30分钟 = 1800秒
+		// 设置绝对结束时间 = 当前世界时间 + 设定秒数
+		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
 		RoomGS->CurrentRound = 0; // 刀战只有一整局，不显示回合数
 		break;
 	case ERoomMatchMode::Zombie:
-		RoomGS->MatchRemainingTime = 10 * 60; // 10分钟 = 600秒
+		//设置绝对结束时间 = 当前世界时间 + 设定秒数
+		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
 		RoomGS->CurrentRound = ZombieTotalRounds; // 初始化为总回合数，每回合结束后递减
 		break;
 	default:
-		RoomGS->MatchRemainingTime = 0;
+		RoomGS->MatchEndTime = 0;
 		RoomGS->CurrentRound = 0;
 		break;
 	}
-
-	// 服务器广播初始值（本地房主/单机时也要触发 OnRep）
-	RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+	
 	RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
 
 	// 启动一个1秒执行一次的循环定时器
@@ -598,18 +598,11 @@ void ARoomGameMode::OnMatchTimerTick()
 {
 	ARoomGameState* RoomGS = GetGameState<ARoomGameState>();
 	if (!RoomGS) return;
+	
 
-	// 扣减时间
-	RoomGS->MatchRemainingTime--;
-
-	// 服务器本地通知UI（客户端会通过 OnRep_MatchRemainingTime 自动通知）
-	if (GetNetMode() != NM_DedicatedServer)
-	{
-		RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
-	}
 
 	// 检查是否倒计时结束
-	if (RoomGS->MatchRemainingTime <= 0)
+	if (RoomGS->GetMatchRemainingSeconds() <= 0)
 	{
 		// 停止计时器
 		GetWorldTimerManager().ClearTimer(MatchTimerHandle);
@@ -680,8 +673,7 @@ void ARoomGameMode::StartNextZombieRound()
 	BroadcastSystemMessage(FString::Printf(TEXT("第 %d/%d 回合开始！"), ZombieTotalRounds - RoomGS->CurrentRound + 1, ZombieTotalRounds));
 
 	// 重置每回合时间
-	RoomGS->MatchRemainingTime = 10 * 60;
-	RoomGS->OnMatchTimeUpdated.Broadcast(RoomGS->MatchRemainingTime);
+	RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
 
 	// TODO: 重置玩家位置、复活等场景清理工作...
 
