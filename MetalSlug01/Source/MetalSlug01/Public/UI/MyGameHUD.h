@@ -31,20 +31,12 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "UI")
 	TSubclassOf<UGameHUDWidget> GameHUDWidgetClass;
 
-	// 准星 Widget 的类引用
-	UPROPERTY(EditAnywhere, Category = "UI|Classes")
-	TSubclassOf<UUserWidget> CrosshairWidgetClass;
-
 private:
 	UPROPERTY()
 	UUserWidget* MainWidget;
 
 	UPROPERTY()
 	UGameHUDWidget* GameHUDWidget;
-	
-	// 准星的实例指针
-	UPROPERTY()
-	UUserWidget* CrosshairWidget;
 
 	// 创建游戏HUD
 	void CreateGameHUD();

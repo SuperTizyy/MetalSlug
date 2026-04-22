@@ -39,6 +39,18 @@ enum class ERoomMatchMode : uint8
 };
 
 // ==========================================
+// 武器类型枚举（用于区分主武器、副武器、近战武器）
+// ==========================================
+UENUM(BlueprintType)
+enum class EWeaponType : uint8
+{
+	None        UMETA(DisplayName = "无"),
+	Primary     UMETA(DisplayName = "主武器"),
+	Secondary   UMETA(DisplayName = "副武器"),
+	Melee       UMETA(DisplayName = "近战武器")
+};
+
+// ==========================================
 // 角色信息配置表 (Data-Driven 核心底座)
 // ==========================================
 USTRUCT(BlueprintType)
@@ -89,6 +101,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")
 	TSubclassOf<class ABaseWeapon> WeaponBlueprint; 
 	
+	// 4. 武器类型（主武器、副武器、近战武器）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")
+	EWeaponType WeaponType;
+
 	//轻击头部伤害
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data")
 	float LightHeadDamage;
@@ -142,4 +158,37 @@ enum class EACERankType : uint8
 	None    UMETA(DisplayName = "无ACE（不显示金色或白色）"),
 	White   UMETA(DisplayName = "队内第一（白色）"),
 	Gold    UMETA(DisplayName = "全场第一（金色）")
+};
+
+// ==========================================
+// 击杀方式枚举（用于击杀信息显示）
+// ==========================================
+UENUM(BlueprintType)
+enum class EKillMethod : uint8
+{
+	None                UMETA(DisplayName = "无"),
+	PrimaryHeadshot     UMETA(DisplayName = "主武器爆头"),
+	PrimaryWeapon       UMETA(DisplayName = "主武器"),
+	SecondaryHeadshot   UMETA(DisplayName = "副武器爆头"),
+	SecondaryWeapon     UMETA(DisplayName = "副武器"),
+	MeleeHeadshot       UMETA(DisplayName = "近战武器爆头"),
+	MeleeWeapon         UMETA(DisplayName = "近战武器")
+};
+
+// ==========================================
+// 击杀图标信息表 (Data-Driven 核心底座)
+// ==========================================
+USTRUCT(BlueprintType)
+struct FKillIconInfo : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// 击杀方式枚举（作为查找键）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Kill Icon Data")
+	EKillMethod KillMethod;
+
+	// 击杀图标（用于 HUD 击杀信息显示）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Kill Icon Data")
+	class UTexture2D* KillIcon;
 };

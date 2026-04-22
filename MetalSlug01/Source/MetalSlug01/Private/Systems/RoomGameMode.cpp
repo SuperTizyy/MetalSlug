@@ -573,8 +573,8 @@ void ARoomGameMode::StartMatchTimer()
 	switch (RoomGS->CurrentMatchMode)
 	{
 	case ERoomMatchMode::Melee:
-		// 设置绝对结束时间 = 当前世界时间 + 设定秒数
-		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
+		// 设置绝对结束时间 = 当前世界时间 + 设定秒数（MeleeMatchDurationSeconds 由蓝图配置）
+		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + MeleeMatchDurationSeconds;
 		RoomGS->CurrentRound = 0; // 刀战只有一整局，不显示回合数
 		break;
 	case ERoomMatchMode::Zombie:
@@ -589,6 +589,9 @@ void ARoomGameMode::StartMatchTimer()
 	}
 	
 	RoomGS->OnCurrentRoundUpdated.Broadcast(RoomGS->CurrentRound);
+
+	// 重置双方击杀统计
+	RoomGS->ResetTeamKillStats();
 
 	// 启动一个1秒执行一次的循环定时器
 	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ARoomGameMode::OnMatchTimerTick, 1.0f, true);
@@ -627,7 +630,8 @@ void ARoomGameMode::HandleMatchTimeOut()
 		// 刀战模式：直接结束一整局游戏
 		UE_LOG(LogTemp, Log, TEXT("刀战模式结束，准备进入全局结算..."));
 		BroadcastSystemMessage(TEXT("刀战模式结束！"));
-		// TODO: 调用结算接口，例如通知 GameFlowSubsystem 切换到 PostBattle 状态
+		// 调用结算系统：判断胜负并广播给所有客户端
+		RoomGS->TriggerSettlement();
 	}
 	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
 	{
@@ -649,7 +653,8 @@ void ARoomGameMode::HandleZombieRoundEnd()
 		// 所有回合结束，整局游戏结束
 		UE_LOG(LogTemp, Log, TEXT("生化模式全部 %d 回合结束，准备进入全局结算..."), ZombieTotalRounds);
 		BroadcastSystemMessage(FString::Printf(TEXT("生化模式结束！共 %d 回合！"), ZombieTotalRounds));
-		// TODO: 调用结算接口
+		// 调用结算系统：判断最终胜负并广播给所有客户端
+		RoomGS->TriggerSettlement();
 	}
 	else
 	{
@@ -674,6 +679,9 @@ void ARoomGameMode::StartNextZombieRound()
 
 	// 重置每回合时间
 	RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + (10 * 60);
+
+	// 重置双方击杀统计
+	RoomGS->ResetTeamKillStats();
 
 	// TODO: 重置玩家位置、复活等场景清理工作...
 

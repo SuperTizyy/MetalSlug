@@ -149,6 +149,10 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
 	int32 ZombieTotalRounds = 5;
 
+	// 刀战模式每局比赛时长（秒），在此可配置任意值，如 300=5分钟、600=10分钟、900=15分钟
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match")
+	int32 MeleeMatchDurationSeconds = 600;
+
 	/**
 	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色
 	 */

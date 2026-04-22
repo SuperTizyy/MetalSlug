@@ -131,10 +131,11 @@ void ABaseWeapon::Tick(float DeltaTime)
 		{
 			float FinalDamage = 0.0f;
 			
-			// 1. 判定这一刀的威力
+			// 1. 判定这一刀的威力和击杀方式
 			if (bIsCurrentAttackHeavy)
 			{
 				FinalDamage = HeavyDamage; // 重击一击必杀
+				LastKillMethod = EKillMethod::MeleeWeapon; // 重击视为近战武器击杀
 				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red, TEXT("重击斩杀！"));
 			}
 			else
@@ -143,11 +144,13 @@ void ABaseWeapon::Tick(float DeltaTime)
 				if (HitResult.BoneName == FName("head")) // 注意物理资产里的头部必须叫 head
 				{
 					FinalDamage = LightDamageHead;
+					LastKillMethod = EKillMethod::MeleeHeadshot; // 轻击爆头
 					if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Orange, TEXT("爆头！"));
 				}
 				else 
 				{
 					FinalDamage = LightDamageBody;
+					LastKillMethod = EKillMethod::MeleeWeapon; // 轻击身体
 					if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, TEXT("击中身体"));
 				}
 			}

@@ -23,6 +23,20 @@ public:
 	// 获取玩家名称（供外部访问）
 	FString GetMyPlayerName() const { return MyPlayerName; }
 
+	// 获取计分板Widget实例
+	class UScoreboardWidget* GetScoreboardWidget() const { return ScoreboardWidgetInstance; }
+
+	// 获取ESC菜单Widget实例
+	class UEscMenuWidget* GetEscMenuWidget() const { return EscMenuWidgetInstance; }
+
+	// 显示ESC菜单（供外部调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void ShowEscMenu();
+
+	// 隐藏ESC菜单（供外部调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void HideEscMenu();
+
 	// ==========================================
 	// 1. 客户端 -> 服务器的 RPC (Client to Server)
 	// ==========================================
@@ -122,13 +136,46 @@ public:
 	// 保存生成出来的 UI 界面指针，方便后续刷新
 	UPROPERTY()
 	URoomInsidePage* RoomUIWidget;
-	
+
+	// 计分板Widget类引用（蓝图配置）
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<class UScoreboardWidget> ScoreboardWidgetClass;
+
+	// 计分板Widget实例指针
+	UPROPERTY()
+	class UScoreboardWidget* ScoreboardWidgetInstance;
+
+	// ESC菜单Widget类引用（蓝图配置）
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<class UEscMenuWidget> EscMenuWidgetClass;
+
+	// ESC菜单Widget实例指针
+	UPROPERTY()
+	class UEscMenuWidget* EscMenuWidgetInstance;
+
+	// ==========================================
+	// ESC 菜单状态管理（用 bool 标志位代替不可靠的可见性检测）
+	// ==========================================
+	// 当前 ESC 菜单是否已打开
+	UPROPERTY()
+	bool bIsEscMenuOpen;
+
 	// ==========================================
 	// 增强输入系统 (Enhanced Input)
 	// ==========================================
 	// 在蓝图 WBP_RoomPlayerController 中配置这个变量，绑定你的 T 键和 回车键
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_ToggleChat;
+
+	// Tab键：显示/隐藏计分板
+	UPROPERTY(EditDefaultsOnly, Category = "Input")
+	UInputAction* IA_ToggleScoreboard;
+
+	// ESC键：显示/隐藏ESC菜单
+	UPROPERTY(EditDefaultsOnly, Category = "Input")
+	UInputAction* IA_ToggleEscMenu;
+
+protected:
 
 protected:
 	// 游戏开始时触发
@@ -144,6 +191,22 @@ protected:
 	// 处理唤醒聊天的按键事件
 	UFUNCTION()
 	void OnToggleChatAction();
+
+	// 处理Tab键按下：显示计分板
+	UFUNCTION()
+	void OnScoreboardPressed();
+
+	// 处理Tab键抬起：隐藏计分板
+	UFUNCTION()
+	void OnScoreboardReleased();
+
+	// 处理ESC键按下：切换ESC菜单显示/隐藏
+	UFUNCTION()
+	void OnEscPressed();
+
+	// 重置所有玩家的计分板数据（服务器专用）
+	UFUNCTION()
+	void ResetAllPlayerScoreboardStats();
 
 private:
 	// 延迟发送玩家信息，避开网络抢跑期

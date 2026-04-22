@@ -12,15 +12,25 @@ bool UMatchInfoWidget::Initialize()
 		return false;
 	}
 
-	// 初始化默认值
+	// 初始化默认值：防御性检查，防止 BindWidget 绑定失败时访问 nullptr
 	if (Text_AttackerCount)
 	{
 		Text_AttackerCount->SetText(FText::AsNumber(0));
+		UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] Initialize: Text_AttackerCount 绑定成功，初始值=0"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MatchInfoWidget] Initialize: Text_AttackerCount 为空！请检查 Blueprint 中是否有名为 Text_AttackerCount 的 TextBlock 控件，并确认其绑定了 meta=(BindWidget)"));
 	}
 
 	if (Text_DefenderCount)
 	{
 		Text_DefenderCount->SetText(FText::AsNumber(0));
+		UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] Initialize: Text_DefenderCount 绑定成功，初始值=0"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MatchInfoWidget] Initialize: Text_DefenderCount 为空！请检查 Blueprint 中是否有名为 Text_DefenderCount 的 TextBlock 控件，并确认其绑定了 meta=(BindWidget)"));
 	}
 
 	if (Text_RoundCountdown)
@@ -41,13 +51,27 @@ void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
 
-	// 步骤 1: 缓存 GameState 提高性能。如果为空则尝试获取一次。
-	if (!CachedGameState)
+	// 尝试绑定 GameState：延迟到 Tick 中执行可以确保 GameState 已经生成
+	// 仅当尚未绑定成功时才执行（bIsBoundToGameState 作为 Guard）
+	if (!bIsBoundToGameState)
 	{
 		CachedGameState = Cast<ARoomGameState>(UGameplayStatics::GetGameState(this));
+		if (CachedGameState)
+		{
+			CachedGameState->OnTeamKillCountUpdated.AddDynamic(this, &UMatchInfoWidget::OnTeamKillCountChanged);
+
+			// 【修复】：绑定后立即读取 GameState 上的最新值（而非使用本地的旧值）
+			// 解决 OnRep_TeamKillCount 在绑定之前就触发、绑定时值为旧数据的问题
+			UpdateAttackerCount(CachedGameState->AttackerTotalKills);
+			UpdateDefenderCount(CachedGameState->DefenderTotalKills);
+
+			bIsBoundToGameState = true;
+			UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] 已成功绑定 GameState，AttackerKills=%d, DefenderKills=%d"),
+				CachedGameState->AttackerTotalKills, CachedGameState->DefenderTotalKills);
+		}
 	}
 
-	// 步骤 2: 实施安全拦截
+	// 倒计时更新：安全拦截（不依赖上面的绑定逻辑）
 	if (!CachedGameState || !Text_RoundCountdown)
 	{
 		return;
@@ -82,20 +106,42 @@ void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime
 	}
 }
 
+void UMatchInfoWidget::OnTeamKillCountChanged(int32 AttackerKills, int32 DefenderKills)
+{
+	// 【核心修复】：直接读取 CachedGameState 上的最新值
+	// 不依赖传入参数，因为 OnRep_TeamKillCount 回调触发时，属性值可能尚未同步完成
+	// 解决 Widget 延迟绑定时，错过 OnRep 触发导致 UI 永远显示旧数据的问题
+	if (CachedGameState)
+	{
+		UpdateAttackerCount(CachedGameState->AttackerTotalKills);
+		UpdateDefenderCount(CachedGameState->DefenderTotalKills);
+		UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] OnTeamKillCountChanged: 直接读取 GameState -> 攻方=%d, 守方=%d"),
+			CachedGameState->AttackerTotalKills, CachedGameState->DefenderTotalKills);
+	}
+}
+
 void UMatchInfoWidget::UpdateAttackerCount(int32 Count)
 {
-	if (Text_AttackerCount)
+	if (!Text_AttackerCount)
 	{
-		Text_AttackerCount->SetText(FText::AsNumber(Count));
+		UE_LOG(LogTemp, Error, TEXT("[MatchInfoWidget] UpdateAttackerCount: Text_AttackerCount 为空！请检查 Blueprint 中是否有名为 Text_AttackerCount 的 TextBlock 控件，并确认其绑定了 meta=(BindWidget)"));
+		return;
 	}
+
+	Text_AttackerCount->SetText(FText::AsNumber(Count));
+	UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] 刷新攻方击杀数: %d"), Count);
 }
 
 void UMatchInfoWidget::UpdateDefenderCount(int32 Count)
 {
-	if (Text_DefenderCount)
+	if (!Text_DefenderCount)
 	{
-		Text_DefenderCount->SetText(FText::AsNumber(Count));
+		UE_LOG(LogTemp, Error, TEXT("[MatchInfoWidget] UpdateDefenderCount: Text_DefenderCount 为空！请检查 Blueprint 中是否有名为 Text_DefenderCount 的 TextBlock 控件，并确认其绑定了 meta=(BindWidget)"));
+		return;
 	}
+
+	Text_DefenderCount->SetText(FText::AsNumber(Count));
+	UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] 刷新守方击杀数: %d"), Count);
 }
 
 

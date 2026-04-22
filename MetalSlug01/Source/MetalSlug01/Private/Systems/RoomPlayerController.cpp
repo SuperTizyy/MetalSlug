@@ -4,6 +4,8 @@
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
+#include "UI/Game/Widgets/ScoreboardWidget.h"
+#include "UI/Game/Widgets/EscMenuWidget.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/GameFlowSubsystem.h"
@@ -17,6 +19,9 @@
 void ARoomPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// 初始化 ESC 菜单状态标志
+	bIsEscMenuOpen = false;
 
 	if (IsLocalPlayerController())
 	{
@@ -217,17 +222,37 @@ void ARoomPlayerController::ExecuteLeaveRoom()
 	}
 
 	// ==========================================
-	// 【架构精进】：彻底删掉 AccountSub->bIsReturningFromRoom 和 OpenLevel！
-	// 开启 0.5 秒定时器给操作系统释放 7777 端口后，
-	// 优雅地交给大管家，呼叫 TransitToState 即可！
+	// 【架构修正】：不在 lambda 中直接调用 Controller 成员。
+	// 改为通过 World 重新获取 GameInstance 和 Subsystem，
+	// 避免 Controller 在地图切换过程中被销毁导致的崩溃或卡死。
 	// ==========================================
 	FTimerHandle TravelTimer;
-	GetWorld()->GetTimerManager().SetTimer(TravelTimer, [this]()
+	GetWorld()->GetTimerManager().SetTimer(TravelTimer, [WeakWorld = TWeakObjectPtr<UWorld>(GetWorld())]()
 	{
-		if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+		if (!WeakWorld.IsValid())
 		{
-			// 告诉管家：我要回大厅！管家会自动调用带着 ?offline 的 OpenLevel 把你送回去。
-			FlowSubsystem->TransitToState(EMatchState::MainLobby);
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] World已失效，无法返回大厅"));
+			return;
+		}
+
+		UWorld* World = WeakWorld.Get();
+		if (UGameInstance* GI = World->GetGameInstance())
+		{
+			if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+			{
+				// 告诉管家：我要回大厅！管家会自动调用带着 ?offline 的 OpenLevel 把你送回去。
+				FlowSubsystem->TransitToState(EMatchState::MainLobby);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] GameFlowSubsystem为空，直接 OpenLevel 回大厅"));
+				// 兜底：直接跳地图回登录地图
+				UGameplayStatics::OpenLevel(GI, FName("L_Login"), true, TEXT("?offline"));
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] GameInstance为空，无法返回大厅"));
 		}
 	}, 0.5f, false);
 }
@@ -447,7 +472,58 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 			RoomUIWidget->RemoveFromParent();
 			RoomUIWidget = nullptr;
 		}
-		
+
+		// 战斗开始时，重置所有玩家的计分板数据
+		ResetAllPlayerScoreboardStats();
+	}
+	// 【状态 C：退出战斗，返回房间或其他状态】
+	else
+	{
+		// 退出战斗态时，重置 ESC 菜单标志位并恢复游戏状态
+		if (bIsEscMenuOpen)
+		{
+			bIsEscMenuOpen = false;
+
+			// 隐藏 ESC 菜单
+			if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+			{
+				HUDWidget->HideEscMenu();
+			}
+
+			// 恢复输入模式和游戏状态
+			SetInputMode(FInputModeGameOnly());
+			bShowMouseCursor = false;
+			UGameplayStatics::SetGamePaused(this, false);
+		}
+
+		// 销毁计分板Widget
+		if (ScoreboardWidgetInstance)
+		{
+			ScoreboardWidgetInstance->RemoveFromParent();
+			ScoreboardWidgetInstance = nullptr;
+		}
+	}
+}
+
+void ARoomPlayerController::ResetAllPlayerScoreboardStats()
+{
+	// 只有服务器才有权限重置计分板数据
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// 遍历所有玩家控制器
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get());
+		if (PC)
+		{
+			if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+			{
+				PS->ResetScoreboardStats();
+			}
+		}
 	}
 }
 
@@ -532,6 +608,30 @@ void ARoomPlayerController::SetupInputComponent()
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleChat，聊天快捷键无法使用！"));
 		}
+
+		// 绑定Tab键：按下显示计分板，抬起隐藏计分板
+		if (IA_ToggleScoreboard)
+		{
+			// 按下时显示
+			EnhancedInputComponent->BindAction(IA_ToggleScoreboard, ETriggerEvent::Started, this, &ARoomPlayerController::OnScoreboardPressed);
+			// 抬起时隐藏
+			EnhancedInputComponent->BindAction(IA_ToggleScoreboard, ETriggerEvent::Completed, this, &ARoomPlayerController::OnScoreboardReleased);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleScoreboard，计分板快捷键无法使用！"));
+		}
+
+		// 绑定ESC键：切换ESC菜单显示/隐藏
+		if (IA_ToggleEscMenu)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[RoomPlayerController] SetupInputComponent 成功绑定 ESC 键"));
+			EnhancedInputComponent->BindAction(IA_ToggleEscMenu, ETriggerEvent::Started, this, &ARoomPlayerController::OnEscPressed);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RoomPlayerController] IA_ToggleEscMenu 未配置！ESC 菜单快捷键无法使用！"));
+		}
 	}
 }
 
@@ -561,5 +661,117 @@ void ARoomPlayerController::OnToggleChatAction()
 			}
 		}
 	}
+}
+
+void ARoomPlayerController::OnScoreboardPressed()
+{
+	// 战斗状态下才显示计分板
+	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+	{
+		if (FlowSubsystem->GetCurrentState() != EMatchState::Battleing)
+		{
+			return;
+		}
+	}
+
+	// 通过GameHUDWidget显示计分板
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		HUDWidget->ShowScoreboard();
+	}
+}
+
+void ARoomPlayerController::OnScoreboardReleased()
+{
+	// 通过GameHUDWidget隐藏计分板
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		HUDWidget->HideScoreboard();
+	}
+}
+
+void ARoomPlayerController::OnEscPressed()
+{
+	// 【诊断日志】：确认按键是否触发
+	UE_LOG(LogTemp, Log, TEXT("[ESC] OnEscPressed 被调用！当前 bIsEscMenuOpen=%s"), bIsEscMenuOpen ? TEXT("true") : TEXT("false"));
+
+	// 只有战斗状态下才能打开ESC菜单
+	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+	{
+		if (FlowSubsystem->GetCurrentState() != EMatchState::Battleing)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[ESC] 当前状态不是 Battleing，拒绝处理"));
+			return;
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[ESC] 状态检查通过，准备切换菜单"));
+
+	// ==========================================
+	// 【核心修复】：用 bool 标志位代替不可靠的可见性检测！
+	// 蓝图中的 Widget 可见性（Visible / SelfHitTestInvisible / Hidden）
+	// 都对 GetVisibility() != Collapsed 返回 true，无法区分菜单开关状态。
+	// 用成员变量 bIsEscMenuOpen 作为唯一可信真相源，彻底断绝对蓝图配置的依赖。
+	// ==========================================
+	if (bIsEscMenuOpen)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[ESC] 执行 HideEscMenu()"));
+		HideEscMenu();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("[ESC] 执行 ShowEscMenu()"));
+		ShowEscMenu();
+	}
+}
+
+void ARoomPlayerController::ShowEscMenu()
+{
+	bIsEscMenuOpen = true;
+	UE_LOG(LogTemp, Log, TEXT("[ESC] ShowEscMenu 开始，bIsEscMenuOpen=%s"), bIsEscMenuOpen ? TEXT("true") : TEXT("false"));
+
+	// 显示ESC菜单并切换输入模式
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[ESC] 获取到 GameHUDWidget 地址: %s"), *FString::Printf(TEXT("%p"), HUDWidget));
+		HUDWidget->ShowEscMenu();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ESC] ShowEscMenu 获取 GameHUDWidget 失败！"));
+	}
+
+	// 设置输入模式：UIOnly，鼠标可操作
+	SetInputMode(FInputModeUIOnly());
+	bShowMouseCursor = true;
+
+	// 暂停游戏
+	UGameplayStatics::SetGamePaused(this, true);
+	UE_LOG(LogTemp, Log, TEXT("[ESC] ShowEscMenu 完成"));
+}
+
+void ARoomPlayerController::HideEscMenu()
+{
+	bIsEscMenuOpen = false;
+	UE_LOG(LogTemp, Log, TEXT("[ESC] HideEscMenu 开始，bIsEscMenuOpen=%s"), bIsEscMenuOpen ? TEXT("true") : TEXT("false"));
+
+	// 隐藏ESC菜单并恢复游戏输入
+	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[ESC] 获取到 GameHUDWidget 地址: %s"), *FString::Printf(TEXT("%p"), HUDWidget));
+		HUDWidget->HideEscMenu();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ESC] HideEscMenu 获取 GameHUDWidget 失败！"));
+	}
+
+	// 恢复输入模式：GameOnly
+	SetInputMode(FInputModeGameOnly());
+	bShowMouseCursor = false;
+
+	// 恢复游戏
+	UGameplayStatics::SetGamePaused(this, false);
+	UE_LOG(LogTemp, Log, TEXT("[ESC] HideEscMenu 完成"));
 }
 

@@ -19,6 +19,15 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnCurrentRoundUpdated, int32, Curre
 // 声明模式切换的委托（UI据此隐藏/显示 Text_RemainingRounds）
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchModeChanged, ERoomMatchMode, NewMode);
 
+// 声明双方击杀人数变化的委托
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnTeamKillCountUpdated, int32, AttackerKills, int32, DefenderKills);
+
+// 声明进入结算状态的委托（倒计时归零时触发，3秒延迟后显示最终结果）
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnEnterSettlementDelegate, int32, AttackerKills, int32, DefenderKills);
+
+// 声明显示最终结算的委托（3秒延迟后触发，显示哪方获胜及总比分）
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnShowFinalSettlementDelegate, int32, AttackerWins, int32, DefenderWins);
+
 UCLASS()
 class METALSLUG01_API ARoomGameState : public AGameStateBase
 {
@@ -79,4 +88,79 @@ public:
 	// 记录当前房间的房主名称，全服同步！
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Global")
 	FString HostPlayerName;
+
+	// ==========================================
+	// 双方击杀统计
+	// ==========================================
+	
+	// 攻方总击杀人数
+	UPROPERTY(ReplicatedUsing = OnRep_TeamKillCount, BlueprintReadOnly, Category = "Room|Match")
+	int32 AttackerTotalKills = 0;
+
+	// 守方总击杀人数
+	UPROPERTY(ReplicatedUsing = OnRep_TeamKillCount, BlueprintReadOnly, Category = "Room|Match")
+	int32 DefenderTotalKills = 0;
+
+	// 击杀统计变化时的回调
+	UFUNCTION()
+	void OnRep_TeamKillCount();
+
+	// 击杀统计变化时的广播事件
+	UPROPERTY(BlueprintAssignable, Category = "Room|Match")
+	FOnTeamKillCountUpdated OnTeamKillCountUpdated;
+
+	// 服务器专用：增加指定队伍的击杀数
+	UFUNCTION(BlueprintCallable, Category = "Room|Match")
+	void AddTeamKill(ERoomTeam Team);
+
+	// 【网络架构修复】：强制广播击杀数给所有客户端
+	// 原因：OnRep_TeamKillCount 在 Listen Server 本地不会触发（仅触发于远程客户端）
+	// NetMulticast 确保包括房主在内的所有客户端都能收到刷新通知
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastRefreshKillCount(int32 AttackerKills, int32 DefenderKills);
+
+	// 服务器专用：重置双方击杀统计（每回合开始时调用）
+	UFUNCTION(BlueprintCallable, Category = "Room|Match")
+	void ResetTeamKillStats();
+
+	// ==========================================
+	// 结算系统
+	// ==========================================
+
+	// 攻方胜利局数
+	UPROPERTY(ReplicatedUsing = OnRep_WinStats, BlueprintReadOnly, Category = "Room|Settlement")
+	int32 AttackerWins = 0;
+
+	// 守方胜利局数
+	UPROPERTY(ReplicatedUsing = OnRep_WinStats, BlueprintReadOnly, Category = "Room|Settlement")
+	int32 DefenderWins = 0;
+
+	// 客户端接到胜负统计同步时的回调
+	UFUNCTION()
+	void OnRep_WinStats();
+
+	// 胜负统计变化时的广播事件（用于 UI 刷新胜负数显示）
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement")
+	FOnTeamKillCountUpdated OnWinStatsUpdated;
+
+	// 进入结算状态的广播事件（触发 UI 显示比分面板，3秒后显示最终结果）
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement")
+	FOnEnterSettlementDelegate OnEnterSettlement;
+
+	// 显示最终结算的广播事件（3秒延迟后触发，显示哪方获胜）
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement")
+	FOnShowFinalSettlementDelegate OnShowFinalSettlement;
+
+	// 服务器专用：执行当局结算（由 RoomGameMode 在倒计时归零时调用）
+	// 内部自动完成：判断胜负 -> 累加胜局数 -> 广播进入结算 -> 延迟3秒广播最终结果
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement")
+	void TriggerSettlement();
+
+private:
+	// 延迟3秒后广播最终结算（供内部 Timer 调用）
+	UFUNCTION()
+	void BroadcastFinalSettlement();
+
+	// 结算定时器句柄（持久化，避免局部变量在延迟期间失效）
+	FTimerHandle SettlementTimerHandle;
 };

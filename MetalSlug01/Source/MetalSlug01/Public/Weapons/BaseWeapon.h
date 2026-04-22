@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "BaseWeapon.generated.h"
 
 UCLASS()
@@ -49,10 +50,20 @@ protected:
 	// 记录这一刀已经砍中过的人，防止一刀对同一个人造成多次伤害
 	UPROPERTY()
 	TArray<AActor*> IgnoreActors;
-	
+
 	// 记录上一帧刀刃的起点和终点
 	FVector LastFrameStartLoc;
 	FVector LastFrameEndLoc;
+
+public:
+	// 获取最后造成的击杀方式（供 HUD 显示用）
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	EKillMethod GetLastKillMethod() const { return LastKillMethod; }
+
+protected:
+	// 最后造成的击杀方式（由 Tick 中判定并存储）
+	UPROPERTY()
+	EKillMethod LastKillMethod = EKillMethod::MeleeWeapon;
 	
 	
 	// ==========================================

@@ -51,6 +51,10 @@ protected:
 	// UE 标准做法：如果 UI 频繁更新状态，使用 NativeTick。如果需要优化，可改用内部 Timer
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 
+	// 响应双方击杀人数变化的回调
+	UFUNCTION()
+	void OnTeamKillCountChanged(int32 AttackerKills, int32 DefenderKills);
+
 	// 【架构重构】：暴露设计参数供 UMG 编辑器（蓝图）配置，彻底解耦 C++ 表现
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Style")
 	int32 WarningTimeThreshold = 10;
@@ -91,11 +95,14 @@ private:
 
 	// 最大图标显示数量（超出后不再添加）
 	int32 MaxIconDisplayCount = 10;
-	
+
+	// 是否已成功绑定 GameState 的标志位（防止每帧重复尝试绑定或重复订阅事件）
+	bool bIsBoundToGameState = false;
+
 	// 缓存 GameState 引用以避免每帧执行 Cast 或 Get 操作，提升性能
-    	UPROPERTY(Transient)
-    	ARoomGameState* CachedGameState;
-	
+	UPROPERTY(Transient)
+	ARoomGameState* CachedGameState;
+
 	// 用于记录上一秒的值，避免每帧都在重复更新 Text 和渲染（UI重绘开销很大）
 	int32 LastRenderedSeconds = -1;
 };
