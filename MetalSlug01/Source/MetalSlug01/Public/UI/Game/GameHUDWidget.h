@@ -12,6 +12,9 @@ class UMatchInfoWidget;
 class UKillFeedWidget;
 class UChatWidget;
 class UKillStreakWidget;
+class UScoreboardWidget;
+class UCrosshairWidget;
+class UEscMenuWidget;
 
 /**
  * 游戏主HUD组件
@@ -89,6 +92,38 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UPlayerStatusWidget* GetWidget_PlayerStatus() { return Widget_PlayerStatus; }
 
+	// 获取计分板Widget（供Controller调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	UScoreboardWidget* GetWidget_Scoreboard() { return Widget_Scoreboard; }
+
+	// 显示计分板（Tab按下时调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void ShowScoreboard();
+
+	// 隐藏计分板（Tab抬起时调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void HideScoreboard();
+
+	// 显示准星
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void ShowCrosshair();
+
+	// 隐藏准星
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void HideCrosshair();
+
+	// 显示ESC菜单
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void ShowEscMenu();
+
+	// 隐藏ESC菜单
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void HideEscMenu();
+
+	// 获取ESC菜单Widget（供Controller调用）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	UEscMenuWidget* GetWidget_EscMenu() { return Widget_EscMenu; }
+
 	// 获取聊天Widget（供外部访问）
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UChatWidget* GetWidget_Chat() { return Widget_Chat; }
@@ -139,4 +174,16 @@ protected:
 	// 连杀显示区域
 	UPROPERTY(meta = (BindWidget))
 	UKillStreakWidget* Widget_KillStreak;
+
+	// 计分板区域（屏幕中央矩形显示）
+	UPROPERTY(meta = (BindWidget))
+	UScoreboardWidget* Widget_Scoreboard;
+
+	// 准星（覆盖在最上层）
+	UPROPERTY(meta = (BindWidget))
+	UCrosshairWidget* Widget_Crosshair;
+
+	// ESC菜单面板（ESC键呼出）
+	UPROPERTY(meta = (BindWidget))
+	UEscMenuWidget* Widget_EscMenu;
 };

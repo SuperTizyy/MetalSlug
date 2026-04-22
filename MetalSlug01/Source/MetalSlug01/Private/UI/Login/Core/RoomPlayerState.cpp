@@ -1,19 +1,25 @@
 ﻿#include "UI/Login/Core/RoomPlayerState.h"
 // 【极其关键】：必须包含此头文件才能使用 DOREPLIFETIME 宏
-#include "Net/UnrealNetwork.h" 
+#include "Net/UnrealNetwork.h"
 
 ARoomPlayerState::ARoomPlayerState()
 {
 	// 默认初始化
 	CurrentTeam = ERoomTeam::None;
 	bIsReady = false;
-	
+
+	// 初始化计分板数据
+	RoomScore = 0;
+	RoomKills = 0;
+	RoomDeaths = 0;
+	RoomAssists = 0;
+
 	// 确保 PlayerState 开启网络同步
 	bReplicates = true;
-	
+
 	SelectedCharacterID = TEXT("Default");
 	//使用新的变量名，并初始化双武器
-	SelectedWeaponID1 = TEXT("Default"); 
+	SelectedWeaponID1 = TEXT("Default");
 	SelectedWeaponID2 = TEXT("Default");
 }
 
@@ -25,6 +31,12 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID1);
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID2); // 注册新变量的网络同步
+
+	// 注册计分板数据的网络同步
+	DOREPLIFETIME(ARoomPlayerState, RoomScore);
+	DOREPLIFETIME(ARoomPlayerState, RoomKills);
+	DOREPLIFETIME(ARoomPlayerState, RoomDeaths);
+	DOREPLIFETIME(ARoomPlayerState, RoomAssists);
 }
 
 // 只有客户端会在变量改变时自动执行这些 OnRep 函数
@@ -38,6 +50,65 @@ void ARoomPlayerState::OnRep_IsReady()
 {
 	// 准备状态发生变化，通知 UI 刷新
 	OnStateChanged.Broadcast();
+}
+
+void ARoomPlayerState::OnRep_ScoreboardData()
+{
+	// 计分板数据发生变化，通知 UI 刷新
+	OnScoreboardDataChanged.Broadcast();
+}
+
+void ARoomPlayerState::AddKillScore()
+{
+	// 只有服务器有权限修改计分板数据
+	if (HasAuthority())
+	{
+		RoomKills += 1;
+		RoomScore += KillScoreValue;
+
+		// 通知所有客户端刷新
+		OnRep_ScoreboardData();
+	}
+}
+
+void ARoomPlayerState::AddAssistScore()
+{
+	// 只有服务器有权限修改计分板数据
+	if (HasAuthority())
+	{
+		RoomAssists += 1;
+		RoomScore += AssistScoreValue;
+
+		// 通知所有客户端刷新
+		OnRep_ScoreboardData();
+	}
+}
+
+void ARoomPlayerState::AddDeath()
+{
+	// 只有服务器有权限修改计分板数据
+	if (HasAuthority())
+	{
+		RoomDeaths += 1;
+
+		// 通知所有客户端刷新
+		OnRep_ScoreboardData();
+	}
+}
+
+void ARoomPlayerState::ResetScoreboardStats()
+{
+	// 只有服务器有权限重置计分板数据
+	if (HasAuthority())
+	{
+		RoomScore = 0;
+		RoomKills = 0;
+		RoomDeaths = 0;
+		RoomAssists = 0;
+
+		// 通知所有客户端刷新
+		OnRep_ScoreboardData();
+	}
 }
 
 // 供服务端 PlayerController 调用的本地 Setter，不再需要是 RPC，因为 RPC 在 Controller 里已经走过了

@@ -8,6 +8,9 @@
 #include "UI/Game/Widgets/KillFeedWidget.h"
 #include "UI/Game/Widgets/ChatWidget.h"
 #include "UI/Game/Widgets/KillStreakWidget.h"
+#include "UI/Game/Widgets/ScoreboardWidget.h"
+#include "UI/Game/Widgets/CrosshairWidget.h"
+#include "UI/Game/Widgets/EscMenuWidget.h"
 
 bool UGameHUDWidget::Initialize()
 {
@@ -207,5 +210,66 @@ void UGameHUDWidget::ActivateChatInput()
 	if (Widget_Chat && !Widget_Chat->IsInputFocused())
 	{
 		Widget_Chat->SetInputFocused(true);
+	}
+}
+
+void UGameHUDWidget::ShowScoreboard()
+{
+	if (Widget_Scoreboard)
+	{
+		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
+		Widget_Scoreboard->RefreshScoreboard();
+	}
+}
+
+void UGameHUDWidget::HideScoreboard()
+{
+	if (Widget_Scoreboard)
+	{
+		Widget_Scoreboard->SetVisibility(ESlateVisibility::Hidden);
+	}
+}
+
+void UGameHUDWidget::ShowCrosshair()
+{
+	if (Widget_Crosshair)
+	{
+		Widget_Crosshair->SetVisibility(ESlateVisibility::HitTestInvisible);
+	}
+}
+
+void UGameHUDWidget::HideCrosshair()
+{
+	if (Widget_Crosshair)
+	{
+		Widget_Crosshair->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+void UGameHUDWidget::ShowEscMenu()
+{
+	// 显示ESC菜单
+	if (Widget_EscMenu)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[GameHUD] ShowEscMenu 设置 Widget_EscMenu 为 Visible"));
+		Widget_EscMenu->SetVisibility(ESlateVisibility::Visible);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameHUD] ShowEscMenu Widget_EscMenu 为空！"));
+	}
+}
+
+void UGameHUDWidget::HideEscMenu()
+{
+	// 隐藏ESC菜单
+	if (Widget_EscMenu)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[GameHUD] HideEscMenu 设置 Widget_EscMenu 为 Hidden"));
+		Widget_EscMenu->SetVisibility(ESlateVisibility::Hidden);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameHUD] HideEscMenu Widget_EscMenu 为空！"));
 	}
 }

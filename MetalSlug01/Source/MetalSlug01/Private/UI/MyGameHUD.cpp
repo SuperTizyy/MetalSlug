@@ -36,7 +36,7 @@ void AMyGameHUD::CreateGameHUD()
 		return;
 	}
 
-	// 1. 创建并隐藏主 HUD
+	// 1. 创建并隐藏主 HUD（包含准星、计分板等所有游戏UI）
 	if (GameHUDWidgetClass)
 	{
 		GameHUDWidget = CreateWidget<UGameHUDWidget>(PC, GameHUDWidgetClass);
@@ -49,21 +49,6 @@ void AMyGameHUD::CreateGameHUD()
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] GameHUDWidgetClass 蓝图中未配置！"));
-	}
-
-	// 2. 【修复】：创建并隐藏准星
-	if (CrosshairWidgetClass)
-	{
-		CrosshairWidget = CreateWidget<UUserWidget>(PC, CrosshairWidgetClass);
-		if (CrosshairWidget)
-		{
-			CrosshairWidget->SetVisibility(ESlateVisibility::Collapsed);
-			CrosshairWidget->AddToViewport(1); // Z-Order为1，确保准星压在血条等元素上方
-		}
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] CrosshairWidgetClass 蓝图中未配置！"));
 	}
 }
 
@@ -100,6 +85,9 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 			// 规范：使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
 			GameHUDWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
+			// 显示准星（由GameHUD统一管理）
+			GameHUDWidget->ShowCrosshair();
+
 			// 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
 			if (UWorld* World = GetWorld())
 			{
@@ -115,18 +103,15 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 			}
 		}
 		
-		if (CrosshairWidget)
-		{
-			// 准星必须是纯穿透，否则会阻挡鼠标射线导致无法开火
-			CrosshairWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
-		}
-		
 		UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] 切换至战斗UI，成功展示主HUD与准星"));
 	}
 	else 
 	{
-		// 如果是房间态或其它状态，隐藏所有战斗 UI
-		if (GameHUDWidget) GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
-		if (CrosshairWidget) CrosshairWidget->SetVisibility(ESlateVisibility::Collapsed);
+		// 如果是房间态或其它状态，隐藏所有战斗 UI（包括准星）
+		if (GameHUDWidget)
+		{
+			GameHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
+			GameHUDWidget->HideCrosshair();
+		}
 	}
 }

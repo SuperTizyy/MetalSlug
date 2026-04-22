@@ -132,6 +132,29 @@ public:
 protected:
 
 	// ==========================================
+	// 助攻追踪系统
+	// ==========================================
+public:
+	// 助攻判定时间窗口（秒）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Assist")
+	float AssistTimeWindow = 5.0f;
+
+	// 最后一次攻击目标的时间戳（用于判定助攻）
+	TMap<TWeakObjectPtr<AActor>, float> LastHitTimestamps;
+
+	// 检查是否可以给予助攻
+	bool CanGrantAssist(AActor* PotentialAssistant) const;
+
+	// 授予符合条件的玩家助攻得分
+	static void GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer);
+
+	// 当受到伤害时，通知可能的助攻者（供武器系统调用）
+	UFUNCTION(BlueprintCallable, Category = "Stats|Assist")
+	void NotifyDamageDealtTo(AActor* Victim);
+
+protected:
+
+	// ==========================================
 	// 生命/能量回复系统
 	// ==========================================
 protected:
@@ -397,6 +420,18 @@ public:
 	// 查询当前 ACE 排名并刷新 HUD 上的 ACE 文字颜色
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void RefreshACEWithRank();
+
+	// ==========================================
+	// 计分板系统 (Scoreboard)
+	// ==========================================
+public:
+	// 服务器广播击杀信息给所有客户端（用于更新计分板）
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_NotifyKill(AActor* VictimActor, AActor* AssistantActor);
+
+	// 获取击杀者 PlayerState
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard")
+	class ARoomPlayerState* GetRoomPlayerState() const;
 
 private:
 	// HUD 还未就绪时延迟刷新的辅助方法

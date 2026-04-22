@@ -191,8 +191,7 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ABaseCharacter, CurrentWeapon);
 	// 同步能量值
 	DOREPLIFETIME(ABaseCharacter, CurrentEnergy);
-	// 同步AC/ACE值
-	DOREPLIFETIME(ABaseCharacter, MaxAC);
+	// 同步AC/ACE值（注意：MaxAC 是配置常量，无需网络同步）
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
 }
@@ -471,7 +470,9 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 
 void ABaseCharacter::Move(const FInputActionValue& Value)
 {
-	if (bIsDead) return; // 死人不能动
+	// 死亡状态和暂停状态都不能移动
+	if (bIsDead) return;
+	if (UGameplayStatics::IsGamePaused(this)) return;
 	
 	FVector2D MovementVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
@@ -495,7 +496,9 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 
 void ABaseCharacter::Look(const FInputActionValue& Value)
 {
-	if (bIsDead) return; // 死人不能看
+	// 死亡状态和暂停状态都不能转动视角
+	if (bIsDead) return;
+	if (UGameplayStatics::IsGamePaused(this)) return;
 	
 	FVector2D LookAxisVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
@@ -511,7 +514,9 @@ void ABaseCharacter::Look(const FInputActionValue& Value)
 
 void ABaseCharacter::LightAttack_Pressed()
 {
-	if (bIsDead || !CurrentWeapon) return; // 死人不能砍人
+	// 死人、暂停状态、武器未装备都不能攻击
+	if (bIsDead || !CurrentWeapon) return;
+	if (UGameplayStatics::IsGamePaused(this)) return;
 	
 	// 下蹲攻击权限拦截！
 	// 如果你正蹲着，并且这把武器禁止下蹲攻击，直接 return，无视玩家按键！
@@ -572,7 +577,9 @@ void ABaseCharacter::ExecuteComboSequence()
 
 void ABaseCharacter::HeavyAttack()
 {
+	// 死人、武器未装备、暂停状态都不能重击
 	if (bIsDead || !CurrentWeapon) return;
+	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// 【新增】：重击同样需要检查下蹲权限
 	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
@@ -597,7 +604,9 @@ void ABaseCharacter::HeavyAttack()
 
 void ABaseCharacter::UseSkill()
 {
+	// 死亡状态和暂停状态都不能释放技能
 	if (bIsDead) return;
+	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// TODO: 技能系统具体实现
 	// 这里可以扩展为技能槽系统，支持多个技能
@@ -731,7 +740,32 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 	// 3. 判定生死！
 	if (CurrentHealth <= 0.0f)
 	{
-		Die(); 
+		// 服务器处理击杀结算
+		if (HasAuthority())
+		{
+			// 通知所有客户端更新计分板
+			Multicast_NotifyKill(this, nullptr);
+
+			// 获取伤害发起者（击杀者）
+			AController* DamageInstigatorController = nullptr;
+			if (EventInstigator)
+			{
+				DamageInstigatorController = EventInstigator;
+			}
+
+			// 查找并奖励助攻者
+			if (DamageInstigatorController)
+			{
+				ABaseCharacter* KillerCharacter = Cast<ABaseCharacter>(DamageInstigatorController->GetPawn());
+				if (KillerCharacter)
+				{
+					// 查找在最近5秒内攻击过受害者的所有玩家
+					GrantAssistsToEligiblePlayers(this, KillerCharacter);
+				}
+			}
+		}
+
+		Die();
 	}
 	
 	// 这里未来可以播放受击蒙太奇、喷血特效、或者死亡逻辑
@@ -845,8 +879,8 @@ void ABaseCharacter::EnableRagdoll()
 // 实现下蹲函数
 void ABaseCharacter::StartCrouch()
 {
-	// 只有没死的时候才能蹲
-	if (!bIsDead) 
+	// 只有没死、没暂停的时候才能蹲
+	if (!bIsDead && !UGameplayStatics::IsGamePaused(this))
 	{
 		Crouch(); // 调用 UE ACharacter 自带的神级下蹲函数
 	}
@@ -854,7 +888,7 @@ void ABaseCharacter::StartCrouch()
 
 void ABaseCharacter::StopCrouch()
 {
-	if (!bIsDead) 
+	if (!bIsDead && !UGameplayStatics::IsGamePaused(this))
 	{
 		UnCrouch(); // 调用自带的起立函数 (它会自动检测头顶有没有障碍物，有的话会保持蹲着！)
 	}
@@ -992,4 +1026,133 @@ void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 			CurrentWeapon = NewWeapon;
 		}
 	}
+}
+
+// ==========================================
+// 计分板系统实现
+// ==========================================
+ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
+{
+	if (APlayerState* PS = GetPlayerState<APlayerState>())
+	{
+		return Cast<ARoomPlayerState>(PS);
+	}
+	return nullptr;
+}
+
+void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AActor* AssistantActor)
+{
+	// 获取击杀者的 PlayerState 并更新计分板数据
+	if (ARoomPlayerState* PS = GetRoomPlayerState())
+	{
+		// 增加击杀者的击杀数和得分
+		PS->AddKillScore();
+	}
+
+	// 如果有助攻者，也更新助攻者的数据
+	if (AssistantActor)
+	{
+		ABaseCharacter* AssistantChar = Cast<ABaseCharacter>(AssistantActor);
+		if (AssistantChar)
+		{
+			if (ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState())
+			{
+				AssistantPS->AddAssistScore();
+			}
+		}
+	}
+}
+
+void ABaseCharacter::NotifyDamageDealtTo(AActor* Victim)
+{
+	// 只有服务器有权记录伤害
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// 记录攻击者和受害者的关联（用于判断助攻）
+	if (Victim && Victim != this)
+	{
+		// 记录当前时间戳
+		float CurrentTime = GetWorld()->GetTimeSeconds();
+		LastHitTimestamps.FindOrAdd(Victim) = CurrentTime;
+
+		// 在受害者的角色上记录攻击者（方便死亡时查找）
+		ABaseCharacter* VictimChar = Cast<ABaseCharacter>(Victim);
+		if (VictimChar)
+		{
+			VictimChar->LastHitTimestamps.FindOrAdd(this) = CurrentTime;
+		}
+	}
+}
+
+bool ABaseCharacter::CanGrantAssist(AActor* PotentialAssistant) const
+{
+	// 检查时间窗口
+	const float* LastHitTimePtr = LastHitTimestamps.Find(PotentialAssistant);
+	if (LastHitTimePtr)
+	{
+		float CurrentTime = GetWorld()->GetTimeSeconds();
+		return (CurrentTime - *LastHitTimePtr) <= AssistTimeWindow;
+	}
+	return false;
+}
+
+void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer)
+{
+	if (!Victim || !Killer)
+	{
+		return;
+	}
+
+	UWorld* World = Victim->GetWorld();
+	if (!World || !World->GetAuthGameMode())
+	{
+		return;
+	}
+
+	// 遍历受害者的最后攻击者记录
+	for (auto& HitPair : Victim->LastHitTimestamps)
+	{
+		AActor* AttackerActor = HitPair.Key.Get();
+		if (!AttackerActor)
+		{
+			continue;
+		}
+
+		// 排除击杀者本人
+		if (AttackerActor == Killer)
+		{
+			continue;
+		}
+
+		// 检查是否在时间窗口内
+		float TimeSinceHit = World->GetTimeSeconds() - HitPair.Value;
+		if (TimeSinceHit <= Victim->AssistTimeWindow)
+		{
+			// 符合条件的助攻者
+			ABaseCharacter* AssistantChar = Cast<ABaseCharacter>(AttackerActor);
+			if (AssistantChar)
+			{
+				// 获取助攻者的 PlayerState
+				if (ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState())
+				{
+					AssistantPS->AddAssistScore();
+
+					// 广播助攻信息给所有客户端
+					AssistantChar->Multicast_NotifyKill(Victim, nullptr);
+				}
+			}
+		}
+	}
+
+	// 更新击杀者的死亡次数
+	if (ARoomPlayerState* VictimPS = Victim->GetRoomPlayerState())
+	{
+		VictimPS->AddDeath();
+	}
+
+	// 清理时间戳
+	Victim->LastHitTimestamps.Empty();
 }
