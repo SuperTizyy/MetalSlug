@@ -176,6 +176,44 @@ enum class EKillMethod : uint8
 };
 
 // ==========================================
+// 武器挂载配置表 (Data-Driven 核心底座)
+// ==========================================
+USTRUCT(BlueprintType)
+struct FWeaponAttachmentConfig : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// 唯一标识符（用于查找，例如 "Warrior_Knife01"）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config")
+	FString ConfigID;
+
+	// 目标角色蓝图（可选。如果为空，则表示该配置适用于所有角色）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config")
+	TSoftClassPtr<class ABaseCharacter> TargetCharacter;
+
+	// 目标武器蓝图（可直接选择具体武器蓝图）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config")
+	TSubclassOf<class ABaseWeapon> WeaponBlueprint;
+
+	// 挂载到角色的哪个目标插槽上（例如 "WeaponSocket_R", "WeaponSocket_L", "Back_Socket"）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config")
+	FName SocketName;
+
+	// 相对于插槽的相对位置偏移（本地空间）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config", meta = (MakeDefaultValue = "0, 0, 0"))
+	FVector RelativeLocation = FVector::ZeroVector;
+
+	// 相对于插槽的相对旋转偏移（欧拉角，本地空间）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config", meta = (MakeDefaultValue = "0, 0, 0"))
+	FRotator RelativeRotation = FRotator::ZeroRotator;
+
+	// 相对于插槽的相对缩放偏移
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attachment Config", meta = (MakeDefaultValue = "1, 1, 1"))
+	FVector RelativeScale = FVector(1.0f);
+};
+
+// ==========================================
 // 击杀图标信息表 (Data-Driven 核心底座)
 // ==========================================
 USTRUCT(BlueprintType)
@@ -191,4 +229,37 @@ public:
 	// 击杀图标（用于 HUD 击杀信息显示）
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Kill Icon Data")
 	class UTexture2D* KillIcon;
+};
+
+// ==========================================
+// 击杀连杀类型枚举（用于连杀图标显示）
+// ==========================================
+UENUM(BlueprintType)
+enum class EKillStreakType : uint8
+{
+	None        UMETA(DisplayName = "无"),
+	Headshot    UMETA(DisplayName = "爆头"),
+	OneKill     UMETA(DisplayName = "一杀"),
+	TwoKills    UMETA(DisplayName = "二杀"),
+	ThreeKills  UMETA(DisplayName = "三杀"),
+	FourKills   UMETA(DisplayName = "四杀"),
+	FiveKills   UMETA(DisplayName = "五杀")
+};
+
+// ==========================================
+// 击杀连杀图标信息表 (Data-Driven 核心底座)
+// ==========================================
+USTRUCT(BlueprintType)
+struct FKillStreakIconInfo : public FTableRowBase
+{
+	GENERATED_BODY()
+
+public:
+	// 连杀类型枚举（作为查找键）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Kill Streak Icon Data")
+	EKillStreakType StreakType;
+
+	// 连杀图标（用于 HUD 连杀图标显示）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Kill Streak Icon Data")
+	class UTexture2D* StreakIcon;
 };

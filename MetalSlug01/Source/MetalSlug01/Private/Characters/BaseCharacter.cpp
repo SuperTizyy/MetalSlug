@@ -18,6 +18,21 @@
 #include "Kismet/GameplayStatics.h"
 #include "UI/Game/GameHUDWidget.h"
 #include "Systems/RoomPlayerController.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Components/AudioComponent.h"
+
+// 脚步声 CVar 定义（控制台命令: g.FootstepVolume）
+// 使用 IConsoleManager 在构造函数外静态定义
+static TAutoConsoleVariable<float> CVarFootstepVolume(
+	TEXT("g.FootstepVolume"),
+	1.0f,
+	TEXT("Footstep volume multiplier (0.0 to 2.0).\n")
+	TEXT("Default: 1.0"),
+	ECVF_Default);
+
+// 初始化静态成员
+float ABaseCharacter::FootstepVolumeCVar = 1.0f;
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -80,6 +95,10 @@ ABaseCharacter::ABaseCharacter()
 	
 	// 设置下蹲时的走路速度 (比如 300)
 	GetCharacterMovement()->MaxWalkSpeedCrouched = 300.0f;
+
+	// 初始化脚步声默认音效（指向已有资源，后续可在蓝图覆盖）
+	// 注意：需要在蓝图或 DataTable 中手动指定 Footstep_Deep_04.uasset
+	// 蓝图中设置：CharacterDetails -> Audio|Footstep -> WalkFootstepSound = Footstep_Deep_04
 }
 
 void ABaseCharacter::BeginPlay()
@@ -205,6 +224,75 @@ void ABaseCharacter::OnRep_Health()
 		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
 		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
 	}
+}
+
+// ==========================================
+// 武器网络复制回调（客户端同步）
+// ==========================================
+void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
+{
+	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
+		*GetNameSafe(OldWeapon), *GetNameSafe(CurrentWeapon), IsLocallyControlled(), HasAuthority());
+
+	// 服务器和本地控制的角色已经在 PossessedBy 中处理了，跳过
+	if (IsLocallyControlled() || HasAuthority())
+	{
+		return;
+	}
+
+	if (!CurrentWeapon)
+	{
+		return;
+	}
+
+	// 从 WeaponDataTable 反查 WeaponID
+	ARoomGameMode* GameMode = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
+	FString WeaponIDToFind;
+
+	if (GameMode && GameMode->WeaponDataTable)
+	{
+		static const FString WeaponContextString(TEXT("WeaponRepLookup"));
+		for (const FName& RowName : GameMode->WeaponDataTable->GetRowNames())
+		{
+			if (FWeaponInfo* Info = GameMode->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WeaponContextString))
+			{
+				if (Info->WeaponBlueprint && CurrentWeapon->IsA(Info->WeaponBlueprint))
+				{
+					WeaponIDToFind = RowName.ToString();
+					break;
+				}
+			}
+		}
+	}
+
+	// 查找挂载配置
+	FWeaponAttachmentConfig* AttachmentConfig = FindWeaponAttachmentConfig(CharacterID, WeaponIDToFind);
+
+	FName SocketName = TEXT("WeaponSocket_R");
+	FVector RelativeLocation = FVector::ZeroVector;
+	FRotator RelativeRotation = FRotator::ZeroRotator;
+
+	if (AttachmentConfig)
+	{
+		SocketName = AttachmentConfig->SocketName;
+		RelativeLocation = AttachmentConfig->RelativeLocation;
+		RelativeRotation = AttachmentConfig->RelativeRotation;
+	}
+
+	// 将武器挂载到插槽
+	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
+	CurrentWeapon->AttachToComponent(GetMesh(), AttachmentRules, SocketName);
+
+	if (!RelativeLocation.IsNearlyZero())
+	{
+		CurrentWeapon->SetActorRelativeLocation(RelativeLocation);
+	}
+	if (!RelativeRotation.IsNearlyZero())
+	{
+		CurrentWeapon->SetActorRelativeRotation(RelativeRotation);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 挂载完成: Socket=%s"), *SocketName.ToString());
 }
 
 void ABaseCharacter::OnRep_Energy()
@@ -800,7 +888,17 @@ void ABaseCharacter::Die()
 	if (!HasAuthority() || bIsDead) return;
 
 	// 告诉所有客户端：这个人死了，准备看布娃娃！
-	Multicast_Die(); 
+	Multicast_Die();
+
+	// 【核心修复】：复活定时器必须放在 PlayerController 上
+	// 如果定时器在角色上，死亡后角色被销毁（或者等待新角色替代），定时器会被清除
+	if (AController* MyController = GetController())
+	{
+		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(MyController))
+		{
+			PC->StartRespawnTimer(RespawnDelaySeconds);
+		}
+	}
 }
 
 void ABaseCharacter::Multicast_Die_Implementation()
@@ -815,10 +913,11 @@ void ABaseCharacter::Multicast_Die_Implementation()
 	}
 	
 	// ==========================================
-    // 【终极重构】：武器脱手掉落系统
+    // 【终极重构】：武器掉落与销毁系统
     // ==========================================
     if (CurrentWeapon)
     {
+    	// 方案 A：如果想让武器掉落在地上（推荐保留一段时间供拾取）
     	// 1. 彻底断开与死人手的骨骼绑定！
     	CurrentWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 
@@ -832,18 +931,35 @@ void ABaseCharacter::Multicast_Die_Implementation()
     		// 开启物理重力
     		WeaponMesh->SetSimulatePhysics(true);
     	}
+
+    	// 3. 【核心修复】：延迟销毁武器！
+    	// 立即将 CurrentWeapon 置空，防止 OnRep 触发 Attach 逻辑
+    	ABaseWeapon* WeaponToDestroy = CurrentWeapon;
+    	CurrentWeapon = nullptr;
+
+    	// 【关键时序】：武器销毁延迟必须小于 RespawnDelaySeconds（默认 3.0 秒）！
+    	// 确保武器一定在角色重生前被清理，防止新武器还没生成就处理旧武器的 OnRep。
+    	FTimerHandle WeaponDestroyTimer;
+    	GetWorldTimerManager().SetTimer(WeaponDestroyTimer, [WeaponToDestroy]()
+    	{
+    		// 使用 IsValid 检查对象是否有效（避免调用已销毁的对象）
+    		if (IsValid(WeaponToDestroy))
+    		{
+    			WeaponToDestroy->Destroy();
+    		}
+    	}, 1.0f, false);
     }
 	
 	// 开启 10 秒倒计时
 	FTimerHandle DissolveTimerHandle;
 	GetWorldTimerManager().SetTimer(DissolveTimerHandle, this, &ABaseCharacter::StartDissolveProcess, DissolveDelay, false);
 
-	// 1. 禁用操作和移动
+	// 1. 禁用移动（禁止角色操作移动，但不能禁用 Controller 输入！）
+	// 【核心修复】：绝对不能调用 PC->DisableInput()！
+	// ESC/Tab 是 PlayerController 级别的 Enhanced Input 回调，不是 Character 级别。
+	// 调用 DisableInput 会导致玩家死亡后无法呼出 ESC 菜单和计分板！
+	// 如果需要禁用 Character 的输入，应使用 APlayerController::SetIgnoreMoveInput(true) 等更细粒度的控制。
 	GetCharacterMovement()->DisableMovement();
-	if (APlayerController* PC = Cast<APlayerController>(GetController()))
-	{
-		PC->DisableInput(PC);
-	}
 
 	// 2. 核心防穿模：让胶囊体变透明，不阻挡别人走路，也不阻挡摄像机
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
@@ -988,7 +1104,27 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	// 仅在服务器执行
 	if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
 	{
-		SpawnAndEquipWeapon(PS->GetSelectedWeapon1ID());
+		// 设置当前角色ID（用于查找武器挂载配置）
+		CharacterID = PS->GetSelectedCharacterID();
+
+		// 【修复】：优先从 RoomGameMode 缓存读取武器ID（绕过 PlayerState 网络复制时序问题）
+		FString WeaponID = PS->GetSelectedWeapon1ID();
+		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+		{
+			FString CachedCharID;
+			FString CachedWeaponID;
+			if (GM->GetPlayerSpawnData(NewController->GetUniqueID(), CachedCharID, CachedWeaponID))
+			{
+				WeaponID = CachedWeaponID;
+				if (!CachedCharID.IsEmpty())
+				{
+					CharacterID = CachedCharID;
+				}
+				UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using cached weapon: %s, char: %s"), *CachedWeaponID, *CachedCharID);
+			}
+		}
+
+		SpawnAndEquipWeapon(WeaponID);
 	}
 }
 
@@ -1012,40 +1148,181 @@ void ABaseCharacter::RetryRefreshHUD()
 void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 {
 	// 工业级规范：指针与有效性校验
-	if (WeaponID.IsEmpty() || WeaponID == TEXT("Default")) return;
+	if (WeaponID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponID 为空，直接返回"));
+		return;
+	}
 
-	// 1. 从 GameMode 那里“借”一下数据表（或者在 Character 里配置）
-	// 这里建议在 Character 蓝图里也配一个 WeaponDataTable 变量，或者通过 GameMode 获取
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 开始生成武器: WeaponID=[%s], CharacterID=[%s]"), *WeaponID, *CharacterID);
+
+	// 1. 从 GameMode 那里获取武器数据表
 	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	if (!GM || !GM->WeaponDataTable) return;
+	if (!GM)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] GM 为空"));
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] GM 获取成功: %s"), *GetNameSafe(GM));
+
+	if (!GM->WeaponDataTable)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponDataTable 未设置，请检查 BP_RoomGameMode 中的 WeaponDataTable 配置"));
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponDataTable 有效"));
 
 	static const FString ContextString(TEXT("WeaponSpawnContext"));
 	FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponID), ContextString);
 
-	if (WeaponInfo && WeaponInfo->WeaponBlueprint)
+	if (!WeaponInfo)
 	{
-		// 2. 在服务器上生成武器
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.Owner = this;
-		SpawnParams.Instigator = this;
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponInfo 未找到: %s，请检查 WeaponDataTable 中是否存在该行"), *WeaponID);
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponInfo 查表成功: %s"), *WeaponID);
 
-		ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
-			WeaponInfo->WeaponBlueprint, 
-			GetActorLocation(), 
-			GetActorRotation(), 
-			SpawnParams
-		);
+	if (!WeaponInfo->WeaponBlueprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponBlueprint 为空，请在 WeaponDataTable 中为 %s 配置 WeaponBlueprint"), *WeaponID);
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponBlueprint 有效: %s"), *WeaponInfo->WeaponBlueprint->GetName());
 
-		if (NewWeapon)
+	// 2. 查找武器挂载配置
+	FWeaponAttachmentConfig* AttachmentConfig = FindWeaponAttachmentConfig(CharacterID, WeaponID);
+
+	// 3. 在服务器上生成武器
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.Instigator = this;
+
+	ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
+		WeaponInfo->WeaponBlueprint, 
+		GetActorLocation(), 
+		GetActorRotation(), 
+		SpawnParams
+	);
+
+	if (!NewWeapon)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] SpawnActor 失败"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 武器生成成功: %s"), *NewWeapon->GetName());
+
+	// 4. 确定挂载参数
+	FName SocketName = TEXT("WeaponSocket_R"); // 默认右手插槽
+	FVector RelativeLocation = FVector::ZeroVector;
+	FRotator RelativeRotation = FRotator::ZeroRotator;
+	FVector RelativeScale = FVector(1.0f, 1.0f, 1.0f);
+
+	// 如果找到了挂载配置，使用配置值
+	if (AttachmentConfig)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 使用挂载配置: Socket=%s, Loc=%s, Rot=%s"),
+			*AttachmentConfig->SocketName.ToString(),
+			*AttachmentConfig->RelativeLocation.ToString(),
+			*AttachmentConfig->RelativeRotation.ToString());
+		SocketName = AttachmentConfig->SocketName;
+		RelativeLocation = AttachmentConfig->RelativeLocation;
+		RelativeRotation = AttachmentConfig->RelativeRotation;
+		RelativeScale = AttachmentConfig->RelativeScale;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 未找到挂载配置，使用默认值"));
+	}
+
+	// 5. 将武器焊接到角色的插槽上
+	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
+	NewWeapon->AttachToComponent(GetMesh(), AttachmentRules, SocketName);
+
+	// 6. 应用相对位置、旋转、缩放偏移
+	if (!RelativeLocation.IsNearlyZero())
+	{
+		NewWeapon->SetActorRelativeLocation(RelativeLocation);
+	}
+	if (!RelativeRotation.IsNearlyZero())
+	{
+		NewWeapon->SetActorRelativeRotation(RelativeRotation);
+	}
+	if (!RelativeScale.Equals(FVector(1.0f, 1.0f, 1.0f)))
+	{
+		NewWeapon->SetActorRelativeScale3D(RelativeScale);
+	}
+
+	// 7. 更新 CurrentWeapon 指针，这会触发网络同步
+	CurrentWeapon = NewWeapon;
+}
+
+FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FString& InCharacterID, const FString& InWeaponID) const
+{
+	static const FString ContextString(TEXT("WeaponAttachmentLookup"));
+
+	if (!WeaponAttachmentDataTable)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[WeaponAttachment] WeaponAttachmentDataTable 未设置!"));
+		return nullptr;
+	}
+
+	UClass* CurrentCharacterClass = GetClass();
+
+	UE_LOG(LogTemp, Log, TEXT("[WeaponAttachment] 查找配置: CharacterID=%s, WeaponID=%s, CurrentClass=%s"), *InCharacterID, *InWeaponID, *CurrentCharacterClass->GetName());
+
+	TArray<FName> RowNames = WeaponAttachmentDataTable->GetRowNames();
+	FWeaponAttachmentConfig* FallbackMatch = nullptr;
+
+	for (const FName& RowName : RowNames)
+	{
+		FWeaponAttachmentConfig* Config = WeaponAttachmentDataTable->FindRow<FWeaponAttachmentConfig>(RowName, ContextString);
+		if (!Config) continue;
+
+		// 检查 TargetCharacter（软引用，需要 IsNull + LoadSynchronous）
+		if (!Config->TargetCharacter.IsNull())
 		{
-			// 3. 将武器焊接到角色的插槽上
-			// 确保你的 Skeleton 上有 "WeaponSocket_R" 这个名字的插槽
-			NewWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, FName("WeaponSocket_R"));
-            
-			// 4. 更新 CurrentWeapon 指针，这会触发网络同步
-			CurrentWeapon = NewWeapon;
+			UClass* TargetCharClass = Config->TargetCharacter.LoadSynchronous();
+			if (!TargetCharClass || TargetCharClass != CurrentCharacterClass) continue;
+		}
+
+		// 【关键修复】：如果数据表中配置了具体 WeaponBlueprint（硬引用），检查是否匹配
+		// WeaponBlueprint 是 TSubclassOf，直接 == nullptr 判断
+		if (Config->WeaponBlueprint != nullptr && !InWeaponID.IsEmpty())
+		{
+			ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
+			if (GM && GM->WeaponDataTable)
+			{
+				static const FString WeaponContextString(TEXT("WeaponBlueprintLookup"));
+				FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*InWeaponID), WeaponContextString);
+				if (WeaponInfo && !WeaponInfo->WeaponBlueprint->IsChildOf(Config->WeaponBlueprint))
+				{
+					continue;
+				}
+			}
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("[WeaponAttachment] 找到匹配配置: RowName=%s"), *RowName.ToString());
+
+		// 优先返回有具体 WeaponBlueprint 配置的（精确匹配）
+		if (Config->WeaponBlueprint != nullptr)
+		{
+			return Config;
+		}
+
+		// 退而求其次，记录一个通配配置作为 fallback
+		if (!FallbackMatch)
+		{
+			FallbackMatch = Config;
 		}
 	}
+
+	if (!FallbackMatch)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[WeaponAttachment] 未找到匹配配置"));
+	}
+
+	return FallbackMatch;
 }
 
 // ==========================================
@@ -1098,6 +1375,17 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AA
 					if (UGameHUDWidget* HUDWidget = RoomPC->GetGameHUDWidget())
 					{
 						HUDWidget->AddKillFeedMessage(KillerName, VictimName, LastKillMethod);
+
+						// 判断是否是本地玩家（击杀者）自己的 HUD
+						// 如果击杀者是当前控制的角色，则更新自己的连杀图标
+						if (IsLocallyControlled())
+						{
+							// 根据击杀方式判断是否是爆头
+							bool bIsHeadshot = (LastKillMethod == EKillMethod::PrimaryHeadshot ||
+								LastKillMethod == EKillMethod::SecondaryHeadshot ||
+								LastKillMethod == EKillMethod::MeleeHeadshot);
+							HUDWidget->OnPlayerKill(bIsHeadshot);
+						}
 					}
 				}
 			}
@@ -1210,4 +1498,82 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 
 	// 清理时间戳
 	Victim->LastHitTimestamps.Empty();
+}
+
+void ABaseCharacter::PlayFootstepSound(FVector Location)
+{
+	// 从 CVar 读取全局音量缩放
+	IConsoleManager& ConsoleMgr = IConsoleManager::Get();
+	static const TConsoleVariableData<float>* CVarData = ConsoleMgr.FindTConsoleVariableDataFloat(TEXT("g.FootstepVolume"));
+	float CVarVolume = CVarData ? CVarData->GetValueOnGameThread() : 1.0f;
+
+	// 如果全局音量为 0，直接跳过
+	if (CVarVolume <= 0.0f)
+	{
+		return;
+	}
+
+	// 根据当前状态选择脚步声资源
+	USoundBase* SoundToPlay = nullptr;
+
+	if (bIsCrouched && CrouchFootstepSound)
+	{
+		// 下蹲时使用下蹲专用脚步声
+		SoundToPlay = CrouchFootstepSound;
+	}
+	else
+	{
+		// 根据速度判断是行走还是奔跑
+		float Speed = GetVelocity().Length();
+		float RunSpeedThreshold = GetCharacterMovement()->MaxWalkSpeed;
+
+		if (Speed > RunSpeedThreshold && RunFootstepSound)
+		{
+			SoundToPlay = RunFootstepSound;
+		}
+		else if (WalkFootstepSound)
+		{
+			SoundToPlay = WalkFootstepSound;
+		}
+	}
+
+	if (!SoundToPlay)
+	{
+		return;
+	}
+
+	// 地面检测：查询物理材质，根据不同地面播放不同音效
+	FHitResult HitResult;
+	FVector TraceStart = Location + FVector(0.0f, 0.0f, 100.0f);
+	FVector TraceEnd = Location - FVector(0.0f, 0.0f, 150.0f);
+
+	FCollisionQueryParams QueryParams;
+	QueryParams.bReturnPhysicalMaterial = true;
+	QueryParams.AddIgnoredActor(this);
+
+	if (GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, FootstepTraceChannel, QueryParams))
+	{
+		if (UPhysicalMaterial* PhysMat = HitResult.PhysMaterial.Get())
+		{
+			// 根据物理材质可进一步扩展为不同地面不同音效
+			UE_LOG(LogTemp, VeryVerbose, TEXT("[Footstep] Surface=%s"),
+				*PhysMat->GetName());
+		}
+	}
+
+	// 随机音高变化（让脚步声更有自然感，不会机械重复）
+	float PitchMultiplier = UKismetMathLibrary::RandomFloatInRange(0.9f, 1.1f);
+
+	// 播放脚步声
+	UGameplayStatics::PlaySoundAtLocation(
+		this,
+		SoundToPlay,
+		Location,
+		FRotator::ZeroRotator,
+		CVarVolume, // 全局 CVar 缩放
+		PitchMultiplier
+	);
+
+	UE_LOG(LogTemp, Log, TEXT("[Footstep] 播放脚步声: Loc=(%.1f, %.1f, %.1f), Crouch=%d"),
+		Location.X, Location.Y, Location.Z, bIsCrouched);
 }

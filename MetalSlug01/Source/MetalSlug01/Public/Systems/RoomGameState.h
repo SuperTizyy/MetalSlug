@@ -161,6 +161,15 @@ private:
 	UFUNCTION()
 	void BroadcastFinalSettlement();
 
+	// 【网络架构修复】：NetMulticast 确保包括房主在内的所有客户端都能收到最终结算广播
+	// 替代方案：BroadcastFinalSettlement 中的 HasAuthority 检查导致纯客户端进程直接 return
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastShowFinalSettlement(int32 InAttackerWins, int32 InDefenderWins);
+
+	// 【网络架构修复】：NetMulticast 确保所有客户端都能收到进入结算通知（显示 Text_GameOver）
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastEnterSettlement(int32 InAttackerKills, int32 InDefenderKills);
+
 	// 结算定时器句柄（持久化，避免局部变量在延迟期间失效）
 	FTimerHandle SettlementTimerHandle;
 };

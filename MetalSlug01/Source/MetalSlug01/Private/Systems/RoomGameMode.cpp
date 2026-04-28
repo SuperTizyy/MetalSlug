@@ -17,6 +17,7 @@
 #include "Systems/RoomGameState.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Login/Core/RoomPlayerState.h"
+#include "Components/CapsuleComponent.h"
 
 ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -318,10 +319,45 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	UE_LOG(LogTemp, Warning, TEXT("[Spawn] HandlePlayerRequestSpawn called. Char='%s', Weapon='%s'"),
 		*CharRowName, *WeaponRowName);
 
-	// 同时写入 PlayerState（保证其他逻辑能用）
+	// 【核心修复】：优先从已有缓存读取，再与入参合并
+	// 避免空字符串覆盖已有的有效缓存数据
+	FString FinalCharID = CharRowName;
+	FString FinalWeaponID = WeaponRowName;
+
+	if (FPlayerSpawnData* ExistingCache = PlayerSpawnDataCache.Find(PlayerToSpawn->GetUniqueID()))
+	{
+		if (FinalCharID.IsEmpty())
+		{
+			FinalCharID = ExistingCache->CharID;
+		}
+		if (FinalWeaponID.IsEmpty())
+		{
+			FinalWeaponID = ExistingCache->WeaponID;
+		}
+	}
+
+	// 最终结果仍然为空，则用默认值兜底
+	if (FinalCharID.IsEmpty() || FinalCharID == TEXT("Default"))
+	{
+		FinalCharID = TEXT("Warrior");
+	}
+	if (FinalWeaponID.IsEmpty())
+	{
+		FinalWeaponID = TEXT("Knife");
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[Spawn] Resolved spawn data: Char='%s', Weapon='%s'"), *FinalCharID, *FinalWeaponID);
+
+	// 写入缓存（供复活时读取）
+	FPlayerSpawnData SpawnData;
+	SpawnData.CharID = FinalCharID;
+	SpawnData.WeaponID = FinalWeaponID;
+	PlayerSpawnDataCache.Add(PlayerToSpawn->GetUniqueID(), SpawnData);
+
+	// 同时写入 PlayerState
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SetPlayerLoadout(CharRowName, WeaponRowName, PS->GetSelectedWeapon2ID());
+		PS->SetPlayerLoadout(FinalCharID, FinalWeaponID, PS->GetSelectedWeapon2ID());
 	}
 
 	// ==========================================
@@ -345,14 +381,43 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	}
 	if (!CharClassToSpawn) CharClassToSpawn = DefaultPawnClass;
 
-	// Step 2：找出生点
-	AActor* BestStart = FindPlayerStart(PlayerToSpawn, TEXT(""));
+	// ==========================================
+	// 【新增】：根据队伍分配出生点
+	// ==========================================
 	FVector SpawnLoc = FVector::ZeroVector;
 	FRotator SpawnRot = FRotator::ZeroRotator;
-	if (BestStart)
+	AActor* AssignedSpawnPoint = nullptr;
+
+	// 获取玩家的队伍信息
+	ERoomTeam PlayerTeam = ERoomTeam::Attack; // 默认攻方
+	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		SpawnLoc = BestStart->GetActorLocation();
-		SpawnRot = BestStart->GetActorRotation();
+		PlayerTeam = PS->CurrentTeam;
+	}
+
+	// 尝试从队伍对应的出生点列表中分配
+	AssignedSpawnPoint = GetAvailableSpawnPointForTeam(PlayerTeam, true);
+
+	// 如果没有找到队伍对应的出生点，回退到引擎默认的 FindPlayerStart（兜底）
+	if (!AssignedSpawnPoint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] No team-specific spawn found, falling back to default FindPlayerStart"));
+		AssignedSpawnPoint = FindPlayerStart(PlayerToSpawn, TEXT(""));
+	}
+
+	if (AssignedSpawnPoint)
+	{
+		SpawnLoc = AssignedSpawnPoint->GetActorLocation();
+		SpawnRot = AssignedSpawnPoint->GetActorRotation();
+		UE_LOG(LogTemp, Log, TEXT("[Spawn] Using spawn point: %s for team %d at %s"),
+			*AssignedSpawnPoint->GetName(), (int32)PlayerTeam, *SpawnLoc.ToString());
+	}
+	else
+	{
+		// 兜底：如果完全找不到出生点，使用默认位置（地图原点上方）
+		SpawnLoc = FVector(0.0f, 0.0f, 200.0f);
+		SpawnRot = FRotator::ZeroRotator;
+		UE_LOG(LogTemp, Error, TEXT("[Spawn] WARNING: No spawn point found! Using default location at (0, 0, 200)"));
 	}
 
 	// Step 3：手动 Spawn 角色
@@ -374,6 +439,9 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualSpawn success: %s at %s"),
 			*SpawnedChar->GetName(), *SpawnLoc.ToString());
+
+		// 设置角色的 TeamID（用于战斗系统和AI识别）
+		SpawnedChar->TeamID = (PlayerTeam == ERoomTeam::Attack) ? 0 : 1;
 
 		// Step 4：Possess（会触发 PossessedBy -> SpawnAndEquipWeapon 自动装备武器）
 		PlayerToSpawn->Possess(SpawnedChar);
@@ -436,21 +504,27 @@ UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AControll
 //3. 生成完毕后，查表并派发武器（仅用于死亡复活流程，手动生成已在上方完成）
 void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 {
-	// 只有在没有缓存数据时才走父类流程（死亡复活）
+	if (!NewPlayer) return;
+
+	// 从缓存中读取角色和武器数据
 	FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(NewPlayer->GetUniqueID());
-	if (!CachedData)
+
+	// 如果有缓存数据，使用自定义的生成逻辑（确保使用基于队伍的出生点）
+	if (CachedData)
 	{
-		// 死亡复活：调用父类标准流程
-		Super::RestartPlayer(NewPlayer);
+		FString CharID = CachedData->CharID.IsEmpty() ? TEXT("Warrior") : CachedData->CharID;
+		FString WeaponID = CachedData->WeaponID.IsEmpty() ? TEXT("Knife") : CachedData->WeaponID;
+
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer (cached): Char='%s', Weapon='%s'"), *CharID, *WeaponID);
+
+		// 调用自定义生成函数，确保使用队伍对应的出生点
+		HandlePlayerRequestSpawn(NewPlayer, CharID, WeaponID);
 		return;
 	}
 
-	// 有缓存数据但仍要走 Possess 后的武器装备流程
-	if (NewPlayer && NewPlayer->GetPawn())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer (cached): Pawn=%s, WeaponID='%s'"),
-			*NewPlayer->GetPawn()->GetName(), *CachedData->WeaponID);
-	}
+	// 如果没有缓存数据（理论上不应该走到这里，但作为兜底）
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer: No cache found, falling back to Super"));
+	Super::RestartPlayer(NewPlayer);
 }
 
 
@@ -526,6 +600,9 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 {
 	UE_LOG(LogTemp, Warning, TEXT("[Spawn] SpawnAllPlayersIntoBattle called!"));
 
+	// 【新增】：在生成玩家前，先扫描并缓存地图中的所有出生点
+	ScanAndCachePlayerStarts(true);
+
 	// 遍历当前的 GameState 中所有成功建立连接的 PlayerState
 	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
 	{
@@ -559,6 +636,162 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 	}
 
 	BroadcastSystemMessage(TEXT("战斗开始！"));
+}
+
+// ==========================================
+// 【新增】：出生点扫描与分配系统实现
+// ==========================================
+
+void ARoomGameMode::ScanAndCachePlayerStarts(bool bReScan)
+{
+	// 如果已经扫描过且不是强制重新扫描，则跳过
+	if (bSpawnPointsScanned && !bReScan)
+	{
+		return;
+	}
+
+	// 清空旧的缓存数据
+	AttackSpawnPoints.Empty();
+	DefenseSpawnPoints.Empty();
+	OccupiedSpawnPoints.Empty();
+
+	// 获取当前地图中所有的 PlayerStart Actor
+	TArray<AActor*> AllPlayerStarts;
+	UGameplayStatics::GetAllActorsOfClass(this, APlayerStart::StaticClass(), AllPlayerStarts);
+
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Scanning %d PlayerStarts..."), AllPlayerStarts.Num());
+
+	// 遍历所有 PlayerStart，按名称前缀分类
+	for (AActor* Actor : AllPlayerStarts)
+	{
+		if (APlayerStart* PS = Cast<APlayerStart>(Actor))
+		{
+			FString StartName = PS->GetName();
+
+			// 大小写不敏感的比较，兼容 "attack", "Attack", "ATTACK" 等写法
+			if (StartName.Contains(TEXT("Attack"), ESearchCase::IgnoreCase) ||
+				StartName.Contains(TEXT("Attacker"), ESearchCase::IgnoreCase))
+			{
+				AttackSpawnPoints.Add(PS);
+				UE_LOG(LogTemp, Log, TEXT("[Spawn] Found Attack spawn point: %s"), *StartName);
+			}
+			else if (StartName.Contains(TEXT("Defense"), ESearchCase::IgnoreCase) ||
+				StartName.Contains(TEXT("Defender"), ESearchCase::IgnoreCase))
+			{
+				DefenseSpawnPoints.Add(PS);
+				UE_LOG(LogTemp, Log, TEXT("[Spawn] Found Defense spawn point: %s"), *StartName);
+			}
+			else
+			{
+				// 未分类的 PlayerStart，默认加入攻方（向后兼容）
+				AttackSpawnPoints.Add(PS);
+				UE_LOG(LogTemp, Warning, TEXT("[Spawn] PlayerStart '%s' has no team prefix, defaulting to Attack"), *StartName);
+			}
+		}
+	}
+
+	// 输出统计日志
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Spawn point scan complete: %d Attack, %d Defense"),
+		AttackSpawnPoints.Num(), DefenseSpawnPoints.Num());
+
+	// 如果没有找到任何出生点，输出警告
+	if (AttackSpawnPoints.Num() == 0 && DefenseSpawnPoints.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[Spawn] WARNING: No valid PlayerStarts found! Make sure your map has PlayerStarts named with 'Attack' or 'Defense' prefix."));
+	}
+
+	bSpawnPointsScanned = true;
+}
+
+AActor* ARoomGameMode::GetAvailableSpawnPointForTeam(ERoomTeam PlayerTeam, bool bRemoveOccupied)
+{
+	// 根据队伍选择对应的出生点列表
+	TArray<class APlayerStart*>* TeamSpawns = nullptr;
+
+	if (PlayerTeam == ERoomTeam::Attack)
+	{
+		TeamSpawns = &AttackSpawnPoints;
+	}
+	else if (PlayerTeam == ERoomTeam::Defense)
+	{
+		TeamSpawns = &DefenseSpawnPoints;
+	}
+
+	// 如果队伍无效或没有对应的出生点列表，返回 nullptr
+	if (!TeamSpawns || TeamSpawns->Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] No spawn points available for team %d"), (int32)PlayerTeam);
+		return nullptr;
+	}
+
+	// 【核心逻辑】：优先找一个未被占用的出生点
+	// 第一轮：遍历所有出生点，找一个未被占用的
+	for (APlayerStart* SpawnPoint : (*TeamSpawns))
+	{
+		if (SpawnPoint && !OccupiedSpawnPoints.Contains(SpawnPoint))
+		{
+			// 找到一个空闲的出生点
+			if (bRemoveOccupied)
+			{
+				OccupiedSpawnPoints.Add(SpawnPoint);
+				UE_LOG(LogTemp, Log, TEXT("[Spawn] Allocated spawn point: %s (Team=%d)"), *SpawnPoint->GetName(), (int32)PlayerTeam);
+			}
+			return SpawnPoint;
+		}
+	}
+
+	// 第二轮：如果所有出生点都被占用，随机选择一个（允许出生点复用，避免玩家无法复活）
+	// 这在玩家数量超过出生点数量时很重要
+	int32 RandomIndex = FMath::RandRange(0, TeamSpawns->Num() - 1);
+	APlayerStart* SelectedSpawn = (*TeamSpawns)[RandomIndex];
+
+	if (SelectedSpawn)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Spawn] All spawn points occupied, reusing: %s (Team=%d)"), *SelectedSpawn->GetName(), (int32)PlayerTeam);
+
+		// 即使复用，也需要更新占用记录（替换旧的占用者）
+		if (bRemoveOccupied)
+		{
+			OccupiedSpawnPoints.Add(SelectedSpawn);
+		}
+	}
+
+	return SelectedSpawn;
+}
+
+void ARoomGameMode::ReleaseSpawnPoint(AActor* PlayerStart)
+{
+	if (!PlayerStart)
+	{
+		return;
+	}
+
+	// 尝试将传入的 Actor 转换为 PlayerStart
+	if (APlayerStart* PS = Cast<APlayerStart>(PlayerStart))
+	{
+		if (OccupiedSpawnPoints.Contains(PS))
+		{
+			OccupiedSpawnPoints.Remove(PS);
+			UE_LOG(LogTemp, Log, TEXT("[Spawn] Released spawn point: %s"), *PS->GetName());
+		}
+	}
+}
+
+void ARoomGameMode::ResetAllSpawnPointOccupancy()
+{
+	OccupiedSpawnPoints.Empty();
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] All spawn point occupancy reset."));
+}
+
+bool ARoomGameMode::GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCharID, FString& OutWeaponID) const
+{
+	if (const FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(ControllerUniqueID))
+	{
+		OutCharID = CachedData->CharID;
+		OutWeaponID = CachedData->WeaponID;
+		return true;
+	}
+	return false;
 }
 
 void ARoomGameMode::StartMatchTimer()

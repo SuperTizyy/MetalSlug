@@ -1,4 +1,5 @@
 ﻿#include "Systems/RoomPlayerController.h"
+#include "Characters/BaseCharacter.h"
 
 #include "EnhancedInputComponent.h"
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
@@ -527,6 +528,34 @@ void ARoomPlayerController::ResetAllPlayerScoreboardStats()
 	}
 }
 
+void ARoomPlayerController::StartRespawnTimer(float InDelaySeconds)
+{
+	if (!HasAuthority()) return;
+
+	UE_LOG(LogTemp, Warning, TEXT("[Respawn] Starting respawn timer for %s, delay=%.1fs"), *GetName(), InDelaySeconds);
+
+	// 清理旧定时器
+	GetWorldTimerManager().ClearTimer(RespawnTimerHandle);
+
+	// 在 Controller 上启动复活定时器（不会随角色死亡而被销毁）
+	GetWorldTimerManager().SetTimer(
+		RespawnTimerHandle,
+		this,
+		&ARoomPlayerController::OnPlayerRespawnTimerFinished,
+		InDelaySeconds,
+		false);
+}
+
+void ARoomPlayerController::OnPlayerRespawnTimerFinished()
+{
+	if (!HasAuthority()) return;
+
+	UE_LOG(LogTemp, Warning, TEXT("[Respawn] OnPlayerRespawnTimerFinished for %s"), *GetName());
+
+	// 向服务器请求复活
+	Server_RequestSpawn();
+}
+
 // 验证函数
 bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName) { return true; }
 
@@ -606,12 +635,13 @@ void ARoomPlayerController::SetupInputComponent()
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleChat，聊天快捷键无法使用！"));
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleChat，聊天快捷键无法使用！请在蓝图 BP_RoomPlayerController 中配置"));
 		}
 
 		// 绑定Tab键：按下显示计分板，抬起隐藏计分板
 		if (IA_ToggleScoreboard)
 		{
+			UE_LOG(LogTemp, Log, TEXT("[RoomPlayerController] SetupInputComponent: IA_ToggleScoreboard 已绑定"));
 			// 按下时显示
 			EnhancedInputComponent->BindAction(IA_ToggleScoreboard, ETriggerEvent::Started, this, &ARoomPlayerController::OnScoreboardPressed);
 			// 抬起时隐藏
@@ -619,7 +649,7 @@ void ARoomPlayerController::SetupInputComponent()
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleScoreboard，计分板快捷键无法使用！"));
+			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] 未配置 IA_ToggleScoreboard，计分板快捷键无法使用！请在蓝图 BP_RoomPlayerController 中配置"));
 		}
 
 		// 绑定ESC键：切换ESC菜单显示/隐藏
@@ -665,24 +695,31 @@ void ARoomPlayerController::OnToggleChatAction()
 
 void ARoomPlayerController::OnScoreboardPressed()
 {
-	// 战斗状态下才显示计分板
-	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
-	{
-		if (FlowSubsystem->GetCurrentState() != EMatchState::Battleing)
-		{
-			return;
-		}
-	}
+	UE_LOG(LogTemp, Log, TEXT("[Scoreboard] OnScoreboardPressed 被调用！当前 bIsEscMenuOpen=%s"), bIsEscMenuOpen ? TEXT("true") : TEXT("false"));
 
 	// 通过GameHUDWidget显示计分板
 	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
 	{
+		if (HUDWidget->GetWidget_Scoreboard())
+		{
+			UE_LOG(LogTemp, Log, TEXT("[Scoreboard] Widget_Scoreboard 存在，开始显示"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[Scoreboard] OnScoreboardPressed: Widget_Scoreboard 为空！"));
+		}
 		HUDWidget->ShowScoreboard();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[Scoreboard] OnScoreboardPressed: GameHUDWidget 为空！"));
 	}
 }
 
 void ARoomPlayerController::OnScoreboardReleased()
 {
+	UE_LOG(LogTemp, Log, TEXT("[Scoreboard] OnScoreboardReleased 被调用"));
+
 	// 通过GameHUDWidget隐藏计分板
 	if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
 	{

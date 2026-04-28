@@ -7,6 +7,7 @@
 
 class ABaseCharacter;
 class ABaseWeapon;
+class APlayerStart;
 
 /**
  * 房间大厅的专属 GameMode（只在服务器/房主端运行）
@@ -190,4 +191,58 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Match")
 	void StartNextZombieRound();
 
+	// ==========================================
+	// 【新增】：攻守双方出生点管理系统
+	// ==========================================
+
+	/**
+	 * @brief 在游戏开始时扫描地图中的所有 PlayerStart，按名称前缀分类存储
+	 * 自动识别 "Attack" 前缀为攻方出生点，"Defense" 前缀为守方出生点
+	 * @param bReScan 是否强制重新扫描（默认只在首次或切换地图时扫描）
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	void ScanAndCachePlayerStarts(bool bReScan = false);
+
+	/**
+	 * @brief 根据玩家所属队伍获取一个未被占用的出生点
+	 * 复活时使用：优先分配未被占用的点，如果都用过了则随机分配
+	 * @param PlayerTeam 玩家所属队伍
+	 * @param bRemoveOccupied 分配后是否标记该点为已占用
+	 * @return 返回一个可用的出生点 Actor，如果找不到则返回 nullptr
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	class AActor* GetAvailableSpawnPointForTeam(ERoomTeam PlayerTeam, bool bRemoveOccupied = true);
+
+	/**
+	 * @brief 当玩家离开（断开连接或退出房间）时，释放其占用的出生点
+	 * @param PlayerStart 要释放的出生点
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	void ReleaseSpawnPoint(class AActor* PlayerStart);
+
+	/**
+	 * @brief 强制重置所有出生点的占用状态（在每回合/每局开始时调用）
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	void ResetAllSpawnPointOccupancy();
+
+	// 【新增】：获取玩家生成数据缓存的接口（供 BaseCharacter 复活时使用）
+	bool GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCharID, FString& OutWeaponID) const;
+
+protected:
+	// 攻方（Attack）出生点列表
+	UPROPERTY()
+	TArray<class APlayerStart*> AttackSpawnPoints;
+
+	// 守方（Defense）出生点列表
+	UPROPERTY()
+	TArray<class APlayerStart*> DefenseSpawnPoints;
+
+	// 已占用的出生点集合（使用 Set 便于快速查找和去重）
+	UPROPERTY()
+	TSet<class APlayerStart*> OccupiedSpawnPoints;
+
+	// 出生点扫描标记（防止重复扫描）
+	UPROPERTY()
+	bool bSpawnPointsScanned = false;
 };

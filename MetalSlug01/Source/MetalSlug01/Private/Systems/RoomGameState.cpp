@@ -220,7 +220,9 @@ void ARoomGameState::TriggerSettlement()
 	}
 
 	// 步骤2：立刻广播"进入结算状态"事件，让所有客户端显示比分面板
-	OnEnterSettlement.Broadcast(AttackerTotalKills, DefenderTotalKills);
+	// 【网络架构修复】：使用 NetMulticast 替代原有的直接 Broadcast
+	// 原因：纯客户端进程的 OnEnterSettlement.Broadcast() 不会触发，导致 Text_GameOver 不显示
+	MulticastEnterSettlement(AttackerTotalKills, DefenderTotalKills);
 
 	// 步骤3：通过 World Timer 延迟3秒，然后广播"显示最终结果"事件
 	UWorld* World = GetWorld();
@@ -234,15 +236,24 @@ void ARoomGameState::TriggerSettlement()
 
 void ARoomGameState::BroadcastFinalSettlement()
 {
-	// 仅在服务器端执行
-	if (!HasAuthority())
-	{
-		return;
-	}
+	// 【网络架构修复】：使用 NetMulticast 替代原有的 HasAuthority + Broadcast 方案
+	// 原问题：在 Listen Server 中，纯客户端进程的 HasAuthority() 返回 false，导致 OnShowFinalSettlement 从未广播给房主以外的玩家
+	// 解决方案：NetMulticast RPC 在服务器端调用时，引擎自动将函数调用复制到所有连接的客户端
+	MulticastShowFinalSettlement(AttackerWins, DefenderWins);
+}
 
-	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] BroadcastFinalSettlement: 显示最终结算！AttackerWins=%d, DefenderWins=%d"),
-		AttackerWins, DefenderWins);
+void ARoomGameState::MulticastShowFinalSettlement_Implementation(int32 InAttackerWins, int32 InDefenderWins)
+{
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] MulticastShowFinalSettlement: 攻方胜%d局, 守方胜%d局"), InAttackerWins, InDefenderWins);
 
-	// 广播最终结算事件，附带双方的总胜局数
-	OnShowFinalSettlement.Broadcast(AttackerWins, DefenderWins);
+	// 广播最终结算事件，附带双方的总胜局数（所有客户端均会执行此行）
+	OnShowFinalSettlement.Broadcast(InAttackerWins, InDefenderWins);
+}
+
+void ARoomGameState::MulticastEnterSettlement_Implementation(int32 InAttackerKills, int32 InDefenderKills)
+{
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] MulticastEnterSettlement: 攻方=%d, 守方=%d"), InAttackerKills, InDefenderKills);
+
+	// 广播进入结算事件，让所有客户端显示 Text_GameOver
+	OnEnterSettlement.Broadcast(InAttackerKills, InDefenderKills);
 }

@@ -55,17 +55,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void UpdateEnergyText(int32 Current, int32 Max);
 
-	// 公开接口：更新连杀数
+	// 公开接口：处理玩家击杀事件（简化：直接调用RecordKill，内部自动管理连杀数和计时）
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void UpdateKillStreak(int32 Kills);
-
-	// 公开接口：显示爆头击杀图标
-	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void ShowHeadshotIcon();
-
-	// 公开接口：显示普通击杀图标
-	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void ShowKillIcon();
+	void OnPlayerKill(bool bIsHeadshot);
 	
 	// 更新剩余局数文本的接口
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
@@ -210,9 +202,13 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UEscMenuWidget* Widget_EscMenu;
 
-	// 击杀图标数据表引用
+	// 击杀图标数据表引用（用于击杀信息显示）
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GameHUD")
 	class UDataTable* KillIconDataTable;
+
+	// 连杀图标数据表引用（用于连杀图标显示）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GameHUD")
+	class UDataTable* KillStreakIconDataTable;
 
 	// ==========================================
 	// 结算覆盖板（由 GameHUD 统一控制显示/隐藏）
@@ -231,4 +227,9 @@ protected:
 	// 返回大厅按钮点击回调
 	UFUNCTION()
 	void OnReturnToLobbyClicked();
+
+private:
+	// 暂存当局击杀数（由 OnEnterSettlement 传入，在 OnShowFinalSettlement 中使用）
+	int32 LastAttackerKills = 0;
+	int32 LastDefenderKills = 0;
 };

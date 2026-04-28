@@ -2,30 +2,18 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "KillStreakWidget.generated.h"
 
 class UImage;
-class UTextBlock;
 
 /**
- * 击杀图标类型枚举
- */
-UENUM(BlueprintType)
-enum class ECKillIconType : uint8
-{
-	NormalKill,     // 普通击杀
-	Headshot,       // 爆头
-	MultiKill,      // 多杀
-	DoubleKill,     // 双杀
-	TripleKill,     // 三杀
-	MegaKill,      // 疯狂杀戮
-	UltraKill,     // 终极击杀
-	MonsterKill    // 怪物杀手
-};
-
-/**
- * 连杀显示组件
- * 负责显示爆头图标、击杀图标、连杀图标和连杀数
+ * 击杀图标组件
+ * 简化逻辑：
+ * - 只使用 Image_Kill 显示击杀图标
+ * - 每次击杀开启1分钟计时，1分钟内持续击杀则累加连杀数
+ * - 爆头击杀使用 Headshot 图标，也记录在总击杀数内
+ * - 根据击杀数量查询数据表显示对应图标
  */
 UCLASS()
 class METALSLUG01_API UKillStreakWidget : public UUserWidget
@@ -33,51 +21,76 @@ class METALSLUG01_API UKillStreakWidget : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// 更新连杀数
+	// 记录一次击杀（每次击杀时调用，自动管理1分钟连杀计时）
 	UFUNCTION(BlueprintCallable, Category = "KillStreak")
-	void UpdateKillCount(int32 Kills);
+	void RecordKill(bool bIsHeadshot);
 
-	// 显示图标类型
+	// 获取当前连杀数
 	UFUNCTION(BlueprintCallable, Category = "KillStreak")
-	void ShowIcon(ECKillIconType IconType);
+	int32 GetCurrentKillStreak() const { return CurrentKillStreak; }
 
-	// 隐藏所有图标
+	// 获取连杀图标数据表
+	class UDataTable* GetKillStreakIconDataTable() const { return KillStreakIconDataTable; }
+
+	// 设置连杀图标数据表
 	UFUNCTION(BlueprintCallable, Category = "KillStreak")
-	void HideAllIcons();
+	void SetKillStreakIconDataTable(class UDataTable* InDataTable) { KillStreakIconDataTable = InDataTable; }
 
 protected:
 	virtual bool Initialize() override;
 
 private:
 	// ==========================================
-	// 图标显示
+	// 唯一图标显示组件
 	// ==========================================
-	UPROPERTY(meta = (BindWidget))
-	UImage* Image_Headshot;
-
 	UPROPERTY(meta = (BindWidget))
 	UImage* Image_Kill;
 
-	UPROPERTY(meta = (BindWidget))
-	UImage* Image_MultiKill;
+	// ==========================================
+	// 连杀计时系统
+	// ==========================================
+
+	// 当前连杀计数
+	int32 CurrentKillStreak = 0;
+
+	// 连杀计时器（1分钟内持续击杀则累加）
+	FTimerHandle KillStreakTimer;
+
+	// 连杀有效时间（秒）
+	float KillStreakDuration = 60.0f;
+
+	// 上一次是否爆头（用于图标优先级判断）
+	bool bLastKillWasHeadshot = false;
 
 	// ==========================================
-	// 连杀数显示
+	// 数据表（由 GameHUDWidget 注入，不暴露到蓝图）
 	// ==========================================
-	UPROPERTY(meta = (BindWidget))
-	UTextBlock* Text_KillCount;
+	class UDataTable* KillStreakIconDataTable;
 
-	// 图标显示定时器
+	// ==========================================
+	// 图标显示定时
+	// ==========================================
+
+	// 图标显示定时器（用于自动隐藏图标）
 	FTimerHandle IconDisplayTimer;
 
 	// 图标自动隐藏时间（秒）
-	float IconDisplayDuration = 2.0f;
+	float IconDisplayDuration = 3.0f;
 
-	// 隐藏图标定时回调
+	// 隐藏图标回调
 	UFUNCTION()
-	void HideCurrentIcon();
+	void HideIcon();
 
-	// 根据连杀数自动显示对应图标
+	// 连杀超时回调（1分钟无击杀则重置）
 	UFUNCTION()
-	void UpdateKillStreakIcon();
+	void OnKillStreakExpired();
+
+	// 根据击杀情况更新图标（核心逻辑）
+	void UpdateKillIcon();
+
+	// 从数据表获取图标
+	UTexture2D* GetKillStreakIcon(EKillStreakType StreakType);
+
+	// 根据击杀数转换为连杀类型
+	EKillStreakType GetKillStreakType(int32 Kills, bool bIsHeadshot) const;
 };
