@@ -87,19 +87,31 @@ class UTexture2D* UKillFeedEntryWidget::FindKillIcon(EKillMethod InKillMethod)
 	// 如果没有配置数据表或 Image 组件无效，直接返回
 	if (!KillIconDataTable || !Image_KillIcon)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("[KillFeed] FindKillIcon: KillIconDataTable=%s, Image_KillIcon=%s"),
+			*GetNameSafe(KillIconDataTable), *GetNameSafe(Image_KillIcon));
 		return nullptr;
 	}
 
+	bool bFound = false;
 	// 遍历数据表查找匹配的击杀方式
 	KillIconDataTable->ForeachRow<FKillIconInfo>(TEXT("LookupKillIcon"),
-		[InKillMethod, this](const FName& RowName, const FKillIconInfo& Row)
+		[InKillMethod, this, &bFound](const FName& RowName, const FKillIconInfo& Row)
 		{
+			UE_LOG(LogTemp, Log, TEXT("[KillFeed] Check row '%s': Row.KillMethod=%d, LookingFor=%d, Icon=%s"),
+				*RowName.ToString(), (int32)Row.KillMethod, (int32)InKillMethod, *GetNameSafe(Row.KillIcon));
 			if (Row.KillMethod == InKillMethod && Row.KillIcon)
 			{
 				// 找到匹配的行，设置图标
 				Image_KillIcon->SetBrushFromTexture(Row.KillIcon);
+				bFound = true;
+				UE_LOG(LogTemp, Log, TEXT("[KillFeed] MATCH! Set icon for KillMethod=%d from row '%s'"), (int32)InKillMethod, *RowName.ToString());
 			}
 		});
+
+	if (!bFound)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[KillFeed] FindKillIcon: No matching icon found for KillMethod=%d! Please check DT_KillIcon data table."), (int32)InKillMethod);
+	}
 
 	return nullptr;
 }

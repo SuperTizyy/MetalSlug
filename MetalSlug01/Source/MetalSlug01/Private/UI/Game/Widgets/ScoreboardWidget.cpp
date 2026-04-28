@@ -23,8 +23,31 @@ void UScoreboardWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
 
-	// 初始刷新一次数据
-	RefreshScoreboard();
+	// 初始化结算文本为隐藏状态（等待 ShowRoundSettlement / ShowFinalResult 时才显示）
+	if (Text_Settlement_AttackerKills)
+	{
+		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (Text_Settlement_DefenderKills)
+	{
+		Text_Settlement_DefenderKills->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (Text_AttackerWinResult)
+	{
+		Text_AttackerWinResult->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (Text_DefenderWinResult)
+	{
+		Text_DefenderWinResult->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	// 延迟刷新一次数据，等待服务器数据同步完成
+	// 如果直接调用 RefreshScoreboard()，此时 RoomPlayerState->CurrentTeam 还未从服务器复制
+	FTimerHandle RefreshTimer;
+	GetWorld()->GetTimerManager().SetTimer(RefreshTimer, this, &UScoreboardWidget::RefreshScoreboard, 0.5f, false);
 }
 
 void UScoreboardWidget::RefreshScoreboard()
@@ -79,15 +102,30 @@ void UScoreboardWidget::UpdateOrCreateEntry(ARoomPlayerState* PlayerState)
 
 	// 获取对应的VerticalBox
 	UVerticalBox* TargetBox = bIsAttacker ? VB_AttackerTeam : VB_DefenderTeam;
+	UVerticalBox* WrongBox = bIsAttacker ? VB_DefenderTeam : VB_AttackerTeam;
 	if (!TargetBox)
 	{
 		return;
 	}
 
-	// 查找是否已存在该玩家的条目
 	FString PlayerName = PlayerState->GetPlayerName();
-	UScoreboardEntryWidget* ExistingEntry = nullptr;
 
+	// 先在错误容器中查找并移除（防止玩家被错误添加到对面容器）
+	if (WrongBox)
+	{
+		for (int32 i = WrongBox->GetChildrenCount() - 1; i >= 0; i--)
+		{
+			UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(WrongBox->GetChildAt(i));
+			if (Entry && Entry->GetPlayerName() == PlayerName)
+			{
+				Entry->RemoveFromParent();
+				break;
+			}
+		}
+	}
+
+	// 在正确容器中查找是否已存在该玩家的条目
+	UScoreboardEntryWidget* ExistingEntry = nullptr;
 	for (int32 i = 0; i < TargetBox->GetChildrenCount(); i++)
 	{
 		UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(TargetBox->GetChildAt(i));
@@ -117,6 +155,15 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidget(ARoomPlayerState* P
 	if (!PlayerState)
 	{
 		return nullptr;
+	}
+
+	// 实时校验队伍归属，防止因服务器数据未同步导致玩家被添加到错误容器
+	bool bActualIsAttacker = (PlayerState->CurrentTeam == ERoomTeam::Attack);
+	if (bActualIsAttacker != bIsAttacker)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ScoreboardWidget] CreateEntryWidget: 玩家 %s 队伍不一致，参数=%d，实际=%d，已修正"),
+			*PlayerState->GetPlayerName(), bIsAttacker, bActualIsAttacker);
+		bIsAttacker = bActualIsAttacker;
 	}
 
 	// 获取目标容器
@@ -192,7 +239,7 @@ void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 
 	// 获取所有子控件
 	TArray<UWidget*> Children = VerticalBox->GetAllChildren();
-	if (Children.Num() <= 1)
+	if (Children.Num() == 0)
 	{
 		return;
 	}
@@ -205,62 +252,92 @@ void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 		int32 Kills;
 		int32 Deaths;
 		int32 Assists;
+		bool bBelongsToThisBox;
 		bool bIsCurrentPlayer;
 		UScoreboardEntryWidget* Widget;
 	};
 
 	TArray<FPlayerScoreData> PlayerDataList;
 
+	// 遍历收集时，同步检查队伍归属（防止玩家被错误添加后乱跳）
 	for (UWidget* Child : Children)
 	{
 		UScoreboardEntryWidget* EntryWidget = Cast<UScoreboardEntryWidget>(Child);
-		if (EntryWidget)
+		if (!EntryWidget)
 		{
-			FPlayerScoreData Data;
-			Data.PlayerName = EntryWidget->GetPlayerName();
-			Data.Widget = EntryWidget;
-			Data.bIsCurrentPlayer = (Data.PlayerName == GetCurrentPlayerName());
+			continue;
+		}
 
-			// 从GameState获取最新得分
-			UWorld* World = GetWorld();
-			if (World)
+		FPlayerScoreData Data;
+		Data.PlayerName = EntryWidget->GetPlayerName();
+		Data.Widget = EntryWidget;
+		Data.bIsCurrentPlayer = (Data.PlayerName == GetCurrentPlayerName());
+
+		// 从 GameState 查找该玩家的最新数据和队伍信息
+		Data.bBelongsToThisBox = false; // 默认不属于
+		UWorld* World = GetWorld();
+		if (World)
+		{
+			ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+			if (RoomGS)
 			{
-				ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
-				if (RoomGS)
+				for (APlayerState* PS : RoomGS->PlayerArray)
 				{
-					for (APlayerState* PS : RoomGS->PlayerArray)
+					ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS);
+					if (RoomPS && RoomPS->GetPlayerName() == Data.PlayerName)
 					{
-						ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS);
-						if (RoomPS && RoomPS->GetPlayerName() == Data.PlayerName)
-						{
-							Data.Score = RoomPS->GetScore();
-							Data.Kills = RoomPS->GetKills();
-							Data.Deaths = RoomPS->GetDeaths();
-							Data.Assists = RoomPS->GetAssists();
-							break;
-						}
+						Data.Score = RoomPS->GetScore();
+						Data.Kills = RoomPS->GetKills();
+						Data.Deaths = RoomPS->GetDeaths();
+						Data.Assists = RoomPS->GetAssists();
+						// 校验该玩家是否真正属于当前容器对应的队伍
+						bool bPlayerIsAttacker = (RoomPS->CurrentTeam == ERoomTeam::Attack);
+						Data.bBelongsToThisBox = (VerticalBox == VB_AttackerTeam) ? bPlayerIsAttacker : !bPlayerIsAttacker;
+						break;
 					}
 				}
 			}
+		}
 
-			PlayerDataList.Add(Data);
+		PlayerDataList.Add(Data);
+	}
+
+	// 清空当前容器
+	VerticalBox->ClearChildren();
+
+	// 按得分降序排序（只排序属于当前容器的条目）
+	TArray<FPlayerScoreData> BelongsList;
+	TArray<FPlayerScoreData> NotBelongsList;
+	for (const FPlayerScoreData& Data : PlayerDataList)
+	{
+		if (Data.bBelongsToThisBox)
+		{
+			BelongsList.Add(Data);
+		}
+		else
+		{
+			NotBelongsList.Add(Data);
 		}
 	}
 
-	// 按得分降序排序
-	PlayerDataList.Sort([](const FPlayerScoreData& A, const FPlayerScoreData& B)
+	BelongsList.Sort([](const FPlayerScoreData& A, const FPlayerScoreData& B)
 	{
 		return A.Score > B.Score;
 	});
 
-	// 重新添加子控件（按排序顺序）
-	VerticalBox->ClearChildren();
-
-	for (const FPlayerScoreData& Data : PlayerDataList)
+	// 重新添加属于当前容器的条目
+	for (const FPlayerScoreData& Data : BelongsList)
 	{
-		if (Data.Widget)
+		VerticalBox->AddChild(Data.Widget);
+	}
+
+	// 将不属于当前容器的条目移动到正确容器
+	for (const FPlayerScoreData& Data : NotBelongsList)
+	{
+		UVerticalBox* CorrectBox = (VerticalBox == VB_AttackerTeam) ? VB_DefenderTeam : VB_AttackerTeam;
+		if (CorrectBox && Data.Widget)
 		{
-			VerticalBox->AddChild(Data.Widget);
+			CorrectBox->AddChild(Data.Widget);
 		}
 	}
 }
@@ -337,11 +414,37 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 {
 	bIsInSettlementState = true;
 
+	// 强制从 GameState 获取最新数据（避免参数传递链路中数据丢失或同步延迟）
+	UWorld* World = GetWorld();
+	if (World)
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			// 直接使用 GameState 的复制属性，覆盖传入参数（确保显示的是服务器认可的数据）
+			AttackerKills = RoomGS->AttackerTotalKills;
+			DefenderKills = RoomGS->DefenderTotalKills;
+			UE_LOG(LogTemp, Log, TEXT("[ScoreboardWidget] ShowRoundSettlement: 从 GameState 读取击杀数，攻方=%d, 守方=%d"),
+				AttackerKills, DefenderKills);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[ScoreboardWidget] ShowRoundSettlement: GameState 未就绪，使用传入参数：攻方=%d, 守方=%d"),
+				AttackerKills, DefenderKills);
+		}
+	}
+
+	// 结算时强制刷新一遍玩家列表的队伍归属（防止 CurrentTeam 同步延迟导致玩家被错分到对面容器）
+	RefreshScoreboard();
+
 	// 刷新当局击杀数显示
 	if (Text_Settlement_AttackerKills)
 	{
 		Text_Settlement_AttackerKills->SetText(FText::FromString(FString::Printf(TEXT("攻方击杀总数：%d"), AttackerKills)));
 		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Visible);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_Settlement_AttackerKills 未绑定（BindWidget 为 nullptr）！请检查蓝图中是否正确绑定了该控件。"));
 	}
 
 	if (Text_Settlement_DefenderKills)
@@ -349,16 +452,28 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 		Text_Settlement_DefenderKills->SetText(FText::FromString(FString::Printf(TEXT("守方击杀总数：%d"), DefenderKills)));
 		Text_Settlement_DefenderKills->SetVisibility(ESlateVisibility::Visible);
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_Settlement_DefenderKills 未绑定（BindWidget 为 nullptr）！请检查蓝图中是否正确绑定了该控件。"));
+	}
 
 	// 胜负文字暂时隐藏，等最终结果广播后再显示
 	if (Text_AttackerWinResult)
 	{
 		Text_AttackerWinResult->SetVisibility(ESlateVisibility::Collapsed);
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_AttackerWinResult 未绑定！"));
+	}
 
 	if (Text_DefenderWinResult)
 	{
 		Text_DefenderWinResult->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_DefenderWinResult 未绑定！"));
 	}
 
 	// 强制显示计分板（结算状态下按 Tab 隐藏后，再按 Tab 应该能重新显示）
@@ -369,6 +484,19 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 
 void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 {
+	// 从 GameState 获取最新胜局数（避免参数传递链路中的同步问题）
+	UWorld* World = GetWorld();
+	if (World)
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			AttackerWins = RoomGS->AttackerWins;
+			DefenderWins = RoomGS->DefenderWins;
+			UE_LOG(LogTemp, Log, TEXT("[ScoreboardWidget] ShowFinalResult: 从 GameState 读取胜局数，攻方=%d, 守方=%d"),
+				AttackerWins, DefenderWins);
+		}
+	}
+
 	// 显示攻方胜利/平局文字
 	if (Text_AttackerWinResult)
 	{
@@ -382,8 +510,11 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 			Text_AttackerWinResult->SetText(FText::FromString(TEXT("平局")));
 			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
-		// 如果攻方输了则不显示文字（保持 Collapsed）
 		Text_AttackerWinResult->SetVisibility(AttackerWins >= DefenderWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowFinalResult: Text_AttackerWinResult 未绑定！"));
 	}
 
 	// 显示守方胜利/平局文字
@@ -399,8 +530,11 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 			Text_DefenderWinResult->SetText(FText::FromString(TEXT("平局")));
 			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
-		// 如果守方输了则不显示文字（保持 Collapsed）
 		Text_DefenderWinResult->SetVisibility(DefenderWins >= AttackerWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowFinalResult: Text_DefenderWinResult 未绑定！"));
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("[ScoreboardWidget] ShowFinalResult: 攻方胜%d局, 守方胜%d局"), AttackerWins, DefenderWins);

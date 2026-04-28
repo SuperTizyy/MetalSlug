@@ -41,9 +41,9 @@ protected:
 	// UI 组件绑定区域
 	// ==========================================
 
-	// 标签底色 (你要求的 Border 控件)
-	UPROPERTY(meta = (BindWidget))
-	UBorder* Border_Background;
+	// // 标签底色 (你要求的 Border 控件)
+	// UPROPERTY(meta = (BindWidget))
+	// UBorder* Border_Background;
 
 	// 玩家名称文本
 	UPROPERTY(meta = (BindWidget))

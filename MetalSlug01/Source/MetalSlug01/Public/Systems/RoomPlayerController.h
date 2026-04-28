@@ -175,6 +175,17 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_ToggleEscMenu;
 
+	// ==========================================
+	// 【复活系统】：定时器必须放在 PlayerController 上，防止角色死亡后定时器随 Actor 一起被销毁
+	// ==========================================
+	// 在 Controller 上启动复活倒计时（由角色死亡时调用，暴露为 public 供外部 Character 类访问）
+	UFUNCTION(BlueprintCallable, Category = "Gameplay|Respawn")
+	void StartRespawnTimer(float InDelaySeconds);
+
+	// 复活定时器回调（由 Controller 内部执行，protected 防止外部直接调用）
+	UFUNCTION()
+	void OnPlayerRespawnTimerFinished();
+
 protected:
 
 protected:
@@ -208,7 +219,7 @@ protected:
 	UFUNCTION()
 	void ResetAllPlayerScoreboardStats();
 
-private:
+protected:
 	// 延迟发送玩家信息，避开网络抢跑期
 	void DelayedSendPlayerInfo();
 
@@ -217,4 +228,7 @@ private:
 
 	// 定时器，让子弹飞一会儿
 	FTimerHandle HostLeaveTimer;
+
+	// 复活定时器句柄（放在 Controller 上，角色死亡时不会被清除）
+	FTimerHandle RespawnTimerHandle;
 };

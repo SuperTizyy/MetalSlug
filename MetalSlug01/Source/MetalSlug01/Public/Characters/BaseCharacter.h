@@ -133,6 +133,36 @@ public:
 protected:
 
 	// ==========================================
+	// 脚步声系统 (Footstep)
+	// ==========================================
+public:
+	// 脚步声 CVar 缩放系数（控制台命令: g.FootstepVolume）
+	// 默认值 1.0，设置为 0.0 可完全静音
+	static float FootstepVolumeCVar;
+
+	// 播放脚步声（供 AnimNotify 或其他系统调用）
+	UFUNCTION(BlueprintCallable, Category = "Audio")
+	void PlayFootstepSound(FVector Location);
+
+	// 下蹲时的脚步声资源（可蓝图配置）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Audio|Footstep")
+	TObjectPtr<USoundBase> CrouchFootstepSound;
+
+	// 奔跑时的脚步声资源（可蓝图配置）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Audio|Footstep")
+	TObjectPtr<USoundBase> RunFootstepSound;
+
+	// 行走时的脚步声资源（可蓝图配置，留空则用默认）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Audio|Footstep")
+	TObjectPtr<USoundBase> WalkFootstepSound;
+
+	// 地面检测通道（用于物理材质识别，从而播放不同地面音效）
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Audio|Footstep")
+	TEnumAsByte<ECollisionChannel> FootstepTraceChannel = ECC_Visibility;
+
+protected:
+
+	// ==========================================
 	// 助攻追踪系统
 	// ==========================================
 public:
@@ -204,6 +234,10 @@ protected:
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_Die();
 
+	// 复活延迟时间（秒），死亡时传递给 PlayerController 启动定时器
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Respawn")
+	float RespawnDelaySeconds = 3.0f;
+
 	// ==========================================
 	// 击杀奖励系统
 	// ==========================================
@@ -272,14 +306,29 @@ protected:
 	// ==========================================
 protected:
 	// 角色手里当前拿着的武器！(通过它来获取动画和执行判定)
-	UPROPERTY(Replicated,VisibleAnywhere, BlueprintReadOnly, Category = "Combat")
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Combat", meta = (ReplicateUsing = "OnRep_CurrentWeapon"))
 	class ABaseWeapon* CurrentWeapon;
+
+	// 武器指针改变时的回调（网络复制通知，客户端需要用这个来同步生成武器）
+	UFUNCTION()
+	void OnRep_CurrentWeapon(class ABaseWeapon* OldWeapon);
+
+	// 武器挂载配置数据表（用于配置不同角色+武器的挂载点、偏移等）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Attachment")
+	class UDataTable* WeaponAttachmentDataTable;
+
+	// 当前角色ID（用于查找挂载配置）
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Attachment")
+	FString CharacterID;
 
 	bool bIsAttacking;            // 全局攻击锁：正在挥刀吗？
 	bool bCanReceiveInput;        // 绿灯亮起：现在处于输入区间内吗？
 	bool bSaveAttack;             // 缓存区：玩家在这个区间内点击过鼠标吗？
 	bool bIsHoldingLightAttack;   // 按住状态：玩家是一直死死按着左键没松吗？
 	int32 ComboIndex;             // 当前连招段数 (1 或 2)
+
+	// 根据角色ID和武器ID查找挂载配置
+	struct FWeaponAttachmentConfig* FindWeaponAttachmentConfig(const FString& InCharacterID, const FString& InWeaponID) const;
 
 	// 连招核心执行逻辑
 	void ExecuteComboSequence();

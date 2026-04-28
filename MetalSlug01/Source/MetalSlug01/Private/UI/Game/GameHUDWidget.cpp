@@ -2,6 +2,8 @@
 #include "Systems/RoomPlayerController.h"
 
 #include "Systems/RoomGameState.h"
+#include "Systems/RoomGameMode.h"
+#include "UI/Login/Data/StaticTable.h"
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
 #include "UI/Game/Widgets/WeaponPanelWidget.h"
 #include "UI/Game/Widgets/MatchInfoWidget.h"
@@ -33,6 +35,24 @@ void UGameHUDWidget::NativeConstruct()
 	if (Widget_KillFeed && KillIconDataTable)
 	{
 		Widget_KillFeed->SetKillIconDataTable(KillIconDataTable);
+	}
+
+	// 初始化连杀图标数据表
+	if (Widget_KillStreak)
+	{
+		if (KillStreakIconDataTable)
+		{
+			Widget_KillStreak->SetKillStreakIconDataTable(KillStreakIconDataTable);
+			UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] KillStreakIconDataTable 已设置: %s"), *KillStreakIconDataTable->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] KillStreakIconDataTable 未配置！"));
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] Widget_KillStreak 为空！"));
 	}
 
 	// 绑定聊天消息事件：当 Widget_Chat 有消息时，发送到服务器
@@ -160,28 +180,19 @@ void UGameHUDWidget::UpdateEnergyText(int32 Current, int32 Max)
 	}
 }
 
-void UGameHUDWidget::UpdateKillStreak(int32 Kills)
+void UGameHUDWidget::OnPlayerKill(bool bIsHeadshot)
 {
 	if (Widget_KillStreak)
 	{
-		Widget_KillStreak->UpdateKillCount(Kills);
+		UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] OnPlayerKill: 调用 RecordKill"));
+		Widget_KillStreak->RecordKill(bIsHeadshot);
 	}
-}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] OnPlayerKill: Widget_KillStreak 为空！"));
+	}
 
-void UGameHUDWidget::ShowHeadshotIcon()
-{
-	if (Widget_KillStreak)
-	{
-		Widget_KillStreak->ShowIcon(ECKillIconType::Headshot);
-	}
-}
-
-void UGameHUDWidget::ShowKillIcon()
-{
-	if (Widget_KillStreak)
-	{
-		Widget_KillStreak->ShowIcon(ECKillIconType::NormalKill);
-	}
+	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] OnPlayerKill: bIsHeadshot=%d"), bIsHeadshot);
 }
 
 void UGameHUDWidget::UpdateRemainingRoundsText(int32 RemainingRounds)
@@ -283,6 +294,7 @@ void UGameHUDWidget::ActivateChatInput()
 
 void UGameHUDWidget::ShowScoreboard()
 {
+	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] ShowScoreboard: Widget_Scoreboard=%s"), *GetNameSafe(Widget_Scoreboard));
 	if (Widget_Scoreboard)
 	{
 		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
@@ -346,23 +358,20 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills)
 {
 	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnEnterSettlement: 攻方=%d, 守方=%d"), AttackerKills, DefenderKills);
 
+	// 暂存当局击杀数，供 3 秒后 OnShowFinalSettlement 使用
+	LastAttackerKills = AttackerKills;
+	LastDefenderKills = DefenderKills;
+
 	// 隐藏 MatchInfo（倒计时归零，不再需要显示）
 	if (Widget_MatchInfo)
 	{
 		Widget_MatchInfo->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
-	// 强制显示计分板并切换到结算状态
-	if (Widget_Scoreboard)
-	{
-		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
-		Widget_Scoreboard->ShowRoundSettlement(AttackerKills, DefenderKills);
-	}
-
 	// 隐藏准星
 	HideCrosshair();
 
-	// 显示游戏结束文本
+	// 显示游戏结束文本（3秒后由 OnShowFinalSettlement 隐藏）
 	if (Text_GameOver)
 	{
 		Text_GameOver->SetVisibility(ESlateVisibility::Visible);
@@ -373,11 +382,23 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills)
 	{
 		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Collapsed);
 	}
+
+	// 隐藏计分板（3秒结算动画期间不显示，等 OnShowFinalSettlement 再展示）
+	if (Widget_Scoreboard)
+	{
+		Widget_Scoreboard->SetVisibility(ESlateVisibility::Collapsed);
+	}
 }
 
-void UGameHUDWidget::OnShowFinalSettlement(int32 AttackerWins, int32 DefenderWins)
+void UGameHUDWidget::OnShowFinalSettlement(int32 AttackerWins, int32 DefenderWills)
 {
-	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnShowFinalSettlement: 攻方胜%d局, 守方胜%d局"), AttackerWins, DefenderWins);
+	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnShowFinalSettlement: 攻方胜%d局, 守方胜%d局"), AttackerWins, DefenderWills);
+
+	// 隐藏游戏结束文本（3秒显示时间已到）
+	if (Text_GameOver)
+	{
+		Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
+	}
 
 	// 显示结算覆盖板（Border 覆盖整个屏幕）
 	if (Border_SettlementOverlay)
@@ -385,16 +406,60 @@ void UGameHUDWidget::OnShowFinalSettlement(int32 AttackerWins, int32 DefenderWin
 		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Visible);
 	}
 
-	// 显示最终胜负结果（更新计分板上的胜负文字）
+	// 显示计分板 + 当局击杀数 + 最终胜负
 	if (Widget_Scoreboard)
 	{
-		Widget_Scoreboard->ShowFinalResult(AttackerWins, DefenderWins);
+		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
+		Widget_Scoreboard->ShowRoundSettlement(LastAttackerKills, LastDefenderKills);
+		Widget_Scoreboard->ShowFinalResult(AttackerWins, DefenderWills);
 	}
 
 	// 显示返回大厅按钮
 	if (Button_ReturnToLobby)
 	{
 		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Visible);
+	}
+}
+
+void UGameHUDWidget::UpdateWeaponIconFromID(const FString& WeaponID)
+{
+	if (WeaponID.IsEmpty()) return;
+
+	if (!Widget_WeaponPanel)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: Widget_WeaponPanel 未绑定！请检查 WBP_GameHUDWidget 蓝图中是否正确拖入了 WeaponPanel 子控件"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: Widget_WeaponPanel=%s, WeaponID=%s"), *Widget_WeaponPanel->GetName(), *WeaponID);
+
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameMode* GM = Cast<ARoomGameMode>(World->GetAuthGameMode()))
+		{
+			if (!GM->WeaponDataTable)
+			{
+				UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: WeaponDataTable 未配置"));
+				return;
+			}
+
+			static const FString ContextString(TEXT("HUD_WeaponIconLookup"));
+			FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponID), ContextString);
+			if (!WeaponInfo)
+			{
+				UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: DT_WeaponInfo 中找不到 WeaponID=%s"), *WeaponID);
+				return;
+			}
+			if (!WeaponInfo->WeaponIcon)
+			{
+				UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: WeaponID=%s 的 WeaponIcon 字段为空，请在 DT_WeaponInfo 中为该行配置图标资源"), *WeaponID);
+				return;
+			}
+
+			UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] UpdateWeaponIconFromID: 找到图标资源=%s, 准备刷新 Image_MeleeWeapon"), *WeaponInfo->WeaponIcon->GetName());
+			Widget_WeaponPanel->UpdateMeleeWeaponIcon(WeaponInfo->WeaponIcon);
+			UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] 刷新武器图标完成: %s"), *WeaponID);
+		}
 	}
 }
 

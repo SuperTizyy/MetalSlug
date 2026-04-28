@@ -61,6 +61,13 @@ bool URoomInsidePage::Initialize()
 	bIsReady = false;
 	if (Text_ReadyStatus) Text_ReadyStatus->SetText(FText::FromString(TEXT("准备")));
 
+	// 【诊断】检查聊天列表控件是否绑定成功，若失败说明蓝图控件名称与 C++ 属性名不匹配
+	if (!ScrollBox_ChatList)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[RoomInsidePage] 严重错误：ScrollBox_ChatList 未绑定！请确认 WBP_RoomInsidePage 蓝图中存在同名 ScrollBox 控件（区分大小写）。"));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：ScrollBox_ChatList 未绑定！请检查蓝图控件命名。"));
+	}
+
 	// 绑定聊天输入框的回车事件
 	if (Input_Chat){Input_Chat->OnTextCommitted.AddDynamic(this, &URoomInsidePage::OnChatTextCommitted);}
 
