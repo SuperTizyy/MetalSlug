@@ -26,6 +26,18 @@ bool UGameMenuPage::Initialize()
 	if (Btn_MultiplePlayer) Btn_MultiplePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnMultiplePlayerClicked);
 	if (Btn_Leaderboard) Btn_Leaderboard->OnClicked.AddDynamic(this, &UGameMenuPage::OnLeaderboardClicked);
 
+	// 绑定活动中心按钮事件
+	if (Btn_ActivityCenter)
+	{
+		// 防呆设计：先清理旧绑定再添加新绑定，防止多重绑定
+		Btn_ActivityCenter->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
+		Btn_ActivityCenter->OnClicked.AddDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
+	}
+	else
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_ActivityCenter 为空！请检查蓝图变量名是否完全匹配（区分大小写）！"));
+	}
+
 	// 绑定返回登录按钮事件
 	if (Btn_BackToLogin)
 	{
@@ -91,6 +103,44 @@ void UGameMenuPage::OnLeaderboardClicked()
 	{
 		Text_Hint->SetText(FText::FromString(TEXT("正在向服务器请求排行榜数据...")));
 		Text_Hint->SetVisibility(ESlateVisibility::Visible);
+	}
+}
+
+void UGameMenuPage::OnActivityCenterClicked()
+{
+	// 点击活动中心按钮时，动态创建并显示活动导航菜单页面
+	// 检查是否在蓝图编辑器中配置了活动中心页面类
+	if (!ActivityNavMenuClass)
+	{
+		// 如果未配置活动中心页面类，输出错误日志
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, TEXT("[GameMenuPage 错误] ActivityNavMenuClass 未配置！请在蓝图类默认值中设置 WBP_ActivityNavMenu。"));
+		}
+		return;
+	}
+
+	// 使用 CreateWidget 在当前世界（World）中动态创建活动导航菜单的实例
+	UUserWidget* ActivityNavMenuWidget = CreateWidget<UUserWidget>(GetWorld(), ActivityNavMenuClass);
+
+	// 确保创建成功
+	if (ActivityNavMenuWidget)
+	{
+		// 将活动中心页面添加到玩家的屏幕上（层级高于菜单）
+		// AddToViewport 会自动将控件置顶显示，覆盖当前菜单
+		ActivityNavMenuWidget->AddToViewport();
+
+		// 【重要】保留当前菜单页面：与"多人模式"按钮不同，
+		// 活动中心是一个覆盖层（Overlay），用户关闭活动页面后应返回到菜单，
+		// 因此不调用 RemoveFromParent() 销毁菜单页面
+	}
+	else
+	{
+		// 创建活动中心页面失败
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, TEXT("[GameMenuPage 错误] ActivityNavMenuWidget 创建失败！"));
+		}
 	}
 }
 

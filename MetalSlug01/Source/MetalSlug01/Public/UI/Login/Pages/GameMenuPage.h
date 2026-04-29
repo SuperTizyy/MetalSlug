@@ -13,7 +13,7 @@ class UTextBlock;
 
 /**
  * 游戏主菜单页面
- * 负责处理单人模式、双人模式、排行榜及退出登录的逻辑跳转
+ * 负责处理单人模式、双人模式、排行榜、活动中心及退出登录的逻辑跳转
  */
 UCLASS()
 class METALSLUG01_API UGameMenuPage : public UUserWidget
@@ -23,9 +23,14 @@ class METALSLUG01_API UGameMenuPage : public UUserWidget
 public:
 	
 	// 暴露给蓝图的变量，用于在编辑器中选择你要跳转的局域网大厅蓝图类（WBP_LANRoom）
-	// EditDefaultsOnly 表示只能在蓝图的“类默认值”面板中修改
+	// EditDefaultsOnly 表示只能在蓝图的"类默认值"面板中修改
 	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
 	TSubclassOf<class UUserWidget> LANRoomClass;
+
+	// 活动中心页面类，在编辑器中选择 WBP_ActivityNavMenu 蓝图类
+	// 点击"活动中心"按钮后将动态创建并显示此页面
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<class UUserWidget> ActivityNavMenuClass;
 	
 protected:
 	// 重写初始化函数，用于绑定各个按钮的点击事件
@@ -35,19 +40,23 @@ protected:
 	// UI 组件绑定区域 (名称必须与蓝图中的控件严格一致)
 	// ==========================================
 
-	// 绑定蓝图中的“单人模式”按钮
+	// 绑定蓝图中的"单人模式"按钮
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_SinglePlayer;
 
-	// 绑定蓝图中的“多人模式”按钮
+	// 绑定蓝图中的"多人模式"按钮
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_MultiplePlayer;
 
-	// 绑定蓝图中的“排行榜”按钮
+	// 绑定蓝图中的"排行榜"按钮
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_Leaderboard;
 
-	// 绑定蓝图中的“返回登录界面”按钮
+	// 绑定蓝图中的"活动中心"按钮
+	UPROPERTY(meta = (BindWidget))
+	UButton* Btn_ActivityCenter;
+
+	// 绑定蓝图中的"返回登录界面"按钮
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_BackToLogin;
 
@@ -72,6 +81,10 @@ private:
 	// 点击排行榜触发
 	UFUNCTION()
 	void OnLeaderboardClicked();
+
+	// 点击活动中心触发
+	UFUNCTION()
+	void OnActivityCenterClicked();
 
 	// 点击返回登录界面触发
 	UFUNCTION()
