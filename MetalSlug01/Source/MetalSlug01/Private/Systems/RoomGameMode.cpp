@@ -33,6 +33,11 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	// 配置引擎的标准框架类
 	GameStateClass = ARoomGameState::StaticClass();
 	PlayerStateClass = ARoomPlayerState::StaticClass();
+
+	// 【核心修复】：必须显式指定战斗地图使用的 PlayerController 类！
+	// 如果不设置，引擎会复用 L_Login 地图的 ALoginPlayerController，
+	// 导致客户端无法正常生成玩家，引发 "Couldn't spawn player" 崩溃！
+	PlayerControllerClass = ARoomPlayerController::StaticClass();
 	
 	//必须从底层硬编码绑定默认的 HUD 类，确保 MyGameHUD 会伴随玩家生出。
 	HUDClass = AMyGameHUD::StaticClass();

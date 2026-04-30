@@ -18,6 +18,18 @@ void UActivityNavMenuWidget::NativeConstruct()
 	// 初始化导航菜单
 	InitializeNavigation();
 	
+	// 绑定返回游戏菜单按钮事件
+	if (Btn_BackToMenu)
+	{
+		// 防呆设计：先清理旧绑定再添加新绑定，防止热重载导致多重绑定
+		Btn_BackToMenu->OnClicked.RemoveDynamic(this, &UActivityNavMenuWidget::OnBackToMenuClicked);
+		Btn_BackToMenu->OnClicked.AddDynamic(this, &UActivityNavMenuWidget::OnBackToMenuClicked);
+	}
+	else
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[ActivityNavMenuWidget 致命错误] Btn_BackToMenu 为空！请检查蓝图变量名是否完全匹配（区分大小写）！"));
+	}
+	
 	// 设置定时刷新红点（每30秒刷新一次）
 	GetWorld()->GetTimerManager().SetTimer(
 		RedDotRefreshTimerHandle,      // 定时器句柄
@@ -964,4 +976,40 @@ void UActivityNavMenuWidget::ClearCurrentPage()
 		CurrentPage.Reset();
 		// 当前页面已清除
 	}
+}
+
+void UActivityNavMenuWidget::OnBackToMenuClicked()
+{
+	// 点击返回游戏菜单按钮时，销毁当前活动页面，返回到游戏主菜单
+	
+	// 步骤 A：禁用按钮，防止玩家快速连续点击导致多次触发
+	if (Btn_BackToMenu)
+	{
+		Btn_BackToMenu->SetIsEnabled(false);
+	}
+
+	// 步骤 B：清理页面缓存和当前页面
+	// 遍历所有缓存的页面并从父级移除
+	for (auto& Pair : PageCache)
+	{
+		if (Pair.Value.IsValid())
+		{
+			Pair.Value->RemoveFromParent();
+		}
+	}
+	PageCache.Empty();
+	
+	// 清理当前页面
+	ClearCurrentPage();
+
+	// 步骤 C：停止红点刷新定时器
+	if (GetWorld() && RedDotRefreshTimerHandle.IsValid())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(RedDotRefreshTimerHandle);
+	}
+
+	// 步骤 D：【核心操作】销毁自身，返回游戏主菜单
+	// 通过 RemoveFromParent 将活动页面从视口移除并销毁
+	// 这样玩家将看到下层的游戏主菜单页面
+	this->RemoveFromParent();
 }

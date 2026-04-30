@@ -91,6 +91,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UPlayerStatusWidget* GetWidget_PlayerStatus() { return Widget_PlayerStatus; }
 
+	// 获取武器面板Widget（供其他类安全访问）
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	UWeaponPanelWidget* GetWidget_WeaponPanel() { return Widget_WeaponPanel; }
+
 	// 获取计分板Widget（供Controller调用）
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UScoreboardWidget* GetWidget_Scoreboard() { return Widget_Scoreboard; }

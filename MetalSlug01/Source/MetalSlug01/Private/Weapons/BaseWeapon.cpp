@@ -1,5 +1,6 @@
 ﻿#include "Weapons/BaseWeapon.h"
 #include "Components/StaticMeshComponent.h"
+#include "Characters/BaseCharacter.h"
 // 为了获取主人的视角和位置，必须包含 Character 头文件
 #include "GameFramework/Character.h" 
 // 射线检测核心库
@@ -126,46 +127,16 @@ void ABaseWeapon::Tick(float DeltaTime)
 		// 2. 将这名受害者加入黑名单，这刀还没收回之前，不会再判定他
 		IgnoreActors.Add(HitResult.GetActor());
 
-		// 【权限与部位检测】：只在服务器算血量
-		if (HasAuthority())
-		{
-			float FinalDamage = 0.0f;
-			
-			// 1. 判定这一刀的威力和击杀方式
-			if (bIsCurrentAttackHeavy)
-			{
-				FinalDamage = HeavyDamage; // 重击一击必杀
-				LastKillMethod = EKillMethod::MeleeWeapon; // 重击视为近战武器击杀
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red, TEXT("重击斩杀！"));
-			}
-			else
-			{
-				// 轻击检查骨骼部位
-				if (HitResult.BoneName == FName("head")) // 注意物理资产里的头部必须叫 head
-				{
-					FinalDamage = LightDamageHead;
-					LastKillMethod = EKillMethod::MeleeHeadshot; // 轻击爆头
-					if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Orange, TEXT("爆头！"));
-				}
-				else 
-				{
-					FinalDamage = LightDamageBody;
-					LastKillMethod = EKillMethod::MeleeWeapon; // 轻击身体
-					if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, TEXT("击中身体"));
-				}
-			}
-			
-			//发送精准伤害 (能把部位信息传给对方)
-			UGameplayStatics::ApplyPointDamage(
-				HitResult.GetActor(), 
-				FinalDamage, 
-				(CurrentMid - LastMid).GetSafeNormal(), // 攻击冲量方向
-				HitResult,
-				GetInstigatorController(), 
-				this, 
-				UDamageType::StaticClass()
-			);
-		}
+		// 【修复】：所有机器都报告命中，由服务器统一执行伤害
+		// 客户端直接报告命中，Server RPC 会自动路由到服务器执行
+		Server_ReportHit(
+			HitResult.GetActor(),
+			0.0f, // 伤害值由服务器根据部位重新计算
+			HitResult.ImpactPoint,
+			HitResult.ImpactNormal,
+			HitResult.BoneName,
+			bIsCurrentAttackHeavy
+		);
 	}
 	// 【极其重要】：当前帧结算完毕，把当前位置存入记忆，变成下一帧的“上一帧”！
 	LastFrameStartLoc = StartLoc;
@@ -195,6 +166,47 @@ UAnimMontage* ABaseWeapon::GetAttackMontage(bool bIsHeavy, int32 ComboIndex) con
 	return nullptr;
 }
 
+void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy)
+{
+	if (!HasAuthority()) return; // 双重保险：确保只在服务器执行
 
+	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
+	if (!Victim) return;
 
+	// 服务器根据部位计算伤害
+	float FinalDamage = 0.0f;
+	if (bIsHeavy)
+	{
+		FinalDamage = HeavyDamage;
+		LastKillMethod = EKillMethod::MeleeWeapon;
+	}
+	else
+	{
+		if (BoneName == FName("head"))
+		{
+			FinalDamage = LightDamageHead;
+			LastKillMethod = EKillMethod::MeleeHeadshot;
+		}
+		else
+		{
+			FinalDamage = LightDamageBody;
+			LastKillMethod = EKillMethod::MeleeWeapon;
+		}
+	}
 
+	// 服务器执行伤害
+	// 注意：HitFromDirection 是从受伤者角度看过去的"攻击来向"，与 HitNormal 方向相反
+	FHitResult HitInfo(Victim, Victim->GetMesh(), HitLocation, HitNormal);
+	UGameplayStatics::ApplyPointDamage(
+		Victim,
+		FinalDamage,
+		-HitNormal, // 攻击来向
+		HitInfo,
+		GetInstigatorController(),
+		this,
+		UDamageType::StaticClass()
+	);
+
+	UE_LOG(LogTemp, Warning, TEXT("[Damage] Server_ReportHit: %s -> %s, Damage=%.1f, Bone=%s, Heavy=%d"),
+		*GetName(), *Victim->GetName(), FinalDamage, *BoneName.ToString(), bIsHeavy);
+}

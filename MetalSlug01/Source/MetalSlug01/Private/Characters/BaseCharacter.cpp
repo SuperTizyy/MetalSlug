@@ -217,11 +217,46 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 
 void ABaseCharacter::OnRep_Health()
 {
-	// 更新客户端HUD血条
-	if (IsLocallyControlled() && GameHUDWidget)
+	// 【架构说明】：OnRep_Health 在所有机器（服务器+所有客户端）触发
+	// 服务器端：直接在服务器更新 HUD（服务器没有 HUD 但代码安全执行）
+	// 客户端：直接在客户端更新 HUD（因为 OnRep 在客户端执行，GameHUDWidget 已是本客户端的 HUD）
+	if (GameHUDWidget)
 	{
 		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
 		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[Health] OnRep_Health 触发，Health=%.1f/%.1f，HUD=%s"),
+		CurrentHealth, MaxHealth, *GetNameSafe(GameHUDWidget));
+}
+
+void ABaseCharacter::Client_UpdateHealthDisplay_Implementation(float Current, float Max)
+{
+	// 【保留 Client RPC】：供外部手动触发 HUD 刷新时使用（如扣血时从外部调用）
+	UE_LOG(LogTemp, Warning, TEXT("[Health] Client_UpdateHealthDisplay 收到: %.1f/%.1f"), Current, Max);
+	if (GameHUDWidget)
+	{
+		GameHUDWidget->UpdateHealth(Current, Max);
+		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
+	}
+}
+
+void ABaseCharacter::OnRep_Energy()
+{
+	// 【架构说明】：OnRep_Energy 在所有机器触发，直接更新 HUD
+	if (GameHUDWidget)
+	{
+		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
+		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
+	}
+}
+
+void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, float Max)
+{
+	// 【保留 Client RPC】：供外部手动触发时使用
+	if (GameHUDWidget)
+	{
+		GameHUDWidget->UpdateEnergy(Current, Max);
+		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
 	}
 }
 
@@ -309,16 +344,6 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 	}
 }
 
-void ABaseCharacter::OnRep_Energy()
-{
-	// 更新客户端HUD能量条
-	if (IsLocallyControlled() && GameHUDWidget)
-	{
-		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
-		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
-	}
-}
-
 void ABaseCharacter::OnRep_ACValue()
 {
 	if (IsLocallyControlled() && GameHUDWidget)
@@ -344,17 +369,10 @@ void ABaseCharacter::OnRep_ACEValue()
 
 void ABaseCharacter::RefreshCharacterIcon()
 {
-	if (!IsLocallyControlled())
-	{
-		return;
-	}
+	// 【核心修复】：本地角色直接在服务器侧走一遍 Client RPC 流程
+	// 服务器先拿到 CharacterID，再通知所属客户端刷新头像
+	// 这样远程玩家也能看到其他人的头像图标了
 
-	if (!GameHUDWidget)
-	{
-		return;
-	}
-
-	// 1. 从 PlayerState 获取当前选中的角色 ID
 	FString CharID;
 	if (APlayerState* PS = GetPlayerState<APlayerState>())
 	{
@@ -366,16 +384,107 @@ void ABaseCharacter::RefreshCharacterIcon()
 
 	if (CharID.IsEmpty())
 	{
-		CharID = TEXT("Warrior"); // 兜底默认角色
+		CharID = TEXT("Warrior");
 	}
 
-	// 2. 从 RoomGameMode 的 CharacterDataTable 查出头像
-	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(CharID))
+	// 服务器通知所属客户端刷新头像（每个客户端只刷新自己 HUD 上对应玩家的头像）
+	Client_RefreshCharacterIcon(CharID);
+}
+
+void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID)
+{
+	// 【网络架构说明】：
+	// 此函数在"所有客户端"上执行，包括本地玩家和远程玩家。
+	// 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像。
+	// 所以这里用 IsLocallyControlled() 做最终过滤 —— 只有本地玩家才刷新自己的 HUD。
+
+	// 缓存 ID，延迟刷新时使用
+	CachedCharacterIDForIcon = InCharacterID;
+
+	// HUD 尚未就绪时，尝试从 PlayerController 重新获取
+	if (!GameHUDWidget)
 	{
-		if (GameHUDWidget)
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
 		{
-			GameHUDWidget->UpdateCharacterIcon(Avatar);
+			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
+			{
+				GameHUDWidget = HUD->GetGameHUDWidget();
+			}
 		}
+	}
+
+	if (!GameHUDWidget)
+	{
+		// HUD 仍未就绪，延迟重试（使用成员变量 TimerHandle 确保计时器正确创建）
+		UE_LOG(LogTemp, Warning, TEXT("[Icon] HUD 未就绪，延迟刷新，InCharacterID=%s"), *InCharacterID);
+		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
+		return;
+	}
+
+	// 刷新角色头像
+	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(InCharacterID))
+	{
+		GameHUDWidget->UpdateCharacterIcon(Avatar);
+	}
+
+	// 同时刷新武器图标（从 PlayerSpawnDataCache 获取 WeaponID）
+	RefreshWeaponIconOnHUD();
+}
+
+void ABaseCharacter::RetryRefreshCharacterIcon()
+{
+	// 延迟重试回调：直接在客户端重新执行 HUD 刷新逻辑，跳过服务器中转
+	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标，CachedID=%s"), *CachedCharacterIDForIcon);
+
+	// 再次尝试获取 HUD
+	if (!GameHUDWidget)
+	{
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		{
+			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
+			{
+				GameHUDWidget = HUD->GetGameHUDWidget();
+			}
+		}
+	}
+
+	if (!GameHUDWidget)
+	{
+		// HUD 仍未就绪，再次延迟重试
+		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
+		return;
+	}
+
+	// HUD 已就绪，直接刷新（使用缓存的 ID）
+	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(CachedCharacterIDForIcon))
+	{
+		GameHUDWidget->UpdateCharacterIcon(Avatar);
+	}
+	RefreshWeaponIconOnHUD();
+}
+
+void ABaseCharacter::RefreshWeaponIconOnHUD()
+{
+	if (!GameHUDWidget || !GameHUDWidget->GetWidget_WeaponPanel())
+	{
+		return;
+	}
+
+	// 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
+	FString WeaponID;
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	{
+		FString CachedCharID;
+		FString CachedWeaponID;
+		if (GM->GetPlayerSpawnData(GetController()->GetUniqueID(), CachedCharID, CachedWeaponID))
+		{
+			WeaponID = CachedWeaponID;
+		}
+	}
+
+	if (!WeaponID.IsEmpty())
+	{
+		GameHUDWidget->UpdateWeaponIconFromID(WeaponID);
 	}
 }
 
@@ -837,8 +946,8 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 	
 	// 2. 安全扣血 (保证不会扣成负数)
 	CurrentHealth = FMath::Clamp(CurrentHealth - ActualDamage, 0.0f, MaxHealth);
-	
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, FString::Printf(TEXT("受到伤害: %f，剩余血量: %f"), ActualDamage, CurrentHealth));
+	UE_LOG(LogTemp, Warning, TEXT("[Health] 服务器扣血完成: Damage=%.1f, NewHealth=%.1f/%.1f, Dead=%d, Auth=%d"),
+		ActualDamage, CurrentHealth, MaxHealth, CurrentHealth <= 0.0f, HasAuthority());
 
 	// 3. 判定生死！
 	if (CurrentHealth <= 0.0f)
@@ -1084,14 +1193,16 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 		}
 	}
 
-	if (GameHUDWidget && GameHUDWidget->GetWidget_PlayerStatus())
+	// 【关键修复】：PossessedBy 在以下时机触发：1) 角色出生时 2) 复活重生时
+	// 此时 CurrentHealth 已经是 MaxHealth（构造函数初始化），但 OnRep_Health 不会触发（因为值没变）
+	// 所以必须强制刷新一次 HUD（仅本地玩家需要刷新自己的 HUD）
+	if (GameHUDWidget)
 	{
-		// 初始化时刷新一次当前值（解决 HUD 显示时初始值不刷新的问题）
 		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
 		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
 		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
 		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
-		
+
 		// 设置初始 AC 值（若尚未初始化，则设为满值）
 		if (ACValue == 0)
 		{
@@ -1108,8 +1219,7 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 			GameHUDWidget ? TEXT("NULL") : TEXT("GameHUDWidget NULL"));
 
 		// HUD 还未完全初始化（Widget_PlayerStatus BindWidget 失败），延迟重试
-		FTimerHandle DummyHandle;
-		GetWorld()->GetTimerManager().SetTimer(DummyHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
+		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
 	}
 
 	// 刷新角色头像（仅本地玩家需要）
@@ -1144,9 +1254,23 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 
 void ABaseCharacter::RetryRefreshHUD()
 {
+	if (!GameHUDWidget)
+	{
+		// 再次尝试从 PlayerController 获取 HUD
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		{
+			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
+			{
+				GameHUDWidget = HUD->GetGameHUDWidget();
+			}
+		}
+	}
+
 	if (!GameHUDWidget || !GameHUDWidget->GetWidget_PlayerStatus())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败"));
+		// HUD 仍未就绪，继续延迟重试
+		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败，再次重试"));
+		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
 		return;
 	}
 

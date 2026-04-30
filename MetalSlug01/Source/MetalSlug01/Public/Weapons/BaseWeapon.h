@@ -60,6 +60,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	EKillMethod GetLastKillMethod() const { return LastKillMethod; }
 
+	// 报告命中（Server RPC）：客户端检测到命中后调用，服务器执行伤害
+	UFUNCTION(Server, Reliable)
+	void Server_ReportHit(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy);
+
 protected:
 	// 最后造成的击杀方式（由 Tick 中判定并存储）
 	UPROPERTY()

@@ -28,6 +28,10 @@ public:
 	/** 页面显示容器 - 在蓝图中绑定用于显示活动页面的面板 */
 	UPROPERTY(BlueprintReadWrite, meta = (BindWidget))
 	class UPanelWidget* PageContainer;
+
+	/** 返回游戏菜单按钮 - 在蓝图中绑定返回按钮控件 */
+	UPROPERTY(meta = (BindWidget))
+	class UButton* Btn_BackToMenu;
 	
 	/** 默认页面类 - 当无法找到特定页面时使用 */
 	UPROPERTY(EditAnywhere, Category = "PageManagement")
@@ -198,4 +202,8 @@ private:
 	void OnButtonClicked_Id3();
 	UFUNCTION()
 	void OnButtonClicked_Default();
+
+	/** 点击返回游戏菜单按钮触发 - 销毁当前活动页面，返回主菜单 */
+	UFUNCTION()
+	void OnBackToMenuClicked();
 };

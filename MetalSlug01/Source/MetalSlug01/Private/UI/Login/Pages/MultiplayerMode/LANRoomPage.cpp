@@ -42,7 +42,15 @@ bool ULANRoomPage::Initialize()
 	// 1. 绑定大厅层按钮
 	// ==========================================
 	if (Btn_ShowCreateRoom) Btn_ShowCreateRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnShowCreateRoomClicked);
-	if (Btn_EnterRoom) Btn_EnterRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnEnterRoomClicked);
+	if (Btn_EnterRoom) 
+	{ 
+		UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_EnterRoom 绑定成功"));
+		Btn_EnterRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnEnterRoomClicked); 
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_EnterRoom 为空！请检查蓝图中的变量名是否匹配"));
+	}
 	if (Btn_BackToMenu) Btn_BackToMenu->OnClicked.AddDynamic(this, &ULANRoomPage::OnBackToMenuClicked);
 
 	// ==========================================
@@ -158,6 +166,8 @@ void ULANRoomPage::OnShowCreateRoomClicked()
 
 void ULANRoomPage::HandleRoomSelected(FString RoomName)
 {
+	UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] HandleRoomSelected 被调用，RoomName=[%s]"), *RoomName);
+
 	// 记录当前选中的房间名
 	CurrentSelectedRoomName = RoomName;
 	
@@ -181,9 +191,12 @@ void ULANRoomPage::HandleRoomSelected(FString RoomName)
 
 void ULANRoomPage::OnEnterRoomClicked()
 {
+	UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] OnEnterRoomClicked 被调用，CurrentSelectedRoomName=[%s]"), *CurrentSelectedRoomName);
+
 	// 1. 拦截：有没有选中房间？
 	if (CurrentSelectedRoomName.IsEmpty())
 	{
+		UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] 房间名为空，无法加入"));
 		return;
 	}
 

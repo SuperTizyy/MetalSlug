@@ -8,6 +8,7 @@
 class ABaseCharacter;
 class ABaseWeapon;
 class APlayerStart;
+class ARoomPlayerController;
 
 /**
  * 房间大厅的专属 GameMode（只在服务器/房主端运行）

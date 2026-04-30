@@ -86,6 +86,14 @@ protected:
 	UFUNCTION()
 	void OnRep_Health();
 
+	// 【核心修复】：服务器主动通知所属客户端刷新血量/能量条（解决远程玩家受伤血条不扣的问题）
+	UFUNCTION(Client, Reliable)
+	void Client_UpdateHealthDisplay(float Current, float Max);
+
+	// 【核心修复】：服务器主动通知所属客户端刷新能量条
+	UFUNCTION(Client, Reliable)
+	void Client_UpdateEnergyDisplay(float Current, float Max);
+
 	// ==========================================
 	// 能量系统 (网络同步)
 	// ==========================================
@@ -229,6 +237,15 @@ protected:
 	void Die();
 	void EnableRagdoll();
 	FTimerHandle RagdollTimerHandle;
+
+	// 角色图标刷新延迟重试定时器
+	FTimerHandle CharacterIconRefreshTimerHandle;
+
+	// HUD 刷新延迟重试定时器
+	FTimerHandle HUDRefreshTimerHandle;
+
+	// 缓存角色 ID，延迟刷新时使用（避免循环触发服务器 RPC）
+	FString CachedCharacterIDForIcon;
 
 	// 网络多播死亡（让所有玩家都看到你变成布娃娃）
 	UFUNCTION(NetMulticast, Reliable)
@@ -474,6 +491,20 @@ public:
 	// 查询当前 ACE 排名并刷新 HUD 上的 ACE 文字颜色
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void RefreshACEWithRank();
+
+	// ==========================================
+	// 角色图标网络同步 (Client RPC)
+	// ==========================================
+protected:
+	// 服务器调用，通知所属客户端刷新自己的头像图标
+	UFUNCTION(Client, Reliable)
+	void Client_RefreshCharacterIcon(const FString& InCharacterID);
+
+	// HUD 未就绪时的延迟重试回调
+	void RetryRefreshCharacterIcon();
+
+	// 刷新武器图标到 HUD（从 PlayerSpawnDataCache 读取 WeaponID）
+	void RefreshWeaponIconOnHUD();
 
 	// ==========================================
 	// 计分板系统 (Scoreboard)

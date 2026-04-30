@@ -63,11 +63,13 @@ void UPlayerStatusWidget::UpdateHealth(float Current, float Max)
 {
 	if (!PB_HealthBar)
 	{
+		UE_LOG(LogTemp, Error, TEXT("[Health] PlayerStatus UpdateHealth: PB_HealthBar 为空！"));
 		return;
 	}
 
 	float Percent = (Max > 0.0f) ? (Current / Max) : 0.0f;
 	Percent = FMath::Clamp(Percent, 0.0f, 1.0f);
+	UE_LOG(LogTemp, Warning, TEXT("[Health] PlayerStatus UpdateHealth: %.1f/%.1f = %.2f%%"), Current, Max, Percent * 100);
 	PB_HealthBar->SetPercent(Percent);
 
 	// 根据血量百分比设置颜色
