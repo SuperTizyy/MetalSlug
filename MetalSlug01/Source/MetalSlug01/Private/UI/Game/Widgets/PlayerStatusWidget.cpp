@@ -1,3 +1,8 @@
+// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
@@ -6,6 +11,17 @@
 #include "Characters/BaseCharacter.h"
 #include "Kismet/GameplayStatics.h"
 
+
+// ==========================================
+// 1. 生命周期
+// ==========================================
+
+/**
+ * UPlayerStatusWidget::NativeConstruct
+ *
+ * 主动从角色拉取初始数据
+ * 解决: UI 创建晚于角色数据初始化导致的初始值为 0 的问题
+ */
 void UPlayerStatusWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
@@ -14,6 +30,15 @@ void UPlayerStatusWidget::NativeConstruct()
 	PullInitialDataFromCharacter();
 }
 
+
+/**
+ * UPlayerStatusWidget::PullInitialDataFromCharacter
+ *
+ * 1. PC = GetOwningPlayer() 获取当前被操控的玩家控制器
+ * 2. Cast<ABaseCharacter>(PC->GetPawn()) 获取当前角色
+ * 3. 拉取 AC/ACE/HP/Energy 各项初值
+ * 注意: GetCurrentHealth/GetMaxHealth 等方法必须存在，否则编译失败
+ */
 void UPlayerStatusWidget::PullInitialDataFromCharacter()
 {
 	// 通过 PlayerController 获取当前被操控的角色
@@ -38,6 +63,14 @@ void UPlayerStatusWidget::PullInitialDataFromCharacter()
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::Initialize
+ *
+ * 1. 血条默认 100%
+ * 2. 能量条默认 100%
+ * 防御性: BindWidget 绑定失败时也能编译通过
+ */
 bool UPlayerStatusWidget::Initialize()
 {
 	if (!Super::Initialize())
@@ -59,11 +92,24 @@ bool UPlayerStatusWidget::Initialize()
 	return true;
 }
 
+
+// ==========================================
+// 2. 血量 / 能量
+// ==========================================
+
+/**
+ * UPlayerStatusWidget::UpdateHealth
+ *
+ * 1. 计算百分比: Current / Max (防御性: Max > 0)
+ * 2. Clamp 0~1
+ * 3. 设置进度条
+ * 4. 根据百分比设置颜色: > 60% 绿, > 30% 黄, 否则 红
+ */
 void UPlayerStatusWidget::UpdateHealth(float Current, float Max)
 {
 	if (!PB_HealthBar)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[Health] PlayerStatus UpdateHealth: PB_HealthBar 为空！"));
+		UE_LOG(LogTemp, Error, TEXT("[Health] PlayerStatus UpdateHealth: PB_HealthBar 为空!"));
 		return;
 	}
 
@@ -87,6 +133,14 @@ void UPlayerStatusWidget::UpdateHealth(float Current, float Max)
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::UpdateEnergy
+ *
+ * 1. 计算百分比
+ * 2. 设置能量条
+ * 注意: 能量条颜色保持单一
+ */
 void UPlayerStatusWidget::UpdateEnergy(float Current, float Max)
 {
 	if (!PB_EnergyBar)
@@ -99,6 +153,12 @@ void UPlayerStatusWidget::UpdateEnergy(float Current, float Max)
 	PB_EnergyBar->SetPercent(Percent);
 }
 
+
+/**
+ * UPlayerStatusWidget::UpdateHealthText
+ *
+ * 文本格式: "X/Y"（使用 FText::Format 支持本地化）
+ */
 void UPlayerStatusWidget::UpdateHealthText(int32 Current, int32 Max)
 {
 	if (Text_HealthValue)
@@ -111,6 +171,12 @@ void UPlayerStatusWidget::UpdateHealthText(int32 Current, int32 Max)
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::UpdateEnergyText
+ *
+ * 文本格式: "X/Y"
+ */
 void UPlayerStatusWidget::UpdateEnergyText(int32 Current, int32 Max)
 {
 	if (Text_EnergyValue)
@@ -123,6 +189,17 @@ void UPlayerStatusWidget::UpdateEnergyText(int32 Current, int32 Max)
 	}
 }
 
+
+// ==========================================
+// 3. AC / ACE
+// ==========================================
+
+/**
+ * UPlayerStatusWidget::UpdateACValue
+ *
+ * 1. 设置 Text_ACValue 数字
+ * 2. 调用 RefreshACIconColor 同步刷新防护服图标
+ */
 void UPlayerStatusWidget::UpdateACValue(int32 Value)
 {
 	if (Text_ACValue)
@@ -134,6 +211,13 @@ void UPlayerStatusWidget::UpdateACValue(int32 Value)
 	RefreshACIconColor(Value);
 }
 
+
+/**
+ * UPlayerStatusWidget::RefreshACIconColor
+ *
+ * AC 值越高，防护服越亮（蓝白色）；AC 值越低，防护服越暗（红黑色）
+ * 分档: 0-25 低 / 26-50 中 / 51-75 良好 / 76+ 最佳
+ */
 void UPlayerStatusWidget::RefreshACIconColor(int32 CurrentAC)
 {
 	if (!Image_ACIcon)
@@ -144,31 +228,37 @@ void UPlayerStatusWidget::RefreshACIconColor(int32 CurrentAC)
 	FLinearColor IconColor;
 
 	// AC 值越高，防护服越亮（蓝白色）；AC 值越低，防护服越暗（红黑色）
-	// 分档：0-25 低 / 26-50 中 / 51-75 良好 / 76+ 最佳
+	// 分档: 0-25 低 / 26-50 中 / 51-75 良好 / 76+ 最佳
 	if (CurrentAC >= 76)
 	{
-		// 最佳状态：明亮的蓝白色（防护服完好）
+		// 最佳状态: 明亮的蓝白色（防护服完好）
 		IconColor = FLinearColor(0.6f, 0.85f, 1.0f, 1.0f);
 	}
 	else if (CurrentAC >= 51)
 	{
-		// 良好状态：黄色（防护服轻微受损）
+		// 良好状态: 黄色（防护服轻微受损）
 		IconColor = FLinearColor(1.0f, 0.9f, 0.2f, 1.0f);
 	}
 	else if (CurrentAC >= 26)
 	{
-		// 中等状态：橙色（防护服明显受损）
+		// 中等状态: 橙色（防护服明显受损）
 		IconColor = FLinearColor(1.0f, 0.55f, 0.1f, 1.0f);
 	}
 	else
 	{
-		// 危急状态：深红色（防护服濒临崩溃）
+		// 危急状态: 深红色（防护服濒临崩溃）
 		IconColor = FLinearColor(0.9f, 0.1f, 0.1f, 1.0f);
 	}
 
 	Image_ACIcon->SetColorAndOpacity(IconColor);
 }
 
+
+/**
+ * UPlayerStatusWidget::UpdateACEValue
+ *
+ * 简单设置 ACE 文本 + 默认白色
+ */
 void UPlayerStatusWidget::UpdateACEValue(int32 Value)
 {
 	if (Text_ACEValue)
@@ -178,6 +268,15 @@ void UPlayerStatusWidget::UpdateACEValue(int32 Value)
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::SetACEValueWithRank
+ *
+ * 根据 EACERankType 设置颜色:
+ * - Gold: 金色 (1, 0.85, 0.2)
+ * - White: 白色
+ * - None: 灰色 (0.5, 0.5, 0.5)
+ */
 void UPlayerStatusWidget::SetACEValueWithRank(int32 Value, EACERankType RankType)
 {
 	if (!Text_ACEValue)
@@ -197,13 +296,23 @@ void UPlayerStatusWidget::SetACEValueWithRank(int32 Value, EACERankType RankType
 		TextColor = FLinearColor(1.0f, 1.0f, 1.0f, 1.0f); // 白色
 		break;
 	default:
-		TextColor = FLinearColor(0.5f, 0.5f, 0.5f, 1.0f); // 灰色（无ACE时）
+		TextColor = FLinearColor(0.5f, 0.5f, 0.5f, 1.0f); // 灰色（无 ACE 时）
 		break;
 	}
 
 	Text_ACEValue->SetColorAndOpacity(TextColor);
 }
 
+
+// ==========================================
+// 4. 角色 / 技能
+// ==========================================
+
+/**
+ * UPlayerStatusWidget::UpdateCharacterIcon
+ *
+ * 设置 Image_CharacterIcon 的画刷
+ */
 void UPlayerStatusWidget::UpdateCharacterIcon(UTexture2D* Icon)
 {
 	if (Image_CharacterIcon && Icon)
@@ -212,6 +321,15 @@ void UPlayerStatusWidget::UpdateCharacterIcon(UTexture2D* Icon)
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::UpdateSkillIcon
+ *
+ * 1. 校验 SkillIndex 范围
+ * 2. HB_SkillBar->GetChildAt(SkillIndex) 获取对应槽位
+ * 3. Cast 为 UImage
+ * 4. 设置画刷并显示
+ */
 void UPlayerStatusWidget::UpdateSkillIcon(int32 SkillIndex, UTexture2D* Icon)
 {
 	if (!HB_SkillBar || SkillIndex < 0)
@@ -233,6 +351,15 @@ void UPlayerStatusWidget::UpdateSkillIcon(int32 SkillIndex, UTexture2D* Icon)
 	}
 }
 
+
+/**
+ * UPlayerStatusWidget::SetSkillCooldown
+ *
+ * 设置冷却遮罩透明度
+ * 冷却百分比越高, 遮罩越透明 (冷却完毕)
+ * @param SkillIndex 技能槽索引
+ * @param CooldownPercent 冷却百分比 (0~1)
+ */
 void UPlayerStatusWidget::SetSkillCooldown(int32 SkillIndex, float CooldownPercent)
 {
 	if (!HB_SkillBar || SkillIndex < 0 || CooldownPercent < 0.0f)

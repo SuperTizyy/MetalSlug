@@ -4,9 +4,22 @@
  * @author AI Assistant
  * @date 2026
  * @version 1.0
- * 
+ *
  * @details 专门用于运行时修改DailyLoginSaveGame中的动态数据
  *          支持修改玩家进度、领取状态等，并自动保存到.sav文件
+ *
+ * 职责说明:
+ * 1. 提供 Modify* 写入接口（进度、领取状态、ClaimedDays等）
+ * 2. 提供 Get* 查询接口
+ * 3. 维护 ModificationHistory 历史记录（最多 100 条）
+ * 4. 注册控制台命令（DailyLogin.SetProgress / SetDayClaimed / Reset / ShowInfo）
+ *
+ * 架构理念:
+ * 1. 解耦: 独立于 UActivitySubsystem, 专注数据修改
+ * 2. 单存档: SaveSlotName 格式 "DailyLogin_{ActivityID}", UserIndex=0
+ * 3. 自动保存: 几乎所有修改接口都支持 bAutoSave 参数
+ * 4. 历史审计: FDailyLoginModificationRecord 记录每次修改
+ * 5. 限制范围: 32 天 (ClaimedHistoryMask 用 int32 bit 位表示)
  */
 
 #pragma once

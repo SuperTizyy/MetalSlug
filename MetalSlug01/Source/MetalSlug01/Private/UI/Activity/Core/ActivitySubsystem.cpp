@@ -3,6 +3,9 @@
 #include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
+// 必须在 .cpp 引入完整定义: 前向声明无法用于 IsValid(Page) 的类型转换和 Page->GetName() 调用
+// 仅在 .h 中前向声明是为了避免循环头文件依赖, .cpp 是真正使用类型的地方
+#include "UI/Activity/Pages/DailyLogin/DailyLoginPage.h"
 
 void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -25,7 +28,7 @@ void UActivitySubsystem::Deinitialize()
 	// Subsystem 销毁时，管理器会随 GC 自动回收
 	RedDotManager = nullptr;
 	ActivityTimeManager = nullptr;
-	
+
 	// 清理动态存档修改器
 	if (SaveModifier)
 	{
@@ -35,7 +38,56 @@ void UActivitySubsystem::Deinitialize()
 
 	CachedSaveGame = nullptr;
 
+	// 清空弱引用: Subsystem 即将销毁, 不再持有任何 Page 引用
+	RegisteredLoginPage.Reset();
+
 	Super::Deinitialize();
+}
+
+// ==================== 页面注册表实现 ====================
+
+void UActivitySubsystem::RegisterLoginPage(UDailyLoginPage* Page)
+{
+	// 防御: 入参校验, UE 5.6 中应同时检查 PendingKill / Garbage
+	if (!IsValid(Page))
+	{
+		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem::RegisterLoginPage: 入参 Page 无效, 已拒绝"));
+		return;
+	}
+
+	// 已注册检查: 同时只允许一个主页面, 防止多个 Page 实例互踩
+	if (RegisteredLoginPage.IsValid() && RegisteredLoginPage.Get() != Page)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("ActivitySubsystem::RegisterLoginPage: 已存在其他主页面实例 (%s), 新实例 (%s) 将覆盖"),
+			*RegisteredLoginPage->GetName(), *Page->GetName());
+	}
+
+	// 弱引用赋值: 不增加引用计数, Page 销毁时 Get() 自动返回 nullptr
+	RegisteredLoginPage = Page;
+	UE_LOG(LogTemp, Log, TEXT("ActivitySubsystem: 主页面已注册 -> %s"), *Page->GetName());
+}
+
+void UActivitySubsystem::UnregisterLoginPage(UDailyLoginPage* Page)
+{
+	// 防御: 入参为 nullptr 直接返回, 避免误清空
+	if (!Page)
+	{
+		return;
+	}
+
+	// 仅在指针匹配时清空, 防止误清空后续注册的新实例
+	if (RegisteredLoginPage.Get() == Page)
+	{
+		RegisteredLoginPage.Reset();
+		UE_LOG(LogTemp, Log, TEXT("ActivitySubsystem: 主页面已反注册 -> %s"), *Page->GetName());
+	}
+}
+
+UDailyLoginPage* UActivitySubsystem::GetLoginPage() const
+{
+	// Get() 内部会检查 UObject 是否已被 GC, 无效时返回 nullptr
+	return RegisteredLoginPage.Get();
 }
 
 URedDotManager* UActivitySubsystem::GetRedDotManager() const

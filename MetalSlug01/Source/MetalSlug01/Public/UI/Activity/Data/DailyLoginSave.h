@@ -4,10 +4,32 @@
  * @author AI Assistant
  * @date 2024
  * @version 1.0
- * 
+ *
  * @details 本文件包含活动系统的所有动态运行时数据结构和存档类定义
  *          所有需要持久化存储的玩家进度数据都定义在此文件中
  *          遵循"所有动态表结构体放入此文件"的项目规范
+ *
+ * ====================================================================
+ * 文件内容索引
+ * ====================================================================
+ *
+ * §1. 运行时数据结构
+ *   - FActivityRuntimeState:    活动的运行时状态（不在存档）
+ *   - FPlayerLoginRecord:       玩家每日登录进度记录
+ *   - FActivityNavItem:         UI 导航项显示数据结构
+ *   - FUpgradeRewardSaveRecord: 升级奖励活动存档记录
+ *
+ * §2. 存档管理类
+ *   - UDailyLoginSaveGame: 继承 USaveGame, 容器
+ *     - ActivityRecords: TMap<ActivityID, FPlayerLoginRecord>
+ *     - UpgradeRewardRecords: TMap<Date, FUpgradeRewardSaveRecord>
+ *     - NavigationItemsCache: 运行时缓存（不存档）
+ *
+ * 设计理念:
+ * 1. 静态表（配置）放 DailyLoginConfig.h, 动态表（存档）放 DailyLoginSave.h
+ * 2. 所有 USTRUCT 都标记 BlueprintType 便于蓝图访问
+ * 3. 所有持久化字段标记 SaveGame, 运行时缓存标记 Transient
+ * 4. FPlayerLoginRecord / FUpgradeRewardSaveRecord 提供 bit-mask 优化状态查询
  */
 
 #pragma once

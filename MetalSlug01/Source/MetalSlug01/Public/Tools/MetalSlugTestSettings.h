@@ -8,8 +8,18 @@
 #include "MetalSlugTestSettings.generated.h"
 
 /**
- * 工业级规范：全局开发与测试配置中心
- * 可以在编辑器的 Project Settings (项目设置) 中直接修改，无需在蓝图中连线
+ * @file MetalSlugTestSettings.h
+ * @brief 全局开发与测试配置中心
+ * @details 可以在编辑器的 Project Settings (项目设置) 中直接修改，无需在蓝图中连线
+ *
+ * 设计要点:
+ * 1. 继承 UDeveloperSettings: 自动注册到 Project Settings 侧边栏
+ * 2. Config=Game + defaultconfig: 配置存于 DefaultGame.ini, 启动加载
+ * 3. 所有 UPROPERTY 标记 Config: 编辑器修改自动写入 .ini
+ * 4. 生产环境默认值关闭: 避免线上包携带开启的作弊功能
+ *
+ * 当前配置项:
+ * - bSkipLoginDirectToLobby: 跳过登录直通大厅（测试用）
  */
 // Config=Game 表示配置将保存在 DefaultGame.ini 中
 // defaultconfig 告诉引擎这是一个默认加载的配置
