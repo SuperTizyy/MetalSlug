@@ -1,7 +1,24 @@
+// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "UI/Game/Widgets/SubWidgets/KillFeedEntryWidget.h"
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
 
+
+// ==========================================
+// 1. 公共接口
+// ==========================================
+
+/**
+ * UKillFeedEntryWidget::SetKillInfo
+ *
+ * 1. 设置击杀者名称
+ * 2. 设置被击杀者名称
+ * 3. 设置击杀方式（会同时更新图标）
+ */
 void UKillFeedEntryWidget::SetKillInfo(const FString& InKillerName, const FString& InVictimName, EKillMethod InKillMethod)
 {
 	// 设置击杀者名称
@@ -14,6 +31,12 @@ void UKillFeedEntryWidget::SetKillInfo(const FString& InKillerName, const FStrin
 	SetKillMethod(InKillMethod);
 }
 
+
+/**
+ * UKillFeedEntryWidget::SetKillerName
+ *
+ * 设置击杀者名称，使用青色高亮显示 (0, 1, 1, 1)
+ */
 void UKillFeedEntryWidget::SetKillerName(const FString& InKillerName)
 {
 	if (Text_KillerName)
@@ -24,6 +47,12 @@ void UKillFeedEntryWidget::SetKillerName(const FString& InKillerName)
 	}
 }
 
+
+/**
+ * UKillFeedEntryWidget::SetVictimName
+ *
+ * 设置被击杀者名称，使用橙色高亮显示 (1, 0.5, 0, 1)
+ */
 void UKillFeedEntryWidget::SetVictimName(const FString& InVictimName)
 {
 	if (Text_VictimName)
@@ -34,17 +63,44 @@ void UKillFeedEntryWidget::SetVictimName(const FString& InVictimName)
 	}
 }
 
+
+/**
+ * UKillFeedEntryWidget::SetKillMethod
+ *
+ * 从数据表中查找并设置对应的击杀图标
+ */
 void UKillFeedEntryWidget::SetKillMethod(EKillMethod InKillMethod)
 {
 	// 从数据表中查找并设置对应的击杀图标
 	FindKillIcon(InKillMethod);
 }
 
+
+// ==========================================
+// 2. 数据表注入
+// ==========================================
+
+/**
+ * UKillFeedEntryWidget::SetKillIconDataTable
+ *
+ * 供父控件注入数据表引用
+ */
 void UKillFeedEntryWidget::SetKillIconDataTable(class UDataTable* InDataTable)
 {
 	KillIconDataTable = InDataTable;
 }
 
+
+// ==========================================
+// 3. 辅助判断
+// ==========================================
+
+/**
+ * UKillFeedEntryWidget::IsHeadshotKill
+ *
+ * @param InKillMethod 击杀方式
+ * @return 是否为爆头
+ */
 bool UKillFeedEntryWidget::IsHeadshotKill(EKillMethod InKillMethod) const
 {
 	// 根据击杀方式判断是否为爆头
@@ -59,6 +115,17 @@ bool UKillFeedEntryWidget::IsHeadshotKill(EKillMethod InKillMethod) const
 	}
 }
 
+
+/**
+ * UKillFeedEntryWidget::GetIconColor
+ *
+ * @param InKillMethod 击杀方式
+ * @return 图标颜色
+ * - 主武器: 绿 (0, 1, 0)
+ * - 副武器: 蓝 (0.3, 0.5, 1)
+ * - 近战: 红 (1, 0.3, 0.3)
+ * - 默认: 白
+ */
 FLinearColor UKillFeedEntryWidget::GetIconColor(EKillMethod InKillMethod) const
 {
 	// 根据击杀方式返回图标颜色
@@ -66,22 +133,34 @@ FLinearColor UKillFeedEntryWidget::GetIconColor(EKillMethod InKillMethod) const
 	{
 	case EKillMethod::PrimaryWeapon:
 	case EKillMethod::PrimaryHeadshot:
-		// 主武器：绿色
+		// 主武器: 绿色
 		return FLinearColor(0.0f, 1.0f, 0.0f, 1.0f);
 	case EKillMethod::SecondaryWeapon:
 	case EKillMethod::SecondaryHeadshot:
-		// 副武器：蓝色
+		// 副武器: 蓝色
 		return FLinearColor(0.3f, 0.5f, 1.0f, 1.0f);
 	case EKillMethod::MeleeWeapon:
 	case EKillMethod::MeleeHeadshot:
-		// 近战武器：红色
+		// 近战武器: 红色
 		return FLinearColor(1.0f, 0.3f, 0.3f, 1.0f);
 	default:
-		// 默认：白色
+		// 默认: 白色
 		return FLinearColor::White;
 	}
 }
 
+
+// ==========================================
+// 4. 数据表查找
+// ==========================================
+
+/**
+ * UKillFeedEntryWidget::FindKillIcon
+ *
+ * 遍历数据表查找匹配的击杀方式
+ * 使用 ForeachRow + lambda
+ * 找到后立即设置 Image_KillIcon
+ */
 class UTexture2D* UKillFeedEntryWidget::FindKillIcon(EKillMethod InKillMethod)
 {
 	// 如果没有配置数据表或 Image 组件无效，直接返回

@@ -1,9 +1,22 @@
-﻿#pragma once
+﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+#pragma once
+
+// ==========================================
+// 头文件包含说明
+// ==========================================
+// UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
 
 
+// ==========================================
+// 1. 动画状态枚举（用于蓝图中切换动画）
+// ==========================================
 
-// 定义动画状态枚举，用于蓝图中切换动画
+/**
+ * 角色动画状态枚举
+ * 用途: 在 AnimBP 中根据状态切换动画
+ */
 UENUM(BlueprintType)
 enum class ECharacterAnimationState : uint8
 {
@@ -24,7 +37,15 @@ enum class ECharacterAnimationState : uint8
 	Reloading UMETA(DisplayName = "装弹")
 };
 
-// 定义角色类型枚举，用于区分不同角色
+
+// ==========================================
+// 2. 角色类型枚举（用于区分不同角色）
+// ==========================================
+
+/**
+ * 角色类型枚举
+ * 用途: 区分玩家/敌人/NPC/Boss
+ */
 UENUM(BlueprintType)
 enum class ECharacterType : uint8
 {
@@ -34,7 +55,15 @@ enum class ECharacterType : uint8
 	Boss UMETA(DisplayName = "Boss角色")
 };
 
-// 定义玩家可控制的角色ID枚举
+
+// ==========================================
+// 3. 玩家可控制的角色ID枚举
+// ==========================================
+
+/**
+ * 玩家可控制的角色 ID 枚举
+ * 用途: 蓝图面板中选择不同的角色
+ */
 UENUM(BlueprintType)
 enum class EControlledCharacterID : uint8
 {
@@ -43,7 +72,15 @@ enum class EControlledCharacterID : uint8
 	Character3 UMETA(DisplayName = "角色3")
 };
 
-// 定义移动状态枚举
+
+// ==========================================
+// 4. 移动状态枚举
+// ==========================================
+
+/**
+ * 角色移动状态枚举
+ * 用途: AnimBP 根据状态切换对应动画
+ */
 UENUM(BlueprintType)
 enum class EMovementState : uint8
 {
@@ -54,7 +91,15 @@ enum class EMovementState : uint8
 	Sliding UMETA(DisplayName = "滑行")
 };
 
-// 定义玩家索引枚举，用于分屏游戏中的不同玩家
+
+// ==========================================
+// 5. 玩家索引枚举（用于分屏游戏）
+// ==========================================
+
+/**
+ * 玩家索引枚举
+ * 用途: 分屏游戏中的不同玩家
+ */
 UENUM(BlueprintType)
 enum class EPlayerIndex : uint8
 {
@@ -64,11 +109,19 @@ enum class EPlayerIndex : uint8
 	Player4 UMETA(DisplayName = "玩家4")
 };
 
-// 冲刺状态枚举 - 定义战士冲刺的不同状态
+
+// ==========================================
+// 6. 冲刺状态枚举（战士冲刺的不同状态）
+// ==========================================
+
+/**
+ * 冲刺状态枚举
+ * 用途: 跟踪战士冲刺的完整生命周期
+ */
 UENUM(BlueprintType)
 enum class ESprintState : uint8
 {
-	NotSprinting UMETA(DisplayName = "未冲刺"),     // 未处于冲刺状态
-	Sprinting UMETA(DisplayName = "冲刺中"),        // 正在冲刺中
-	Cooldown UMETA(DisplayName = "冷却中")          // 冲刺后处于冷却状态
+	NotSprinting UMETA(DisplayName = "未冲刺"),  // 未处于冲刺状态
+	Sprinting UMETA(DisplayName = "冲刺中"),     // 正在冲刺中
+	Cooldown UMETA(DisplayName = "冷却中")       // 冲刺后处于冷却状态
 };

@@ -1,8 +1,25 @@
+// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "UI/Game/Widgets/KillStreakWidget.h"
 #include "Components/Image.h"
 #include "TimerManager.h"
 #include "Engine/DataTable.h"
 
+
+// ==========================================
+// 1. 初始化
+// ==========================================
+
+/**
+ * UKillStreakWidget::Initialize
+ *
+ * 1. 隐藏 Image_Kill
+ * 2. 初始化连杀计数 = 0
+ * 3. 初始化 bLastKillWasHeadshot = false
+ */
 bool UKillStreakWidget::Initialize()
 {
 	if (!Super::Initialize())
@@ -23,12 +40,26 @@ bool UKillStreakWidget::Initialize()
 	return true;
 }
 
+
+// ==========================================
+// 2. 公共接口
+// ==========================================
+
+/**
+ * UKillStreakWidget::RecordKill
+ *
+ * 1. 记录爆头状态
+ * 2. 累加连杀数
+ * 3. 重置 1 分钟连杀计时器
+ * 4. 更新图标
+ * 5. 启动 3 秒图标自动隐藏计时器
+ */
 void UKillStreakWidget::RecordKill(bool bIsHeadshot)
 {
 	UE_LOG(LogTemp, Log, TEXT("[KillStreakWidget] RecordKill 开始"));
 	if (!Image_Kill)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[KillStreakWidget] RecordKill: Image_Kill 为空！"));
+		UE_LOG(LogTemp, Error, TEXT("[KillStreakWidget] RecordKill: Image_Kill 为空!"));
 		return;
 	}
 
@@ -45,7 +76,7 @@ void UKillStreakWidget::RecordKill(bool bIsHeadshot)
 
 	UE_LOG(LogTemp, Log, TEXT("[KillStreakWidget] RecordKill: Kills=%d, bIsHeadshot=%d"), CurrentKillStreak, bIsHeadshot);
 
-	// 重置1分钟连杀计时器
+	// 重置 1 分钟连杀计时器
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(KillStreakTimer);
@@ -75,6 +106,17 @@ void UKillStreakWidget::RecordKill(bool bIsHeadshot)
 	}
 }
 
+
+// ==========================================
+// 3. 定时器回调
+// ==========================================
+
+/**
+ * UKillStreakWidget::HideIcon
+ *
+ * 时机: IconDisplayTimer 到期（3 秒）
+ * 用途: 隐藏 Image_Kill
+ */
 void UKillStreakWidget::HideIcon()
 {
 	if (Image_Kill)
@@ -83,6 +125,13 @@ void UKillStreakWidget::HideIcon()
 	}
 }
 
+
+/**
+ * UKillStreakWidget::OnKillStreakExpired
+ *
+ * 时机: KillStreakTimer 到期（1 分钟无击杀）
+ * 用途: 重置 CurrentKillStreak = 0
+ */
 void UKillStreakWidget::OnKillStreakExpired()
 {
 	UE_LOG(LogTemp, Log, TEXT("[KillStreakWidget] 连杀超时，重置"));
@@ -90,6 +139,19 @@ void UKillStreakWidget::OnKillStreakExpired()
 	bLastKillWasHeadshot = false;
 }
 
+
+// ==========================================
+// 4. 核心逻辑
+// ==========================================
+
+/**
+ * UKillStreakWidget::GetKillStreakType
+ *
+ * @param Kills 当前连杀数
+ * @param bIsHeadshot 是否爆头
+ * @return 对应的 EKillStreakType
+ * 规则: 爆头优先显示爆头图标；否则按 1~5 杀
+ */
 EKillStreakType UKillStreakWidget::GetKillStreakType(int32 Kills, bool bIsHeadshot) const
 {
 	// 爆头击杀优先显示爆头图标
@@ -122,11 +184,21 @@ EKillStreakType UKillStreakWidget::GetKillStreakType(int32 Kills, bool bIsHeadsh
 	return EKillStreakType::None;
 }
 
+
+/**
+ * UKillStreakWidget::GetKillStreakIcon
+ *
+ * 从数据表按枚举名查找图标
+ * 1. UEnum::GetValueAsString 获取 "EKillStreakType::OneKill" 格式
+ * 2. 截取 "OneKill" 部分
+ * 3. FindRow<FKillStreakIconInfo> 查找
+ * @return 图标贴图（找不到返回 nullptr）
+ */
 UTexture2D* UKillStreakWidget::GetKillStreakIcon(EKillStreakType StreakType)
 {
 	if (!KillStreakIconDataTable)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[KillStreakWidget] KillStreakIconDataTable 未配置！"));
+		UE_LOG(LogTemp, Error, TEXT("[KillStreakWidget] KillStreakIconDataTable 未配置!"));
 		return nullptr;
 	}
 
@@ -168,6 +240,15 @@ UTexture2D* UKillStreakWidget::GetKillStreakIcon(EKillStreakType StreakType)
 	return nullptr;
 }
 
+
+/**
+ * UKillStreakWidget::UpdateKillIcon
+ *
+ * 1. 获取 EKillStreakType
+ * 2. 从数据表取图标
+ * 3. 设置 Image_Kill 的画刷
+ * 4. 找不到时隐藏图标
+ */
 void UKillStreakWidget::UpdateKillIcon()
 {
 	if (!Image_Kill)

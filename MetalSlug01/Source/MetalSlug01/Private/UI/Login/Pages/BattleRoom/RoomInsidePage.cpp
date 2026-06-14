@@ -1,17 +1,22 @@
+// 版权声明：在项目设置的描述页面填写您的版权信息。
+
 /**
  * @file RoomInsidePage.cpp
  * @brief 房间内部页面实现文件
  * @author 开发团队
  * @date 2026-04-20
- * 
- * 实现了房间内部UI的所有功能，包括：
+ *
+ * 实现了房间内部 UI 的所有功能，包括:
  * - 玩家队伍管理（攻方/守方）
  * - 角色和武器选择
  * - 聊天系统
- * - AI玩家配置
- * - UI自动刷新机制
+ * - AI 玩家配置
+ * - UI 自动刷新机制
  */
 
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "Components/VerticalBox.h"
 #include "Components/Button.h"
@@ -37,10 +42,21 @@
 #include "Systems/RoomGameState.h"
 #include "UI/Login/Core/RoomPlayerState.h"
 
+
+// ==========================================
+// 1. 初始化
+// ==========================================
+
 /**
- * @brief 初始化函数，设置所有UI控件的事件绑定
- * @return 初始化是否成功
- * @note 在此函数中完成所有按钮点击事件、文本输入事件的绑定
+ * URoomInsidePage::Initialize
+ *
+ * 初始化函数，设置所有 UI 控件的事件绑定
+ * 1. 绑定退出/开始/加入攻守/准备/AI/武器按钮
+ * 2. 诊断 ScrollBox_ChatList 是否绑定
+ * 3. 绑定聊天输入框 OnTextCommitted
+ * 4. 绑定武器弹窗、确认、呼出按钮
+ * 5. 绑定背包 1/2 按钮
+ * 6. 绑定 AI 面板开关/确认按钮
  */
 bool URoomInsidePage::Initialize()
 {
@@ -57,15 +73,15 @@ bool URoomInsidePage::Initialize()
 	// 绑定切换准备状态按钮点击事件
 	if (Btn_ToggleReady) Btn_ToggleReady->OnClicked.AddDynamic(this, &URoomInsidePage::OnToggleReadyClicked);
 
-	// 初始化准备状态为false
+	// 初始化准备状态为 false
 	bIsReady = false;
 	if (Text_ReadyStatus) Text_ReadyStatus->SetText(FText::FromString(TEXT("准备")));
 
 	// 【诊断】检查聊天列表控件是否绑定成功，若失败说明蓝图控件名称与 C++ 属性名不匹配
 	if (!ScrollBox_ChatList)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[RoomInsidePage] 严重错误：ScrollBox_ChatList 未绑定！请确认 WBP_RoomInsidePage 蓝图中存在同名 ScrollBox 控件（区分大小写）。"));
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：ScrollBox_ChatList 未绑定！请检查蓝图控件命名。"));
+		UE_LOG(LogTemp, Error, TEXT("[RoomInsidePage] 严重错误: ScrollBox_ChatList 未绑定! 请确认 WBP_RoomInsidePage 蓝图中存在同名 ScrollBox 控件（区分大小写）。"));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】: ScrollBox_ChatList 未绑定! 请检查蓝图控件命名。"));
 	}
 
 	// 绑定聊天输入框的回车事件
@@ -80,33 +96,51 @@ bool URoomInsidePage::Initialize()
 	// 绑定打开武器选择弹窗按钮点击事件
 	if (Btn_ChangeWeapon){Btn_ChangeWeapon->OnClicked.AddDynamic(this, &URoomInsidePage::OnChangeWeaponClicked);}
 
-	// 绑定背包1切换按钮点击事件
+	// 绑定背包 1 切换按钮点击事件
 	if (Btn_Inventory1) Btn_Inventory1->OnClicked.AddDynamic(this, &URoomInsidePage::OnInventory1Clicked);
-	// 绑定背包2切换按钮点击事件
+	// 绑定背包 2 切换按钮点击事件
 	if (Btn_Inventory2) Btn_Inventory2->OnClicked.AddDynamic(this, &URoomInsidePage::OnInventory2Clicked);
 
-	// 绑定关闭AI面板按钮点击事件
+	// 绑定关闭 AI 面板按钮点击事件
 	if (Btn_HideAddAI){Btn_HideAddAI->OnClicked.AddDynamic(this, &URoomInsidePage::OnHideAddAIClicked);}
-	// 绑定确认添加AI按钮点击事件
+	// 绑定确认添加 AI 按钮点击事件
 	if (Btn_ConfirmAddAI){Btn_ConfirmAddAI->OnClicked.AddDynamic(this, &URoomInsidePage::OnConfirmAddAIClicked);}
 
-	// 绑定打开AI面板按钮点击事件
+	// 绑定打开 AI 面板按钮点击事件
 	if (Btn_OpenAIPanel) Btn_OpenAIPanel->OnClicked.AddDynamic(this, &URoomInsidePage::OnOpenAIPanelClicked);
 
 	return true;
 }
 
+
+// ==========================================
+// 2. UI 构建完成后的初始化
+// ==========================================
+
 /**
- * @brief UI构建完成后的初始化函数
- * @note 在此函数中完成数据表加载、UI元素初始化、事件监听器注册等操作
+ * URoomInsidePage::NativeConstruct
+ *
+ * UI 构建完成后执行
+ * 1. 启动 0.5 秒一次的玩家变化检查定时器
+ * 2. 立即执行一次 UI 刷新
+ * 3. 判断当前玩家是否为房主
+ * 4. 校验 CharacterDataTable 是否绑定
+ * 5. 初始化角色下拉框（从 DataTable 读 + 记忆上次选择）
+ * 6. 初始化武器下拉框（两个背包槽位兜底默认）
+ * 7. 通过 Server_SelectLoadout 同步装备到服务器
+ * 8. 隐藏武器选择弹窗、AI 面板
+ * 9. 默认激活背包槽 1
+ * 10. 从 SessionSettings 读取房间名/游戏模式
+ * 11. 根据房主身份控制按钮可见性
+ * 12. 订阅 GameFlowSubsystem 状态变化
  */
 void URoomInsidePage::NativeConstruct()
 {
 	Super::NativeConstruct();
 
-	// 启动定时器，每0.5秒检查一次玩家变化
+	// 启动定时器，每 0.5 秒检查一次玩家变化
 	GetWorld()->GetTimerManager().SetTimer(PlayerCheckTimerHandle, this, &URoomInsidePage::CheckForNewPlayers, 0.5f, true);
-	// 立即执行一次UI刷新
+	// 立即执行一次 UI 刷新
 	RefreshRoomUI();
 
 	// 判断当前玩家是否为房主
@@ -115,9 +149,9 @@ void URoomInsidePage::NativeConstruct()
 	// 检查角色数据表是否已绑定
 	if (!CharacterDataTable)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[URoomInsidePage] 严重错误：未绑定 CharacterDataTable！请检查 WBP_RoomInsidePage 的细节面板！"));
+		UE_LOG(LogTemp, Error, TEXT("[URoomInsidePage] 严重错误: 未绑定 CharacterDataTable! 请检查 WBP_RoomInsidePage 的细节面板!"));
 
-		if (GEngine) {GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】：CharacterDataTable 缺失！"));}
+		if (GEngine) {GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("【致命错误】: CharacterDataTable 缺失!"));}
 
 		// 如果数据表缺失，禁用角色选择下拉框并显示错误提示
 		if (ComboBox_CharacterSelect)
@@ -143,7 +177,7 @@ void URoomInsidePage::NativeConstruct()
 
 		if (RowNames.IsEmpty())
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[URoomInsidePage] 数据表为空，无法初始化角色列表！"));
+			UE_LOG(LogTemp, Warning, TEXT("[URoomInsidePage] 数据表为空，无法初始化角色列表!"));
 			ComboBox_CharacterSelect->AddOption(TEXT("无可用角色"));
 			ComboBox_CharacterSelect->SetIsEnabled(false);
 		}
@@ -157,12 +191,12 @@ void URoomInsidePage::NativeConstruct()
 				{
 					// 添加角色名称到下拉框
 					ComboBox_CharacterSelect->AddOption(Info->CharacterName.ToString());
-					// 缓存角色ID，用于后续查找
+					// 缓存角色 ID，用于后续查找
 					CachedCharacterIDs.Add(RowName);
 				}
 			}
 
-			// 从AccountSubsystem中读取上次选择的角色
+			// 从 AccountSubsystem 中读取上次选择的角色
 			FString SavedCharacterID = TEXT("");
 			UAccountSubsystem* AccountSub = nullptr;
 			if (UGameInstance* GI = GetGameInstance())
@@ -196,7 +230,7 @@ void URoomInsidePage::NativeConstruct()
 			}
 
 			UE_LOG(LogTemp, Warning, TEXT("[Room] Syncing char='%s' to server (FoundIndex=%d)"), *CharIDToSync, FoundIndex);
-			// 保存当前选择的角色ID
+			// 保存当前选择的角色 ID
 			if (AccountSub)
 			{
 				AccountSub->SaveLastSelectedCharacter(CharIDToSync);
@@ -241,29 +275,29 @@ void URoomInsidePage::NativeConstruct()
 		Overlay_WeaponSelect->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
-	// 默认激活背包槽位1
+	// 默认激活背包槽位 1
 	ActiveBackpackSlot = 1;
 	UpdateWeaponDisplayImage(ActiveBackpackSlot);
 
 	// 更新背包高亮指示器
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
 
-	// 初始化时隐藏AI配置面板
+	// 初始化时隐藏 AI 配置面板
 	if (Overlay_AddAI)
 	{
 		Overlay_AddAI->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
-	// 填充AI配置面板的数据
+	// 填充 AI 配置面板的数据
 	PopulateAIPanelData();
 
-	// 只有房主才能看到打开AI面板的按钮
+	// 只有房主才能看到打开 AI 面板的按钮
 	if (Btn_OpenAIPanel)
 	{
 		Btn_OpenAIPanel->SetVisibility(bIsHost ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
 
-	// 从会话设置中读取房间名称和游戏模式，并显示在UI上
+	// 从会话设置中读取房间名称和游戏模式，并显示在 UI 上
 	if (Text_RoomName)
 	{
 		FString DisplayRoomName = TEXT("未命名房间");
@@ -317,9 +351,17 @@ void URoomInsidePage::NativeConstruct()
 	}
 }
 
+
+// ==========================================
+// 3. UI 销毁时的清理
+// ==========================================
+
 /**
- * @brief UI销毁时的清理工作
- * @note 清理事件监听器和定时器，防止内存泄漏
+ * URoomInsidePage::NativeDestruct
+ *
+ * UI 销毁时执行
+ * 1. 清除玩家检查定时器
+ * 2. 退订 GameFlowSubsystem 状态变化监听
  */
 void URoomInsidePage::NativeDestruct()
 {
@@ -338,29 +380,43 @@ void URoomInsidePage::NativeDestruct()
 	Super::NativeDestruct();
 }
 
+
+// ==========================================
+// 4. 退出房间
+// ==========================================
+
 /**
- * @brief 退出房间按钮点击事件
- * @note 处理玩家离开房间的请求，如果已准备则不允许退出
+ * OnLeaveRoomClicked
+ *
+ * 退出房间按钮点击事件
+ * 1. 检查是否已准备（已准备不允许退出）
+ * 2. 调用 PC->LeaveRoom()
  */
 void URoomInsidePage::OnLeaveRoomClicked()
 {
 	// 如果已准备，提示先取消准备
 	if (bIsReady)
 	{
-		AddSystemMessageToChat(TEXT("取消准备才能退出房间！"));
+		AddSystemMessageToChat(TEXT("取消准备才能退出房间!"));
 		return;
 	}
 
-	// 调用PlayerController的离开房间函数
+	// 调用 PlayerController 的离开房间函数
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
 	{
 		PC->LeaveRoom();
 	}
 }
 
+
+// ==========================================
+// 5. 开始游戏
+// ==========================================
+
 /**
- * @brief 开始游戏按钮点击事件
- * @note 房主点击后向服务器请求开始游戏
+ * OnStartGameClicked
+ *
+ * 房主点击后通过 PC->Server_RequestStartGame() 请求服务器开始游戏
  */
 void URoomInsidePage::OnStartGameClicked()
 {
@@ -370,49 +426,67 @@ void URoomInsidePage::OnStartGameClicked()
 	}
 }
 
+
+// ==========================================
+// 6. 加入攻方/守方
+// ==========================================
+
 /**
- * @brief 加入攻方按钮点击事件
- * @note 检查攻方人数是否已满，未满则请求加入攻方
+ * OnJoinAttackTeamClicked
+ *
+ * 加入攻方按钮
+ * 1. 检查攻方人数是否已满（5 人）
+ * 2. 调用 PC->Server_RequestChangeTeam(true)
  */
 void URoomInsidePage::OnJoinAttackTeamClicked()
 {
-	// 检查攻方人数是否已达到上限（5人）
+	// 检查攻方人数是否已达到上限（5 人）
 	if (Box_AttackTeam && Box_AttackTeam->GetChildrenCount() >= 5)
 	{
-		AddSystemMessageToChat(TEXT("系统提示：攻方人数已满，不可更换队伍！"));
+		AddSystemMessageToChat(TEXT("系统提示: 攻方人数已满，不可更换队伍!"));
 		return;
 	}
 
-	// 向服务器请求加入攻方（true表示攻方）
+	// 向服务器请求加入攻方 (true 表示攻方)
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
 	{
 		PC->Server_RequestChangeTeam(true);
 	}
 }
 
+
 /**
- * @brief 加入守方按钮点击事件
- * @note 检查守方人数是否已满，未满则请求加入守方
+ * OnJoinDefenseTeamClicked
+ *
+ * 加入守方按钮
+ * 1. 检查守方人数是否已满（5 人）
+ * 2. 调用 PC->Server_RequestChangeTeam(false)
  */
 void URoomInsidePage::OnJoinDefenseTeamClicked()
 {
-	// 检查守方人数是否已达到上限（5人）
+	// 检查守方人数是否已达到上限（5 人）
 	if (Box_DefenseTeam && Box_DefenseTeam->GetChildrenCount() >= 5)
 	{
-		AddSystemMessageToChat(TEXT("系统提示：守方人数已满，不可更换队伍！"));
+		AddSystemMessageToChat(TEXT("系统提示: 守方人数已满，不可更换队伍!"));
 		return;
 	}
 
-	// 向服务器请求加入守方（false表示守方）
+	// 向服务器请求加入守方 (false 表示守方)
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
 	{
 		PC->Server_RequestChangeTeam(false);
 	}
 }
 
+
+// ==========================================
+// 7. 切换准备状态
+// ==========================================
+
 /**
- * @brief 切换准备状态按钮点击事件
- * @note 切换玩家的准备/取消准备状态，并同步到服务器
+ * OnToggleReadyClicked
+ *
+ * 切换玩家准备/取消准备状态，并同步到服务器
  */
 void URoomInsidePage::OnToggleReadyClicked()
 {
@@ -431,11 +505,18 @@ void URoomInsidePage::OnToggleReadyClicked()
 	}
 }
 
+
+// ==========================================
+// 8. 聊天消息
+// ==========================================
+
 /**
- * @brief 监听玩家在输入框按下回车键发送消息
- * @param Text 输入的文本内容
- * @param CommitMethod 提交方式（如按回车键）
- * @note 当玩家在聊天输入框中按下回车时触发，向服务器发送聊天消息
+ * OnChatTextCommitted
+ *
+ * 聊天输入框回车事件
+ * 1. 检查是否按回车键
+ * 2. 调用 PC->Server_SendChatMessage
+ * 3. 清空输入框
  */
 void URoomInsidePage::OnChatTextCommitted(const FText& Text, ETextCommit::Type CommitMethod)
 {
@@ -453,13 +534,15 @@ void URoomInsidePage::OnChatTextCommitted(const FText& Text, ETextCommit::Type C
 	}
 }
 
+
 /**
- * @brief 向聊天框添加消息
- * @param SenderName 发送者名称
- * @param bIsHost 是否为房主
- * @param Message 消息内容
- * @param bIsSystemMsg 是否为系统消息
- * @note 该函数用于在房间内显示聊天信息，区分普通玩家消息、房主消息和系统消息
+ * AddChatMessage
+ *
+ * 向聊天框添加一条消息
+ * 1. 区分系统消息（绿色）、房主消息（黄色）、普通消息（白色）
+ * 2. 加上时间戳和发送者名
+ * 3. 创建 UTextBlock 添加到 ScrollBox
+ * 4. 滚动到底部
  */
 void URoomInsidePage::AddChatMessage(const FString& SenderName, bool bIsHost, const FString& Message, bool bIsSystemMsg)
 {
@@ -473,20 +556,20 @@ void URoomInsidePage::AddChatMessage(const FString& SenderName, bool bIsHost, co
 
 	if (bIsSystemMsg)
 	{
-		// 系统消息：绿色显示
-		FinalString = FString::Printf(TEXT("%s系统提示：%s"), *DateStr, *Message);
+		// 系统消息: 绿色显示
+		FinalString = FString::Printf(TEXT("%s系统提示: %s"), *DateStr, *Message);
 		TextColor = FColor::Green;
 	}
 	else if (bIsHost)
 	{
-		// 房主消息：黄色显示，带【房主】标记
-		FinalString = FString::Printf(TEXT("%s【房主】%s：%s"), *DateStr, *SenderName, *Message);
+		// 房主消息: 黄色显示，带【房主】标记
+		FinalString = FString::Printf(TEXT("%s【房主】%s: %s"), *DateStr, *SenderName, *Message);
 		TextColor = FColor::Yellow;
 	}
 	else
 	{
-		// 普通玩家消息：白色显示
-		FinalString = FString::Printf(TEXT("%s%s：%s"), *DateStr, *SenderName, *Message);
+		// 普通玩家消息: 白色显示
+		FinalString = FString::Printf(TEXT("%s%s: %s"), *DateStr, *SenderName, *Message);
 		TextColor = FColor::White;
 	}
 
@@ -500,23 +583,30 @@ void URoomInsidePage::AddChatMessage(const FString& SenderName, bool bIsHost, co
 	ScrollBox_ChatList->ScrollToEnd();
 }
 
+
+// ==========================================
+// 9. 角色选择变化
+// ==========================================
+
 /**
- * @brief 监听角色选择下拉框变化事件
- * @param SelectedItem 选中的角色名称
- * @param SelectionType 选择类型
- * @note 当玩家在下拉框中选择不同角色时触发，更新头像并同步到服务器
+ * OnCharacterSelectionChanged
+ *
+ * 角色下拉框切换事件
+ * 1. 更新头像
+ * 2. 保存角色 ID 到 AccountSubsystem
+ * 3. 通过 SyncLoadoutToServer 同步装备到服务器
  */
 void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
 {
 	if (GEngine)
 	{
-		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan, FString::Printf(TEXT("本地玩家切换了战备角色：%s"), *SelectedItem));
+		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan, FString::Printf(TEXT("本地玩家切换了战备角色: %s"), *SelectedItem));
 	}
 
 	// 更新角色头像显示
 	UpdateCharacterDisplayImage(SelectedItem);
 
-	// 保存选择的角色ID到AccountSubsystem
+	// 保存选择的角色 ID 到 AccountSubsystem
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UAccountSubsystem* AccSub = GI->GetSubsystem<UAccountSubsystem>())
@@ -531,10 +621,13 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 	SyncLoadoutToServer();
 }
 
+
 /**
- * @brief 根据选中的角色名称更新显示的头像图片
- * @param SelectedCharacterName 选中的角色名称
- * @note 从角色数据表中查找对应角色的头像并显示
+ * UpdateCharacterDisplayImage
+ *
+ * 根据选中的角色名称更新显示的头像图片
+ * 1. 从 CharacterDataTable 查找匹配角色
+ * 2. 设置 Image_CharacterDisplay 的画刷为 AvatarIcon
  */
 void URoomInsidePage::UpdateCharacterDisplayImage(const FString& SelectedCharacterName)
 {
@@ -558,9 +651,15 @@ void URoomInsidePage::UpdateCharacterDisplayImage(const FString& SelectedCharact
 	}
 }
 
+
+// ==========================================
+// 10. 武器选择弹窗
+// ==========================================
+
 /**
- * @brief 隐藏武器选择弹窗按钮点击事件
- * @note 关闭武器选择界面
+ * OnHideWeaponOverlayClicked
+ *
+ * 关闭武器选择弹窗
  */
 void URoomInsidePage::OnHideWeaponOverlayClicked()
 {
@@ -570,15 +669,22 @@ void URoomInsidePage::OnHideWeaponOverlayClicked()
 	}
 }
 
+
 /**
- * @brief 确认更换武器按钮点击事件
- * @note 确认选择的武器并应用到当前背包槽位，同步到服务器
+ * OnConfirmWeaponChangeClicked
+ *
+ * 确认更换武器
+ * 1. 校验 TempSelectedWeaponRow
+ * 2. 保存到 AccountSubsystem
+ * 3. 调用 UpdateWeaponDisplayImage 刷新主界面图标
+ * 4. 调用 SyncLoadoutToServer 同步服务器
+ * 5. 关闭弹窗
  */
 void URoomInsidePage::OnConfirmWeaponChangeClicked()
 {
 	if (!TempSelectedWeaponRow.IsNone())
 	{
-		// 保存选择的武器到AccountSubsystem
+		// 保存选择的武器到 AccountSubsystem
 		if (UGameInstance* GI = GetGameInstance())
 		{
 			if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
@@ -589,7 +695,7 @@ void URoomInsidePage::OnConfirmWeaponChangeClicked()
 		// 更新主界面武器显示
 		UpdateWeaponDisplayImage(ActiveBackpackSlot);
 
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green, FString::Printf(TEXT("背包 %d 已装备武器：%s"), ActiveBackpackSlot, *TempSelectedWeaponRow.ToString()));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green, FString::Printf(TEXT("背包 %d 已装备武器: %s"), ActiveBackpackSlot, *TempSelectedWeaponRow.ToString()));
 
 		// 同步装备配置到服务器
 		SyncLoadoutToServer();
@@ -602,13 +708,19 @@ void URoomInsidePage::OnConfirmWeaponChangeClicked()
 	}
 }
 
+
 /**
- * @brief 打开武器选择弹窗按钮点击事件
- * @note 初始化弹窗数据并显示武器选择界面
+ * OnChangeWeaponClicked
+ *
+ * 打开武器选择弹窗
+ * 1. 从 AccountSubsystem 读取当前背包槽位的武器
+ * 2. 设置武器预览图
+ * 3. 显示弹窗
+ * 4. 调用 PopulateWeaponGrid 生成网格
  */
 void URoomInsidePage::OnChangeWeaponClicked()
 {
-	// 从AccountSubsystem中读取当前背包槽位的武器
+	// 从 AccountSubsystem 中读取当前背包槽位的武器
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
@@ -640,34 +752,56 @@ void URoomInsidePage::OnChangeWeaponClicked()
 	PopulateWeaponGrid();
 }
 
+
+// ==========================================
+// 11. 背包切换
+// ==========================================
+
 /**
- * @brief 背包1按钮点击回调
- * @note 切换到第一个背包槽位，更新显示和高亮指示器
+ * OnInventory1Clicked
+ *
+ * 切换到背包 1
+ * 1. 设置 ActiveBackpackSlot = 1
+ * 2. 更新武器显示
+ * 3. 更新高亮指示器
  */
 void URoomInsidePage::OnInventory1Clicked()
 {
 	ActiveBackpackSlot = 1;
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至：背包 1"));
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至: 背包 1"));
 	UpdateWeaponDisplayImage(ActiveBackpackSlot);
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
 }
 
+
 /**
- * @brief 背包2按钮点击回调
- * @note 切换到第二个背包槽位，更新显示和高亮指示器
+ * OnInventory2Clicked
+ *
+ * 切换到背包 2
  */
 void URoomInsidePage::OnInventory2Clicked()
 {
 	ActiveBackpackSlot = 2;
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至：背包 2"));
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至: 背包 2"));
 
 	UpdateWeaponDisplayImage(ActiveBackpackSlot);
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
 }
 
+
+// ==========================================
+// 12. 武器网格生成
+// ==========================================
+
 /**
- * @brief 根据武器数据表动态生成武器选择网格
- * @note 遍历武器数据表，为每个武器创建图标Widget并添加到网格中
+ * PopulateWeaponGrid
+ *
+ * 根据 WeaponDataTable 动态生成武器选择网格
+ * 1. 清空现有网格
+ * 2. 遍历所有武器，创建 UWeaponIconWidget
+ * 3. 调用 SetupWeaponItem 设置信息
+ * 4. 设置高亮（已选中的）
+ * 5. 计算网格位置并 AddChildToUniformGrid
  */
 void URoomInsidePage::PopulateWeaponGrid()
 {
@@ -679,10 +813,10 @@ void URoomInsidePage::PopulateWeaponGrid()
 	static const FString ContextString(TEXT("Weapon Context"));
 	TArray<FName> RowNames = WeaponDataTable->GetRowNames();
 
-	int32 MaxColumns = 4; // 每行最多4个武器
+	int32 MaxColumns = 4; // 每行最多 4 个武器
 	int32 CurrentIndex = 0;
 
-	// 遍历所有武器，创建对应的图标Widget
+	// 遍历所有武器，创建对应的图标 Widget
 	for (const FName& RowName : RowNames)
 	{
 		FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(RowName, ContextString);
@@ -710,10 +844,14 @@ void URoomInsidePage::PopulateWeaponGrid()
 	}
 }
 
+
 /**
- * @brief 当玩家在武器网格中选择某个武器时调用此函数
- * @param WeaponRowName 被选中的武器行名
- * @note 更新临时选择的武器，刷新预览图和高亮状态
+ * OnWeaponItemSelectedInGrid
+ *
+ * 武器网格中被选中时调用
+ * 1. 更新 TempSelectedWeaponRow
+ * 2. 更新武器预览图
+ * 3. 刷新所有武器图标的高亮状态
  */
 void URoomInsidePage::OnWeaponItemSelectedInGrid(FName WeaponRowName)
 {
@@ -746,10 +884,18 @@ void URoomInsidePage::OnWeaponItemSelectedInGrid(FName WeaponRowName)
 	}
 }
 
+
+// ==========================================
+// 13. 主界面武器图标刷新
+// ==========================================
+
 /**
- * @brief 根据指定背包槽位的武器配置更新显示的武器图标
- * @param BackpackSlot 要更新的背包槽位 (1 或 2)
- * @note 从AccountSubsystem读取武器配置并显示对应图标
+ * UpdateWeaponDisplayImage
+ *
+ * 根据指定背包槽位的武器配置更新显示的武器图标
+ * 1. 从 AccountSubsystem 读取武器
+ * 2. 从 WeaponDataTable 查找 FWeaponInfo
+ * 3. 设置 Image_WeaponDisplay 的画刷
  */
 void URoomInsidePage::UpdateWeaponDisplayImage(int32 BackpackSlot)
 {
@@ -757,7 +903,7 @@ void URoomInsidePage::UpdateWeaponDisplayImage(int32 BackpackSlot)
 
 	FString SavedWeaponRow = TEXT("");
 
-	// 从AccountSubsystem中读取保存的武器
+	// 从 AccountSubsystem 中读取保存的武器
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
@@ -787,10 +933,13 @@ void URoomInsidePage::UpdateWeaponDisplayImage(int32 BackpackSlot)
 	}
 }
 
+
 /**
- * @brief 更新背包选择的高亮指示器位置
- * @param BackpackSlot 要高亮的背包槽位 (1 或 2)
- * @note 根据当前选中的背包槽位显示对应的高亮框
+ * UpdateInventoryHighlightUI
+ *
+ * 更新背包选择的高亮指示器位置
+ * 1 = Image_HighlightBP1 可见
+ * 2 = Image_HighlightBP2 可见
  */
 void URoomInsidePage::UpdateInventoryHighlightUI(int32 BackpackSlot)
 {
@@ -801,13 +950,24 @@ void URoomInsidePage::UpdateInventoryHighlightUI(int32 BackpackSlot)
 	Image_HighlightBP2->SetVisibility(BackpackSlot == 2 ? ESlateVisibility::SelfHitTestInvisible : ESlateVisibility::Hidden);
 }
 
+
+// ==========================================
+// 14. AI 配置面板
+// ==========================================
+
 /**
- * @brief 初始化填充 AI 面板的下拉框（角色、武器、队伍）
- * @note 从数据表中读取数据并填充AI配置界面的下拉选项，恢复上次的选择
+ * PopulateAIPanelData
+ *
+ * 初始化 AI 面板的下拉框
+ * 1. 填充 AI 角色下拉框（从 CharacterDataTable）
+ * 2. 填充 AI 武器下拉框（从 WeaponDataTable）
+ * 3. 填充 AI 队伍下拉框（攻方/守方）
+ * 4. 恢复上次的选择
+ * 5. 设置默认 AI 数量为 1
  */
 void URoomInsidePage::PopulateAIPanelData()
 {
-	// 填充AI角色选择下拉框
+	// 填充 AI 角色选择下拉框
 	if (ComboBox_AICharacter && CharacterDataTable)
 	{
 		ComboBox_AICharacter->ClearOptions();
@@ -834,7 +994,7 @@ void URoomInsidePage::PopulateAIPanelData()
 		}
 	}
 
-	// 填充AI武器选择下拉框
+	// 填充 AI 武器选择下拉框
 	if (ComboBox_AIWeapon && WeaponDataTable)
 	{
 		ComboBox_AIWeapon->ClearOptions();
@@ -861,7 +1021,7 @@ void URoomInsidePage::PopulateAIPanelData()
 		}
 	}
 
-	// 填充AI队伍选择下拉框
+	// 填充 AI 队伍选择下拉框
 	if (ComboBox_AITeam)
 	{
 		ComboBox_AITeam->ClearOptions();
@@ -878,16 +1038,21 @@ void URoomInsidePage::PopulateAIPanelData()
 		}
 	}
 
-	// 设置默认AI数量为1
+	// 设置默认 AI 数量为 1
 	if (Input_AICount)
 	{
 		Input_AICount->SetText(FText::FromString(TEXT("1")));
 	}
 }
 
+
 /**
- * @brief 打开AI配置面板按钮点击事件
- * @note 填充AI配置数据并显示AI配置界面
+ * OnOpenAIPanelClicked
+ *
+ * 打开 AI 配置面板
+ * 1. 调用 PopulateAIPanelData
+ * 2. 隐藏提示信息
+ * 3. 显示 AI 配置面板
  */
 void URoomInsidePage::OnOpenAIPanelClicked()
 {
@@ -899,13 +1064,15 @@ void URoomInsidePage::OnOpenAIPanelClicked()
 		Text_AddAIHint->SetVisibility(ESlateVisibility::Hidden);
 	}
 
-	// 显示AI配置面板
+	// 显示 AI 配置面板
 	if (Overlay_AddAI) Overlay_AddAI->SetVisibility(ESlateVisibility::Visible);
 }
 
+
 /**
- * @brief 关闭AI配置面板按钮点击事件
- * @note 隐藏AI配置界面
+ * OnHideAddAIClicked
+ *
+ * 关闭 AI 配置面板
  */
 void URoomInsidePage::OnHideAddAIClicked()
 {
@@ -915,15 +1082,24 @@ void URoomInsidePage::OnHideAddAIClicked()
 	}
 }
 
+
 /**
- * @brief 确认添加AI按钮点击事件
- * @note 根据配置向房间中添加指定数量的AI玩家，检查队伍人数限制
+ * OnConfirmAddAIClicked
+ *
+ * 确认添加 AI
+ * 1. 读取选择: 角色、武器、队伍、数量
+ * 2. 保存 LastConfirmedAI* 用于恢复
+ * 3. 计算目标队伍容器、最大人数、剩余空位
+ * 4. 实际可添加数量 = Min(请求数, 剩余空位)
+ * 5. 调用 PC->Server_AddAI 添加
+ * 6. 空间不足时显示提示
+ * 7. 成功添加则关闭面板
  */
 void URoomInsidePage::OnConfirmAddAIClicked()
 {
 	if (!ComboBox_AICharacter || !ComboBox_AIWeapon || !ComboBox_AITeam || !Input_AICount) return;
 
-	// 获取AI配置
+	// 获取 AI 配置
 	FString SelectedChar = ComboBox_AICharacter->GetSelectedOption();
 	FString SelectedWeapon = ComboBox_AIWeapon->GetSelectedOption();
 	FString SelectedTeam = ComboBox_AITeam->GetSelectedOption();
@@ -956,16 +1132,16 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 		{
 			if (Text_AddAIHint)
 			{
-				Text_AddAIHint->SetText(FText::FromString(TEXT("添加失败：该队伍已满员！")));
+				Text_AddAIHint->SetText(FText::FromString(TEXT("添加失败: 该队伍已满员!")));
 				Text_AddAIHint->SetVisibility(ESlateVisibility::Visible);
 			}
 			return;
 		}
 
-		// 计算实际可添加的AI数量
+		// 计算实际可添加的 AI 数量
 		int32 ActualAddCount = FMath::Min(RequestedAICount, RemainingSlots);
 
-		// 向服务器请求添加AI
+		// 向服务器请求添加 AI
 		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
 		{
 			bool bIsAttackTeam = SelectedTeam.Contains(TEXT("攻方"));
@@ -996,10 +1172,19 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 	}
 }
 
+
+// ==========================================
+// 15. 系统消息
+// ==========================================
+
 /**
- * @brief 向聊天框发送系统提示消息
- * @param Message 要显示的系统消息内容
- * @note 用于显示系统级别的提示信息，如操作失败、状态变更等
+ * AddSystemMessageToChat
+ *
+ * 向聊天框发送系统提示消息
+ * 1. 创建 UTextBlock
+ * 2. 黄色显示
+ * 3. 字体大小 14
+ * 4. 添加到 ScrollBox 并滚动到底部
  */
 void URoomInsidePage::AddSystemMessageToChat(const FString& Message)
 {
@@ -1023,16 +1208,26 @@ void URoomInsidePage::AddSystemMessageToChat(const FString& Message)
 	}
 }
 
+
+/**
+ * ActivateChatInput
+ *
+ * 激活聊天输入框
+ * 1. 设置可见性 + 键盘焦点
+ * 2. FInputModeGameAndUI 模式（同时操作游戏和 UI）
+ * 3. 焦点锁定到 Input_Chat
+ * 4. 显示鼠标
+ */
 void URoomInsidePage::ActivateChatInput()
 {
-	// 工业级规范：安全校验，防止空指针
+	// 工业级规范: 安全校验，防止空指针
 	if (!Input_Chat) return;
 
-	// 激活输入框：设置可见性 + 切 GameAndUI 模式 + 锁定鼠标
+	// 激活输入框: 设置可见性 + 切 GameAndUI 模式 + 锁定鼠标
 	Input_Chat->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 	Input_Chat->SetKeyboardFocus();
 
-	// 配置输入模式：允许同时操作游戏和 UI，并将焦点锁定到聊天输入框
+	// 配置输入模式: 允许同时操作游戏和 UI，并将焦点锁定到聊天输入框
 	if (APlayerController* PC = GetOwningPlayer())
 	{
 		FInputModeGameAndUI InputMode;
@@ -1043,9 +1238,19 @@ void URoomInsidePage::ActivateChatInput()
 	}
 }
 
+
+// ==========================================
+// 16. 自动订阅 / 刷新引擎
+// ==========================================
+
 /**
- * @brief 定时器回调函数：每0.5秒检查一次房间内的玩家变化
- * @note 扫描GameState中的玩家列表，检测新加入或离开的玩家，并订阅状态变化事件
+ * CheckForNewPlayers
+ *
+ * 0.5 秒一次的玩家变化检查
+ * 1. 扫描 GameState->PlayerArray
+ * 2. 新玩家 -> 加入 KnownPlayerStates + 订阅 OnStateChanged
+ * 3. 已离开 -> 从 KnownPlayerStates 移除
+ * 4. 期望人数 != UI 实际人数 -> 触发 RefreshRoomUI
  */
 void URoomInsidePage::CheckForNewPlayers()
 {
@@ -1054,7 +1259,7 @@ void URoomInsidePage::CheckForNewPlayers()
 
 	bool bNeedsRefresh = false;
 
-	// 遍历GameState中的所有玩家状态
+	// 遍历 GameState 中的所有玩家状态
 	for (APlayerState* GenericPS : GS->PlayerArray)
 	{
 		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
@@ -1096,12 +1301,12 @@ void URoomInsidePage::CheckForNewPlayers()
 		}
 	}
 
-	// 获取UI中实际显示的人数
+	// 获取 UI 中实际显示的人数
 	int32 UIAttackCount = Box_AttackTeam ? Box_AttackTeam->GetChildrenCount() : 0;
 	int32 UIDefenseCount = Box_DefenseTeam ? Box_DefenseTeam->GetChildrenCount() : 0;
 	int32 RenderedTotalCount = UIAttackCount + UIDefenseCount;
 
-	// 检查是否需要刷新UI（人数不匹配或队伍分布不一致）
+	// 检查是否需要刷新 UI（人数不匹配或队伍分布不一致）
 	if (RenderedTotalCount != KnownPlayerStates.Num() ||
 		ExpectedAttackCount != UIAttackCount ||
 		ExpectedDefenseCount != UIDefenseCount)
@@ -1109,16 +1314,24 @@ void URoomInsidePage::CheckForNewPlayers()
 		bNeedsRefresh = true;
 	}
 
-	// 如果需要刷新，执行UI重绘
+	// 如果需要刷新，执行 UI 重绘
 	if (bNeedsRefresh)
 	{
 		RefreshRoomUI();
 	}
 }
 
+
 /**
- * @brief 核心刷新函数：重新绘制房间UI，更新所有玩家的显示信息
- * @note 只有当人员变动，或者某个玩家触发OnStateChanged时，才执行重绘
+ * RefreshRoomUI
+ *
+ * 重新绘制房间 UI，更新所有玩家的显示信息
+ * 1. 清空攻守方列表
+ * 2. 校验 PlayerLabelClass 是否已配置
+ * 3. 获取房主名
+ * 4. 遍历 KnownPlayerStates 创建 PlayerLabelWidget
+ * 5. 设置 AI/房主/玩家标签样式
+ * 6. 设置移除按钮可见性（房主有，且非房主自己）
  */
 void URoomInsidePage::RefreshRoomUI()
 {
@@ -1126,10 +1339,10 @@ void URoomInsidePage::RefreshRoomUI()
 	if (Box_AttackTeam) Box_AttackTeam->ClearChildren();
 	if (Box_DefenseTeam) Box_DefenseTeam->ClearChildren();
 
-	// 检查PlayerLabelClass是否已配置
+	// 检查 PlayerLabelClass 是否已配置
 	if (!PlayerLabelClass)
 	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[严重错误] PlayerLabelClass 未配置！"));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, TEXT("[严重错误] PlayerLabelClass 未配置!"));
 		return;
 	}
 
@@ -1140,7 +1353,7 @@ void URoomInsidePage::RefreshRoomUI()
 		CurrentHostName = GS->HostPlayerName;
 	}
 
-	// 遍历所有已知玩家，创建对应的UI标签
+	// 遍历所有已知玩家，创建对应的 UI 标签
 	for (ARoomPlayerState* PS : KnownPlayerStates)
 	{
 		if (!IsValid(PS)) continue;
@@ -1152,7 +1365,7 @@ void URoomInsidePage::RefreshRoomUI()
 
 		if (TargetBox)
 		{
-			// 创建玩家标签Widget
+			// 创建玩家标签 Widget
 			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
 			if (PlayerLabel)
 			{
@@ -1162,12 +1375,12 @@ void URoomInsidePage::RefreshRoomUI()
 				PlayerLabel->SetPlayerName(PName);
 				PlayerLabel->SetReadyState(PS->bIsReady);
 
-				bool bIsAI = PName.StartsWith(TEXT("[AI]")); // 是否为AI玩家
+				bool bIsAI = PName.StartsWith(TEXT("[AI]")); // 是否为 AI 玩家
 				bool bIsThisLabelTheHost = (PName == CurrentHostName); // 是否为房主
 
 				if (bIsAI)
 				{
-					// 标记为AI玩家
+					// 标记为 AI 玩家
 					PlayerLabel->SetAsAI();
 				}
 				else if (bIsThisLabelTheHost)
@@ -1187,24 +1400,40 @@ void URoomInsidePage::RefreshRoomUI()
 	}
 }
 
+
+// ==========================================
+// 17. 监听游戏流程状态变化
+// ==========================================
+
 /**
- * @brief 监听游戏流程状态变化
- * @param NewState 新的游戏流程状态
- * @note 当游戏状态变为战斗状态时，销毁大厅UI
+ * OnGameFlowStateChanged
+ *
+ * 监听游戏流程状态变化
+ * 时机: 状态变为 EMatchState::Battleing
+ * 用途: 销毁大厅 UI
  */
 void URoomInsidePage::OnGameFlowStateChanged(EMatchState NewState)
 {
 	if (NewState == EMatchState::Battleing)
 	{
-		UE_LOG(LogTemp, Log, TEXT("[RoomInsidePage] 收到战斗开始指令，大厅UI开始自我销毁！"));
+		UE_LOG(LogTemp, Log, TEXT("[RoomInsidePage] 收到战斗开始指令，大厅UI开始自我销毁!"));
 
 		this->RemoveFromParent();
 	}
 }
 
+
+// ==========================================
+// 18. 同步装备到服务器
+// ==========================================
+
 /**
- * @brief 同步玩家的装备配置到服务器
- * @note 将当前选择的角色和武器配置发送到服务器，确保其他玩家能看到正确的装备
+ * SyncLoadoutToServer
+ *
+ * 同步玩家的装备配置到服务器
+ * 1. 获取当前选中的角色 ID
+ * 2. 获取两个背包槽位的武器
+ * 3. 调用 PC->Server_SelectLoadout 同步服务器
  */
 void URoomInsidePage::SyncLoadoutToServer()
 {
@@ -1214,7 +1443,7 @@ void URoomInsidePage::SyncLoadoutToServer()
 		{
 			int32 SelectedIndex = ComboBox_CharacterSelect->GetSelectedIndex();
 
-			// 获取当前选择的角色ID
+			// 获取当前选择的角色 ID
 			FString CurrentCharID = (SelectedIndex != INDEX_NONE) ? CachedCharacterIDs[SelectedIndex].ToString() : TEXT("Default");
 
 			// 获取两个背包槽位的武器
