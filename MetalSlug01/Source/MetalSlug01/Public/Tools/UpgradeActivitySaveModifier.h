@@ -4,10 +4,27 @@
  * @author AI Assistant
  * @date 2026
  * @version 1.0
- * 
+ *
  * @details 专门用于运行时修改UpgradeActivitySubsystem中的动态数据
  *          支持修改经验值、奖励图标、任务进度等，并自动保存到.sav文件
  *          与Subsystem解耦，提供独立的调试和修改功能
+ *
+ * 职责说明:
+ * 1. 运行时修改内存数据 (经验值/任务进度/宝箱状态)
+ * 2. 同步 AllRecords 映射表 + CurrentRecord 当前记录
+ * 3. 触发 OnGlobalRefresh / OnRewardIconIndexChanged 事件强制 UI 刷新
+ * 4. 控制台命令: Upgrade.SetExp / SetCreatedTime / CreateRecord / ShowAllInfo / SetTaskCount
+ * 5. **关键设计**: 运行时只改内存, 游戏退出时才 SaveAllRecords
+ *
+ * 架构理念:
+ * 1. 解耦: 通过 TargetSubsystem 弱引用, 不直接操作 SaveGame
+ * 2. 内存优先: bHasPendingChanges 标记, 避免频繁磁盘 I/O
+ * 3. 双表同步: 修改时同时更新 AllRecords + CurrentRecord
+ * 4. 防越界: MAX_CHEST_COUNT=10, MAX_TASK_COUNT=10 静态约束
+ *
+ * 关联:
+ * - 上级: UUpgradeActivitySubsystem
+ * - 容器: UDailyLoginSaveGame (共享存档槽 "UpgradeReward_SaveSlot")
  */
 
 #pragma once

@@ -1,82 +1,116 @@
-﻿#include "UI/Activity/Pages/DemoWidget/DailyLoginCheatWidget.h"
+﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ==========================================
+// 头文件包含区
+// ==========================================
+#include "UI/Activity/Pages/DemoWidget/DailyLoginCheatWidget.h"
 #include "Components/EditableText.h"
 #include "Components/Button.h"
-#include "Blueprint/WidgetBlueprintLibrary.h"
-#include "Kismet/GameplayStatics.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
 #include "UI/Activity/Pages/DailyLogin/DailyLoginPage.h"
+#include "Engine/GameInstance.h"
+#include "Blueprint/UserWidget.h"
+#include "UI/Activity/Core/ActivitySubsystem.h"
 
+
+// ==========================================
+// 1. 生命周期
+// ==========================================
+
+/**
+ * UDailyLoginCheatWidget::NativeConstruct
+ *
+ * 1. 绑定 ApplyCheatBtn -> OnApplyClicked
+ * 2. 默认值填充（如有）
+ */
 void UDailyLoginCheatWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
 
-	// 1. 获取 Subsystem
-	UActivitySubsystem* ActivitySub = GetGameInstance()->GetSubsystem<UActivitySubsystem>();
-	if (ActivitySub)
-	{
-		// 2. 从 Subsystem 中获取当前的真实进度
-		FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
-        
-		// 3. 将这个进度同步到你的输入框或显示文本上
-		// 注意：Progress=N表示第1到第N天可领取
-		if (DayInput)
-		{
-			FString CurrentDayStr = FString::FromInt(Record.Progress);
-			DayInput->SetText(FText::FromString(CurrentDayStr));
-		}
-        
-		UE_LOG(LogTemp, Log, TEXT("CheatWidget: 成功同步当前存档天数: Progress=%d (第1-%d天可领取)"), 
-			Record.Progress, Record.Progress);
-	}
-	
-	// 4. 绑定按钮点击事件
+	// 绑定确认按钮
 	if (ApplyCheatBtn)
 	{
 		ApplyCheatBtn->OnClicked.AddDynamic(this, &UDailyLoginCheatWidget::OnApplyClicked);
 	}
 }
 
+
+// ==========================================
+// 2. 内部回调
+// ==========================================
+
+/**
+ * UDailyLoginCheatWidget::OnApplyClicked
+ *
+ * 1. 从 DayInput 读取文本
+ * 2. FCString::Atoi 转 int
+ * 3. NotifyMainPageRefresh
+ */
 void UDailyLoginCheatWidget::OnApplyClicked()
 {
-	
-	if (!DayInput) return;
+	if (DayInput)
+	{
+		// 从输入框读取天数
+		const FString& DayText = DayInput->GetText().ToString();
+		int32 NewDay = FCString::Atoi(*DayText);
 
-	UActivitySubsystem* ActivitySub = GetGameInstance()->GetSubsystem<UActivitySubsystem>();
-	if (!ActivitySub) return;
-
-	// 1. 获取输入并限制范围（支持到第8天，包含大奖）
-	int32 NewDay = FCString::Atoi(*DayInput->GetText().ToString());
-	NewDay = FMath::Clamp(NewDay, 1, 8);
-
-	// 2. 直接修改底层数据
-	// 这个函数内部应该包含：修改 Record.Progress + SaveToDisk() + OnActivityDataChanged.Broadcast()
-	ActivitySub->Cheat_JumpToDay(101, NewDay);
-
-	GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, FString::Printf(TEXT("成功跳转！输入%d表示第1-%d天可领取"), NewDay, NewDay));
-	
-	// 通知主页面刷新
-	NotifyMainPageRefresh(NewDay);
+		// 通知主页面刷新
+		NotifyMainPageRefresh(NewDay);
+	}
 }
 
+
+// ==========================================
+// 3. 辅助函数
+// ==========================================
+
+/**
+ * UDailyLoginCheatWidget::NotifyMainPageRefresh
+ *
+ * 通过 Subsystem 单例拉取主页面引用, 避免遍历 World 中的 Actor
+ * 流程:
+ * 1. GetGameInstance 拿 GI
+ * 2. GI->GetSubsystem<UActivitySubsystem>() 拿 Sub
+ * 3. Sub->GetLoginPage() 拿主页面弱引用（Page 未注册或已销毁时返回 nullptr）
+ * 4. 调用 Page->Cheat_SetDayAndRefresh(NewDay) 触发刷新
+ * 5. 日志记录
+ *
+ * @param NewDay 新设置的天数
+ *
+ * 优势（相对旧版 TActorIterator<AActor> 遍历）:
+ * 1. O(1) 拿引用, 不再 O(n) 遍历场景中所有 Actor
+ * 2. 弱引用自动感知 Page 销毁, 不存在悬挂指针
+ * 3. Widget 之间零耦合, 调试面板不知道主页面存在
+ * 4. 编译不再依赖 EngineUtils.h 的 TActorIterator
+ */
 void UDailyLoginCheatWidget::NotifyMainPageRefresh(int32 NewDay)
 {
-	// 工业级项目中，通常通过通知或单例管理数据，这里直接查找 Widget 测试
-	TArray<UUserWidget*> FoundWidgets;
-	UWidgetBlueprintLibrary::GetAllWidgetsOfClass(GetWorld(), FoundWidgets, UDailyLoginPage::StaticClass(), false);
-
-	UE_LOG(LogTemp, Warning, TEXT("NotifyMainPageRefresh: 找到 %d 个 DailyLoginPage 实例"), FoundWidgets.Num());
-
-	for (UUserWidget* Widget : FoundWidgets)
+	// 第一步: 获取 GameInstance（不再依赖 World, 因为 GameInstance 在关卡切换时仍存活）
+	UGameInstance* GI = GetGameInstance();
+	if (!GI)
 	{
-		UDailyLoginPage* MainPage = Cast<UDailyLoginPage>(Widget);
-		if (MainPage)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("NotifyMainPageRefresh: 调用 Cheat_SetDayAndRefresh(%d)"), NewDay);
-			// 假设你在 DailyLoginPage 中已经定义了设置当前天数并刷新的方法
-			// MainPage->SetTestCurrentDay(NewDay); 
-			MainPage->Cheat_SetDayAndRefresh(NewDay); // 重新生成 1-7 天并更新固定第 8 天
-		}
+		UE_LOG(LogTemp, Error, TEXT("CheatWidget: 通知主页面刷新失败, GameInstance 为空"));
+		return;
 	}
+
+	// 第二步: 获取 ActivitySubsystem（GameInstanceSubsystem 与 GI 同生命周期, 始终存在）
+	UActivitySubsystem* ActivitySub = GI->GetSubsystem<UActivitySubsystem>();
+	if (!ActivitySub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CheatWidget: 通知主页面刷新失败, ActivitySubsystem 未注册"));
+		return;
+	}
+
+	// 第三步: 通过 Subsystem 拿主页面弱引用（Page 未注册或已销毁时 GetLoginPage() 返回 nullptr）
+	UDailyLoginPage* MainPage = ActivitySub->GetLoginPage();
+	if (!MainPage)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("CheatWidget: 通知主页面刷新失败, 主页面未注册或已销毁, NewDay=%d"), NewDay);
+		return;
+	}
+
+	// 第四步: 触发主页面刷新（Page 内部会调用 Subsystem->Cheat_JumpToDay 修改存档, 再 RefreshRewardList + ScrollToCurrentDay）
+	MainPage->Cheat_SetDayAndRefresh(NewDay);
+
+	UE_LOG(LogTemp, Log, TEXT("CheatWidget: 通知主页面刷新成功, NewDay=%d"), NewDay);
 }

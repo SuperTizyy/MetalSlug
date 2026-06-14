@@ -6,33 +6,120 @@
  * @version 1.0
  *
  * @details 实现每日升级奖励活动页面的核心功能
- * 
+ *
+ * ====================================================================
+ * 文件实现说明（按代码顺序）
+ * ====================================================================
+ *
+ * §1. 头文件包含区
+ *   - UMG 控件 (Border, HBox, Image, Button, TextBlock, ProgressBar, VBox, ScrollBox)
+ *   - Styling/SlateTypes（按钮样式）
+ *   - ActivitySubsystem / UpgradeActivitySubsystem（数据源）
+ *   - 子 Widget: ExperienceChestClaimWidget / TaskDetailWidget / DayLockHintWidget
+ *
+ * §2. 生命周期 (Initialize / NativeConstruct / NativeDestruct)
+ *   - Initialize: 绑定 ReselectRewardButton
+ *   - NativeConstruct: 0.2s 延迟居中 ScrollBox
+ *   - NativeDestruct: 解绑 ReselectRewardButton（保留 Subsystem 订阅, 让缓存页可继续接收事件）
+ *
+ * §3. 奖励物品图标 (InitializeRewardItemIcons / UpdateRewardItemImage / SwitchToNext/PreviousRewardIcon)
+ *   - CachedItemIcons: 全局缓存, 用于循环切换
+ *   - 依赖 Subsystem: GetRewardItemIcons / GetCurrentRewardIconIndex
+ *   - 编辑器预览模式下静默返回
+ *
+ * §4. 宝箱数量 (UpdateChestCountText)
+ *   - 格式: "X{count}" - 拼接 X 前缀
+ *
+ * §5. 经验宝箱控件列表 (InitializeExperienceChestWidgets)
+ *   - 动态创建 ExperienceChestClaimWidget（刨除最后一个索引）
+ *   - 状态机: 已领取 / 满足经验 / 经验不足
+ *   - 设置 HighlightFrameImage 可见性
+ *   - **防御链**: ItemsScrollBox / GameInstance / Subsystem / Config / ChestBoxIcons
+ *
+ * §6. 经验值显示 (UpdateExperienceDisplay)
+ *   - 简单同步: Subsystem->GetCurrentExperience -> CurrentExpText
+ *
+ * §7. 每日任务列表 (UpdateDailyTasks)
+ *   - 动态创建 UDailyTaskWidget 到 DayButtonsContainer
+ *   - 业务逻辑下沉: Subsystem 计算 HighlightStates / LockStates
+ *   - 默认选中 MaxRecordDate 那一天
+ *   - 清理 TasksContainer 时保留 BonusInfoBorder / BonusInfoText
+ *
+ * §8. 天数按钮点击 (OnDayButtonClicked)
+ *   - 流程: 提取 DayNumber -> RefreshDailyTaskHighlights -> 清理 TasksContainer
+ *   - HasDayDataInMemory 检查: 否则显示 DayLockHintWidget
+ *   - 动态创建 TaskDetailWidget + SetupClaimButton + SetupRewardsContainer
+ *
+ * §9. 整体刷新 (RefreshUI)
+ *   - 7 步骤: 图标 -> 宝箱状态 -> 进度条 -> 居中 -> 宝箱数量 -> 经验值 -> 奖励图 -> 任务 -> 固定奖励
+ *   - 自我身份核对: GetPageIdentity 输出
+ *
+ * §10. 按钮事件包装器 (HandleDayButtonClicked)
+ *   - 通过 IsHovered() 反查被点击的按钮（无参委托技巧）
+ *   - 防御: ButtonToDayIndexMap 为空 / 按钮失效
+ *
+ * §11. 重选奖励 (OnReselectRewardClicked)
+ *   - 创建 ActivityConfirmPopupWidget
+ *   - 弹窗内由用户选择索引 -> UpdateRewardIconIndexAndSave
+ *
+ * §12. Subsystem 事件订阅 (SubscribeToSubsystemEvents / UnsubscribeFromSubsystemEvents / OnRewardIconIndexChanged)
+ *   - 订阅: OnRewardIconIndexChanged / OnGlobalRefresh
+ *   - 防御: 先 RemoveDynamic 防止 NativeConstruct 多次触发导致重复绑定
+ *
+ * §13. 手动刷新 (ManualRefreshUI / RefreshDailyTaskHighlights)
+ *   - ManualRefreshUI: 直接调用 RefreshUI
+ *   - RefreshDailyTaskHighlights: 临时高亮覆盖自动高亮
+ *
+ * §14. 页面身份 (GetPageIdentity)
+ *   - 格式: "Page[0xADDRESS]@MMdd-HHmmss"
+ *
+ * §15. 事件处理 (HandleChestClaimRequest / ShowRewardOptionWidget / HandleRewardStore)
+ *   - HandleChestClaimRequest -> ShowRewardOptionWidget -> CreateWidget<URewardOptionWidget>
+ *   - HandleRewardStore: 同步 AllRecords + CurrentRecord + OnGlobalRefresh.Broadcast
+ *   - TObjectIterator 查找并关闭 RewardOptionWidget 弹窗
+ *
+ * §16. 固定奖励 (InitializeFixedPrizeWidget / UpdateFixedPrizeWidget)
+ *   - 数据下沉: Subsystem->ShouldShowFixedPrizeHighlight / GetFixedPrizeExperienceValue
+ *   - 复用 InitializeFixedPrizeWidget 完成所有更新
+ *
+ * §17. 滚动居中 (CenterScrollBoxOnCurrentExperience / FindTargetChestIndexForExperience / CalculateCenterScrollOffset / CalculateMaxScrollOffset)
+ *   - 目标: ItemsScrollBox 居中显示当前经验对应的宝箱
+ *   - 备用方案: 估算 WidgetWidth=130 / Spacing=10
+ *   - 几何信息无效时通过全局 bool 标志降级
+ *
+ * §18. 加成信息文本 (UpdateBonusInfoText)
+ *   - 格式: "{Description} {Complete}/{Total} 剩余时长: {H}H {M}M"
+ *   - 过期时: 隐藏 BonusInfoText + BonusInfoBorder
+ *
  * @section Overview 系统概述
- * 该文件实现了每日升级奖励活动页面的完整功能，采用Subsystem模式实现
- * 数据访问层与UI层的分离，确保代码的可维护性和扩展性。
- * 
+ * 该文件实现了每日升级奖励活动页面的完整功能，采用 Subsystem 模式实现
+ * 数据访问层与 UI 层的分离，确保代码的可维护性和扩展性。
+ *
  * @section Architecture 系统架构
- * - UI层：DailyUpgradeRewardPage负责界面显示和用户交互
- * - 数据层：UpgradeActivitySubsystem提供数据访问接口
- * - 配置层：通过DataTable配置活动规则和奖励信息
- * 
+ * - UI 层：DailyUpgradeRewardPage 负责界面显示和用户交互
+ * - 数据层：UpgradeActivitySubsystem 提供数据访问接口
+ * - 配置层：通过 DataTable 配置活动规则和奖励信息
+ *
  * @section KeyFeatures 核心功能
  * 1. 奖励物品图标动态加载和显示
  * 2. 经验宝箱状态的实时更新
  * 3. 重选奖励功能的弹窗交互
  * 4. 编辑器预览模式的支持
  * 5. 完善的事件绑定和资源管理
- * 
+ *
  * @section DataFlow 数据流向
- * 配置表(DT_DailyUpgradeRewardConfigRow) → Subsystem → UI组件 → 界面显示
- * 
+ * 配置表 (DT_DailyUpgradeRewardConfigRow) → Subsystem → UI 组件 → 界面显示
+ *
  * @section BestPractices 最佳实践
- * - 使用Subsystem模式解耦数据访问
+ * - 使用 Subsystem 模式解耦数据访问
  * - 实现完善的错误处理和日志记录
  * - 支持编辑器预览模式下的优雅降级
- * - 遵循UE C++编码规范和内存管理原则
+ * - 遵循 UE C++ 编码规范和内存管理原则
  */
 
+// ==========================================
+// §1. 头文件包含区
+// ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
 #include "Components/Border.h"
 #include "Components/HorizontalBox.h"
@@ -608,6 +695,35 @@ void UDailyUpgradeRewardPage::UpdateExperienceDisplay()
 	
 }
 
+/**
+ * @brief UpdateDailyTasks - 重新构建每日任务按钮列表
+ * @details 在 NativeConstruct 和 RefreshUI 步骤 6 中调用
+ *
+ * 流程 (10 步):
+ *  1. 防御: 必须在游戏世界 + DayButtonsContainer + DailyTaskWidgetClass 都存在
+ *  2. DayButtonsContainer->ClearChildren() (DayButtonsContainer 自身可以全清)
+ *  3. TasksContainer 特殊清理 - 保留 BonusInfoBorder 和 BonusInfoText 两个特殊控件
+ *     (因为它们是在蓝图中预设的, 不应该被动态清理)
+ *  4. 清空 ButtonToDayIndexMap (防止旧映射悬挂)
+ *  5. 拿 GameInstance / Subsystem
+ *  6. 拿三组数据:
+ *     - DayIdentifiers (从 GetDailyTaskDescriptions 拿 "day1"~"day7" 字符串数组)
+ *     - HighlightStates (从 GetDailyTaskHighlightStates 拿 bool 数组)
+ *     - LockStates (从 GetDailyTaskLockStates 拿 bool 数组)
+ *  7. 循环创建 UDailyTaskWidget, AddChild 到 DayButtonsContainer
+ *     - 设置 DayText / SelectionHighlightImage / LockIconImage
+ *  8. 第二次循环绑定点击事件
+ *     - 填充 ButtonToDayIndexMap
+ *     - OnClicked.AddDynamic 绑到 HandleDayButtonClicked (无参包装器)
+ *  9. 查 MaxRecordDate, 拼 "day{N}" 格式默认 DayIdentifier
+ * 10. 调用 OnDayButtonClicked(DefaultDayIdentifier, DefaultDayIndex) 默认显示
+ *
+ * 业务逻辑下沉:
+ *   HighlightStates / LockStates 完全由 Subsystem 计算, Page 只负责渲染
+ *   这样新增"第 N 天"业务时, 只需改 Subsystem
+ *
+ * @note 调试日志很多 ([BONUS_DEBUG]), 调试完后可清理
+ */
 void UDailyUpgradeRewardPage::UpdateDailyTasks()
 {
 	// 确保在游戏世界中运行
@@ -769,9 +885,33 @@ void UDailyUpgradeRewardPage::UpdateDailyTasks()
 }
 
 /**
- * @brief 处理天数按钮点击事件 - 在 TasksContainer 中动态生成 TaskDetailWidget
- * @param DayIdentifier 天数标识（如"day1", "day2"）
- * @param DayIndex 天数索引
+ * @brief 处理天数按钮点击的核心方法 - 显示某一天的任务详情
+ * @param DayIdentifier 天数标识符 (如 "day1", "day3")
+ * @param DayIndex 天数索引 (0-based)
+ *
+ * 流程 (12 步):
+ *  1. 记录 CurrentDayIndex = DayIndex, CurrentSelectedDay = 数字部分
+ *  2. 调用 RefreshDailyTaskHighlights() 刷新选中态
+ *  3. DayButtonsContainer->InvalidateLayoutAndVolatility() 强制重绘
+ *  4. 更新 BonusInfoText 和 BonusIconsContainer
+ *  5. 防御: GameWorld / TasksContainer / TaskDetailWidgetClass
+ *  6. 清理 TasksContainer 动态子节点 (保留 BonusInfoBorder/Text)
+ *  7. 校验 GameInstance / Subsystem
+ *  8. **核心业务**: 调用 Subsystem->HasDayDataInMemory(DayNumber) 判断是否有数据
+ *     - 没数据: 创建 UDayLockHintWidget 锁屏提示, 初始化后 AddChild
+ *     - 有数据: 继续
+ *  9. 拿 ProcessedDescriptions (Subsystem 已处理过的任务文案)
+ * 10. 循环创建 UTaskDetailWidget
+ *     - 设置 TaskRequirementText
+ *     - 从 ConfigRow / DayRecord 拿 CompleteCount vs RequiredCount
+ *     - SetupClaimButton(DayIdentifier, i, CompleteCount, RequiredCount) - 子 Widget 状态机
+ *     - SetupRewardsContainer(DayIdentifier, i) - 子 Widget 奖励展示
+ *     - 隐藏 ClaimSuccessImage
+ * 11. 末尾再次 RefreshDailyTaskHighlights + InvalidateLayout
+ * 12. 日志分隔线结束
+ *
+ * @note 锁屏 vs 任务详情的分支: 这是"玩家尚未到达那一天"的核心入口
+ *       HasDayDataInMemory 的判断依据: 存档中是否有 DayNumber 对应的 FUpgradeRewardSaveRecord
  */
 void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, int32 DayIndex)
 {
@@ -1090,15 +1230,27 @@ void UDailyUpgradeRewardPage::HandleDayButtonClicked()
 
 
 /**
- * @brief 重选奖励按钮点击事件处理
- * @details 处理重选奖励功能的核心逻辑
- * 主要功能：
- * 1. 通过UpgradeActivitySubsystem获取重选奖励选项数据
- * 2. 验证必要的组件和数据是否存在
- * 3. 创建ActivityConfirmPopupWidget弹窗实例
- * 4. 初始化弹窗并添加到视口显示
- * 5. 将奖励选项数据传递给弹窗组件
- * @note 这是重选奖励功能的入口点，实现了UI层与数据层的解耦
+ * @brief 处理"重选奖励"按钮的点击事件 - 弹出奖励选项确认弹窗
+ * @details 当玩家点击 ReselectRewardButton 时触发
+ *
+ * 业务流程:
+ * 1. 防御链: GameInstance -> UpgradeActivitySubsystem -> 配置数据 -> 弹窗类
+ * 2. 调用 Subsystem 的 GetReselectRewardOptions 获取所有可选的奖励物品 TSoftObjectPtr<UTexture2D>
+ * 3. 校验 ActivityConfirmPopupWidgetClass 是否已绑定 (蓝图端 WBP_ActivityConfirmPopupWidget)
+ * 4. 通过 CreateWidget 创建 UActivityConfirmPopupWidget 实例
+ * 5. 构造一份 FDailyLoginConfigRow 数据 (ActivityID / RewardItemID 来自 Config)
+ * 6. 调用 InitializePopup(PopupOptions, 0) 初始化弹窗 (0 表示默认选中第一项)
+ * 7. AddToViewport(1000) - 用高 ZOrder 确保弹窗始终在最上层
+ *
+ * 数据格式转换说明:
+ *   UActivityConfirmPopupWidget 期望 FDailyLoginConfigRow 格式
+ *   但本类业务配置为 FDailyUpgradeRewardConfigRow
+ *   所以这里需要做一次"桥接": 用后者的 ActivityID + 最后一个 RewardItemID 拼一个临时的 FDailyLoginConfigRow
+ *
+ * 关联:
+ * - 上游: ReselectRewardButton->OnClicked (Initialize 中绑定)
+ * - 下游: UActivityConfirmPopupWidget->InitializePopup
+ * - 事件: 用户在弹窗内选择 → UpdateRewardIconIndexAndSave → OnRewardIconIndexChanged 广播
  */
 void UDailyUpgradeRewardPage::OnReselectRewardClicked()
 {
@@ -1191,6 +1343,28 @@ void UDailyUpgradeRewardPage::OnReselectRewardClicked()
 	}
 }
 
+/**
+ * @brief 订阅 UpgradeActivitySubsystem 提供的两个核心事件
+ * @details 在 NativeConstruct 中调用, 完成本页面与 Subsystem 的事件桥接
+ *
+ * 订阅的事件:
+ * 1. OnRewardIconIndexChanged(int32 NewIndex)
+ *    - 触发时机: 玩家在 ActivityConfirmPopupWidget 选中新的奖励图标, Subsystem 完成存档写入后
+ *    - 本类处理: OnRewardIconIndexChanged → 重新拉取图标缓存 + 刷新 RewardItemImage
+ *
+ * 2. OnGlobalRefresh()
+ *    - 触发时机: 任意对 Subsystem 数据有影响的操作 (HandleRewardStore 领取宝箱 / SaveModifier 控制台命令 / 跨天刷新)
+ *    - 本类处理: RefreshUI → 走全量 7 步刷新流程
+ *
+ * 防御性设计:
+ * - 先 RemoveDynamic 再 AddDynamic, 防止 NativeConstruct 多次触发 (蓝图重载 / 重新打开页面) 导致重复绑定
+ * - 强校验 GameInstance / Subsystem 是否有效, 失败时打 Error 日志直接返回
+ * - 末尾日志记录 Subsystem 与 Page 的指针地址, 便于排查多实例共存问题
+ *
+ * 注意:
+ *   对称的反订阅函数 UnsubscribeFromSubsystemEvents() 在 NativeDestruct 中**不调用**
+ *   故意保留订阅, 让被缓存的页面也能继续响应全局刷新广播
+ */
 void UDailyUpgradeRewardPage::SubscribeToSubsystemEvents()
 {
 	// 通过GameInstance获取UpgradeActivitySubsystem
@@ -1228,6 +1402,20 @@ void UDailyUpgradeRewardPage::SubscribeToSubsystemEvents()
 	
 }
 
+/**
+ * @brief 取消订阅 Subsystem 事件
+ * @details 与 SubscribeToSubsystemEvents 配对使用
+ *
+ * 当前调用方:
+ * - **未被 NativeDestruct 调用** (有意保留, 让缓存页继续接收广播)
+ * - 仅在外部强制调用时使用 (例如 CheatWidget 主动关闭页面)
+ *
+ * 取消的委托:
+ * - OnRewardIconIndexChanged
+ * - OnGlobalRefresh
+ *
+ * @note 与订阅时一致, 必须使用 RemoveDynamic 显式解绑, 不能依赖 UObject 析构
+ */
 void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()
 {
 	// 通过GameInstance获取UpgradeActivitySubsystem
@@ -1252,6 +1440,17 @@ void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已取消订阅Subsystem事件"));
 }
 
+/**
+ * @brief OnRewardIconIndexChanged 事件回调 - 玩家重选奖励图标后被广播
+ * @param NewIndex Subsystem 中新写入的奖励图标索引
+ *
+ * 处理流程:
+ * 1. 日志记录新索引
+ * 2. 调用 InitializeRewardItemIcons() 重新拉取 CachedItemIcons (可能图标列表未变, 但确保缓存与 Subsystem 一致)
+ * 3. 调用 UpdateRewardItemImage() 让 RewardItemImage 显示新图标
+ *
+ * @note 这里**不**调用 RefreshUI 全部刷新, 因为只有"奖励图标"一项变更, 没必要重走 7 步
+ */
 void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 接收到奖励图标索引更新事件，新索引: %d"), NewIndex);
@@ -1265,12 +1464,36 @@ void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 奖励图标索引更新完成"));
 }
 
+/**
+ * @brief 手动触发全量 UI 刷新
+ * @details 给蓝图 / CheatWidget 调用的"一键刷新"入口
+ *
+ * 内部实现: 直接调用 RefreshUI()
+ * 日志: 输出当前 Page 地址, 便于多实例调试
+ */
 void UDailyUpgradeRewardPage::ManualRefreshUI()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 手动刷新UI被调用 - 页面地址=%p"), this);
 	RefreshUI();
 }
 
+/**
+ * @brief 刷新每日任务按钮的高亮状态
+ * @details 在两种情况下被调用:
+ *  1. OnDayButtonClicked 之后 (用户点击新的一天)
+ *  2. UpdateDailyTasks 之后 (重新生成所有 DailyTaskWidget)
+ *
+ * 高亮逻辑 (双轨叠加):
+ *  - 自动高亮: 由 Subsystem 提供的 HighlightStates (基于存档中 MaxRecordDate 计算)
+ *  - 临时高亮: 用户当前点击的 CurrentSelectedDay (优先级更高, 覆盖自动高亮)
+ *
+ * 关键点:
+ *  - 用户点击的天数索引 = CurrentSelectedDay - 1
+ *  - 当 CurrentSelectedDay > 0 时, 临时高亮完全替代自动高亮 (只点亮被点击的那一天)
+ *  - 当 CurrentSelectedDay == 0 时 (默认值, 未点击), 使用 Subsystem 的自动高亮
+ *
+ * 防御: 校验 DayButtonsContainer / GameInstance / Subsystem 全部有效
+ */
 void UDailyUpgradeRewardPage::RefreshDailyTaskHighlights()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 刷新每日任务高亮状态"));
@@ -1363,6 +1586,19 @@ FString UDailyUpgradeRewardPage::GetPageIdentity() const
 
 // ==================== 事件处理函数 ====================
 
+/**
+ * @brief 处理宝箱领取请求 - 由 ExperienceChestClaimWidget 通过 OnChestClaimRequested 委托广播
+ * @param ChestIndex 玩家点击的宝箱索引
+ *
+ * 流程:
+ * 1. 验证 Subsystem 可用
+ * 2. 调用 ShowRewardOptionWidget(ChestIndex) 弹出奖励选择弹窗
+ * 3. **不在这里直接修改 Subsystem 数据** - 数据更新由 RewardOptionWidget 的 StoreBtn 点击后通过 HandleRewardStore 完成
+ *
+ * 这种"两阶段提交"的设计:
+ *  - 玩家点宝箱 → 看到奖励选项 → 玩家在弹窗中再次确认 → 才写入存档
+ *  - 防止误点击造成奖励直接发放
+ */
 void UDailyUpgradeRewardPage::HandleChestClaimRequest(int32 ChestIndex)
 {
 	UE_LOG(LogTemp, Log, TEXT("=========================================="));
@@ -1392,6 +1628,20 @@ void UDailyUpgradeRewardPage::HandleChestClaimRequest(int32 ChestIndex)
 	// 注意：状态更新将在RewardOptionWidget的StoreBtn点击时执行
 }
 
+/**
+ * @brief 弹出 URewardOptionWidget 奖励选择/确认弹窗
+ * @param ChestIndex 玩家尝试领取的宝箱索引
+ *
+ * 流程:
+ * 1. 防御链: RewardOptionWidgetClass / World / Subsystem / Config 缺一不可
+ * 2. CreateWidget<URewardOptionWidget> 创建弹窗实例
+ * 3. 构造 FDailyLoginConfigRow TempRow 桥接数据 (ActivityID + ChestIndex 对应的 RewardItemID + DayIndex)
+ * 4. RewardOptionWidget->InitSelection(RewardOptions) 初始化弹窗
+ * 5. AddToViewport(1000) 高 ZOrder 显示
+ * 6. 绑定 OnStoreToBag 事件 (先 Clear 防止热重载残留绑定) 到 HandleRewardStore
+ *
+ * @note 这里的 "RewardOptions" 数组只有一项, 因为单个宝箱只对应一个奖励物品
+ */
 void UDailyUpgradeRewardPage::ShowRewardOptionWidget(int32 ChestIndex)
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 准备显示RewardOptionWidget，宝箱索引: %d"), ChestIndex);
@@ -1473,6 +1723,25 @@ void UDailyUpgradeRewardPage::ShowRewardOptionWidget(int32 ChestIndex)
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: RewardOptionWidget已添加到视口并绑定事件"));
 }
 
+/**
+ * @brief 刷新所有经验宝箱 Widget 的进度条
+ * @details 在 RefreshUI 步骤 2.1 中调用, 与 UpdateExperienceChestWidgetsState 配合
+ *
+ * 区别:
+ *  - RefreshAllProgressBars: 调用每个 ChestWidget 的 RefreshProgressBar (重算进度)
+ *  - UpdateExperienceChestWidgetsState: 调用 UpdateButtonState (重算按钮三态)
+ *
+ * 流程:
+ * 1. 校验 ItemsScrollBox 存在
+ * 2. 遍历所有子控件, Cast 到 UExperienceChestClaimWidget
+ * 3. 对每个有效 ChestWidget 调用:
+ *     - RefreshProgressBar() - 重算百分比并更新 ExperienceProgressBar
+ *     - UpdateDiamondIconColor() - 根据经验是否满足设置钻石颜色
+ *     - UpdateExperienceTextColor() - 根据经验是否满足设置文本颜色
+ * 4. 统计并日志输出成功刷新的数量
+ *
+ * @note 这里**不创建新 Widget**, 假定 ItemsScrollBox 的子节点已由 InitializeExperienceChestWidgets 预创建
+ */
 void UDailyUpgradeRewardPage::RefreshAllProgressBars()
 {
 	UE_LOG(LogTemp, Log, TEXT("RefreshAllProgressBars 开始执行"));
@@ -1513,6 +1782,21 @@ void UDailyUpgradeRewardPage::RefreshAllProgressBars()
 	UE_LOG(LogTemp, Log, TEXT("RefreshAllProgressBars 执行完成，共刷新 %d 个进度条"), UpdatedCount);
 }
 
+/**
+ * @brief 更新所有经验宝箱 Widget 的按钮状态 (不重算进度条)
+ * @details 与 RefreshAllProgressBars 的区别: 这里只重算按钮三态, 不重算进度条
+ *
+ * 适用场景: 业务规则变了, 但经验值没变 (例如玩家刚刚领取某个宝箱, ChestClaimStatus 变了, 但 CurrentExperience 没变)
+ *
+ * 流程:
+ * 1. 遍历 ItemsScrollBox 子节点
+ * 2. Cast 到 UExperienceChestClaimWidget 后调用:
+ *     - UpdateButtonState() - 重新评估 已领取 / 满足经验 / 经验不足 三种状态
+ *     - UpdateDiamondIconColor() - 同步更新钻石图标颜色
+ *     - UpdateExperienceTextColor() - 同步更新经验文本颜色
+ *
+ * @note 增量更新, 比 RefreshAllProgressBars 更轻量
+ */
 void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 {
 	UE_LOG(LogTemp, Log, TEXT("UpdateExperienceChestWidgetsState 开始执行"));
@@ -1544,6 +1828,27 @@ void UDailyUpgradeRewardPage::UpdateExperienceChestWidgetsState()
 	UE_LOG(LogTemp, Log, TEXT("UpdateExperienceChestWidgetsState 执行完成"));
 }
 
+/**
+ * @brief 玩家在 RewardOptionWidget 弹窗中点击 StoreBtn 后的回调
+ * @param DayIndex 宝箱索引 (DayIndex 实际就是 ChestIndex, 命名沿用弹窗事件签名)
+ *
+ * 数据更新流程:
+ * 1. 从 Subsystem 取出当前 CurrentRecord (副本)
+ * 2. 校验 ChestClaimStatus[ChestIndex] 索引有效
+ * 3. 设置 ChestClaimStatus[ChestIndex] = 1 (标记为已领取)
+ * 4. 更新 LastUpdateTime = FDateTime::Now()
+ * 5. **双轨同步**:
+ *     - Subsystem->AddOrUpdateRecord(CurrentDay, ModifiedRecord) → 写入 AllRecords 字典
+ *     - Subsystem->GetRecord() = ModifiedRecord → 同步写入 CurrentRecord
+ * 6. Subsystem->OnGlobalRefresh.Broadcast() → 通知所有订阅者刷新 (含本页面)
+ * 7. UpdateFixedPrizeWidget() → 本页面立即响应, 不用等广播
+ *
+ * 弹窗关闭:
+ *   使用 TObjectIterator<URewardOptionWidget> 全局遍历已打开的弹窗
+ *   找到第一个 IsInViewport 的实例, 调用 RemoveFromParent 销毁
+ *
+ * @note 存档写入: HandleRewardStore **不直接调用 SaveGameToSlot**, 走 Subsystem 的 OnGlobalRefresh 事件链
+ */
 void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 {
 	
@@ -1611,6 +1916,23 @@ void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 	}
 }
 
+/**
+ * @brief 初始化"固定奖励" Widget (页面右侧的大宝箱)
+ * @details 集中配置 FixedPrizeWidget 的所有显示属性, 可作为"完全更新"使用
+ *
+ * 设置的内容:
+ *  1. HighlightFrameImage 可见性 - 由 Subsystem->ShouldShowFixedPrizeHighlight() 决定
+ *  2. ExperienceText 文本 - 来自 TaskRelatedValues 最后一个索引
+ *  3. SetChestIndex(FixedIndex) - 设置逻辑索引 (用于区分普通宝箱)
+ *  4. UpdateButtonState() - 三态评估 (已领取/可领/不可领)
+ *  5. UpdateDiamondIconColor() + UpdateExperienceTextColor() - 颜色同步
+ *  6. 绑定 OnChestClaimRequested 到 HandleChestClaimRequest (重复绑定会有警告, 但 RemoveDynamic 由 EnsureSafeBinding 守卫)
+ *  7. ChestCountText - "X{count}" 格式
+ *  8. ExperienceProgressBar.SetPercent - 通过 Subsystem->CalculateFixedPrizeProgress 计算
+ *  9. SetChestBoxIcon - 通过 Subsystem->GetFixedPrizeBoxIcon 加载
+ *
+ * @note 实质上是 "Initialize + Refresh" 二合一, 后续 UpdateFixedPrizeWidget 复用同一函数
+ */
 void UDailyUpgradeRewardPage::InitializeFixedPrizeWidget()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始初始化FixedPrizeWidget"));
@@ -1732,6 +2054,17 @@ void UDailyUpgradeRewardPage::InitializeFixedPrizeWidget()
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget初始化完成"));
 }
 
+/**
+ * @brief 增量更新 FixedPrizeWidget 状态
+ * @details 实际是 InitializeFixedPrizeWidget 的别名
+ *
+ * 原因: InitializeFixedPrizeWidget 设计时已经把"初始化"和"更新"逻辑合并,
+ *       所以刷新时直接复用即可
+ *
+ * 调用方:
+ *  - RefreshUI 步骤 7
+ *  - HandleRewardStore 完成后立即调用
+ */
 void UDailyUpgradeRewardPage::UpdateFixedPrizeWidget()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始更新FixedPrizeWidget状态"));
@@ -1742,12 +2075,45 @@ void UDailyUpgradeRewardPage::UpdateFixedPrizeWidget()
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget状态更新完成"));
 }
 
-// 全局静态变量用于跨函数通信
+/**
+ * @brief 匿名命名空间 - 存放仅本翻译单元可见的全局静态变量
+ * @details GHasInvalidGeometryDetected 用于跨函数通信, 标记是否检测到 ScrollBox 子控件几何信息无效
+ *
+ * 用途:
+ *  - 在 CalculateMaxScrollOffset() 中检测 WidgetSize.X 或 LocalToAbsolute 位置 <= 0 时, 设为 true
+ *  - 在 CenterScrollBoxOnCurrentExperience() 中读到该标志为 true 时, 改用估算公式 (130px 控件 + 10px 间距)
+ *
+ * 为什么需要它:
+ *   UE 的 ScrollBox 在 ForceLayoutPrepass() 之后, 部分子 Widget 仍未被布局引擎计算实际大小
+ *   (尤其是 InitializeExperienceChestWidgets 刚创建还没经过一帧的 Widget)
+ *   此时 GetCachedGeometry().GetLocalSize().X 会是 0
+ *   单个函数内无法判断"计算结果为 0 是正常, 还是异常",
+ *   所以用全局标志位 + 备用方案规避
+ */
 namespace
 {
 	bool GHasInvalidGeometryDetected = false;
 }
 
+/**
+ * @brief 滚动 ItemsScrollBox, 让"当前经验值对应"的宝箱居中显示
+ * @details 在 NativeConstruct (延迟 0.2s 触发) 和 RefreshUI 步骤 2.2 中调用
+ *
+ * 算法流程:
+ *  1. ItemsScrollBox->ForceLayoutPrepass() - 强制布局预计算
+ *  2. 防御链: ItemsScrollBox / 子控件 > 0 / GameInstance / Subsystem
+ *  3. 调用 Subsystem->GetTargetChestIndexForCurrentExperience() 拿到目标索引
+ *  4. 目标索引有效性校验
+ *  5. 区分两种分支:
+ *     a) 目标是最后一个控件 → 用 CalculateMaxScrollOffset 算最大值, 必要时启用估算公式
+ *     b) 目标是中间控件 → 用 CalculateCenterScrollOffset 算居中偏移
+ *  6. SetScrollOffset(ScrollOffset) 应用
+ *
+ * 备选方案触发条件:
+ *   - ScrollOffset <= 0 (说明 TotalContentWidth <= ViewportWidth, 内容放不下)
+ *   - GHasInvalidGeometryDetected == true (说明子控件几何信息无效)
+ *   此时用 130px 控件宽 + 10px 间距 + 50px 额外偏移的估算值
+ */
 void UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 开始根据当前经验值居中ScrollBox内容"));
@@ -1847,6 +2213,22 @@ void UDailyUpgradeRewardPage::CenterScrollBoxOnCurrentExperience()
 	}
 }
 
+/**
+ * @brief 根据当前经验值查找目标宝箱索引 - 业务逻辑下沉到 Subsystem 的本地桥接
+ * @param CurrentExp 当前经验值 (虽然函数已不再直接用, 但保留签名以兼容可能的外部调用)
+ * @param TaskRelatedValues 经验阈值数组
+ * @return 目标宝箱索引
+ *
+ * 业务流程:
+ *  1. 优先调用 Subsystem->GetTargetChestIndexForCurrentExperience() (业务逻辑下沉)
+ *  2. Subsystem 不可用时, 启用降级方案:
+ *     - 遍历 TaskRelatedValues, 找到第一个 > CurrentExp 的索引 i
+ *     - 返回 max(0, i - 1) (即"刚好满足"的那个宝箱)
+ *     - 如果所有阈值都 <= CurrentExp, 返回最后一个索引
+ *
+ * @note 现在几乎不会被调用, 因为 CenterScrollBoxOnCurrentExperience 直接走 Subsystem
+ *       保留它是为了未来可能的扩展 (例如外部逻辑传入自定义经验值)
+ */
 int32 UDailyUpgradeRewardPage::FindTargetChestIndexForExperience(int32 CurrentExp, const TArray<int32>& TaskRelatedValues)
 {
 	// 调用Subsystem的业务逻辑函数
@@ -1878,6 +2260,22 @@ int32 UDailyUpgradeRewardPage::FindTargetChestIndexForExperience(int32 CurrentEx
 	return LastIndex;
 }
 
+/**
+ * @brief 计算"让目标索引的控件居中"所需的 ScrollBox 滚动偏移量
+ * @param TargetIndex 目标宝箱在 ItemsScrollBox 中的子节点索引
+ * @return 滚动偏移量 (像素), 已 Clamp 到 [0, MaxOffset]
+ *
+ * 算法:
+ *  1. ViewportWidth = ScrollBox 的可视区域宽度
+ *  2. 遍历累加前 N 个子节点的 WidgetWidth + 假设 10px 间距, 累加到 TargetPosition
+ *  3. TargetPosition = 目标控件左边缘的累计 X 坐标
+ *  4. CenterOffset = TargetPosition + TargetWidgetWidth/2 - ViewportWidth/2
+ *     (让目标控件中心对齐 ScrollBox 中心)
+ *  5. 用 CalculateMaxScrollOffset() 拿最大值, Clamp(CenterOffset, 0, MaxOffset)
+ *
+ * 关键假设: 子控件间距恒为 10px (因为 ItemsScrollBox 默认没有 spacing 设置)
+ *          如果未来调整了 spacing, 需要同步修改这个常量
+ */
 float UDailyUpgradeRewardPage::CalculateCenterScrollOffset(int32 TargetIndex)
 {
 	// 计算使目标控件居中显示所需的滚动偏移量
@@ -1930,6 +2328,23 @@ float UDailyUpgradeRewardPage::CalculateCenterScrollOffset(int32 TargetIndex)
 	return CenterOffset;
 }
 
+/**
+ * @brief 计算 ScrollBox 的最大滚动偏移量 (总内容宽度 - 可视宽度)
+ * @return MaxOffset (像素), 当内容不够滚动时返回 0
+ *
+ * 算法:
+ *  1. 累加所有子 Widget 宽度 + 假设的 10px 间距
+ *  2. 减去 ViewportWidth
+ *  3. 用 FMath::Max 防止负数
+ *
+ * 副作用:
+ *  - 遍历子控件时检查每个 WidgetSize.X 和 LocalToAbsolute X 是否 > 0
+ *  - 如果发现任何一个 <= 0, 标记 GHasInvalidGeometryDetected = true
+ *  - 调用方 (CenterScrollBoxOnCurrentExperience) 看到标志后, 走估算公式
+ *
+ * @note 这是一个有"外部副作用"的纯计算函数, 设计上耦合了全局静态变量
+ *       在单线程的 Slate 渲染线程下安全, 但要小心多线程/异步场景
+ */
 float UDailyUpgradeRewardPage::CalculateMaxScrollOffset()
 {
 	// 计算ScrollBox的最大滚动偏移量
@@ -2001,8 +2416,24 @@ float UDailyUpgradeRewardPage::CalculateMaxScrollOffset()
 }
 
 /**
- * @brief 更新限时加成图标容器
- * @details 根据活动时效性动态加载WBP_RewardIcon组件
+ * @brief 更新限时加成图标容器 (BonusIconsContainer) 的内容
+ * @details 根据 TargetDay 的 CreatedTime + BonusDurationHours 判断是否过期, 然后加载对应 BonusIDs 的图标
+ *
+ * 业务流程 (8 步):
+ *  1. 校验 BonusIconsContainer 存在且在游戏世界
+ *  2. 校验两个 Subsystem (Upgrade + Activity) 都有
+ *  3. 查 MaxRecordDate, 但上限 5 (用于"day5 内完成累计任务"型业务)
+ *  4. 查 TargetRecord (FUpgradeRewardSaveRecord) - 拿 CreatedTime
+ *  5. 查 ConfigRow (FDailyUpgradeRewardConfigRow) - 拿 BonusDurationHours
+ *  6. 计算 ExpiryTime = CreatedTime + BonusDurationHours
+ *  7. 过期检查: CurrentTime >= ExpiryTime 则清空容器并返回
+ *  8. 未过期: 遍历 ConfigRow->BonusIDs, 每个 ItemID 通过 ActivitySubsystem->GetItemDetail 查到 ItemIcon
+ *     - CreateWidget<WBP_RewardIcon>
+ *     - GetWidgetFromName("RewardImage") 设置 ItemIcon (128x128)
+ *     - GetWidgetFromName("CountText") 设为 Collapsed (不显示数量)
+ *     - 添加到容器, 清空 HorizontalBoxSlot 的 padding
+ *
+ * @note 防御链非常长, 任意一步失败都不会崩, 只会清空容器或跳过单个图标
  */
 void UDailyUpgradeRewardPage::UpdateBonusIconsContainer()
 {
@@ -2183,8 +2614,25 @@ void UDailyUpgradeRewardPage::UpdateBonusIconsContainer()
 }
 
 /**
- * @brief 更新限时加成信息文本
- * @param DayIdentifier 天数标识符
+ * @brief 更新限时加成信息文本 (BonusInfoText) - 显示 "{描述} {完成数}/{总数} 剩余时长: {H}H {M}M"
+ * @param DayIdentifier 天数标识符 (如 "day1", "day3")
+ *
+ * 业务流程:
+ *  1. 防御链: BonusInfoText 控件有效 / GameInstance / Subsystem
+ *  2. 查 ConfigRow, 如果没有或 BonusDescription 为空, 隐藏控件
+ *  3. 查 HasDayDataInMemory, 没数据则隐藏
+ *  4. 查 DayRecord 拿 CreatedTime
+ *  5. 计算 EndTime = CreatedTime + BonusDurationHours
+ *  6. 已过期则隐藏
+ *  7. 计算 RemainingTime = EndTime - CurrentTime
+ *  8. 拼装显示文本: "{Description} {Complete}/{Total} 剩余时长: {H}H {M}M"
+ *  9. 强制设置字体大小 (如果未设置, 用 16.0f 默认值)
+ * 10. BonusInfoText->SetText + SetVisibility(Visible)
+ * 11. 设置 BonusInfoBorder 的 Padding (10,5,10,5) 和可见性
+ * 12. 强制刷新布局 (InvalidateLayoutAndVolatility)
+ *
+ * @note 包含大量调试日志 ([BONUS_DEBUG]), 调试完成后可清理
+ *       实际业务逻辑下沉到了 Subsystem::GetLimitedActivityCompleteCount 等方法
  */
 void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 {

@@ -4,10 +4,38 @@
  * @author AI Assistant
  * @date 2024
  * @version 1.0
- * 
+ *
  * @details 本文件包含活动系统的所有静态配置数据结构和枚举定义
  *          所有需要持久化存储的配置信息都定义在此文件中
  *          遵循"所有静态表结构体放入此文件"的项目规范
+ *
+ * ====================================================================
+ * 文件内容索引
+ * ====================================================================
+ *
+ * §1. 枚举定义
+ *   - EActivityType:     活动类型（Category/Normal/Web/Special）
+ *   - EActivityStatus:   活动状态（Upcoming/Active/EndingSoon/Ended/Maintenance）
+ *   - ETimeControlType:  时间控制（FixedPeriod/Recurring/Permanent/Manual）
+ *   - ERedDotType:       红点类型（None/Simple/Number/Special/Progress）
+ *   - ELoginRewardType:  登录奖励（NormalItem/Premium/Box）
+ *   - EGameModeType:     游戏模式（Team/Solo/GunKingRank）
+ *   - ETaskType:         任务类型（PlayRecord/Kill/FirstPlace/TripleKill）
+ *   - ERewardState:      奖励状态（Incomplete/Claimable/Claimed）
+ *
+ * §2. USTRUCT 数据表
+ *   - FRedDotData:               红点数据结构
+ *   - FDailyLoginConfigRow:      每日登录配置
+ *   - FActivityInfoRow:          活动信息表（精简版, 集成基础/导航/红点/时间/路由）
+ *   - FItemDetailRow:            物品详情
+ *   - FTreasureBoxItemRow:       宝箱物品配置
+ *   - FDailyUpgradeRewardConfigRow: 每日升级奖励活动配置
+ *
+ * 设计理念:
+ * 1. 枚举与数据结构统一管理, 单一信息源
+ * 2. FActivityInfoRow 精简版: 减少嵌套结构, 职责更清晰
+ * 3. BlueprintType + EditAnywhere: 编辑器友好
+ * 4. 所有 FDaily* 字段支持 CSV 导入
  */
 
 #pragma once

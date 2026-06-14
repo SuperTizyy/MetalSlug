@@ -4,8 +4,26 @@
  * @author AI Assistant
  * @date 2024
  * @version 1.0
- * 
- * @details 管理升级奖励活动的核心业务逻辑，包括数据存取、宝箱领取等功能
+ *
+ * @details 管理升级奖励活动的所有业务逻辑和数据操作
+ *
+ * 职责说明:
+ * 1. 活动配置缓存 (DT_DailyUpgradeRewardConfigRow, 启动时预加载)
+ * 2. 玩家进度存档 (FUpgradeRewardSaveRecord, 多日表)
+ * 3. 业务规则计算: HasDayDataInMemory / GetDailyTaskHighlightStates / ShouldShowFixedPrizeHighlight
+ * 4. 跨表数据关联: Config -> TreasureBoxItem -> ItemDetail (多级查找)
+ * 5. 委托事件: OnRewardIconIndexChanged / OnGlobalRefresh
+ *
+ * 架构理念:
+ * 1. 业务下沉: 所有高亮/锁定/状态判断都在 Subsystem, UI 仅消费结果
+ * 2. AllRecords 内存表 + CurrentRecord 单一当前记录
+ * 3. 通过 TArray<int32> TaskRelatedValues 实现"第N天完成N局"型规则
+ * 4. 宝箱+任务双轨: ChestClaimStatus + TaskClaimStatus 独立管理
+ *
+ * 关联:
+ * - 上级: UGameInstance
+ * - 下属: UUpgradeActivitySaveModifier（修改器）
+ * - 上层消费者: UDailyUpgradeRewardPage / UActivityNavMenuWidget / 各子 Widget
  */
 
 #pragma once

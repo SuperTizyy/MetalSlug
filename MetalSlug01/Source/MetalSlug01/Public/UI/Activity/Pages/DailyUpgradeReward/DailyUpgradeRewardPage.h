@@ -10,10 +10,14 @@
 
 #pragma once
 
+// ==========================================
+// 头文件包含说明
+// ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "DailyUpgradeRewardPage.generated.h"
 
+// 前向声明: 仅引用指针, 避免循环包含
 class UBorder;
 class UHorizontalBox;
 class UImage;
@@ -28,9 +32,27 @@ class UDailyTaskWidget;
 class UTaskDetailWidget;
 class UDayLockHintWidget;
 
+
 /**
+ * @class UDailyUpgradeRewardPage
  * @brief 每日升级奖励活动页面
- * @details 提供每日升级奖励活动的UI展示和交互功能
+ *
+ * 职责说明:
+ * - 7 天活动进度的中央控制页
+ * - 集成 DayButtons (每日按钮) + Tasks (任务列表) + Chest (经验宝箱) + FixedPrize
+ * - 与 UUpgradeActivitySubsystem 深度联动, 实时反映数据变化
+ *
+ * 架构理念:
+ * 1. 单一职责: 一个页面管一种活动
+ * 2. 事件驱动: 订阅 Subsystem 事件自动更新
+ * 3. 数据驱动: 配置表 (DT_DailyUpgradeRewardConfig) + 存档 (FUpgradeRewardSaveRecord)
+ * 4. 模块化: TaskDetail / ExperienceChest / DayLockHint / DailyTask 拆分
+ * 5. 防御链: 多次空指针 + 多次 IsValidIndex
+ *
+ * 关联:
+ * - 上级: UActivityNavMenuWidget
+ * - 数据: UUpgradeActivitySubsystem
+ * - 子件: UTaskDetailWidget / UExperienceChestClaimWidget / UDailyTaskWidget / UDayLockHintWidget
  */
 UCLASS()
 class METALSLUG01_API UDailyUpgradeRewardPage : public UUserWidget
@@ -38,44 +60,71 @@ class METALSLUG01_API UDailyUpgradeRewardPage : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// ==================== 生命周期 ====================
-	
-	virtual bool Initialize() override;
-	virtual void NativeConstruct() override;
-	virtual void NativeDestruct() override;
-	
-	// ==================== 蓝图可调用函数 ====================
-	
+	// ==========================================
+	// 1. 生命周期
+	// ==========================================
+
 	/**
-	 * @brief 手动刷新UI - 用于调试测试
-	 * @note 可以在蓝图中调用此函数来测试UI刷新功能
+	 * 初始化
+	 * 1. InitializeUI: 初始化所有 UI 控件
+	 * 2. BindEventHandlers: 绑定事件
+	 * 3. SubscribeToSubsystemEvents
+	 * 4. UpdateExperienceDisplay / UpdateBonusInfoText / UpdateRewardItem
+	 */
+	virtual bool Initialize() override;
+
+	/**
+	 * 构造
+	 * 1. InitializeUI
+	 * 2. BindEventHandlers
+	 * 3. SubscribeToSubsystemEvents
+	 * 4. CenterScrollBoxOnCurrentExperience 居中滚动条
+	 */
+	virtual void NativeConstruct() override;
+
+	/**
+	 * 析构
+	 * 1. UnbindEventHandlers
+	 * 2. UnsubscribeFromSubsystemEvents
+	 */
+	virtual void NativeDestruct() override;
+
+	// ==========================================
+	// 2. 蓝图可调用函数
+	// ==========================================
+
+	/**
+	 * 手动刷新 UI（用于调试测试）
+	 * 在蓝图中调用此函数来测试 UI 刷新功能
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|Debug")
 	void ManualRefreshUI();
-	
+
 	/**
-	 * @brief 刷新每日任务高亮状态 - 可在蓝图中调用
-	 * @note 用于手动更新每日任务按钮的选中高亮显示
+	 * 刷新每日任务高亮状态（可在蓝图中调用）
+	 * 用于手动更新每日任务按钮的选中高亮显示
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|UI")
 	void RefreshDailyTaskHighlights();
 
 protected:
-	// ==================== UI控件引用 ====================
-	
-	/** 加成图标容器 */
+	// ==========================================
+	// 3. UI 控件引用
+	// ==========================================
+
+	/** 加成图标容器（HBox, 用于显示活动加成） */
 	UPROPERTY(meta = (BindWidget))
 	UHorizontalBox* BonusIconsContainer;
 
-	/** 奖励物品图片 */
+	/** 奖励物品图片（可切换的奖励预览图） */
 	UPROPERTY(meta = (BindWidget))
 	UImage* RewardItemImage;
 
-	/** 重选奖励按钮 */
+	/** 重选奖励按钮（触发 SwitchToNextRewardIcon / SwitchToPreviousRewardIcon） */
 	UPROPERTY(meta = (BindWidget))
 	UButton* ReselectRewardButton;
 
-	/** 天数选择按钮容器 */
+	/** 天数选择按钮容器（HBox, 第 1-7 天） */
 	UPROPERTY(meta = (BindWidget))
 	UHorizontalBox* DayButtonsContainer;
 
@@ -87,7 +136,7 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UBorder* BonusInfoBorder;
 
-	/** 任务列表容器 */
+	/** 任务列表容器（VBox, 包含所有 UTaskDetailWidget） */
 	UPROPERTY(meta = (BindWidget))
 	UVerticalBox* TasksContainer;
 
@@ -95,7 +144,7 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* CurrentExpText;
 
-	/** 物品图标滚动容器 */
+	/** 物品图标滚动容器（滚动显示所有 ExperienceChestClaimWidget） */
 	UPROPERTY(meta = (BindWidget))
 	UScrollBox* ItemsScrollBox;
 
@@ -103,44 +152,50 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* ChestCountText;
 
-	/** ExperienceChestClaimWidget蓝图类引用 */
+	/** 固定奖励控件引用（通常显示最后一个 FixedPrize） */
+	UPROPERTY(meta = (BindWidget))
+	UExperienceChestClaimWidget* FixedPrizeWidget;
+
+	// ==========================================
+	// 4. Widget 蓝图类引用
+	// ==========================================
+
+	/** ExperienceChestClaimWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UExperienceChestClaimWidget> ExperienceChestWidgetClass;
 
-	/** 固定奖励控件引用 */
-	UPROPERTY(meta = (BindWidget))
-	UExperienceChestClaimWidget* FixedPrizeWidget;
-	
-	/** RewardOptionWidget蓝图类引用 */
+	/** RewardOptionWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class URewardOptionWidget> RewardOptionWidgetClass;
 
-	/** FixedPrizeWidget蓝图类引用 */
+	/** FixedPrizeWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UExperienceChestClaimWidget> FixedPrizeWidgetClass;
 
-	/** ActivityConfirmPopupWidget蓝图类引用 */
+	/** ActivityConfirmPopupWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UActivityConfirmPopupWidget> ActivityConfirmPopupWidgetClass;
 
-	/** DailyTaskWidget蓝图类引用 */
+	/** DailyTaskWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UDailyTaskWidget> DailyTaskWidgetClass;
-	
-	/** TaskDetailWidget蓝图类引用 */
+
+	/** TaskDetailWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UTaskDetailWidget> TaskDetailWidgetClass;
 
-	/** DayLockHintWidget蓝图类引用 */
+	/** DayLockHintWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UDayLockHintWidget> DayLockHintWidgetClass;
 
-	/** WBP_RewardIcon蓝图类引用 */
+	/** WBP_RewardIcon 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UUserWidget> RewardIconWidgetClass;
 
-	// ==================== 数据管理 ====================
-	
+	// ==========================================
+	// 5. 数据管理
+	// ==========================================
+
 	/** 当前选择的天数索引 */
 	int32 CurrentDayIndex;
 
@@ -153,282 +208,302 @@ protected:
 	/** 加成倍数 */
 	float CurrentBonusMultiplier;
 
-	/** 按钮到天数索引的映射 */
+	/** 按钮到天数索引的映射（用于 OnClicked 路由） */
 	TMap<UButton*, int32> ButtonToDayIndexMap;
 
-	/** 缓存的物品图标数据（全局变量） */
+	/** 缓存的物品图标数据（全局变量, 用于循环切换） */
 	TArray<TSoftObjectPtr<UTexture2D>> CachedItemIcons;
 
+	// ==========================================
+	// 6. 事件处理
+	// ==========================================
+
 	/**
-	 * @brief 静态回调函数用于按钮点击
+	 * 静态回调函数用于按钮点击
 	 * @param Button 被点击的按钮
 	 * @param DayIndex 对应的天数索引
 	 */
 	static void StaticButtonCallback(UButton* Button, int32 DayIndex);
-	
 
-	
 	/**
-	 * @brief 处理天数按钮点击事件
+	 * 处理天数按钮点击事件
 	 * @param DayIdentifier 天数标识
 	 * @param DayIndex 天数索引
 	 */
 	void OnDayButtonClicked(const FString& DayIdentifier, int32 DayIndex);
 
 	/**
-	 * @brief 处理天数按钮点击事件（无参包装器）
-	 * @note 用于绑定到 FOnButtonClickedEvent 委托
+	 * 处理天数按钮点击事件（无参包装器）
+	 * 用于绑定到 FOnButtonClickedEvent 委托
 	 */
 	UFUNCTION()
 	void HandleDayButtonClicked();
 
-	// ==================== 初始化方法 ====================
-	
+	// ==========================================
+	// 7. 初始化方法
+	// ==========================================
+
 	/**
-	 * @brief 初始化UI控件
+	 * 初始化 UI 控件
+	 * 1. UpdateExperienceDisplay
+	 * 2. UpdateBonusInfoText
+	 * 3. UpdateRewardItem
+	 * 4. UpdateBonusIconsContainer
+	 * 5. UpdateDayButtons
+	 * 6. UpdateDailyTasks
 	 */
 	void InitializeUI();
 
 	/**
-	 * @brief 绑定事件处理器
+	 * 绑定事件处理器
+	 * 绑定 ReselectRewardButton / DayButtons / FixedPrizeWidget
 	 */
 	void BindEventHandlers();
 
 	/**
-	 * @brief 解绑事件处理器
+	 * 解绑事件处理器
+	 * 解绑所有事件（包括 Subsystem 事件）
 	 */
 	void UnbindEventHandlers();
 
-	// ==================== UI更新方法 ====================
-	
+	// ==========================================
+	// 8. UI 更新方法
+	// ==========================================
+
 	/**
-	 * @brief 获取页面唯一身份标识
+	 * 获取页面唯一身份标识
 	 * @return 页面身份字符串（包含地址和创建时间等信息）
 	 */
 	FString GetPageIdentity() const;
-	
+
 	/**
-	 * @brief 更新加成图标显示
+	 * 更新加成图标显示（BonusIconsContainer）
 	 */
 	void UpdateBonusIcons();
-	
+
 	/**
-	 * @brief 更新限时加成图标容器
-	 * @details 根据活动时效性动态加载WBP_RewardIcon组件
+	 * 更新限时加成图标容器
+	 * 根据活动时效性动态加载 WBP_RewardIcon 组件
 	 */
 	void UpdateBonusIconsContainer();
 
 	/**
-	 * @brief 更新奖励物品显示
+	 * 更新奖励物品显示（基于 CachedItemIcons + CurrentDayIndex）
 	 */
 	void UpdateRewardItem();
 
 	/**
-	 * @brief 更新天数按钮
+	 * 更新天数按钮（第 1-7 天的可点击按钮）
 	 */
 	void UpdateDayButtons();
 
 	/**
-	 * @brief 更新加成信息文本
+	 * 更新加成信息文本
 	 */
 	void UpdateBonusInfoText();
 
 	/**
-	 * @brief 更新任务列表
+	 * 更新任务列表（TasksContainer）
 	 */
 	void UpdateTasks();
 
 	/**
-	 * @brief 更新经验值显示
+	 * 更新经验值显示（CurrentExpText）
 	 */
 	void UpdateExperienceDisplay();
 
 	/**
-	 * @brief 更新物品图标滚动列表
+	 * 更新物品图标滚动列表（ItemsScrollBox 内的 ExperienceChestClaimWidget）
 	 */
 	void UpdateItemsScrollBox();
 
-	/** 更新每日任务列表 */
+	/** 更新每日任务列表（DayButtonsContainer 内的 UDailyTaskWidget） */
 	void UpdateDailyTasks();
 
-	// ==================== 事件处理方法 ====================
-	
+	// ==========================================
+	// 9. 事件处理方法
+	// ==========================================
+
 	/**
-	 * @brief 处理任务完成状态变化
+	 * 处理任务完成状态变化
 	 * @param TaskIndex 任务索引
 	 * @param bCompleted 是否完成
 	 */
 	void OnTaskCompletionChanged(int32 TaskIndex, bool bCompleted);
 
-	// ==================== 辅助方法 ====================
-	
+	// ==========================================
+	// 10. 辅助方法
+	// ==========================================
+
 	/**
-	 * @brief 计算当前加成倍数
+	 * 计算当前加成倍数
 	 * @param DayIndex 天数索引
 	 * @return 加成倍数
 	 */
 	float CalculateBonusMultiplier(int32 DayIndex);
 
 	/**
-	 * @brief 获取天数对应的奖励数据
+	 * 获取天数对应的奖励数据
 	 * @param DayIndex 天数索引
 	 * @return 奖励数据
 	 */
 	TArray<int32> GetDayRewards(int32 DayIndex);
 
 private:
-	// ==================== 图标管理方法 ====================
-	
+	// ==========================================
+	// 11. 图标管理方法
+	// ==========================================
+
 	/**
-	 * @brief 初始化奖励物品图标数据
-	 * @details 从配置表读取数据并缓存ItemIcon到全局变量
+	 * 初始化奖励物品图标数据
+	 * 从配置表读取数据并缓存 ItemIcon 到全局变量
 	 */
 	void InitializeRewardItemIcons();
-	
+
 	/**
-	 * @brief 更新奖励物品图片显示
-	 * @details 使用缓存的图标数据显示RewardItemImage控件
+	 * 更新奖励物品图片显示
+	 * 使用缓存的图标数据显示 RewardItemImage 控件
 	 */
 	void UpdateRewardItemImage();
-	
+
 	/**
-	 * @brief 更新限时加成信息文本
+	 * 更新限时加成信息文本
 	 * @param DayIdentifier 天数标识符
 	 */
 	void UpdateBonusInfoText(const FString& DayIdentifier);
 
 	/**
-	 * @brief 切换到下一个奖励图标
-	 * @details 循环切换CachedItemIcons数组中的图标索引
+	 * 切换到下一个奖励图标
+	 * 循环切换 CachedItemIcons 数组中的图标索引
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward")
 	void SwitchToNextRewardIcon();
 
 	/**
-	 * @brief 切换到上一个奖励图标
-	 * @details 循环切换CachedItemIcons数组中的图标索引
+	 * 切换到上一个奖励图标
+	 * 循环切换 CachedItemIcons 数组中的图标索引
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward")
 	void SwitchToPreviousRewardIcon();
 
 	/**
-	 * @brief 更新宝箱数量文本显示
-	 * @details 从DailyUpgradeRewardConfigRow表获取ActivityID==110数据的RewardItemCounts最后一个索引值
+	 * 更新宝箱数量文本显示
+	 * 从 DailyUpgradeRewardConfigRow 表获取 ActivityID==110 数据的 RewardItemCounts 最后一个索引值
 	 */
 	void UpdateChestCountText();
 
 	/**
-	 * @brief 初始化ItemsScrollBox中的ExperienceChestClaimWidget
-	 * @details 根据RewardItemIDs创建多个ExperienceChestClaimWidget并设置对应的BoxIcon
+	 * 初始化 ItemsScrollBox 中的 ExperienceChestClaimWidget
+	 * 根据 RewardItemIDs 创建多个 ExperienceChestClaimWidget 并设置对应的 BoxIcon
 	 */
 	void InitializeExperienceChestWidgets();
 
 	/**
-	 * @brief 刷新UI显示
-	 * @details 重新初始化所有UI组件以反映最新状态
+	 * 刷新 UI 显示
+	 * 重新初始化所有 UI 组件以反映最新状态
 	 */
 	UFUNCTION()
 	void RefreshUI();
 
 	/**
-	 * @brief 处理重选奖励按钮点击事件
+	 * 处理重选奖励按钮点击事件
 	 */
 	UFUNCTION()
 	void OnReselectRewardClicked();
-	
+
 	/**
-	 * @brief 处理宝箱领取请求
+	 * 处理宝箱领取请求
 	 * @param ChestIndex 宝箱索引
 	 */
 	UFUNCTION()
 	void HandleChestClaimRequest(int32 ChestIndex);
-	
+
 	/**
-	 * @brief 处理奖励存储操作
+	 * 处理奖励存储操作
 	 * @param DayIndex 天数索引
 	 */
 	UFUNCTION()
 	void HandleRewardStore(int32 DayIndex);
-	
+
 	/**
-	 * @brief 更新所有宝箱Widget的状态
-	 * @details 手动刷新ItemsScrollBox中所有ExperienceChestClaimWidget的视觉状态
-	 * 确保领取操作后所有Widget都能正确显示最新状态
+	 * 更新所有宝箱 Widget 的状态
+	 * 手动刷新 ItemsScrollBox 中所有 ExperienceChestClaimWidget 的视觉状态
+	 * 确保领取操作后所有 Widget 都能正确显示最新状态
 	 */
 	void UpdateAllChestWidgetStates();
-	
+
 	/**
-	 * @brief 更新经验宝箱控件状态
-	 * @details 更新现有ExperienceChestClaimWidget的状态而不重新创建
+	 * 更新经验宝箱控件状态
+	 * 更新现有 ExperienceChestClaimWidget 的状态而不重新创建
 	 */
 	void UpdateExperienceChestWidgetsState();
-	
+
 	/**
-	 * @brief 手动刷新所有ExperienceChestClaimWidget的进度条
-	 * @details 在经验值发生变化后调用此方法更新所有进度条显示
+	 * 手动刷新所有 ExperienceChestClaimWidget 的进度条
+	 * 在经验值发生变化后调用此方法更新所有进度条显示
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Daily Upgrade Reward")
 	void RefreshAllProgressBars();
 
 	/**
-	 * @brief 订阅Subsystem事件
+	 * 订阅 Subsystem 事件
 	 */
 	void SubscribeToSubsystemEvents();
-	
+
 	/**
-	 * @brief 取消订阅Subsystem事件
+	 * 取消订阅 Subsystem 事件
 	 */
 	void UnsubscribeFromSubsystemEvents();
-	
+
 	/**
-	 * @brief 处理奖励图标索引更新事件
+	 * 处理奖励图标索引更新事件
 	 * @param NewIndex 新的图标索引
 	 */
 	UFUNCTION()
 	void OnRewardIconIndexChanged(int32 NewIndex);
-	
+
 	/**
-	 * @brief 显示奖励选项Widget
+	 * 显示奖励选项 Widget
 	 * @param ChestIndex 宝箱索引
 	 */
 	void ShowRewardOptionWidget(int32 ChestIndex);
-	
+
 	/**
-	 * @brief 初始化固定奖励控件
-	 * @details 根据TaskRelatedValues最后一个索引值和ChestClaimStatus状态控制HighlightFrameImage显示
+	 * 初始化固定奖励控件
+	 * 根据 TaskRelatedValues 最后一个索引值和 ChestClaimStatus 状态控制 HighlightFrameImage 显示
 	 */
 	void InitializeFixedPrizeWidget();
-	
+
 	/**
-	 * @brief 更新固定奖励控件状态
-	 * @details 根据当前经验和领取状态更新FixedPrizeWidget的显示状态
+	 * 更新固定奖励控件状态
+	 * 根据当前经验和领取状态更新 FixedPrizeWidget 的显示状态
 	 */
 	void UpdateFixedPrizeWidget();
-	
+
 	/**
-	 * @brief 根据当前经验值居中显示ScrollBox内容
-	 * @details 读取UpgradeActivitySubsystem内存数据的CurrentExperience值，
-	 *          根据TaskRelatedValues数组计算应该居中的宝箱索引，并设置ScrollBox滚动位置
+	 * 根据当前经验值居中显示 ScrollBox 内容
+	 * 读取 UpgradeActivitySubsystem 内存数据的 CurrentExperience 值，
+	 * 根据 TaskRelatedValues 数组计算应该居中的宝箱索引，并设置 ScrollBox 滚动位置
 	 */
 	void CenterScrollBoxOnCurrentExperience();
-	
+
 	/**
-	 * @brief 根据当前经验值找到目标宝箱索引
+	 * 根据当前经验值找到目标宝箱索引
 	 * @param CurrentExp 当前经验值
 	 * @param TaskRelatedValues 任务相关经验值数组
 	 * @return 应该居中的宝箱索引
 	 */
 	int32 FindTargetChestIndexForExperience(int32 CurrentExp, const TArray<int32>& TaskRelatedValues);
-	
+
 	/**
-	 * @brief 计算使目标控件居中显示的滚动偏移量
+	 * 计算使目标控件居中显示的滚动偏移量
 	 * @param TargetIndex 目标控件索引
 	 * @return 滚动偏移量
 	 */
 	float CalculateCenterScrollOffset(int32 TargetIndex);
-	
+
 	/**
-	 * @brief 计算ScrollBox的最大滚动偏移量
+	 * 计算 ScrollBox 的最大滚动偏移量
 	 * @return 最大滚动偏移量
 	 */
 	float CalculateMaxScrollOffset();
