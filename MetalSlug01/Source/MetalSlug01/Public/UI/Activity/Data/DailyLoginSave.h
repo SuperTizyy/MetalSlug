@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file DailyLoginSave.h
  * @brief 活动系统动态数据和存档定义文件
  * @author AI Assistant
@@ -24,6 +24,8 @@
  * @details 包含活动的动态运行时信息，不保存到DataTable
  * @note 这些状态在程序运行时动态计算和更新，属于动态表范畴
  */
+
+
 USTRUCT(BlueprintType)
 struct FActivityRuntimeState
 {

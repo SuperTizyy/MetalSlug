@@ -1,15 +1,43 @@
-﻿#pragma once
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
+#pragma once
+
+// ==========================================
+// 头文件包含说明
+// ==========================================
+// UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
+
+// 引入 UE 原生 APlayerController 类（基类）
 #include "GameFramework/PlayerController.h"
+
+// UE 自动生成的头文件
 #include "RoomPlayerController.generated.h"
 
-class UInputAction;
-class URoomInsidePage;
-class UGameHUDWidget;
+// ==========================================
+// 前置声明（加快编译速度，避免循环包含）
+// ==========================================
+class UInputAction;          // Enhanced Input 输入动作
+class UInputMappingContext;  // Enhanced Input 映射上下文
+class URoomInsidePage;       // 房间内 UI 页面
+class UGameHUDWidget;        // 战斗 HUD 容器
+class ARoomPlayerState;      // 房间玩家状态
 
 /**
- * 房间内的专属玩家控制器，负责处理 UI 数据与服务器的 RPC 同步
+ * @class ARoomPlayerController
+ * @brief 房间内的专属玩家控制器
+ *
+ * 职责说明:
+ * - 处理 UI 数据与服务器的 RPC 同步（攻守方选择/准备/开始游戏/聊天/踢人/退房等）
+ * - Enhanced Input 绑定（Tab 计分板/ESC 菜单/T 聊天）
+ * - 死亡后的复活定时器
+ * - 监听 GameFlowSubsystem 状态变化，自动切换 UI（房间 UI / 战斗 HUD）
+ *
+ * 关键设计:
+ * 1. 复活定时器放在 Controller 上而非 Character，避免死亡被销毁
+ * 2. UI 不在客户端直接调用 Server RPC，而是通过 PlayerController 中转
+ * 3. 使用 Enhanced Input 系统，提供更好的输入控制粒度
+ * 4. ESC 菜单状态用 bool 标志位 bIsEscMenuOpen 维护，避免依赖蓝图可见性
  */
 UCLASS()
 class METALSLUG01_API ARoomPlayerController : public APlayerController
@@ -17,218 +45,332 @@ class METALSLUG01_API ARoomPlayerController : public APlayerController
 	GENERATED_BODY()
 
 public:
-	// 获取 GameHUDWidget 实例
-	UGameHUDWidget* GetGameHUDWidget() const;
-
-	// 获取玩家名称（供外部访问）
-	FString GetMyPlayerName() const { return MyPlayerName; }
-
-	// 获取计分板Widget实例
-	class UScoreboardWidget* GetScoreboardWidget() const { return ScoreboardWidgetInstance; }
-
-	// 获取ESC菜单Widget实例
-	class UEscMenuWidget* GetEscMenuWidget() const { return EscMenuWidgetInstance; }
-
-	// 显示ESC菜单（供外部调用）
-	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void ShowEscMenu();
-
-	// 隐藏ESC菜单（供外部调用）
-	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void HideEscMenu();
-
 	// ==========================================
-	// 1. 客户端 -> 服务器的 RPC (Client to Server)
+	// 生命周期
 	// ==========================================
 
-	// 刚进入房间时，客户端呼叫服务器："报告老大，我进来了，这是我的名字！"
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_SendPlayerInfo(const FString& InPlayerName);
+	/**
+	 * UE 原生生命周期: 在 Actor 首次初始化时调用
+	 * 用途: 订阅 GameFlowSubsystem 状态变化、初始化 ESC 菜单标志位
+	 */
+	virtual void BeginPlay() override;
 
-	// 客户端上报："我准备/取消准备了！"
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_ToggleReady(bool bIsReady);
-
-	// 向服务器请求换队伍 (true=去攻方, false=去守方)
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_RequestChangeTeam(bool bToAttackTeam);
-
-	// UI 按钮调用的本地退出逻辑
-	UFUNCTION(BlueprintCallable, Category = "RoomUI")
-	void LeaveRoom();
-
-	// 告诉服务器我要走了，赶紧把我名字删掉
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_LeaveRoom();
-
-	// 房主专属 RPC，告诉服务器"把这个人给我踢了！"
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_KickPlayer(const FString& PlayerNameToKick);
-
-	// 客户端请求服务器添加 AI
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_AddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count);
-
-	// 聊天：客户端发给服务器
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_SendChatMessage(const FString& Message);
-
-	// 房主专属：向服务器请求开始游戏
-	UFUNCTION(Server, Reliable)
-	void Server_RequestStartGame();
-
-	// 客户端选择装备后通知服务器保存
-	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_SelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName);
-
-	// 客户端向服务器呼叫："我进地图了，别管UI了，直接给我发人发枪！"
-	UFUNCTION(Server, Reliable)
-	void Server_RequestSpawn();
+	/**
+	 * UE 原生生命周期: 设置输入组件
+	 * 用途: 绑定 Enhanced Input 动作（Tab/ESC/T 聊天）
+	 */
+	virtual void SetupInputComponent() override;
 
 	// ==========================================
-	// 2. 服务器 -> 客户端的 RPC (Server to Client)
+	// Enhanced Input 系统配置
 	// ==========================================
 
-	// 服务器下达的终极指令："全军出击！"
-	UFUNCTION(Client, Reliable)
-	void Client_EnterBattleState();
-
-	// 服务器强制命令客户端："房主解散了，立刻退房！"
-	UFUNCTION(Client, Reliable)
-	void Client_ForceLeaveRoom();
-
-	// 服务器给被踢的倒霉蛋发的专属指令："你被踢了，快回大厅！"
-	UFUNCTION(Client, Reliable)
-	void Client_BeKicked();
-
-	// 服务器群发给所有人聊天消息
-	UFUNCTION(Client, Reliable)
-	void Client_ReceiveChatMessage(const FString& SenderName, bool bIsHost, const FString& Message, bool bIsSystemMsg);
-
-	// 服务器发回系统警告文本
-	UFUNCTION(Client, Reliable)
-	void Client_ReceiveSystemMessage(const FString& Message);
-
-	// 接收来自服务器的指令，强制本地客户端切换游戏状态流程
-	UFUNCTION(Client, Reliable, Category = "MetalSlug|Network")
-	void Client_TransitToMatchState(EMatchState NewState);
-
-	// ==========================================
-	// 3. 玩家数据属性（供外部读取）
-	// ==========================================
-	UPROPERTY()
-	FString MyPlayerName;
-
-	// 本地记录玩家在 UI 上点击选择的配置
-	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
-	FString MySelectedCharacter;
-
-	UPROPERTY(BlueprintReadWrite, Category = "Room|Loadout")
-	FString MySelectedWeapon;
-
-	// ==========================================
-	// 4. 蓝图/UI 绑定
-	// ==========================================
-	// 暴露给蓝图，用于生成 WBP_RoomInside
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<URoomInsidePage> RoomUIClass;
-
-	// 保存生成出来的 UI 界面指针，方便后续刷新
-	UPROPERTY()
-	URoomInsidePage* RoomUIWidget;
-
-	// 计分板Widget类引用（蓝图配置）
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UScoreboardWidget> ScoreboardWidgetClass;
-
-	// 计分板Widget实例指针
-	UPROPERTY()
-	class UScoreboardWidget* ScoreboardWidgetInstance;
-
-	// ESC菜单Widget类引用（蓝图配置）
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UEscMenuWidget> EscMenuWidgetClass;
-
-	// ESC菜单Widget实例指针
-	UPROPERTY()
-	class UEscMenuWidget* EscMenuWidgetInstance;
-
-	// ==========================================
-	// ESC 菜单状态管理（用 bool 标志位代替不可靠的可见性检测）
-	// ==========================================
-	// 当前 ESC 菜单是否已打开
-	UPROPERTY()
-	bool bIsEscMenuOpen;
-
-	// ==========================================
-	// 增强输入系统 (Enhanced Input)
-	// ==========================================
-	// 在蓝图 WBP_RoomPlayerController 中配置这个变量，绑定你的 T 键和 回车键
+	/**
+	 * 聊天快捷键输入动作（T 键）
+	 * 在 BP_RoomPlayerController 蓝图中配置
+	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_ToggleChat;
 
-	// Tab键：显示/隐藏计分板
+	/**
+	 * 计分板快捷键输入动作（Tab 键）
+	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_ToggleScoreboard;
 
-	// ESC键：显示/隐藏ESC菜单
+	/**
+	 * ESC 菜单快捷键输入动作
+	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_ToggleEscMenu;
 
 	// ==========================================
-	// 【复活系统】：定时器必须放在 PlayerController 上，防止角色死亡后定时器随 Actor 一起被销毁
+	// UI 引用
 	// ==========================================
-	// 在 Controller 上启动复活倒计时（由角色死亡时调用，暴露为 public 供外部 Character 类访问）
-	UFUNCTION(BlueprintCallable, Category = "Gameplay|Respawn")
+
+	/**
+	 * 房间内 UI 页面蓝图类（攻守方选择/准备/开始游戏界面）
+	 * 目的: OnFlowStateChanged(InRoom) 中动态 CreateWidget 创建
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "UI")
+	TSubclassOf<URoomInsidePage> RoomUIClass;
+
+	/**
+	 * 当前激活的房间内 UI 实例
+	 * 用途: 切换显示/隐藏、转发聊天消息
+	 */
+	UPROPERTY(Transient)
+	URoomInsidePage* RoomUIWidget = nullptr;
+
+	// ==========================================
+	// 状态监听
+	// ==========================================
+
+	/**
+	 * ESC 菜单的开关状态标志
+	 * 作用: 用作 ESC 菜单是否打开的唯一可信真相源，规避蓝图可见性配置不一致的坑
+	 */
+	UPROPERTY(Transient)
+	bool bIsEscMenuOpen = false;
+
+	/**
+	 * 房主解散房间时的延迟退出定时器
+	 */
+	FTimerHandle HostLeaveTimer;
+
+	/**
+	 * 计分板 Widget 实例缓存
+	 */
+	UPROPERTY(Transient)
+	class UScoreboardWidget* ScoreboardWidgetInstance = nullptr;
+
+	// ==========================================
+	// Server RPC（客户端 → 服务器）
+	// ==========================================
+
+	/**
+	 * 玩家向服务器发送自己的玩家名
+	 * @param InPlayerName 玩家展示名（账号名）
+	 * 服务器端: 写入 MyPlayerName + 覆盖底层 PlayerState 名字 + 通知 GameMode.AddPlayerToRoom
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_SendPlayerInfo(const FString& InPlayerName);
+
+	/**
+	 * 玩家向服务器发送选中的角色和武器（用于加载存档偏好）
+	 * @param CharacterRowName 角色 DataTable 行名
+	 * @param Weapon1RowName 武器1 DataTable 行名
+	 * @param Weapon2RowName 武器2 DataTable 行名
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_SelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName);
+
+	/**
+	 * 玩家请求切换队伍（攻/守）
+	 * @param bToAttackTeam true=攻方，false=守方
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_RequestChangeTeam(bool bToAttackTeam);
+
+	/**
+	 * 玩家请求切换准备状态
+	 * @param bIsReady 是否准备
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_ToggleReady(bool bIsReady);
+
+	/**
+	 * 玩家请求开始游戏（房主专属）
+	 * 服务器端: 校验所有玩家已准备 -> 通知每个 Client 切换状态 -> HandlePlayerRequestSpawn
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_RequestStartGame();
+
+	/**
+	 * 玩家请求离开房间（普通玩家）
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_LeaveRoom();
+
+	/**
+	 * 房主踢人请求
+	 * @param PlayerNameToKick 被踢玩家名（[AI] 前缀的为 AI）
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_KickPlayer(const FString& PlayerNameToKick);
+
+	/**
+	 * 房主请求添加 AI
+	 * @param bToAttackTeam AI 加入攻/守
+	 * @param CharacterName AI 角色名
+	 * @param Count AI 数量
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_AddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count);
+
+	/**
+	 * 玩家发送聊天消息
+	 * @param Message 聊天内容
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_SendChatMessage(const FString& Message);
+
+	/**
+	 * 玩家请求服务器生成自己的 3D 角色（用于测试/复活）
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_RequestSpawn();
+
+	// ==========================================
+	// Client RPC（服务器 → 客户端）
+	// ==========================================
+
+	/**
+	 * 服务器通知客户端"进入战斗状态"
+	 * 客户端: 初始化倒计时 + 通知 GameFlowSubsystem 切换到 Battleing
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_EnterBattleState();
+
+	/**
+	 * 服务器命令某个玩家离开房间（被房主踢出或房主解散）
+	 * 客户端: 屏幕提示 + 执行 ExecuteLeaveRoom
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_ForceLeaveRoom();
+
+	/**
+	 * 服务器通知某个玩家"你被踢了"
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_BeKicked();
+
+	/**
+	 * 服务器广播聊天消息给某个客户端
+	 * @param SenderName 发送者
+	 * @param bIsHost 是否是房主
+	 * @param Message 消息内容
+	 * @param bIsSystemMsg 是否是系统消息
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_ReceiveChatMessage(const FString& SenderName, bool bIsHost, const FString& Message, bool bIsSystemMsg);
+
+	/**
+	 * 服务器广播系统提示给某个客户端
+	 * @param Message 提示内容
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_ReceiveSystemMessage(const FString& Message);
+
+	/**
+	 * 服务器命令某个客户端切换全局状态
+	 * @param NewState 目标状态
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_TransitToMatchState(EMatchState NewState);
+
+	// ==========================================
+	// 退房系统
+	// ==========================================
+
+	/**
+	 * 玩家点击"离开房间"按钮时调用
+	 * 房主: 解散 Session + 遣散其他人 + 0.5秒后自己也走
+	 * 普通玩家: 通知服务器 + 自己也走
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Leave")
+	void LeaveRoom();
+
+	/**
+	 * 真正执行断网和跳地图的底层逻辑
+	 * 步骤: DestroySession -> 0.5s 延时 -> GameFlowSubsystem.TransitToState(MainLobby)
+	 */
+	void ExecuteLeaveRoom();
+
+	// ==========================================
+	// Enhanced Input 回调
+	// ==========================================
+
+	/**
+	 * T 键按下: 根据当前状态路由到正确的 UI 聊天输入
+	 */
+	void OnToggleChatAction();
+
+	/**
+	 * Tab 键按下: 显示计分板
+	 */
+	void OnScoreboardPressed();
+
+	/**
+	 * Tab 键松开: 隐藏计分板
+	 */
+	void OnScoreboardReleased();
+
+	/**
+	 * ESC 键按下: 切换 ESC 菜单显示/隐藏
+	 */
+	void OnEscPressed();
+
+	// ==========================================
+	// ESC 菜单
+	// ==========================================
+
+	/**
+	 * 显示 ESC 菜单（暂停游戏 + UIOnly 输入 + 鼠标显示）
+	 */
+	void ShowEscMenu();
+
+	/**
+	 * 隐藏 ESC 菜单（恢复游戏 + GameOnly 输入 + 鼠标隐藏）
+	 */
+	void HideEscMenu();
+
+	// ==========================================
+	// 状态监听
+	// ==========================================
+
+	/**
+	 * GameFlowSubsystem 状态变化回调
+	 * @param NewState 新状态
+	 * InRoom: 显示 RoomUI（鼠标UIOnly）
+	 * Battleing: 隐藏 RoomUI（鼠标GameOnly）
+	 * 其他: 销毁所有 UI，恢复游戏状态
+	 */
+	UFUNCTION()
+	void OnFlowStateChanged(EMatchState NewState);
+
+	// ==========================================
+	// 复活系统
+	// ==========================================
+
+	/**
+	 * 服务器端: 启动玩家复活倒计时
+	 * @param InDelaySeconds 复活等待时间（秒）
+	 */
 	void StartRespawnTimer(float InDelaySeconds);
 
-	// 复活定时器回调（由 Controller 内部执行，protected 防止外部直接调用）
+	/**
+	 * 复活定时器到期回调
+	 * 作用: 调 Server_RequestSpawn 重生角色
+	 */
 	UFUNCTION()
 	void OnPlayerRespawnTimerFinished();
 
-protected:
+	/**
+	 * 复活倒计时定时器句柄
+	 */
+	FTimerHandle RespawnTimerHandle;
 
-protected:
-	// 游戏开始时触发
-	virtual void BeginPlay() override;
+	// ==========================================
+	// 计分板管理
+	// ==========================================
 
-	// 监听全局状态变化的事件回调
-	UFUNCTION()
-	void OnFlowStateChanged(EMatchState NewState);
-	
-	// 重写输入组件绑定函数
-	virtual void SetupInputComponent() override;
-
-	// 处理唤醒聊天的按键事件
-	UFUNCTION()
-	void OnToggleChatAction();
-
-	// 处理Tab键按下：显示计分板
-	UFUNCTION()
-	void OnScoreboardPressed();
-
-	// 处理Tab键抬起：隐藏计分板
-	UFUNCTION()
-	void OnScoreboardReleased();
-
-	// 处理ESC键按下：切换ESC菜单显示/隐藏
-	UFUNCTION()
-	void OnEscPressed();
-
-	// 重置所有玩家的计分板数据（服务器专用）
+	/**
+	 * 服务器端: 重置所有玩家的计分板数据
+	 * 触发时机: 进入战斗状态时
+	 */
 	UFUNCTION()
 	void ResetAllPlayerScoreboardStats();
 
-protected:
-	// 延迟发送玩家信息，避开网络抢跑期
+	// ==========================================
+	// 辅助接口
+	// ==========================================
+
+	/**
+	 * 获取当前玩家激活的 HUD Widget
+	 * 用途: 路由聊天/系统消息到战斗 HUD
+	 */
+	UGameHUDWidget* GetGameHUDWidget() const;
+
+	/**
+	 * 玩家名缓存（由 Server_SendPlayerInfo 设置）
+	 */
+	UPROPERTY(Transient)
+	FString MyPlayerName;
+
+	/**
+	 * 玩家进入房间后延迟发送自身信息（解决网络未稳固问题）
+	 */
+	UFUNCTION()
 	void DelayedSendPlayerInfo();
-
-	// 真正执行断网和跳地图的底层逻辑
-	void ExecuteLeaveRoom();
-
-	// 定时器，让子弹飞一会儿
-	FTimerHandle HostLeaveTimer;
-
-	// 复活定时器句柄（放在 Controller 上，角色死亡时不会被清除）
-	FTimerHandle RespawnTimerHandle;
 };

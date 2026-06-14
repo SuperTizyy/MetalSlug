@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // 引入核心头文件
 #include "CoreMinimal.h"
@@ -13,6 +13,8 @@
  * 玩家账号记录结构体
  * 用于将玩家的单个账号所有相关信息打包在一起
  */
+
+
 USTRUCT(BlueprintType)
 struct FAccountRecord
 {

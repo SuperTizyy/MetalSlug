@@ -13,6 +13,8 @@
  * @brief 活动导航菜单组件
  * 实现图片中红色框出的列表功能
  */
+
+
 UCLASS(BlueprintType)
 class METALSLUG01_API UActivityNavMenuWidget : public UUserWidget
 {

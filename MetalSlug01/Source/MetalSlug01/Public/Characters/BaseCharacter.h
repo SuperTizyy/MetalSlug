@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
@@ -15,6 +15,8 @@ class UCameraComponent;
 class USkeletalMeshComponent;
 class ABaseWeapon; // 我们新建的武器基类
 class UGameHUDWidget;
+
+
 
 UCLASS()
 class METALSLUG01_API ABaseCharacter : public ACharacter

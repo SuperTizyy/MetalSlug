@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "Engine/DataTable.h" // 【极其关键】：必须包含这个头文件，才能继承 FTableRowBase
@@ -11,6 +11,8 @@ class ABaseWeapon;
 // ==========================================
 // 【新增】：定义房间的状态机枚举
 // ==========================================
+
+
 UENUM(BlueprintType)
 enum class ERoomState : uint8
 {

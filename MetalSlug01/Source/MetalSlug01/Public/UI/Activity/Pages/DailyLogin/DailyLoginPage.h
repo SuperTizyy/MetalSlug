@@ -1,10 +1,12 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "UI/Activity/Data/DailyLoginConfig.h"
 // 移除导航相关包含，保持每日登录功能纯净
 #include "DailyLoginPage.generated.h"
+
+
 
 UCLASS()
 class METALSLUG01_API UDailyLoginPage : public UUserWidget

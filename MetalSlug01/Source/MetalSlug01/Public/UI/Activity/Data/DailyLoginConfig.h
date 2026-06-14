@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file DailyLoginConfig.h
  * @brief 活动系统静态配置数据定义文件
  * @author AI Assistant
@@ -23,6 +23,8 @@
  * @details 用于明确区分不同类型的活动项，支持活动系统的分类管理
  * @note CategoryHeader表示导航分类标题，NormalActivity表示普通活动页面
  */
+
+
 UENUM(BlueprintType)
 enum class EActivityType : uint8
 {
