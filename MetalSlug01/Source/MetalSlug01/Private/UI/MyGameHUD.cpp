@@ -1,38 +1,72 @@
+// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+// ==========================================
+// 头文件包含区
+// ==========================================
+// 引入本类头文件
 #include "UI/MyGameHUD.h"
+
+// 引入 UE UserWidget 基类
 #include "Blueprint/UserWidget.h"
+
+// 引入 GameFlowSubsystem（用于订阅状态变化）
 #include "Systems/GameFlowSubsystem.h"
+
+// 引入房间 GameState（用于获取倒计时等数据）
 #include "Systems/RoomGameState.h"
+
+// 引入 GameHUDWidget（用于显示战斗 HUD）
 #include "UI/Game/GameHUDWidget.h"
 
+
+// ==========================================
+// 1. 生命周期
+// ==========================================
+
+/**
+ * AMyGameHUD::BeginPlay
+ *
+ * HUD 初始化入口
+ * 1. 提前在后台创建所有游戏 HUD 并隐藏（对象池/预加载思维）
+ * 2. 向 GameFlowSubsystem 订阅状态变化
+ * 3. 防呆: 主动同步初始状态
+ */
 void AMyGameHUD::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 提前在后台创建所有游戏HUD并隐藏，避免战斗瞬间卡顿（对象池/预加载思维）
+	// 提前在后台创建所有游戏 HUD 并隐藏，避免战斗瞬间卡顿（对象池/预加载思维）
 	CreateGameHUD();
 
 	// ==========================================
-	// 向管家订阅状态改变的“报纸”
+	// 向管家订阅状态改变的"报纸"
 	// ==========================================
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 		{
 			FlowSubsystem->OnStateChanged.AddDynamic(this, &AMyGameHUD::OnGameFlowStateChanged);
-			
-			// 防呆设计：刚出生时主动问一下现在的状态，同步初始表现
+
+			// 防呆设计: 刚出生时主动问一下现在的状态，同步初始表现
 			OnGameFlowStateChanged(FlowSubsystem->GetCurrentState());
 		}
 	}
 }
 
+
+/**
+ * AMyGameHUD::CreateGameHUD
+ *
+ * 创建游戏 HUD（私有方法）
+ * 工业规范: UI 的创建必须严格绑定到真实的玩家控制器，而不是宽泛的 GetWorld()
+ */
 void AMyGameHUD::CreateGameHUD()
 {
-	// 【工业规范】：UI的创建必须严格绑定到真实的玩家控制器，而不是宽泛的 GetWorld()
+	// 【工业规范】: UI 的创建必须严格绑定到真实的玩家控制器，而不是宽泛的 GetWorld()
 	APlayerController* PC = GetOwningPlayerController();
 	if (!PC)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[MyGameHUD] 严重错误：未获取到本地 PlayerController！"));
+		UE_LOG(LogTemp, Error, TEXT("[MyGameHUD] 严重错误: 未获取到本地 PlayerController！"));
 		return;
 	}
 
@@ -52,9 +86,16 @@ void AMyGameHUD::CreateGameHUD()
 	}
 }
 
+
+/**
+ * AMyGameHUD::EndPlay
+ *
+ * HUD 销毁时清理委托
+ * 工业规范: Actor 被销毁前必须退订报纸，否则会报野指针崩溃
+ */
 void AMyGameHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// 【工业规范】：Actor 被销毁前（例如切换地图或退出游戏），必须退订报纸，否则会报野指针崩溃！
+	// 【工业规范】: Actor 被销毁前（例如切换地图或退出游戏），必须退订报纸，否则会报野指针崩溃
 	if (UGameInstance* GI = GetGameInstance())
 	{
 		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
@@ -67,14 +108,22 @@ void AMyGameHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 
 // ==========================================
-// 状态机核心调度逻辑
+// 2. 状态机核心调度逻辑
 // ==========================================
+
+/**
+ * AMyGameHUD::OnGameFlowStateChanged
+ *
+ * GameFlowSubsystem 状态变化回调
+ * Battleing: 显示 HUD + 准星 + 刷新倒计时和回合数
+ * 其他: 隐藏 HUD + 准星
+ *
+ * 【架构重构】: HUD 只负责 UI 元素的展示与隐藏
+ * 已将鼠标控制权交还给 PlayerController，避免代码职责互相覆盖
+ */
 void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 {
 	UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] OnGameFlowStateChanged called: NewState=%d"), (int32)NewState);
-
-	// 【架构重构】：HUD 只负责 UI 元素的展示与隐藏。
-	// 已将鼠标控制权交还给 PlayerController，避免代码职责互相覆盖。
 
 	if (NewState == EMatchState::Battleing)
 	{
@@ -82,10 +131,10 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 		{
 			UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] Setting HUD visible..."));
 
-			// 规范：使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
+			// 规范: 使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
 			GameHUDWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
-			// 显示准星（由GameHUD统一管理）
+			// 显示准星（由 GameHUD 统一管理）
 			GameHUDWidget->ShowCrosshair();
 
 			// 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
@@ -102,10 +151,10 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 				}
 			}
 		}
-		
+
 		UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] 切换至战斗UI，成功展示主HUD与准星"));
 	}
-	else 
+	else
 	{
 		// 如果是房间态或其它状态，隐藏所有战斗 UI（包括准星）
 		if (GameHUDWidget)

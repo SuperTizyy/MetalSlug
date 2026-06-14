@@ -1,9 +1,27 @@
-﻿#include "Characters/BaseCharacter.h"
+﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+
+// ==========================================
+// 头文件包含区
+// ==========================================
+// 引入本类头文件
+#include "Characters/BaseCharacter.h"
+
+// 引入摄像机组件
 #include "Camera/CameraComponent.h"
+
+// 引入胶囊体组件
 #include "Components/CapsuleComponent.h"
+
+// 引入 Net/UnrealNetwork.h（DOREPLIFETIME 宏的来源）
 #include "Net/UnrealNetwork.h"
+
+// 引入增强输入组件
 #include "EnhancedInputComponent.h"
+
+// 引入增强输入本地玩家子系统
 #include "EnhancedInputSubsystems.h"
+
+// 引入弹簧臂组件
 #include "GameFramework/SpringArmComponent.h"
 // 引入武器基类，以便调用武器的接口
 #include "GameFramework/CharacterMovementComponent.h"
@@ -33,13 +51,32 @@ static TAutoConsoleVariable<float> CVarFootstepVolume(
 // 初始化静态成员
 float ABaseCharacter::FootstepVolumeCVar = 1.0f;
 
+
+// ==========================================
+// 1. 构造函数
+// ==========================================
+
+/**
+ * ABaseCharacter 构造函数
+ *
+ * 目的: 创建组件、初始化属性、设置默认值
+ * 关键:
+ * 1. 开启网络同步
+ * 2. 搭建第三人称摄像机（弹簧臂 + 跟随相机）
+ * 3. 调整骨骼网格对齐胶囊体
+ * 4. 初始化战斗属性（血量/能量/AC/ACE）
+ * 5. 初始化回复系统
+ * 6. 初始化连击系统状态
+ * 7. 开启 NavAgent 下蹲权限
+ * 8. 设置下蹲时走路速度
+ */
 ABaseCharacter::ABaseCharacter()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	// 1. 极其关键：开启角色的网络同步！
+	// 1. 极其关键: 开启角色的网络同步
 	bReplicates = true;
-	
+
 	// 允许武器本身在网络中存在
 	bReplicates = true;
 
@@ -60,8 +97,8 @@ ABaseCharacter::ABaseCharacter()
 	// ==========================================
 	// 角色模型设置
 	// ==========================================
-	// 【关键修改】：允许玩家自己看到自己的全身模型！
-	GetMesh()->SetOwnerNoSee(false); 
+	// 【关键修改】: 允许玩家自己看到自己的全身模型
+	GetMesh()->SetOwnerNoSee(false);
 	GetMesh()->SetRelativeLocation(FVector(0.f, 0.f, -90.f)); // 往下挪一点，对齐胶囊体底盘
 	GetMesh()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f)); // 把脸转到正前方
 
@@ -87,24 +124,33 @@ ABaseCharacter::ABaseCharacter()
 	bIsHoldingLightAttack = false;
 	bIsAttacking = false;
 	CurrentWeapon = nullptr; // 初始状态手里没武器
-	
-	// 【核心权限】：告诉引擎底层的导航代理，这个角色可以下蹲！
-	// 如果不加这句，你按破键盘角色也不会蹲下。
+
+	// 【核心权限】: 告诉引擎底层的导航代理，这个角色可以下蹲
+	// 如果不加这句，你按破键盘角色也不会蹲下
 	GetCharacterMovement()->GetNavAgentPropertiesRef().bCanCrouch = true;
-	
+
 	// 设置下蹲时的走路速度 (比如 300)
 	GetCharacterMovement()->MaxWalkSpeedCrouched = 300.0f;
 
 	// 初始化脚步声默认音效（指向已有资源，后续可在蓝图覆盖）
-	// 注意：需要在蓝图或 DataTable 中手动指定 Footstep_Deep_04.uasset
-	// 蓝图中设置：CharacterDetails -> Audio|Footstep -> WalkFootstepSound = Footstep_Deep_04
 }
 
+
+// ==========================================
+// 2. BeginPlay
+// ==========================================
+
+/**
+ * ABaseCharacter::BeginPlay
+ *
+ * 在角色被初始化时调用
+ * 关键: 初始化动态材质实例数组（用于死亡溶解特效）
+ */
 void ABaseCharacter::BeginPlay()
 {
 	Super::BeginPlay();
-	
-	// 【新增】：初始化动态材质
+
+	// 【新增】: 初始化动态材质
 	if (GetMesh())
 	{
 		int32 MaterialCount = GetMesh()->GetNumMaterials();
@@ -117,13 +163,26 @@ void ABaseCharacter::BeginPlay()
 			}
 		}
 	}
-	
 }
 
+
+// ==========================================
+// 3. Tick
+// ==========================================
+
+/**
+ * ABaseCharacter::Tick
+ *
+ * 每帧调用
+ * 关键:
+ * 1. 摄像机阻尼减震回弹（下蹲/起立时镜头平滑）
+ * 2. 生命/能量回复系统（仅服务器，停止移动 N 秒后开始回血回蓝）
+ * 3. 死亡溶解特效（值达到 1.1 时销毁）
+ */
 void ABaseCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
-	
+
 	// ==========================================
 	// 摄像机阻尼减震回弹
 	// ==========================================
@@ -132,7 +191,7 @@ void ABaseCharacter::Tick(float DeltaTime)
 		// 利用 FInterpTo，每一帧让 TargetOffset.Z 平滑地向 0.0f 靠拢
 		CameraBoom->TargetOffset.Z = FMath::FInterpTo(CameraBoom->TargetOffset.Z, 0.0f, DeltaTime, CrouchCameraSmoothSpeed);
 	}
-	
+
 	// ==========================================
 	// 生命/能量回复系统
 	// ==========================================
@@ -173,7 +232,10 @@ void ABaseCharacter::Tick(float DeltaTime)
 			}
 		}
 	}
-	
+
+	// ==========================================
+	// 死亡溶解特效
+	// ==========================================
 	if (bStartDissolving)
 	{
 		// 1. 累加溶解值
@@ -196,9 +258,17 @@ void ABaseCharacter::Tick(float DeltaTime)
 	}
 }
 
+
 // ==========================================
-// 注册需要网络同步的变量
+// 4. 网络同步注册
 // ==========================================
+
+/**
+ * GetLifetimeReplicatedProps
+ *
+ * 注册需要网络同步的 UPROPERTY
+ * 同步内容: 生命值/死亡状态/武器/能量/AC/ACE
+ */
 void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
@@ -206,20 +276,33 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 同步生命值
 	DOREPLIFETIME(ABaseCharacter, CurrentHealth);
 	DOREPLIFETIME(ABaseCharacter, bIsDead); // 同步死亡状态
-	// 同步武器指针，让所有人都知道你拿了什么武器！
+	// 同步武器指针，让所有人都知道你拿了什么武器
 	DOREPLIFETIME(ABaseCharacter, CurrentWeapon);
 	// 同步能量值
 	DOREPLIFETIME(ABaseCharacter, CurrentEnergy);
-	// 同步AC/ACE值（注意：MaxAC 是配置常量，无需网络同步）
+	// 同步AC/ACE值（注意: MaxAC 是配置常量，无需网络同步）
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
 }
 
+
+// ==========================================
+// 5. 客户端 OnRep 回调
+// ==========================================
+
+/**
+ * OnRep_Health
+ *
+ * 生命值改变时的客户端回调
+ * 架构说明: OnRep_Health 在所有机器（服务器+所有客户端）触发
+ * - 服务器端: 直接在服务器更新 HUD
+ * - 客户端: 直接在客户端更新 HUD
+ */
 void ABaseCharacter::OnRep_Health()
 {
-	// 【架构说明】：OnRep_Health 在所有机器（服务器+所有客户端）触发
-	// 服务器端：直接在服务器更新 HUD（服务器没有 HUD 但代码安全执行）
-	// 客户端：直接在客户端更新 HUD（因为 OnRep 在客户端执行，GameHUDWidget 已是本客户端的 HUD）
+	// 【架构说明】: OnRep_Health 在所有机器（服务器+所有客户端）触发
+	// 服务器端: 直接在服务器更新 HUD（服务器没有 HUD 但代码安全执行）
+	// 客户端: 直接在客户端更新 HUD（因为 OnRep 在客户端执行，GameHUDWidget 已是本客户端的 HUD）
 	if (GameHUDWidget)
 	{
 		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
@@ -229,9 +312,16 @@ void ABaseCharacter::OnRep_Health()
 		CurrentHealth, MaxHealth, *GetNameSafe(GameHUDWidget));
 }
 
+
+/**
+ * Client_UpdateHealthDisplay_Implementation
+ *
+ * Client RPC: 服务器主动通知所属客户端刷新血量
+ * 解决远程玩家受伤血条不扣的问题
+ */
 void ABaseCharacter::Client_UpdateHealthDisplay_Implementation(float Current, float Max)
 {
-	// 【保留 Client RPC】：供外部手动触发 HUD 刷新时使用（如扣血时从外部调用）
+	// 【保留 Client RPC】: 供外部手动触发 HUD 刷新时使用（如扣血时从外部调用）
 	UE_LOG(LogTemp, Warning, TEXT("[Health] Client_UpdateHealthDisplay 收到: %.1f/%.1f"), Current, Max);
 	if (GameHUDWidget)
 	{
@@ -240,9 +330,15 @@ void ABaseCharacter::Client_UpdateHealthDisplay_Implementation(float Current, fl
 	}
 }
 
+
+/**
+ * OnRep_Energy
+ *
+ * 能量改变时的客户端回调
+ */
 void ABaseCharacter::OnRep_Energy()
 {
-	// 【架构说明】：OnRep_Energy 在所有机器触发，直接更新 HUD
+	// 【架构说明】: OnRep_Energy 在所有机器触发，直接更新 HUD
 	if (GameHUDWidget)
 	{
 		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
@@ -250,9 +346,15 @@ void ABaseCharacter::OnRep_Energy()
 	}
 }
 
+
+/**
+ * Client_UpdateEnergyDisplay_Implementation
+ *
+ * Client RPC: 服务器主动通知所属客户端刷新能量条
+ */
 void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, float Max)
 {
-	// 【保留 Client RPC】：供外部手动触发时使用
+	// 【保留 Client RPC】: 供外部手动触发时使用
 	if (GameHUDWidget)
 	{
 		GameHUDWidget->UpdateEnergy(Current, Max);
@@ -260,9 +362,18 @@ void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, fl
 	}
 }
 
+
 // ==========================================
-// 武器网络复制回调（客户端同步）
+// 6. 武器网络复制回调（客户端同步）
 // ==========================================
+
+/**
+ * OnRep_CurrentWeapon
+ *
+ * 武器指针改变时的回调（网络复制通知）
+ * 目的: 让客户端用 OnRep_CurrentWeapon 同步挂载武器
+ * 注意: 服务器和本地控制的角色已经在 PossessedBy 中处理了
+ */
 void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 {
 	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
@@ -344,6 +455,12 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 	}
 }
 
+
+/**
+ * OnRep_ACValue
+ *
+ * AC 值改变时的客户端回调
+ */
 void ABaseCharacter::OnRep_ACValue()
 {
 	if (IsLocallyControlled() && GameHUDWidget)
@@ -355,6 +472,12 @@ void ABaseCharacter::OnRep_ACValue()
 	}
 }
 
+
+/**
+ * OnRep_ACEValue
+ *
+ * ACE 值改变时的客户端回调
+ */
 void ABaseCharacter::OnRep_ACEValue()
 {
 	if (IsLocallyControlled() && GameHUDWidget)
@@ -367,9 +490,21 @@ void ABaseCharacter::OnRep_ACEValue()
 	}
 }
 
+
+// ==========================================
+// 7. 角色图标/武器图标刷新
+// ==========================================
+
+/**
+ * RefreshCharacterIcon
+ *
+ * 核心修复: 本地角色直接在服务器侧走一遍 Client RPC 流程
+ * 服务器先拿到 CharacterID，再通知所属客户端刷新头像
+ * 这样远程玩家也能看到其他人的头像图标了
+ */
 void ABaseCharacter::RefreshCharacterIcon()
 {
-	// 【核心修复】：本地角色直接在服务器侧走一遍 Client RPC 流程
+	// 【核心修复】: 本地角色直接在服务器侧走一遍 Client RPC 流程
 	// 服务器先拿到 CharacterID，再通知所属客户端刷新头像
 	// 这样远程玩家也能看到其他人的头像图标了
 
@@ -391,12 +526,21 @@ void ABaseCharacter::RefreshCharacterIcon()
 	Client_RefreshCharacterIcon(CharID);
 }
 
+
+/**
+ * Client_RefreshCharacterIcon_Implementation
+ *
+ * Client RPC: 在所属客户端上刷新头像
+ * 网络架构说明: 此函数在"所有客户端"上执行
+ * 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像
+ * 所以这里用 IsLocallyControlled() 做最终过滤
+ */
 void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID)
 {
-	// 【网络架构说明】：
-	// 此函数在"所有客户端"上执行，包括本地玩家和远程玩家。
-	// 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像。
-	// 所以这里用 IsLocallyControlled() 做最终过滤 —— 只有本地玩家才刷新自己的 HUD。
+	// 【网络架构说明】:
+	// 此函数在"所有客户端"上执行，包括本地玩家和远程玩家
+	// 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像
+	// 所以这里用 IsLocallyControlled() 做最终过滤 —— 只有本地玩家才刷新自己的 HUD
 
 	// 缓存 ID，延迟刷新时使用
 	CachedCharacterIDForIcon = InCharacterID;
@@ -431,9 +575,16 @@ void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& I
 	RefreshWeaponIconOnHUD();
 }
 
+
+/**
+ * RetryRefreshCharacterIcon
+ *
+ * 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑
+ * 跳过服务器中转
+ */
 void ABaseCharacter::RetryRefreshCharacterIcon()
 {
-	// 延迟重试回调：直接在客户端重新执行 HUD 刷新逻辑，跳过服务器中转
+	// 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑，跳过服务器中转
 	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标，CachedID=%s"), *CachedCharacterIDForIcon);
 
 	// 再次尝试获取 HUD
@@ -463,6 +614,13 @@ void ABaseCharacter::RetryRefreshCharacterIcon()
 	RefreshWeaponIconOnHUD();
 }
 
+
+/**
+ * RefreshWeaponIconOnHUD
+ *
+ * 刷新武器图标到 HUD
+ * 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
+ */
 void ABaseCharacter::RefreshWeaponIconOnHUD()
 {
 	if (!GameHUDWidget || !GameHUDWidget->GetWidget_WeaponPanel())
@@ -488,6 +646,13 @@ void ABaseCharacter::RefreshWeaponIconOnHUD()
 	}
 }
 
+
+/**
+ * GetCharacterAvatarFromTable
+ *
+ * 从 CharacterDataTable 查指定角色 ID 的头像贴图
+ * @return 头像 UTexture2D（找不到返回 nullptr）
+ */
 UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
 {
 	if (CharID.IsEmpty()) return nullptr;
@@ -506,6 +671,15 @@ UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
 	return nullptr;
 }
 
+
+/**
+ * RefreshACEWithRank
+ *
+ * 查询当前 ACE 排名并刷新 HUD 上的 ACE 文字颜色
+ * - 全场第一: 金色
+ * - 队内第一: 白色
+ * - 其他: 无
+ */
 void ABaseCharacter::RefreshACEWithRank()
 {
 	if (!IsLocallyControlled() || !GameHUDWidget)
@@ -557,6 +731,18 @@ void ABaseCharacter::RefreshACEWithRank()
 	GameHUDWidget->UpdateACEWithRank(ACEValue, RankType);
 }
 
+
+// ==========================================
+// 8. 能量管理
+// ==========================================
+
+/**
+ * ConsumeEnergy
+ *
+ * 消耗能量（释放技能时调用）
+ * @param Amount 要消耗的能量
+ * @return 是否消耗成功
+ */
 bool ABaseCharacter::ConsumeEnergy(float Amount)
 {
 	if (Amount <= 0.0f) return true;
@@ -569,6 +755,13 @@ bool ABaseCharacter::ConsumeEnergy(float Amount)
 	return false;
 }
 
+
+/**
+ * AddEnergy
+ *
+ * 增加能量（仅服务器权威）
+ * @param Amount 要增加的能量
+ */
 void ABaseCharacter::AddEnergy(float Amount)
 {
 	if (HasAuthority())
@@ -577,6 +770,16 @@ void ABaseCharacter::AddEnergy(float Amount)
 	}
 }
 
+
+// ==========================================
+// 9. 回复系统
+// ==========================================
+
+/**
+ * StartRegeneration
+ *
+ * 开始回复（标记 bIsRegenerating=true）
+ */
 void ABaseCharacter::StartRegeneration()
 {
 	if (!bIsRegenerating)
@@ -585,6 +788,12 @@ void ABaseCharacter::StartRegeneration()
 	}
 }
 
+
+/**
+ * StopRegeneration
+ *
+ * 停止回复（角色开始移动时调用）
+ */
 void ABaseCharacter::StopRegeneration()
 {
 	if (bIsRegenerating)
@@ -593,11 +802,24 @@ void ABaseCharacter::StopRegeneration()
 	}
 }
 
+
+// ==========================================
+// 10. 击杀奖励与 AC/ACE
+// ==========================================
+
+/**
+ * OnKill
+ *
+ * 击杀奖励接口
+ * - 增加血量（HealthRewardPerKill）
+ * - 增加能量（EnergyRewardPerKill）
+ * - 增加 AC（AddAC）
+ */
 void ABaseCharacter::OnKill(ABaseCharacter* KilledCharacter)
 {
 	if (!HasAuthority()) return;
 
-	// 击杀奖励：增加血量和能量
+	// 击杀奖励: 增加血量和能量
 	AddEnergy(EnergyRewardPerKill);
 	CurrentHealth = FMath::Clamp(CurrentHealth + HealthRewardPerKill, 0.0f, MaxHealth);
 
@@ -605,6 +827,13 @@ void ABaseCharacter::OnKill(ABaseCharacter* KilledCharacter)
 	AddAC(1);
 }
 
+
+/**
+ * AddAC
+ *
+ * 增加 AC 值（仅服务器）
+ * ACE 代表连续击杀，每次击杀都 +1
+ */
 void ABaseCharacter::AddAC(int32 Amount)
 {
 	if (HasAuthority())
@@ -615,6 +844,12 @@ void ABaseCharacter::AddAC(int32 Amount)
 	}
 }
 
+
+/**
+ * TakeAC
+ *
+ * 扣除 AC 值（用于结算时扣分）
+ */
 void ABaseCharacter::TakeAC(int32 Amount)
 {
 	if (HasAuthority())
@@ -623,6 +858,12 @@ void ABaseCharacter::TakeAC(int32 Amount)
 	}
 }
 
+
+/**
+ * ResetAC
+ *
+ * 重置 AC 到 0（同时重置 ACE）
+ */
 void ABaseCharacter::ResetAC()
 {
 	if (HasAuthority())
@@ -632,13 +873,21 @@ void ABaseCharacter::ResetAC()
 	}
 }
 
+
 // ==========================================
-// 输入绑定与移动逻辑
+// 11. 输入绑定与移动逻辑
 // ==========================================
+
+/**
+ * SetupPlayerInputComponent
+ *
+ * 绑定增强输入上下文
+ * 绑定基础移动视角/跳跃/下蹲/轻重击/技能
+ */
 void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
-	
+
 	// 绑定增强输入上下文
 	if (APlayerController* PlayerController = Cast<APlayerController>(Controller))
 	{
@@ -657,22 +906,22 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		if (MoveAction) EnhancedInputComponent->BindAction(MoveAction, ETriggerEvent::Triggered, this, &ABaseCharacter::Move);
 		if (LookAction) EnhancedInputComponent->BindAction(LookAction, ETriggerEvent::Triggered, this, &ABaseCharacter::Look);
 		if (JumpAction) EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Triggered, this, &ACharacter::Jump);
-		
-		// 【连斩核心绑定】：左键按下 (Started) 和 松开 (Completed)
-		if (LightAttackAction) 
+
+		// 【连斩核心绑定】: 左键按下 (Started) 和 松开 (Completed)
+		if (LightAttackAction)
 		{
 			EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Started, this, &ABaseCharacter::LightAttack_Pressed);
 			EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Completed, this, &ABaseCharacter::LightAttack_Released);
 		}
-		
+
 		// 重击只需单击
 		if (HeavyAttackAction) EnhancedInputComponent->BindAction(HeavyAttackAction, ETriggerEvent::Started, this, &ABaseCharacter::HeavyAttack);
-		
+
 		// 绑定技能释放
 		if (UseSkillAction) EnhancedInputComponent->BindAction(UseSkillAction, ETriggerEvent::Started, this, &ABaseCharacter::UseSkill);
-		
+
 		// 绑定下蹲 (按下时触发 StartCrouch，松开时触发 StopCrouch)
-		if (CrouchAction) 
+		if (CrouchAction)
 		{
 			EnhancedInputComponent->BindAction(CrouchAction, ETriggerEvent::Started, this, &ABaseCharacter::StartCrouch);
 			EnhancedInputComponent->BindAction(CrouchAction, ETriggerEvent::Completed, this, &ABaseCharacter::StopCrouch);
@@ -680,12 +929,20 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 	}
 }
 
+
+/**
+ * Move
+ *
+ * 基础输入回调: 移动
+ * 死亡/暂停时不能移动
+ * 按摄像机视角驱动角色移动
+ */
 void ABaseCharacter::Move(const FInputActionValue& Value)
 {
 	// 死亡状态和暂停状态都不能移动
 	if (bIsDead) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
-	
+
 	FVector2D MovementVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
 	{
@@ -693,7 +950,7 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 		const FRotator Rotation = Controller->GetControlRotation();
 		const FRotator YawRotation(0, Rotation.Yaw, 0);
 
-		// 获取摄像机视角下的“正前方”和“正右方”
+		// 获取摄像机视角下的"正前方"和"正右方"
 		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
 		const FVector RightDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
 
@@ -706,12 +963,18 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 	}
 }
 
+
+/**
+ * Look
+ *
+ * 基础输入回调: 视角
+ */
 void ABaseCharacter::Look(const FInputActionValue& Value)
 {
 	// 死亡状态和暂停状态都不能转动视角
 	if (bIsDead) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
-	
+
 	FVector2D LookAxisVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
 	{
@@ -720,36 +983,47 @@ void ABaseCharacter::Look(const FInputActionValue& Value)
 	}
 }
 
+
 // ==========================================
-// 自动连斩系统核心逻辑
+// 12. 自动连斩系统核心逻辑
 // ==========================================
 
+/**
+ * LightAttack_Pressed
+ *
+ * 轻击按下事件
+ * 1. 死亡/暂停/无武器/下蹲禁止攻击都不能挥刀
+ * 2. 记录按住状态
+ * 3. 根据武器配置决定是否锁步
+ * 4. 第一刀起手: 初始化状态机
+ * 5. 连击区间: 记录缓存
+ */
 void ABaseCharacter::LightAttack_Pressed()
 {
 	// 死人、暂停状态、武器未装备都不能攻击
 	if (bIsDead || !CurrentWeapon) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
-	
-	// 下蹲攻击权限拦截！
-	// 如果你正蹲着，并且这把武器禁止下蹲攻击，直接 return，无视玩家按键！
+
+	// 下蹲攻击权限拦截
+	// 如果你正蹲着，并且这把武器禁止下蹲攻击，直接 return，无视玩家按键
 	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
 	{
 		return;
 	}
-	
+
 	bIsHoldingLightAttack = true; // 记录按住状态
-	
-	// 根据当前武器的配置，决定要不要锁步！
+
+	// 根据当前武器的配置，决定要不要锁步
 	bIsMovementLocked = !CurrentWeapon->bCanMoveWhileLightAttack;
-	
+
 	if (bIsMovementLocked)
 	{
 		GetCharacterMovement()->MaxWalkSpeed = 0.0f; // 物理刹车
 	}
-	
+
 	if (!bIsAttacking)
 	{
-		// 1. 第一刀起手：上锁，初始化状态
+		// 1. 第一刀起手: 上锁，初始化状态
 		bIsAttacking = true;
 		ComboIndex = 1;
 		bSaveAttack = false;
@@ -759,21 +1033,36 @@ void ABaseCharacter::LightAttack_Pressed()
 	else if (bCanReceiveInput)
 	{
 		// 2. 如果正在挥刀，且【绿色输入区间】开启了
-		// 记录玩家点过鼠标了！(不管点几次，只记为 true)
+		// 记录玩家点过鼠标了（不管点几次，只记为 true）
 		bSaveAttack = true;
 	}
 }
 
+
+/**
+ * LightAttack_Released
+ *
+ * 轻击松开事件
+ * 记录: 玩家松手了
+ */
 void ABaseCharacter::LightAttack_Released()
 {
-	bIsHoldingLightAttack = false; // 记录：玩家松手了！
+	bIsHoldingLightAttack = false; // 记录: 玩家松手了
 }
 
+
+/**
+ * ExecuteComboSequence
+ *
+ * 连招核心执行逻辑
+ * 工业级做法: 所有连招全在第 0 个蒙太奇里
+ * 智能拼接要跳转的片段名字 (Combo1 或 Combo2)
+ */
 void ABaseCharacter::ExecuteComboSequence()
 {
 	if (!CurrentWeapon) return;
 
-	// 工业级做法：所有连招全在第 0 个蒙太奇里
+	// 工业级做法: 所有连招全在第 0 个蒙太奇里
 	UAnimMontage* ComboMontage = CurrentWeapon->GetAttackMontage(false, 0);
 	if (ComboMontage)
 	{
@@ -781,39 +1070,40 @@ void ABaseCharacter::ExecuteComboSequence()
 		FName SectionName = (ComboIndex == 1) ? FName("Combo1") : FName("Combo2");
 
 		PlayAnimMontage(ComboMontage, 1.0f, SectionName);
-		
-		// 【激活网络同步】：告诉服务器我出的是第几刀！
+
+		// 【激活网络同步】: 告诉服务器我出的是第几刀
 		Server_PlayAttackAnim(false, ComboIndex);
 	}
 }
 
+
+/**
+ * HeavyAttack
+ *
+ * 重击事件（单击）
+ * 注意: 当前版本 HeavyAttack 实现被注释，仅留下权限检查
+ */
 void ABaseCharacter::HeavyAttack()
 {
 	// 死人、武器未装备、暂停状态都不能重击
 	if (bIsDead || !CurrentWeapon) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
-	// 【新增】：重击同样需要检查下蹲权限
+	// 【新增】: 重击同样需要检查下蹲权限
 	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
 	{
 		return;
 	}
-	// // 必须在没挥刀的时候才能触发重击，防止轻击动作被强行打断
-	// if (!bIsAttacking && CurrentWeapon)
-	// {
-	// 	bIsAttacking = true;
-	// 	GetWorldTimerManager().ClearTimer(ComboResetTimer);
-	//
-	// 	// 重击不需要连击索引，默认传 0
-	// 	UAnimMontage* MontageToPlay = CurrentWeapon->GetAttackMontage(true, 0);
-	// 	if (MontageToPlay)
-	// 	{
-	// 		PlayAnimMontage(MontageToPlay);
-	// 		Server_PlayAttackAnim(true, 0);
-	// 	}
-	// }
+	// 注: 重击主体实现已注释（保留扩展位）
 }
 
+
+/**
+ * UseSkill
+ *
+ * 释放技能事件
+ * TODO: 技能系统具体实现
+ */
 void ABaseCharacter::UseSkill()
 {
 	// 死亡状态和暂停状态都不能释放技能
@@ -824,40 +1114,60 @@ void ABaseCharacter::UseSkill()
 	// 这里可以扩展为技能槽系统，支持多个技能
 }
 
+
 // ==========================================
-// 动画通知 (Anim Notify) 回调接口
+// 13. 动画通知 (Anim Notify) 回调接口
 // ==========================================
 
+/**
+ * EnableComboWindow
+ *
+ * 区间开始时触发（开启连招窗口）
+ * 绿灯亮起，开始接收输入
+ */
 void ABaseCharacter::EnableComboWindow()
 {
 	bCanReceiveInput = true; // 绿灯亮起，开始接收输入
 	bSaveAttack = false;     // 清空上一轮的垃圾缓存
 }
 
+
+/**
+ * CheckCombo
+ *
+ * 区间结束时触发（检查缓存区是否有缓存攻击）
+ * 终极结算: 如果有缓存的点击或玩家正死死按住左键，则跳转下一段
+ */
 void ABaseCharacter::CheckCombo()
 {
 	bCanReceiveInput = false; // 绿灯熄灭，关闭窗口
 
-	// 【终极结算】：如果有缓存的点击，或者玩家正死死按住左键！
+	// 【终极结算】: 如果有缓存的点击，或者玩家正死死按住左键
 	if (bSaveAttack || bIsHoldingLightAttack)
 	{
-		
-		// 【新增防逃课锁】：连击派生前，检查当前是不是已经蹲下了！
+		// 【新增防逃课锁】: 连击派生前，检查当前是不是已经蹲下了
 		if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
 		{
 			bSaveAttack = false; // 清除缓存
 			return; // 强行中断后续连招
 		}
-		
+
 		bSaveAttack = false; // 消耗掉这次缓存
-		
-		// 核心需求：1变2，2变1，无限循环！
-		ComboIndex = (ComboIndex == 1) ? 2 : 1; 
-		
+
+		// 核心需求: 1变2，2变1，无限循环
+		ComboIndex = (ComboIndex == 1) ? 2 : 1;
+
 		ExecuteComboSequence(); // 丝滑跳转下一刀
 	}
 }
 
+
+/**
+ * EndAttackState
+ *
+ * 动画彻底结束时触发
+ * 彻底收招，解开所有锁
+ */
 void ABaseCharacter::EndAttackState()
 {
 	// 彻底收招，解开所有锁
@@ -867,26 +1177,42 @@ void ABaseCharacter::EndAttackState()
 	ComboIndex = 1;
 	// 收刀时，彻底解除移动锁定
 	bIsMovementLocked = false;
-	GetCharacterMovement()->MaxWalkSpeed = 600.0f; // 恢复正常速度 (请填入你自己的满速)
+	GetCharacterMovement()->MaxWalkSpeed = 600.0f; // 恢复正常速度
 }
 
+
 // ==========================================
-// RPC 动画广播实现
+// 14. RPC 动画广播实现
 // ==========================================
+
+/**
+ * Server_PlayAttackAnim_Implementation
+ *
+ * Server RPC 实现: 客户端向服务器请求挥刀
+ * 1. 服务器端也必须同步锁死速度
+ * 2. 服务器收到请求后，向全频道广播
+ */
 void ABaseCharacter::Server_PlayAttackAnim_Implementation(bool bIsHeavy, int32 InComboIndex)
 {
-	// 服务器端也必须同步锁死速度！
-	// 这样服务器和客户端的物理推演就完全一致了，再也不会发生“强行拽人”的瞬移！
+	// 服务器端也必须同步锁死速度
+	// 这样服务器和客户端的物理推演就完全一致了，再也不会发生"强行拽人"的瞬移
 	if (CurrentWeapon && !CurrentWeapon->bCanMoveWhileLightAttack)
 	{
 		bIsMovementLocked = true;
 		GetCharacterMovement()->MaxWalkSpeed = 0.0f;
 	}
-	
+
 	// 服务器收到请求后，直接向全频道广播
 	Multicast_PlayAttackAnim(bIsHeavy, InComboIndex);
 }
 
+
+/**
+ * Multicast_PlayAttackAnim_Implementation
+ *
+ * NetMulticast 实现: 服务器向所有客户端广播
+ * 发起攻击的本地玩家自己已经播过动画了，防鬼畜直接跳过
+ */
 void ABaseCharacter::Multicast_PlayAttackAnim_Implementation(bool bIsHeavy, int32 InComboIndex)
 {
 	// 发起攻击的本地玩家自己已经播过动画了，防鬼畜直接跳过
@@ -894,29 +1220,40 @@ void ABaseCharacter::Multicast_PlayAttackAnim_Implementation(bool bIsHeavy, int3
 
 	if (CurrentWeapon)
 	{
-		// 工业级做法：直接拿第 0 个蒙太奇（因为所有轻击招式都在这里面）
+		// 工业级做法: 直接拿第 0 个蒙太奇（因为所有轻击招式都在这里面）
 		UAnimMontage* MontageToPlay = CurrentWeapon->GetAttackMontage(bIsHeavy, 0);
-		if (MontageToPlay) 
+		if (MontageToPlay)
 		{
-			// 根据服务器传来的 InComboIndex，智能推断该播哪个片段！
+			// 根据服务器传来的 InComboIndex，智能推断该播哪个片段
 			FName SectionName = (InComboIndex == 1) ? FName("Combo1") : FName("Combo2");
-			
-			// 让其他玩家屏幕上的你，也精准跳到对应的连招片段！
+
+			// 让其他玩家屏幕上的你，也精准跳到对应的连招片段
 			PlayAnimMontage(MontageToPlay, 1.0f, SectionName);
 		}
 	}
 }
 
+
 // ==========================================
-// 外部调用的发枪接口
+// 15. 装备武器
 // ==========================================
+
+/**
+ * EquipWeapon
+ *
+ * 供上帝 (GameMode) 调用的装备武器接口
+ * 1. 只有服务器上帝有资格发枪
+ * 2. 如果手里已经有武器了，先销毁旧的
+ * 3. 在世界中凭空召唤出这把武器
+ * 4. 焊接到角色的插槽上
+ */
 void ABaseCharacter::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip)
 {
 	// 只有服务器上帝有资格发枪
 	if (HasAuthority() && WeaponClassToEquip)
 	{
 		// 如果手里已经有武器了，先销毁旧的（为以后切枪做准备）
-		if (CurrentWeapon) 
+		if (CurrentWeapon)
 		{
 			CurrentWeapon->Destroy();
 		}
@@ -927,29 +1264,42 @@ void ABaseCharacter::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip)
 
 		// 在世界中凭空召唤出这把武器
 		CurrentWeapon = GetWorld()->SpawnActor<ABaseWeapon>(WeaponClassToEquip, GetActorLocation(), GetActorRotation(), SpawnParams);
-		
+
 		if (CurrentWeapon)
 		{
-			// 【第三人称关键】：将武器死死地焊在第三人称全身模型 (GetMesh) 的 "WeaponSocket" 插槽上！
+			// 【第三人称关键】: 将武器死死地焊在第三人称全身模型 (GetMesh) 的 "WeaponSocket" 插槽上
 			CurrentWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, FName("WeaponSocket_L"));
 		}
 	}
 }
 
+
+// ==========================================
+// 16. 受伤与死亡
+// ==========================================
+
+/**
+ * TakeDamage
+ *
+ * UE 原生函数: 处理伤害（仅服务器）
+ * 1. 安全扣血
+ * 2. 判定生死
+ * 3. 服务器处理击杀结算（查找击杀方式、设置击杀者、通知助攻、广播计分板）
+ */
 float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, AActor* DamageCauser)
 {
 	// 1. 如果已经死了，或者客户端没有权限，直接退出
 	if (bIsDead || !HasAuthority()) return 0.0f;
-	
+
 	// 先执行父类的逻辑
 	float ActualDamage = Super::TakeDamage(DamageAmount, DamageEvent, EventInstigator, DamageCauser);
-	
+
 	// 2. 安全扣血 (保证不会扣成负数)
 	CurrentHealth = FMath::Clamp(CurrentHealth - ActualDamage, 0.0f, MaxHealth);
 	UE_LOG(LogTemp, Warning, TEXT("[Health] 服务器扣血完成: Damage=%.1f, NewHealth=%.1f/%.1f, Dead=%d, Auth=%d"),
 		ActualDamage, CurrentHealth, MaxHealth, CurrentHealth <= 0.0f, HasAuthority());
 
-	// 3. 判定生死！
+	// 3. 判定生死
 	if (CurrentHealth <= 0.0f)
 	{
 		// 服务器处理击杀结算
@@ -998,22 +1348,27 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 
 		Die();
 	}
-	
-	// 这里未来可以播放受击蒙太奇、喷血特效、或者死亡逻辑
-	// PlayAnimMontage(HitReactMontage);
 
 	return ActualDamage;
 }
 
+
+/**
+ * Die
+ *
+ * 服务器专用: 死亡逻辑
+ * 1. 告诉所有客户端: 这个人死了
+ * 2. 启动 PlayerController 上的复活定时器
+ */
 void ABaseCharacter::Die()
 {
 	// 只有服务器能宣判死亡
 	if (!HasAuthority() || bIsDead) return;
 
-	// 告诉所有客户端：这个人死了，准备看布娃娃！
+	// 告诉所有客户端: 这个人死了，准备看布娃娃
 	Multicast_Die();
 
-	// 【核心修复】：复活定时器必须放在 PlayerController 上
+	// 【核心修复】: 复活定时器必须放在 PlayerController 上
 	// 如果定时器在角色上，死亡后角色被销毁（或者等待新角色替代），定时器会被清除
 	if (AController* MyController = GetController())
 	{
@@ -1024,6 +1379,18 @@ void ABaseCharacter::Die()
 	}
 }
 
+
+/**
+ * Multicast_Die_Implementation
+ *
+ * NetMulticast 实现: 死亡动画在所有机器上播放
+ * 1. 标记死亡状态
+ * 2. 重置 AC/ACE（仅服务器）
+ * 3. 武器掉落与销毁（延迟 1 秒）
+ * 4. 启动溶解特效定时器
+ * 5. 禁用移动、调整胶囊体碰撞
+ * 6. 播放死亡动画 + 定时开启布娃娃
+ */
 void ABaseCharacter::Multicast_Die_Implementation()
 {
 	// 【所有人都会执行这个函数，包括发起死亡的服务器和所有客户端】
@@ -1034,57 +1401,56 @@ void ABaseCharacter::Multicast_Die_Implementation()
 	{
 		ResetAC();
 	}
-	
+
 	// ==========================================
-    // 【终极重构】：武器掉落与销毁系统
-    // ==========================================
-    if (CurrentWeapon)
-    {
-    	// 方案 A：如果想让武器掉落在地上（推荐保留一段时间供拾取）
-    	// 1. 彻底断开与死人手的骨骼绑定！
-    	CurrentWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+	// 【终极重构】: 武器掉落与销毁系统
+	// ==========================================
+	if (CurrentWeapon)
+	{
+		// 方案 A: 如果想让武器掉落在地上（推荐保留一段时间供拾取）
+		// 1. 彻底断开与死人手的骨骼绑定
+		CurrentWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 
-    	// 2. 找到武器的模型组件，激活真实的物理模拟，让它当啷掉在地上！
-    	UMeshComponent* WeaponMesh = CurrentWeapon->FindComponentByClass<UMeshComponent>();
-    	if (WeaponMesh)
-    	{
-    		// 开启碰撞，确保它能砸在地上而不是掉出世界
-    		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
-    		WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
-    		// 开启物理重力
-    		WeaponMesh->SetSimulatePhysics(true);
-    	}
+		// 2. 找到武器的模型组件，激活真实的物理模拟，让它当啷掉在地上
+		UMeshComponent* WeaponMesh = CurrentWeapon->FindComponentByClass<UMeshComponent>();
+		if (WeaponMesh)
+		{
+			// 开启碰撞，确保它能砸在地上而不是掉出世界
+			WeaponMesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+			WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
+			// 开启物理重力
+			WeaponMesh->SetSimulatePhysics(true);
+		}
 
-    	// 3. 【核心修复】：延迟销毁武器！
-    	// 立即将 CurrentWeapon 置空，防止 OnRep 触发 Attach 逻辑
-    	ABaseWeapon* WeaponToDestroy = CurrentWeapon;
-    	CurrentWeapon = nullptr;
+		// 3. 【核心修复】: 延迟销毁武器
+		// 立即将 CurrentWeapon 置空，防止 OnRep 触发 Attach 逻辑
+		ABaseWeapon* WeaponToDestroy = CurrentWeapon;
+		CurrentWeapon = nullptr;
 
-    	// 【关键时序】：武器销毁延迟必须小于 RespawnDelaySeconds（默认 3.0 秒）！
-    	// 确保武器一定在角色重生前被清理，防止新武器还没生成就处理旧武器的 OnRep。
-    	FTimerHandle WeaponDestroyTimer;
-    	GetWorldTimerManager().SetTimer(WeaponDestroyTimer, [WeaponToDestroy]()
-    	{
-    		// 使用 IsValid 检查对象是否有效（避免调用已销毁的对象）
-    		if (IsValid(WeaponToDestroy))
-    		{
-    			WeaponToDestroy->Destroy();
-    		}
-    	}, 1.0f, false);
-    }
-	
+		// 【关键时序】: 武器销毁延迟必须小于 RespawnDelaySeconds（默认 3.0 秒）
+		// 确保武器一定在角色重生前被清理，防止新武器还没生成就处理旧武器的 OnRep
+		FTimerHandle WeaponDestroyTimer;
+		GetWorldTimerManager().SetTimer(WeaponDestroyTimer, [WeaponToDestroy]()
+		{
+			// 使用 IsValid 检查对象是否有效（避免调用已销毁的对象）
+			if (IsValid(WeaponToDestroy))
+			{
+				WeaponToDestroy->Destroy();
+			}
+		}, 1.0f, false);
+	}
+
 	// 开启 10 秒倒计时
 	FTimerHandle DissolveTimerHandle;
 	GetWorldTimerManager().SetTimer(DissolveTimerHandle, this, &ABaseCharacter::StartDissolveProcess, DissolveDelay, false);
 
-	// 1. 禁用移动（禁止角色操作移动，但不能禁用 Controller 输入！）
-	// 【核心修复】：绝对不能调用 PC->DisableInput()！
-	// ESC/Tab 是 PlayerController 级别的 Enhanced Input 回调，不是 Character 级别。
-	// 调用 DisableInput 会导致玩家死亡后无法呼出 ESC 菜单和计分板！
-	// 如果需要禁用 Character 的输入，应使用 APlayerController::SetIgnoreMoveInput(true) 等更细粒度的控制。
+	// 1. 禁用移动（禁止角色操作移动，但不能禁用 Controller 输入）
+	// 【核心修复】: 绝对不能调用 PC->DisableInput()
+	// ESC/Tab 是 PlayerController 级别的 Enhanced Input 回调，不是 Character 级别
+	// 调用 DisableInput 会导致玩家死亡后无法呼出 ESC 菜单和计分板
 	GetCharacterMovement()->DisableMovement();
 
-	// 2. 核心防穿模：让胶囊体变透明，不阻挡别人走路，也不阻挡摄像机
+	// 2. 核心防穿模: 让胶囊体变透明，不阻挡别人走路，也不阻挡摄像机
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
 
@@ -1100,15 +1466,21 @@ void ABaseCharacter::Multicast_Die_Implementation()
 	GetWorldTimerManager().SetTimer(RagdollTimerHandle, this, &ABaseCharacter::EnableRagdoll, TimeToRagdoll, false);
 }
 
-// 定时器触发后，标记开始融化
+
+/**
+ * StartDissolveProcess
+ *
+ * 定时器触发后，标记开始融化
+ * 同时把武器上的材质也拽进来一起融化
+ */
 void ABaseCharacter::StartDissolveProcess()
 {
 	bStartDissolving = true;
-	
-	// 在开始融化的瞬间，去把武器上的材质也拽进来！
+
+	// 在开始融化的瞬间，去把武器上的材质也拽进来
 	if (CurrentWeapon)
 	{
-		// 泛型查找法：不管你的武器组件叫啥，直接找它身上的 Mesh 组件
+		// 泛型查找法: 不管你的武器组件叫啥，直接找它身上的 Mesh 组件
 		UMeshComponent* WeaponMesh = CurrentWeapon->FindComponentByClass<UMeshComponent>();
 		if (WeaponMesh)
 		{
@@ -1117,7 +1489,7 @@ void ABaseCharacter::StartDissolveProcess()
 				UMaterialInstanceDynamic* DynMat = WeaponMesh->CreateDynamicMaterialInstance(i);
 				if (DynMat)
 				{
-					// 塞进同一个数组里！Tick 函数不用改任何代码，就能自动带它一起融化！
+					// 塞进同一个数组里! Tick 函数不用改任何代码，就能自动带它一起融化
 					DynamicMaterials.Add(DynMat);
 				}
 			}
@@ -1125,6 +1497,14 @@ void ABaseCharacter::StartDissolveProcess()
 	}
 }
 
+
+/**
+ * EnableRagdoll
+ *
+ * 启用布娃娃物理
+ * 1. 打断所有还在播的动画
+ * 2. 将控制权完全交给物理资产
+ */
 void ABaseCharacter::EnableRagdoll()
 {
 	// 1. 打断所有还在播的动画
@@ -1135,7 +1515,17 @@ void ABaseCharacter::EnableRagdoll()
 	GetMesh()->SetSimulatePhysics(true);
 }
 
-// 实现下蹲函数
+
+// ==========================================
+// 17. 下蹲系统
+// ==========================================
+
+/**
+ * StartCrouch
+ *
+ * 实现下蹲函数
+ * 只有没死、没暂停的时候才能蹲
+ */
 void ABaseCharacter::StartCrouch()
 {
 	// 只有没死、没暂停的时候才能蹲
@@ -1145,41 +1535,69 @@ void ABaseCharacter::StartCrouch()
 	}
 }
 
+
+/**
+ * StopCrouch
+ *
+ * 解除下蹲
+ * 自带起立函数（它会自动检测头顶有没有障碍物，有的话会保持蹲着）
+ */
 void ABaseCharacter::StopCrouch()
 {
 	if (!bIsDead && !UGameplayStatics::IsGamePaused(this))
 	{
-		UnCrouch(); // 调用自带的起立函数 (它会自动检测头顶有没有障碍物，有的话会保持蹲着！)
+		UnCrouch(); // 调用自带的起立函数 (它会自动检测头顶有没有障碍物，有的话会保持蹲着)
 	}
 }
 
-// 当物理系统判定角色【真正蹲下】的瞬间触发
+
+/**
+ * OnStartCrouch
+ *
+ * 当物理系统判定角色【真正蹲下】的瞬间触发（用于平滑相机高度）
+ */
 void ABaseCharacter::OnStartCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust)
 {
 	Super::OnStartCrouch(HalfHeightAdjust, ScaledHalfHeightAdjust);
 
-	// 此时胶囊体瞬间矮了，摄像机跟着掉下去了。
-	// 我们给摄像机的 TargetOffset (目标偏移) 瞬间加上这段高度差！
-	// 这样摄像机在视觉上就仿佛停留在原处没动！
+	// 此时胶囊体瞬间矮了，摄像机跟着掉下去了
+	// 我们给摄像机的 TargetOffset (目标偏移) 瞬间加上这段高度差
+	// 这样摄像机在视觉上就仿佛停留在原处没动
 	if (CameraBoom)
 	{
 		CameraBoom->TargetOffset.Z += HalfHeightAdjust;
 	}
 }
 
-// 当物理系统判定角色【真正站起】的瞬间触发
+
+/**
+ * OnEndCrouch
+ *
+ * 当物理系统判定角色【真正站起】的瞬间触发
+ */
 void ABaseCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightAdjust)
 {
 	Super::OnEndCrouch(HalfHeightAdjust, ScaledHalfHeightAdjust);
 
-	// 此时胶囊体瞬间长高了，摄像机被瞬间顶上去了。
-	// 我们把摄像机瞬间往下拉同样的距离，抵消瞬移！
+	// 此时胶囊体瞬间长高了，摄像机被瞬间顶上去了
+	// 我们把摄像机瞬间往下拉同样的距离，抵消瞬移
 	if (CameraBoom)
 	{
 		CameraBoom->TargetOffset.Z -= HalfHeightAdjust;
 	}
 }
 
+
+// ==========================================
+// 18. 角色附身/出生
+// ==========================================
+
+/**
+ * PossessedBy
+ *
+ * 当 AI/Player 控制器附身时调用
+ * 关键: 强制刷新一次 HUD（PossessedBy 在角色出生时/复活重生时触发）
+ */
 void ABaseCharacter::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
@@ -1193,7 +1611,7 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 		}
 	}
 
-	// 【关键修复】：PossessedBy 在以下时机触发：1) 角色出生时 2) 复活重生时
+	// 【关键修复】: PossessedBy 在以下时机触发: 1) 角色出生时 2) 复活重生时
 	// 此时 CurrentHealth 已经是 MaxHealth（构造函数初始化），但 OnRep_Health 不会触发（因为值没变）
 	// 所以必须强制刷新一次 HUD（仅本地玩家需要刷新自己的 HUD）
 	if (GameHUDWidget)
@@ -1231,7 +1649,7 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 		// 设置当前角色ID（用于查找武器挂载配置）
 		CharacterID = PS->GetSelectedCharacterID();
 
-		// 【修复】：优先从 RoomGameMode 缓存读取武器ID（绕过 PlayerState 网络复制时序问题）
+		// 【修复】: 优先从 RoomGameMode 缓存读取武器ID（绕过 PlayerState 网络复制时序问题）
 		FString WeaponID = PS->GetSelectedWeapon1ID();
 		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 		{
@@ -1252,6 +1670,12 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	}
 }
 
+
+/**
+ * RetryRefreshHUD
+ *
+ * HUD 延迟刷新重试
+ */
 void ABaseCharacter::RetryRefreshHUD()
 {
 	if (!GameHUDWidget)
@@ -1283,9 +1707,16 @@ void ABaseCharacter::RetryRefreshHUD()
 	RefreshACEWithRank();
 }
 
+
+/**
+ * SpawnAndEquipWeapon
+ *
+ * 根据 WeaponID 查表并生成+装备武器
+ * 工业级规范: 指针与有效性校验贯穿全流程
+ */
 void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 {
-	// 工业级规范：指针与有效性校验
+	// 工业级规范: 指针与有效性校验
 	if (WeaponID.IsEmpty())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponID 为空，直接返回"));
@@ -1336,9 +1767,9 @@ void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 	SpawnParams.Instigator = this;
 
 	ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
-		WeaponInfo->WeaponBlueprint, 
-		GetActorLocation(), 
-		GetActorRotation(), 
+		WeaponInfo->WeaponBlueprint,
+		GetActorLocation(),
+		GetActorRotation(),
 		SpawnParams
 	);
 
@@ -1410,6 +1841,14 @@ void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 	}
 }
 
+
+/**
+ * FindWeaponAttachmentConfig
+ *
+ * 在 WeaponAttachmentDataTable 中查找挂载配置
+ * 优先返回有具体 WeaponBlueprint 配置的（精确匹配）
+ * 退而求其次，记录一个通配配置作为 fallback
+ */
 FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FString& InCharacterID, const FString& InWeaponID) const
 {
 	static const FString ContextString(TEXT("WeaponAttachmentLookup"));
@@ -1439,7 +1878,7 @@ FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FStrin
 			if (!TargetCharClass || TargetCharClass != CurrentCharacterClass) continue;
 		}
 
-		// 【关键修复】：如果数据表中配置了具体 WeaponBlueprint（硬引用），检查是否匹配
+		// 【关键修复】: 如果数据表中配置了具体 WeaponBlueprint（硬引用），检查是否匹配
 		// WeaponBlueprint 是 TSubclassOf，直接 == nullptr 判断
 		if (Config->WeaponBlueprint != nullptr && !InWeaponID.IsEmpty())
 		{
@@ -1478,9 +1917,16 @@ FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FStrin
 	return FallbackMatch;
 }
 
+
 // ==========================================
-// 计分板系统实现
+// 19. 计分板系统
 // ==========================================
+
+/**
+ * GetRoomPlayerState
+ *
+ * 获取击杀者 PlayerState（便捷转换）
+ */
 ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
 {
 	if (APlayerState* PS = GetPlayerState<APlayerState>())
@@ -1490,6 +1936,17 @@ ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
 	return nullptr;
 }
 
+
+/**
+ * Multicast_NotifyKill_Implementation
+ *
+ * NetMulticast 实现: 服务器广播击杀信息给所有客户端
+ * 1. 获取击杀者和被击杀者的名称
+ * 2. 增加击杀者的击杀数和得分
+ * 3. 向所有客户端的 HUD 广播击杀消息
+ * 4. 如果击杀者是本地玩家，触发连杀图标更新
+ * 5. 如果有助攻者，更新助攻者的数据
+ */
 void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AActor* AssistantActor)
 {
 	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] Multicast_NotifyKill: Killer=%s, Victim=%s, HasAuthority=%d"),
@@ -1559,6 +2016,18 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AA
 	}
 }
 
+
+// ==========================================
+// 20. 助攻追踪系统
+// ==========================================
+
+/**
+ * NotifyDamageDealtTo
+ *
+ * 当受到伤害时，通知可能的助攻者（供武器系统调用）
+ * 1. 记录当前时间戳
+ * 2. 在受害者的角色上记录攻击者（方便死亡时查找）
+ */
 void ABaseCharacter::NotifyDamageDealtTo(AActor* Victim)
 {
 	// 只有服务器有权记录伤害
@@ -1583,6 +2052,14 @@ void ABaseCharacter::NotifyDamageDealtTo(AActor* Victim)
 	}
 }
 
+
+/**
+ * CanGrantAssist
+ *
+ * 检查是否可以给予助攻
+ * @param PotentialAssistant 潜在助攻者
+ * @return 是否在助攻时间窗口内
+ */
 bool ABaseCharacter::CanGrantAssist(AActor* PotentialAssistant) const
 {
 	// 检查时间窗口
@@ -1595,6 +2072,15 @@ bool ABaseCharacter::CanGrantAssist(AActor* PotentialAssistant) const
 	return false;
 }
 
+
+/**
+ * GrantAssistsToEligiblePlayers
+ *
+ * 授予符合条件的玩家助攻得分
+ * 静态方法: 遍历受害者的最后攻击者记录
+ * 排除击杀者本人，检查时间窗口
+ * 更新助攻者的得分 + 广播助攻信息
+ */
 void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer)
 {
 	if (!Victim || !Killer)
@@ -1653,6 +2139,21 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 	Victim->LastHitTimestamps.Empty();
 }
 
+
+// ==========================================
+// 21. 脚步声系统
+// ==========================================
+
+/**
+ * PlayFootstepSound
+ *
+ * 播放脚步声
+ * 1. 从 CVar 读取全局音量缩放
+ * 2. 根据当前状态选择脚步声资源（蹲/跑/走）
+ * 3. 地面检测（查询物理材质）
+ * 4. 随机音高变化（更自然）
+ * 5. 在指定位置播放音效
+ */
 void ABaseCharacter::PlayFootstepSound(FVector Location)
 {
 	// 从 CVar 读取全局音量缩放
@@ -1695,7 +2196,7 @@ void ABaseCharacter::PlayFootstepSound(FVector Location)
 		return;
 	}
 
-	// 地面检测：查询物理材质，根据不同地面播放不同音效
+	// 地面检测: 查询物理材质，根据不同地面播放不同音效
 	FHitResult HitResult;
 	FVector TraceStart = Location + FVector(0.0f, 0.0f, 100.0f);
 	FVector TraceEnd = Location - FVector(0.0f, 0.0f, 150.0f);
