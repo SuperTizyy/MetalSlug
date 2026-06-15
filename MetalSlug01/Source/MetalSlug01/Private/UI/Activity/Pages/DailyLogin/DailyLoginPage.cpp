@@ -13,8 +13,8 @@
 #include "Components/CanvasPanel.h"
 
 // 核心: 引入新的 Subsystem 和 存档类
-#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Data/ActivitySaveGame.h"
+#include "Systems/Activity/ActivitySubsystem.h"
+#include "Data/ActivitySaveGame.h"
 
 #include "UI/Activity/Pages/DailyLogin/DailyLoginDayItemWidget.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"

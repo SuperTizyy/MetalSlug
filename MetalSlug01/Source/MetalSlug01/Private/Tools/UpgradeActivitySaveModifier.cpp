@@ -13,8 +13,8 @@
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
-#include "UI/Activity/Data/ActivitySaveGame.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Data/ActivitySaveGame.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 
 // ==================== 结构体实现 ====================
 

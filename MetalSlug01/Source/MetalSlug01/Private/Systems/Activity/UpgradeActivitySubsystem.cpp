@@ -13,12 +13,12 @@
  * - 重选奖励功能的数据提供
  */
 
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h" // GetGameInstance
-#include "UI/Activity/Core/ActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
 #include "Misc/DateTime.h"
 #include "Tools/UpgradeActivitySaveModifier.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口

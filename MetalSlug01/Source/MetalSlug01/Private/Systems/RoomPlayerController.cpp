@@ -37,7 +37,7 @@
 #include "Systems/GameFlowSubsystem.h"
 
 // 引入账号子系统（用于获取登录用户信息）
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
 
 // 引入 UE 静态函数库（用于 OpenLevel/SetGamePaused 等）
 #include "Kismet/GameplayStatics.h"

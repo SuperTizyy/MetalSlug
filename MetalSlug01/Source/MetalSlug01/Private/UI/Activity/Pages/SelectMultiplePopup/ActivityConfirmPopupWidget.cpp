@@ -11,8 +11,8 @@
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Data/Tables/DailyLoginTableRow.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/GameInstance.h"
 
