@@ -203,30 +203,27 @@ protected:
 	// ==========================================
 
 	/**
-	 * 【2026-06-15 新增】: HealthComponent->OnHealthChanged 事件回调
-	 * 替代原 OnRep_Health,通过事件订阅实现
+	 * HealthComponent->OnHealthChanged 事件回调
+	 * 用途: 血量变化时刷新 HUD (替代原 OnRep_Health 路径)
+	 * 调用时机:
+	 *   - 服务器: HealthComponent::ApplyDamage / Heal 内部 Broadcast
+	 *   - 客户端: HealthComponent::OnRep_CurrentHealth 内部 Broadcast
 	 */
 	UFUNCTION()
-	void HandleHealthChanged(float NewHealth);
+	void OnHealthChanged_Callback(float NewHealth);
 
 	/**
-	 * 生命值改变时的回调 (已废弃,改订阅 HealthComponent->OnHealthChanged)
-	 * 【2026-06-15 保留为过渡接口】: 通过 OnRep 旧字段转发到 Component
-	 * 实际: 我们直接绑定 HealthComponent->OnHealthChanged,不再走 OnRep_Health
-	 * 保留仅为兼容(外部不直接调用)
-	 */
-	UFUNCTION()
-	void OnRep_Health();
-
-	/**
-	 * 【2026-06-15 保留】: 服务器主动通知所属客户端刷新血量
-	 * Client RPC,内部改为读 HealthComponent
+	 * 服务器主动通知所属客户端刷新血量 (已废弃)
+	 * 【2026-06-15 废弃】: 改用 HealthComponent->OnHealthChanged 事件, 由 OnHealthChanged_Callback 处理
+	 * 保留声明仅为避免 UHT 报错
 	 */
 	UFUNCTION(Client, Reliable)
 	void Client_UpdateHealthDisplay(float Current, float Max);
 
 	/**
-	 * 【核心修复】: 服务器主动通知所属客户端刷新能量条
+	 * 服务器主动通知所属客户端刷新能量条 (已废弃)
+	 * 【2026-06-15 废弃】: 改用 EnergyComponent->OnEnergyChanged 事件
+	 * 保留声明仅为避免 UHT 报错
 	 */
 	UFUNCTION(Client, Reliable)
 	void Client_UpdateEnergyDisplay(float Current, float Max);
