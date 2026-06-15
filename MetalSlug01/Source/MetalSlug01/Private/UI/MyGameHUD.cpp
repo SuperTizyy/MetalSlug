@@ -9,6 +9,9 @@
 // 引入 UE UserWidget 基类
 #include "Blueprint/UserWidget.h"
 
+// 引入统一日志通道
+#include "Logs/MetalSlugLogChannels.h"
+
 // 引入 GameFlowSubsystem（用于订阅状态变化）
 #include "Systems/GameFlowSubsystem.h"
 
@@ -66,7 +69,7 @@ void AMyGameHUD::CreateGameHUD()
 	APlayerController* PC = GetOwningPlayerController();
 	if (!PC)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[MyGameHUD] 严重错误: 未获取到本地 PlayerController！"));
+		UE_LOG(LogUI, Error, TEXT("[MyGameHUD] 严重错误: 未获取到本地 PlayerController！"));
 		return;
 	}
 
@@ -82,7 +85,7 @@ void AMyGameHUD::CreateGameHUD()
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] GameHUDWidgetClass 蓝图中未配置！"));
+		UE_LOG(LogUI, Warning, TEXT("[MyGameHUD] GameHUDWidgetClass 蓝图中未配置！"));
 	}
 }
 
@@ -123,13 +126,13 @@ void AMyGameHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
  */
 void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 {
-	UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] OnGameFlowStateChanged called: NewState=%d"), (int32)NewState);
+	UE_LOG(LogGameFlow, Log, TEXT("[MyGameHUD] OnGameFlowStateChanged called: NewState=%d"), (int32)NewState);
 
 	if (NewState == EMatchState::Battleing)
 	{
 		if (GameHUDWidget)
 		{
-			UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] Setting HUD visible..."));
+			UE_LOG(LogUI, Log, TEXT("[MyGameHUD] Setting HUD visible..."));
 
 			// 规范: 使用 SelfHitTestInvisible，允许自身的按钮点击（如果有），但无视背景
 			GameHUDWidget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
@@ -147,12 +150,12 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 				}
 				else
 				{
-					UE_LOG(LogTemp, Warning, TEXT("[MyGameHUD] RoomGameState is NULL when refreshing HUD!"));
+					UE_LOG(LogUI, Warning, TEXT("[MyGameHUD] RoomGameState is NULL when refreshing HUD!"));
 				}
 			}
 		}
 
-		UE_LOG(LogTemp, Log, TEXT("[MyGameHUD] 切换至战斗UI，成功展示主HUD与准星"));
+		UE_LOG(LogUI, Log, TEXT("[MyGameHUD] 切换至战斗UI, 成功展示主HUD与准星"));
 	}
 	else
 	{

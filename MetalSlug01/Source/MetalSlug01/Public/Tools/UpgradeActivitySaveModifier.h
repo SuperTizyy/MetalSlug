@@ -33,6 +33,7 @@
 #include "GameFramework/SaveGame.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 #include "Kismet/GameplayStatics.h"
+#include "Tools/ActivitySaveModifierBase.h" // 改造: 共享基类
 #include "UpgradeActivitySaveModifier.generated.h"
 
 // ==================== 常量定义 ====================
@@ -47,11 +48,10 @@ constexpr int32 MAX_TASK_COUNT = 10;
  * @brief 升级活动存档动态修改器
  * @details 提供运行时修改UpgradeActivitySaveGame数据的功能
  *          与UpgradeActivitySubsystem解耦，专注于数据修改和持久化
+ * @note 改造: 继承自 UActivitySaveModifierBase 共享 WorldContext/CachedSaveGame/历史记录
  */
-
-
 UCLASS()
-class METALSLUG01_API UUpgradeActivitySaveModifier : public UObject
+class METALSLUG01_API UUpgradeActivitySaveModifier : public UActivitySaveModifierBase
 {
 	GENERATED_BODY()
 
@@ -77,6 +77,14 @@ public:
 	 * @brief 构造函数
 	 */
 	UUpgradeActivitySaveModifier();
+
+	// ==================== 基类接口实现 ====================
+
+	/** Slot 名固定 UpgradeReward_SaveSlot (与 UpgradeActivitySubsystem 共用) */
+	virtual FString GetSaveSlotName(int32 /*ActivityID*/) const
+	{
+		return TEXT("UpgradeReward_SaveSlot");
+	}
 
 	// ==================== 数据修改接口 ====================
 
@@ -242,11 +250,9 @@ public:
 
 private:
 	// ==================== 内部数据 ====================
-	
-	/** 世界上下文对象 */
-	UPROPERTY()
-	TWeakObjectPtr<UObject> WorldContextObject;
-	
+	// 【2026-06-15 重构】: WorldContextObject / CachedSaveGame / bIsInitialized 已提升到基类
+	// 子类不再重复声明, 直接通过基类访问器 (IsInitialized() / GetWorldContext()) 使用
+
 	// ==================== 调试辅助函数 ====================
 		
 	/**
@@ -302,21 +308,16 @@ private:
 	 */
 	void InitializeNewRecord(FUpgradeRewardSaveRecord& Record, int32 RecordDate);
 
-	/** 缓存的存档实例 */
-	UPROPERTY()
-	UDailyLoginSaveGame* CachedSaveGame;
-
-	/** 目标Subsystem引用 */
+	/** 目标Subsystem引用 (子类特有, 保留) */
 	UPROPERTY()
 	class UUpgradeActivitySubsystem* TargetSubsystem;
 
 
-
-	/** 是否已初始化 */
-	bool bIsInitialized;
-	
-	/** 是否有待处理的更改（需要在游戏关闭时保存） */
-	bool bHasPendingChanges;
+	/**
+	 * 是否有待处理的更改 (需要在游戏关闭时保存)
+	 * 【2026-06-15 重构】: 保留为子类特有字段 (Base 没有"待保存"语义)
+	 */
+	bool bHasPendingChanges = false;
 
 	// ==================== 内部方法 ====================
 	

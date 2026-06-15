@@ -1,8 +1,8 @@
 ﻿#include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
+#include "Data/FActivityDataTableService.h" // 活动表统一加载入口 (替代硬编码路径)
 // 必须在 .cpp 引入完整定义: 前向声明无法用于 IsValid(Page) 的类型转换和 Page->GetName() 调用
 // 仅在 .h 中前向声明是为了避免循环头文件依赖, .cpp 是真正使用类型的地方
 #include "UI/Activity/Pages/DailyLogin/DailyLoginPage.h"
@@ -13,7 +13,6 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	// ================= 初始化管理器 =================
 	RedDotManager = NewObject<URedDotManager>(this);
-	ActivityTimeManager = NewObject<UActivityTimeManager>(this);
 
 	// ================= 初始化动态存档修改器 =================
 	SaveModifier = NewObject<UDailyLoginSaveModifier>(this);
@@ -27,7 +26,6 @@ void UActivitySubsystem::Deinitialize()
 {
 	// Subsystem 销毁时，管理器会随 GC 自动回收
 	RedDotManager = nullptr;
-	ActivityTimeManager = nullptr;
 
 	// 清理动态存档修改器
 	if (SaveModifier)
@@ -95,25 +93,19 @@ URedDotManager* UActivitySubsystem::GetRedDotManager() const
 	return RedDotManager;
 }
 
-UActivityTimeManager* UActivitySubsystem::GetActivityTimeManager() const
-{
-	return ActivityTimeManager;
-}
-
 TArray<const FActivityInfoRow*> UActivitySubsystem::GetAllNavItems() const
 {
-	// 直接从DataTable加载所有活动信息
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
-	
+	// 改造: 通过 FActivityDataTableService 统一加载, 避免硬编码路径
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+
 	TArray<const FActivityInfoRow*> Result;
-	
+
 	if (ActivityInfoTable)
 	{
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FActivityInfoRow*> AllRows;
 		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-		
+
 		for (FActivityInfoRow* Row : AllRows)
 		{
 			if (Row)
@@ -122,22 +114,21 @@ TArray<const FActivityInfoRow*> UActivitySubsystem::GetAllNavItems() const
 			}
 		}
 	}
-	
+
 	return Result;
 }
 
 const FActivityInfoRow* UActivitySubsystem::GetActivityInfo(int32 ActivityID) const
 {
-	// 从DataTable查找指定ActivityID的信息
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
-	
+	// 改造: 通过 FActivityDataTableService 统一加载
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+
 	if (ActivityInfoTable)
 	{
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FActivityInfoRow*> AllRows;
 		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-		
+
 		for (FActivityInfoRow* Row : AllRows)
 		{
 			if (Row && Row->ActivityID == ActivityID)
@@ -146,7 +137,7 @@ const FActivityInfoRow* UActivitySubsystem::GetActivityInfo(int32 ActivityID) co
 			}
 		}
 	}
-	
+
 	return nullptr;
 }
 
@@ -214,85 +205,51 @@ void UActivitySubsystem::SavePlayerRecord(int32 ActivityID)
 
 TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetDailyLoginConfigs(int32 ActivityID) const
 {
-	// 从DailyLoginConfig表加载指定ActivityID的所有配置
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow");
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-	
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyLoginConfig);
+
 	TArray<FDailyLoginConfigRow*> Result;
-	
+
 	if (ConfigTable)
 	{
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FDailyLoginConfigRow*> AllRows;
 		ConfigTable->GetAllRows<FDailyLoginConfigRow>(ContextString, AllRows);
-		
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: GetDailyLoginConfigs called with ActivityID=%d"), ActivityID);
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: Found %d total rows in DT_DailyLoginConfig"), AllRows.Num());
-		
+
 		for (FDailyLoginConfigRow* Row : AllRows)
 		{
-			if (Row)
+			if (Row && Row->ActivityID == ActivityID)
 			{
-				UE_LOG(LogTemp, Log, TEXT("Config Row: ActivityID=%d, DayIndex=%d, RewardItemID=%d"), 
-					Row->ActivityID, Row->DayIndex, Row->RewardItemID);
-				
-				if (Row->ActivityID == ActivityID)
-				{
-					Result.Add(Row);
-				}
+				Result.Add(Row);
 			}
 		}
-		
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: Returning %d config rows for ActivityID=%d"), Result.Num(), ActivityID);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: Failed to load DT_DailyLoginConfig for GetDailyLoginConfigs"));
-	}
-	
+
 	return Result;
 }
 
 TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetRewardsByDay(int32 ActivityID, int32 Day) const
 {
-	// 从DailyLoginConfig表加载指定ActivityID和DayIndex的奖励配置
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_DailyLoginConfigRow");
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-	
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyLoginConfig);
+
 	TArray<FDailyLoginConfigRow*> Result;
-	
+
 	if (ConfigTable)
 	{
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FDailyLoginConfigRow*> AllRows;
 		ConfigTable->GetAllRows<FDailyLoginConfigRow>(ContextString, AllRows);
-		
-		// 调试日志：输出所有行的信息
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: GetRewardsByDay called with ActivityID=%d, Day=%d"), ActivityID, Day);
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: Found %d rows in DT_DailyLoginConfig"), AllRows.Num());
-		
+
 		for (FDailyLoginConfigRow* Row : AllRows)
 		{
-			if (Row)
+			if (Row && Row->ActivityID == ActivityID && Row->DayIndex == Day)
 			{
-				UE_LOG(LogTemp, Log, TEXT("Row: ActivityID=%d, DayIndex=%d, RewardItemID=%d"), 
-					Row->ActivityID, Row->DayIndex, Row->RewardItemID);
-				
-				if (Row->ActivityID == ActivityID && Row->DayIndex == Day)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: Found matching row for ActivityID=%d, Day=%d"), ActivityID, Day);
-					Result.Add(Row);
-				}
+				Result.Add(Row);
 			}
 		}
-		
-		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: Returning %d reward rows"), Result.Num());
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("ActivitySubsystem: Failed to load DT_DailyLoginConfig from path: %s"), *ConfigPath);
-	}
-	
+
 	return Result;
 }
 
@@ -389,144 +346,74 @@ bool UActivitySubsystem::TryClaimMultipleRewards(int32 ActivityID, const TArray<
 
 const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 {
-	// 从DT_ItemDetailRow表加载指定ItemID的物品详情
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_ItemDetailRow");
-	UE_LOG(LogTemp, Warning, TEXT("🔍 GetItemDetail: 尝试加载路径 %s"), *ConfigPath);
-	
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-	
+	// 改造: 走 FActivityDataTableService (替代硬编码路径)
+	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::ItemDetail);
+
 	if (ConfigTable)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载DT_ItemDetailRow DataTable"));
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FItemDetailRow*> AllRows;
 		ConfigTable->GetAllRows<FItemDetailRow>(ContextString, AllRows);
-		
-		UE_LOG(LogTemp, Warning, TEXT("📊 DataTable包含 %d 条记录"), AllRows.Num());
-		
+
 		for (FItemDetailRow* Row : AllRows)
 		{
-			if (Row)
+			if (Row && Row->ItemID == ItemID)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("📋 记录: ItemID=%d, Name=%s"), Row->ItemID, *Row->ItemName.ToString());
-				UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsValid: %s"), Row->ItemIcon.IsValid() ? TEXT("是") : TEXT("否"));
-				UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsNull: %s"), Row->ItemIcon.IsNull() ? TEXT("是") : TEXT("否"));
-				UE_LOG(LogTemp, Warning, TEXT("   ItemIcon IsPending: %s"), Row->ItemIcon.IsPending() ? TEXT("是") : TEXT("否"));
-				
-				if (Row->ItemID == ItemID)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的ItemID: %d"), ItemID);
-					UE_LOG(LogTemp, Warning, TEXT("   匹配记录的ItemIcon状态:"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsValid: %s"), Row->ItemIcon.IsValid() ? TEXT("是") : TEXT("否"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsNull: %s"), Row->ItemIcon.IsNull() ? TEXT("是") : TEXT("否"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsPending: %s"), Row->ItemIcon.IsPending() ? TEXT("是") : TEXT("否"));
-					return Row;
-				}
+				return Row;
 			}
 		}
-		
-		UE_LOG(LogTemp, Warning, TEXT("❌ 未找到ItemID: %d 的记录"), ItemID);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载ItemDetail DataTable: %s"), *ConfigPath);
-	}
-	
+
 	return nullptr;
 }
 
 const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) const
 {
-	// 从TreasureBoxItemRow表加载指定BoxID的宝箱物品配置
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow");
-	UE_LOG(LogTemp, Warning, TEXT("🔍 GetTreasureBoxItem: 尝试加载路径 %s"), *ConfigPath);
-	
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-	
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::TreasureBoxItem);
+
 	if (ConfigTable)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载DT_TreasureBoxItemRow DataTable"));
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TArray<FTreasureBoxItemRow*> AllRows;
 		ConfigTable->GetAllRows<FTreasureBoxItemRow>(ContextString, AllRows);
-		
-		UE_LOG(LogTemp, Warning, TEXT("📊 TreasureBox DataTable包含 %d 条记录"), AllRows.Num());
-		
+
 		for (FTreasureBoxItemRow* Row : AllRows)
 		{
-			if (Row)
+			if (Row && Row->BoxID == BoxID)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("📋 宝箱记录: BoxID=%d, ItemID=%d"), Row->BoxID, Row->ItemID);
-				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsValid: %s"), Row->BoxIcon.IsValid() ? TEXT("是") : TEXT("否"));
-				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsNull: %s"), Row->BoxIcon.IsNull() ? TEXT("是") : TEXT("否"));
-				UE_LOG(LogTemp, Warning, TEXT("   BoxIcon IsPending: %s"), Row->BoxIcon.IsPending() ? TEXT("是") : TEXT("否"));
-				
-				if (Row->BoxID == BoxID)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的BoxID: %d"), BoxID);
-					UE_LOG(LogTemp, Warning, TEXT("   匹配记录的BoxIcon状态:"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsValid: %s"), Row->BoxIcon.IsValid() ? TEXT("是") : TEXT("否"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsNull: %s"), Row->BoxIcon.IsNull() ? TEXT("是") : TEXT("否"));
-					UE_LOG(LogTemp, Warning, TEXT("   IsPending: %s"), Row->BoxIcon.IsPending() ? TEXT("是") : TEXT("否"));
-					return Row;
-				}
+				return Row;
 			}
 		}
-		
-		UE_LOG(LogTemp, Warning, TEXT("❌ 未找到BoxID: %d 的记录"), BoxID);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载TreasureBoxItem DataTable: %s"), *ConfigPath);
-	}
-	
+
 	return nullptr;
 }
 
 TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxID(int32 BoxID) const
 {
-	// 从TreasureBoxItemRow表加载指定BoxID的所有宝箱物品配置
-	FString ConfigPath = TEXT("/Game/UI/Activity/Data/DT_TreasureBoxItemRow");
-	UE_LOG(LogTemp, Warning, TEXT("🔍 GetTreasureBoxItemsByBoxID: 尝试加载路径 %s"), *ConfigPath);
-	
-	UDataTable* ConfigTable = LoadObject<UDataTable>(nullptr, *ConfigPath);
-	
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::TreasureBoxItem);
+
 	TArray<const FTreasureBoxItemRow*> Result;
-	
+
 	if (ConfigTable)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("✅ 成功加载DT_TreasureBoxItemRow DataTable"));
 		static const FString ContextString(TEXT("ActivitySubsystem"));
 		TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
-		
-		UE_LOG(LogTemp, Warning, TEXT("📊 TreasureBox DataTable包含 %d 条记录"), RowMap.Num());
-		
+
 		for (const auto& Pair : RowMap)
 		{
 			const FTreasureBoxItemRow* Row = reinterpret_cast<const FTreasureBoxItemRow*>(Pair.Value);
-			if (Row)
+			if (Row && Row->BoxID == BoxID)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("📋 宝箱记录: BoxID=%d, ItemID=%d"), Row->BoxID, Row->ItemID);
-				
-				if (Row->BoxID == BoxID)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("✅ 找到匹配的BoxID: %d, ItemID: %d"), BoxID, Row->ItemID);
-					Result.Add(Row);
-				}
+				Result.Add(Row);
 			}
 		}
-		
-		UE_LOG(LogTemp, Warning, TEXT("📦 找到 %d 个BoxID=%d的宝箱物品记录"), Result.Num(), BoxID);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ 无法加载TreasureBoxItem DataTable: %s"), *ConfigPath);
-	}
-	
+
 	return Result;
 }
-
-// ==================== 动态存档修改器接口实现 ====================
 
 // ==================== 动态存档修改器接口实现 ====================
 

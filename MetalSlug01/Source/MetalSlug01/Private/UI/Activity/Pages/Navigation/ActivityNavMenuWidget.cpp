@@ -15,6 +15,7 @@
 #include "Components/CanvasPanelSlot.h"
 #include "Engine/Texture2D.h"
 #include "Blueprint/UserWidget.h"
+#include "Data/FActivityDataTableService.h" // 活动表统一加载入口
 
 
 // ==========================================
@@ -260,8 +261,8 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 		NavButtonWidget->SetVisibility(ESlateVisibility::Visible);
 
 		// 从 DataTable 获取完整的活动信息
-		FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-		UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+		// 改造: 走 FActivityDataTableService, 避免硬编码路径
+		UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 		// 初始化显示标题和图标
 		FText DisplayTitle = FText::GetEmpty();
@@ -674,8 +675,8 @@ void UActivityNavMenuWidget::LoadNavItemsFromDataTable()
 	// 从数据表直接加载导航项数据
 
 	// 先尝试直接加载 DataTable
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+	// 改造: 走 FActivityDataTableService, 避免硬编码路径
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 	if (!ActivityInfoTable)
 	{
@@ -738,8 +739,8 @@ void UActivityNavMenuWidget::LoadAllActivityItemsFromDataTable()
 	// 从数据表加载所有活动项，而不仅仅是导航项
 
 	// 直接加载 DataTable
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 	if (!ActivityInfoTable)
 	{
@@ -798,8 +799,8 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 	// 根据活动 ID 从 DataTable 获取活动的显示名称
 
 	// 加载活动信息数据表
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 	if (ActivityInfoTable)
 	{
@@ -853,8 +854,8 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 FName UActivityNavMenuWidget::GetDefaultSelectedActivityId()
 {
 	// 从 DataTable 中查找设置了 bIsDefaultSelected=true 的活动，返回其活动 ID
-	FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-	UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+	// 改造: 走 FActivityDataTableService
+	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 	if (ActivityInfoTable)
 	{
@@ -1010,8 +1011,8 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 	if (!TargetPage)
 	{
 		// 直接从 DataTable 加载活动配置，获取 TargetPageClass
-		FString InfoPath = TEXT("/Game/UI/Activity/Data/DT_ActivityInfoRow");
-		UDataTable* ActivityInfoTable = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *InfoPath));
+		// 改造: 走 FActivityDataTableService
+		UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
 		if (!ActivityInfoTable)
 		{

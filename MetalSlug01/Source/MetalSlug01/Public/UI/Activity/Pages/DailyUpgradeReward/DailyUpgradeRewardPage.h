@@ -61,6 +61,18 @@ class METALSLUG01_API UDailyUpgradeRewardPage : public UUserWidget
 
 public:
 	// ==========================================
+	// 0. ViewModel (改造: 数据访问从 Page 抽离)
+	// ==========================================
+
+	/**
+	 * 访问 Page 持有的 ViewModel (蓝图可用)
+	 * @return ViewModel 实例; 未 Bind 时返回 nullptr
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "DailyUpgrade")
+	class UDailyUpgradeRewardViewModel* GetViewModel() const { return ViewModel; }
+
+public:
+	// ==========================================
 	// 1. 生命周期
 	// ==========================================
 
@@ -106,6 +118,15 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|UI")
 	void RefreshDailyTaskHighlights();
+
+protected:
+	// ==========================================
+	// 3.5 ViewModel 实例 (改造: 数据访问从 Page 抽离)
+	// ==========================================
+
+	/** ViewModel, 持有后由 Page 通过 GetViewModel() 访问 */
+	UPROPERTY(BlueprintReadOnly, Category = "DailyUpgradeReward")
+	TObjectPtr<UDailyUpgradeRewardViewModel> ViewModel = nullptr;
 
 protected:
 	// ==========================================

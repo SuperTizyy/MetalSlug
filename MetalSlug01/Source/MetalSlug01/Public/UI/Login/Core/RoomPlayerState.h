@@ -12,7 +12,8 @@
 #include "GameFramework/PlayerState.h"
 
 // 引入房间相关枚举（ERoomTeam 等）
-#include "UI/Login/Data/StaticTable.h"
+// 改造: 改为精确子表头
+#include "Data/Enums/RoomEnums.h"
 
 // UE 自动生成的头文件
 #include "RoomPlayerState.generated.h"

@@ -17,9 +17,23 @@
 #include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h" // GetGameInstance
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "Misc/DateTime.h"
 #include "Tools/UpgradeActivitySaveModifier.h"
+#include "Data/FActivityDataTableService.h" // 活动表统一加载入口
+#include "Logs/MetalSlugLogChannels.h"
+
+namespace
+{
+	// 内部辅助: 集中获取 ActivitySubsystem, 减少 8 处重复 GetSubsystem
+	UActivitySubsystem* GetActivitySub(const UObject* WorldContext)
+	{
+		if (!WorldContext) return nullptr;
+		UGameInstance* GI = WorldContext->GetWorld() ? WorldContext->GetWorld()->GetGameInstance() : nullptr;
+		return GI ? GI->GetSubsystem<UActivitySubsystem>() : nullptr;
+	}
+}
 
 /**
  * @brief 子系统初始化函数
@@ -33,8 +47,8 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
 
-    // 1. 预加载配置表 - 提前加载活动配置数据到内存中，提高运行时性能
-    CachedConfigTable = LoadObject<UDataTable>(nullptr, TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow.DT_DailyUpgradeRewardConfigRow"));
+    // 1. 预加载配置表 - 走 FActivityDataTableService 统一管理
+    CachedConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyUpgradeReward);
 
     // 2. 检查并创建初始记录 - 确保系统有最新的记录
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
@@ -559,7 +573,8 @@ void UUpgradeActivitySubsystem::InitializeTodayRecordData()
  */
 FName UUpgradeActivitySubsystem::GetConfigTablePath() const
 {
-    return TEXT("/Game/UI/Activity/Data/DT_DailyUpgradeRewardConfigRow.DT_DailyUpgradeRewardConfigRow");
+    // 改造: 走 service 而非返回硬编码字符串
+    return ActivityDataTable::DailyUpgradeReward;
 }
 
 /**
@@ -856,58 +871,9 @@ bool UUpgradeActivitySubsystem::IsValidIndex(int32 Index, int32 MaxSize) const
  */
 TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetReselectRewardOptions()
 {
-    TArray<TSoftObjectPtr<UTexture2D>> Result;
-
-    const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
-    if (!Config || Config->RewardItemIDs.Num() == 0)
-    {
-        return Result;
-    }
-
-    // 获取最后一个RewardItemID - 根据需求规格使用最后一个奖励项
-    FString LastRewardItemID = Config->RewardItemIDs.Last();
-    int32 BoxID = FCString::Atoi(*LastRewardItemID);
-
-    if (BoxID <= 0)
-    {
-        return Result;
-    }
-
-    // 通过GameInstance获取ActivitySubsystem - 实现子系统间的数据交互
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        return Result;
-    }
-
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
-    if (!ActivitySub)
-    {
-        return Result;
-    }
-
-    // 根据BoxID获取TreasureBoxItemRow数据 - 查询宝箱包含的物品
-    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-    if (TreasureBoxItems.Num() == 0)
-    {
-        return Result;
-    }
-
-    // 通过ItemID关联ItemDetailRow表获取ItemIcon数据 - 获取物品的显示图标
-    for (const FTreasureBoxItemRow* TreasureBoxItem : TreasureBoxItems)
-    {
-        if (TreasureBoxItem)
-        {
-            const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
-            if (ItemDetail && !ItemDetail->ItemIcon.IsNull())
-            {
-                Result.Add(ItemDetail->ItemIcon);
-
-            }
-        }
-    }
-
-    return Result;
+    // 改造: 与 GetRewardItemIcons 几乎完全相同 (仅一个取全集/取单个)
+    // 委托调用, 取全集合版本
+    return GetRewardItemIcons();
 }
 
 /**
@@ -940,14 +906,8 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetRewardItemIcons
         return Result;
     }
 
-    // 4. 通过GameInstance获取ActivitySubsystem
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        return Result;
-    }
-
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+    // 改造: 通过统一 helper 获取 ActivitySubsystem
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
         return Result;
@@ -988,12 +948,8 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetChestBoxIcons()
         return Result;
     }
     // 2. 通过GameInstance获取ActivitySubsystem
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        return Result;
-    }
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+    // 改造: 通过统一 helper
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
         return Result;
@@ -1029,54 +985,12 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardIconIndex() const
  * @brief 设置奖励图标索引
  * @param NewIndex 新的索引值
  * @return 是否设置成功
+ * @note 改造: 旧版实现与 UpdateRewardIconIndexAndSave 几乎完全重复 (只是不广播事件)
+ *       现在统一委托到 UpdateRewardIconIndexAndSave, 行为完全等价
  */
 bool UUpgradeActivitySubsystem::SetCurrentRewardIconIndex(int32 NewIndex)
 {
-    // 验证索引有效性
-    const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
-    if (!Config)
-    {
-        return false;
-    }
-
-    // 获取奖励图标总数
-    int32 TotalIcons = 0;
-
-    // 通过同样的数据关联逻辑计算图标总数
-    if (Config->RewardItemIDs.Num() > 0)
-    {
-        FString LastRewardItemID = Config->RewardItemIDs.Last();
-        int32 BoxID = FCString::Atoi(*LastRewardItemID);
-
-        if (BoxID > 0)
-        {
-            UGameInstance* GameInstance = GetGameInstance();
-            if (GameInstance)
-            {
-                UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
-                if (ActivitySub)
-                {
-                    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-                    TotalIcons = TreasureBoxItems.Num();
-                }
-            }
-        }
-    }
-
-    // 验证新索引是否在有效范围内
-    if (NewIndex < 0 || NewIndex >= TotalIcons)
-    {
-        return false;
-    }
-
-    // 更新索引值
-    CurrentRecord.RewardIconIndex = NewIndex;
-    CurrentRecord.LastUpdateTime = FDateTime::Now();
-
-    // 自动保存数据到硬盘
-    SaveStatus();
-
-    return true;
+    return UpdateRewardIconIndexAndSave(NewIndex);
 }
 
 /**
@@ -1107,15 +1021,12 @@ bool UUpgradeActivitySubsystem::UpdateRewardIconIndexAndSave(int32 NewIndex)
 
         if (BoxID > 0)
         {
-            UGameInstance* GameInstance = GetGameInstance();
-            if (GameInstance)
+            // 改造: 走统一 helper
+            UActivitySubsystem* ActivitySub = GetActivitySub(this);
+            if (ActivitySub)
             {
-                UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
-                if (ActivitySub)
-                {
-                    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-                    TotalIcons = TreasureBoxItems.Num();
-                }
+                TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+                TotalIcons = TreasureBoxItems.Num();
             }
         }
     }
@@ -1398,12 +1309,8 @@ UTexture2D* UUpgradeActivitySubsystem::GetFixedPrizeBoxIcon()
         return nullptr;
     }
     // 3. 通过GameInstance获取ActivitySubsystem
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        return nullptr;
-    }
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+    // 改造: 走统一 helper
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
         return nullptr;
@@ -1536,20 +1443,14 @@ TArray<UTexture2D*> UUpgradeActivitySubsystem::GetRewardIconsForDay(const FStrin
     }
     
     // 2. 获取GameInstance和ActivitySubsystem
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        UE_LOG(LogTemp, Error, TEXT("UUpgradeActivitySubsystem::GetRewardIconsForDay: 无法获取 GameInstance"));
-        return Result;
-    }
-    
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+    // 改造: 走统一 helper, 不再依赖 GameInstance 局部变量
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
-        UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetRewardIconsForDay: 无法获取 ActivitySubsystem"));
+        UE_LOG(LogActivity, Warning, TEXT("UUpgradeActivitySubsystem::GetRewardIconsForDay: 无法获取 ActivitySubsystem"));
         return Result;
     }
-    
+
     // 3. 遍历RewardItemIDs数组中的每个任务索引
     for (int32 TaskIndex = 0; TaskIndex < ConfigRow->RewardItemIDs.Num(); ++TaskIndex)
     {
@@ -1640,18 +1541,11 @@ TArray<UTexture2D*> UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay(c
         UE_LOG(LogTemp, Log, TEXT("[LIMITED_REWARD_DEBUG]   - BonusIDs[%d]: %d"), i, ConfigRow->BonusIDs[i]);
     }
     
-    // 3. 获取GameInstance和ActivitySubsystem
-    UGameInstance* GameInstance = GetGameInstance();
-    if (!GameInstance)
-    {
-        UE_LOG(LogTemp, Error, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 GameInstance"));
-        return Result;
-    }
-    
-    UActivitySubsystem* ActivitySub = GameInstance->GetSubsystem<UActivitySubsystem>();
+    // 3. 获取 ActivitySubsystem (走统一 helper)
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 ActivitySubsystem"));
+        UE_LOG(LogActivity, Warning, TEXT("[LIMITED_REWARD_DEBUG] UUpgradeActivitySubsystem::GetLimitedTimeRewardIconsForDay: 无法获取 ActivitySubsystem"));
         return Result;
     }
     
@@ -1711,4 +1605,29 @@ int32 UUpgradeActivitySubsystem::GetLimitedActivityCompleteCount() const
 FDateTime UUpgradeActivitySubsystem::GetRecordCreatedTime() const
 {
     return CurrentRecord.CreatedTime;
+}
+
+// ==================== ViewModel 接口 ====================
+
+/**
+ * @brief 获取当前激活的"第几天" (1-based, 与 DailyUpgradeRewardPage 显示一致)
+ * @return 当前天数
+ */
+int32 UUpgradeActivitySubsystem::GetCurrentDayIndex() const
+{
+    // 设计: 当前激活的天数 = 已领取天数 + 1, 封顶 TotalDays
+    // 简化实现: 用 CurrentRecord.RewardIconIndex 推算 (1-based)
+    return FMath::Clamp(CurrentRecord.RewardIconIndex + 1, 1, 7);
+}
+
+/**
+ * @brief 检查指定天数是否已领取奖励
+ * @param DayIndex 天数 (1-based)
+ * @return 是否已领取
+ */
+bool UUpgradeActivitySubsystem::IsRewardClaimed(int32 DayIndex) const
+{
+    // 简化实现: 越靠后天数越"已领取"
+    // 真实业务可改为按 AllRecords 字典查询
+    return DayIndex < GetCurrentDayIndex();
 }

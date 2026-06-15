@@ -20,28 +20,23 @@
 // ==================== 主类实现 ====================
 
 UDailyLoginSaveModifier::UDailyLoginSaveModifier()
-	: CachedSaveGame(nullptr), bIsInitialized(false)
+	: Super()
 {
+	// 父类已初始化 CachedSaveGame=nullptr, IsInitialized()=false
 }
 
 bool UDailyLoginSaveModifier::InitializeModifier(UObject* WorldContext)
 {
-	if (!WorldContext)
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: WorldContext为空"));
-		return false;
-	}
-
-	WorldContextObject = WorldContext;
-	bIsInitialized = true;
-
-	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 初始化成功"));
-	return true;
+	// 【2026-06-15 修复】: 委托给基类 (基类会实际赋值 WorldContext 并置 IsInitialized()=true)
+	// 修复前: 这里只调了基类, 但基类没有赋值, 导致 IsInitialized() 永远 = false
+	return Super::InitializeBase(WorldContext);
 }
 
 void UDailyLoginSaveModifier::DestroyModifier()
 {
-	if (!bIsInitialized)
+	// 【2026-06-15 修复】: 用基类 IsInitialized() (字段已提升)
+	// 修复前: 永远触发, 无法释放
+	if (!IsInitialized())
 	{
 		return;
 	}
@@ -49,17 +44,15 @@ void UDailyLoginSaveModifier::DestroyModifier()
 	// 保存所有未保存的修改
 	SaveAllRecords();
 
-	// 清理资源
-	CachedSaveGame = nullptr;
-	WorldContextObject.Reset();
-	bIsInitialized = false;
+	// 委托给基类清理 (基类负责重置 IsInitialized()=false)
+	Super::DestroyBase();
 
-	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 已销毁"));
+	UE_LOG(LogAccount, Log, TEXT("[DailyLoginSaveModifier] 已销毁"));
 }
 
 bool UDailyLoginSaveModifier::ModifyPlayerProgress(int32 ActivityID, int32 NewProgress, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
 		return false;
@@ -98,7 +91,7 @@ bool UDailyLoginSaveModifier::ModifyPlayerProgress(int32 ActivityID, int32 NewPr
 
 bool UDailyLoginSaveModifier::ModifyDayClaimedStatus(int32 ActivityID, int32 DayIndex, bool bClaimed, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
 		return false;
@@ -168,7 +161,7 @@ bool UDailyLoginSaveModifier::ModifyDayClaimedStatus(int32 ActivityID, int32 Day
 
 bool UDailyLoginSaveModifier::ModifyClaimedDays(int32 ActivityID, const TArray<int32>& ClaimedDays, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
 		return false;
@@ -228,7 +221,7 @@ bool UDailyLoginSaveModifier::ModifyClaimedDays(int32 ActivityID, const TArray<i
 
 bool UDailyLoginSaveModifier::ModifyCurrentClaimCount(int32 ActivityID, int32 NewCount, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
 		return false;
@@ -267,7 +260,7 @@ bool UDailyLoginSaveModifier::ModifyCurrentClaimCount(int32 ActivityID, int32 Ne
 
 bool UDailyLoginSaveModifier::ResetPlayerRecord(int32 ActivityID, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 修改器未初始化"));
 		return false;
@@ -310,7 +303,7 @@ bool UDailyLoginSaveModifier::ResetPlayerRecord(int32 ActivityID, bool bAutoSave
 
 int32 UDailyLoginSaveModifier::GetPlayerProgress(int32 ActivityID) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return 0;
 	}
@@ -328,7 +321,7 @@ TArray<int32> UDailyLoginSaveModifier::GetClaimedDays(int32 ActivityID) const
 {
 	TArray<int32> Result;
 
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return Result;
 	}
@@ -344,7 +337,7 @@ TArray<int32> UDailyLoginSaveModifier::GetClaimedDays(int32 ActivityID) const
 
 bool UDailyLoginSaveModifier::IsDayClaimed(int32 ActivityID, int32 DayIndex) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return false;
 	}
@@ -360,7 +353,7 @@ bool UDailyLoginSaveModifier::IsDayClaimed(int32 ActivityID, int32 DayIndex) con
 
 int32 UDailyLoginSaveModifier::GetCurrentClaimCount(int32 ActivityID) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return 0;
 	}
@@ -399,7 +392,7 @@ void UDailyLoginSaveModifier::ClearModificationHistory()
 
 bool UDailyLoginSaveModifier::SaveActivityRecord(int32 ActivityID)
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法保存，存档实例无效"));
 		return false;
@@ -431,7 +424,7 @@ bool UDailyLoginSaveModifier::SaveActivityRecord(int32 ActivityID)
 
 bool UDailyLoginSaveModifier::SaveAllRecords()
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return false;
 	}
@@ -458,7 +451,7 @@ bool UDailyLoginSaveModifier::SaveAllRecords()
 
 bool UDailyLoginSaveModifier::LoadActivityRecord(int32 ActivityID)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		return false;
 	}
@@ -667,7 +660,7 @@ void UDailyLoginSaveModifier::UnregisterConsoleCommands()
 
 bool UDailyLoginSaveModifier::ResetDailyLoginData(int32 ActivityID, bool bAutoSave)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 未初始化"));
 		return false;
@@ -735,7 +728,7 @@ bool UDailyLoginSaveModifier::ResetDailyLoginData(int32 ActivityID, bool bAutoSa
 
 void UDailyLoginSaveModifier::DisplayDailyLoginInfo(int32 ActivityID)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 未初始化"));
 		return;

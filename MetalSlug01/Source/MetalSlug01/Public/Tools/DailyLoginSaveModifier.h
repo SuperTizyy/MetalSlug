@@ -28,6 +28,7 @@
 #include "GameFramework/SaveGame.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 #include "Kismet/GameplayStatics.h"
+#include "Tools/ActivitySaveModifierBase.h" // 改造: 共享基类
 #include "DailyLoginSaveModifier.generated.h"
 
 /**
@@ -81,9 +82,10 @@ public:
 /**
  * @brief 每日登录存档动态修改器
  * @details 提供运行时修改DailyLoginSaveGame数据的功能
+ * @note 改造: 继承自 UActivitySaveModifierBase, 共享 WorldContext/CachedSaveGame/bIsInitialized
  */
 UCLASS()
-class METALSLUG01_API UDailyLoginSaveModifier : public UObject
+class METALSLUG01_API UDailyLoginSaveModifier : public UActivitySaveModifierBase
 {
 	GENERATED_BODY()
 
@@ -108,6 +110,14 @@ public:
 	 * @brief 构造函数
 	 */
 	UDailyLoginSaveModifier();
+
+	// ==================== 基类接口实现 ====================
+
+	/** Slot 名格式: DailyLogin_{ActivityID} */
+	virtual FString GetSaveSlotName(int32 ActivityID) const
+	{
+		return FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	}
 
 	// ==================== 数据修改接口 ====================
 
@@ -239,26 +249,17 @@ public:
 
 private:
 	// ==================== 内部数据 ====================
+	// 【2026-06-15 重构】: WorldContextObject / CachedSaveGame / bIsInitialized 已提升到基类
+	// 子类不再重复声明, 直接通过基类访问器 (IsInitialized() / GetWorldContext()) 使用
 
-	/** 世界上下文对象 */
-	UPROPERTY()
-	TWeakObjectPtr<UObject> WorldContextObject;
-
-	/** 缓存的存档实例 */
-	UPROPERTY()
-	UDailyLoginSaveGame* CachedSaveGame;
-
-	/** 修改历史记录 */
+	/** 修改历史记录 (子类特有, 保留) */
 	UPROPERTY()
 	TArray<FDailyLoginModificationRecord> ModificationHistory;
-
-	/** 是否已初始化 */
-	bool bIsInitialized;
 
 	// ==================== 内部方法 ====================
 
 	/**
-	 * @brief 获取或创建存档实例
+	 * @brief 获取或创建存档实例 (委托给基类 GetOrCreateSaveGameBase)
 	 * @param ActivityID 活动ID
 	 * @return 存档实例
 	 */

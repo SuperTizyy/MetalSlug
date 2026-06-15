@@ -7,7 +7,9 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Login/Data/StaticTable.h" // 引入 EKillMethod
+// 引入 EKillMethod
+// 改造: 改为精确子表头, 不再 include 整个 432 行 StaticTable.h
+#include "Data/Enums/CombatEnums.h"
 #include "KillFeedEntryWidget.generated.h"
 
 // 前向声明

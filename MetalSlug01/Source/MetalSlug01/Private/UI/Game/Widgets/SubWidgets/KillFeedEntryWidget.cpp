@@ -6,6 +6,7 @@
 #include "UI/Game/Widgets/SubWidgets/KillFeedEntryWidget.h"
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
+#include "Data/Tables/KillIconTableRow.h" // 改造: 拆分后 FKillIconInfo 在这里
 
 
 // ==========================================

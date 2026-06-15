@@ -14,6 +14,47 @@
 // 作用: 用于获取当前世界对象、当前地图名等运行时信息
 #include "Engine/World.h"
 
+// 引入活动 DataTable 集中加载服务 (启动期一次性检查所有表)
+#include "Data/FActivityDataTableService.h"
+
+// 引入统一日志通道
+#include "Logs/MetalSlugLogChannels.h"
+
+// ============== 生命周期 ==============
+
+void UGameFlowSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+
+	// 启动期一次性访问每张活动表, 触发 LoadSynchronous 并打印缺失列表
+	// 设计: 故意不在这里直接调 GetMissingTables (那样只会检查未访问过的表)
+	//       而是逐个 Get 一遍, 确保所有活动 DT 都被加载
+	UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] 启动: 预加载活动 DataTable..."));
+	const TArray<FName> Missing = FActivityDataTableService::GetMissingTables();
+	if (Missing.Num() > 0)
+	{
+		// 改造: TArray<FName> 不能直接 FString::Join, 改用手动拼接
+		FString MissingList;
+		for (const FName& ID : Missing)
+		{
+			if (!MissingList.IsEmpty())
+			{
+				MissingList += TEXT(", ");
+			}
+			MissingList += ID.ToString();
+		}
+		UE_LOG(LogGameFlow, Error, TEXT("[GameFlow] 缺失 %d 张活动 DataTable: %s"),
+			Missing.Num(), *MissingList);
+	}
+}
+
+void UGameFlowSubsystem::Deinitialize()
+{
+	// 清理活动表缓存 (GC 友好)
+	FActivityDataTableService::Shutdown();
+	Super::Deinitialize();
+}
+
 /**
  * UGameFlowSubsystem::TransitToState
  *

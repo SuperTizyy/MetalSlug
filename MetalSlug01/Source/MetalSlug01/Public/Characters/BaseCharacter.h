@@ -15,7 +15,14 @@
 #include "InputActionValue.h"
 
 // 引入房间相关枚举（EKillMethod 等）
-#include "UI/Login/Data/StaticTable.h"
+// 改造: 改为精确子表头, 不再 include 整个 432 行 StaticTable.h
+#include "Data/Enums/CombatEnums.h"
+
+// 引入新增的 4 个 Component (健康/能量/溶解/脚步)
+#include "Components/HealthComponent.h"
+#include "Components/EnergyComponent.h"
+#include "Components/DissolveComponent.h"
+#include "Components/FootstepComponent.h"
 
 // UE 自动生成的头文件（必须放在最后）
 #include "BaseCharacter.generated.h"
@@ -79,11 +86,19 @@ public:
 	bool bIsMovementLocked = false;
 
 	/**
-	 * 暴露给外部或蓝图调用的生死状态获取接口
+	 * 【2026-06-15 重构】: 暴露给外部或蓝图调用的生死状态获取接口
 	 * @return 是否已死亡
+	 * 实现委托给 HealthComponent (数据权威在 Component)
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Stats")
-	bool GetIsDead() const { return bIsDead; }
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Stats")
+	bool IsDead() const { return HealthComponent ? HealthComponent->IsDead() : false; }
+
+	/**
+	 * 兼容旧调用方 (RoomGameMode/RoomGameState 等已用此名)
+	 * 新代码请使用 IsDead()
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Stats", meta = (DeprecatedFunction, DeprecationMessage = "请改用 IsDead()"))
+	bool GetIsDead() const { return IsDead(); }
 
 	// ==========================================
 	// 阵营系统 (0=人类, 1=丧尸)
@@ -103,19 +118,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Team")
 	uint8 GetTeamID() const { return TeamID; }
 
-	/**
-	 * 开放给外部检查生死的只读接口
-	 * @return 是否已死亡
-	 */
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "State")
-	bool IsDead() const { return bIsDead; }
-
 protected:
 	/**
 	 * UE 原生生命周期: 在 Actor 首次被初始化时调用
 	 * 用途: 启动回复定时器、初始化 HUD
 	 */
 	virtual void BeginPlay() override;
+
+	/**
+	 * UE 原生生命周期: 在 Actor 被销毁/离开世界前调用
+	 * 用途: 【工业规范】显式清理所有由自身注册的 Timer
+	 * 背景: UE 内部虽会通过 OnDestroyed 自动清理成员绑定的 Timer,
+	 *       但显式清理可避免: (1) 边角崩溃 (2) 死亡流程中未触发的 timer 残留
+	 */
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 public:
 	/**
@@ -141,6 +157,26 @@ public:
 	// 1. 核心组件 (第三人称视角)
 	// ==========================================
 protected:
+	// ===== 改造: 业务组件（健康/能量/溶解/脚步）已抽离为独立 Component =====
+	// 设计: BaseCharacter 创建并持有 4 个业务 Component, 后续业务代码可逐步迁移
+	// 行为兼容: 当前 BaseCharacter 内部仍维护同名字段, 两者并存; 后续批次将字段删除
+
+	/** 健康管理 (血量/受伤/死亡事件) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Health")
+	UHealthComponent* HealthComponent;
+
+	/** 能量管理 (消耗/回复/百分比) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Energy")
+	UEnergyComponent* EnergyComponent;
+
+	/** 溶解特效 (死亡后材质渐隐) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Dissolve")
+	UDissolveComponent* DissolveComponent;
+
+	/** 脚步音效 (地面检测 + 音效播放) */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Footstep")
+	UFootstepComponent* FootstepComponent;
+
 	/**
 	 * 第三人称专属的"自拍杆" (弹簧臂)
 	 * 作用: 防止相机穿墙，自动跟随角色
@@ -159,28 +195,32 @@ protected:
 	// 2. 战斗属性 (网络同步)
 	// ==========================================
 protected:
-	/**
-	 * 最大血量 (暴露给蓝图，可以随时修改)
-	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats")
-	float MaxHealth;
+	// ==========================================
+	// 【2026-06-15 重构】: 血量数据已下沉到 HealthComponent
+	// BaseCharacter 不再持有 MaxHealth/CurrentHealth/bIsDead 字段
+	// 访问通过 HealthComponent 委托方法
+	// 旧 GetCurrentHealth/GetMaxHealth 委托给 Component,外部调用方无感
+	// ==========================================
 
 	/**
-	 * 当前生命值
-	 * ReplicatedUsing: 当服务器改变这个值时，会自动通知客户端执行 OnRep_Health
+	 * 【2026-06-15 新增】: HealthComponent->OnHealthChanged 事件回调
+	 * 替代原 OnRep_Health,通过事件订阅实现
 	 */
-	UPROPERTY(ReplicatedUsing = OnRep_Health, VisibleAnywhere, BlueprintReadOnly, Category = "Stats")
-	float CurrentHealth;
+	UFUNCTION()
+	void HandleHealthChanged(float NewHealth);
 
 	/**
-	 * 生命值改变时的客户端回调（用来刷新屏幕上的血条UI）
+	 * 生命值改变时的回调 (已废弃,改订阅 HealthComponent->OnHealthChanged)
+	 * 【2026-06-15 保留为过渡接口】: 通过 OnRep 旧字段转发到 Component
+	 * 实际: 我们直接绑定 HealthComponent->OnHealthChanged,不再走 OnRep_Health
+	 * 保留仅为兼容(外部不直接调用)
 	 */
 	UFUNCTION()
 	void OnRep_Health();
 
 	/**
-	 * 【核心修复】: 服务器主动通知所属客户端刷新血量
-	 * 解决远程玩家受伤血条不扣的问题
+	 * 【2026-06-15 保留】: 服务器主动通知所属客户端刷新血量
+	 * Client RPC,内部改为读 HealthComponent
 	 */
 	UFUNCTION(Client, Reliable)
 	void Client_UpdateHealthDisplay(float Current, float Max);
@@ -236,16 +276,18 @@ protected:
 
 public:
 	/**
-	 * 获取当前血量（供 UI 直接访问）
+	 * 获取当前血量 (供 UI 直接访问)
+	 * 【2026-06-15 重构】: 委托给 HealthComponent
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Stats")
-	float GetCurrentHealth() const { return CurrentHealth; }
+	float GetCurrentHealth() const { return HealthComponent ? HealthComponent->GetCurrent() : 0.0f; }
 
 	/**
-	 * 获取最大血量（供 UI 直接访问）
+	 * 获取最大血量 (供 UI 直接访问)
+	 * 【2026-06-15 重构】: 委托给 HealthComponent
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Stats")
-	float GetMaxHealth() const { return MaxHealth; }
+	float GetMaxHealth() const { return HealthComponent ? HealthComponent->GetMax() : 0.0f; }
 
 	/**
 	 * 获取当前能量（供 UI 直接访问）
@@ -387,11 +429,11 @@ protected:
 	void StopRegeneration();
 
 	/**
-	 * 死亡状态锁 (防止鞭尸)
-	 * Replicated: 同步到所有客户端
+	 * 【2026-06-15 重构】: 死亡状态锁 (防止鞭尸) 委托给 HealthComponent
+	 * 原字段已删除,这里保留声明仅为兼容(无字段后置)
+	 * 实际语义: HealthComponent->bIsDead 仍会 Replicated
 	 */
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats")
-	bool bIsDead = false;
+	// 注: 原 UPROPERTY(Replicated) bool bIsDead 已下沉到 HealthComponent
 
 	/**
 	 * 记录最后的击杀方式（用于 HUD 击杀信息显示）
@@ -430,6 +472,20 @@ protected:
 	 * HUD 刷新延迟重试定时器
 	 */
 	FTimerHandle HUDRefreshTimerHandle;
+
+	/**
+	 * 【2026-06-15 重构】: 死亡流程 - 武器延迟销毁定时器句柄
+	 * 原代码为局部变量 (BaseCharacter.cpp L1457),会在栈帧结束时丢失句柄
+	 * 改为成员变量,允许 EndPlay 或新一轮死亡时主动 ClearTimer
+	 */
+	FTimerHandle WeaponDestroyTimerHandle;
+
+	/**
+	 * 【2026-06-15 重构】: 死亡流程 - 溶解特效启动定时器句柄
+	 * 原代码为局部变量 (BaseCharacter.cpp L1469),存在同样的句柄丢失问题
+	 * 改为成员变量以便精确管理
+	 */
+	FTimerHandle DissolveTimerHandle;
 
 	/**
 	 * 缓存角色 ID，延迟刷新时使用（避免循环触发服务器 RPC）
@@ -476,13 +532,37 @@ public:
 	// ==========================================
 	// UI连接
 	// ==========================================
+	// 【2026-06-15 重构】: 跨层依赖集中化
+	// 历史: BaseCharacter.cpp 中曾有 50+ 处直接访问 GameHUDWidget / MyGameHUD
+	// 现状: 收敛到 2 个 helper 函数 (RefreshHUDFromCurrentState / TryResolveHUDWidget)
+	//      集中点位于 cpp 文件底部 "UI Bridge (跨层访问点)" 区段
+	// 待优化: 长期应改为 UI 订阅 HealthComponent->OnHealthChanged 事件
+	//        实现真正的依赖倒置 (UI→Core 单向), 当前阶段先收敛
+	// ==========================================
 protected:
 	/**
 	 * 游戏 HUD 引用
 	 * 用途: 通过它刷新血条/能量/武器图标
+	 * @note 外部代码请勿直接访问, 走 helper 函数
 	 */
 	UPROPERTY()
 	UGameHUDWidget* GameHUDWidget;
+
+	// === UI Bridge Helper (2026-06-15 新增) ===
+	/**
+	 * 【UI Bridge】从 PlayerController 安全获取 GameHUDWidget 引用
+	 * @param bLogWarning 失败时是否打 Warning 日志 (默认 true)
+	 * @return 是否成功解析 (true 表示 GameHUDWidget 非空)
+	 * @note 替代散落在 30+ 处的 HUD 获取样板代码
+	 */
+	bool TryResolveHUDWidget(bool bLogWarning = true);
+
+	/**
+	 * 【UI Bridge】一次性推送所有角色状态到 HUD
+	 * 推送内容: 血量/能量/AC/ACE
+	 * @note 替代散落在 10+ 处的 UpdateXxx 调用
+	 */
+	void RefreshHUDFromCurrentState();
 
 
 	// ==========================================

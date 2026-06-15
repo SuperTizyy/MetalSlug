@@ -12,7 +12,8 @@
 #include "GameFramework/GameStateBase.h"
 
 // 引入房间相关枚举（ERoomTeam/ERoomMatchMode 等）
-#include "UI/Login/Data/StaticTable.h"
+// 改造: 改为精确子表头, 不再被其他无关表污染 (原 StaticTable.h 432 行)
+#include "Data/Enums/RoomEnums.h"
 
 // UE 自动生成的头文件
 #include "RoomGameState.generated.h"

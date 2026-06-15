@@ -7,13 +7,11 @@
 #include "UI/Activity/Data/DailyLoginConfig.h"
 #include "UI/Activity/Data/DailyLoginSave.h"
 #include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Managers/ActivityTimeManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 #include "ActivitySubsystem.generated.h"
 
 class URedDotManager;
-class UActivityTimeManager;
 class UDailyLoginPage; // 前向声明: 避免 Widget 头文件反向依赖 Subsystem
 
 /**
@@ -26,7 +24,7 @@ class UDailyLoginPage; // 前向声明: 避免 Widget 头文件反向依赖 Subs
  * @details 活动系统的中央数据服务层
  *
  * 职责说明:
- * 1. 管理 URedDotManager / UActivityTimeManager 等子管理器
+ * 1. 管理 URedDotManager 等子管理器
  * 2. 加载 DataTable (DT_ActivityInfoRow / DT_DailyLoginConfig / DT_ItemDetail / DT_TreasureBoxItem)
  * 3. 持久化玩家活动进度（FPlayerLoginRecord -> UDailyLoginSaveGame）
  * 4. 提供 Page 注册表（弱引用）供 CheatWidget 等外部模块查询
@@ -42,7 +40,7 @@ class UDailyLoginPage; // 前向声明: 避免 Widget 头文件反向依赖 Subs
  *
  * 关联:
  * - 上级: UGameInstance（生命周期同 GameInstance）
- * - 下属: URedDotManager / UActivityTimeManager / UDailyLoginSaveModifier
+ * - 下属: URedDotManager / UDailyLoginSaveModifier
  * - 上层消费者: UDailyLoginPage / UDailyUpgradeRewardPage / UDailyLoginCheatWidget
  */
 UCLASS()
@@ -61,9 +59,6 @@ public:
 
 	/** 获取红点管理器 */
 	URedDotManager* GetRedDotManager() const;
-
-	/** 获取活动时间管理器 */
-	UActivityTimeManager* GetActivityTimeManager() const;
 
 	/** 获取所有导航项 */
 	TArray<const FActivityInfoRow*> GetAllNavItems() const;
@@ -197,9 +192,6 @@ public:
 public:
 	// ================= 事件 =================
 
-
-	// ================= 事件 =================
-	
 	/** 活动数据变更事件 */
 	DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnActivityDataChanged);
 	UPROPERTY(BlueprintAssignable, Category = "Activity")
@@ -212,10 +204,6 @@ private:
 		
 	UPROPERTY()
 	URedDotManager* RedDotManager = nullptr;
-		
-	UPROPERTY()
-	UActivityTimeManager* ActivityTimeManager = nullptr;
-		
 	// ================= SaveGame 缓存 =================
 		
 	UPROPERTY()

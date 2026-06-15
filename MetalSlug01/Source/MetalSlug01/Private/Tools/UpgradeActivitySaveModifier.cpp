@@ -23,20 +23,20 @@
 // ==================== 主类实现 ====================
 
 UUpgradeActivitySaveModifier::UUpgradeActivitySaveModifier()
-	: CachedSaveGame(nullptr), TargetSubsystem(nullptr), bIsInitialized(false), bHasPendingChanges(false)
+	: Super(), TargetSubsystem(nullptr)
 {
+	// 父类已初始化 IsInitialized()=false, bHasPendingChanges=false
+	// 本类额外清空 TargetSubsystem
 }
 
 bool UUpgradeActivitySaveModifier::InitializeModifier(UObject* WorldContext, UUpgradeActivitySubsystem* Subsystem)
 {
-	if (!WorldContext)
+	// 【2026-06-15 修复】: 委托给基类 (基类会实际赋值 WorldContext 并置 IsInitialized()=true)
+	if (!Super::InitializeBase(WorldContext))
 	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: WorldContext为空"));
 		return false;
 	}
 
-	WorldContextObject = WorldContext;
-	
 	// 强制映射UpgradeActivitySubsystem内存数据
 	UGameInstance* GameInstance = WorldContext->GetWorld()->GetGameInstance();
 	if (GameInstance)
@@ -44,30 +44,29 @@ bool UUpgradeActivitySaveModifier::InitializeModifier(UObject* WorldContext, UUp
 		TargetSubsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 		if (TargetSubsystem)
 		{
-			UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 成功映射Subsystem内存数据"));
-			UE_LOG(LogTemp, Log, TEXT("   Subsystem地址: %p"), TargetSubsystem);
-			UE_LOG(LogTemp, Log, TEXT("   当前RecordDate: %d"), TargetSubsystem->GetRecord().GetDayNumber());
+			UE_LOG(LogAccount, Log, TEXT("UpgradeActivitySaveModifier: 成功映射Subsystem内存数据"));
+			UE_LOG(LogAccount, Log, TEXT("   Subsystem地址: %p"), TargetSubsystem);
+			UE_LOG(LogAccount, Log, TEXT("   当前RecordDate: %d"), TargetSubsystem->GetRecord().GetDayNumber());
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取UpgradeActivitySubsystem"));
+			UE_LOG(LogAccount, Error, TEXT("UpgradeActivitySaveModifier: 无法获取UpgradeActivitySubsystem"));
 			return false;
 		}
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法获取GameInstance"));
+		UE_LOG(LogAccount, Error, TEXT("UpgradeActivitySaveModifier: 无法获取GameInstance"));
 		return false;
 	}
 
-	bIsInitialized = true;
-	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 内存映射初始化完成 - 运行时只操作内存，游戏关闭时保存到磁盘"));
+	UE_LOG(LogAccount, Log, TEXT("UpgradeActivitySaveModifier: 内存映射初始化完成 - 运行时只操作内存, 游戏关闭时保存到磁盘"));
 	return true;
 }
 
 void UUpgradeActivitySaveModifier::DestroyModifier()
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		return;
 	}
@@ -75,12 +74,11 @@ void UUpgradeActivitySaveModifier::DestroyModifier()
 	// 保存所有未保存的修改
 	SaveAllRecords();
 
-	// 清理资源
-	CachedSaveGame = nullptr;
-	WorldContextObject.Reset();
-	bIsInitialized = false;
+	// 委托给基类清理
+	TargetSubsystem = nullptr;
+	Super::DestroyBase();
 
-	UE_LOG(LogTemp, Log, TEXT("UpgradeActivitySaveModifier: 已销毁"));
+	UE_LOG(LogAccount, Log, TEXT("UpgradeActivitySaveModifier: 已销毁"));
 }
 
 bool UUpgradeActivitySaveModifier::ModifyCurrentExperience(int32 RecordDate, int32 NewExp, bool bAutoSave)
@@ -603,7 +601,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 
 const FUpgradeRewardSaveRecord* UUpgradeActivitySaveModifier::GetRecordOrNull(int32 RecordDate) const
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return nullptr;
 	}
@@ -650,7 +648,7 @@ int32 UUpgradeActivitySaveModifier::GetLimitedActivityCount(int32 RecordDate) co
 
 bool UUpgradeActivitySaveModifier::SaveRecord(int32 RecordDate)
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier: 无法保存，存档实例无效"));
 		return false;
@@ -668,7 +666,7 @@ bool UUpgradeActivitySaveModifier::SaveRecord(int32 RecordDate)
 
 bool UUpgradeActivitySaveModifier::SaveAllRecords()
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		return false;
 	}
@@ -695,7 +693,7 @@ bool UUpgradeActivitySaveModifier::SaveAllRecords()
 
 void UUpgradeActivitySaveModifier::SavePendingChangesOnShutdown()
 {
-	if (!bIsInitialized || !CachedSaveGame)
+	if (!IsInitialized() || !CachedSaveGame)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("⚠️ SavePendingChangesOnShutdown: 存档实例无效，跳过保存"));
 		return;
@@ -722,7 +720,7 @@ void UUpgradeActivitySaveModifier::SavePendingChangesOnShutdown()
 
 bool UUpgradeActivitySaveModifier::LoadRecord(int32 RecordDate)
 {
-	if (!bIsInitialized)
+	if (!IsInitialized())
 	{
 		return false;
 	}
@@ -798,7 +796,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.SetExp"),
 		TEXT("设置经验值: Upgrade.SetExp RecordDate ExperienceValue"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = GetWorldContext(), this](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 2)
 			{
@@ -876,7 +874,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 		IConsoleManager::Get().RegisterConsoleCommand(
 			TEXT("Upgrade.SetCreatedTime"),
 			TEXT("设置创建时间: Upgrade.SetCreatedTime RecordDate Year Month Day Hour Minute Second"),
-			FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+			FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = GetWorldContext(), this](const TArray<FString>& Args)
 			{
 				if (Args.Num() >= 7)
 				{
@@ -961,15 +959,16 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.CreateRecord"),
 		TEXT("创建新记录: Upgrade.CreateRecord RecordDate [InheritPrevious=1]"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = GetWorldContext(), this](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 1)
 			{
 				int32 RecordDate = FCString::Atoi(*Args[0]);
 				bool bInherit = Args.Num() >= 2 ? (FCString::Atoi(*Args[1]) != 0) : true;
 								
-				// 通过GameInstance获取最新的Subsystem实例
-				if (WorldContext.IsValid())
+				// 通过 GameInstance 获取最新的 Subsystem 实例
+				// 注意: GetWorldContext() 返回原始 UObject*, 因此用 nullptr 判空, 不可调用 .IsValid()
+				if (WorldContext)
 				{
 					UWorld* World = WorldContext->GetWorld();
 					if (World)
@@ -1015,7 +1014,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.ShowAllInfo"),
 		TEXT("显示所有天数记录信息: Upgrade.ShowAllInfo"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = GetWorldContext(), this](const TArray<FString>& Args)
 		{
 			// 直接使用已初始化的 TargetSubsystem
 			if (this->TargetSubsystem)
@@ -1095,7 +1094,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 	IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Upgrade.SetTaskCount"),
 		TEXT("设置任务完成次数: Upgrade.SetTaskCount RecordDate TaskIndex Count"),
-		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = WorldContextObject, this](const TArray<FString>& Args)
+		FConsoleCommandWithArgsDelegate::CreateLambda([WorldContext = GetWorldContext(), this](const TArray<FString>& Args)
 		{
 			if (Args.Num() >= 3)
 			{
@@ -1185,7 +1184,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 
 bool UUpgradeActivitySaveModifier::ValidateAndLog(const TCHAR* FunctionName) const
 {
-	if (!bIsInitialized || !TargetSubsystem)
+	if (!IsInitialized() || !TargetSubsystem)
 	{
 		UE_LOG(LogTemp, Error, TEXT("UpgradeActivitySaveModifier::%s: 未初始化或Subsystem无效"), FunctionName);
 		return false;
