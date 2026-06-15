@@ -4,11 +4,11 @@
 // 头文件包含区
 // ==========================================
 // 包含当前子系统的头文件
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
 // 包含虚幻引擎提供的静态工具函数类（用于执行 LoadGame 和 SaveGame）
 #include "Kismet/GameplayStatics.h"
 // 【关键引入】必须包含我们用来"装箱"的 SaveGame 类头文件
-#include "Account/AccountSaveGame.h"
+#include "Data/Account/AccountSaveGame.h"
 
 
 // ==========================================
@@ -153,6 +153,11 @@ void UAccountSubsystem::Deinitialize()
  */
 bool UAccountSubsystem::TryRegister(const FString& Username, const FString& Password)
 {
+	// 【关键!】双开/多端测试时, 另一个窗口可能刚注册了同名账号
+	// 必须先从硬盘重新读取一次最新数据, 否则内存里的 AccountData 是过期的
+	// 也会导致 SaveDataToDisk() 整表覆盖时把别人写的内容吞掉
+	LoadDataFromDisk();
+
 	// 先在内存里查一下，防止玩家注册一个已经被别人注册过的名字
 	if (AccountData.Contains(Username))
 	{

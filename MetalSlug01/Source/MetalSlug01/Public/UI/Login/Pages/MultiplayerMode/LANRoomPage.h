@@ -126,6 +126,34 @@ protected:
 	UButton* Btn_BackToMenu;
 
 	// ==========================================
+	// 3.5 账号冲突模态对话框（从 LoginPage 迁移）
+	// 触发场景: 房主拒收本客户端 (Client_LoginResult bReject=true)
+	// 职责: 在大厅页面弹模态框, 玩家点 [确认] → 保持账号登录态, 仅回大厅
+	// 注意: 蓝图里要拖 3 个同名控件进 WBP_LANRoomPage
+	// 默认 Overlay 全部 Collapsed
+	// ==========================================
+
+	/**
+	 * 模态对话框容器
+	 * 蓝图侧: 建议放 1 个 Border + 1 个 VerticalBox(包含 Text + 按钮)
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UOverlay* Overlay_LANRoomConflict;
+
+	/**
+	 * 对话框内显示的提示文本
+	 * 例如: "账号 [甲] 已在房间 [房间名] 中, 不允许重复进房"
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UTextBlock* Text_ConflictMsg;
+
+	/**
+	 * 确认按钮 (强踢后玩家点这个 → 留在大厅, 不退账号)
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UButton* Btn_ConfirmLANRoomConflict;
+
+	// ==========================================
 	// 4. 创建房间覆盖面板 (Create Room Overlay)
 	// ==========================================
 
@@ -215,6 +243,31 @@ private:
 	UFUNCTION() void OnToggleReadyClicked();
 
 	// ==========================================
+	// 6.5 账号冲突对话框回调（从 LoginPage 迁移）
+	// ==========================================
+
+	/**
+	 * 外部调用入口: 弹模态对话框
+	 * @param Reason 冲突原因(例如: "账号已在房间中")
+	 *
+	 * 被谁调用:
+	 *  - ARoomPlayerController::HandleForcedKickNotification → 反射调到这里
+	 *
+	 * 内部行为:
+	 *  - 显示 Overlay_LANRoomConflict + Text_ConflictMsg
+	 *  - 改输入模式为 UIOnly + 显示鼠标
+	 */
+	UFUNCTION(BlueprintCallable, Category = "LANRoom|Account")
+	void ShowLANRoomConflictDialog(const FString& Reason);
+
+	/**
+	 * 确认按钮回调: 玩家点"确认" → 切回大厅(不退出账号)
+	 * 用户想退出登录 → 自己点 GameMenuPage 的 Btn_BackToLogin
+	 */
+	UFUNCTION()
+	void OnConfirmLANRoomConflictClicked();
+
+	// ==========================================
 	// 7. 局域网会话底层逻辑
 	// ==========================================
 
@@ -268,6 +321,42 @@ private:
 	 * 引擎提供的搜索设置容器（必须用 TSharedPtr 智能指针包起来）
 	 */
 	TSharedPtr<class FOnlineSessionSearch> SessionSearch;
+
+	// ==========================================
+	// 8.1 创房前的"同号检查"搜索（新增）
+	// ==========================================
+
+	/**
+	 * 创房前专用: 搜索大厅是否有"我的账号"已建好的房间
+	 * 区别于 FindLANRooms: 本函数只查 HOST_ACCOUNT 这一项, 不刷新 CurrentDisplayedRooms
+	 *
+	 * 用法: 在 OnConfirmCreateRoomClicked 末尾调一次
+	 *      → OnAccountCheckFindSessionsComplete 回调里决定放行或弹框
+	 */
+	void FindSessionsForAccountCheck();
+
+	/**
+	 * 创房前搜索完成的引擎回调
+	 * 检查所有结果的 HOST_ACCOUNT 是否与当前账号名相同
+	 * - 相同: 弹"已有此账户创建的房间"提示, 不创建
+	 * - 不同/无: 继续走真正的创房流程
+	 */
+	void OnAccountCheckFindSessionsComplete(bool bWasSuccessful);
+
+	/** 创房前搜索的委托句柄(独立于常规搜索,避免冲突) */
+	FDelegateHandle AccountCheckFindSessionsDelegateHandle;
+
+	/** 创房前搜索的临时结果缓存(回调里用) */
+	TSharedPtr<class FOnlineSessionSearch> AccountCheckSessionSearch;
+
+	/**
+	 * 同号检查通过后, 真正开始执行创房流程
+	 * 从 OnConfirmCreateRoomClicked 末尾搬过来, 由 OnAccountCheckFindSessionsComplete 调用
+	 *
+	 * 为什么单独抽出来: 创房前要异步等 FindSessions 回调, 不能再同步调用
+	 * 把"创房"动作搬到异步回调里
+	 */
+	void ProceedToCreateRoomAfterCheck();
 
 	// ==========================================
 	// 8. 搜索与刷新相关

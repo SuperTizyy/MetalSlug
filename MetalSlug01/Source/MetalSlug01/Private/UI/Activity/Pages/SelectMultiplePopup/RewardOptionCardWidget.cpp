@@ -6,8 +6,8 @@
 // 头文件包含区
 // ==========================================
 #include "UI/Activity/Pages/SelectMultiplePopup/RewardOptionCardWidget.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "Components/Image.h"
 #include "Components/TextBlock.h"

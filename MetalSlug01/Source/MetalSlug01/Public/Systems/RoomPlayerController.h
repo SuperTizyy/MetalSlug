@@ -22,6 +22,8 @@ class UInputMappingContext;  // Enhanced Input 映射上下文
 class URoomInsidePage;       // 房间内 UI 页面
 class UGameHUDWidget;        // 战斗 HUD 容器
 class ARoomPlayerState;      // 房间玩家状态
+class UAccountRoomAuthority; // 账号在线状态权威表（房主端持有）
+class UUserWidget;            // UI 控件基类（按类名反射查找时用）
 
 /**
  * @class ARoomPlayerController
@@ -202,6 +204,76 @@ public:
 	void Server_RequestSpawn();
 
 	// ==========================================
+	// 账号在线状态同步 RPC（新增）
+	// ==========================================
+
+	/**
+	 * 客户端通知房主"我上线了"
+	 * 时机: BeginPlay 后, 玩家进房成功
+	 * @param Username 玩家账号
+	 * @param SessionId 客户端本地生成的 FGuid, 用于"重连"判定
+	 *
+	 * 房主端: AccountRoomAuthority.HandleLoginRequest()
+	 *  - 同 (Username, SessionId) → 重连, 直接 ok
+	 *  - 同 Username 不同 SessionId → 强踢旧 PC, 弹模态对话框
+	 *  - 新账号 → 直接注册
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_NotifyAccountLogin(const FString& Username, const FString& SessionId);
+
+	/**
+	 * 客户端通知房主"我下线了"
+	 * 时机: ExecuteLeaveRoom / EndPlay
+	 * @param Username 玩家账号
+	 * @param SessionId 客户端本地生成的 FGuid
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_NotifyAccountLogout(const FString& Username, const FString& SessionId);
+
+	/**
+	 * 客户端主动查询"某账号是否在线"
+	 * (当前未使用, 保留给将来"显示在线列表"等功能)
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_RequestIsAccountOnline(const FString& Username);
+
+	/**
+	 * 客户端主动查询"某账号是否在线" 的响应（房主 → 发起查询的客户端）
+	 * @param Username 被查询的账号
+	 * @param bOnline 是否在线
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_ReceiveIsAccountOnline(const FString& Username, bool bOnline);
+
+	/**
+	 * 房主 → 客户端 的"账号登录结果"通知
+	 * @param bSuccess 是否成功注册到权威表
+	 * @param Reason 失败原因(空=成功)
+	 * @param bReject true=该账号已在别处登录, 客户端需弹"拒绝进房"对话框
+	 *                然后让玩家退回登录页
+	 *
+	 * 注意:
+	 *  - 旧版叫 bForcedKick, 含义是"强踢旧 PC"; 现在改成 bReject,
+	 *    含义是"拒绝新 PC 进房" - 旧 PC 不再被踢, 业务更简单
+	 *
+	 * 客户端行为:
+	 *  - bReject=true → 调 HandleForcedKickNotification → 找 LANRoomPage 弹模态框
+	 *  - bReject=false 且 bSuccess=false → 用 Reason 做普通提示
+	 *  - bSuccess=true → 静默, 不打扰玩家
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_LoginResult(bool bSuccess, const FString& Reason, bool bReject);
+
+	/**
+	 * 客户端 → 房主 的心跳(每 5 秒一次)
+	 * 用途: 房主用来检测客户端是否异常掉线(X 关闭 / 断电)
+	 * @param Username 玩家账号
+	 * @param SessionId 客户端本地 FGuid
+	 */
+	UFUNCTION(Server, Unreliable)
+	void Server_Heartbeat(const FString& Username, const FString& SessionId);
+
+	// ==========================================
 	// Client RPC（服务器 → 客户端）
 	// ==========================================
 
@@ -373,4 +445,66 @@ public:
 	 */
 	UFUNCTION()
 	void DelayedSendPlayerInfo();
+
+	// ==========================================
+	// 账号在线状态相关（新增）
+	// ==========================================
+
+	/**
+	 * 客户端在进房时本地生成的 SessionId
+	 * 用 FGuid 避免撞车
+	 */
+	UPROPERTY(Transient)
+	FString MyAccountSessionId;
+
+	/**
+	 * 客户端当前登录的账号名（用于在退房/断线时通知房主下线）
+	 */
+	UPROPERTY(Transient)
+	FString MyAccountUsername;
+
+	/**
+	 * 房主端持有的权威表（仅 ListenServer 端非空）
+	 * 用 TWeakObjectPtr 防止 GC 误回收
+	 */
+	UPROPERTY(Transient)
+	TWeakObjectPtr<UAccountRoomAuthority> AccountAuthority;
+
+	/**
+	 * 心跳定时器: 客户端每 5 秒发一次心跳给房主
+	 * 仅本地玩家控制器(IsLocalPlayerController()==true) 启动
+	 */
+	FTimerHandle HeartbeatTimerHandle;
+
+	/**
+	 * 客户端心跳定时器回调: 实际发送 RPC
+	 */
+	UFUNCTION()
+	void SendHeartbeat();
+
+	/**
+	 * 【UI 跳转入口 - BP 可调】客户端收到强制踢出通知时调用本函数
+	 * 用途: 优先找 LANRoomPage 弹模态对话框(玩家在大厅/选房时被拒, 回大厅)
+	 *       兜底找 LoginPage 弹模态对话框(理论上不应该走到这里)
+	 *       双兜底都没找到 → 直接 Client_ForceLeaveRoom
+	 *
+	 * 设计: 不需要知道具体页面类, 通过反射按类名查找 UUserWidget 实例
+	 *       保持 BP 端和 C++ 端的解耦
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Account")
+	void HandleForcedKickNotification(const FString& Reason);
+
+	/**
+	 * 辅助: 在当前 World 上按类名查找 UUserWidget 实例
+	 * 用反射避免硬编码 include
+	 * @param ClassName 短类名(例如 "LANRoomPage" / "LoginPage")
+	 * @return 第一个匹配的 UUserWidget, 找不到返回 nullptr
+	 */
+	UUserWidget* FindWidgetByClassName(const FString& ClassName) const;
+
+	/**
+	 * 钩子: PC 销毁时通知权威表清理
+	 * 重写 UE 原生 EndPlay
+	 */
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 };

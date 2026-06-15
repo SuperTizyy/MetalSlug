@@ -16,6 +16,7 @@
 class UEditableTextBox;
 class UButton;
 class UTextBlock;
+class UOverlay;
 
 /**
  * @class ULoginPage

@@ -3,8 +3,8 @@
 // ==========================================
 // 头文件包含区
 // ==========================================
-#include "UI/Activity/Core/RedDotManager.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
+#include "Systems/Activity/RedDotManager.h"
+#include "Systems/Activity/ActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"
 
 

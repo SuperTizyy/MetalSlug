@@ -19,7 +19,7 @@
 #include "Components/Image.h"
 #include "Components/ProgressBar.h"
 #include "Kismet/GameplayStatics.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 
 
 // ==========================================

@@ -2,7 +2,7 @@
 // UDailyUpgradeRewardViewModel 实现
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardViewModel.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Logs/MetalSlugLogChannels.h"
 
 void UDailyUpgradeRewardViewModel::Bind(UUpgradeActivitySubsystem* InSubsystem)

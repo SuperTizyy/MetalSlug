@@ -29,6 +29,7 @@
 
 // 引入房间 GameMode（用于调用房间管理接口）
 #include "Systems/RoomGameMode.h"
+#include "Systems/Room/AccountRoomAuthority.h"
 
 // 引入房间 GameState（用于查询比赛信息）
 #include "Systems/RoomGameState.h"
@@ -37,7 +38,7 @@
 #include "Systems/GameFlowSubsystem.h"
 
 // 引入账号子系统（用于获取登录用户信息）
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
 
 // 引入 UE 静态函数库（用于 OpenLevel/SetGamePaused 等）
 #include "Kismet/GameplayStatics.h"
@@ -136,6 +137,40 @@ void ARoomPlayerController::DelayedSendPlayerInfo()
 
 	// 把玩家名发给服务器
 	Server_SendPlayerInfo(MyName);
+
+	// ==========================================
+	// 【新增】同步"账号在线"状态到房主权威表
+	// 1. 把 MyName 缓存到成员变量, 用于退房时通知
+	// 2. 用本地 FGuid 生成 SessionId, 房主用它做"重连"判定
+	// 3. 调 Server_NotifyAccountLogin → 房主 TMap 注册/判定
+	// ==========================================
+	MyAccountUsername = MyName;
+	MyAccountSessionId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+
+	if (!MyAccountUsername.IsEmpty())
+	{
+		Server_NotifyAccountLogin(MyAccountUsername, MyAccountSessionId);
+
+		// 启动客户端心跳定时器(5s 一次)
+		// 房主端: Server_Heartbeat 直接走本地执行,刷新 LastHeartbeatAt
+		// 客户端端: 走网络发到房主
+		if (GetWorld())
+		{
+			GetWorld()->GetTimerManager().SetTimer(
+				HeartbeatTimerHandle,
+				this,
+				&ARoomPlayerController::SendHeartbeat,
+				5.0f,    // 5 秒一次
+				true);   // 循环
+		}
+
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan,
+				FString::Printf(TEXT("[Account] 已通知房主: %s 上线 (Session=%s)"),
+					*MyAccountUsername, *MyAccountSessionId));
+		}
+	}
 }
 
 
@@ -371,10 +406,7 @@ void ARoomPlayerController::ExecuteLeaveRoom()
 			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] GameInstance为空，无法返回大厅"));
 		}
 	}, 0.5f, false);
-}
-
-
-// ==========================================
+}// ==========================================
 // 5. 告诉服务器的 RPC 逻辑
 // ==========================================
 
@@ -1083,4 +1115,347 @@ void ARoomPlayerController::HideEscMenu()
 
 	// 恢复游戏
 	UGameplayStatics::SetGamePaused(this, false);
+}
+
+
+// ==========================================
+// 13. 账号在线状态同步 RPC（新增）
+// ==========================================
+
+/**
+ * Server_NotifyAccountLogin_Validate
+ * 验证函数: 账号和 SessionId 不能为空
+ */
+bool ARoomPlayerController::Server_NotifyAccountLogin_Validate(const FString& Username, const FString& SessionId)
+{
+	return !Username.IsEmpty() && !SessionId.IsEmpty();
+}
+
+
+/**
+ * Server_NotifyAccountLogin_Implementation
+ *
+ * 房主端: 收到客户端的"上线通知" → 调权威表处理
+ * 1. 拿到 (或创建) AccountRoomAuthority 单例
+ * 2. 调 HandleLoginRequest 做冲突判定
+ * 3. HandleLoginRequest 内部会发 Client_LoginResult 回包
+ *
+ * 注意: 房主自己 HasAuthority()==true, Server_* 直接本地执行
+ */
+void ARoomPlayerController::Server_NotifyAccountLogin_Implementation(const FString& Username, const FString& SessionId)
+{
+	// 防御: 仅在房主(权威端)处理
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// 拿到或创建权威表
+	if (!AccountAuthority.IsValid())
+	{
+		// 仅当权威表还没建时才新建
+		AccountAuthority = NewObject<UAccountRoomAuthority>(this);
+
+		// 启动心跳扫描定时器(5s 扫一次, 15s 超时清理)
+		// 内部有 ClearTimer 防御, 多次调用安全
+		AccountAuthority->StartSweepTimer(GetWorld());
+	}
+
+	// 调用权威表的核心入口(里面会发 Client_LoginResult)
+	AccountAuthority->HandleLoginRequest(Username, SessionId, this);
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan,
+			FString::Printf(TEXT("[Authority] 收到上线通知: %s (Session=%s)"), *Username, *SessionId));
+	}
+}
+
+
+/**
+ * Server_NotifyAccountLogout_Validate
+ */
+bool ARoomPlayerController::Server_NotifyAccountLogout_Validate(const FString& Username, const FString& SessionId)
+{
+	return true; // 离线下通知允许空,方便异常断线时调
+}
+
+
+/**
+ * Server_NotifyAccountLogout_Implementation
+ *
+ * 房主端: 收到客户端的"下线通知" → 清理权威表
+ */
+void ARoomPlayerController::Server_NotifyAccountLogout_Implementation(const FString& Username, const FString& SessionId)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (AccountAuthority.IsValid())
+	{
+		AccountAuthority->HandleLogoutRequest(Username, SessionId);
+	}
+}
+
+
+/**
+ * Server_RequestIsAccountOnline_Implementation
+ *
+ * 房主端: 查表, 通过 Client_ReceiveIsAccountOnline 回包
+ * (当前版本未主动调用, 保留供"显示在线列表"等扩展用)
+ */
+void ARoomPlayerController::Server_RequestIsAccountOnline_Implementation(const FString& Username)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	bool bOnline = false;
+	if (AccountAuthority.IsValid())
+	{
+		bOnline = AccountAuthority->IsAccountOnline(Username);
+	}
+
+	// 回包给发起查询的客户端
+	Client_ReceiveIsAccountOnline(Username, bOnline);
+}
+
+
+/**
+ * Client_ReceiveIsAccountOnline_Implementation
+ * 收到"某账号是否在线"的回包
+ * (扩展用, 当前为空实现)
+ */
+void ARoomPlayerController::Client_ReceiveIsAccountOnline_Implementation(const FString& Username, bool bOnline)
+{
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::White,
+			FString::Printf(TEXT("[Account] %s 在线状态: %s"), *Username, bOnline ? TEXT("是") : TEXT("否")));
+	}
+}
+
+
+/**
+ * Client_LoginResult_Implementation
+ *
+ * 客户端: 收到房主回包
+ * - bReject=true    → 弹模态对话框(拒绝进房, 玩家点确认后回登录页)
+ * - bSuccess=true   → 静默成功
+ * - 其他           → 用 Reason 做普通提示
+ */
+void ARoomPlayerController::Client_LoginResult_Implementation(bool bSuccess, const FString& Reason, bool bReject)
+{
+	// 拒绝进房通知: 弹模态对话框
+	if (bReject)
+	{
+		// 调 BP 可调函数, 内部会找到当前 LoginPage 并弹框
+		HandleForcedKickNotification(Reason);
+		return;
+	}
+
+	// 普通成功/失败: 用 Debug 提示
+	if (!bSuccess)
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+				FString::Printf(TEXT("[Account] 上线失败: %s"), *Reason));
+		}
+	}
+	else
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green,
+				TEXT("[Account] 上线成功"));
+		}
+	}
+}
+
+
+/**
+ * Server_Heartbeat_Implementation
+ *
+ * 房主端: 收到客户端心跳,刷新 LastHeartbeatAt
+ * 房主自己 HasAuthority()==true 时直接本地执行
+ */
+void ARoomPlayerController::Server_Heartbeat_Implementation(const FString& Username, const FString& SessionId)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	if (AccountAuthority.IsValid())
+	{
+		AccountAuthority->HandleHeartbeat(Username, SessionId);
+	}
+}
+
+
+/**
+ * SendHeartbeat
+ *
+ * 客户端定时器回调: 5 秒一次发心跳给房主
+ * 房主自己走 Server_* 直接本地执行,不消耗网络
+ */
+void ARoomPlayerController::SendHeartbeat()
+{
+	// 没账号就不发(可能玩家没登录就退房了)
+	if (MyAccountUsername.IsEmpty() || MyAccountSessionId.IsEmpty())
+	{
+		return;
+	}
+
+	// 调 Server RPC(房主端直接本地执行)
+	Server_Heartbeat(MyAccountUsername, MyAccountSessionId);
+}
+
+
+// ==========================================
+// 14. UI 跳转入口（新增）
+// ==========================================
+
+/**
+ * HandleForcedKickNotification
+ *
+ * BP 可调的 UI 跳转入口
+ * 职责: 优先找 LANRoomPage 弹模态对话框(玩家在大厅/选房时被拒)
+ *       兜底找 LoginPage 弹模态对话框(理论上不应该走到这里)
+ *
+ * 实现: 用 UObjectIterator 找 UUserWidget 实例
+ *       (不直接 include .h, 改用反射查找, 降低编译期耦合)
+ *
+ * 注意: LANRoomPage 的 [确认] 按钮只回大厅(不退出账号)
+ *       LoginPage 的 [确认] 按钮回登录页(也不退出账号)
+ *       想退出账号 → 用户自己点 GameMenuPage 的 Btn_BackToLogin
+ */
+void ARoomPlayerController::HandleForcedKickNotification(const FString& Reason)
+{
+	// ==========================================
+	// 1. 优先找 LANRoomPage (玩家在大厅/选房时被拒的场景)
+	// ==========================================
+	if (UUserWidget* LANPageWidget = FindWidgetByClassName(TEXT("LANRoomPage")))
+	{
+		UFunction* ShowFunc = LANPageWidget->FindFunction(TEXT("ShowLANRoomConflictDialog"));
+		if (ShowFunc)
+		{
+			struct { FString Reason; } Params;
+			Params.Reason = Reason;
+			LANPageWidget->ProcessEvent(ShowFunc, &Params);
+
+			if (GEngine)
+			{
+				GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow,
+					TEXT("[Account] 已通知 LANRoomPage 弹模态对话框(回大厅)"));
+			}
+			return;
+		}
+	}
+
+	// ==========================================
+	// 2. 兜底: 理论上 LANRoomPage 一定能找到(冲突就发生在大厅/选房时)
+	//    找不到时走 ExecuteLeaveRoom 直接回大厅(不弹框, 因为没有 UI 可弹)
+	// ==========================================
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow,
+			TEXT("[Account] 强踢通知: 屏幕上没有 LANRoomPage, 直接走 ExecuteLeaveRoom 兜底"));
+	}
+
+	// 直接走 ExecuteLeaveRoom(已经包含了 DestroySession + 0.5s 后回大厅)
+	ExecuteLeaveRoom();
+}
+
+
+/**
+ * FindWidgetByClassName
+ *
+ * 辅助函数: 在当前 World 上按类名查找 UUserWidget 实例
+ * 不直接 include 头文件, 用反射降低耦合
+ *
+ * @param ClassName 短类名(例如 "LANRoomPage")
+ * @return 找到的第一个 UUserWidget 实例, 找不到返回 nullptr
+ */
+UUserWidget* ARoomPlayerController::FindWidgetByClassName(const FString& ClassName) const
+{
+	UWorld* MyWorld = GetWorld();
+	if (!MyWorld)
+	{
+		return nullptr;
+	}
+
+	// 1. 尝试用反射包路径找类(快速路径)
+	UClass* TargetClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/MetalSlug01.%s"), *ClassName));
+	if (!TargetClass)
+	{
+		// 2. 退路: 遍历 UClass 找同名类
+		for (TObjectIterator<UClass> It; It; ++It)
+		{
+			if (It->GetName() == ClassName)
+			{
+				TargetClass = *It;
+				break;
+			}
+		}
+	}
+
+	if (!TargetClass)
+	{
+		return nullptr;
+	}
+
+	// 3. 遍历当前 World 上的 UUserWidget, 找到第一个匹配的
+	for (TObjectIterator<UUserWidget> It; It; ++It)
+	{
+		UUserWidget* Widget = *It;
+		if (Widget && Widget->GetWorld() == MyWorld && Widget->IsA(TargetClass))
+		{
+			return Widget;
+		}
+	}
+
+	return nullptr;
+}
+
+
+// ==========================================
+// 15. 生命周期钩子（新增）
+// ==========================================
+
+/**
+ * EndPlay
+ *
+ * PC 销毁时:
+ * 1. 房主端: 通知权威表清理
+ * 2. 客户端: 主动发下线通知(若有)
+ *
+ * 关键: 用弱引用检查 AccountAuthority 防止野指针
+ */
+void ARoomPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// 0. 停掉心跳定时器(防止回调里访问已销毁的 PC)
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(HeartbeatTimerHandle);
+	}
+
+	// 1. 客户端: 发下线通知(无论房主是否在, 都发, 不等回包)
+	//    注意: PC 已开始销毁, RPC 可能发不出去, 但还是尝试一下
+	if (!MyAccountUsername.IsEmpty() && !MyAccountSessionId.IsEmpty())
+	{
+		Server_NotifyAccountLogout(MyAccountUsername, MyAccountSessionId);
+	}
+
+	// 2. 房主端: 通知权威表清理本 PC 的所有记录
+	if (HasAuthority() && AccountAuthority.IsValid())
+	{
+		AccountAuthority->HandleControllerDestroyed(this);
+	}
+
+	Super::EndPlay(EndPlayReason);
 }

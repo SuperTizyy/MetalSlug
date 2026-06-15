@@ -12,9 +12,9 @@
 #include "Styling/SlateTypes.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Kismet/GameplayStatics.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
 #include "Data/Tables/DailyLoginTableRow.h"
 

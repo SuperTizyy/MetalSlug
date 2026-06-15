@@ -2,7 +2,7 @@
 // UActivitySaveModifierBase 实现 【2026-06-15 重构: 实际持有共享状态】
 // ==========================================
 #include "Tools/ActivitySaveModifierBase.h"
-#include "UI/Activity/Data/ActivitySaveGame.h" // UActivitySaveGame
+#include "Data/ActivitySaveGame.h" // UActivitySaveGame
 #include "Kismet/GameplayStatics.h"
 
 UActivitySaveModifierBase::UActivitySaveModifierBase()

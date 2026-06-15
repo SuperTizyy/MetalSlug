@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Activity/Core/UpgradeActivitySubsystem.h"
+#include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "DayLockHintWidget.generated.h"
 
 

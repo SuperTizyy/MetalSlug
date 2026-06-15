@@ -32,7 +32,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Data/Tables/UpgradeRewardTableRow.h"
 #include "Data/Tables/DailyLoginTableRow.h"
-#include "UI/Activity/Data/ActivitySaveGame.h"
+#include "Data/ActivitySaveGame.h"
 #include "Tools/UpgradeActivitySaveModifier.h"
 #include "UpgradeActivitySubsystem.generated.h"
 

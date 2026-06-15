@@ -19,7 +19,8 @@
 #include "Components/TextBlock.h"
 #include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
+#include "Systems/GameFlowSubsystem.h"
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
 #include "Data/Enums/RoomEnums.h"
 #include "Data/Tables/MapTableRow.h"
@@ -73,6 +74,26 @@ bool ULANRoomPage::Initialize()
 		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_EnterRoom 为空! 请检查蓝图中的变量名是否匹配"));
 	}
 	if (Btn_BackToMenu) Btn_BackToMenu->OnClicked.AddDynamic(this, &ULANRoomPage::OnBackToMenuClicked);
+
+	// ==========================================
+	// 1.5 账号冲突模态对话框初始化（从 LoginPage 迁移）
+	// ==========================================
+	// 默认隐藏冲突弹框
+	if (Overlay_LANRoomConflict)
+	{
+		Overlay_LANRoomConflict->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	// 绑定确认按钮(防呆: 先清理旧绑定, 防止多重绑定)
+	if (Btn_ConfirmLANRoomConflict)
+	{
+		Btn_ConfirmLANRoomConflict->OnClicked.RemoveDynamic(this, &ULANRoomPage::OnConfirmLANRoomConflictClicked);
+		Btn_ConfirmLANRoomConflict->OnClicked.AddDynamic(this, &ULANRoomPage::OnConfirmLANRoomConflictClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_ConfirmLANRoomConflict 为空! 请检查 WBP_LANRoomPage 里是否拖了同名按钮"));
+	}
 
 	// ==========================================
 	// 2. 绑定创房层按钮
@@ -635,33 +656,17 @@ void ULANRoomPage::OnConfirmCreateRoomClicked()
 	// 2. 准备调用引擎底层接口创建真实的局域网会话 (Session)
 	if (Text_CreateRoomHint)
 	{
-		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在创建房间，请稍候...")));
+		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在检查同账号房间，请稍候...")));
 		Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 	}
 
-	// 获取在线子系统 (OnlineSubsystem)
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub)
-	{
-		// 获取会话接口
-		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-		if (Sessions.IsValid())
-		{
-			// 【修复Bug的核心】: 检查是不是内存里卡着一个叫 NAME_GameSession 的旧房间
-			if (Sessions->GetNamedSession(NAME_GameSession) != nullptr)
-			{
-				// 如果有旧的，先绑定销毁回调，然后强制销毁它
-				DestroySessionCompleteDelegateHandle = Sessions->AddOnDestroySessionCompleteDelegate_Handle(
-					FOnDestroySessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnDestroySessionComplete));
-				Sessions->DestroySession(NAME_GameSession);
-			}
-			else
-			{
-				// 如果没有旧的，直接开始创建
-				HostRealSession();
-			}
-		}
-	}
+	// ==========================================
+	// 【核心修复】: 创房前先 FindSessions 查大厅
+	//                防止"同账号已有建房"的情况
+	// ==========================================
+	// 不在这里直接创房, 而是把"创房"动作放到 OnAccountCheckFindSessionsComplete 里
+	// (类似 OnCreateSessionComplete 的延迟逻辑)
+	FindSessionsForAccountCheck();
 }
 
 
@@ -725,6 +730,21 @@ void ULANRoomPage::HostRealSession()
 		// 默认状态标签
 		SessionSettings.Set(FName("ROOM_STATE"), false, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // false=等待中
 		SessionSettings.Set(FName("TOTAL_PLAYERS_WITH_AI"), 1, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // 默认人数
+
+		// ==========================================
+		// 【新增】: 把"房主账号名"也写进 SessionSettings
+		// 用途: 其他人创房前先 FindSessions,
+		//      看到 HOST_ACCOUNT == 自己的账号 → 阻止创房
+		// ==========================================
+		FString HostAccountName = TEXT("");
+		if (UGameInstance* GI = GetGameInstance())
+		{
+			if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+			{
+				HostAccountName = AccountSub->GetCurrentLoggedInUser();
+			}
+		}
+		SessionSettings.Set(FName("HOST_ACCOUNT"), HostAccountName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 
 		// 执行底层创建命令，NAME_GameSession 是引擎默认的当前游戏会话宏
 		Sessions->CreateSession(0, NAME_GameSession, SessionSettings);
@@ -854,4 +874,288 @@ void ULANRoomPage::OnToggleReadyClicked()
 {
 	// 翻转状态
 	bIsReady = !bIsReady;
+}
+
+
+// ==========================================
+// 10. 创房前"同号检查"搜索（新增）
+// ==========================================
+
+/**
+ * FindSessionsForAccountCheck
+ *
+ * 创房前专用搜索: 查大厅是否有"我的账号"已建好的房间
+ *
+ * 设计:
+ *  - 走独立委托句柄 (AccountCheckFindSessionsDelegateHandle)
+ *    不与常规 FindLANRooms 冲突
+ *  - 不刷新 CurrentDisplayedRooms (本函数不显示列表, 只查)
+ *  - 不弹 UI 提示, 回调里集中处理
+ */
+void ULANRoomPage::FindSessionsForAccountCheck()
+{
+	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	if (!OnlineSub || !OnlineSub->GetSessionInterface().IsValid())
+	{
+		// 在线子系统都没, 直接放行让 HostRealSession 自己报错
+		ProceedToCreateRoomAfterCheck();
+		return;
+	}
+
+	IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
+
+	// 防御: 清旧句柄, 防重复订阅
+	Sessions->ClearOnFindSessionsCompleteDelegate_Handle(AccountCheckFindSessionsDelegateHandle);
+
+	// 绑新回调
+	AccountCheckFindSessionsDelegateHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(
+		FOnFindSessionsCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnAccountCheckFindSessionsComplete));
+
+	// 准备搜索配置
+	AccountCheckSessionSearch = MakeShareable(new FOnlineSessionSearch());
+	AccountCheckSessionSearch->bIsLanQuery = true;       // 局域网模式
+	AccountCheckSessionSearch->MaxSearchResults = 100;   // 多查一些, 防止漏
+	AccountCheckSessionSearch->PingBucketSize = 50;
+
+	// 设置查询过滤: 只查 GameSession 类型
+	// 注意: 用字符串 "PRESENCESEARCH" 而非 SEARCH_PRESENCE 宏
+	//       因为原 FindLANRooms 也在用这个字符串, 保证一致性
+	AccountCheckSessionSearch->QuerySettings.Set(FName("PRESENCESEARCH"), true, EOnlineComparisonOp::Equals);
+
+	// 执行搜索
+	Sessions->FindSessions(0, AccountCheckSessionSearch.ToSharedRef());
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
+			TEXT("[CreateRoom] 已发起同号检查搜索, 等待回调..."));
+	}
+}
+
+
+/**
+ * OnAccountCheckFindSessionsComplete
+ *
+ * 同号检查的搜索回调
+ * 1. 遍历所有结果, 比对 HOST_ACCOUNT 字段
+ * 2. 若有同账号建房 → 弹"已有此账户创建的房间"提示, 不创房
+ * 3. 若无 → 继续走真正的创房流程
+ */
+void ULANRoomPage::OnAccountCheckFindSessionsComplete(bool bWasSuccessful)
+{
+	// 退订委托(无论结果如何)
+	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+	{
+		OnlineSub->GetSessionInterface()->ClearOnFindSessionsCompleteDelegate_Handle(AccountCheckFindSessionsDelegateHandle);
+	}
+
+	// 搜索失败: 不当误创房, 让 HostRealSession 自己处理失败
+	if (!bWasSuccessful)
+	{
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow,
+				TEXT("[CreateRoom] 同号检查搜索失败, 放行创房"));
+		}
+		ProceedToCreateRoomAfterCheck();
+		return;
+	}
+
+	// 拿到当前账号名
+	FString MyAccountName = TEXT("");
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		{
+			MyAccountName = AccountSub->GetCurrentLoggedInUser();
+		}
+	}
+
+	if (MyAccountName.IsEmpty())
+	{
+		// 拿不到账号名, 放行让 HostRealSession 处理
+		ProceedToCreateRoomAfterCheck();
+		return;
+	}
+
+	// 遍历所有搜索结果, 查 HOST_ACCOUNT
+	if (AccountCheckSessionSearch.IsValid())
+	{
+		for (const FOnlineSessionSearchResult& Result : AccountCheckSessionSearch->SearchResults)
+		{
+			FString HostAccount = TEXT("");
+			Result.Session.SessionSettings.Get(FName("HOST_ACCOUNT"), HostAccount);
+
+			// ==========================================
+			// 【核心校验】: 同账号已有建房 → 拦截!
+			// ==========================================
+			if (HostAccount.Equals(MyAccountName, ESearchCase::IgnoreCase))
+			{
+				// 弹提示, 阻止创房
+				if (Text_CreateRoomHint)
+				{
+					Text_CreateRoomHint->SetText(FText::FromString(
+						FString::Printf(TEXT("已有此账户 [%s] 创建的房间，请更换账户重试"), *MyAccountName)));
+					Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
+				}
+
+				if (GEngine)
+				{
+					GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+						FString::Printf(TEXT("[CreateRoom] 拦截: 账号 [%s] 已存在建房"), *MyAccountName));
+				}
+
+				// 清缓存, 不创房
+				AccountCheckSessionSearch.Reset();
+				return;
+			}
+		}
+	}
+
+	// 清缓存
+	AccountCheckSessionSearch.Reset();
+
+	// 没有同账号建房, 放行创房
+	ProceedToCreateRoomAfterCheck();
+}
+
+
+/**
+ * ProceedToCreateRoomAfterCheck
+ *
+ * 同号检查通过后, 真正开始执行创房流程
+ * (从原 OnConfirmCreateRoomClicked 末尾搬过来)
+ */
+void ULANRoomPage::ProceedToCreateRoomAfterCheck()
+{
+	// 更新提示
+	if (Text_CreateRoomHint)
+	{
+		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在创建房间，请稍候...")));
+		Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
+	}
+
+	// 获取在线子系统 (OnlineSubsystem)
+	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	if (OnlineSub)
+	{
+		// 获取会话接口
+		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
+		if (Sessions.IsValid())
+		{
+			// 【修复Bug的核心】: 检查是不是内存里卡着一个叫 NAME_GameSession 的旧房间
+			if (Sessions->GetNamedSession(NAME_GameSession) != nullptr)
+			{
+				// 如果有旧的，先绑定销毁回调，然后强制销毁它
+				// 用 Lambda 包裹避免 OnDestroySessionComplete 的私有访问问题
+				DestroySessionCompleteDelegateHandle = Sessions->AddOnDestroySessionCompleteDelegate_Handle(
+					FOnDestroySessionCompleteDelegate::CreateLambda([WeakThis = TWeakObjectPtr<ULANRoomPage>(this)](FName SessionName, bool bWasSuccessful)
+					{
+						if (ULANRoomPage* Self = WeakThis.Get())
+						{
+							Self->OnDestroySessionComplete(SessionName, bWasSuccessful);
+						}
+					}));
+				Sessions->DestroySession(NAME_GameSession);
+			}
+			else
+			{
+				// 如果没有旧的，直接开始创建
+				HostRealSession();
+			}
+		}
+	}
+}
+
+
+// ==========================================
+// 11. 账号冲突模态对话框（从 LoginPage 迁移）
+// ==========================================
+
+/**
+ * ShowLANRoomConflictDialog
+ *
+ * 外部调用入口: 弹模态对话框
+ * 被 ARoomPlayerController::HandleForcedKickNotification 反射调用
+ *
+ * 行为:
+ *  1. 显示 Overlay_LANRoomConflict + Text_ConflictMsg
+ *  2. 改输入模式为 UIOnly(确保鼠标能点按钮)
+ */
+void ULANRoomPage::ShowLANRoomConflictDialog(const FString& Reason)
+{
+	// 1. 显示对话框容器
+	if (Overlay_LANRoomConflict)
+	{
+		Overlay_LANRoomConflict->SetVisibility(ESlateVisibility::Visible);
+	}
+
+	// 2. 显示提示文本
+	if (Text_ConflictMsg)
+	{
+		// 给玩家清晰的提示: 冲突原因 + 操作
+		const FString FullMessage = FString::Printf(
+			TEXT("%s\n\n点 [确认] 返回大厅"),
+			*Reason);
+		Text_ConflictMsg->SetText(FText::FromString(FullMessage));
+	}
+
+	// 3. 输入模式切到 UIOnly + 显示鼠标
+	// 优先用 GetOwningPlayer()，拿不到时用 World->GetFirstPlayerController() 兜底
+	APlayerController* PC = GetOwningPlayer();
+	if (!PC && GetWorld())
+	{
+		PC = GetWorld()->GetFirstPlayerController();
+	}
+
+	if (PC)
+	{
+		FInputModeUIOnly InputMode;
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		PC->SetInputMode(InputMode);
+		PC->SetShowMouseCursor(true);
+	}
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow,
+			FString::Printf(TEXT("[LANRoomPage] 弹冲突对话框: %s"), *Reason));
+	}
+}
+
+
+/**
+ * OnConfirmLANRoomConflictClicked
+ *
+ * 玩家点 [确认] → 切回大厅(不退出账号!)
+ *
+ * 注意: 用户想退出登录, 应该自己到 GameMenuPage 点 Btn_BackToLogin
+ *       这里只负责把玩家带回大厅, 账号保持登录态
+ */
+void ULANRoomPage::OnConfirmLANRoomConflictClicked()
+{
+	// 1. 关闭对话框
+	if (Overlay_LANRoomConflict)
+	{
+		Overlay_LANRoomConflict->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	// 2. 切回大厅(不退出账号)
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSub = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			FlowSub->TransitToState(EMatchState::MainLobby);
+		}
+
+		// 故意不调 AccountSubsystem->Logout()
+		// 用户的账号保持登录态, 切回大厅后可继续操作或自己点 Btn_BackToLogin 换号
+	}
+
+	if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
+			TEXT("[LANRoomPage] 玩家确认, 已返回大厅(账号保持登录)"));
+	}
 }

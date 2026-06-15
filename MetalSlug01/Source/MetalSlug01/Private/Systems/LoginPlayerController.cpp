@@ -16,7 +16,7 @@
 #include "Tools/MetalSlugTestSettings.h"
 
 // 引入账号子系统（用于读取当前登录账号 / 触发 MockLogin）
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
 
 
 // ==========================================

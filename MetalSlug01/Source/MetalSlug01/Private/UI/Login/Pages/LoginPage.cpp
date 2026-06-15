@@ -9,11 +9,12 @@
 #include "Components/Button.h"
 #include "Components/EditableTextBox.h"
 #include "Components/TextBlock.h"
+#include "Components/Overlay.h"
 #include "Kismet/KismetSystemLibrary.h" // 核心: 包含 QuitGame 退出游戏的函数
 // 包含提供游戏基础静态函数的头文件
 #include "Kismet/GameplayStatics.h"
 // 包含我们刚刚写好的全局账号子系统，用于真实的存取逻辑
-#include "UI/Login/Core/AccountSubsystem.h"
+#include "Systems/Account/AccountSubsystem.h"
 // 包含游戏流程管理子系统
 #include "Systems/GameFlowSubsystem.h"
 // 包含玩家控制器的头文件
@@ -272,3 +273,5 @@ void ULoginPage::OnQuitGameClicked()
 	// 调用虚幻引擎底层的退出函数（参数: 当前上下文，控制器，退出方式，是否忽略未保存的关卡直接退）
 	UKismetSystemLibrary::QuitGame(this, SpecificPlayer, EQuitPreference::Quit, true);
 }
+
+

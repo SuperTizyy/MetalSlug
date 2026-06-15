@@ -1,5 +1,5 @@
-﻿#include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Core/RedDotManager.h"
+﻿#include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Activity/RedDotManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口 (替代硬编码路径)

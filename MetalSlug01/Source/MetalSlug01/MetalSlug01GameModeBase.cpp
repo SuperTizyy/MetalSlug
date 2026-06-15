@@ -25,32 +25,32 @@
  */
 AMyGameModeBase::AMyGameModeBase()
 {
-	// ==========================================
-	// 1. 设置默认生成的角色类 (Default Pawn)
-	// ==========================================
-	// 假设你的玩家蓝图路径是 /Content/Blueprints/Characters/BP_MSPlayer.uasset
-	// 注意：路径结尾必须带有 _C 才是引用蓝图生成的类（这是 UE 的硬性约定！）
-	// 目的: 让所有使用本 GameMode 的关卡在玩家加入时自动 Spawn 这个 Pawn
-	static ConstructorHelpers::FClassFinder<APawn> PlayerPawnBPClass(TEXT("/Script/Engine.Blueprint'/Game/Blueprints/Characters/BP_MSPlayer.BP_MSPlayer_C'"));
-
-	// 如果找到了这个蓝图类，就把它设置为默认玩家角色
-	// 引擎在生成玩家时会自动 Spawn 这个类
-	if (PlayerPawnBPClass.Class != nullptr)
-	{
-		DefaultPawnClass = PlayerPawnBPClass.Class;
-	}
-
-	// ==========================================
-	// 2. 如果你有自定义的 PlayerController，也在这里设置
-	// ==========================================
-	// 目的: 用我们自定义的 PlayerController 替代引擎默认的，从而实现自定义输入/UI/相机控制
-	// 当前已注释，留给后续扩展
-	// PlayerControllerClass = AMSPlayerController::StaticClass();
+	// // ==========================================
+	// // 1. 设置默认生成的角色类 (Default Pawn)
+	// // ==========================================
+	// // 假设你的玩家蓝图路径是 /Content/Blueprints/Characters/BP_MSPlayer.uasset
+	// // 注意：路径结尾必须带有 _C 才是引用蓝图生成的类（这是 UE 的硬性约定！）
+	// // 目的: 让所有使用本 GameMode 的关卡在玩家加入时自动 Spawn 这个 Pawn
+	// static ConstructorHelpers::FClassFinder<APawn> PlayerPawnBPClass(TEXT("/Script/Engine.Blueprint'/Game/Blueprints/Characters/BP_MSPlayer.BP_MSPlayer_C'"));
+	//
+	// // 如果找到了这个蓝图类，就把它设置为默认玩家角色
+	// // 引擎在生成玩家时会自动 Spawn 这个类
+	// if (PlayerPawnBPClass.Class != nullptr)
+	// {
+	// 	DefaultPawnClass = PlayerPawnBPClass.Class;
+	// }
+	//
+	// // ==========================================
+	// // 2. 如果你有自定义的 PlayerController，也在这里设置
+	// // ==========================================
+	// // 目的: 用我们自定义的 PlayerController 替代引擎默认的，从而实现自定义输入/UI/相机控制
+	// // 当前已注释，留给后续扩展
+	// // PlayerControllerClass = AMSPlayerController::StaticClass();
 
 	// ==========================================
 	// 3. 绑定自定义 HUD
 	// ==========================================
 	// 所有进入关卡的玩家都会自动获得这个 HUD 实例
 	// 目的: 用我们自己写的 AMyGameHUD 替代引擎默认的 HUD，从而挂载血条/准星/聊天框等
-	HUDClass = AMyGameHUD::StaticClass();
+	//HUDClass = AMyGameHUD::StaticClass();
 }

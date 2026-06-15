@@ -10,7 +10,7 @@
 #include "Components/Widget.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Styling/SlateTypes.h"
-#include "UI/Activity/Core/ActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
 #include "UI/Activity/Pages/DailyLogin/DailyLoginPage.h"  // 临时添加
 #include "Engine/Texture2D.h"
 #include "TimerManager.h"
