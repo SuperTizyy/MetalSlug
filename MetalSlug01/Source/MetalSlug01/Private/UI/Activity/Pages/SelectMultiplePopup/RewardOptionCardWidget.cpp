@@ -13,7 +13,7 @@
 #include "Components/TextBlock.h"
 #include "Components/CheckBox.h"
 #include "Engine/GameInstance.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 
 
 // ==========================================

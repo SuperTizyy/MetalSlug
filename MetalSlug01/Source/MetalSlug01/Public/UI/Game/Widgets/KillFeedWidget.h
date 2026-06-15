@@ -8,7 +8,7 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/Widget.h"
-#include "UI/Login/Data/StaticTable.h" // 引入 EKillMethod 枚举
+#include "Data/Enums/CombatEnums.h" // 引入 EKillMethod 枚举
 #include "KillFeedWidget.generated.h"
 
 // 前向声明

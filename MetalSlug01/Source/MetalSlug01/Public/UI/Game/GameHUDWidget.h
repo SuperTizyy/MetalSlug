@@ -8,7 +8,9 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 // 引入数据表类型（EACERankType、EKillMethod 等）
-#include "UI/Login/Data/StaticTable.h"
+#include "Data/Enums/CombatEnums.h"
+// 引入 ERoomMatchMode 等房间枚举
+#include "Data/Enums/RoomEnums.h"
 #include "GameHUDWidget.generated.h"
 
 // 前向声明所有用到的子控件

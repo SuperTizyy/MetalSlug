@@ -10,7 +10,7 @@
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 #include "Kismet/GameplayStatics.h"

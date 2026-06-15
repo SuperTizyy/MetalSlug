@@ -1,10 +1,10 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
 // ==========================================
 // 引入本类头文件
-#include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/Core/RoomPlayerState.h"
 // 【极其关键】: 必须包含此头文件才能使用 DOREPLIFETIME 宏
 #include "Net/UnrealNetwork.h"
 

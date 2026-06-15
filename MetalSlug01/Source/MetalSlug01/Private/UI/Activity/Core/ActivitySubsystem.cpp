@@ -147,12 +147,12 @@ FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
 	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
 	
 	// 尝试加载现有存档
-	UDailyLoginSaveGame* SaveGameInstance = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0));
+	UActivitySaveGame* SaveGameInstance = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0));
 	
 	if (!SaveGameInstance)
 	{
 		// 如果没有存档，创建新的
-		SaveGameInstance = Cast<UDailyLoginSaveGame>(UGameplayStatics::CreateSaveGameObject(UDailyLoginSaveGame::StaticClass()));
+		SaveGameInstance = Cast<UActivitySaveGame>(UGameplayStatics::CreateSaveGameObject(UActivitySaveGame::StaticClass()));
 		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 创建新的存档实例 for ActivityID=%d"), ActivityID);
 	}
 	else

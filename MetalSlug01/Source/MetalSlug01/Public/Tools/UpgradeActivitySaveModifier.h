@@ -24,14 +24,14 @@
  *
  * 关联:
  * - 上级: UUpgradeActivitySubsystem
- * - 容器: UDailyLoginSaveGame (共享存档槽 "UpgradeReward_SaveSlot")
+ * - 容器: UActivitySaveGame (共享存档槽 "UpgradeReward_SaveSlot")
  */
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/SaveGame.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
+#include "UI/Activity/Data/ActivitySaveGame.h"
 #include "Kismet/GameplayStatics.h"
 #include "Tools/ActivitySaveModifierBase.h" // 改造: 共享基类
 #include "UpgradeActivitySaveModifier.generated.h"
@@ -326,7 +326,7 @@ private:
 	 * @param RecordDate 记录日期
 	 * @return 存档实例
 	 */
-	UDailyLoginSaveGame* GetOrCreateSaveGame(int32 RecordDate);
+	UActivitySaveGame* GetOrCreateSaveGame(int32 RecordDate);
 
 	/**
 	 * @brief 获取记录指针（查询接口内部使用）

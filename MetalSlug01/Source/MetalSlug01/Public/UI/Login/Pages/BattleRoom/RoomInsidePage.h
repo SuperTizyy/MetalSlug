@@ -8,6 +8,7 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/ComboBoxString.h"
+#include "Data/Tables/CharacterTableRow.h"
 #include "RoomInsidePage.generated.h"
 
 // 前向声明所有用到的 UI 控件

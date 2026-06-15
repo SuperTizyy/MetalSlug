@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Login/Data/StaticTable.h" // 引入 ERoomMatchMode
+#include "Data/Enums/RoomEnums.h" // 引入 ERoomMatchMode
 #include "ScoreboardWidget.generated.h"
 
 // 前向声明

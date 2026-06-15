@@ -23,7 +23,7 @@
 #include "Logs/MetalSlugLogChannels.h"
 #include "ActivitySaveModifierBase.generated.h"
 
-class UDailyLoginSaveGame;
+class UActivitySaveGame;
 
 /**
  * @class UActivitySaveModifierBase
@@ -67,7 +67,7 @@ public:
 	 * @brief 通过基类加载/创建存档 (子类的 GetOrCreateSaveGame 应委托到此)
 	 * @details 内部用 Slot/UserIndex 通过 UGameplayStatics 加载
 	 */
-	UDailyLoginSaveGame* GetOrCreateSaveGameBase(int32 ActivityID, const FString& SlotName, int32 UserIndex = 0);
+	UActivitySaveGame* GetOrCreateSaveGameBase(int32 ActivityID, const FString& SlotName, int32 UserIndex = 0);
 
 	/**
 	 * @brief 注册控制台命令 (子类重写以注册自己的命令)
@@ -97,7 +97,7 @@ protected:
 	 * 缓存的存档实例 (供子类共享, 避免每次 LoadGameFromSlot)
 	 */
 	UPROPERTY()
-	UDailyLoginSaveGame* CachedSaveGame;
+	UActivitySaveGame* CachedSaveGame;
 
 	/**
 	 * 是否已初始化

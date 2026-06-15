@@ -21,7 +21,8 @@
 #include "Kismet/GameplayStatics.h"
 #include "UI/Login/Core/AccountSubsystem.h"
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
-#include "UI/Login/Data/StaticTable.h"
+#include "Data/Enums/RoomEnums.h"
+#include "Data/Tables/MapTableRow.h"
 
 
 // ==========================================

@@ -2,7 +2,7 @@
 // UActivitySaveModifierBase 实现 【2026-06-15 重构: 实际持有共享状态】
 // ==========================================
 #include "Tools/ActivitySaveModifierBase.h"
-#include "UI/Activity/Data/DailyLoginSave.h" // UDailyLoginSaveGame
+#include "UI/Activity/Data/ActivitySaveGame.h" // UActivitySaveGame
 #include "Kismet/GameplayStatics.h"
 
 UActivitySaveModifierBase::UActivitySaveModifierBase()
@@ -43,7 +43,7 @@ void UActivitySaveModifierBase::DestroyBase()
 }
 
 
-UDailyLoginSaveGame* UActivitySaveModifierBase::GetOrCreateSaveGameBase(int32 ActivityID, const FString& SlotName, int32 UserIndex)
+UActivitySaveGame* UActivitySaveModifierBase::GetOrCreateSaveGameBase(int32 ActivityID, const FString& SlotName, int32 UserIndex)
 {
 	// 【2026-06-15 修复】: 如果已有缓存直接返回
 	// 修复前: 基类方法被定义但从未被调用, 子类各自实现
@@ -55,7 +55,7 @@ UDailyLoginSaveGame* UActivitySaveModifierBase::GetOrCreateSaveGameBase(int32 Ac
 	// 1. 尝试加载已存在存档
 	if (UGameplayStatics::DoesSaveGameExist(SlotName, UserIndex))
 	{
-		UDailyLoginSaveGame* Loaded = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SlotName, UserIndex));
+		UActivitySaveGame* Loaded = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SlotName, UserIndex));
 		if (Loaded)
 		{
 			CachedSaveGame = Loaded;
@@ -64,7 +64,7 @@ UDailyLoginSaveGame* UActivitySaveModifierBase::GetOrCreateSaveGameBase(int32 Ac
 	}
 
 	// 2. 没有则创建新存档
-	UDailyLoginSaveGame* NewSave = Cast<UDailyLoginSaveGame>(UGameplayStatics::CreateSaveGameObject(UDailyLoginSaveGame::StaticClass()));
+	UActivitySaveGame* NewSave = Cast<UActivitySaveGame>(UGameplayStatics::CreateSaveGameObject(UActivitySaveGame::StaticClass()));
 	if (NewSave)
 	{
 		CachedSaveGame = NewSave;

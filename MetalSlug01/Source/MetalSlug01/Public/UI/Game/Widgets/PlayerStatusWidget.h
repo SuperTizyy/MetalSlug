@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Login/Data/StaticTable.h" // 引入 EACERankType
+#include "Data/Enums/CombatEnums.h" // 引入 EACERankType
 #include "PlayerStatusWidget.generated.h"
 
 // 前向声明

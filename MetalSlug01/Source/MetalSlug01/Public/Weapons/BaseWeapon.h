@@ -12,7 +12,7 @@
 #include "GameFramework/Actor.h"
 
 // 引入 EKillMethod 击杀方式枚举
-#include "UI/Login/Data/StaticTable.h"
+#include "Data/Enums/CombatEnums.h"
 
 // UE 自动生成的头文件
 #include "BaseWeapon.generated.h"

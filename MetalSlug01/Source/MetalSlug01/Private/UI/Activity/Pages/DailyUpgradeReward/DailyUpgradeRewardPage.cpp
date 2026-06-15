@@ -139,7 +139,7 @@
 #include "Engine/EngineTypes.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 #include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyTaskWidget.h"

@@ -7,6 +7,7 @@
 #include "Components/Image.h"
 #include "TimerManager.h"
 #include "Engine/DataTable.h"
+#include "Data/Tables/KillIconTableRow.h"
 
 
 // ==========================================

@@ -32,7 +32,8 @@
 #include "UI/Login/Core/AccountSubsystem.h"
 #include "Components/ComboBoxString.h"
 #include "Engine/DataTable.h"
-#include "UI/Login/Data/StaticTable.h"
+#include "Data/Tables/CharacterTableRow.h"
+#include "Data/Enums/RoomEnums.h"
 #include "Components/UniformGridSlot.h"
 #include "UI/Login/Pages/BattleRoom/WeaponIconWidget.h"
 #include "OnlineSubsystem.h"
@@ -40,7 +41,7 @@
 #include "OnlineSessionSettings.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "Systems/RoomGameState.h"
-#include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/Core/RoomPlayerState.h"
 
 
 // ==========================================

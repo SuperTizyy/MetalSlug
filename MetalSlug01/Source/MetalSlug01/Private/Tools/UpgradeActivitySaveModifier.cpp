@@ -13,7 +13,7 @@
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 #include "Kismet/GameplayStatics.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
+#include "UI/Activity/Data/ActivitySaveGame.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 
 // ==================== 结构体实现 ====================
@@ -431,7 +431,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 
 	// 检查是否已存在
-	UDailyLoginSaveGame* SaveGame = TargetSubsystem->GetSaveGameInstance();
+	UActivitySaveGame* SaveGame = TargetSubsystem->GetSaveGameInstance();
 	if (SaveGame && SaveGame->UpgradeRewardRecords.Contains(RecordDate))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("⚠️ UpgradeActivitySaveModifier: 记录%d已存在"), RecordDate);
@@ -555,7 +555,7 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	// 更新Subsystem中的记录
 	if (!SaveGame)
 	{
-		SaveGame = NewObject<UDailyLoginSaveGame>();
+		SaveGame = NewObject<UActivitySaveGame>();
 	}
 	SaveGame->UpgradeRewardRecords.Add(RecordDate, NewRecord);
 	
@@ -727,7 +727,7 @@ bool UUpgradeActivitySaveModifier::LoadRecord(int32 RecordDate)
 
 	// 使用与Subsystem一致的存档槽位
 	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
-	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
 
@@ -747,7 +747,7 @@ bool UUpgradeActivitySaveModifier::LoadRecord(int32 RecordDate)
 
 // ==================== 内部方法实现 ====================
 
-UDailyLoginSaveGame* UUpgradeActivitySaveModifier::GetOrCreateSaveGame(int32 RecordDate)
+UActivitySaveGame* UUpgradeActivitySaveModifier::GetOrCreateSaveGame(int32 RecordDate)
 {
 	if (CachedSaveGame)
 	{
@@ -756,15 +756,15 @@ UDailyLoginSaveGame* UUpgradeActivitySaveModifier::GetOrCreateSaveGame(int32 Rec
 
 	// 尝试加载现有存档 - 使用与Subsystem一致的存档槽位
 	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
-	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
 
 	if (!LoadedSaveGame)
 	{
 		// 创建新的存档
-		LoadedSaveGame = Cast<UDailyLoginSaveGame>(
-			UGameplayStatics::CreateSaveGameObject(UDailyLoginSaveGame::StaticClass())
+		LoadedSaveGame = Cast<UActivitySaveGame>(
+			UGameplayStatics::CreateSaveGameObject(UActivitySaveGame::StaticClass())
 		);
 
 		if (LoadedSaveGame)

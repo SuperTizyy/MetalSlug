@@ -3,7 +3,6 @@
 // ==========================================
 #include "Components/EnergyComponent.h"
 #include "Logs/MetalSlugLogChannels.h"
-#include "Net/UnrealNetwork.h"
 
 UEnergyComponent::UEnergyComponent()
 {
@@ -19,8 +18,9 @@ void UEnergyComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	// 同步 CurrentEnergy 到所有客户端
-	DOREPLIFETIME(UEnergyComponent, CurrentEnergy);
+	// 【修复 Q4】: SetIsReplicatedByDefault(true) 已自动复制所有 UPROPERTY
+	// DOREPLIFETIME 是冗余的（且会与 ReplicatedUsing 产生双重复制通知），删除之
+	// CurrentEnergy 的 ReplicatedUsing=OnRep_CurrentEnergy 单独生效
 }
 
 

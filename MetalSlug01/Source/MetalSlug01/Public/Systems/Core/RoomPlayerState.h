@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 #pragma once
 
@@ -12,7 +12,6 @@
 #include "GameFramework/PlayerState.h"
 
 // 引入房间相关枚举（ERoomTeam 等）
-// 改造: 改为精确子表头
 #include "Data/Enums/RoomEnums.h"
 
 // UE 自动生成的头文件

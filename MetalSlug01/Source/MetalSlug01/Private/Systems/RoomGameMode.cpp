@@ -34,7 +34,9 @@
 #include "Kismet/GameplayStatics.h"
 
 // 引入房间相关枚举
-#include "UI/Login/Data/StaticTable.h"
+#include "Data/Enums/CombatEnums.h"
+#include "Data/Enums/RoomEnums.h"
+#include "Data/Tables/CharacterTableRow.h"
 
 // 引入武器基类
 #include "Weapons/BaseWeapon.h"
@@ -55,7 +57,7 @@
 #include "UI/MyGameHUD.h"
 
 // 引入房间 PlayerState
-#include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/Core/RoomPlayerState.h"
 
 // 引入胶囊体组件（用于获取角色位置）
 #include "Components/CapsuleComponent.h"

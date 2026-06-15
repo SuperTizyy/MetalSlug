@@ -7,12 +7,13 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"  // 包含整合后的 FRedDotData
+#include "Data/Tables/ActivityTableRow.h"
+#include "Data/Tables/ItemTableRow.h"  // 包含整合后的 FRedDotData
 #include "RedDotManager.generated.h"
 
 class UActivitySubsystem;
 
-// 注意: FRedDotData 结构体现在已在 DailyLoginConfig.h 中统一管理
+// 注意: FRedDotData 结构体已在 Data/Tables/ItemTableRow.h 中统一管理
 
 
 /**

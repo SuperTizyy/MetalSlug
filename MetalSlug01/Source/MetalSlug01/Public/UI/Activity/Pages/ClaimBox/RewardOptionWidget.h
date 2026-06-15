@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 #include "RewardOptionWidget.generated.h"
 
 

@@ -7,7 +7,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomPlayerController.h"
-#include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/Core/RoomPlayerState.h"
 
 bool UScoreboardWidget::Initialize()
 {

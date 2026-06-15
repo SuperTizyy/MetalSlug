@@ -16,7 +16,7 @@
 #include "Blueprint/UserWidget.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 
 // UE 会自动生成构造函数，无需手动实现
 

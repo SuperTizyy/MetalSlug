@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 // 移除导航相关包含，保持每日登录功能纯净
 #include "DailyLoginPage.generated.h"
 

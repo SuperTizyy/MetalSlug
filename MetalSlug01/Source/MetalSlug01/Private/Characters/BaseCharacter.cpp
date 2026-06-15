@@ -29,11 +29,13 @@
 #include "Weapons/BaseWeapon.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
-#include "UI/Login/Core/RoomPlayerState.h"
+#include "Systems/Core/RoomPlayerState.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomPlayerController.h"
 #include "Kismet/GameplayStatics.h"
+#include "Data/Tables/WeaponTableRow.h"
+#include "Data/Tables/CharacterTableRow.h"
 
 // ==========================================
 // 1. 构造函数
@@ -143,13 +145,13 @@ void ABaseCharacter::BeginPlay()
 	// 客户端: Component->OnRep_CurrentHealth 内部 Broadcast
 	if (HealthComponent)
 	{
-		HealthComponent->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleHealthChanged);
+		HealthComponent->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthChanged_Callback);
 	}
 }
 
 
 /**
- * ABaseCharacter::HandleHealthChanged
+ * ABaseCharacter::OnHealthChanged_Callback
  *
  * 【2026-06-15 新增】: HealthComponent->OnHealthChanged 事件回调
  * 用途: 血量变化时刷新 HUD (替代原 OnRep_Health)
@@ -157,7 +159,7 @@ void ABaseCharacter::BeginPlay()
  *   - 服务器: HealthComponent::ApplyDamage / Heal 内部 Broadcast
  *   - 客户端: HealthComponent::OnRep_CurrentHealth 内部 Broadcast
  */
-void ABaseCharacter::HandleHealthChanged(float NewHealth)
+void ABaseCharacter::OnHealthChanged_Callback(float NewHealth)
 {
 	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
 	if (TryResolveHUDWidget(false) && HealthComponent)
@@ -301,34 +303,15 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 同步AC/ACE值（注意: MaxAC 是配置常量，无需网络同步）
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
+	// 【修复 Q3】: LastKillMethod 声明了 UPROPERTY(Replicated), 必须加入 DOREPLIFETIME
+	// 背景: Multicast_NotifyKill 在所有客户端读取 LastKillMethod, 若不复制则永远是默认值
+	DOREPLIFETIME(ABaseCharacter, LastKillMethod);
 }
 
 
 // ==========================================
 // 5. 客户端 OnRep 回调
 // ==========================================
-
-/**
- * OnRep_Health
- *
- * 【2026-06-15 重构】: 字段已下沉,此回调废弃
- * 实际血量变化通知改走 HealthComponent->OnHealthChanged 多播
- * 保留函数体仅为兼容(目前已无 UPROPERTY(ReplicatedUsing) 触发它)
- */
-void ABaseCharacter::OnRep_Health()
-{
-	// 【2026-06-15 重构】: 字段已下沉到 HealthComponent, 此回调实为废弃路径
-	// (曾有 UPROPERTY(ReplicatedUsing=OnRep_Health) 现已移除)
-	// 实际血量变化通知通过 HealthComponent->OnHealthChanged 事件, 由 HandleHealthChanged 处理
-	// 此处仅作防御性更新(代码可达但不会自动触发)
-	if (TryResolveHUDWidget(false))
-	{
-		if (HealthComponent)
-		{
-			GameHUDWidget->UpdateHealth(HealthComponent->GetCurrent(), HealthComponent->GetMax());
-		}
-	}
-}
 
 
 /**
@@ -340,7 +323,9 @@ void ABaseCharacter::OnRep_Health()
  */
 void ABaseCharacter::Client_UpdateHealthDisplay_Implementation(float Current, float Max)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[Health] Client_UpdateHealthDisplay 收到: %.1f/%.1f"), Current, Max);
+	// 【2026-06-15 废弃】: 形参 Current/Max 未使用(内部改用 RefreshHUDFromCurrentState)
+	// 保留实现体仅为兼容旧蓝图调用方(如有)
+	UE_LOG(LogTemp, Warning, TEXT("[Health] Client_UpdateHealthDisplay 已废弃,改用 HealthComponent 事件"));
 	RefreshHUDFromCurrentState();
 }
 

@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Login/Data/StaticTable.h" // 引入 EKillStreakType 枚举
+#include "Data/Enums/CombatEnums.h" // 引入 EKillStreakType 枚举
 #include "KillStreakWidget.generated.h"
 
 class UImage;

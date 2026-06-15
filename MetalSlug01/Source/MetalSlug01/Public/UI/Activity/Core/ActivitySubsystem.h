@@ -4,8 +4,10 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
+#include "Data/Tables/DailyLoginTableRow.h"
+#include "Data/Tables/ActivityTableRow.h"
+#include "Data/Tables/ItemTableRow.h"
+#include "UI/Activity/Data/ActivitySaveGame.h"
 #include "UI/Activity/Core/RedDotManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "UObject/WeakObjectPtrTemplates.h"
@@ -25,8 +27,8 @@ class UDailyLoginPage; // 前向声明: 避免 Widget 头文件反向依赖 Subs
  *
  * 职责说明:
  * 1. 管理 URedDotManager 等子管理器
- * 2. 加载 DataTable (DT_ActivityInfoRow / DT_DailyLoginConfig / DT_ItemDetail / DT_TreasureBoxItem)
- * 3. 持久化玩家活动进度（FPlayerLoginRecord -> UDailyLoginSaveGame）
+ * 2. 加载 DataTable (DT_ActivityInfo / DT_DailyLoginConfig / DT_ItemDetail / DT_TreasureBoxItem)
+ * 3. 持久化玩家活动进度（FPlayerLoginRecord -> UActivitySaveGame）
  * 4. 提供 Page 注册表（弱引用）供 CheatWidget 等外部模块查询
  * 5. 调度存档修改器 UDailyLoginSaveModifier 提供动态调试能力
  * 6. 暴露数据变更事件 OnActivityDataChanged 供 UI 订阅
@@ -207,7 +209,7 @@ private:
 	// ================= SaveGame 缓存 =================
 		
 	UPROPERTY()
-	UDailyLoginSaveGame* CachedSaveGame = nullptr;
+	UActivitySaveGame* CachedSaveGame = nullptr;
 
 	// ================= 动态存档修改器 =================
 

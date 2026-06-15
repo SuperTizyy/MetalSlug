@@ -5,8 +5,7 @@
 // ==========================================
 #include "UI/Activity/Pages/Navigation/ActivityNavMenuWidget.h"
 #include "UI/Activity/Core/ActivitySubsystem.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
+#include "UI/Activity/Data/ActivitySaveGame.h"
 #include "Components/Button.h"
 #include "Components/VerticalBox.h"
 #include "Components/TextBlock.h"

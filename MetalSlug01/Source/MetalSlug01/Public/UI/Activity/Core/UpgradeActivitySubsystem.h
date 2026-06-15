@@ -30,8 +30,9 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
-#include "UI/Activity/Data/DailyLoginSave.h"
+#include "Data/Tables/UpgradeRewardTableRow.h"
+#include "Data/Tables/DailyLoginTableRow.h"
+#include "UI/Activity/Data/ActivitySaveGame.h"
 #include "Tools/UpgradeActivitySaveModifier.h"
 #include "UpgradeActivitySubsystem.generated.h"
 
@@ -462,7 +463,7 @@ public:
      * @return 存档游戏实例指针，如果加载失败则返回nullptr
      * @details 从磁盘加载存档游戏实例，用于访问所有记录数据
      */
-    UDailyLoginSaveGame* GetSaveGameInstance() const;
+    UActivitySaveGame* GetSaveGameInstance() const;
 
 
 private:

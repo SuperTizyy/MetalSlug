@@ -1,16 +1,16 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 #pragma once
 
 // ==========================================
 // 头文件包含说明
 // ==========================================
-// 【关键修复 3】让这个纸箱类认识你的"档案袋"结构体
-#include "UI/Login/Data/DynamicTable.h"
 // UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
 // 引入 UE 原生 USaveGame 类（基类）
 #include "GameFramework/SaveGame.h"
+// 【关键修复 3】让这个纸箱类认识你的"档案袋"结构体
+#include "Account/AccountSaveTypes.h"
 // UE 自动生成的头文件
 #include "AccountSaveGame.generated.h"
 

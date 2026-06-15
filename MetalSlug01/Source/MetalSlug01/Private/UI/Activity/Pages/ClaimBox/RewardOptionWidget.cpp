@@ -5,7 +5,7 @@
 // ==========================================
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Components/Button.h"
-#include "UI/Activity/Data/DailyLoginConfig.h"
+#include "Data/Tables/DailyLoginTableRow.h"
 #include "UI/Activity/Core/UpgradeActivitySubsystem.h"
 
 

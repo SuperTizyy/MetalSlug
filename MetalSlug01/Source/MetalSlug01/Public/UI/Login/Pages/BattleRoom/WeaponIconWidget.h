@@ -7,7 +7,7 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "UI/Login/Data/StaticTable.h" // 【极其重要】: 包含 FWeaponInfo 结构体定义
+#include "Data/Tables/WeaponTableRow.h" // 【极其重要】: 包含 FWeaponInfo 结构体定义
 #include "WeaponIconWidget.generated.h"
 
 // 前向声明

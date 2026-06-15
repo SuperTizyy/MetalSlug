@@ -58,7 +58,7 @@ bool UDailyLoginSaveModifier::ModifyPlayerProgress(int32 ActivityID, int32 NewPr
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
@@ -103,7 +103,7 @@ bool UDailyLoginSaveModifier::ModifyDayClaimedStatus(int32 ActivityID, int32 Day
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
@@ -167,7 +167,7 @@ bool UDailyLoginSaveModifier::ModifyClaimedDays(int32 ActivityID, const TArray<i
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
@@ -227,7 +227,7 @@ bool UDailyLoginSaveModifier::ModifyCurrentClaimCount(int32 ActivityID, int32 Ne
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
@@ -266,7 +266,7 @@ bool UDailyLoginSaveModifier::ResetPlayerRecord(int32 ActivityID, bool bAutoSave
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 无法获取存档实例"));
@@ -457,7 +457,7 @@ bool UDailyLoginSaveModifier::LoadActivityRecord(int32 ActivityID)
 	}
 
 	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
-	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
 
@@ -477,7 +477,7 @@ bool UDailyLoginSaveModifier::LoadActivityRecord(int32 ActivityID)
 
 // ==================== 内部方法实现 ====================
 
-UDailyLoginSaveGame* UDailyLoginSaveModifier::GetOrCreateSaveGame(int32 ActivityID)
+UActivitySaveGame* UDailyLoginSaveModifier::GetOrCreateSaveGame(int32 ActivityID)
 {
 	if (CachedSaveGame)
 	{
@@ -486,15 +486,15 @@ UDailyLoginSaveGame* UDailyLoginSaveModifier::GetOrCreateSaveGame(int32 Activity
 
 	// 尝试加载现有存档
 	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
-	UDailyLoginSaveGame* LoadedSaveGame = Cast<UDailyLoginSaveGame>(
+	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
 
 	if (!LoadedSaveGame)
 	{
 		// 创建新的存档
-		LoadedSaveGame = Cast<UDailyLoginSaveGame>(
-			UGameplayStatics::CreateSaveGameObject(UDailyLoginSaveGame::StaticClass())
+		LoadedSaveGame = Cast<UActivitySaveGame>(
+			UGameplayStatics::CreateSaveGameObject(UActivitySaveGame::StaticClass())
 		);
 
 		if (LoadedSaveGame)
@@ -666,7 +666,7 @@ bool UDailyLoginSaveModifier::ResetDailyLoginData(int32 ActivityID, bool bAutoSa
 		return false;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		return false;
@@ -734,7 +734,7 @@ void UDailyLoginSaveModifier::DisplayDailyLoginInfo(int32 ActivityID)
 		return;
 	}
 
-	UDailyLoginSaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
+	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
 	if (!SaveGame)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("DailyLoginSaveModifier: 未找到活动%d的存档数据"), ActivityID);

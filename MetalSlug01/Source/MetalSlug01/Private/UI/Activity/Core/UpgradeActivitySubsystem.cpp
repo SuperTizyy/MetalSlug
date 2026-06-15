@@ -53,7 +53,7 @@ void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // 2. 检查并创建初始记录 - 确保系统有最新的记录
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
     {
-        UDailyLoginSaveGame* Loaded = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+        UActivitySaveGame* Loaded = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
         if (Loaded && Loaded->UpgradeRewardRecords.Num() > 0)
         {
             // 存档存在且包含记录，加载最新的记录（不管RecordDate是多少）
@@ -127,7 +127,7 @@ void UUpgradeActivitySubsystem::ReloadLatestRecord()
 {
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
     {
-        UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
+        UActivitySaveGame* LoadedSave = Cast<UActivitySaveGame>(
             UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
 
         if (LoadedSave && LoadedSave->UpgradeRewardRecords.Num() > 0)
@@ -444,11 +444,11 @@ bool UUpgradeActivitySubsystem::CanClaimTask(int32 TaskIndex) const
 void UUpgradeActivitySubsystem::SaveStatus()
 {
     // 保存到现有的DailyLoginSaveGame中 - 与登录系统共享同一个存档文件
-    UDailyLoginSaveGame* SaveGame = Cast<UDailyLoginSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+    UActivitySaveGame* SaveGame = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
     if (!SaveGame)
     {
         // 没有现有存档，创建新的存档对象
-        SaveGame = NewObject<UDailyLoginSaveGame>();
+        SaveGame = NewObject<UActivitySaveGame>();
     }
 
     // 更新或添加所有升级奖励记录 - 保存 AllRecords 中的所有数据
@@ -656,7 +656,7 @@ int32 UUpgradeActivitySubsystem::GetMaxRecordDate() const
     }
 
     // 内存数据为空，从存档数据获取
-    UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
+    UActivitySaveGame* LoadedSave = Cast<UActivitySaveGame>(
         UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
 
     if (!LoadedSave || LoadedSave->UpgradeRewardRecords.Num() == 0)
@@ -1088,7 +1088,7 @@ void UUpgradeActivitySubsystem::ProcessSaveRecordLogic()
 const FUpgradeRewardSaveRecord* UUpgradeActivitySubsystem::GetLatestSaveRecord() const
 {
     // 加载存档数据
-    UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
+    UActivitySaveGame* LoadedSave = Cast<UActivitySaveGame>(
         UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
 
     if (!LoadedSave || LoadedSave->UpgradeRewardRecords.Num() == 0)
@@ -1112,10 +1112,10 @@ const FUpgradeRewardSaveRecord* UUpgradeActivitySubsystem::GetLatestSaveRecord()
     return LatestRecord;
 }
 
-UDailyLoginSaveGame* UUpgradeActivitySubsystem::GetSaveGameInstance() const
+UActivitySaveGame* UUpgradeActivitySubsystem::GetSaveGameInstance() const
 {
     // 加载存档数据
-    UDailyLoginSaveGame* LoadedSave = Cast<UDailyLoginSaveGame>(
+    UActivitySaveGame* LoadedSave = Cast<UActivitySaveGame>(
         UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
 
     if (!LoadedSave)
