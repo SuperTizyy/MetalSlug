@@ -28,29 +28,12 @@
 #include "TimerManager.h" // 为了使用定时器
 #include "Weapons/BaseWeapon.h"
 #include "UI/MyGameHUD.h"
-#include "UI/Login/Data/StaticTable.h"
+#include "UI/Game/GameHUDWidget.h"
 #include "UI/Login/Core/RoomPlayerState.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomGameMode.h"
-#include "Kismet/GameplayStatics.h"
-#include "UI/Game/GameHUDWidget.h"
 #include "Systems/RoomPlayerController.h"
-#include "Kismet/KismetMathLibrary.h"
-#include "PhysicalMaterials/PhysicalMaterial.h"
-#include "Components/AudioComponent.h"
-
-// 脚步声 CVar 定义（控制台命令: g.FootstepVolume）
-// 使用 IConsoleManager 在构造函数外静态定义
-static TAutoConsoleVariable<float> CVarFootstepVolume(
-	TEXT("g.FootstepVolume"),
-	1.0f,
-	TEXT("Footstep volume multiplier (0.0 to 2.0).\n")
-	TEXT("Default: 1.0"),
-	ECVF_Default);
-
-// 初始化静态成员
-float ABaseCharacter::FootstepVolumeCVar = 1.0f;
-
+#include "Kismet/GameplayStatics.h"
 
 // ==========================================
 // 1. 构造函数
@@ -74,10 +57,7 @@ ABaseCharacter::ABaseCharacter()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	// 1. 极其关键: 开启角色的网络同步
-	bReplicates = true;
-
-	// 允许武器本身在网络中存在
+	// 极其关键: 开启角色的网络同步
 	bReplicates = true;
 
 	// ==========================================
@@ -95,6 +75,15 @@ ABaseCharacter::ABaseCharacter()
 	FollowCamera->bUsePawnControlRotation = false; // 相机本身不转，跟着弹簧臂转就行
 
 	// ==========================================
+	// 3. 业务组件 (改造: 从内联字段抽离为 ActorComponent)
+	// ==========================================
+	// 优势: 业务逻辑独立测试, 可被多个角色类复用, 单元可被替换
+	HealthComponent   = CreateDefaultSubobject<UHealthComponent>(TEXT("HealthComponent"));
+	EnergyComponent   = CreateDefaultSubobject<UEnergyComponent>(TEXT("EnergyComponent"));
+	DissolveComponent = CreateDefaultSubobject<UDissolveComponent>(TEXT("DissolveComponent"));
+	FootstepComponent = CreateDefaultSubobject<UFootstepComponent>(TEXT("FootstepComponent"));
+
+	// ==========================================
 	// 角色模型设置
 	// ==========================================
 	// 【关键修改】: 允许玩家自己看到自己的全身模型
@@ -102,14 +91,12 @@ ABaseCharacter::ABaseCharacter()
 	GetMesh()->SetRelativeLocation(FVector(0.f, 0.f, -90.f)); // 往下挪一点，对齐胶囊体底盘
 	GetMesh()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f)); // 把脸转到正前方
 
-	// 5. 初始化战斗属性
-	MaxHealth = 100.0f;
-	CurrentHealth = MaxHealth;
-	bIsDead = false; // 初始化存活
-
-	// 初始化能量系统
-	MaxEnergy = 100.0f;
-	CurrentEnergy = MaxEnergy;
+	// 5. 【2026-06-15 重构】初始化战斗属性
+	// 注: MaxHealth/CurrentHealth/bIsDead 已下沉到 HealthComponent
+	//     MaxEnergy/CurrentEnergy 已下沉到 EnergyComponent
+	// 业务组件初始化: 由各 Component 自治 (均已开启 Replicated)
+	// HealthComponent 和 EnergyComponent 的初值在 CreateDefaultSubobject 时由 UPROPERTY 默认值决定
+	// 如需自定义初值，可在蓝图子类中覆盖 UPROPERTY 的默认值
 
 	// 初始化AC/ACE系统
 	MaxAC = 100;
@@ -144,25 +131,81 @@ ABaseCharacter::ABaseCharacter()
  * ABaseCharacter::BeginPlay
  *
  * 在角色被初始化时调用
- * 关键: 初始化动态材质实例数组（用于死亡溶解特效）
+ * 【2026-06-15 重构】: 溶解材质初始化已迁移到 DissolveComponent::CollectDynamicMaterials
  */
 void ABaseCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 【新增】: 初始化动态材质
-	if (GetMesh())
+	// 【2026-06-15 重构】: 订阅 HealthComponent 事件
+	// 原因: 血量数据已下沉到 Component, BaseCharacter 通过事件转发来驱动 HUD 刷新
+	// 服务器: Component->ApplyDamage/Heal 内部 Broadcast
+	// 客户端: Component->OnRep_CurrentHealth 内部 Broadcast
+	if (HealthComponent)
 	{
-		int32 MaterialCount = GetMesh()->GetNumMaterials();
-		for (int32 i = 0; i < MaterialCount; i++)
-		{
-			UMaterialInstanceDynamic* DynamicMat = GetMesh()->CreateDynamicMaterialInstance(i);
-			if (DynamicMat)
-			{
-				DynamicMaterials.Add(DynamicMat);
-			}
-		}
+		HealthComponent->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleHealthChanged);
 	}
+}
+
+
+/**
+ * ABaseCharacter::HandleHealthChanged
+ *
+ * 【2026-06-15 新增】: HealthComponent->OnHealthChanged 事件回调
+ * 用途: 血量变化时刷新 HUD (替代原 OnRep_Health)
+ * 调用时机:
+ *   - 服务器: HealthComponent::ApplyDamage / Heal 内部 Broadcast
+ *   - 客户端: HealthComponent::OnRep_CurrentHealth 内部 Broadcast
+ */
+void ABaseCharacter::HandleHealthChanged(float NewHealth)
+{
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (TryResolveHUDWidget(false) && HealthComponent)
+	{
+		GameHUDWidget->UpdateHealth(NewHealth, HealthComponent->GetMax());
+		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(NewHealth), FMath::CeilToInt(HealthComponent->GetMax()));
+	}
+}
+
+
+/**
+ * ABaseCharacter::EndPlay
+ *
+ * 【2026-06-15 新增】: 工业规范 - 显式清理所有由自身注册的 Timer
+ *
+ * 调用时机:
+ * 1. 角色被销毁(死亡后服务器销毁旧角色、客户端主动离开)
+ * 2. 角色离开世界(切关、玩家掉线)
+ *
+ * 为什么需要显式清理:
+ * - UE 内部虽会通过 OnDestroyed 自动清理成员绑定的 Timer,但自动清理是"被动响应"
+ * - 显式清理可以: (1) 立即释放 TimerManager 槽位 (2) 防止死亡流程未触发 timer 残留
+ * - 极端情况下(快速死亡-重生-再死亡),残留 timer 会在新角色上误触发
+ *
+ * 防御性编程:
+ * - 每个 ClearTimer 调用前先检查 World 有效性(EndPlay 时可能已无 World)
+ * - 使用 IsTimerActive 判断避免无谓调用(可选,ClearTimer 本来就幂等)
+ */
+void ABaseCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// 防御: EndPlay 时 World 可能已无效(切关时序问题)
+	if (UWorld* World = GetWorld())
+	{
+		FTimerManager& TM = World->GetTimerManager();
+
+		// 清理死亡流程相关的 timer
+		// 这两个 timer 在快速死亡-重生-再死亡场景下会产生残留,必须显式清理
+		// 注: DissolveTimerHandle 已迁移到 DissolveComponent, 由其自行清理
+		TM.ClearTimer(WeaponDestroyTimerHandle);
+		TM.ClearTimer(RagdollTimerHandle);
+
+		// 清理延迟重试 timer
+		// 这两个 timer 通过 this 绑定,UE 内部会自动清理,但显式清理更安全
+		TM.ClearTimer(CharacterIconRefreshTimerHandle);
+		TM.ClearTimer(HUDRefreshTimerHandle);
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 
@@ -195,7 +238,7 @@ void ABaseCharacter::Tick(float DeltaTime)
 	// ==========================================
 	// 生命/能量回复系统
 	// ==========================================
-	if (!bIsDead && HasAuthority())
+	if (!IsDead() && HasAuthority())
 	{
 		// 检测角色是否在移动
 		FVector Velocity = GetVelocity();
@@ -219,41 +262,17 @@ void ABaseCharacter::Tick(float DeltaTime)
 		// 执行回复
 		if (bIsRegenerating)
 		{
-			// 回复生命值
-			if (CurrentHealth < MaxHealth)
+			// 回复生命值 - 【2026-06-15 重构】通过 HealthComponent
+			if (HealthComponent && HealthComponent->GetCurrent() < HealthComponent->GetMax())
 			{
-				CurrentHealth = FMath::Clamp(CurrentHealth + HealthRegenRate * DeltaTime, 0.0f, MaxHealth);
+				HealthComponent->Heal(HealthRegenRate * DeltaTime);
 			}
 
-			// 回复能量值
-			if (CurrentEnergy < MaxEnergy)
+			// 回复能量值 - 【2026-06-15 重构】通过 EnergyComponent
+			if (EnergyComponent)
 			{
-				CurrentEnergy = FMath::Clamp(CurrentEnergy + EnergyRegenRate * DeltaTime, 0.0f, MaxEnergy);
+				EnergyComponent->Add(EnergyRegenRate * DeltaTime);
 			}
-		}
-	}
-
-	// ==========================================
-	// 死亡溶解特效
-	// ==========================================
-	if (bStartDissolving)
-	{
-		// 1. 累加溶解值
-		CurrentDissolveValue += DeltaTime * DissolveSpeed;
-
-		// 2. 更新所有材质槽的 "DissolveAmount" 参数 (需与材质球中的命名一致)
-		for (UMaterialInstanceDynamic* Mat : DynamicMaterials)
-		{
-			if (Mat)
-			{
-				Mat->SetScalarParameterValue(FName("DissolveAmount"), CurrentDissolveValue);
-			}
-		}
-
-		// 3. 当完全溶解（值超过1）时，销毁尸体
-		if (CurrentDissolveValue >= 1.1f) // 给一点余量确保完全消失
-		{
-			Destroy();
 		}
 	}
 }
@@ -273,13 +292,12 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	// 同步生命值
-	DOREPLIFETIME(ABaseCharacter, CurrentHealth);
-	DOREPLIFETIME(ABaseCharacter, bIsDead); // 同步死亡状态
-	// 同步武器指针，让所有人都知道你拿了什么武器
+	// 【2026-06-15 重构】删除对 CurrentHealth/bIsDead 的 DOREPLIFETIME
+	// 这两个字段已下沉到 HealthComponent, 复制由 Component 自治
+	// 【2026-06-15 重构】删除对 CurrentEnergy 的 DOREPLIFETIME
+	// 已下沉到 EnergyComponent, 复制由 Component 自治
+	// 同步武器指针, 让所有人都知道你拿了什么武器
 	DOREPLIFETIME(ABaseCharacter, CurrentWeapon);
-	// 同步能量值
-	DOREPLIFETIME(ABaseCharacter, CurrentEnergy);
 	// 同步AC/ACE值（注意: MaxAC 是配置常量，无需网络同步）
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
@@ -293,23 +311,23 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 /**
  * OnRep_Health
  *
- * 生命值改变时的客户端回调
- * 架构说明: OnRep_Health 在所有机器（服务器+所有客户端）触发
- * - 服务器端: 直接在服务器更新 HUD
- * - 客户端: 直接在客户端更新 HUD
+ * 【2026-06-15 重构】: 字段已下沉,此回调废弃
+ * 实际血量变化通知改走 HealthComponent->OnHealthChanged 多播
+ * 保留函数体仅为兼容(目前已无 UPROPERTY(ReplicatedUsing) 触发它)
  */
 void ABaseCharacter::OnRep_Health()
 {
-	// 【架构说明】: OnRep_Health 在所有机器（服务器+所有客户端）触发
-	// 服务器端: 直接在服务器更新 HUD（服务器没有 HUD 但代码安全执行）
-	// 客户端: 直接在客户端更新 HUD（因为 OnRep 在客户端执行，GameHUDWidget 已是本客户端的 HUD）
-	if (GameHUDWidget)
+	// 【2026-06-15 重构】: 字段已下沉到 HealthComponent, 此回调实为废弃路径
+	// (曾有 UPROPERTY(ReplicatedUsing=OnRep_Health) 现已移除)
+	// 实际血量变化通知通过 HealthComponent->OnHealthChanged 事件, 由 HandleHealthChanged 处理
+	// 此处仅作防御性更新(代码可达但不会自动触发)
+	if (TryResolveHUDWidget(false))
 	{
-		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
-		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
+		if (HealthComponent)
+		{
+			GameHUDWidget->UpdateHealth(HealthComponent->GetCurrent(), HealthComponent->GetMax());
+		}
 	}
-	UE_LOG(LogTemp, Warning, TEXT("[Health] OnRep_Health 触发，Health=%.1f/%.1f，HUD=%s"),
-		CurrentHealth, MaxHealth, *GetNameSafe(GameHUDWidget));
 }
 
 
@@ -317,33 +335,13 @@ void ABaseCharacter::OnRep_Health()
  * Client_UpdateHealthDisplay_Implementation
  *
  * Client RPC: 服务器主动通知所属客户端刷新血量
+ * 【2026-06-15 重构】: 改用 RefreshHUDFromCurrentState (全量刷新,包含能量/AC)
  * 解决远程玩家受伤血条不扣的问题
  */
 void ABaseCharacter::Client_UpdateHealthDisplay_Implementation(float Current, float Max)
 {
-	// 【保留 Client RPC】: 供外部手动触发 HUD 刷新时使用（如扣血时从外部调用）
 	UE_LOG(LogTemp, Warning, TEXT("[Health] Client_UpdateHealthDisplay 收到: %.1f/%.1f"), Current, Max);
-	if (GameHUDWidget)
-	{
-		GameHUDWidget->UpdateHealth(Current, Max);
-		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
-	}
-}
-
-
-/**
- * OnRep_Energy
- *
- * 能量改变时的客户端回调
- */
-void ABaseCharacter::OnRep_Energy()
-{
-	// 【架构说明】: OnRep_Energy 在所有机器触发，直接更新 HUD
-	if (GameHUDWidget)
-	{
-		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
-		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
-	}
+	RefreshHUDFromCurrentState();
 }
 
 
@@ -351,11 +349,11 @@ void ABaseCharacter::OnRep_Energy()
  * Client_UpdateEnergyDisplay_Implementation
  *
  * Client RPC: 服务器主动通知所属客户端刷新能量条
+ * 【2026-06-15 重构】: 改用 TryResolveHUDWidget
  */
 void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, float Max)
 {
-	// 【保留 Client RPC】: 供外部手动触发时使用
-	if (GameHUDWidget)
+	if (TryResolveHUDWidget(false))
 	{
 		GameHUDWidget->UpdateEnergy(Current, Max);
 		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
@@ -401,10 +399,15 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		{
 			if (FWeaponInfo* Info = GameMode->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WeaponContextString))
 			{
-				if (Info->WeaponBlueprint && CurrentWeapon->IsA(Info->WeaponBlueprint))
+				// 改造: WeaponBlueprint 是 TSoftClassPtr, 需要 LoadSynchronous 拿到 UClass* 再 IsA
+				if (!Info->WeaponBlueprint.IsNull())
 				{
-					WeaponIDToFind = RowName.ToString();
-					break;
+					UClass* WeaponClass = Info->WeaponBlueprint.LoadSynchronous();
+					if (WeaponClass && CurrentWeapon->IsA(WeaponClass))
+					{
+						WeaponIDToFind = RowName.ToString();
+						break;
+					}
 				}
 			}
 		}
@@ -463,7 +466,8 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
  */
 void ABaseCharacter::OnRep_ACValue()
 {
-	if (IsLocallyControlled() && GameHUDWidget)
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (IsLocallyControlled() && TryResolveHUDWidget(false))
 	{
 		GameHUDWidget->UpdateACValue(ACValue);
 
@@ -480,7 +484,8 @@ void ABaseCharacter::OnRep_ACValue()
  */
 void ABaseCharacter::OnRep_ACEValue()
 {
-	if (IsLocallyControlled() && GameHUDWidget)
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (IsLocallyControlled() && TryResolveHUDWidget(false))
 	{
 		// 刷新 ACE 数值（独立于排名的更新）
 		GameHUDWidget->UpdateACEValue(ACEValue);
@@ -545,19 +550,8 @@ void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& I
 	// 缓存 ID，延迟刷新时使用
 	CachedCharacterIDForIcon = InCharacterID;
 
-	// HUD 尚未就绪时，尝试从 PlayerController 重新获取
-	if (!GameHUDWidget)
-	{
-		if (APlayerController* PC = Cast<APlayerController>(GetController()))
-		{
-			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
-			{
-				GameHUDWidget = HUD->GetGameHUDWidget();
-			}
-		}
-	}
-
-	if (!GameHUDWidget)
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (!TryResolveHUDWidget())
 	{
 		// HUD 仍未就绪，延迟重试（使用成员变量 TimerHandle 确保计时器正确创建）
 		UE_LOG(LogTemp, Warning, TEXT("[Icon] HUD 未就绪，延迟刷新，InCharacterID=%s"), *InCharacterID);
@@ -587,19 +581,8 @@ void ABaseCharacter::RetryRefreshCharacterIcon()
 	// 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑，跳过服务器中转
 	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标，CachedID=%s"), *CachedCharacterIDForIcon);
 
-	// 再次尝试获取 HUD
-	if (!GameHUDWidget)
-	{
-		if (APlayerController* PC = Cast<APlayerController>(GetController()))
-		{
-			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
-			{
-				GameHUDWidget = HUD->GetGameHUDWidget();
-			}
-		}
-	}
-
-	if (!GameHUDWidget)
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (!TryResolveHUDWidget())
 	{
 		// HUD 仍未就绪，再次延迟重试
 		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
@@ -623,7 +606,8 @@ void ABaseCharacter::RetryRefreshCharacterIcon()
  */
 void ABaseCharacter::RefreshWeaponIconOnHUD()
 {
-	if (!GameHUDWidget || !GameHUDWidget->GetWidget_WeaponPanel())
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (!TryResolveHUDWidget(false) || !GameHUDWidget->GetWidget_WeaponPanel())
 	{
 		return;
 	}
@@ -728,7 +712,11 @@ void ABaseCharacter::RefreshACEWithRank()
 	}
 
 	// 7. 刷新 HUD（数字用 ACEValue，排名决定颜色）
-	GameHUDWidget->UpdateACEWithRank(ACEValue, RankType);
+	// 【2026-06-15 重构】: 添加 HUD 就绪检查
+	if (TryResolveHUDWidget(false))
+	{
+		GameHUDWidget->UpdateACEWithRank(ACEValue, RankType);
+	}
 }
 
 
@@ -740,34 +728,24 @@ void ABaseCharacter::RefreshACEWithRank()
  * ConsumeEnergy
  *
  * 消耗能量（释放技能时调用）
+ * 【2026-06-15 重构】: 委托给 EnergyComponent
  * @param Amount 要消耗的能量
  * @return 是否消耗成功
  */
 bool ABaseCharacter::ConsumeEnergy(float Amount)
 {
-	if (Amount <= 0.0f) return true;
-	if (CurrentEnergy >= Amount)
+	if (!EnergyComponent)
 	{
-		CurrentEnergy -= Amount;
-		StopRegeneration(); // 消耗能量后停止回复
-		return true;
+		return false;
 	}
-	return false;
-}
 
-
-/**
- * AddEnergy
- *
- * 增加能量（仅服务器权威）
- * @param Amount 要增加的能量
- */
-void ABaseCharacter::AddEnergy(float Amount)
-{
-	if (HasAuthority())
+	// 消耗能量后停止回复
+	const bool bSuccess = EnergyComponent->Consume(Amount);
+	if (bSuccess)
 	{
-		CurrentEnergy = FMath::Clamp(CurrentEnergy + Amount, 0.0f, MaxEnergy);
+		StopRegeneration();
 	}
+	return bSuccess;
 }
 
 
@@ -820,8 +798,15 @@ void ABaseCharacter::OnKill(ABaseCharacter* KilledCharacter)
 	if (!HasAuthority()) return;
 
 	// 击杀奖励: 增加血量和能量
-	AddEnergy(EnergyRewardPerKill);
-	CurrentHealth = FMath::Clamp(CurrentHealth + HealthRewardPerKill, 0.0f, MaxHealth);
+	if (EnergyComponent)
+	{
+		EnergyComponent->Add(EnergyRewardPerKill);
+	}
+	// 【2026-06-15 重构】: 通过 HealthComponent 加血
+	if (HealthComponent)
+	{
+		HealthComponent->Heal(HealthRewardPerKill);
+	}
 
 	// 增加AC（AddAC 内部已 Clamp 到 MaxAC）
 	AddAC(1);
@@ -940,7 +925,8 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 void ABaseCharacter::Move(const FInputActionValue& Value)
 {
 	// 死亡状态和暂停状态都不能移动
-	if (bIsDead) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead()) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	FVector2D MovementVector = Value.Get<FVector2D>();
@@ -972,7 +958,8 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 void ABaseCharacter::Look(const FInputActionValue& Value)
 {
 	// 死亡状态和暂停状态都不能转动视角
-	if (bIsDead) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead()) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	FVector2D LookAxisVector = Value.Get<FVector2D>();
@@ -1001,7 +988,8 @@ void ABaseCharacter::Look(const FInputActionValue& Value)
 void ABaseCharacter::LightAttack_Pressed()
 {
 	// 死人、暂停状态、武器未装备都不能攻击
-	if (bIsDead || !CurrentWeapon) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead() || !CurrentWeapon) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// 下蹲攻击权限拦截
@@ -1086,7 +1074,8 @@ void ABaseCharacter::ExecuteComboSequence()
 void ABaseCharacter::HeavyAttack()
 {
 	// 死人、武器未装备、暂停状态都不能重击
-	if (bIsDead || !CurrentWeapon) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead() || !CurrentWeapon) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// 【新增】: 重击同样需要检查下蹲权限
@@ -1107,7 +1096,8 @@ void ABaseCharacter::HeavyAttack()
 void ABaseCharacter::UseSkill()
 {
 	// 死亡状态和暂停状态都不能释放技能
-	if (bIsDead) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead()) return;
 	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// TODO: 技能系统具体实现
@@ -1289,18 +1279,20 @@ void ABaseCharacter::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip)
 float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, AActor* DamageCauser)
 {
 	// 1. 如果已经死了，或者客户端没有权限，直接退出
-	if (bIsDead || !HasAuthority()) return 0.0f;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (IsDead() || !HasAuthority()) return 0.0f;
 
 	// 先执行父类的逻辑
 	float ActualDamage = Super::TakeDamage(DamageAmount, DamageEvent, EventInstigator, DamageCauser);
 
-	// 2. 安全扣血 (保证不会扣成负数)
-	CurrentHealth = FMath::Clamp(CurrentHealth - ActualDamage, 0.0f, MaxHealth);
+	// 2. 【2026-06-15 重构】安全扣血改为调 HealthComponent
+	const float ActualApplied = HealthComponent ? HealthComponent->ApplyDamage(ActualDamage) : 0.0f;
 	UE_LOG(LogTemp, Warning, TEXT("[Health] 服务器扣血完成: Damage=%.1f, NewHealth=%.1f/%.1f, Dead=%d, Auth=%d"),
-		ActualDamage, CurrentHealth, MaxHealth, CurrentHealth <= 0.0f, HasAuthority());
+		ActualApplied, GetCurrentHealth(), GetMaxHealth(), IsDead(), HasAuthority());
 
 	// 3. 判定生死
-	if (CurrentHealth <= 0.0f)
+	// 【2026-06-15 重构】: 改用 IsDead() 委托给 Component
+	if (IsDead())
 	{
 		// 服务器处理击杀结算
 		if (HasAuthority())
@@ -1363,7 +1355,8 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 void ABaseCharacter::Die()
 {
 	// 只有服务器能宣判死亡
-	if (!HasAuthority() || bIsDead) return;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (!HasAuthority() || IsDead()) return;
 
 	// 告诉所有客户端: 这个人死了，准备看布娃娃
 	Multicast_Die();
@@ -1393,8 +1386,9 @@ void ABaseCharacter::Die()
  */
 void ABaseCharacter::Multicast_Die_Implementation()
 {
-	// 【所有人都会执行这个函数，包括发起死亡的服务器和所有客户端】
-	bIsDead = true;
+	// 【2026-06-15 重构】: bIsDead 字段已下沉到 HealthComponent
+	// 死亡状态由 Component 内部 ApplyDamage 触发 (TakeDamage → HealthComponent->ApplyDamage)
+	// 这里不再需要写 bIsDead
 
 	// 死亡时重置AC和ACE（HasAuthority确保只在服务器执行，避免重复复制冲突）
 	if (HasAuthority())
@@ -1429,8 +1423,10 @@ void ABaseCharacter::Multicast_Die_Implementation()
 
 		// 【关键时序】: 武器销毁延迟必须小于 RespawnDelaySeconds（默认 3.0 秒）
 		// 确保武器一定在角色重生前被清理，防止新武器还没生成就处理旧武器的 OnRep
-		FTimerHandle WeaponDestroyTimer;
-		GetWorldTimerManager().SetTimer(WeaponDestroyTimer, [WeaponToDestroy]()
+		// 【2026-06-15 修复】: 原为局部 FTimerHandle,会导致新一轮死亡时无法取消旧 timer,可能并发销毁
+		// 改为成员变量,EndPlay 或重复死亡时可主动 ClearTimer
+		GetWorldTimerManager().ClearTimer(WeaponDestroyTimerHandle);
+		GetWorldTimerManager().SetTimer(WeaponDestroyTimerHandle, [WeaponToDestroy]()
 		{
 			// 使用 IsValid 检查对象是否有效（避免调用已销毁的对象）
 			if (IsValid(WeaponToDestroy))
@@ -1440,9 +1436,8 @@ void ABaseCharacter::Multicast_Die_Implementation()
 		}, 1.0f, false);
 	}
 
-	// 开启 10 秒倒计时
-	FTimerHandle DissolveTimerHandle;
-	GetWorldTimerManager().SetTimer(DissolveTimerHandle, this, &ABaseCharacter::StartDissolveProcess, DissolveDelay, false);
+	// 溶解特效由 DissolveComponent 自治（订阅 HealthComponent->OnDeath 事件自动触发）
+	// 【2026-06-15 重构】: 原手动 SetTimer 启动溶解已迁移到 DissolveComponent::OnOwnerDeath
 
 	// 1. 禁用移动（禁止角色操作移动，但不能禁用 Controller 输入）
 	// 【核心修复】: 绝对不能调用 PC->DisableInput()
@@ -1465,38 +1460,6 @@ void ABaseCharacter::Multicast_Die_Implementation()
 	float TimeToRagdoll = AnimDuration > 0.1f ? (AnimDuration * 0.7f) : 0.1f;
 	GetWorldTimerManager().SetTimer(RagdollTimerHandle, this, &ABaseCharacter::EnableRagdoll, TimeToRagdoll, false);
 }
-
-
-/**
- * StartDissolveProcess
- *
- * 定时器触发后，标记开始融化
- * 同时把武器上的材质也拽进来一起融化
- */
-void ABaseCharacter::StartDissolveProcess()
-{
-	bStartDissolving = true;
-
-	// 在开始融化的瞬间，去把武器上的材质也拽进来
-	if (CurrentWeapon)
-	{
-		// 泛型查找法: 不管你的武器组件叫啥，直接找它身上的 Mesh 组件
-		UMeshComponent* WeaponMesh = CurrentWeapon->FindComponentByClass<UMeshComponent>();
-		if (WeaponMesh)
-		{
-			for (int32 i = 0; i < WeaponMesh->GetNumMaterials(); i++)
-			{
-				UMaterialInstanceDynamic* DynMat = WeaponMesh->CreateDynamicMaterialInstance(i);
-				if (DynMat)
-				{
-					// 塞进同一个数组里! Tick 函数不用改任何代码，就能自动带它一起融化
-					DynamicMaterials.Add(DynMat);
-				}
-			}
-		}
-	}
-}
-
 
 /**
  * EnableRagdoll
@@ -1529,7 +1492,8 @@ void ABaseCharacter::EnableRagdoll()
 void ABaseCharacter::StartCrouch()
 {
 	// 只有没死、没暂停的时候才能蹲
-	if (!bIsDead && !UGameplayStatics::IsGamePaused(this))
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (!IsDead() && !UGameplayStatics::IsGamePaused(this))
 	{
 		Crouch(); // 调用 UE ACharacter 自带的神级下蹲函数
 	}
@@ -1544,7 +1508,8 @@ void ABaseCharacter::StartCrouch()
  */
 void ABaseCharacter::StopCrouch()
 {
-	if (!bIsDead && !UGameplayStatics::IsGamePaused(this))
+	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	if (!IsDead() && !UGameplayStatics::IsGamePaused(this))
 	{
 		UnCrouch(); // 调用自带的起立函数 (它会自动检测头顶有没有障碍物，有的话会保持蹲着)
 	}
@@ -1612,29 +1577,25 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	}
 
 	// 【关键修复】: PossessedBy 在以下时机触发: 1) 角色出生时 2) 复活重生时
-	// 此时 CurrentHealth 已经是 MaxHealth（构造函数初始化），但 OnRep_Health 不会触发（因为值没变）
+	// 【2026-06-15 重构】: HUD 推送收敛到 RefreshHUDFromCurrentState
+	// 此时血量已是初始值,但 OnRep_CurrentHealth 不会触发（值没变）
 	// 所以必须强制刷新一次 HUD（仅本地玩家需要刷新自己的 HUD）
-	if (GameHUDWidget)
+	if (TryResolveHUDWidget())
 	{
-		GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
-		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
-		GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
-		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
-
 		// 设置初始 AC 值（若尚未初始化，则设为满值）
 		if (ACValue == 0)
 		{
 			ACValue = MaxAC;
 		}
-		GameHUDWidget->UpdateACValue(ACValue);
+		// 【2026-06-15 重构】: 全量刷新 (血量+能量+AC)
+		RefreshHUDFromCurrentState();
 		RefreshACEWithRank();
 	}
 	else
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] HUD 或 Widget_PlayerStatus 未就绪，延迟刷新。GameHUDWidget=%s, Widget_PlayerStatus=%s"),
-			*GetNameSafe(GameHUDWidget),
-			GameHUDWidget ? TEXT("NULL") : TEXT("GameHUDWidget NULL"));
+			TEXT("[BaseCharacter] HUD 或 Widget_PlayerStatus 未就绪，延迟刷新。GameHUDWidget=%s"),
+			*GetNameSafe(GameHUDWidget));
 
 		// HUD 还未完全初始化（Widget_PlayerStatus BindWidget 失败），延迟重试
 		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
@@ -1678,19 +1639,8 @@ void ABaseCharacter::PossessedBy(AController* NewController)
  */
 void ABaseCharacter::RetryRefreshHUD()
 {
-	if (!GameHUDWidget)
-	{
-		// 再次尝试从 PlayerController 获取 HUD
-		if (APlayerController* PC = Cast<APlayerController>(GetController()))
-		{
-			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
-			{
-				GameHUDWidget = HUD->GetGameHUDWidget();
-			}
-		}
-	}
-
-	if (!GameHUDWidget || !GameHUDWidget->GetWidget_PlayerStatus())
+	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	if (!TryResolveHUDWidget())
 	{
 		// HUD 仍未就绪，继续延迟重试
 		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败，再次重试"));
@@ -1698,12 +1648,16 @@ void ABaseCharacter::RetryRefreshHUD()
 		return;
 	}
 
+	if (!GameHUDWidget->GetWidget_PlayerStatus())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败，再次重试"));
+		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
+		return;
+	}
+
 	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] HUD 刷新成功"));
-	GameHUDWidget->UpdateHealth(CurrentHealth, MaxHealth);
-	GameHUDWidget->UpdateHealthText(FMath::CeilToInt(CurrentHealth), FMath::CeilToInt(MaxHealth));
-	GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
-	GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(CurrentEnergy), FMath::CeilToInt(MaxEnergy));
-	GameHUDWidget->UpdateACValue(ACValue);
+	// 【2026-06-15 重构】: 全量刷新
+	RefreshHUDFromCurrentState();
 	RefreshACEWithRank();
 }
 
@@ -1766,8 +1720,17 @@ void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 	SpawnParams.Owner = this;
 	SpawnParams.Instigator = this;
 
+	// 改造: WeaponBlueprint 改为 TSoftClassPtr (启动期不加载, 避免内存浪费)
+	// 这里运行时调用 LoadSynchronous 同步加载拿到 UClass* 再 SpawnActor
+	UClass* WeaponClass = WeaponInfo->WeaponBlueprint.LoadSynchronous();
+	if (!WeaponClass)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] 武器蓝图加载失败 (TSoftClassPtr)"));
+		return;
+	}
+
 	ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
-		WeaponInfo->WeaponBlueprint,
+		WeaponClass,
 		GetActorLocation(),
 		GetActorRotation(),
 		SpawnParams
@@ -1887,9 +1850,15 @@ FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FStrin
 			{
 				static const FString WeaponContextString(TEXT("WeaponBlueprintLookup"));
 				FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*InWeaponID), WeaponContextString);
-				if (WeaponInfo && !WeaponInfo->WeaponBlueprint->IsChildOf(Config->WeaponBlueprint))
+				// 改造: WeaponBlueprint 都是 TSoftClassPtr, 需 LoadSynchronous 拿到 UClass* 再 IsChildOf
+				if (WeaponInfo)
 				{
-					continue;
+					UClass* ConfigWeaponClass = Config->WeaponBlueprint.LoadSynchronous();
+					UClass* ActualWeaponClass = WeaponInfo->WeaponBlueprint.LoadSynchronous();
+					if (!ConfigWeaponClass || !ActualWeaponClass || !ActualWeaponClass->IsChildOf(ConfigWeaponClass))
+					{
+						continue;
+					}
 				}
 			}
 		}
@@ -2147,87 +2116,119 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 /**
  * PlayFootstepSound
  *
- * 播放脚步声
- * 1. 从 CVar 读取全局音量缩放
- * 2. 根据当前状态选择脚步声资源（蹲/跑/走）
- * 3. 地面检测（查询物理材质）
- * 4. 随机音高变化（更自然）
- * 5. 在指定位置播放音效
+ * 播放脚步声（供 AnimNotify 或其他系统调用）
+ * 【2026-06-15 重构】: 逻辑已迁移到 FootstepComponent::PlayFootstep
+ * @param Location 播放位置
  */
 void ABaseCharacter::PlayFootstepSound(FVector Location)
 {
-	// 从 CVar 读取全局音量缩放
-	IConsoleManager& ConsoleMgr = IConsoleManager::Get();
-	static const TConsoleVariableData<float>* CVarData = ConsoleMgr.FindTConsoleVariableDataFloat(TEXT("g.FootstepVolume"));
-	float CVarVolume = CVarData ? CVarData->GetValueOnGameThread() : 1.0f;
+	if (FootstepComponent)
+	{
+		FootstepComponent->PlayFootstep(this, Location);
+	}
+}
 
-	// 如果全局音量为 0，直接跳过
-	if (CVarVolume <= 0.0f)
+
+// ==========================================
+// 【2026-06-15 新增】UI Bridge 区段
+// 作用: 集中所有跨层访问 (Core/Characters → UI/Game/Systems)
+// 历史: 修复前 50+ 处散落访问, 修改需要改 50+ 个地方
+// 现状: 集中在 2 个 helper 函数中
+// 待优化: 长期应改为 UI 订阅 HealthComponent 事件 (依赖倒置)
+// ==========================================
+
+/**
+ * 【UI Bridge】从 PlayerController 安全获取 GameHUDWidget 引用
+ *
+ * 替代散落在 30+ 处的样板代码:
+ *   if (!GameHUDWidget) {
+ *       if (APlayerController* PC = Cast<APlayerController>(GetController())) {
+ *           if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD())) {
+ *               GameHUDWidget = HUD->GetGameHUDWidget();
+ *           }
+ *       }
+ *   }
+ */
+bool ABaseCharacter::TryResolveHUDWidget(bool bLogWarning)
+{
+	// 已解析则直接返回
+	if (GameHUDWidget)
+	{
+		return true;
+	}
+
+	// 仅本地玩家需要 HUD
+	if (!IsLocallyControlled())
+	{
+		return false;
+	}
+
+	APlayerController* PC = Cast<APlayerController>(GetController());
+	if (!PC)
+	{
+		if (bLogWarning)
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("[UI Bridge] TryResolveHUDWidget: 无 PlayerController (Role=%d)"), (int32)GetLocalRole());
+		}
+		return false;
+	}
+
+	AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD());
+	if (!HUD)
+	{
+		if (bLogWarning)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[UI Bridge] TryResolveHUDWidget: HUD 未就绪 (可能 PlayerController 初始化中)"));
+		}
+		return false;
+	}
+
+	GameHUDWidget = HUD->GetGameHUDWidget();
+	if (!GameHUDWidget && bLogWarning)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[UI Bridge] TryResolveHUDWidget: HUD 存在但 GameHUDWidget 为空"));
+	}
+	return GameHUDWidget != nullptr;
+}
+
+
+/**
+ * 【UI Bridge】一次性推送所有角色状态到 HUD
+ *
+ * 替代散落在 10+ 处的分散更新:
+ *   GameHUDWidget->UpdateHealth(Current, Max);
+ *   GameHUDWidget->UpdateHealthText(...);
+ *   GameHUDWidget->UpdateEnergy(CurrentEnergy, MaxEnergy);
+ *   GameHUDWidget->UpdateEnergyText(...);
+ *   GameHUDWidget->UpdateACValue(ACValue);
+ *   GameHUDWidget->UpdateACEValue(ACEValue);
+ */
+void ABaseCharacter::RefreshHUDFromCurrentState()
+{
+	if (!TryResolveHUDWidget(false))
 	{
 		return;
 	}
 
-	// 根据当前状态选择脚步声资源
-	USoundBase* SoundToPlay = nullptr;
-
-	if (bIsCrouched && CrouchFootstepSound)
+	// 血量
+	if (HealthComponent)
 	{
-		// 下蹲时使用下蹲专用脚步声
-		SoundToPlay = CrouchFootstepSound;
-	}
-	else
-	{
-		// 根据速度判断是行走还是奔跑
-		float Speed = GetVelocity().Length();
-		float RunSpeedThreshold = GetCharacterMovement()->MaxWalkSpeed;
-
-		if (Speed > RunSpeedThreshold && RunFootstepSound)
-		{
-			SoundToPlay = RunFootstepSound;
-		}
-		else if (WalkFootstepSound)
-		{
-			SoundToPlay = WalkFootstepSound;
-		}
+		const float Current = HealthComponent->GetCurrent();
+		const float Max = HealthComponent->GetMax();
+		GameHUDWidget->UpdateHealth(Current, Max);
+		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
 	}
 
-	if (!SoundToPlay)
+	// 能量 - 【2026-06-15 重构】通过 EnergyComponent
+	if (EnergyComponent)
 	{
-		return;
+		const float ECurrent = EnergyComponent->GetCurrent();
+		const float EMax = EnergyComponent->GetMax();
+		GameHUDWidget->UpdateEnergy(ECurrent, EMax);
+		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(ECurrent), FMath::CeilToInt(EMax));
 	}
 
-	// 地面检测: 查询物理材质，根据不同地面播放不同音效
-	FHitResult HitResult;
-	FVector TraceStart = Location + FVector(0.0f, 0.0f, 100.0f);
-	FVector TraceEnd = Location - FVector(0.0f, 0.0f, 150.0f);
-
-	FCollisionQueryParams QueryParams;
-	QueryParams.bReturnPhysicalMaterial = true;
-	QueryParams.AddIgnoredActor(this);
-
-	if (GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, FootstepTraceChannel, QueryParams))
-	{
-		if (UPhysicalMaterial* PhysMat = HitResult.PhysMaterial.Get())
-		{
-			// 根据物理材质可进一步扩展为不同地面不同音效
-			UE_LOG(LogTemp, VeryVerbose, TEXT("[Footstep] Surface=%s"),
-				*PhysMat->GetName());
-		}
-	}
-
-	// 随机音高变化（让脚步声更有自然感，不会机械重复）
-	float PitchMultiplier = UKismetMathLibrary::RandomFloatInRange(0.9f, 1.1f);
-
-	// 播放脚步声
-	UGameplayStatics::PlaySoundAtLocation(
-		this,
-		SoundToPlay,
-		Location,
-		FRotator::ZeroRotator,
-		CVarVolume, // 全局 CVar 缩放
-		PitchMultiplier
-	);
-
-	UE_LOG(LogTemp, Log, TEXT("[Footstep] 播放脚步声: Loc=(%.1f, %.1f, %.1f), Crouch=%d"),
-		Location.X, Location.Y, Location.Z, bIsCrouched);
+	// AC / ACE
+	GameHUDWidget->UpdateACValue(ACValue);
+	GameHUDWidget->UpdateACEValue(ACEValue);
 }

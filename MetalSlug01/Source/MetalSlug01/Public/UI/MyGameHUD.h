@@ -71,13 +71,6 @@ protected:
 	// ==========================================
 
 	/**
-	 * 主菜单 Widget 类（在 BP_MyGameHUD 中配置）
-	 * 用途: 主菜单页面（当前未使用）
-	 */
-	UPROPERTY(EditAnywhere, Category = "UI")
-	TSubclassOf<class UUserWidget> MainWidgetClass;
-
-	/**
 	 * 游戏 HUD Widget 类（在 BP_MyGameHUD 中配置）
 	 * 用途: 战斗内 HUD 容器（血条/准星/计分板等）
 	 */
@@ -88,12 +81,6 @@ private:
 	// ==========================================
 	// 私有成员
 	// ==========================================
-
-	/**
-	 * 主菜单 Widget 实例缓存（当前未使用）
-	 */
-	UPROPERTY()
-	UUserWidget* MainWidget;
 
 	/**
 	 * 游戏 HUD Widget 实例缓存

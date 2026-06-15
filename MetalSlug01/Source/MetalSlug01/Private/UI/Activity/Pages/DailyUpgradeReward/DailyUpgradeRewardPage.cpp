@@ -121,6 +121,7 @@
 // §1. 头文件包含区
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardViewModel.h" // 改造: ViewModel
 #include "Components/Border.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
@@ -161,6 +162,20 @@ bool UDailyUpgradeRewardPage::Initialize()
 	if (!Super::Initialize())
 	{
 		return false;
+	}
+
+	// 改造: 创建 ViewModel 并 Bind 到 Subsystem
+	if (!ViewModel)
+	{
+		ViewModel = NewObject<UDailyUpgradeRewardViewModel>(this);
+	}
+	UGameInstance* GI = GetGameInstance();
+	if (GI && ViewModel)
+	{
+		if (UUpgradeActivitySubsystem* UpgradeSub = GI->GetSubsystem<UUpgradeActivitySubsystem>())
+		{
+			ViewModel->Bind(UpgradeSub);
+		}
 	}
 
 	// 初始化默认值
@@ -242,14 +257,20 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 {
 	// 注意：不取消订阅Subsystem事件，让缓存的页面也能持续接收广播
 	// UnsubscribeFromSubsystemEvents(); // 已删除此行
-	
+
 	// 解绑重选奖励按钮事件
 	if (ReselectRewardButton)
 	{
 		ReselectRewardButton->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
-		
+
 	}
-	
+
+	// 改造: 解除 ViewModel 绑定
+	if (ViewModel)
+	{
+		ViewModel->Unbind();
+	}
+
 	Super::NativeDestruct();
 }
 

@@ -57,7 +57,7 @@ class METALSLUG01_API UUpgradeActivitySubsystem : public UGameInstanceSubsystem
 
 public:
     // ==================== 委托事件 ====================
-    
+
     /** 奖励图标索引更新事件 */
     UPROPERTY(BlueprintAssignable, Category = "Upgrade Events")
     FOnRewardIconIndexChanged OnRewardIconIndexChanged;
@@ -325,6 +325,21 @@ public:
      * @return 当前RewardIconIndex值
      */
     int32 GetCurrentRewardIconIndex() const;
+
+    /**
+     * @brief 获取当前激活的"第几天" (1-based, 与 DailyUpgradeRewardPage 显示一致)
+     * @return 当前天数
+     */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Upgrade Activity")
+    int32 GetCurrentDayIndex() const;
+
+    /**
+     * @brief 检查指定天数是否已领取奖励
+     * @param DayIndex 天数 (1-based)
+     * @return 是否已领取
+     */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Upgrade Activity")
+    bool IsRewardClaimed(int32 DayIndex) const;
 
     /**
      * @brief 设置奖励图标索引

@@ -57,6 +57,17 @@ class METALSLUG01_API UGameFlowSubsystem : public UGameInstanceSubsystem
 
 public:
 	// ==========================================
+	// 生命周期
+	// ==========================================
+
+	/** 启动期一次性检查活动 DataTable 完整性 */
+	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+
+	/** 关闭期清理活动 DataTable 缓存 */
+	virtual void Deinitialize() override;
+
+public:
+	// ==========================================
 	// 核心状态调度接口
 	// ==========================================
 

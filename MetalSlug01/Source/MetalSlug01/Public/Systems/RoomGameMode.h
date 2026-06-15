@@ -12,7 +12,8 @@
 #include "GameFramework/GameModeBase.h"
 
 // 引入房间相关枚举（ERoomState/ERoomTeam/ERoomMatchMode 等）
-#include "UI/Login/Data/StaticTable.h"
+// 改造: 改为精确子表头
+#include "Data/Enums/RoomEnums.h"
 
 // UE 自动生成的头文件（必须放在最后一行）
 #include "RoomGameMode.generated.h"

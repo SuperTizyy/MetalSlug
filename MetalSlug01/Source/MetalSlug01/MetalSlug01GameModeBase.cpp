@@ -10,9 +10,6 @@
 // 目的: 用我们自己写的 AMyGameHUD 替代引擎默认的 HUD，从而挂载血条/准星/聊天框等
 #include "UI/MyGameHUD.h"
 
-// 重复包含（无副作用，但稍显冗余；保留原样便于阅读）
-#include "MetalSlug01GameModeBase.h"
-
 // 引入 UE 提供的"类查找助手" ConstructorHelpers
 // 作用: 在 C++ 构造函数中按资源路径加载蓝图/资产/类对象
 #include "UObject/ConstructorHelpers.h"

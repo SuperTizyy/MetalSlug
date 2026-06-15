@@ -18,5 +18,7 @@ public class MetalSlug01Target : TargetRules
 		bAdaptiveUnityDisablesOptimizations = true;
 		// 如果内存够快，可以关闭磁盘缓存加速
 		 bUsePCHFiles = true;
+		 
+		 //bUseIncrementalLinking = true; // 开启增量链接，只链接修改过的部分，极大缩短二次链接时间
 	}
 }
