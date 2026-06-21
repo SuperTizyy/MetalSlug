@@ -56,6 +56,39 @@ protected:
 	UFUNCTION()
 	void StartDissolveEffect();
 
+public:
+	/**
+	 * 【2026-07-01 新增】收集指定武器 Mesh 的动态材质 (死亡时外部主动传入, 不依赖 Owner 查找)
+	 *
+	 * 【大厂 P0 修复】 旧实现 GetOwnerWeaponMesh() 用 Char->FindComponentByClass<UMeshComponent>(),
+	 *   武器 Detach 后已不在 Char 的子组件里 → 永远找不到 → 武器**永不溶解**
+	 *   新实现: 死亡流程主动传入已 Detach 的武器 Mesh 引用, 解决查找失败 bug
+	 *
+	 * @param WeaponMesh  已 Detach 的武器网格组件 (可能为 nullptr, 内部已防御)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Dissolve")
+	void CollectWeaponDynamicMaterials(UMeshComponent* WeaponMesh);
+
+	/**
+	 * 【2026-07-01 P0 新增】公开 API: 立即启动溶解
+	 *
+	 * 取代旧的 BeginPlay 订阅 OnDeath 自启动模式
+	 * 死亡流程编排器 (BaseCharacter::ExecuteDeathLocal) 显式调用此方法,
+	 *   可以精确控制溶解与复活的时序
+	 *
+	 * 调用时机: 角色死亡后立即调用 (无延迟), 与死亡动画/Ragdoll 并行
+	 * 溶解时长: 1.0/DissolveSpeed 秒 (默认 1.5 表示 ~0.67 秒)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Dissolve")
+	void StartDissolveImmediate();
+
+	/**
+	 * 【2026-07-01 新增】收集所有已挂载的动态材质 (角色 + 已注册武器)
+	 * 公开为 UFUNCTION 允许外部在死亡前主动触发, 不再依赖 OnDeath 定时器
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Dissolve")
+	void CollectAllDynamicMaterials();
+
 private:
 	/**
 	 * 从 Owner 角色及其武器收集动态材质
@@ -74,13 +107,20 @@ private:
 	class UMeshComponent* GetOwnerWeaponMesh() const;
 
 public:
-	/** 死亡后多久开始溶解（秒） */
+	/**
+	 * 【2026-07-01 P0 重构】溶解启动延迟 (秒)
+	 * 旧默认 5.0s 太长, 与 RespawnDelaySeconds=3s 冲突, 身体来不及溶解就被销毁
+	 * 新默认 0.5s: 给死亡动画留出最小时长, 之后立即开始溶解
+	 * 死亡流程: ExecuteDeathLocal 立即调用 StartDissolveImmediate
+	 *           溶解速度由 DissolveSpeed 决定 (典型 1.5~2.0s 完成)
+	 *           RespawnDelaySeconds 必须 > 溶解完成时间, 否则身体提前销毁
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dissolve|Config")
-	float DissolveDelay = 5.0f;
+	float DissolveDelay = 0.5f;
 
-	/** 溶解速度（值越大溶解越快） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dissolve|Config")
-	float DissolveSpeed = 0.5f;
+	/** 溶解速度（值越大溶解越快，典型 1.0~2.0 表示 1~2 秒内完成） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dissolve|Config", meta = (ClampMin = "0.1", ClampMax = "10.0"))
+	float DissolveSpeed = 1.5f;
 
 protected:
 	/** 溶解时使用的材质（蓝图可配置） */

@@ -79,6 +79,21 @@ public:
 	void RemovePlayerFromRoom(AController* RequestingController);
 
 	/**
+	 * 【P0 架构升级】服务端主动变更房主
+	 *
+	 * 用途: 房主离房/被踢时, 服务器自动把房主权限转交给下一个玩家
+	 * 副作用:
+	 *  - 修改 GameState->HostPlayerName (ReplicatedUsing 触发客户端 OnRep)
+	 *  - 服务器主动广播 URoomService::BroadcastHostChanged (本地 OnRep 不会触发)
+	 *  - 广播系统提示"X 成为新房主"
+	 *
+	 * @param NewHostPlayerName 新房主名 (为空表示"随机选下一个在线玩家")
+	 * @return 是否成功转交 (false 表示房间没人了/新房主名不合法)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Host")
+	bool TransferHostTo(const FString& NewHostPlayerName);
+
+	/**
 	 * @brief 广播玩家聊天
 	 * @param SenderName 发送者名称
 	 * @param Message 聊天内容

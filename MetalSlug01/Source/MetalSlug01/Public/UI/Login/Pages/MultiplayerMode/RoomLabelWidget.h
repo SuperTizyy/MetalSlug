@@ -17,9 +17,11 @@ class UTextBlock;
 /**
  * @delegate FOnRoomSelectedSignature
  * @brief 房间被选中的事件（大喇叭）
- * @param SelectedRoomName 选中的房间名
+ * @param SelectedRoomWidget 被点击的房间条目 widget 引用 (而非字符串)
+ *                              外层通过 widget->GetRoomName() 读取房间名,
+ *                              避免字符串在传递过程中丢失
  */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomSelectedSignature, FString, SelectedRoomName);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomSelectedSignature, URoomLabelWidget*, SelectedRoomWidget);
 
 
 /**
@@ -36,6 +38,13 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomSelectedSignature, FString, S
  * 2. 状态机: SetHighlight / SetRoomState 都是单一职责方法
  * 3. 复用: 每个房间一条 URoomLabelWidget
  * 4. 防御性: GetRoomName 时做空指针保护
+ *
+ * 【架构升级】: OnRoomSelected 改为广播 widget 自身引用 (URoomLabelWidget*)
+ * 设计理由: 旧设计广播 FString RoomName, 依赖点击时刻 GetRoomName() 返回正确的 CachedRoomName
+ *           若 CachedRoomName 为空 (例: SetRoomName 未调用 / 房主未写入 ROOM_NAME),
+ *           外层收到空字符串, 按钮永远不可用 → 大厂 P0 反模式
+ * 新设计: 广播 widget 引用, 外层 HandleRoomSelected 从 widget 缓存里直接读取,
+ *         同时把选中态 + 高亮态绑定到 widget 自身, 不依赖字符串匹配
  */
 UCLASS()
 class METALSLUG01_API URoomLabelWidget : public UUserWidget
@@ -70,8 +79,9 @@ public:
 	FString GetRoomName() const;
 
 	/**
-	 * 【新增】供外层（大厅）绑定的事件分发器
+	 * 【架构升级】供外层（大厅）绑定的事件分发器
 	 * 触发时机: 玩家点击该房间条目时
+	 * 参数: 自身 widget 引用 (而非字符串)
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "Events")
 	FOnRoomSelectedSignature OnRoomSelected;
@@ -134,6 +144,18 @@ protected:
 	class UTextBlock* Text_RoomStatus;
 
 private:
+	// ==========================================
+	// 3.5 数据缓存（View Model）
+	// ==========================================
+
+	/**
+	 * 【Bug2 修复】房间名数据缓存
+	 * 设计理由: 之前 GetRoomName 依赖 Text_RoomName->GetText() 反读,
+	 *           这是反模式 (View 不应作为数据源, 否则 TextBlock 重命名/未绑定就崩)
+	 *           改为: SetRoomName 时同时写缓存 + 写 UI, GetRoomName 直接读缓存
+	 */
+	FString CachedRoomName;
+
 	// ==========================================
 	// 4. 内部回调
 	// ==========================================

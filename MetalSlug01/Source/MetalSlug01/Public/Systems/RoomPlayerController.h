@@ -121,6 +121,20 @@ public:
 	FTimerHandle HostLeaveTimer;
 
 	/**
+	 * 【大厂标准】退房流程订阅的 PostLoadMapWithWorld 全局委托句柄
+	 *
+	 * 用途: ExecuteLeaveRoom 主动 OpenLevel 后, 在新 World 上主动切到 MainLobby
+	 * 原因: TWeakObjectPtr<UWorld> 在 World 销毁后失效, 不能跨地图捕获
+	 *       必须用引擎全局委托, 引擎保证在新 World 上回调
+	 *
+	 * 生命周期:
+	 *   - ExecuteLeaveRoom: AddLambda 时保存 handle
+	 *   - Lambda 内处理完毕: Remove + Reset
+	 *   - EndPlay: 兜底 Remove (防御 PC 在跳图前被销毁, 留下野指针)
+	 */
+	FDelegateHandle LeaveRoomSafeHandle;
+
+	/**
 	 * 计分板 Widget 实例缓存
 	 */
 	UPROPERTY(Transient)
@@ -165,7 +179,7 @@ public:
 	 * 玩家请求开始游戏（房主专属）
 	 * 服务器端: 校验所有玩家已准备 -> 通知每个 Client 切换状态 -> HandlePlayerRequestSpawn
 	 */
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_RequestStartGame();
 
 	/**
@@ -200,7 +214,7 @@ public:
 	/**
 	 * 玩家请求服务器生成自己的 3D 角色（用于测试/复活）
 	 */
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_RequestSpawn();
 
 	// ==========================================
@@ -230,20 +244,9 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_NotifyAccountLogout(const FString& Username, const FString& SessionId);
 
-	/**
-	 * 客户端主动查询"某账号是否在线"
-	 * (当前未使用, 保留给将来"显示在线列表"等功能)
-	 */
-	UFUNCTION(Server, Reliable)
-	void Server_RequestIsAccountOnline(const FString& Username);
-
-	/**
-	 * 客户端主动查询"某账号是否在线" 的响应（房主 → 发起查询的客户端）
-	 * @param Username 被查询的账号
-	 * @param bOnline 是否在线
-	 */
-	UFUNCTION(Client, Reliable)
-	void Client_ReceiveIsAccountOnline(const FString& Username, bool bOnline);
+	// 【P0 清理】删除未使用的 RPC: Server_RequestIsAccountOnline / Client_ReceiveIsAccountOnline
+	// 旧注释说"保留给将来显示在线列表", 但 YAGNI 原则: 不写用不到的代码
+	// 等真有需求时再加
 
 	/**
 	 * 房主 → 客户端 的"账号登录结果"通知

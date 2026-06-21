@@ -48,12 +48,29 @@ class METALSLUG01_API URoomInsidePage : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	/**
-	 * 初始化函数
-	 * 时机: UI 创建时最先调用的地方
-	 * 用途: 设置所有 UI 控件的事件绑定
-	 */
-	virtual bool Initialize() override;
+    /**
+     * 初始化函数
+     * 时机: UI 创建时最先调用的地方
+     * 用途: 设置所有 UI 控件的事件绑定
+     */
+    virtual bool Initialize() override;
+
+    // ==========================================
+    // 【架构升级】View 标准接口
+    // ==========================================
+
+    /**
+     * IView 接口: View 绑定后由 UIViewService 调用
+     * 内部职责: 启动 0.5s 一次 UI 刷新定时器 + 立即刷新一次
+     */
+    UFUNCTION(BlueprintCallable, Category = "RoomInsidePage")
+    void OnViewShown();
+
+    /**
+     * IView 接口: View 解绑时由 UIViewService 调用
+     */
+    UFUNCTION(BlueprintCallable, Category = "RoomInsidePage")
+    void OnViewHidden();
 
 	// ==========================================
 	// 1. 公共接口（对外）
@@ -129,32 +146,49 @@ protected:
 	void OnGameFlowStateChanged(EMatchState NewState);
 
 	// ==========================================
+	// 【P0 架构升级】URoomService 事件总线回调（替代 0.5s 定时器轮询）
+	// 必须是 UFUNCTION, 因为是 Dynamic 委托的 BindDynamic 目标
+	// ==========================================
+
+	/** 房主身份变化: 刷新按钮可见性 */
+	UFUNCTION()
+	void OnRoomServiceHostChanged(bool bIsHostNow);
+
+	/** 玩家加入: 立即刷新房间标签列表 */
+	UFUNCTION()
+	void OnRoomServicePlayerJoined(const FString& PlayerName);
+
+	/** 玩家离开: 立即刷新房间标签列表 */
+	UFUNCTION()
+	void OnRoomServicePlayerLeft(const FString& PlayerName);
+
+	// ==========================================
 	// 3. 攻守方玩家列表相关控件
 	// ==========================================
 
 	/** 攻方列表容器: 用于显示所有加入攻方的玩家条目 */
-	UPROPERTY(meta = (BindWidget)) UVerticalBox* Box_AttackTeam;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UVerticalBox> Box_AttackTeam;
 
 	/** 守方列表容器: 用于显示所有加入守方的玩家条目 */
-	UPROPERTY(meta = (BindWidget)) UVerticalBox* Box_DefenseTeam;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UVerticalBox> Box_DefenseTeam;
 
 	/** 加入攻方按钮 */
-	UPROPERTY(meta = (BindWidget)) UButton* Btn_JoinAttackTeam;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_JoinAttackTeam;
 
 	/** 加入守方按钮 */
-	UPROPERTY(meta = (BindWidget)) UButton* Btn_JoinDefenseTeam;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_JoinDefenseTeam;
 
 	/** 退出房间按钮 */
-	UPROPERTY(meta = (BindWidget)) UButton* Btn_LeaveRoom;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_LeaveRoom;
 
 	/** 准备/取消准备按钮 */
-	UPROPERTY(meta = (BindWidget)) UButton* Btn_ToggleReady;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_ToggleReady;
 
 	/** 准备/取消准备文字显示 */
-	UPROPERTY(meta = (BindWidget)) UTextBlock* Text_ReadyStatus;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UTextBlock> Text_ReadyStatus;
 
 	/** 开始游戏按钮（仅房主可见） */
-	UPROPERTY(meta = (BindWidget)) UButton* Btn_StartGame;
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_StartGame;
 
 	/**
 	 * 动态生成玩家条目所需的蓝图类配置
@@ -486,6 +520,24 @@ private:
 	 */
 	UFUNCTION()
 	void RefreshRoomUI();
+
+	/**
+	 * 【2026-06-29 P0 修复】统一刷新房主/玩家专属按钮的可见性
+	 * 职责: 根据当前玩家房主身份, 设置 Btn_OpenAIPanel / Btn_StartGame / Btn_ToggleReady 可见性
+	 * 触发点:
+	 *   - NativeConstruct (widget 首次创建时)
+	 *   - OnViewShown (View 挂载时, 修复玩家B加入看不到按钮的 bug)
+	 *   - OnRoomServiceHostChanged (房主身份变化时)
+	 *   - RefreshRoomUI 末尾 (房主身份可能在订阅期间变化)
+	 */
+	void UpdateHostVisibility();
+
+	/**
+	 * 【Bug1 P0 修复】兜底函数: 遍历本机玩家 VBox, 把对应本地账号的 PlayerLabel 强制标为房主
+	 * 场景: 服务器 ON_REP 时延导致 RefreshRoomUI 创建 widget 时漏判房主身份,
+	 *       → 监听 OnRoomServiceHostChanged(true) 后调用本函数补救
+	 */
+	void ForceApplyHostIdentityToLocalWidget();
 
 	/**
 	 * 工业级规范: 将重复的网络同步逻辑封装成私有助手函数

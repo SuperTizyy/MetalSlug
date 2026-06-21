@@ -13,6 +13,8 @@
 #include "UI/Game/Widgets/WeaponPanelWidget.h"
 #include "UI/Game/Widgets/MatchInfoWidget.h"
 #include "UI/Game/Widgets/KillFeedWidget.h"
+#include "Characters/BaseCharacter.h"
+#include "Components/CharacterEvents.h"
 #include "UI/Game/Widgets/ChatWidget.h"
 #include "UI/Game/Widgets/KillStreakWidget.h"
 #include "UI/Game/Widgets/ScoreboardWidget.h"
@@ -116,6 +118,109 @@ void UGameHUDWidget::NativeConstruct()
 		*GetNameSafe(Widget_MatchInfo), *GetNameSafe(Widget_PlayerStatus));
 
 	TryBindToGameState();
+
+	// 【2026-07-01 新增】订阅 CharacterEvents (依赖倒置核心)
+	// 与 TryBindToGameState 并行执行: GameState 控制比赛状态, CharacterEvents 控制角色状态
+	// 成功 → 立即刷新武器图标; 失败 → 延迟重试 (最多 10 次)
+	TryBindToCharacterEvents();
+}
+
+
+/**
+ * UGameHUDWidget::NativeDestruct
+ *
+ * Widget 从视口移除时调用
+ * 【2026-07-01 新增】: 清理 CharacterEvents 订阅, 防止 Widget 销毁后回调残留
+ */
+void UGameHUDWidget::NativeDestruct()
+{
+	// 先清理 CharacterEvents 订阅 (避免 Widget 销毁后 CharacterEvents 回调仍被触发)
+	UnbindFromCharacterEvents();
+
+	// 清理重试定时器
+	if (CharacterEventsRetryTimerHandle.IsValid() && GetWorld())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(CharacterEventsRetryTimerHandle);
+	}
+
+	Super::NativeDestruct();
+}
+
+
+/**
+ * UGameHUDWidget::NativeTick
+ *
+ * 【2026-07-01 P0 新增】架构级兜底
+ *
+ * 解决 10 次重试仍未订阅的死局:
+ *   原架构: TryBindToCharacterEvents 重试 10 次 (共 5 秒) 后放弃 → 永久丢订阅
+ *   真实场景: ListenServer 上, ListenServer 玩家的 Pawn 可能在第 11 秒才被 ServerTravel + Possess 进来
+ *             此时头像订阅失败 → 玩家永远看不到自己头像
+ *
+ * 兜底策略:
+ *   - 每秒 1 次检查 (节流)
+ *   - 已订阅但 Pawn 变了 → Unbind + 重试
+ *   - 未订阅 + 有 Pawn → 重置重试计数 + 重新订阅
+ *   - 已订阅 + Pawn 还在 → 不做事
+ *
+ * 性能:
+ *   - 每秒 1 次字符串比较 + 引用比较, 开销可忽略
+ *   - 不订阅 Tick 不增加任何开销 (GameHUDWidget 在战斗场景才显示)
+ */
+void UGameHUDWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+	TickFallbackCheck(InDeltaTime);
+}
+
+
+/**
+ * UGameHUDWidget::TickFallbackCheck
+ *
+ * 每秒 1 次 (节流), 检查 CharacterEvents 订阅状态
+ */
+void UGameHUDWidget::TickFallbackCheck(float DeltaTime)
+{
+	CharacterEventsFallbackTimer += DeltaTime;
+	if (CharacterEventsFallbackTimer < 1.0f)
+	{
+		return;
+	}
+	CharacterEventsFallbackTimer = 0.0f;
+
+	APlayerController* PC = GetOwningPlayer();
+	if (!PC)
+	{
+		return;
+	}
+
+	ABaseCharacter* Character = Cast<ABaseCharacter>(PC->GetPawn());
+
+	// 场景 1: 已订阅, 但 Pawn 变了 (或 CharacterEvents 失效)
+	if (CachedCharacterEvents)
+	{
+		if (!IsValid(CachedCharacterEvents) || CachedCharacterEvents->GetOwner() != Character)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[GameHUDWidget][TickFallback] 已订阅但 CharacterEvents 失效或 Pawn 变了, 重新订阅"));
+
+			UnbindFromCharacterEvents();
+			CharacterEventsRetryCount = 0;
+			TryBindToCharacterEvents();
+		}
+		return;
+	}
+
+	// 场景 2: 未订阅, 但 Pawn 已就绪 → 重置重试计数并重新尝试
+	if (Character && Character->CharacterEvents)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GameHUDWidget][TickFallback] 未订阅但 Pawn 已就绪, 重置重试计数并重新订阅 (Pawn=%s)"),
+			*Character->GetName());
+
+		CharacterEventsRetryCount = 0;
+		TryBindToCharacterEvents();
+	}
 }
 
 
@@ -617,4 +722,301 @@ void UGameHUDWidget::OnReturnToLobbyClicked()
 			RoomPC->LeaveRoom();
 		}
 	}
+}
+
+
+// ==========================================
+// 11. CharacterEvents 订阅 (2026-07-01 新增 - 依赖倒置核心)
+// 替代 BaseCharacter 直接 Push GameHUDWidget 的旧模式
+// ==========================================
+
+/**
+ * UGameHUDWidget::TryBindToCharacterEvents
+ *
+ * 尝试订阅 CharacterEvents 组件 (挂在 Pawn 上)
+ * 流程: PC -> GetPawn -> Cast<UCharacterEvents> -> AddDynamic
+ * 成功: 记录 CachedCharacterEvents 以便后续 Unbind
+ * 失败: 0.5s 重试, 最多 10 次 (共 5 秒, 足够 Pawn 切换)
+ *
+ * 【2026-07-01 P0 修复】"事件 + 缓存"双轨制: 订阅成功后**主动拉取快照**
+ * 设计动机:
+ *   - BaseCharacter::PossessedBy 在 GameHUDWidget 创建之前调用 Client_RefreshCharacterIcon
+ *   - 那次 Broadcast CharacterIconReady 事件时, 没有订阅者 → 头像永远丢
+ *   - 现在 CharacterEvents 缓存最近一次头像, 订阅成功后立刻拉取快照, 主动调用 OnCharacterIconReady 模拟"补发"
+ *   - 这样无论何时订阅, 都能拿到头像
+ */
+void UGameHUDWidget::TryBindToCharacterEvents()
+{
+	// 防御: 检查是否已绑定
+	if (CachedCharacterEvents)
+	{
+		return;
+	}
+
+	// 通过 PlayerController 获取当前控制的角色
+	APlayerController* PC = GetOwningPlayer();
+	ABaseCharacter* Character = PC ? Cast<ABaseCharacter>(PC->GetPawn()) : nullptr;
+
+	if (Character && Character->CharacterEvents)
+	{
+		UCharacterEvents* Events = Character->CharacterEvents;
+
+		// 订阅 7 个角色状态事件
+		Events->OnCharacterIconReady.AddDynamic(this,   &UGameHUDWidget::OnCharacterIconReady);
+		Events->OnHealthChangedDelegate.AddDynamic(this, &UGameHUDWidget::OnHealthChanged);
+		Events->OnEnergyChangedDelegate.AddDynamic(this, &UGameHUDWidget::OnEnergyChanged);
+		Events->OnACValueChanged.AddDynamic(this,       &UGameHUDWidget::OnACValueChanged);
+		Events->OnACEValueChanged.AddDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
+		Events->OnACEWithRankChanged.AddDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
+		Events->OnWeaponIconReady.AddDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+
+		CachedCharacterEvents = Events;
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[GameHUDWidget][Bind] 成功订阅 CharacterEvents, Pawn=%s, IsLocallyControlled=%d"),
+			*Character->GetName(), Character->IsLocallyControlled() ? 1 : 0);
+
+		// ==========================================
+		// 【2026-07-01 P0 修复】"事件 + 缓存"双轨制 - 主动拉取快照补发
+		// ==========================================
+		// 1. 头像快照补发
+		{
+			FString CachedCharID;
+			UTexture2D* CachedAvatar = nullptr;
+			if (Events->GetCachedCharacterIcon(CachedCharID, CachedAvatar))
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 补发头像: CharID=%s, Avatar=%s"),
+					*CachedCharID,
+					CachedAvatar ? *CachedAvatar->GetName() : TEXT("nullptr (查表失败)"));
+				OnCharacterIconReady(CachedCharID, CachedAvatar);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 无头像缓存, 等待 CharacterEvents::OnCharacterIconReady 事件"));
+			}
+		}
+
+		// 2. AC 快照补发 (主动拉取, 避免 OnRep_ACValue 比订阅晚触发)
+		{
+			const int32 CachedAC = Events->GetCachedACValue();
+			if (CachedAC >= 0 && Widget_PlayerStatus)
+			{
+				UE_LOG(LogTemp, Verbose, TEXT("[GameHUDWidget][Bind-Snapshot] 补发 AC=%d"), CachedAC);
+				Widget_PlayerStatus->UpdateACValue(CachedAC);
+			}
+		}
+
+		// 3. ACE + 排名 快照补发
+		{
+			int32 CachedACE = -1;
+			EACERankType CachedRank = EACERankType::None;
+			Events->GetCachedACEState(CachedACE, CachedRank);
+			if (CachedACE >= 0 && Widget_PlayerStatus)
+			{
+				UE_LOG(LogTemp, Verbose, TEXT("[GameHUDWidget][Bind-Snapshot] 补发 ACE=%d, Rank=%d"),
+					CachedACE, (int32)CachedRank);
+				Widget_PlayerStatus->SetACEValueWithRank(CachedACE, CachedRank);
+			}
+		}
+
+		// ==========================================
+		// 4. HP / Energy 不缓存, 但仍主动拉一次 (实时性高, 但被订阅频率低, 拉一次保险)
+		// ==========================================
+		if (Widget_PlayerStatus && Character->HealthComponent)
+		{
+			Widget_PlayerStatus->UpdateHealth(
+				Character->HealthComponent->GetCurrent(),
+				Character->HealthComponent->GetMax());
+			Widget_PlayerStatus->UpdateHealthText(
+				FMath::CeilToInt(Character->HealthComponent->GetCurrent()),
+				FMath::CeilToInt(Character->HealthComponent->GetMax()));
+		}
+		if (Widget_PlayerStatus && Character->EnergyComponent)
+		{
+			Widget_PlayerStatus->UpdateEnergy(
+				Character->EnergyComponent->GetCurrent(),
+				Character->EnergyComponent->GetMax());
+			Widget_PlayerStatus->UpdateEnergyText(
+				FMath::CeilToInt(Character->EnergyComponent->GetCurrent()),
+				FMath::CeilToInt(Character->EnergyComponent->GetMax()));
+		}
+
+		// 清理重试定时器
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(CharacterEventsRetryTimerHandle);
+		}
+		CharacterEventsRetryCount = 0;
+		return;
+	}
+
+	// 绑定失败, 延迟重试
+	CharacterEventsRetryCount++;
+	if (CharacterEventsRetryCount < 10)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[GameHUDWidget][Bind-Retry] CharacterEvents 未就绪, 重试中 (%d/10), Pawn=%s"),
+			CharacterEventsRetryCount,
+			Character ? *Character->GetName() : TEXT("nullptr"));
+
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().SetTimer(
+				CharacterEventsRetryTimerHandle, this,
+				&UGameHUDWidget::TryBindToCharacterEvents, 0.5f, false);
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget][Bind-Failed] CharacterEvents 绑定失败 (已达最大重试次数 10 次), 请检查 BaseCharacter 是否正确挂载 CharacterEvents 组件"));
+		CharacterEventsRetryCount = 0;
+	}
+}
+
+
+/**
+ * UGameHUDWidget::UnbindFromCharacterEvents
+ *
+ * 取消订阅 CharacterEvents (在 Pawn 切换时调用)
+ * 用途: 防止旧 Pawn 的 CharacterEvents 被销毁后, 回调仍被触发
+ */
+void UGameHUDWidget::UnbindFromCharacterEvents()
+{
+	if (CachedCharacterEvents)
+	{
+		CachedCharacterEvents->OnCharacterIconReady.RemoveDynamic(this,   &UGameHUDWidget::OnCharacterIconReady);
+		CachedCharacterEvents->OnHealthChangedDelegate.RemoveDynamic(this, &UGameHUDWidget::OnHealthChanged);
+		CachedCharacterEvents->OnEnergyChangedDelegate.RemoveDynamic(this, &UGameHUDWidget::OnEnergyChanged);
+		CachedCharacterEvents->OnACValueChanged.RemoveDynamic(this,       &UGameHUDWidget::OnACValueChanged);
+		CachedCharacterEvents->OnACEValueChanged.RemoveDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
+		CachedCharacterEvents->OnACEWithRankChanged.RemoveDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
+		CachedCharacterEvents->OnWeaponIconReady.RemoveDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+
+		CachedCharacterEvents = nullptr;
+		CharacterEventsRetryCount = 0;
+	}
+}
+
+
+// ==========================================
+// 7 个 CharacterEvents 回调实现
+// ==========================================
+
+/**
+ * UGameHUDWidget::OnCharacterIconReady
+ *
+ * 角色头像加载完毕回调 (由 CharacterEvents 广播触发)
+ * 服务器传递 UTexture2D* Avatar, 解决客户端查表失败的白板问题
+ */
+void UGameHUDWidget::OnCharacterIconReady(const FString& CharacterID, class UTexture2D* Icon)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateCharacterIcon(Icon);
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnHealthChanged
+ *
+ * 血量变化回调 (由 CharacterEvents 广播触发)
+ * 同时更新进度条和文本
+ */
+void UGameHUDWidget::OnHealthChanged(float Current, float Max)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateHealth(Current, Max);
+		Widget_PlayerStatus->UpdateHealthText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnEnergyChanged
+ *
+ * 能量变化回调 (由 CharacterEvents 广播触发)
+ * 同时更新进度条和文本
+ */
+void UGameHUDWidget::OnEnergyChanged(float Current, float Max)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateEnergy(Current, Max);
+		Widget_PlayerStatus->UpdateEnergyText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnACValueChanged
+ *
+ * AC 防护服值变化回调
+ */
+void UGameHUDWidget::OnACValueChanged(int32 NewAC)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateACValue(NewAC);
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnACEValueChanged
+ *
+ * ACE 击杀数变化回调 (无排名, 默认白色)
+ */
+void UGameHUDWidget::OnACEValueChanged(int32 NewACE)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->UpdateACEValue(NewACE);
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnACEWithRankChanged
+ *
+ * ACE 击杀数 + 排名颜色变化回调
+ */
+void UGameHUDWidget::OnACEWithRankChanged(int32 NewACE, EACERankType RankType)
+{
+	if (Widget_PlayerStatus)
+	{
+		Widget_PlayerStatus->SetACEValueWithRank(NewACE, RankType);
+	}
+}
+
+
+/**
+ * UGameHUDWidget::OnWeaponIconReady
+ *
+ * 武器图标加载完毕回调
+ * WeaponID 从 CharacterEvents 传入, 触发异步加载流程
+ */
+void UGameHUDWidget::OnWeaponIconReady(const FString& WeaponID, class UTexture2D* Icon)
+{
+	if (WeaponID.IsEmpty())
+	{
+		return;
+	}
+
+	// 如果服务器直接传递了 Icon, 直接使用
+	if (Icon)
+	{
+		if (Widget_WeaponPanel)
+		{
+			Widget_WeaponPanel->UpdateMeleeWeaponIcon(Icon);
+		}
+		return;
+	}
+
+	// Icon 为空: 通过 WeaponID 从 DataTable 加载
+	UpdateWeaponIconFromID(WeaponID);
 }

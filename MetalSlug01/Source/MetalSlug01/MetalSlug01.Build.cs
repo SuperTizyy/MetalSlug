@@ -11,7 +11,10 @@ public class MetalSlug01 : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[] { 
 			"Core", "CoreUObject", "Engine", "InputCore", "UMG", "Paper2D", 
 			"EnhancedInput", "GameplayTags", "Json", "JsonUtilities","Slate", 
-			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils","DeveloperSettings","AIModule" });
+			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils","DeveloperSettings","AIModule",
+			// 【大厂 P0 修复 2026.06.28】ENetworkFailure::Type 来自 NetCore 模块
+			// 用于 GameFlowSubsystem 的 HandleNetworkFailure 回调参数类型
+			"NetCore" });
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });

@@ -14,77 +14,40 @@
 // UE 自动生成的头文件
 #include "LoginPlayerController.generated.h"
 
-// 前置声明: 避免直接包含 UserWidget 头文件，加快编译速度
 class UUserWidget;
 
 /**
  * @class ALoginPlayerController
- * @brief 专门负责主菜单/登录地图的玩家控制器
+ * @brief 登录地图的玩家控制器 (极简版)
  *
- * 职责说明:
- * - 监听 UGameFlowSubsystem 的全局状态变化
- * - 根据状态自动决定向玩家展示登录页还是局域网大厅
- * - 是登录地图的"UI 总管"
+ * 职责 (【P0 架构清理 2026.06.28】):
+ * - BeginPlay 仅做 PC 硬件初始化 (鼠标 / 输入模式)
+ * - 不再主动 ShowPanel / 不再订阅 OnStateChanged / 不再延迟拉起 UI
+ * - UI 编排完全由 UIViewService 接管 (单一职责 + 事件驱动)
  *
  * 架构理念:
- * 1. 单一职责: 本类只管登录/大厅 UI 切换，不参与任何游戏内逻辑
- * 2. 事件驱动: 不主动轮询状态，而是订阅 OnStateChanged 自动响应
- * 3. 解耦: 不直接引用 UGameFlowSubsystem，而是由 BeginPlay 中 GetSubsystem 获取
+ * 1. 单一职责: 仅负责"PC 硬件配置", 不参与 UI 编排
+ * 2. 解耦: PC 不直接引用任何 Widget / Subsystem / Service
+ * 3. 时序安全: 不在 BeginPlay 中捕获状态 (避免被 PostLoadMapWithWorld 之后的主动切状态覆盖)
+ *
+ * 修复历史:
+ *   - 之前: LoginPC::BeginPlay 延迟 0.2s ShowPanel → 退房后 LANRoomPage 被旧值 Login 覆盖
+ *   - 现在: LoginPC 完全不参与 UI 拉起, 由 UIViewService 监听 OnStateChanged 自动 ShowPanel
  */
 UCLASS()
 class METALSLUG01_API ALoginPlayerController : public APlayerController
 {
-	GENERATED_BODY()
+    GENERATED_BODY()
 
 protected:
-	/**
-	 * UE 原生生命周期函数: 在 Actor 首次被初始化时调用
-	 * 用途: 获取 GameFlowSubsystem 引用并订阅其 OnStateChanged 事件
-	 */
-	virtual void BeginPlay() override;
+    /**
+     * UE 原生生命周期函数: Actor 首次初始化时调用
+     * 仅配置: 鼠标显示 + UIOnly 输入模式
+     */
+    virtual void BeginPlay() override;
 
-	/**
-	 * 登录界面的蓝图类（在 BP_LoginPlayerController 中配置）
-	 * 目的: 动态 CreateWidget 创建登录页 UI
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<UUserWidget> LoginUIClass;
-
-	/**
-	 * 主菜单界面的蓝图类（在 BP_LoginPlayerController 中配置）
-	 * 目的: 登录成功后进入 MainLobby 状态时，动态创建主菜单 UI
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<UUserWidget> GameMenuUIClass;
-
-	/**
-	 * 局域网房间界面的蓝图类（在 BP_LoginPlayerController 中配置）
-	 * 目的: 点击"多人模式"时，动态创建局域网房间 UI
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<UUserWidget> LANRoomUIClass;
-
-	/**
-	 * 监听全局状态变化的事件回调
-	 * @param NewState 新的全局流程状态
-	 * 触发时机: UGameFlowSubsystem::TransitToState 被调用时
-	 */
-	
-	UFUNCTION()
-	void OnFlowStateChanged(EMatchState NewState);
-
-private:
-	/**
-	 * 缓存当前创建的登录 UI（避免重复创建）
-	 * 标记 Transient: 不参与序列化，纯运行时引用
-	 */
-	UPROPERTY(Transient)
-	UUserWidget* ActiveLoginWidget = nullptr;
-
-	/**
-	 * 缓存当前创建的大厅 UI（避免重复创建）
-	 * 标记 Transient: 不参与序列化，纯运行时引用
-	 */
-	UPROPERTY(Transient)
-	UUserWidget* ActiveLobbyWidget = nullptr;
+    /**
+     * EndPlay: 仅 Super::EndPlay (无委托需要解绑)
+     */
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 };

@@ -9,12 +9,12 @@
 #include "Components/Button.h"
 #include "Components/EditableTextBox.h"
 #include "Components/TextBlock.h"
-#include "Components/Overlay.h"
+// 移除冗余 include: Components/Overlay.h (本页未使用 Overlay)
 #include "Kismet/KismetSystemLibrary.h" // 核心: 包含 QuitGame 退出游戏的函数
-// 包含提供游戏基础静态函数的头文件
-#include "Kismet/GameplayStatics.h"
-// 包含我们刚刚写好的全局账号子系统，用于真实的存取逻辑
-#include "Systems/Account/AccountSubsystem.h"
+// 【架构升级】移除 Kismet/GameplayStatics.h（此页不再需要）
+// 【架构升级】移除 Systems/Account/AccountSubsystem.h（直接调 Service）
+// 【架构升级】新增: AccountService 业务门面（项目内已有的版本, 路径: Public/Systems/Account/）
+#include "Services/AccountService.h"
 // 包含游戏流程管理子系统
 #include "Systems/GameFlowSubsystem.h"
 // 包含玩家控制器的头文件
@@ -110,61 +110,76 @@ bool ULoginPage::Initialize()
  */
 void ULoginPage::OnLoginButtonClicked()
 {
-	// 从输入框中获取玩家输入的账号和密码
-	FString Username = Input_Username->GetText().ToString();
-	FString Password = Input_Password->GetText().ToString();
+    // 从输入框中获取玩家输入的账号和密码
+    FString Username = Input_Username->GetText().ToString();
+    FString Password = Input_Password->GetText().ToString();
 
-	// 拦截操作: 检查账号或密码是否为空
-	if (Username.IsEmpty() || Password.IsEmpty())
-	{
-		Text_Hint->SetText(FText::FromString(TEXT("账号或密码不能为空!")));
-		Text_Hint->SetVisibility(ESlateVisibility::Visible);
-		return;
-	}
+    // 【架构升级】所有业务调用走 UAccountService, 不再直接读 UAccountSubsystem
+    // 注意: 现有 UAccountService (Public/Services/AccountService.h) 的方法名是 Login() 而非 TryLogin()
+    //        且它内部 OnLoginSuccess() 已经自动触发 GameFlowSubsystem->TransitToState(MainMenu), V 层不需要重复切状态
+    UAccountService* AccountService = UAccountService::Get(this);
+    if (!AccountService)
+    {
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(TEXT("[致命错误] 账号服务不可用!")));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+        return;
+    }
 
-	// 从当前的游戏世界中获取全局游戏实例 (GameInstance)
-	UGameInstance* GameInstance = GetGameInstance();
-	if (GameInstance)
-	{
-		// 从游戏实例中，获取我们自己写的账号大管家 (AccountSubsystem)
-		UAccountSubsystem* AccountSubsystem = GameInstance->GetSubsystem<UAccountSubsystem>();
-		if (AccountSubsystem)
-		{
-			// ==========================================
-			// 【新增拦截】: 先问大管家，这个号是不是被别人登了？
-			// ==========================================
-			if (AccountSubsystem->IsAccountOnline(Username))
-			{
-				Text_Hint->SetText(FText::FromString(TEXT("该账号已在其他地方登录!")));
-				Text_Hint->SetVisibility(ESlateVisibility::Visible);
-				return; // 直接拦截，不往下走
-			}
-			// 确保子系统存在，并调用它的 TryLogin 接口，把脏活累活全交给子系统去判断
-			if (AccountSubsystem->TryLogin(Username, Password))
-			{
-				// 如果 TryLogin 返回 true，说明密码完全匹配，登录成功!
-				Text_Hint->SetText(FText::FromString(TEXT("登录成功! 正在进入游戏...")));
-				Text_Hint->SetVisibility(ESlateVisibility::Visible);
+    // 调用 Service 获取结构化结果
+    const EAccountLoginResult Result = AccountService->Login(Username, Password);
+    if (Result == EAccountLoginResult::Success)
+    {
+        // 登录成功 → 提示一下, 实际跳转由 AccountService 内部完成
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(TEXT("登录成功! 正在进入游戏...")));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+    }
+    else
+    {
+        // 失败 → 根据枚举显示错误（文案由 View 层本地翻译, 便于 i18n 后续迁移）
+        if (Text_Hint)
+        {
+            // 【修复】原 static FText 函数定义在调用点之后导致 C3861
+            //         改为直接 inline 翻译逻辑（一次性代码, lambda 避免命名空间污染）
+            auto TranslateResult = [](EAccountLoginResult R) -> FText
+            {
+                switch (R)
+                {
+                case EAccountLoginResult::Success:            return FText::FromString(TEXT("登录成功! 正在进入游戏..."));
+                case EAccountLoginResult::EmptyInput:         return FText::FromString(TEXT("账号或密码不能为空!"));
+                case EAccountLoginResult::AccountOnline:      return FText::FromString(TEXT("该账号已在其他地方登录!"));
+                case EAccountLoginResult::InvalidCredentials: return FText::FromString(TEXT("账号不存在或密码错误!"));
+                case EAccountLoginResult::InternalError:      return FText::FromString(TEXT("登录失败, 请稍后再试!"));
+                default:                                      return FText::FromString(TEXT("未知错误"));
+                }
+            };
+            Text_Hint->SetText(TranslateResult(Result));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+    }
+}
 
-				// ==========================================
-				// 【关键修复】: 登录成功后必须切换到 MainMenu 状态!
-				// TransitToState(MainMenu) -> 广播 OnStateChanged -> OnFlowStateChanged(MainMenu) -> 创建 GameMenuPage
-				// ==========================================
-				if (UGameFlowSubsystem* FlowSubsystem = GameInstance->GetSubsystem<UGameFlowSubsystem>())
-				{
-					FlowSubsystem->TransitToState(EMatchState::MainMenu);
-				}
-				// 不再手动 CreateWidget 和 RemoveFromParent，ALoginPlayerController 会处理
-
-			}
-			else
-			{
-				// 如果 TryLogin 返回 false，说明账号没找到或者密码错了
-				Text_Hint->SetText(FText::FromString(TEXT("账号不存在或密码错误!")));
-				Text_Hint->SetVisibility(ESlateVisibility::Visible);
-			}
-		}
-	}
+/**
+ * ULoginPage::OnViewShown
+ *
+ * View 绑定后由 UIViewService 调用
+ * 当前职责: 聚焦用户名输入框 + 清空历史提示
+ */
+void ULoginPage::OnViewShown()
+{
+    if (Input_Username)
+    {
+        Input_Username->SetKeyboardFocus();
+    }
+    if (Text_Hint)
+    {
+        Text_Hint->SetVisibility(ESlateVisibility::Hidden);
+    }
 }
 
 
@@ -183,40 +198,52 @@ void ULoginPage::OnLoginButtonClicked()
  */
 void ULoginPage::OnRegisterButtonClicked()
 {
-	// 从输入框中获取玩家想要注册的账号和密码
-	FString Username = Input_Username->GetText().ToString();
-	FString Password = Input_Password->GetText().ToString();
+    // 从输入框中获取玩家想要注册的账号和密码
+    FString Username = Input_Username->GetText().ToString();
+    FString Password = Input_Password->GetText().ToString();
 
-	// 拦截操作: 确保注册时两者都不为空
-	if (Username.IsEmpty() || Password.IsEmpty())
-	{
-		Text_Hint->SetText(FText::FromString(TEXT("注册时账号和密码不能为空!")));
-		Text_Hint->SetVisibility(ESlateVisibility::Visible);
-		return;
-	}
+    // 拦截操作: 确保注册时两者都不为空
+    if (Username.IsEmpty() || Password.IsEmpty())
+    {
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(TEXT("注册时账号和密码不能为空!")));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+        return;
+    }
 
-	// 获取全局游戏实例
-	UGameInstance* GameInstance = GetGameInstance();
-	if (GameInstance)
-	{
-		// 获取账号子系统
-		UAccountSubsystem* AccountSubsystem = GameInstance->GetSubsystem<UAccountSubsystem>();
+    // 【架构升级】所有业务调用走 UAccountService, 不再直接读 UAccountSubsystem
+    UAccountService* AccountService = UAccountService::Get(this);
+    if (!AccountService)
+    {
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(TEXT("[致命错误] 账号服务不可用!")));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+        return;
+    }
 
-		// 确保子系统存在，并调用它的 TryRegister 接口进行真实注册
-		if (AccountSubsystem && AccountSubsystem->TryRegister(Username, Password))
-		{
-			// TryRegister 返回 true，说明内存里以前没这个号，注册并自动保存成功
-			FString Msg = FString::Printf(TEXT("账号 %s 注册成功! 请点击登录。"), *Username);
-			Text_Hint->SetText(FText::FromString(Msg));
-			Text_Hint->SetVisibility(ESlateVisibility::Visible);
-		}
-		else
-		{
-			// TryRegister 返回 false，说明字典里已经有这个 Key 了，账号重复
-			Text_Hint->SetText(FText::FromString(TEXT("该账号已被占用，请换一个或直接登录!")));
-			Text_Hint->SetVisibility(ESlateVisibility::Visible);
-		}
-	}
+    if (AccountService->Register(Username, Password))
+    {
+        // 注册成功
+        const FString Msg = FString::Printf(TEXT("账号 %s 注册成功! 请点击登录。"), *Username);
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(Msg));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+    }
+    else
+    {
+        // 注册失败: 账号已存在
+        if (Text_Hint)
+        {
+            Text_Hint->SetText(FText::FromString(TEXT("该账号已被占用，请换一个或直接登录!")));
+            Text_Hint->SetVisibility(ESlateVisibility::Visible);
+        }
+    }
 }
 
 
@@ -233,28 +260,21 @@ void ULoginPage::OnRegisterButtonClicked()
  */
 void ULoginPage::OnQuitGameClicked()
 {
-	// ==========================================
-	// 1. 执行最后的数据保存逻辑
-	// ==========================================
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			// 【说明】: 我们在切换武器/角色时，其实已经调用了 SaveLastSelectedCharacter 等函数存进硬盘了
-			// 如果你的 AccountSubsystem 里有统一的类似 SaveAllData() 的函数，可以在这里调用一次做最后的兜底
+    // 【架构升级】退出流程:
+    // 1. UAccountSubsystem::Deinitialize 会在 GameInstance 关闭时自动 Logout + SaveData
+    //    View 不需要做任何手动调用, 这正是 Service/Subsystem 抽象的价值
+    // 2. 直接调 UKismetSystemLibrary::QuitGame
 
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Green, TEXT("正在保存本地数据..."));
-		}
-	}
+    if (GEngine)
+    {
+        GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Green, TEXT("正在退出游戏..."));
+    }
 
-	// ==========================================
-	// 2. 执行退出游戏指令
-	// ==========================================
-	// 获取当前的玩家控制器
-	APlayerController* SpecificPlayer = GetWorld()->GetFirstPlayerController();
+    // 获取当前的玩家控制器
+    APlayerController* SpecificPlayer = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
 
-	// 调用虚幻引擎底层的退出函数（参数: 当前上下文，控制器，退出方式，是否忽略未保存的关卡直接退）
-	UKismetSystemLibrary::QuitGame(this, SpecificPlayer, EQuitPreference::Quit, true);
+    // 调用虚幻引擎底层的退出函数（参数: 当前上下文，控制器，退出方式，是否忽略未保存的关卡直接退）
+    UKismetSystemLibrary::QuitGame(this, SpecificPlayer, EQuitPreference::Quit, true);
 }
 
 

@@ -78,6 +78,20 @@ protected:
 	UFUNCTION()
 	void OnRep_CurrentHealth();
 
+	/**
+	 * 【2026-07-01 新增】OnRep 回调: 客户端收到 bIsDead=true 时触发死亡事件
+	 * 解决原架构 bug:
+	 *   旧 bIsDead 是普通 Replicated,客户端不会触发任何回调
+	 *   → 客户端只能依赖 Multicast_Die RPC, 如果 RPC 失败 / 丢失 / 时序错乱
+	 *     客户端永远不会进入死亡流程 → 布娃娃/武器不消失
+	 * 新架构:
+	 *   - 服务器: HealthComponent::ApplyDamage 内 OnDeath.Broadcast (已有)
+	 *   - 客户端: 本回调触发 OnDeath.Broadcast (新增) → 客户端独立进入死亡流程
+	 *   这样死亡事件在所有机器上**统一由 HealthComponent 事件总线驱动**
+	 */
+	UFUNCTION()
+	void OnRep_bIsDead();
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health")
 	float MaxHealth = 100.0f;
 
@@ -88,6 +102,6 @@ protected:
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentHealth, VisibleAnywhere, BlueprintReadOnly, Category = "Health")
 	float CurrentHealth = 100.0f;
 
-	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Health")
+	UPROPERTY(ReplicatedUsing = OnRep_bIsDead, VisibleAnywhere, BlueprintReadOnly, Category = "Health")
 	bool bIsDead = false;
 };

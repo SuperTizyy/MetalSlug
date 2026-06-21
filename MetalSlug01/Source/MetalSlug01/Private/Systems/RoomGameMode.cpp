@@ -15,6 +15,9 @@
 // 引入房间玩家控制器（用于类型转换）
 #include "Systems/RoomPlayerController.h"
 
+// 【P0】URoomService::BroadcastPlayerJoined/Left 事件广播
+#include "Services/RoomService.h"
+
 // 引入 World 头文件（用于获取 World 实例）
 #include "Engine/World.h"
 
@@ -135,12 +138,24 @@ void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FSt
 			int32 DefenseCount = GS->GetPlayersInTeam(ERoomTeam::Defense).Num();
 
 			// 修改队伍，引擎会自动将这个改动广播给全服
-			PS->CurrentTeam = (AttackCount <= DefenseCount) ? ERoomTeam::Attack : ERoomTeam::Defense;
+			const ERoomTeam NewTeam = (AttackCount <= DefenseCount) ? ERoomTeam::Attack : ERoomTeam::Defense;
+			PS->CurrentTeam = NewTeam;
+
+			// ==========================================
+			// 【2026-06-29 P0 修复】服务器端手动触发 OnRep
+			// 同 ChangePlayerTeam 的根因: ReplicatedUsing 只在客户端触发,
+			// 服务器自己改 CurrentTeam 必须手动 Broadcast OnStateChanged
+			// 否则房主自己的 UI 在新玩家加入时不会立即显示该玩家
+			// ==========================================
+			PS->OnRep_Team();
 		}
 	}
 
 	// 广播系统提示，告知所有人有新玩家加入
 	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】加入了房间"), *PlayerName));
+
+	// 【P0 架构升级】通过 URoomService 事件总线广播玩家加入 (RoomInsidePage 订阅了 OnPlayerJoined, 无需 5s 兜底)
+	URoomService::BroadcastPlayerJoined(this, PlayerName);
 }
 
 
@@ -157,7 +172,26 @@ void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bTo
 	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
 		// 服务器直接修改它的值
-		PS->CurrentTeam = bToAttackTeam ? ERoomTeam::Attack : ERoomTeam::Defense;
+		const ERoomTeam NewTeam = bToAttackTeam ? ERoomTeam::Attack : ERoomTeam::Defense;
+
+		// 【2026-06-29 P0 修复】已经在该阵营则不需要重复触发
+		if (PS->CurrentTeam == NewTeam)
+		{
+			return;
+		}
+
+		PS->CurrentTeam = NewTeam;
+
+		// ==========================================
+		// 【2026-06-29 P0 修复】服务器端手动触发 OnRep
+		// 根因: ReplicatedUsing 只在**客户端**收到同步包后触发 OnRep_* 回调,
+		//       服务器自己改了 CurrentTeam 不会触发, 但服务器端运行的 UI (房主/独立进程模式)
+		//       必须收到 OnStateChanged 才能刷新自己看到的队伍切换
+		// 修复: 服务器主动调用 OnRep_Team() 等价于 OnStateChanged.Broadcast()
+		//       → 订阅了 ARoomPlayerState::OnStateChanged 的所有 UI 立即刷新
+		//       → 客户端那边: 复制系统下发后, 客户端 OnRep_Team 自动触发, 同样刷新
+		// ==========================================
+		PS->OnRep_Team();
 	}
 }
 
@@ -170,9 +204,28 @@ void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bTo
  */
 void ARoomGameMode::RemovePlayerFromRoom(AController* RequestingController)
 {
+	FString LeftPlayerName;
 	if (ARoomPlayerState* PS = RequestingController->GetPlayerState<ARoomPlayerState>())
 	{
-		BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】退出了房间"), *PS->GetPlayerName()));
+		LeftPlayerName = PS->GetPlayerName();
+		BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】退出了房间"), *LeftPlayerName));
+	}
+
+	// 【P0 架构升级】通过 URoomService 事件总线广播玩家离开 (RoomInsidePage 订阅了 OnPlayerLeft, 无需 5s 兜底)
+	if (!LeftPlayerName.IsEmpty())
+	{
+		URoomService::BroadcastPlayerLeft(this, LeftPlayerName);
+	}
+
+	// 【P0 架构升级】自动房主转让: 如果离开的是房主, 自动把房主权限转交给下一个在线玩家
+	// 触发路径: 房主主动退房 / 房主被踢 / 房主断线
+	if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+	{
+		if (!GS->HostPlayerName.IsEmpty() && GS->HostPlayerName.Equals(LeftPlayerName, ESearchCase::IgnoreCase))
+		{
+			UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] 房主 [%s] 离房, 自动转交房主权限"), *LeftPlayerName);
+			TransferHostTo(TEXT("")); // 空字符串 = 自动选下一个
+		}
 	}
 }
 
@@ -244,6 +297,15 @@ void ARoomGameMode::AddAIToRoom(bool bToAttackTeam, const FString& CharacterName
  *
  * 切换玩家准备状态
  * 服务器直接修改 PlayerState 的 bIsReady，引擎自动同步
+ *
+ * 【2026-06-30 P0 修复】手动触发 OnRep_IsReady (与 SwitchPlayerTeam 同款)
+ * 根因: ReplicatedUsing OnRep_IsReady 只在**远端客户端**收到同步包后触发。
+ *       服务器自己（房主进程 / ListenServer 上的 server 自己）改了 bIsReady 后
+ *       OnRep_IsReady 不会自动跑, 房主 UI 看不到玩家准备状态即时变化。
+ * 之前症状: "玩家点了准备后, 房主端 widget 一直是未准备, 必须切换阵营才更新"
+ * 修复: 修改 PS->bIsReady 后立即主动调用 OnRep_IsReady(), 强制 server 端触发 OnStateChanged
+ *       → 订阅了 OnStateChanged 的 RoomInsidePage 立即 RefreshRoomUI
+ *       → 远端 client 那边仍由复制系统自动触发 OnRep_IsReady, 不冲突
  */
 void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bool bIsReady)
 {
@@ -251,6 +313,9 @@ void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bo
 	{
 		// 服务器直接修改它的值，引擎会自动同步给全网
 		PS->bIsReady = bIsReady;
+
+		// 房主端 (ListenServer 进程本地) 立即看到该玩家准备状态变化
+		PS->OnRep_IsReady();
 	}
 }
 
@@ -1199,4 +1264,87 @@ void ARoomGameMode::StartNextZombieRound()
 
 	// 重新启动定时器
 	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ARoomGameMode::OnMatchTimerTick, 1.0f, true);
+}
+
+
+// ==========================================
+// 【P0 架构升级】服务端房主变更流程
+// ==========================================
+
+/**
+ * TransferHostTo
+ *
+ * 服务端主动转交房主身份
+ * 1. 解析新房主名 (空字符串 → 取第一个在线玩家)
+ * 2. 校验新房主不是当前房主自己
+ * 3. 修改 GameState->HostPlayerName (ReplicatedUsing 触发客户端 OnRep_HostPlayerName)
+ * 4. 服务器本地主动广播 BroadcastHostChanged (因为服务端不走 OnRep)
+ * 5. 系统提示"X 成为新房主"
+ *
+ * 调用时机:
+ *  - 房主玩家离开房间后 (RemovePlayerFromRoom 末尾)
+ *  - 房主主动转让 (未来 Server_RequestTransferHost)
+ *  - 房主被强制踢出 (Server_KickPlayer 命中自己时)
+ *
+ * @param NewHostPlayerName 新房主名 (为空表示"自动选下一个")
+ * @return 是否成功转交
+ */
+bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
+{
+	ARoomGameState* GS = GetGameState<ARoomGameState>();
+	if (!GS)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] TransferHostTo 失败: GameState 无效"));
+		return false;
+	}
+
+	// ---- 1. 解析目标房主名 ----
+	FString TargetHost = NewHostPlayerName;
+	if (TargetHost.IsEmpty())
+	{
+		// 空字符串: 取第一个在线玩家 (按 PlayerController 顺序)
+		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (ARoomPlayerState* PS = It->Get()->GetPlayerState<ARoomPlayerState>())
+			{
+				TargetHost = PS->GetPlayerName();
+				break;
+			}
+		}
+	}
+
+	if (TargetHost.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RoomGameMode] TransferHostTo 失败: 房间内已无玩家"));
+		return false;
+	}
+
+	// ---- 2. 校验: 新房主不能等于当前房主 ----
+	if (TargetHost.Equals(GS->HostPlayerName, ESearchCase::IgnoreCase))
+	{
+		UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] TransferHostTo: 目标 %s 已是当前房主, 跳过"), *TargetHost);
+		return true;
+	}
+
+	// ---- 3. 修改 GameState->HostPlayerName (触发客户端 OnRep) ----
+	const FString OldHost = GS->HostPlayerName;
+	GS->HostPlayerName = TargetHost;
+
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] TransferHostTo: 房主变更 %s → %s"), *OldHost, *TargetHost);
+
+	// ---- 4. 服务器本地主动广播 (服务端不走 OnRep, 必须手动广播) ----
+	// 【P0 架构修正】走 URoomService::GetCurrentAccountName() 而非直读 PC->MyPlayerName
+	bool bLocalPCIsHostNow = false;
+	if (URoomService* RoomService = URoomService::Get(this))
+	{
+		const FString LocalAccountName = RoomService->GetCurrentAccountName();
+		bLocalPCIsHostNow = !LocalAccountName.IsEmpty()
+			&& LocalAccountName.Equals(TargetHost, ESearchCase::IgnoreCase);
+	}
+	URoomService::BroadcastHostChanged(this, bLocalPCIsHostNow);
+
+	// ---- 5. 系统提示 ----
+	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】成为新房主"), *TargetHost));
+
+	return true;
 }

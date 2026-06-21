@@ -6,7 +6,14 @@
 #include "UI/Login/Pages/MultiplayerMode/LANRoomPage.h"
 // 房间条目 UI
 #include "UI/Login/Pages/MultiplayerMode/RoomLabelWidget.h"
-// 【新增】必须包含的在线子系统核心头文件
+// 【修复 C2065】末尾追加的 OnViewShown/OnViewHidden 使用了 ULANRoomPresenter, 必须显式 include
+#include "Systems/Session/LANRoomPresenter.h"
+// 【P0】SessionManager 替代 OnlineSubsystem 直调（但老路径仍需完整类型定义）
+#include "Systems/Session/SessionManagerSubsystem.h"
+#include "Systems/Session/SessionResult.h"
+#include "Systems/RoomPlayerController.h"
+#include "Systems/LoginPlayerController.h"
+// 【保留】旧代码路径（OnShowCreateRoomClicked / FindSessionsForAccountCheck / OnFindSessionsComplete）仍用这些类型
 #include "OnlineSubsystem.h"
 #include "OnlineSessionSettings.h"
 #include "Components/ScrollBox.h"
@@ -19,7 +26,7 @@
 #include "Components/TextBlock.h"
 #include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
-#include "Systems/Account/AccountSubsystem.h"
+#include "Services/AccountService.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
 #include "Data/Enums/RoomEnums.h"
@@ -33,30 +40,26 @@
 /**
  * ULANRoomPage::Initialize
  *
- * 1. 订阅 FindSessions 委托（用 AddOnFindSessionsCompleteDelegate_Handle）
+ * 1. 订阅 SessionManager 的 OnRoomsFound 事件（替代直绑 OnlineSubsystem 委托）
  * 2. 绑定大厅层 / 创房层 按钮
  * 3. 初始化 UI 面板状态（隐藏创房弹窗）
  * 4. 开启 3 秒一次自动刷新定时器
  * 5. 初始化游戏模式下拉框（刀战/生化）
  * 6. 初始化地图下拉框（从 MapInfoDataTable 读）
+ *
+ * 【P0 架构升级】LANRoomPage 不再直读 IOnlineSubsystem, 全部委托走 SessionManager
  */
 bool ULANRoomPage::Initialize()
 {
 	if (!Super::Initialize()) return false;
 
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub)
+	// 【P0】订阅 SessionManager 的 OnRoomsFound 事件
+	//   替代原来 Initialize/Destruct 中 AddOnFindSessionsCompleteDelegate_Handle 的手动管理
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		IOnlineSessionPtr SessionInterface = OnlineSub->GetSessionInterface();
-		if (SessionInterface.IsValid())
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
 		{
-			// ==========================================
-			// 【修复 1】: 删掉旧的两行绑定代码，换成这极简的一行
-			// 直接用 CreateUObject 绑定，防止委托变量被意外回收
-			// ==========================================
-			FindSessionsCompleteDelegateHandle = SessionInterface->AddOnFindSessionsCompleteDelegate_Handle(
-				FOnFindSessionsCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnFindSessionsComplete)
-			);
+			SessionManager->OnRoomsFound.AddDynamic(this, &ULANRoomPage::OnRoomsFoundFromManager);
 		}
 	}
 
@@ -68,6 +71,10 @@ bool ULANRoomPage::Initialize()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_EnterRoom 绑定成功"));
 		Btn_EnterRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnEnterRoomClicked);
+
+		// 【Bug1 修复】初始为禁用态: 未选中任何房间时按钮不可点击
+		// 设计理念: View 层显式控制自身可达性, 避免出现"点了没反应"的死局
+		Btn_EnterRoom->SetIsEnabled(false);
 	}
 	else
 	{
@@ -98,8 +105,29 @@ bool ULANRoomPage::Initialize()
 	// ==========================================
 	// 2. 绑定创房层按钮
 	// ==========================================
-	if (Btn_ConfirmCreateRoom) Btn_ConfirmCreateRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnConfirmCreateRoomClicked);
-	if (Btn_HideCreateRoom) Btn_HideCreateRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnHideCreateRoomClicked);
+	// 【大厂标准】创房/取消按钮必须打诊断日志, 与 Btn_EnterRoom 保持一致
+	// 原因: 早期排查发现: Btn_ConfirmCreateRoom 静默失败 → 无法定位是按钮为空还是点击未触发
+	if (Btn_ConfirmCreateRoom)
+	{
+		Btn_ConfirmCreateRoom->OnClicked.RemoveDynamic(this, &ULANRoomPage::OnConfirmCreateRoomClicked);
+		Btn_ConfirmCreateRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnConfirmCreateRoomClicked);
+		UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_ConfirmCreateRoom 绑定成功"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_ConfirmCreateRoom 为空! 请检查 WBP_LANRoomPage 里是否拖了同名按钮 (类型必须为 UButton)"));
+	}
+
+	if (Btn_HideCreateRoom)
+	{
+		Btn_HideCreateRoom->OnClicked.RemoveDynamic(this, &ULANRoomPage::OnHideCreateRoomClicked);
+		Btn_HideCreateRoom->OnClicked.AddDynamic(this, &ULANRoomPage::OnHideCreateRoomClicked);
+		UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_HideCreateRoom 绑定成功"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_HideCreateRoom 为空! 请检查 WBP_LANRoomPage 里是否拖了同名按钮 (类型必须为 UButton)"));
+	}
 
 	// ==========================================
 	// 初始化 UI 面板状态
@@ -172,24 +200,41 @@ bool ULANRoomPage::Initialize()
  */
 void ULANRoomPage::NativeDestruct()
 {
+	// ==========================================
+	// 【DEBUG-SET-3-C】LANRoomPage 被销毁的入口 (切图/主动 RemoveFromParent 都会触发)
+	// ==========================================
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S3-C][LANRoomPage::NativeDestruct] PID=%u WorldName=%s bIsHost=%d bIsTraveling=%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		bIsHost ? 1 : 0,
+		bIsTraveling ? 1 : 0);
+
 	// 关闭自动刷新定时器
 	GetWorld()->GetTimerManager().ClearTimer(SearchTimerHandle);
 
-	// // 2. 【核心修复】: 拿着凭证去退订！做到人走茶凉
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	// 【P0】解绑 SessionManager 事件订阅
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
+		{
+			SessionManager->OnRoomsFound.RemoveDynamic(this, &ULANRoomPage::OnRoomsFoundFromManager);
+		}
+	}
 
 	// ==========================================
-	// 【核心修复 2】: 只有当你既是房主，【并且】又不是因为传送而销毁 UI 时，才炸毁房间
+	// 【P0】房主离开: 走 SessionManager->DestroyRoom, 不再直调 DestroySession
 	// ==========================================
 	if (bIsHost && !bIsTraveling)
 	{
-
-		if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+		if (UGameInstance* GI2 = GetGameInstance())
 		{
-			OnlineSub->GetSessionInterface()->DestroySession(NAME_GameSession);
-			bIsHost = false;
-
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, TEXT("检测到房主离开，后台房间已强制解散!"));
+			if (USessionManagerSubsystem* SessionManager = GI2->GetSubsystem<USessionManagerSubsystem>())
+			{
+				SessionManager->DestroyRoom(FOnDestroyRoomComplete());
+				bIsHost = false;
+				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, TEXT("检测到房主离开，后台房间已强制解散!"));
+			}
 		}
 	}
 
@@ -227,18 +272,72 @@ void ULANRoomPage::OnShowCreateRoomClicked()
  * HandleRoomSelected
  *
  * 房间条目被点击的回调
- * 1. 记录当前选中的房间名
- * 2. 遍历所有条目，更新高亮状态（多选一）
+ * 1. 通过 widget 引用读取房间名 (单一可信数据源)
+ * 2. 联动 Btn_EnterRoom 可用性
+ * 3. 遍历所有条目，更新高亮状态（多选一）
+ *
+ * 【架构升级】: 参数从 FString 改为 URoomLabelWidget*
+ * 原因: 旧设计依赖 CachedRoomName 字符串传递, 若房主未写入 ROOM_NAME SessionSetting
+ *       则 widget 收到空字符串, 外层按钮永远不可用
+ *       新设计: 外层通过 widget 引用直接调用 GetRoomName(), 拿到准确的 CachedRoomName
+ *               即使房主没写 ROOM_NAME, 玩家至少能拿到 "" 而不是被静默丢弃
  */
-void ULANRoomPage::HandleRoomSelected(FString RoomName)
+void ULANRoomPage::HandleRoomSelected(URoomLabelWidget* SelectedRoomWidget)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] HandleRoomSelected 被调用，RoomName=[%s]"), *RoomName);
+	// ==========================================
+	// 【P0 防御】: 防止 widget 被 ClearChildren 销毁后, 残留的回调进入
+	// IsValid 检查能识别"已标记 GC 但内存还在"的情况, 比 nullptr 严格
+	// ==========================================
+	if (!IsValid(SelectedRoomWidget))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[LANRoomPage] HandleRoomSelected: SelectedRoomWidget 为空或已销毁, 忽略本次回调"));
+		return;
+	}
+
+	// ==========================================
+	// 【P0 修复】: 从 widget 引用读取房间名 (单一可信数据源)
+	// ==========================================
+	const FString RoomName = SelectedRoomWidget->GetRoomName();
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[LANRoomPage] HandleRoomSelected 被调用, SelectedWidget=%s RoomName=[%s]"),
+		*SelectedRoomWidget->GetName(), *RoomName);
 
 	// 记录当前选中的房间名
 	CurrentSelectedRoomName = RoomName;
 
+	// 【架构升级】缓存选中的 widget 引用, 用于后续重绘时回填高亮
+	CurrentSelectedRoomWidget = SelectedRoomWidget;
+
 	// ==========================================
-	// 【新增核心魔法】: 遍历列表，刷新所有条目的高亮状态
+	// 【Bug1/Bug2 修复】: 选中房间后, Btn_EnterRoom 立即变为可用态
+	// 设计理由: 选中是用户的"明确意图", 此时禁用按钮违反交互预期
+	// ==========================================
+	if (Btn_EnterRoom)
+	{
+		bool bShouldEnable = !CurrentSelectedRoomName.IsEmpty();
+		Btn_EnterRoom->SetIsEnabled(bShouldEnable);
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("[LANRoomPage] HandleRoomSelected Btn_EnterRoom SetIsEnabled=%d (CurrentSelectedRoomName=[%s])"),
+			bShouldEnable ? 1 : 0, *CurrentSelectedRoomName);
+
+		// 【Bug2 大厂诊断】: 同步日志告知按钮实际状态
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Yellow,
+				FString::Printf(TEXT("已选中房间 [%s]，进入按钮已启用"), *CurrentSelectedRoomName));
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] HandleRoomSelected: Btn_EnterRoom 为空!"));
+	}
+
+	// ==========================================
+	// 【核心魔法】: 遍历列表，刷新所有条目的高亮状态
+	// 使用 widget 引用比对, 不依赖字符串 (与新架构匹配)
 	// ==========================================
 	if (List_Rooms)
 	{
@@ -247,8 +346,8 @@ void ULANRoomPage::HandleRoomSelected(FString RoomName)
 		{
 			if (URoomLabelWidget* RoomLabel = Cast<URoomLabelWidget>(ChildWidget))
 			{
-				// 如果这个条目的名字等于玩家刚才点击的名字，就高亮! 否则熄灭!
-				bool bShouldHighlight = (RoomLabel->GetRoomName() == CurrentSelectedRoomName);
+				// 引用相等: 点击的 widget 与当前 widget 是同一个 → 高亮
+				bool bShouldHighlight = (RoomLabel == SelectedRoomWidget);
 				RoomLabel->SetHighlight(bShouldHighlight);
 			}
 		}
@@ -263,6 +362,11 @@ void ULANRoomPage::HandleRoomSelected(FString RoomName)
  * 1. 拦截: 是否有选中房间
  * 2. 从 SessionSearch 中找到对应的 FOnlineSessionSearchResult
  * 3. 调用 JoinSession 加入
+ *
+ * 【Bug3 修复要点】:
+ *   - 使用 FRoomSessionResult(const FOnlineSessionSearchResult&) 构造函数,
+ *     让业务字段 (RoomName/HostAccount/...) 自动填充 (旧代码手动构造, 业务字段全空)
+ *   - 加入失败时给玩家明确的 Toast, 不要再静默 return
  */
 void ULANRoomPage::OnEnterRoomClicked()
 {
@@ -275,29 +379,71 @@ void ULANRoomPage::OnEnterRoomClicked()
 		return;
 	}
 
-	// 2. 从底层的搜索结果 (SessionSearch->SearchResults) 里，找到这个名字对应的真实房间数据
+	// ==========================================
+	// 【P0 修复】从 SessionSearch 中找选中房间的搜索结果
+	// 旧设计: 按 ROOM_NAME 字符串匹配 → 若房间名为空, 会匹配错
+	// 新设计: 按 CurrentSelectedWidget 在 List_Rooms 中的索引匹配 SessionSearch->SearchResults 同索引
+	//         索引是稳定的, 不依赖字段值
+	// ==========================================
 	FOnlineSessionSearchResult* TargetRoomResult = nullptr;
-	if (SessionSearch.IsValid())
+	int32 SelectedIndex = INDEX_NONE;
+	if (SessionSearch.IsValid() && List_Rooms)
 	{
-		for (FOnlineSessionSearchResult& Result : SessionSearch->SearchResults)
+		// 找到当前选中 widget 在 List_Rooms 中的索引
+		TArray<UWidget*> AllChildren = List_Rooms->GetAllChildren();
+		for (int32 i = 0; i < AllChildren.Num(); ++i)
 		{
-			FString FoundName;
-			Result.Session.SessionSettings.Get(FName("ROOM_NAME"), FoundName);
-			if (FoundName == CurrentSelectedRoomName)
+			if (AllChildren[i] == CurrentSelectedRoomWidget.Get())
 			{
-				TargetRoomResult = &Result;
+				SelectedIndex = i;
 				break;
 			}
 		}
+
+		// 用索引拿搜索结果 (ClearChildren+CreateWidget 保持 widget 顺序与 SessionSearch 顺序一致)
+		if (SessionSearch->SearchResults.IsValidIndex(SelectedIndex))
+		{
+			TargetRoomResult = &SessionSearch->SearchResults[SelectedIndex];
+		}
+	}
+
+	// 【Bug3 防御】: 找不到对应搜索结果 (可能 SessionSearch 已被 OnRoomsFoundFromManager 重建, 选中态过期)
+	if (!TargetRoomResult)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[LANRoomPage] 找不到选中房间 [%s] 的搜索结果 (SelectedIndex=%d, SessionSearch 已过期), 请重新点击房间刷新选中态"),
+			*CurrentSelectedRoomName, SelectedIndex);
+
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Orange,
+				TEXT("房间列表已刷新，请重新选择房间"));
+		}
+
+		// 清掉选中态, 按钮回到禁用, 让用户重新选
+		CurrentSelectedRoomName = TEXT("");
+		CurrentSelectedRoomWidget.Reset();
+		if (Btn_EnterRoom) Btn_EnterRoom->SetIsEnabled(false);
+		if (List_Rooms)
+		{
+			for (UWidget* Child : List_Rooms->GetAllChildren())
+			{
+				if (URoomLabelWidget* RoomLabel = Cast<URoomLabelWidget>(Child))
+				{
+					RoomLabel->SetHighlight(false);
+				}
+			}
+		}
+		return;
 	}
 
 	// 3. 获取当前登录账号
 	FString MyAccountName = TEXT("");
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccountSub = UAccountService::Get(this))
 		{
-			MyAccountName = AccountSub->GetCurrentLoggedInUser();
+			MyAccountName = AccountSub->GetCurrentUser();
 		}
 	}
 
@@ -336,16 +482,105 @@ void ULANRoomPage::OnEnterRoomClicked()
 		}
 	}
 
-	// 5. 所有检查通过 → 正常加入房间
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+	// 5. 所有检查通过 → 走 SessionManager->JoinRoom (由 SessionManager 内部管理委托)
+	if (TargetRoomResult)
 	{
-		// 绑定加入完成的回调
-		JoinSessionCompleteDelegateHandle = OnlineSub->GetSessionInterface()->AddOnJoinSessionCompleteDelegate_Handle(
-			FOnJoinSessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnJoinSessionComplete));
+		if (UGameInstance* GI = GetGameInstance())
+		{
+			if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
+			{
+				// 【Bug3 修复】使用 FRoomSessionResult(const FOnlineSessionSearchResult&) 构造函数
+				//
+				// 设计理由:
+				//   旧代码手动 MakeShared<FOnlineSessionSearchResult>(*TargetRoomResult)
+				//   然后 RoomResult.RoomName/HostAccount 等业务字段保持空字符串!
+				//   这会导致 SessionManager 内部 JoinSession 时, OSS 用业务字段匹配失败
+				//   → 返回 SessionDoesNotExist → ConnectString 为空 → ClientTravel 失败
+				//
+				// 新代码: 走标准构造函数, 自动填充 RoomName/HostAccount/GameMode/MapName/...
+				//         同时 RawSearchResult 仍然共享源数据 (MakeShared 是引用计数安全的)
+				FRoomSessionResult RoomResult(*TargetRoomResult);
 
-		// 执行真正的加入指令
-		OnlineSub->GetSessionInterface()->JoinSession(0, NAME_GameSession, *TargetRoomResult);
+				// 安全日志: 诊断用
+				UE_LOG(LogTemp, Warning,
+					TEXT("[LANRoomPage] 准备加入房间: RoomName=[%s] HostAccount=[%s] Map=[%s] Mode=[%s]"),
+					*RoomResult.RoomName, *RoomResult.HostAccount,
+					*RoomResult.MapName, *RoomResult.GameMode);
+
+				// 【P0】用 UFUNCTION 装回调 (FOnJoinRoomComplete 是 Dynamic 委托, 必须 UFUNCTION)
+				FOnJoinRoomComplete JoinDelegate;
+				JoinDelegate.BindDynamic(this, &ULANRoomPage::OnJoinRoomFromManager);
+				SessionManager->JoinRoom(RoomResult, JoinDelegate);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] SessionManager 不可用, 无法加入房间"));
+				if (GEngine)
+				{
+					GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red,
+						TEXT("会话管理器不可用，无法加入房间"));
+				}
+			}
+		}
+	}
+}
+
+
+/**
+ * OnJoinRoomFromManager
+ *
+ * 【P0 架构升级】SessionManager JoinRoom 单播回调 (Dynamic 委托)
+ * 收到后转交原有 OnJoinSessionComplete 走 ClientTravel 流程
+ *
+ * 【Bug3 修复】: 失败路径不再静默, 给玩家明确的 Toast 提示
+ */
+void ULANRoomPage::OnJoinRoomFromManager(bool bWasSuccessful, const FString& ConnectString)
+{
+	if (bWasSuccessful)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[LANRoomPage] JoinRoom 成功, ConnectString=%s"), *ConnectString);
+
+		// 【大厂 P0 修复】传入 SessionManager 解析的真实 ConnectString
+		// 真局域网: 192.168.x.x:7777
+		// 单机器本地: 127.0.0.1:7777（引擎 GetResolvedConnectString 自动返回）
+		// 不再硬编码地址，跨机器部署时仍能正确连接房主。
+		OnJoinSessionComplete(NAME_GameSession, EOnJoinSessionCompleteResult::Success, ConnectString);
+	}
+	else
+	{
+		// 【Bug3 修复】失败路径给玩家明确提示, 不要再静默 return
+		// 失败原因:
+		//   - 房间已满 (SessionIsFull)
+		//   - 房间已消失 (SessionDoesNotExist) — 通常是搜索结果过期, 房主已下线
+		//   - 地址解析失败 (CouldNotRetrieveAddress)
+		//   - 网络错误
+		UE_LOG(LogTemp, Error,
+			TEXT("[LANRoomPage] JoinRoom 失败 (ConnectString=%s)"),
+			*ConnectString);
+
+		if (GEngine)
+		{
+			GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Red,
+				TEXT("加入房间失败：房间可能已关闭、已满或网络异常，请稍后重试"));
+		}
+
+		// 重置选中态 + 按钮回到禁用
+		CurrentSelectedRoomName = TEXT("");
+		if (Btn_EnterRoom) Btn_EnterRoom->SetIsEnabled(false);
+		if (List_Rooms)
+		{
+			for (UWidget* Child : List_Rooms->GetAllChildren())
+			{
+				if (URoomLabelWidget* RoomLabel = Cast<URoomLabelWidget>(Child))
+				{
+					RoomLabel->SetHighlight(false);
+				}
+			}
+		}
+
+		// 失败路径：ConnectString 无意义, 走 Error 结果码
+		OnJoinSessionComplete(NAME_GameSession, EOnJoinSessionCompleteResult::SessionDoesNotExist, FString());
 	}
 }
 
@@ -363,28 +598,38 @@ void ULANRoomPage::OnEnterRoomClicked()
  * 3. 调用 ClientTravel 传送到房主世界
  * 注意: 本地测试写死 127.0.0.1:7777
  */
-void ULANRoomPage::OnJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result)
+void ULANRoomPage::OnJoinSessionComplete(
+	FName SessionName,
+	EOnJoinSessionCompleteResult::Type Result,
+	const FString& ConnectString)
 {
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
-	{
-		OnlineSub->GetSessionInterface()->ClearOnJoinSessionCompleteDelegate_Handle(JoinSessionCompleteDelegateHandle);
-	}
+	// 【P0】原 OnlineSubsystem 委托清理已废弃 (改由 SessionManager 内部管理)
 
 	if (Result == EOnJoinSessionCompleteResult::Success)
 	{
 		bIsHost = false; // 我是加入者，不是房主
 
-		// 【核心修改】: 获取底层的连接字符串（其实就是房主的局域网 IP 地址）
-		FString ConnectString;
-		if (OnlineSub->GetSessionInterface()->GetResolvedConnectString(NAME_GameSession, ConnectString))
+		// 【大厂 P0 修复】使用 SessionManager 通过 OnJoinRoomFromManager 传入的真实 ConnectString
+		// 防御 1: 理论上 Success 时 ConnectString 必然非空 (SessionManager 在 JoinSessionComplete 成功时
+		//         已经调 GetResolvedConnectString 拿到地址)。但兜底检查一下, 避免空字符串传给 ClientTravel。
+		// 防御 2: 只有房主在同一台机器本地测试时, ConnectString 是 127.0.0.1:7777
+		//         跨机器时, ConnectString 是房主的局域网 IP: 192.168.x.x:7777
+		if (ConnectString.IsEmpty())
 		{
-			// 让当前玩家的控制器带着 IP 地址，瞬间飞进房主的世界
-			if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
-			{
-				ConnectString = TEXT("127.0.0.1:7777"); // 【终极本地测试写死大法】
-				PC->ClientTravel(ConnectString, TRAVEL_Absolute);
-			}
+			UE_LOG(LogTemp, Error,
+				TEXT("[LANRoomPage] OnJoinSessionComplete 成功但 ConnectString 为空, 拒绝 ClientTravel 防止跳错地址"));
+			return;
+		}
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[LANRoomPage] 准备 ClientTravel → ConnectString=%s"), *ConnectString);
+
+		bIsTraveling = true; // 标记正在跳转, NativeDestruct 时不再误判为房主离开
+
+		// 让当前玩家的控制器带着真实 IP，瞬间飞进房主的世界
+		if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
+		{
+			PC->ClientTravel(ConnectString, TRAVEL_Absolute);
 		}
 	}
 }
@@ -402,22 +647,15 @@ void ULANRoomPage::OnBackToMenuClicked()
 	// 【核心跳转逻辑】: 动态生成主菜单 UI 并销毁当前局域网大厅
 	// ==========================================
 
-	// 检查我们是否在蓝图里配置了主菜单的类
-	if (GameMenuClass)
-	{
-		// 在内存中重新生成主菜单的实例
-		UUserWidget* GameMenuWidget = CreateWidget<UUserWidget>(GetWorld(), GameMenuClass);
-
-		// 确保生成成功
-		if (GameMenuWidget)
-		{
-			// 将主菜单重新添加到玩家的屏幕上
-			GameMenuWidget->AddToViewport();
-
-			// 把自己（当前的局域网大厅）从屏幕上彻底销毁
-			this->RemoveFromParent();
-		}
-	}
+	// 【架构升级】返回主菜单: 走 GameFlowSubsystem, 由 UIViewService 自动接管
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+        {
+            FlowSubsystem->TransitToState(EMatchState::MainMenu);
+        }
+    }
+    // 注意: 不再手动 RemoveFromParent, UIViewService 会处理
 }
 
 
@@ -436,36 +674,58 @@ void ULANRoomPage::OnBackToMenuClicked()
  */
 void ULANRoomPage::FindLANRooms()
 {
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (!OnlineSub || !OnlineSub->GetSessionInterface().IsValid()) return;
-
-	IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-
-	// ==========================================
-	// 【无敌逻辑 1】: 使用引擎官方的状态锁，彻底抛弃我们自己写的 bIsSearching
-	// ==========================================
-	if (SessionSearch.IsValid() && SessionSearch->SearchState == EOnlineAsyncTaskState::InProgress)
+	// 【P0】走 SessionManager->FindRooms, 由 SessionManager 内部管理状态锁/委托生命周期
+	//   替代原 OnlineSubsystem 直调 + SessionSearch 直配
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		return;
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
+		{
+			SessionManager->FindRooms(FOnFindRoomsComplete());
+		}
 	}
+}
 
-	// ==========================================
-	// 【无敌逻辑 2】: 每次搜索前，强制重新插拔一次天线!保证回调绝对畅通
-	// ==========================================
-	Sessions->ClearOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegateHandle);
-	FindSessionsCompleteDelegateHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(
-		FOnFindSessionsCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnFindSessionsComplete)
-	);
 
-	// 重新配置搜索参数
+/**
+ * OnRoomsFoundFromManager
+ *
+ * 【P0 架构升级】SessionManager.OnRoomsFound 多播委托回调
+ * 职责: 把 SessionManager 返回的 TArray<FRoomSessionResult> 还原为 SessionSearch
+ *       然后转交给 OnFindSessionsComplete 走原有 UI 渲染逻辑
+ *
+ * 设计取舍: 不重写整个 UI 渲染（OnFindSessionsComplete 内部强依赖 FOnlineSessionSearch）,
+ *          通过复用 SessionSearch 兼容老代码, 后续可平滑迁移
+ */
+void ULANRoomPage::OnRoomsFoundFromManager(const TArray<FRoomSessionResult>& Rooms)
+{
+	// ==========================================
+	// 【DEBUG-SET-1-A】入口: 跨进程 OSS 回调是否真的触发了？
+	// ==========================================
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S1-A][OnRoomsFoundFromManager] PID=%u WorldName=%s Rooms.Num=%d NetMode=%d IsInViewport=%d ActivePanel/WidgetValid=%d/%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		Rooms.Num(),
+		(int32)GetWorld()->GetNetMode(),
+		IsInViewport() ? 1 : 0,
+		0, 0);  // ActivePanel/Widget 暂时用 0 占位, 后面看 UIViewService
+
+	// 1. 构造 SessionSearch 并填充 SearchResults
 	SessionSearch = MakeShareable(new FOnlineSessionSearch());
 	SessionSearch->bIsLanQuery = true;
 	SessionSearch->MaxSearchResults = 20;
 	SessionSearch->TimeoutInSeconds = 2.0f;
-	SessionSearch->QuerySettings.Set(FName("PRESENCESEARCH"), true, EOnlineComparisonOp::Equals);
 
-	Sessions->FindSessions(0, SessionSearch.ToSharedRef());
+	for (const FRoomSessionResult& Room : Rooms)
+	{
+		if (Room.IsValid() && Room.RawSearchResult.IsValid())
+		{
+			SessionSearch->SearchResults.Add(*Room.RawSearchResult);
+		}
+	}
 
+	// 2. 走原有 UI 渲染逻辑（OnFindSessionsComplete 内部已封装, 不重复实现）
+	OnFindSessionsComplete(true);
 }
 
 
@@ -482,19 +742,23 @@ void ULANRoomPage::FindLANRooms()
 void ULANRoomPage::OnFindSessionsComplete(bool bWasSuccessful)
 {
 	// ==========================================
+	// 【DEBUG-SET-2-A】入口: 搜索完成回调触发
+	// ==========================================
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S2-A][OnFindSessionsComplete] PID=%u WorldName=%s bWasSuccessful=%d IsInViewport=%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		bWasSuccessful ? 1 : 0,
+		IsInViewport() ? 1 : 0);
+
+	// ==========================================
 	// 1. 声明这两个关键的数组（修复 C2065 报错）
 	// ==========================================
 	TArray<FString> NewlyFoundRooms;
 	TArray<FString> NewlyFoundRoomSignatures;
 
-	// ==========================================
-	// 2. 收到消息的第一件事: 立刻注销天线，防止重复接收
-	// ==========================================
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
-	{
-		OnlineSub->GetSessionInterface()->ClearOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegateHandle);
-	}
+	// 【P0】原 OnlineSubsystem 委托清理已废弃 (改由 SessionManager.OnRoomsFound 推送)
+	//   保留这段是为了兼容 OnRoomsFoundFromManager 转发调用, 但解绑已经不需要
 
 	// ==========================================
 	// 3. 打印我们期待已久的终极回调状态
@@ -562,6 +826,17 @@ void ULANRoomPage::OnFindSessionsComplete(bool bWasSuccessful)
 			CurrentDisplayedRooms = NewlyFoundRooms;
 			CurrentRoomSignatures = NewlyFoundRoomSignatures;
 
+			// ==========================================
+			// 【DEBUG-SET-2-B】即将重绘房间列表 (ClearChildren + AddChild)
+			// ==========================================
+			UE_LOG(LogTemp, Error,
+				TEXT("[DEBUG-S2-B][RedrawList] PID=%u WorldName=%s OldSigNum=%d NewSigNum=%d IsInViewport=%d"),
+				FPlatformProcess::GetCurrentProcessId(),
+				*GetWorld()->GetName(),
+				CurrentRoomSignatures.Num(),
+				NewlyFoundRoomSignatures.Num(),
+				IsInViewport() ? 1 : 0);
+
 			if (List_Rooms)
 			{
 				List_Rooms->ClearChildren();
@@ -575,20 +850,67 @@ void ULANRoomPage::OnFindSessionsComplete(bool bWasSuccessful)
 							URoomLabelWidget* RoomLabel = CreateWidget<URoomLabelWidget>(GetWorld(), RoomLabelClass);
 							if (RoomLabel)
 							{
+								// 【Bug1 修复】强制触发蓝图属性同步
+								// UMG 的 BindWidget 绑定在 NativeConstruct 阶段尚未解析 (Slate 树未构建完)
+								// 若不主动调用 SynchronizeProperties，Text_RoomName 在 CreateWidget 后仍为 nullptr
+								// 导致 SetRoomName 写入 CachedRoomName 成功但 Text_RoomName->SetText 静默跳过
+								RoomLabel->SynchronizeProperties();
+
+								// ==========================================
+								// 【P0 修复】解析房间名: 多源兜底策略
+								// 优先级: ROOM_NAME > HOST_ACCOUNT > 未命名房间#索引
+								// 原因: 即使房主端某个字段没广播 (DontAdvertise), 也不会让玩家看到空字符串
+								// ==========================================
 								FString RoomName;
 								Result.Session.SessionSettings.Get(FName("ROOM_NAME"), RoomName);
+
+								FString HostAccount;
+								Result.Session.SessionSettings.Get(FName("HOST_ACCOUNT"), HostAccount);
+
+								if (RoomName.IsEmpty())
+								{
+									if (!HostAccount.IsEmpty())
+									{
+										// 兜底 1: 用房主账号作为房间名
+										RoomName = FString::Printf(TEXT("%s 的房间"), *HostAccount);
+									}
+									else
+									{
+										// 兜底 2: 硬编码 "未命名房间" 保证按钮可用
+										RoomName = TEXT("未命名房间");
+									}
+								}
+
+								// 【大厂 P0 诊断】: 把每个房间的真实 RoomName 打印出来
+								// 解决"按钮永远不可用"问题: 即使房主未广播 ROOM_NAME,
+								// 客户端也会使用 HOST_ACCOUNT 兜底, 保证房间名非空
+								UE_LOG(LogTemp, Warning,
+									TEXT("[LANRoomPage][RedrawList] RoomName=[%s] HostAccount=[%s] IsValid=%d"),
+									*RoomName, *HostAccount, Result.IsValid() ? 1 : 0);
+
 								RoomLabel->SetRoomName(RoomName);
 
+								// 【2026-06-30 P0 Bug2 终极修复】客户端: 严禁用 MaxPlayers - NumOpenPublicConnections 兜底
+								// 旧逻辑: CurrentRealPlayers = MaxPlayers - NumOpenPublicConnections, 默认填入 TotalPlayersWithAI
+								// 根因: NumOpenPublicConnections 在 listen server 跨图/玩家加入退出时的状态不一致
+								//       (player counts via FUniqueNetId replication 滞后于 PlayerController replication),
+								//       → 客户端看到的 TotalPlayersWithAI 经常是错的 (例如 4 而非 2)。
+								// 新策略: TotalPlayersWithAI 必须由房主主动推送, 客户端拿到就用, 拿不到就 1 (兜底)
 								int32 MaxPlayers = Result.Session.SessionSettings.NumPublicConnections;
 								if (MaxPlayers <= 0) MaxPlayers = 10;
 
-								int32 CurrentRealPlayers = MaxPlayers - Result.Session.NumOpenPublicConnections;
-								if (CurrentRealPlayers <= 0) CurrentRealPlayers = 1;
-
-								int32 TotalPlayersWithAI = CurrentRealPlayers;
+								int32 TotalPlayersWithAI = 0;
 								Result.Session.SessionSettings.Get(FName("TOTAL_PLAYERS_WITH_AI"), TotalPlayersWithAI);
 
+								// 兜底: 房主还没推送过 (例如刚 create session 时的瞬时窗口)
 								if (TotalPlayersWithAI <= 0) TotalPlayersWithAI = 1;
+
+								// 【大厂 P0 诊断日志 - 2026-06-30】追踪 TOTAL_PLAYERS_WITH_AI 读取是否正确
+								// 解决"显示4人"问题: 看清每个房间项的 NumOpenConnections vs Get 实际读到的值
+								UE_LOG(LogTemp, Log,
+									TEXT("[LANRoomPage][PlayerCount-DIAG] RoomName=[%s] MaxPlayers=%d NumOpenPublicConn=%d GetReturns=%d FinalTotal=%d"),
+									*RoomName, MaxPlayers, Result.Session.NumOpenPublicConnections,
+									TotalPlayersWithAI, FMath::Max(TotalPlayersWithAI, 1));
 
 								RoomLabel->SetPlayerCount(TotalPlayersWithAI, MaxPlayers);
 
@@ -596,7 +918,19 @@ void ULANRoomPage::OnFindSessionsComplete(bool bWasSuccessful)
 								Result.Session.SessionSettings.Get(FName("ROOM_STATE"), bIsPlaying);
 								RoomLabel->SetRoomState(bIsPlaying);
 
-								bool bIsHighlight = (RoomName == CurrentSelectedRoomName);
+								// 【架构升级】高亮匹配逻辑:
+								//  1. 优先: 引用相等 (用户刚刚点的 widget 与当前 widget 是同一个)
+								//  2. 兜底: 字符串相等 (新 widget 通过 RoomName 找回高亮态)
+								//  这样即使 ClearChildren 后 widget 实例重建, 也能恢复高亮
+								bool bIsHighlight = false;
+								if (CurrentSelectedRoomWidget.IsValid())
+								{
+									bIsHighlight = (RoomLabel == CurrentSelectedRoomWidget.Get());
+								}
+								else
+								{
+									bIsHighlight = (RoomName == CurrentSelectedRoomName);
+								}
 								RoomLabel->SetHighlight(bIsHighlight);
 
 								RoomLabel->OnRoomSelected.AddDynamic(this, &ULANRoomPage::HandleRoomSelected);
@@ -682,11 +1016,15 @@ void ULANRoomPage::OnConfirmCreateRoomClicked()
 
 	// ==========================================
 	// 2. 准备调用引擎底层接口创建真实的局域网会话 (Session)
+	// 【Bug3 修复】: 文字改为用户期望的内容，且按钮立即禁用，防止重复点击
 	if (Text_CreateRoomHint)
 	{
-		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在检查大厅，请稍候...")));
+		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在检测是否有相同账号创建了房间...")));
 		Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 	}
+
+	// 【Bug3 修复】: 立即禁用创建按钮，防止异步过程中用户重复点击
+	DisableCreateRoomButton();
 
 	// ==========================================
 	// 账号本地存储，创房前先 FindSessions 查大厅
@@ -700,20 +1038,13 @@ void ULANRoomPage::OnConfirmCreateRoomClicked()
 /**
  * OnDestroySessionComplete
  *
- * 销毁旧房间完成回调
- * 1. 退订委托
- * 2. 调用 HostRealSession 真正开始创建新房间
+ * 【P0 废弃】原 OnlineSubsystem 直调 DestroySession 的回调
+ * 现已替换为 OnDestroyRoomBeforeCreateFromManager (走 SessionManager 链)
+ * 保留函数仅为避免 Blueprint 反射丢失, 内部不再有实际逻辑
  */
 void ULANRoomPage::OnDestroySessionComplete(FName SessionName, bool bWasSuccessful)
 {
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
-	{
-		// 注销委托
-		OnlineSub->GetSessionInterface()->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
-	}
-	// 旧垃圾清理完毕，真正开始创建新房间
-	HostRealSession();
+	// 【P0】委托清理由 SessionManager 内部完成, 此函数已无业务职责
 }
 
 
@@ -728,64 +1059,54 @@ void ULANRoomPage::OnDestroySessionComplete(FName SessionName, bool bWasSuccessf
  */
 void ULANRoomPage::HostRealSession()
 {
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+	// 【P0】走 SessionManager->CreateRoom, 由 SessionManager 内部封装 SessionSettings + 委托管理
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-
-		// 绑定回调: 创房结束（无论成功失败）时通知 UI
-		CreateSessionCompleteDelegateHandle = Sessions->AddOnCreateSessionCompleteDelegate_Handle(
-			FOnCreateSessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnCreateSessionComplete));
-
-		FOnlineSessionSettings SessionSettings;
-		SessionSettings.bIsLANMatch = true;          // 开启局域网模式
-		SessionSettings.NumPublicConnections = 10;   // 房间最大人数
-		SessionSettings.bShouldAdvertise = true;     // 允许局域网广播被搜到
-		SessionSettings.bUsesPresence = true;        // 开启在线状态存在 (Presence)
-		SessionSettings.bAllowJoinInProgress = true; // 允许中途加入 (JIP)
-
-		// ==========================================
-		// 【架构规范】: 将用户选择的所有核心元数据写入 SessionSettings
-		// EOnlineDataAdvertisementType::ViaOnlineServiceAndPing 确保这些数据会随着心跳包被其他客户端搜到
-		// ==========================================
-		SessionSettings.Set(FName("ROOM_NAME"), PendingRoomName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-		SessionSettings.Set(FName("GAME_MODE"), PendingGameMode, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-
-		// 【核心修复】: 必须将地图名称存入 Session，供大厅 UI 查询
-		SessionSettings.Set(FName("MAP_NAME"), PendingMapLevelName.ToString(), EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-
-		// 默认状态标签
-		SessionSettings.Set(FName("ROOM_STATE"), false, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // false=等待中
-		SessionSettings.Set(FName("TOTAL_PLAYERS_WITH_AI"), 1, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing); // 默认人数
-
-		// ==========================================
-		// 【新增】: 把"房主账号名"也写进 SessionSettings
-		// 用途: 其他人创房前先 FindSessions,
-		//      看到 HOST_ACCOUNT == 自己的账号 → 阻止创房
-		// ==========================================
-		FString HostAccountName = TEXT("");
-		if (UGameInstance* GI = GetGameInstance())
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
 		{
-			if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+			// ---- 收集房主账号 ----
+			FString HostAccountName = TEXT("");
+			if (UAccountService* AccountSub = UAccountService::Get(this))
 			{
-				HostAccountName = AccountSub->GetCurrentLoggedInUser();
+				HostAccountName = AccountSub->GetCurrentUser();
 			}
+
+			// ---- 构造 FRoomCreationParams ----
+			FRoomCreationParams Params;
+			Params.RoomName = PendingRoomName;
+			Params.Password = PendingRoomPassword;
+			Params.GameMode = PendingGameMode;
+			Params.MapName = PendingMapLevelName.ToString();
+			Params.LevelName = PendingMapLevelName;
+			Params.MaxPlayers = 10;
+			Params.HostAccount = HostAccountName;
+
+			// ---- 订阅 SessionManager 完成回调 (Dynamic 委托必须 UFUNCTION) ----
+			FOnCreateRoomComplete CreateDelegate;
+			CreateDelegate.BindDynamic(this, &ULANRoomPage::OnCreateRoomFromManager);
+			SessionManager->CreateRoom(Params, CreateDelegate);
 		}
-		SessionSettings.Set(FName("HOST_ACCOUNT"), HostAccountName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-
-		// ==========================================
-		// 【新增】: 写入初始房间账号列表 ROOM_ACCOUNTS
-		// 包含: [HOST_ACCOUNT]
-		// 房主端在每次玩家登录/登出时通过 UpdateSession 动态更新此列表
-		// 供其他客户端在加入前扫描，防止同账号重复进入
-		// 注意: OnlineSubsystemNull 只导出了 FString 版本的 Set/Get，故用管道符序列化
-		// ==========================================
-		FString InitialRoomAccountsStr = HostAccountName + TEXT("|");
-		SessionSettings.Set(FName("ROOM_ACCOUNTS"), InitialRoomAccountsStr, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
-
-		// 执行底层创建命令，NAME_GameSession 是引擎默认的当前游戏会话宏
-		Sessions->CreateSession(0, NAME_GameSession, SessionSettings);
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] HostRealSession: SessionManager 不可用"));
+		}
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] HostRealSession: GameInstance 不可用"));
+	}
+}
+
+
+/**
+ * OnCreateRoomFromManager
+ *
+ * 【P0 架构升级】SessionManager CreateRoom 单播回调 (Dynamic 委托)
+ * 收到后转交原有 OnCreateSessionComplete 走 OpenLevel ?listen 流程
+ */
+void ULANRoomPage::OnCreateRoomFromManager(bool bWasSuccessful, const FString& ErrorMessage)
+{
+	OnCreateSessionComplete(NAME_GameSession, bWasSuccessful);
 }
 
 
@@ -807,17 +1128,17 @@ void ULANRoomPage::HostRealSession()
 void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessful)
 {
 	// ==========================================
-	// 【内存管理规范】: 无论结果如何，第一时间注销委托句柄，防止内存泄漏或野指针触发
+	// 【DEBUG-SET-3-A】入口: CreateSession 完成回调 (Host 端)
 	// ==========================================
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub)
-	{
-		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-		if (Sessions.IsValid())
-		{
-			Sessions->ClearOnCreateSessionCompleteDelegate_Handle(CreateSessionCompleteDelegateHandle);
-		}
-	}
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S3-A][OnCreateSessionComplete] PID=%u WorldName=%s bWasSuccessful=%d NetMode=%d IsInViewport=%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		bWasSuccessful ? 1 : 0,
+		(int32)GetWorld()->GetNetMode(),
+		IsInViewport() ? 1 : 0);
+
+	// 【P0】原 OnlineSubsystem 委托清理已废弃 (改由 SessionManager 内部管理)
 
 	if (bWasSuccessful)
 	{
@@ -851,6 +1172,17 @@ void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessfu
 		}
 
 		// 执行绝对跳转 (TRAVEL_Absolute)
+		// ==========================================
+		// 【DEBUG-SET-3-B】即将 OpenLevel (Host 端触发 ServerTravel)
+		// ==========================================
+		UE_LOG(LogTemp, Error,
+			TEXT("[DEBUG-SET-3-B][OpenLevel-Host] PID=%u WorldName=%s TargetMap=%s URL=%s IsInViewport=%d"),
+			FPlatformProcess::GetCurrentProcessId(),
+			*GetWorld()->GetName(),
+			*TargetMapName.ToString(),
+			*URLOptions,
+			IsInViewport() ? 1 : 0);
+
 		UGameplayStatics::OpenLevel(GetWorld(), TargetMapName, true, URLOptions);
 	}
 	else
@@ -861,6 +1193,9 @@ void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessfu
 			Text_CreateRoomHint->SetText(FText::FromString(TEXT("创建房间失败，请检查网络或重启游戏重试!")));
 			Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 		}
+
+		// 【Bug3 修复】: 创房失败时重新启用按钮，让玩家可以修改后重试
+		ReEnableCreateRoomButton();
 	}
 }
 
@@ -874,31 +1209,9 @@ void ULANRoomPage::OnHideCreateRoomClicked()
 {
 	// 取消创房，隐藏面板
 	if (Overlay_CreateRoom) Overlay_CreateRoom->SetVisibility(ESlateVisibility::Hidden);
-}
 
-
-/**
- * OnLeaveRoomClicked
- *
- * 离开房间按钮
- * 核心逻辑: 如果是房主退出，必须销毁房间，不留垃圾
- */
-void ULANRoomPage::OnLeaveRoomClicked()
-{
-
-	// ==========================================
-	// 【核心逻辑】: 如果是房主退出，必须销毁房间，不留垃圾
-	// ==========================================
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
-	{
-		if (bIsHost)
-		{
-			// 房主退房，真正摧毁这个 Session
-			OnlineSub->GetSessionInterface()->DestroySession(NAME_GameSession);
-			bIsHost = false; // 剥夺房主身份
-		}
-	}
+	// 【Bug3 修复】: 取消操作也需要重新启用按钮，否则下次打开弹窗时按钮仍是禁用态
+	ReEnableCreateRoomButton();
 }
 
 
@@ -931,42 +1244,43 @@ void ULANRoomPage::OnToggleReadyClicked()
  */
 void ULANRoomPage::FindSessionsForAccountCheck()
 {
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (!OnlineSub || !OnlineSub->GetSessionInterface().IsValid())
+	// 【P0】走 SessionManager->FindRooms, 由 SessionManager 内部管理状态锁/委托生命周期
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		// 在线子系统都没, 直接放行让 HostRealSession 自己报错
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
+		{
+			FOnFindRoomsComplete FindDelegate;
+			FindDelegate.BindDynamic(this, &ULANRoomPage::OnAccountCheckFindRoomsFromManager);
+			SessionManager->FindRooms(FindDelegate);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] SessionManager 不可用, 放行"));
+			// SessionManager 不可用, 直接放行让 HostRealSession 自己报错
+			ProceedToCreateRoomAfterCheck();
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] GameInstance 不可用, 放行"));
 		ProceedToCreateRoomAfterCheck();
-		return;
 	}
+}
 
-	IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
 
-	// 防御: 清旧句柄, 防重复订阅
-	Sessions->ClearOnFindSessionsCompleteDelegate_Handle(AccountCheckFindSessionsDelegateHandle);
+/**
+ * OnAccountCheckFindRoomsFromManager
+ *
+ * 【P0 架构升级】SessionManager FindRooms 单播回调 (Dynamic 委托)
+ * 用于创房前同号检查: 从 FRoomSessionResult 缓存读 HOST_ACCOUNT, 不再直读 SessionSettings
+ */
+void ULANRoomPage::OnAccountCheckFindRoomsFromManager(bool bWasSuccessful, const TArray<FRoomSessionResult>& Rooms)
+{
+	// 缓存结果, 给 OnAccountCheckFindSessionsComplete 用
+	AccountCheckRoomsCache = Rooms;
 
-	// 绑新回调
-	AccountCheckFindSessionsDelegateHandle = Sessions->AddOnFindSessionsCompleteDelegate_Handle(
-		FOnFindSessionsCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnAccountCheckFindSessionsComplete));
-
-	// 准备搜索配置
-	AccountCheckSessionSearch = MakeShareable(new FOnlineSessionSearch());
-	AccountCheckSessionSearch->bIsLanQuery = true;       // 局域网模式
-	AccountCheckSessionSearch->MaxSearchResults = 100;   // 多查一些, 防止漏
-	AccountCheckSessionSearch->PingBucketSize = 50;
-
-	// 设置查询过滤: 只查 GameSession 类型
-	// 注意: 用字符串 "PRESENCESEARCH" 而非 SEARCH_PRESENCE 宏
-	//       因为原 FindLANRooms 也在用这个字符串, 保证一致性
-	AccountCheckSessionSearch->QuerySettings.Set(FName("PRESENCESEARCH"), true, EOnlineComparisonOp::Equals);
-
-	// 执行搜索
-	Sessions->FindSessions(0, AccountCheckSessionSearch.ToSharedRef());
-
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
-			TEXT("[CreateRoom] 已发起同号检查搜索, 等待回调..."));
-	}
+	// 委托原 OnAccountCheckFindSessionsComplete 处理 (它会从 AccountCheckRoomsCache 读取)
+	OnAccountCheckFindSessionsComplete(bWasSuccessful);
 }
 
 
@@ -980,12 +1294,7 @@ void ULANRoomPage::FindSessionsForAccountCheck()
  */
 void ULANRoomPage::OnAccountCheckFindSessionsComplete(bool bWasSuccessful)
 {
-	// 退订委托(无论结果如何)
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
-	{
-		OnlineSub->GetSessionInterface()->ClearOnFindSessionsCompleteDelegate_Handle(AccountCheckFindSessionsDelegateHandle);
-	}
+	// 【P0】原 OnlineSubsystem 委托清理已废弃 (改由 SessionManager 内部管理)
 
 	// 搜索失败: 不当误创房, 让 HostRealSession 自己处理失败
 	if (!bWasSuccessful)
@@ -995,6 +1304,7 @@ void ULANRoomPage::OnAccountCheckFindSessionsComplete(bool bWasSuccessful)
 			GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow,
 				TEXT("[CreateRoom] 同号检查搜索失败, 放行创房"));
 		}
+		AccountCheckRoomsCache.Reset();
 		ProceedToCreateRoomAfterCheck();
 		return;
 	}
@@ -1003,55 +1313,53 @@ void ULANRoomPage::OnAccountCheckFindSessionsComplete(bool bWasSuccessful)
 	FString MyAccountName = TEXT("");
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccountSub = UAccountService::Get(this))
 		{
-			MyAccountName = AccountSub->GetCurrentLoggedInUser();
+			MyAccountName = AccountSub->GetCurrentUser();
 		}
 	}
 
 	if (MyAccountName.IsEmpty())
 	{
 		// 拿不到账号名, 放行让 HostRealSession 处理
+		AccountCheckRoomsCache.Reset();
 		ProceedToCreateRoomAfterCheck();
 		return;
 	}
 
-	// 遍历所有搜索结果, 查 HOST_ACCOUNT
-	if (AccountCheckSessionSearch.IsValid())
+	// 【P0】遍历 SessionManager 提供的 FRoomSessionResult 缓存, 查 HOST_ACCOUNT
+	for (const FRoomSessionResult& Room : AccountCheckRoomsCache)
 	{
-		for (const FOnlineSessionSearchResult& Result : AccountCheckSessionSearch->SearchResults)
+		// ==========================================
+		// 【核心校验】: 同账号已有建房 → 拦截!
+		// ==========================================
+		if (Room.HostAccount.Equals(MyAccountName, ESearchCase::IgnoreCase))
 		{
-			FString HostAccount = TEXT("");
-			Result.Session.SessionSettings.Get(FName("HOST_ACCOUNT"), HostAccount);
-
-			// ==========================================
-			// 【核心校验】: 同账号已有建房 → 拦截!
-			// ==========================================
-			if (HostAccount.Equals(MyAccountName, ESearchCase::IgnoreCase))
+			// 弹提示, 阻止创房
+			if (Text_CreateRoomHint)
 			{
-				// 弹提示, 阻止创房
-				if (Text_CreateRoomHint)
-				{
-					Text_CreateRoomHint->SetText(FText::FromString(
-						FString::Printf(TEXT("此账号在别的客户端已经登陆并创房，您无法创建房间，请更换账号重新登陆！"))));
-					Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
-				}
-
-				if (GEngine)
-				{
-					GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-						FString::Printf(TEXT("[CreateRoom] 拦截: 账号 [%s] 已存在建房"), *MyAccountName));
-				}
-
-				// 清缓存, 不创房
-				AccountCheckSessionSearch.Reset();
-				return;
+				Text_CreateRoomHint->SetText(FText::FromString(
+					FString::Printf(TEXT("此账号在别的客户端已经登陆并创房，您无法创建房间，请更换账号重新登陆！"))));
+				Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 			}
+
+			if (GEngine)
+			{
+				GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
+					FString::Printf(TEXT("[CreateRoom] 拦截: 账号 [%s] 已存在建房"), *MyAccountName));
+			}
+
+			// 清缓存, 不创房
+			AccountCheckRoomsCache.Reset();
+
+			// 【Bug3 修复】: 同号检查拦截, 重新启用按钮让玩家可以重试
+			ReEnableCreateRoomButton();
+			return;
 		}
 	}
 
 	// 清缓存
-	AccountCheckSessionSearch.Reset();
+	AccountCheckRoomsCache.Reset();
 
 	// 没有同账号建房, 放行创房
 	ProceedToCreateRoomAfterCheck();
@@ -1073,28 +1381,18 @@ void ULANRoomPage::ProceedToCreateRoomAfterCheck()
 		Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 	}
 
-	// 获取在线子系统 (OnlineSubsystem)
-	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-	if (OnlineSub)
+	// 【P0】走 SessionManager->DestroyRoom / CreateRoom, 由 SessionManager 内部管理委托 + 状态锁
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		// 获取会话接口
-		IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-		if (Sessions.IsValid())
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
 		{
-			// 【修复Bug的核心】: 检查是不是内存里卡着一个叫 NAME_GameSession 的旧房间
-			if (Sessions->GetNamedSession(NAME_GameSession) != nullptr)
+			// 【修复Bug的核心】: 检查 SessionManager 是不是已经 Hosting (内存里卡着旧房间)
+			if (SessionManager->IsHosting())
 			{
-				// 如果有旧的，先绑定销毁回调，然后强制销毁它
-				// 用 Lambda 包裹避免 OnDestroySessionComplete 的私有访问问题
-				DestroySessionCompleteDelegateHandle = Sessions->AddOnDestroySessionCompleteDelegate_Handle(
-					FOnDestroySessionCompleteDelegate::CreateLambda([WeakThis = TWeakObjectPtr<ULANRoomPage>(this)](FName SessionName, bool bWasSuccessful)
-					{
-						if (ULANRoomPage* Self = WeakThis.Get())
-						{
-							Self->OnDestroySessionComplete(SessionName, bWasSuccessful);
-						}
-					}));
-				Sessions->DestroySession(NAME_GameSession);
+				// 如果有旧的，先订阅销毁回调, 销毁后再触发创房
+				FOnDestroyRoomComplete DestroyDelegate;
+				DestroyDelegate.BindDynamic(this, &ULANRoomPage::OnDestroyRoomBeforeCreateFromManager);
+				SessionManager->DestroyRoom(DestroyDelegate);
 			}
 			else
 			{
@@ -1103,6 +1401,19 @@ void ULANRoomPage::ProceedToCreateRoomAfterCheck()
 			}
 		}
 	}
+}
+
+
+/**
+ * OnDestroyRoomBeforeCreateFromManager
+ *
+ * 【P0 架构升级】SessionManager DestroyRoom 单播回调 (Dynamic 委托)
+ * 用于创房前清理旧房间: 销毁完后转 HostRealSession 创新房
+ */
+void ULANRoomPage::OnDestroyRoomBeforeCreateFromManager(bool bWasSuccessful, const FString& ErrorMessage)
+{
+	// 不管销毁成功/失败, 都尝试创建新房间 (SessionManager 内部幂等)
+	HostRealSession();
 }
 
 
@@ -1190,4 +1501,120 @@ void ULANRoomPage::OnConfirmLANRoomConflictClicked()
 		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
 			TEXT("[LANRoomPage] 玩家确认, 已返回大厅(账号保持登录)"));
 	}
+}
+// ==========================================
+// 【架构升级】View 接口实现
+// ==========================================
+
+/**
+ * ULANRoomPage::OnViewShown
+ *
+ * View 绑定后由 UIViewService 调用
+ */
+void ULANRoomPage::OnViewShown()
+{
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        if (ULANRoomPresenter* Presenter = GI->GetSubsystem<ULANRoomPresenter>())
+        {
+            // 订阅 Presenter 的状态变化（用 Lambda 包装, 避免额外声明函数）
+            Presenter->OnStateChanged.AddDynamic(this, &ULANRoomPage::HandlePresenterStateChangedForView);
+            Presenter->OnRoomListRefreshed.AddDynamic(this, &ULANRoomPage::HandlePresenterRoomListRefreshedForView);
+            Presenter->OnErrorOccurred.AddDynamic(this, &ULANRoomPage::HandlePresenterErrorForView);
+            // 通知 Presenter View 已显示, 触发首次刷新
+            Presenter->OnWidgetShow();
+        }
+    }
+}
+
+/**
+ * ULANRoomPage::OnViewHidden
+ */
+void ULANRoomPage::OnViewHidden()
+{
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        if (ULANRoomPresenter* Presenter = GI->GetSubsystem<ULANRoomPresenter>())
+        {
+            Presenter->OnStateChanged.RemoveDynamic(this, &ULANRoomPage::HandlePresenterStateChangedForView);
+            Presenter->OnRoomListRefreshed.RemoveDynamic(this, &ULANRoomPage::HandlePresenterRoomListRefreshedForView);
+            Presenter->OnErrorOccurred.RemoveDynamic(this, &ULANRoomPage::HandlePresenterErrorForView);
+            Presenter->OnWidgetHide();
+        }
+    }
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(SearchTimerHandle);
+    }
+}
+
+// 桩函数: 简单委托给 View 现有的刷新逻辑
+void ULANRoomPage::HandlePresenterStateChangedForView()
+{
+    // TODO: 根据 Presenter CurrentState 切换 UI 状态
+}
+
+void ULANRoomPage::HandlePresenterRoomListRefreshedForView()
+{
+    // 委托 Presenter 重新拉取房间列表
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        if (ULANRoomPresenter* Presenter = GI->GetSubsystem<ULANRoomPresenter>())
+        {
+            Presenter->RequestRefreshRoomList();
+        }
+    }
+}
+
+void ULANRoomPage::HandlePresenterErrorForView(const FString& ErrorMessage)
+{
+    if (Text_CreateRoomHint)
+    {
+        Text_CreateRoomHint->SetText(FText::FromString(ErrorMessage));
+        Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
+    }
+}
+
+
+// ==========================================
+// 12. 创房按钮状态管理 helper 实现
+// ==========================================
+// 设计原则 (DRY):
+//   - 所有创房流程的"异步开始 → 禁用按钮 / 失败终止 → 启用按钮"
+//     必须经由此处两个 helper, 避免散落在多处导致状态不一致
+//   - .h 中只前向声明, 函数体在 .cpp 内实现
+//     (因 .h 里只有 class UButton 前向声明, 编译器看不到 SetIsEnabled 接口)
+
+/**
+ * 禁用创房按钮: 异步操作开始时调用
+ * 设计理由: 防止异步过程中玩家重复点击导致多次创房请求
+ */
+void ULANRoomPage::DisableCreateRoomButton()
+{
+    if (Btn_ConfirmCreateRoom)
+    {
+        Btn_ConfirmCreateRoom->SetIsEnabled(false);
+        UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_ConfirmCreateRoom 已禁用 (异步操作中)"));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] DisableCreateRoomButton: Btn_ConfirmCreateRoom 为空!"));
+    }
+}
+
+/**
+ * 启用创房按钮: 创房失败/取消时调用
+ * 设计理由: 异步终止后必须恢复 UI 可用性, 否则玩家卡死
+ */
+void ULANRoomPage::ReEnableCreateRoomButton()
+{
+    if (Btn_ConfirmCreateRoom)
+    {
+        Btn_ConfirmCreateRoom->SetIsEnabled(true);
+        UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] Btn_ConfirmCreateRoom 已恢复可用"));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] ReEnableCreateRoomButton: Btn_ConfirmCreateRoom 为空!"));
+    }
 }

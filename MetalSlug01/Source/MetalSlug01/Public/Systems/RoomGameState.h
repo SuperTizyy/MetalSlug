@@ -171,8 +171,9 @@ public:
 	/**
 	 * 记录当前房间的房主名称，全服同步！
 	 * 用途: 房主专属标识 / UI 房主皇冠图标显示
+	 * 【P0 升级】ReplicatedUsing: 服务端修改后, 客户端 OnRep_HostPlayerName 自动触发广播
 	 */
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Global")
+	UPROPERTY(ReplicatedUsing = OnRep_HostPlayerName, BlueprintReadOnly, Category = "Room|Global")
 	FString HostPlayerName;
 
 	// ==========================================
@@ -297,4 +298,16 @@ private:
 	 * 结算定时器句柄（持久化，避免局部变量在延迟期间失效）
 	 */
 	FTimerHandle SettlementTimerHandle;
+
+	// ==========================================
+	// 【P0 架构升级】房主变更事件回调
+	// ==========================================
+
+	/**
+	 * HostPlayerName 复制回调
+	 * 时机: 服务器修改 HostPlayerName 后自动同步到所有客户端
+	 * 职责: 转发给 URoomService.BroadcastHostChanged 让 UI 订阅者收到通知
+	 */
+	UFUNCTION()
+	void OnRep_HostPlayerName();
 };

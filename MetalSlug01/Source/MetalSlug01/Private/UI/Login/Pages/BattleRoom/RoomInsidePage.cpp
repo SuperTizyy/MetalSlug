@@ -29,16 +29,22 @@
 #include "Kismet/GameplayStatics.h"
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
 #include "Systems/RoomPlayerController.h"
-#include "Systems/Account/AccountSubsystem.h"
+// 【架构修正】UI 层不直接调 Subsystem, 改走 Service 门面
+// 【修复 C1083】项目内的 RoomService 在 Public/Systems/ 而非 Public/Services/
+#include "Services/AccountService.h"
+#include "Services/RoomService.h"
+#include "Services/RoomStateService.h"
 #include "Components/ComboBoxString.h"
 #include "Engine/DataTable.h"
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Enums/RoomEnums.h"
 #include "Components/UniformGridSlot.h"
 #include "UI/Login/Pages/BattleRoom/WeaponIconWidget.h"
-#include "OnlineSubsystem.h"
-#include "Interfaces/OnlineSessionInterface.h"
+// 【架构修正】已不再直读 OnlineSubsystem, SessionManager 已封装会话数据查询
+#include "Systems/Session/SessionManagerSubsystem.h"
+// 【Bug2 终极修复】RoomInsidePage 直接调 IOnlineSession::UpdateSession 时需要 EOnlineDataAdvertisementType
 #include "OnlineSessionSettings.h"
+// OnlineSubsystem 直引保留（兼容旧逻辑）; RoomGameState/RoomPlayerState 后续按 Service 化重构
 #include "Systems/GameFlowSubsystem.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/Core/RoomPlayerState.h"
@@ -139,13 +145,42 @@ void URoomInsidePage::NativeConstruct()
 {
 	Super::NativeConstruct();
 
-	// 启动定时器，每 0.5 秒检查一次玩家变化
-	GetWorld()->GetTimerManager().SetTimer(PlayerCheckTimerHandle, this, &URoomInsidePage::CheckForNewPlayers, 0.5f, true);
+	// 【P0 架构升级】订阅 URoomService 事件总线, 替代 0.5s 定时器轮询
+	if (URoomService* RoomService = URoomService::Get(this))
+	{
+		RoomService->OnHostChanged.AddDynamic(this, &URoomInsidePage::OnRoomServiceHostChanged);
+		RoomService->OnPlayerJoined.AddDynamic(this, &URoomInsidePage::OnRoomServicePlayerJoined);
+		RoomService->OnPlayerLeft.AddDynamic(this, &URoomInsidePage::OnRoomServicePlayerLeft);
+	}
+
+	// ==========================================
+	// 【2026-06-29 P0 修复】在 NativeConstruct 中启动 0.5s 兜底定时器
+	// 根因 (1): OnViewShown() 永远不被调用 (UIViewService 没有调用 IView 生命周期的代码)
+	//            → 上次修改放 OnViewShown 里的 0.5s 定时器启动完全无效
+	// 根因 (2): 玩家 REP 同步需要时间 (DelayedSendPlayerInfo 延迟 2 秒),
+	//            首次 RefreshRoomUI 时 KnownPlayerStates 为空
+	// 根因 (3): URoomService 是 GameInstanceSubsystem, 服务器 Broadcast 事件
+	//            根本到不了客户端, 必须客户端主动扫描
+	// 修复: 直接在 NativeConstruct 启动 0.5s CheckForNewPlayers 循环定时器
+	// ==========================================
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
+		World->GetTimerManager().SetTimer(
+			PlayerCheckTimerHandle,
+			this,
+			&URoomInsidePage::CheckForNewPlayers,
+			0.5f,
+			true);  // 循环, 直到 ClearTimer
+	}
+
 	// 立即执行一次 UI 刷新
 	RefreshRoomUI();
 
-	// 判断当前玩家是否为房主
-	bool bIsHost = GetOwningPlayer()->HasAuthority();
+	// 【2026-06-29 P0 修复】删掉此处 bIsHost 局部变量计算, 改在 UpdateHostVisibility() 内部统一计算
+	// 旧代码: NativeConstruct 这里算一次 bIsHost, 只用于按钮可见性
+	//       → 按钮可见性已在 UpdateHostVisibility() 集中处理, 此处计算是浪费
+	//       → 保留会触发 "unused variable" 编译警告
 
 	// 检查角色数据表是否已绑定
 	if (!CharacterDataTable)
@@ -199,10 +234,10 @@ void URoomInsidePage::NativeConstruct()
 
 			// 从 AccountSubsystem 中读取上次选择的角色
 			FString SavedCharacterID = TEXT("");
-			UAccountSubsystem* AccountSub = nullptr;
+			UAccountService* AccountSub = nullptr;
 			if (UGameInstance* GI = GetGameInstance())
 			{
-				AccountSub = GI->GetSubsystem<UAccountSubsystem>();
+				AccountSub = UAccountService::Get(this);
 				if (AccountSub)
 				{
 					SavedCharacterID = AccountSub->GetLastSelectedCharacter();
@@ -292,12 +327,6 @@ void URoomInsidePage::NativeConstruct()
 	// 填充 AI 配置面板的数据
 	PopulateAIPanelData();
 
-	// 只有房主才能看到打开 AI 面板的按钮
-	if (Btn_OpenAIPanel)
-	{
-		Btn_OpenAIPanel->SetVisibility(bIsHost ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
-	}
-
 	// 从会话设置中读取房间名称和游戏模式，并显示在 UI 上
 	if (Text_RoomName)
 	{
@@ -305,42 +334,22 @@ void URoomInsidePage::NativeConstruct()
 
 		FString DisplayGameMode = TEXT("默认模式");
 
-		IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-		if (OnlineSub)
+		// 【架构修正】UI 不直读 OnlineSubsystem, 改为通过 SessionManager 获取
+		if (UGameInstance* GI = GetGameInstance())
 		{
-			IOnlineSessionPtr Sessions = OnlineSub->GetSessionInterface();
-			if (Sessions.IsValid())
+			if (USessionManagerSubsystem* SessionMgr = GI->GetSubsystem<USessionManagerSubsystem>())
 			{
-				FNamedOnlineSession* Session = Sessions->GetNamedSession(NAME_GameSession);
-				if (Session)
-				{
-					// 从会话设置中获取房间名称
-					Session->SessionSettings.Get(FName("ROOM_NAME"), DisplayRoomName);
-					// 从会话设置中获取游戏模式
-					Session->SessionSettings.Get(FName("GAME_MODE"), DisplayGameMode);
-				}
+				SessionMgr->GetCurrentSessionDisplayInfo(DisplayRoomName, DisplayGameMode);
 			}
 		}
+
 		// 组合房间名称和游戏模式显示文本
 		FString FinalDisplayText = FString::Printf(TEXT("%s-%s"), *DisplayRoomName, *DisplayGameMode);
 		Text_RoomName->SetText(FText::FromString(FinalDisplayText));
 	}
 
-	// 非房主显示准备按钮，房主隐藏该按钮
-	if (Btn_ToggleReady) Btn_ToggleReady->SetVisibility(bIsHost ? ESlateVisibility::Collapsed : ESlateVisibility::Visible);
-
-	// 只有房主才能看到开始游戏按钮
-	if (Btn_StartGame)
-	{
-		if (GetOwningPlayer() && GetOwningPlayer()->HasAuthority())
-		{
-			Btn_StartGame->SetVisibility(ESlateVisibility::Visible);
-		}
-		else
-		{
-			Btn_StartGame->SetVisibility(ESlateVisibility::Collapsed);
-		}
-	}
+	// 【2026-06-29 P0 修复】统一房主按钮可见性
+	UpdateHostVisibility();
 
 	// 注册游戏流程状态变化的监听器
 	if (UGameInstance* GI = GetGameInstance())
@@ -368,6 +377,14 @@ void URoomInsidePage::NativeDestruct()
 {
 	// 清除玩家检查定时器
 	GetWorld()->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
+
+	// 【P0】解绑 URoomService 事件订阅
+	if (URoomService* RoomService = URoomService::Get(this))
+	{
+		RoomService->OnHostChanged.RemoveDynamic(this, &URoomInsidePage::OnRoomServiceHostChanged);
+		RoomService->OnPlayerJoined.RemoveDynamic(this, &URoomInsidePage::OnRoomServicePlayerJoined);
+		RoomService->OnPlayerLeft.RemoveDynamic(this, &URoomInsidePage::OnRoomServicePlayerLeft);
+	}
 
 	// 移除游戏流程状态变化的监听器
 	if (UGameInstance* GI = GetGameInstance())
@@ -421,9 +438,10 @@ void URoomInsidePage::OnLeaveRoomClicked()
  */
 void URoomInsidePage::OnStartGameClicked()
 {
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	// 【P0 架构迁移】走 RoomService 业务门面, View 不感知 PC/RPC
+	if (URoomService* RoomService = URoomService::Get(this))
 	{
-		PC->Server_RequestStartGame();
+		RoomService->RequestStartGame();
 	}
 }
 
@@ -449,9 +467,9 @@ void URoomInsidePage::OnJoinAttackTeamClicked()
 	}
 
 	// 向服务器请求加入攻方 (true 表示攻方)
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	if (URoomService* RoomService = URoomService::Get(this))
 	{
-		PC->Server_RequestChangeTeam(true);
+		RoomService->RequestChangeTeam(true);
 	}
 }
 
@@ -473,9 +491,9 @@ void URoomInsidePage::OnJoinDefenseTeamClicked()
 	}
 
 	// 向服务器请求加入守方 (false 表示守方)
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	if (URoomService* RoomService = URoomService::Get(this))
 	{
-		PC->Server_RequestChangeTeam(false);
+		RoomService->RequestChangeTeam(false);
 	}
 }
 
@@ -500,9 +518,9 @@ void URoomInsidePage::OnToggleReadyClicked()
 	}
 
 	// 向服务器同步准备状态
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+	if (URoomService* RoomService = URoomService::Get(this))
 	{
-		PC->Server_ToggleReady(bIsReady);
+		RoomService->RequestReady(bIsReady);
 	}
 }
 
@@ -524,10 +542,10 @@ void URoomInsidePage::OnChatTextCommitted(const FText& Text, ETextCommit::Type C
 	// 检查是否是按回车键且文本不为空
 	if (CommitMethod == ETextCommit::OnEnter && !Text.IsEmpty())
 	{
-		// 向服务器发送聊天消息
-		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+		// 【P0 架构迁移】走 RoomService 业务门面
+		if (URoomService* RoomService = URoomService::Get(this))
 		{
-			PC->Server_SendChatMessage(Text.ToString());
+			RoomService->RequestSendChatMessage(Text.ToString());
 		}
 
 		// 清空输入框
@@ -610,7 +628,7 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 	// 保存选择的角色 ID 到 AccountSubsystem
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccSub = UAccountService::Get(this))
 		{
 			int32 SelectedIdx = ComboBox_CharacterSelect->GetSelectedIndex();
 			FString CurrentCharID = (SelectedIdx != INDEX_NONE) ? CachedCharacterIDs[SelectedIdx].ToString() : TEXT("Default");
@@ -688,7 +706,7 @@ void URoomInsidePage::OnConfirmWeaponChangeClicked()
 		// 保存选择的武器到 AccountSubsystem
 		if (UGameInstance* GI = GetGameInstance())
 		{
-			if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+			if (UAccountService* AccountSub = UAccountService::Get(this))
 			{
 				AccountSub->SaveLastSelectedWeapon(ActiveBackpackSlot, TempSelectedWeaponRow.ToString());
 			}
@@ -724,7 +742,7 @@ void URoomInsidePage::OnChangeWeaponClicked()
 	// 从 AccountSubsystem 中读取当前背包槽位的武器
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccountSub = UAccountService::Get(this))
 		{
 			FString SavedWeapon = AccountSub->GetLastSelectedWeapon(ActiveBackpackSlot);
 			TempSelectedWeaponRow = FName(*SavedWeapon);
@@ -907,7 +925,7 @@ void URoomInsidePage::UpdateWeaponDisplayImage(int32 BackpackSlot)
 	// 从 AccountSubsystem 中读取保存的武器
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccountSub = UAccountService::Get(this))
 		{
 			SavedWeaponRow = AccountSub->GetLastSelectedWeapon(BackpackSlot);
 		}
@@ -1143,10 +1161,10 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 		int32 ActualAddCount = FMath::Min(RequestedAICount, RemainingSlots);
 
 		// 向服务器请求添加 AI
-		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
+		bool bIsAttackTeam = SelectedTeam.Contains(TEXT("攻方"));
+		if (URoomService* RoomService = URoomService::Get(this))
 		{
-			bool bIsAttackTeam = SelectedTeam.Contains(TEXT("攻方"));
-			PC->Server_AddAI(bIsAttackTeam, SelectedChar, ActualAddCount);
+			RoomService->RequestAddAI(bIsAttackTeam, SelectedChar, ActualAddCount);
 		}
 
 		if (GEngine)
@@ -1248,31 +1266,50 @@ void URoomInsidePage::ActivateChatInput()
  * CheckForNewPlayers
  *
  * 0.5 秒一次的玩家变化检查
- * 1. 扫描 GameState->PlayerArray
- * 2. 新玩家 -> 加入 KnownPlayerStates + 订阅 OnStateChanged
- * 3. 已离开 -> 从 KnownPlayerStates 移除
- * 4. 期望人数 != UI 实际人数 -> 触发 RefreshRoomUI
+ * 1. 通过 URoomStateService 获取攻守方快照数量
+ * 2. 维护 KnownPlayerStates（订阅单个玩家的 OnStateChanged, 仍合理: 订阅事件 ≠ 直读数据）
+ * 3. 期望人数 != UI 实际人数 -> 触发 RefreshRoomUI
+ *
+ * 【P0 架构升级】玩家状态读取走 RoomStateService, View 不直接读 GameState/PlayerState
+ * (但订阅 PlayerState 事件用于响应单玩家变化是合理的——订阅 ≠ 直读)
  */
 void URoomInsidePage::CheckForNewPlayers()
 {
-	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
-	if (!GS) return;
+	URoomStateService* RoomState = URoomStateService::Get(this);
+	if (!RoomState) return;
+
+	// 合并攻守方快照, 拿到当前所有活跃玩家
+	TArray<FPlayerSnapshot> AllSnapshots;
+	AllSnapshots.Append(RoomState->GetAttackTeamSnapshots());
+	AllSnapshots.Append(RoomState->GetDefenseTeamSnapshots());
 
 	bool bNeedsRefresh = false;
 
-	// 遍历 GameState 中的所有玩家状态
-	for (APlayerState* GenericPS : GS->PlayerArray)
+	// 用 PlayerName 作为唯一 key, 对比 KnownPlayerStates 维护订阅链
+	// (订阅单个 PlayerState 的 OnStateChanged, 用于响应单玩家变化)
+	for (const FPlayerSnapshot& Snapshot : AllSnapshots)
 	{
-		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
+		const bool bAlreadyKnown = KnownPlayerStates.ContainsByPredicate(
+			[&Snapshot](ARoomPlayerState* PS){ return PS && PS->GetPlayerName() == Snapshot.PlayerName; });
+
+		if (!bAlreadyKnown)
 		{
-			// 检查是否为新玩家
-			if (!KnownPlayerStates.Contains(RoomPS))
+			// 找到对应的 ARoomPlayerState 来订阅其变化事件
+			if (ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>())
 			{
-				// 添加到已知玩家列表
-				KnownPlayerStates.Add(RoomPS);
-				// 订阅该玩家的状态变化事件
-				RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
-				bNeedsRefresh = true;
+				for (APlayerState* GenericPS : GS->PlayerArray)
+				{
+					if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
+					{
+						if (RoomPS->GetPlayerName() == Snapshot.PlayerName)
+						{
+							KnownPlayerStates.Add(RoomPS);
+							RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
+							bNeedsRefresh = true;
+							break;
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1281,26 +1318,19 @@ void URoomInsidePage::CheckForNewPlayers()
 	for (int32 i = KnownPlayerStates.Num() - 1; i >= 0; --i)
 	{
 		ARoomPlayerState* TrackedPS = KnownPlayerStates[i];
-		if (!IsValid(TrackedPS) || !GS->PlayerArray.Contains(TrackedPS))
+		const bool bStillInRoom = TrackedPS && AllSnapshots.ContainsByPredicate(
+			[TrackedPS](const FPlayerSnapshot& S){ return S.PlayerName == TrackedPS->GetPlayerName(); });
+
+		if (!IsValid(TrackedPS) || !bStillInRoom)
 		{
-			// 从已知玩家列表中移除
 			KnownPlayerStates.RemoveAt(i);
 			bNeedsRefresh = true;
 		}
 	}
 
-	// 计算期望的攻守方人数
-	int32 ExpectedAttackCount = 0;
-	int32 ExpectedDefenseCount = 0;
-
-	for (ARoomPlayerState* PS : KnownPlayerStates)
-	{
-		if (IsValid(PS))
-		{
-			if (PS->CurrentTeam == ERoomTeam::Attack) ExpectedAttackCount++;
-			else if (PS->CurrentTeam == ERoomTeam::Defense) ExpectedDefenseCount++;
-		}
-	}
+	// 【P0】人数从快照直接拿, 不再从 PS 字段读
+	const int32 ExpectedAttackCount = RoomState->GetAttackTeamSnapshots().Num();
+	const int32 ExpectedDefenseCount = RoomState->GetDefenseTeamSnapshots().Num();
 
 	// 获取 UI 中实际显示的人数
 	int32 UIAttackCount = Box_AttackTeam ? Box_AttackTeam->GetChildrenCount() : 0;
@@ -1347,22 +1377,118 @@ void URoomInsidePage::RefreshRoomUI()
 		return;
 	}
 
-	// 获取房主名称
+	// 【P0】HostPlayerName 走 RoomStateService::GetMatchSnapshot, 不直接读 GameState
 	FString CurrentHostName = TEXT("");
-	if (ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>())
+	if (URoomStateService* RoomStateForHost = URoomStateService::Get(this))
 	{
-		CurrentHostName = GS->HostPlayerName;
+		CurrentHostName = RoomStateForHost->GetMatchSnapshot().HostPlayerName;
 	}
+
+	// ==========================================
+	// 【2026-06-30 P0 Bug1+Bug3 终极修复】本机房主身份判定 - 双路权威
+	// --------------------------------------------------------------
+	// 旧实现只走 URoomService::IsHost() 一条路, 跨图后行为未验证完全可靠
+	// 新实现双路兜底:
+	//   【路1 权威】 NetMode == NM_ListenServer → 本机必然是 listen server 上的房主
+	//                → 直接基于 UE 网络层, 不依赖任何 Subsystem 状态
+	//                → ListenServer 上 server 自己立即可见 (无 ON_REP 延迟)
+	//   【路2 兜底】 URoomService::IsHost() — 老逻辑保留, 路1 拿不到时用
+	//                → 路1 已确定 bAmILocalHost=true 时, 路2 只用于拿 LocalAccountName
+	// 【P0 关键】: ListenServer 上的玩家 100% 是房主, 不需要等 HostPlayerName 同步
+	//              这样房主 widget 在 RefreshRoomUI 第一帧就能被 SetAsHost(true)
+	//              → Text_IsReady 永久 Collapsed, 不会显示"未准备"
+	// ==========================================
+	FString LocalAccountName = TEXT("");
+	bool bAmILocalHost = false;
+
+	if (UWorld* World = GetWorld())
+	{
+		// 路1: NetMode 权威判定 (ListenServer → 本机就是房主, 不依赖任何 GameState 同步)
+		if (World->GetNetMode() == NM_ListenServer)
+		{
+			bAmILocalHost = true;
+
+			// ==========================================
+			// 【2026-06-30 P0 Bug1 终极修复】本机账号名: 优先走 UAccountService::GetCurrentAccountName
+			// ----------------------------------------------------------------------
+			// 旧实现直接读 LocalPC->LocalPS->GetPlayerName(), 在跨图后第一帧会拿到
+			//   UE 默认填的"机器名" (如 YiYuanDesktop-7845BD) 而非登录玩家的真实账号 (如 111)。
+			// 根因: RoomPS.SetPlayerName() 通过 Server_SendPlayerInfo (延迟 2 秒) 才会覆盖,
+			//       而 UAccountSubsystem.CurrentLoggedInUser 是登录时就持久化的, 不会被覆盖。
+			// 路1a (优先) 路1b (兜底) 双源拿 LocalAccountName, 保证第一帧就拿到对的名字
+			//   - 路1a: UAccountService::GetCurrentAccountName() → 跨图持久, 准
+			//   - 路1b: LocalPS->GetPlayerName() → 跨图后 2s 内可能为机器名, 用作兜底
+			// ==========================================
+			if (URoomService* RoomServiceForName = URoomService::Get(this))
+			{
+				LocalAccountName = RoomServiceForName->GetCurrentAccountName();
+			}
+			if (LocalAccountName.IsEmpty())
+			{
+				if (APlayerController* LocalPC = World->GetFirstPlayerController())
+				{
+					if (ARoomPlayerState* LocalPS = LocalPC->GetPlayerState<ARoomPlayerState>())
+					{
+						LocalAccountName = LocalPS->GetPlayerName();
+					}
+				}
+			}
+			// 【兜底】如果本地还没有名字 (例如 Standalone 测试模式),
+			//         借 GameState.HostPlayerName 当作 LocalAccountName
+			if (LocalAccountName.IsEmpty() && !CurrentHostName.IsEmpty())
+			{
+				LocalAccountName = CurrentHostName;
+			}
+		}
+
+		// 路2: URoomService 兜底 (Standalone / 跨 GameInstance 等 NetMode 拿不到时)
+		if (!bAmILocalHost)
+		{
+			if (URoomService* LocalRoomService = URoomService::Get(this))
+			{
+				bAmILocalHost = LocalRoomService->IsHost();
+				if (bAmILocalHost)
+				{
+					LocalAccountName = LocalRoomService->GetCurrentAccountName();
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomInsidePage] RefreshRoomUI: bAmILocalHost=%d, LocalAccount=[%s], CurrentHostName=[%s]"),
+		bAmILocalHost ? 1 : 0, *LocalAccountName, *CurrentHostName);
 
 	// 遍历所有已知玩家，创建对应的 UI 标签
 	for (ARoomPlayerState* PS : KnownPlayerStates)
 	{
 		if (!IsValid(PS)) continue;
 
+		// 【P0】先取玩家名, 再用快照查 Team/bIsReady（避免直读 PS 字段）
+		const FString PName = PS->GetPlayerName();
+
 		// 确定目标队伍容器
 		UVerticalBox* TargetBox = nullptr;
-		if (PS->CurrentTeam == ERoomTeam::Attack) TargetBox = Box_AttackTeam;
-		else if (PS->CurrentTeam == ERoomTeam::Defense) TargetBox = Box_DefenseTeam;
+		ERoomTeam PS_Team = ERoomTeam::None;
+		bool PS_bIsReady = false;
+		if (URoomStateService* RoomState = URoomStateService::Get(this))
+		{
+			// 按 Name 在攻守方快照中查找
+			const FPlayerSnapshot* Snap = RoomState->GetAttackTeamSnapshots().FindByPredicate(
+				[&PName](const FPlayerSnapshot& S){ return S.PlayerName == PName; });
+			if (!Snap)
+			{
+				Snap = RoomState->GetDefenseTeamSnapshots().FindByPredicate(
+					[&PName](const FPlayerSnapshot& S){ return S.PlayerName == PName; });
+			}
+			if (Snap)
+			{
+				PS_Team = Snap->Team;
+				PS_bIsReady = Snap->bIsReady;
+			}
+		}
+		if (PS_Team == ERoomTeam::Attack) TargetBox = Box_AttackTeam;
+		else if (PS_Team == ERoomTeam::Defense) TargetBox = Box_DefenseTeam;
 
 		if (TargetBox)
 		{
@@ -1370,32 +1496,115 @@ void URoomInsidePage::RefreshRoomUI()
 			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
 			if (PlayerLabel)
 			{
-				FString PName = PS->GetPlayerName();
-
-				// 设置玩家名称和准备状态
+				// ==========================================
+				// 【Bug1 修复 - 调用顺序关键】
+				// 必须先 SetPlayerName (写 CachedPlayerName), 再 SetAsHost/SetAsAI (读 CachedPlayerName 拼后缀)
+				// 然后 SetReadyState 才会被 bIsHostEntry / bIsAIEntry 拦截, 不会把 Text_IsReady 显示出来
+				// ==========================================
 				PlayerLabel->SetPlayerName(PName);
-				PlayerLabel->SetReadyState(PS->bIsReady);
 
 				bool bIsAI = PName.StartsWith(TEXT("[AI]")); // 是否为 AI 玩家
-				bool bIsThisLabelTheHost = (PName == CurrentHostName); // 是否为房主
+				bool bIsThisLabelTheHost = (PName == CurrentHostName); // 服务器权威
 
+				// 【Bug1 本地权威兜底】即使 GameState 还没下发 HostPlayerName, 只要本机被标记为 Host,
+				//                 也立即把本地账号对应的 widget 标为房主
+				if (!bIsThisLabelTheHost && bAmILocalHost && !LocalAccountName.IsEmpty() &&
+					PName.Equals(LocalAccountName, ESearchCase::IgnoreCase))
+				{
+					bIsThisLabelTheHost = true;
+				}
+
+				// 先标记身份 (SetAsHost/SetAsAI 会写 bIsHostEntry/bIsAIEntry 状态位)
+				const bool bWasHostBefore = PlayerLabel->IsHostEntry();
+				const bool bWasAIBefore = PlayerLabel->IsAIEntry();
 				if (bIsAI)
 				{
-					// 标记为 AI 玩家
 					PlayerLabel->SetAsAI();
 				}
 				else if (bIsThisLabelTheHost)
 				{
-					// 标记为房主
 					PlayerLabel->SetAsHost(true);
 				}
 
+				// 再设置准备状态 — 内部被 bIsHostEntry/bIsAIEntry 拦截, 不会反向污染 Text_IsReady
+				PlayerLabel->SetReadyState(PS_bIsReady);
+
+				// 【大厂 P0 诊断日志 - 2026-06-30】追踪 SetAsHost 是否真的调用成功
+				UE_LOG(LogTemp, Log,
+					TEXT("[RoomInsidePage][Identity-DIAG] PName=[%s] CurrentHostName=[%s] LocalAccount=[%s] bAmILocalHost=%d bIsThisLabelTheHost=%d bIsHostEntryBefore=%d bIsHostEntryAfter=%d"),
+					*PName, *CurrentHostName, *LocalAccountName, bAmILocalHost ? 1 : 0, bIsThisLabelTheHost ? 1 : 0,
+					bWasHostBefore ? 1 : 0, PlayerLabel->IsHostEntry() ? 1 : 0);
+
 				// 只有房主才能看到移除按钮（且不能移除自己）
-				bool bAmIHost = GetOwningPlayer()->HasAuthority();
+				// 【2026-06-30 P0 修复】双路权威: NetMode 优先, URoomService 兜底
+				bool bAmIHost = false;
+				if (UWorld* World = GetWorld())
+				{
+					if (World->GetNetMode() == NM_ListenServer)
+					{
+						bAmIHost = true;
+					}
+				}
+				if (!bAmIHost)
+				{
+					if (URoomService* RoomService = URoomService::Get(this))
+					{
+						bAmIHost = RoomService->IsHost();
+					}
+				}
 				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && !bIsThisLabelTheHost);
 
 				// 添加到对应的队伍容器中
 				TargetBox->AddChild(PlayerLabel);
+			}
+		}
+	}
+
+	// 【2026-06-29 P0 修复】刷新完成后再次确认房主按钮可见性
+	// 场景: RefreshRoomUI 可能由 OnRoomServiceHostChanged 触发 (此时房主身份刚变),
+	//       必须在最后一次 RefreshRoomUI 末尾确保按钮可见性与新身份一致
+	UpdateHostVisibility();
+
+	// ==========================================
+	// 【2026-06-30 P0 Bug2 终极修复】房主端: 推送当前总人数到 SessionSettings
+	// ----------------------------------------------------------------------
+	// 旧实现走 USessionManagerSubsystem::BroadcastRoomPlayerCountStatic, 内部 bIsHost 护栏静默忽略
+	//   → 跨图后 USessionManagerSubsystem.bIsHost = false (GameInstance 重建)
+	//   → 推送被静默忽略 → TOTAL_PLAYERS_WITH_AI 永远停在 BuildSessionSettings 的初始值 1
+	// 新实现绕开 bIsHost 护栏, 直接拿 SessionInterface 写 SessionSettings + UpdateSession
+	//   - 本机是不是房主用 NetMode == NM_ListenServer 权威判定
+	//   - 直接走 IOnlineSession 接口, 不依赖任何 Subsystem 状态
+	//   - 推送时机: RefreshRoomUI 末尾, 此时 VBox 节点数 = 当前 (真人 + AI) 总数
+	// ==========================================
+	if (bAmILocalHost)
+	{
+		int32 AttackCount = Box_AttackTeam ? Box_AttackTeam->GetChildrenCount() : 0;
+		int32 DefenseCount = Box_DefenseTeam ? Box_DefenseTeam->GetChildrenCount() : 0;
+		int32 TotalWithAI = AttackCount + DefenseCount;
+		if (TotalWithAI < 1) TotalWithAI = 1;
+
+		// 直接拿 SessionInterface, 绕开 USessionManagerSubsystem 内部 bIsHost 护栏
+		if (IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get())
+		{
+			if (IOnlineSessionPtr SessionPtr = OnlineSub->GetSessionInterface())
+			{
+				if (FNamedOnlineSession* NamedSession = SessionPtr->GetNamedSession(NAME_GameSession))
+				{
+					const int32 MaxPlayers = FMath::Max(1, NamedSession->SessionSettings.NumPublicConnections);
+					const int32 SafeTotal = FMath::Clamp(TotalWithAI, 1, MaxPlayers);
+					NamedSession->SessionSettings.Set(
+						FName("TOTAL_PLAYERS_WITH_AI"),
+						SafeTotal,
+						EOnlineDataAdvertisementType::ViaOnlineService);
+					SessionPtr->UpdateSession(NAME_GameSession, NamedSession->SessionSettings, true);
+					UE_LOG(LogTemp, Log,
+						TEXT("[RoomInsidePage] RefreshRoomUI: 推送 TOTAL_PLAYERS_WITH_AI=%d (Attack=%d, Defense=%d, Max=%d)"),
+						SafeTotal, AttackCount, DefenseCount, MaxPlayers);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[RoomInsidePage] RefreshRoomUI: 推送人数失败, NamedSession 为空"));
+				}
 			}
 		}
 	}
@@ -1440,7 +1649,7 @@ void URoomInsidePage::SyncLoadoutToServer()
 {
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetOwningPlayer()))
 	{
-		if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
+		if (UAccountService* AccountSub = UAccountService::Get(this))
 		{
 			int32 SelectedIndex = ComboBox_CharacterSelect->GetSelectedIndex();
 
@@ -1451,8 +1660,255 @@ void URoomInsidePage::SyncLoadoutToServer()
 			FString CurrentWeapon1 = AccountSub->GetLastSelectedWeapon(1);
 			FString CurrentWeapon2 = AccountSub->GetLastSelectedWeapon(2);
 
-			// 向服务器发送装备配置
-			PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
+			// 向服务器发送装备配置（通过 RoomService 抽象）
+			if (URoomService* RoomService = URoomService::Get(this))
+			{
+				RoomService->RequestSelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
+			}
+			// 【架构升级】原 PC->Server_SelectLoadout(...) 调用改走 RoomService
+			// PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
 		}
 	}
+}
+
+// ==========================================
+// 【架构升级】View 接口实现
+// ==========================================
+
+void URoomInsidePage::OnViewShown()
+{
+    // ==========================================
+    // 【2026-06-29 P0 修复】说明: 定时器启动已搬到 NativeConstruct 中
+    // 根因: UIViewService::CreateAndShowPanel() 不会调用 IView 的 OnViewShown 生命周期方法
+    //       (UIViewService 只 BindViewModel, 不触发 View 的 Show 回调)
+    //       → 之前 OnViewShown 中启动的 0.5s 定时器永远不执行 → Bug 永远修不好
+    // 修复: 在 NativeConstruct 启动定时器, 这里保留幂等 ClearTimer + 重新 SetTimer,
+    //       即使未来 UIViewService 修复了 Show 调用, 此处也能正常工作
+    // ==========================================
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
+        World->GetTimerManager().SetTimer(
+            PlayerCheckTimerHandle,
+            this,
+            &URoomInsidePage::CheckForNewPlayers,
+            0.5f,
+            true);  // 循环定时器, 直到 ClearTimer
+    }
+
+    // 立即刷新一次 UI (玩家进入房间瞬间的首次绘制)
+    RefreshRoomUI();
+
+    // 立即刷新房主按钮可见性 (兜底)
+    UpdateHostVisibility();
+    // 根因: NativeConstruct 设置的可见性在 widget 已创建后失效
+    UpdateHostVisibility();
+}
+
+void URoomInsidePage::OnViewHidden()
+{
+    if (UWorld* World = GetWorld())
+    {
+        // ClearTimer 即使 Handle 未绑定也安全 (no-op), 保留无害
+        World->GetTimerManager().ClearTimer(PlayerCheckTimerHandle);
+    }
+
+    // 解绑所有订阅的 PlayerState OnStateChanged, 防止内存泄漏
+    for (ARoomPlayerState* PS : KnownPlayerStates)
+    {
+        if (IsValid(PS))
+        {
+            PS->OnStateChanged.RemoveDynamic(this, &URoomInsidePage::RefreshRoomUI);
+        }
+    }
+    KnownPlayerStates.Reset();
+}
+
+
+// ==========================================
+// 【P0 架构升级】URoomService 事件总线回调（替代 0.5s 定时器轮询）
+// ==========================================
+
+/**
+ * UpdateHostVisibility
+ *
+ * 【2026-06-29 P0 修复】统一刷新房主/玩家专属按钮可见性
+ * 【Bug3 加强】: 若 URoomService 此时 IsHost() 仍为 false (Presenter::NotifyBecameHost
+ *                还未触发, 例如 OpenLevel 跨图过程中) → 不再静默丢失, 而是订阅 OnHostChanged
+ *                让 Presenter 后续调 BroadcastHostChanged 时再次刷新
+ *
+ * 业务规则:
+ *   - Btn_OpenAIPanel : 仅房主可见 (添加 AI 是房主专属权限)
+ *   - Btn_StartGame   : 仅房主可见 (开始游戏是房主专属权限)
+ *   - Btn_ToggleReady : 仅非房主可见 (房主永远不需要"准备", 房主随时可以开始)
+ *
+ * 设计理由:
+ *   - 旧代码在 NativeConstruct 里设置可见性, 但 widget 早已创建后不会重新执行
+ *   - 玩家B 加入时 NativeConstruct 不再跑, 按钮可见性停留在初次进入的状态
+ *   - 提取为函数, 在三处统一调用: NativeConstruct / OnViewShown / OnRoomServiceHostChanged
+ *   - 确保无论何时身份变化, 按钮可见性都立即生效
+ */
+void URoomInsidePage::UpdateHostVisibility()
+{
+    // ==========================================
+    // 【2026-06-30 P0 Bug3 终极修复】双路权威判定本机是否房主
+    //   路1: NetMode == NM_ListenServer (UE 网络层权威, 不依赖任何 Subsystem)
+    //   路2: URoomService::IsHost() (跨图前已持久, 兜底)
+    // 这样无论跨图前后/GameInstance 是否被重建, 按钮可见性都是 100% 准确的
+    // ==========================================
+    bool bIsHost = false;
+
+    // 路1: NetMode 权威判定
+    if (UWorld* World = GetWorld())
+    {
+        if (World->GetNetMode() == NM_ListenServer)
+        {
+            bIsHost = true;
+        }
+    }
+
+    // 路2: URoomService 兜底 (NetMode 不为 ListenServer 时, 比如纯 Standalone 也可能)
+    if (!bIsHost)
+    {
+        URoomService* RoomService = URoomService::Get(this);
+        bIsHost = RoomService && RoomService->IsHost();
+    }
+
+    // ==========================================
+    // 【Bug3 P0 防御】URoomService 此刻还拿不到 Host 身份怎么办?
+    // 场景: 房主刚 OpenLevel 跳转到 L_Room → GameInstance 持久保留 bIsHost=true,
+    //       但 LANRoomPresenter::NotifyBecameHost() 在新地图 OpenLevel 异步延迟回调
+    //       → 期间 NativeConstruct / OnViewShown 调用此函数读到 bIsHost=true (GameInstance 持久)
+    // 实际根因: GameInstanceSubsystem bIsHost 在切图过程中是持久的,
+    //          所以读取永远是准确的 → 我们不需要 defer
+    // 但若未来 bIsHost 不持久, 下面的 defer 兜底机制会兜住
+    // ==========================================
+    if (!URoomService::Get(this))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[RoomInsidePage] UpdateHostVisibility: URoomService 获取失败!"));
+    }
+
+    const ESlateVisibility HostVisibility = bIsHost ? ESlateVisibility::Visible : ESlateVisibility::Collapsed;
+    const ESlateVisibility ClientVisibility = bIsHost ? ESlateVisibility::Collapsed : ESlateVisibility::Visible;
+
+    // 房主专属: 打开 AI 面板
+    if (Btn_OpenAIPanel)
+    {
+        Btn_OpenAIPanel->SetVisibility(HostVisibility);
+    }
+
+    // 房主专属: 开始游戏
+    if (Btn_StartGame)
+    {
+        Btn_StartGame->SetVisibility(HostVisibility);
+    }
+
+    // 非房主专属: 切换准备状态 (房主永远不需要准备)
+    if (Btn_ToggleReady)
+    {
+        Btn_ToggleReady->SetVisibility(ClientVisibility);
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[RoomInsidePage] UpdateHostVisibility: bIsHost=%d (NetMode=%d), OpenAI=%d, StartGame=%d, ToggleReady=%d"),
+        bIsHost ? 1 : 0,
+        GetWorld() ? (int32)GetWorld()->GetNetMode() : -1,
+        Btn_OpenAIPanel ? (int32)Btn_OpenAIPanel->GetVisibility() : -1,
+        Btn_StartGame ? (int32)Btn_StartGame->GetVisibility() : -1,
+        Btn_ToggleReady ? (int32)Btn_ToggleReady->GetVisibility() : -1);
+}
+
+/**
+ * OnRoomServiceHostChanged
+ *
+ * 房主身份变化时触发（RoomService.OnHostChanged）
+ * 用途: 重新计算"开始游戏/移除玩家/添加 AI"等房主专属按钮的可见性
+ *
+ * 【Bug1 P0 修复】除了按钮可见性, 还要**主动修正本地玩家自己的 PlayerLabel**:
+ *   场景:
+ *     1. NativeConstruct 时 RoomStateService.HostPlayerName 还没同步下来 (服务器 ON_REP 时延)
+ *     2. RefreshRoomUI 创建本地玩家的 widget 时, 没法识别"我是不是房主"
+ *     3. 因此 SetAsHost(true) 没被调用, Text_IsReady 被错误地显示为 "未准备"
+ *     4. 一旦 OnRep_HostPlayerName 下发 → URoomService.BroadcastHostChanged → 这里被触发
+ *     5. 这里遍历 Box_AttackTeam/Box_DefenseTeam 找本地玩家 widget, 调 ApplyIdentity(true, false)
+ *        → 强制把"我这条"标为房主 → Text_IsReady 立即 Collapsed
+ */
+void URoomInsidePage::OnRoomServiceHostChanged(bool bIsHostNow)
+{
+	// 1. 房主身份变了, 立即刷新按钮可见性 + 玩家列表
+	UpdateHostVisibility();
+	RefreshRoomUI();
+
+	// 2. 【Bug1 防御】如果变成房主, 强制把所有以"本地账号名"命名的 widget 标为房主
+	//    这是对 RefreshRoomUI 漏判的兜底
+	if (bIsHostNow)
+	{
+		ForceApplyHostIdentityToLocalWidget();
+	}
+}
+
+
+/**
+ * ForceApplyHostIdentityToLocalWidget
+ *
+ * 【Bug1 大厂 P0 修复】兜底刷新: 遍历本机 VBox, 把本地账号名对应的 PlayerLabel 标为房主
+ * 触发场景: 服务器 OnRep_HostPlayerName 时延 + RoomStateService.GetMatchSnapshot 数据不一致
+ * 副作用: ApplyIdentity 内会写 bIsHostEntry, 后续 SetReadyState 不会再把 Text_IsReady 显出来
+ */
+void URoomInsidePage::ForceApplyHostIdentityToLocalWidget()
+{
+	// 仅房主身份才需要做这件事
+	URoomService* RoomService = URoomService::Get(this);
+	if (!RoomService || !RoomService->IsHost()) return;
+
+	const FString LocalAccountName = RoomService->GetCurrentAccountName();
+	if (LocalAccountName.IsEmpty()) return;
+
+	// 遍历 Box_AttackTeam 和 Box_DefenseTeam 两个容器, 找到本地玩家 widget
+	auto ApplyToBox = [&](UVerticalBox* Box)
+	{
+		if (!Box) return;
+		for (int32 i = 0; i < Box->GetChildrenCount(); ++i)
+		{
+			if (UPlayerLabelWidget* PlayerLabel = Cast<UPlayerLabelWidget>(Box->GetChildAt(i)))
+			{
+				const FString LabelName = PlayerLabel->GetPlayerName();
+				if (!LabelName.IsEmpty() && LabelName.Equals(LocalAccountName, ESearchCase::IgnoreCase))
+				{
+					// 【P0】调 ApplyIdentity 而非 SetAsHost: ApplyIdentity 内有"已是房主则跳过"判断, 安全幂等
+					PlayerLabel->ApplyIdentity(/*bIsHostEntry=*/true, /*bIsAIEntry=*/PlayerLabel->IsAIEntry());
+
+					UE_LOG(LogTemp, Log,
+						TEXT("[RoomInsidePage] ForceApplyHostIdentityToLocalWidget: 修正本地玩家 [%s] 为房主 (UI 索引=%d)"),
+						*LocalAccountName, i);
+				}
+			}
+		}
+	};
+
+	ApplyToBox(Box_AttackTeam);
+	ApplyToBox(Box_DefenseTeam);
+}
+
+/**
+ * OnRoomServicePlayerJoined
+ *
+ * 有玩家加入时触发（RoomService.OnPlayerJoined）
+ * 用途: 立即刷新房间标签列表（不等 5s 兜底定时器）
+ */
+void URoomInsidePage::OnRoomServicePlayerJoined(const FString& PlayerName)
+{
+	// 直接调用 CheckForNewPlayers 重新维护 KnownPlayerStates + 触发 RefreshRoomUI
+	CheckForNewPlayers();
+}
+
+/**
+ * OnRoomServicePlayerLeft
+ *
+ * 有玩家离开时触发（RoomService.OnPlayerLeft）
+ * 用途: 立即刷新房间标签列表
+ */
+void URoomInsidePage::OnRoomServicePlayerLeft(const FString& PlayerName)
+{
+	CheckForNewPlayers();
 }

@@ -36,25 +36,30 @@ class METALSLUG01_API UGameMenuPage : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// ==========================================
-	// 蓝图可配置
-	// ==========================================
+    // ==========================================
+    // 蓝图可配置
+    // ==========================================
 
-	/**
-	 * 局域网大厅页面类
-	 * 用途: 在编辑器中选择 WBP_LANRoom 蓝图类
-	 * 点击"多人模式"按钮后将动态创建并显示此页面
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UUserWidget> LANRoomClass;
+    /**
+     * 活动中心页面类
+     * 用途: 在编辑器中选择 WBP_ActivityNavMenu 蓝图类
+     * 点击"活动中心"按钮后将动态创建并显示此页面
+     *
+     * 【架构升级】原 LANRoomClass 已删除（多人模式跳转走 UGameFlowSubsystem->TransitToState(MainLobby),
+     *                                由 UIViewService 接管 LANRoomPage 的创建）
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+    TSubclassOf<class UUserWidget> ActivityNavMenuClass;
 
-	/**
-	 * 活动中心页面类
-	 * 用途: 在编辑器中选择 WBP_ActivityNavMenu 蓝图类
-	 * 点击"活动中心"按钮后将动态创建并显示此页面
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UUserWidget> ActivityNavMenuClass;
+    // ==========================================
+    // 【架构升级】View 标准接口
+    // ==========================================
+
+    /**
+     * IView 接口: View 绑定后由 UIViewService 调用
+     */
+    UFUNCTION(BlueprintCallable, Category = "GameMenuPage")
+    void OnViewShown();
 
 protected:
 	// ==========================================

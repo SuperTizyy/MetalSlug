@@ -61,6 +61,16 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+	// ==========================================
+	// 【2026-06-29 P0 修复】注册阵营与准备状态的复制
+	// 根因: CurrentTeam 和 bIsReady 标了 ReplicatedUsing = OnRep_Team/OnRep_IsReady,
+	//       但 DOREPLIFETIME 漏注册 → 客户端永远拿不到这两个字段的值 → 
+	//       GetPlayersInTeam(Attack/Defense) 找不到任何玩家 → Box_AttackTeam/Box_DefenseTeam 始终为空
+	//       OnRep_Team/OnRep_IsReady 永远不触发 → UI 不刷新
+	// ==========================================
+	DOREPLIFETIME(ARoomPlayerState, CurrentTeam);
+	DOREPLIFETIME(ARoomPlayerState, bIsReady);
+
 	// 【核心规范】: 在这里注册变量。DOREPLIFETIME 会让引擎底层接管这些变量的网络同步
 	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID1);

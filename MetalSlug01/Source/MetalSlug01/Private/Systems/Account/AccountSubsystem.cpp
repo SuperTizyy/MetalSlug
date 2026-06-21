@@ -100,31 +100,57 @@ bool UAccountSubsystem::IsAccountOnline(const FString& Username)
  * Logout
  *
  * 登出并解锁
- * 1. 如果当前没人登录，安全返回
+ * 1. 如果当前没人登录，也要兜底扫描全表, 把所有 bIsOnline=true 都还原为 false (防止僵死锁)
  * 2. 先从硬盘拿最新数据覆盖内存，再去字典里找
- * 3. 修改 bIsOnline = false，写入硬盘
+ * 3. 把字典里所有 bIsOnline 记录全部置为 false, 写入硬盘
  * 4. 清空本地窗口的登录记录
+ *
+ * 【2026-06-30 P0 修复】"返回登录界面后用相同账号登录被拒" 根因防御
+ * 旧 bug:
+ *   GameMenuPage 点 [返回登录] → AccountSubsystem::Logout() 在 CurrentLoggedInUser 为空时
+ *   直接 early-return → 不写硬盘 → 硬盘里的 bIsOnline 永远是 true
+ *   → Login Page 用同账号再次登录 → IsAccountOnline() 读硬盘 → 仍然 true → 拒绝
+ * 修复: 即使 CurrentLoggedInUser 为空, 也要遍历整张字典, 把所有 bIsOnline=true 的记录
+ *       全部清零, 写盘. 保证"返回登录"就是"完全退出所有账号状态".
  */
 void UAccountSubsystem::Logout()
 {
-	// 1. 如果当前压根没人登录，直接当无事发生，安全返回
-	if (CurrentLoggedInUser.IsEmpty())
-	{
-		return;
-	}
-
-	// 2. 【核心修复】: 必须先从硬盘拿最新数据覆盖内存! 然后再去字典里找
+	// 1. 先从硬盘拿最新数据覆盖内存 (确保看到的是最新状态, 而不是内存里可能过期的脏数据)
 	LoadDataFromDisk();
 
-	// 3. 拿着最新的字典查岗，如果有这个人，才去改状态
-	if (AccountData.Contains(CurrentLoggedInUser))
+	// 2. 【核心 P0 修复】遍历整张字典, 强制把所有 bIsOnline=true 的条目统统置 false
+	//    这样做的好处:
+	//    a) CurrentLoggedInUser 为空时也能兜底清理 (例如双开测试中另一个窗口残留上锁)
+	//    b) 单窗口内即使已经退过号, 这次再点返回登录时也能彻底重置
+	bool bAnyCleared = false;
+	for (auto& Pair : AccountData)
 	{
-		AccountData[CurrentLoggedInUser].bIsOnline = false; // 解除在线状态锁
-		SaveDataToDisk(); // 写入硬盘
+		if (Pair.Value.bIsOnline)
+		{
+			Pair.Value.bIsOnline = false;
+			bAnyCleared = true;
+		}
 	}
 
-	// 4. 无论如何，本地窗口的登录记录必须被清空
+	// 3. 只要动过数据, 就必须写盘 (失败也要打日志)
+	if (bAnyCleared)
+	{
+		SaveDataToDisk();
+		UE_LOG(LogTemp, Log, TEXT("[Account] Logout: 已强制清零所有 bIsOnline 标记, 已写盘"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("[Account] Logout: 内存中已无在线账号, 跳过写盘"));
+	}
+
+	// 4. 无论如何, 本地窗口的登录记录必须被清空
+	const FString OldLoggedInUser = CurrentLoggedInUser;
 	CurrentLoggedInUser.Empty();
+
+	if (!OldLoggedInUser.IsEmpty())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[Account] Logout: 已退出登录 [%s]"), *OldLoggedInUser);
+	}
 }
 
 

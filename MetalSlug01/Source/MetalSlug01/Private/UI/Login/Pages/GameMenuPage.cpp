@@ -12,8 +12,8 @@
 #include "Kismet/GameplayStatics.h"
 // 引入 GameFlowSubsystem（用于 Logout 状态切回 Login）
 #include "Systems/GameFlowSubsystem.h"
-// 引入 AccountSubsystem（用于 Logout 解锁账号）
-#include "Systems/Account/AccountSubsystem.h"
+// 【架构升级】移除 AccountSubsystem.h 直引, 改为项目内已有的 AccountService
+#include "Services/AccountService.h"
 // 引入登录地图控制器（用于切换子页面）
 #include "Systems/LoginPlayerController.h"
 
@@ -30,49 +30,49 @@
  */
 bool UGameMenuPage::Initialize()
 {
-	if (!Super::Initialize()) return false;
+    if (!Super::Initialize()) return false;
 
-	// 如果按钮存在，则将其与对应的 C++ 函数绑定
-	if (Btn_SinglePlayer)
-	{
-		Btn_SinglePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnSinglePlayerClicked);
-	}
-	else
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_SinglePlayer 为空! 请检查蓝图绑定!"));
-	}
+    // 如果按钮存在，则将其与对应的 C++ 函数绑定
+    if (Btn_SinglePlayer)
+    {
+        Btn_SinglePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnSinglePlayerClicked);
+    }
+    else
+    {
+        if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_SinglePlayer 为空! 请检查蓝图绑定!"));
+    }
 
-	if (Btn_MultiplePlayer) Btn_MultiplePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnMultiplePlayerClicked);
-	if (Btn_Leaderboard) Btn_Leaderboard->OnClicked.AddDynamic(this, &UGameMenuPage::OnLeaderboardClicked);
+    if (Btn_MultiplePlayer) Btn_MultiplePlayer->OnClicked.AddDynamic(this, &UGameMenuPage::OnMultiplePlayerClicked);
+    if (Btn_Leaderboard) Btn_Leaderboard->OnClicked.AddDynamic(this, &UGameMenuPage::OnLeaderboardClicked);
 
-	// 绑定活动中心按钮事件
-	if (Btn_ActivityCenter)
-	{
-		// 防呆设计: 先清理旧绑定再添加新绑定，防止多重绑定
-		Btn_ActivityCenter->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
-		Btn_ActivityCenter->OnClicked.AddDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
-	}
-	else
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_ActivityCenter 为空! 请检查蓝图变量名是否完全匹配（区分大小写）!"));
-	}
+    // 绑定活动中心按钮事件
+    if (Btn_ActivityCenter)
+    {
+        // 防呆设计: 先清理旧绑定再添加新绑定，防止多重绑定
+        Btn_ActivityCenter->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
+        Btn_ActivityCenter->OnClicked.AddDynamic(this, &UGameMenuPage::OnActivityCenterClicked);
+    }
+    else
+    {
+        if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_ActivityCenter 为空! 请检查蓝图变量名是否完全匹配（区分大小写）!"));
+    }
 
-	// 绑定返回登录按钮事件
-	if (Btn_BackToLogin)
-	{
-		// 【防呆设计】: 确保先清理旧的绑定，防止多重绑定导致触发多次
-		Btn_BackToLogin->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
-		Btn_BackToLogin->OnClicked.AddDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
-	}
-	else
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_BackToLogin 为空! 请检查蓝图变量名是否完全匹配（区分大小写）!"));
-	}
+    // 绑定返回登录按钮事件
+    if (Btn_BackToLogin)
+    {
+        // 【防呆设计】: 确保先清理旧的绑定，防止多重绑定导致触发多次
+        Btn_BackToLogin->OnClicked.RemoveDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
+        Btn_BackToLogin->OnClicked.AddDynamic(this, &UGameMenuPage::OnBackToLoginClicked);
+    }
+    else
+    {
+        if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("[GameMenuPage 致命错误] Btn_BackToLogin 为空! 请检查蓝图变量名是否完全匹配（区分大小写）!"));
+    }
 
-	// 初始状态下隐藏提示文本
-	if (Text_Hint) Text_Hint->SetVisibility(ESlateVisibility::Hidden);
+    // 初始状态下隐藏提示文本
+    if (Text_Hint) Text_Hint->SetVisibility(ESlateVisibility::Hidden);
 
-	return true;
+    return true;
 }
 
 
@@ -196,37 +196,48 @@ void UGameMenuPage::OnActivityCenterClicked()
  */
 void UGameMenuPage::OnBackToLoginClicked()
 {
-	// ==========================================
-	// 【新增防线】: 点完瞬间把按钮禁用，彻底物理隔绝玩家的连环夺命点
-	// ==========================================
-	if (Btn_BackToLogin)
-	{
-		Btn_BackToLogin->SetIsEnabled(false);
-	}
+    // ==========================================
+    // 【新增防线】: 点完瞬间把按钮禁用，彻底物理隔绝玩家的连环夺命点
+    // ==========================================
+    if (Btn_BackToLogin)
+    {
+        Btn_BackToLogin->SetIsEnabled(false);
+    }
 
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		// 步骤 A: 底层数据层清理
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			AccountSub->Logout();
-		}
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        // 步骤 A: 通过 UAccountService 解除账号锁（不直接读 Subsystem）
+        if (UAccountService* AccountService = GI->GetSubsystem<UAccountService>())
+        {
+            AccountService->Logout();
+        }
 
-		// 步骤 B: 全局状态机流转
-		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
-		{
-			// 【调试】: 先输出当前状态
-			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
+        // 步骤 B: 全局状态机流转
+        if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+        {
+            FlowSubsystem->TransitToState(EMatchState::Login);
+        }
+    }
 
-			FlowSubsystem->TransitToState(EMatchState::Login);
-		}
-	}
+    // ==========================================
+    // 步骤 C:【核心修复】UI 的自我销毁 (Self-Destruct)
+    // 因为这个菜单页通常是作为一个弹窗 (Popup) 加到屏幕上的
+    // 当我们通知管家切状态后，必须手动把这个菜单自己从屏幕上扒下来，
+    // 否则它会永远挡在 Login 界面上面
+    // ==========================================
+    this->RemoveFromParent();
+}
 
-	// ==========================================
-	// 步骤 C:【核心修复】UI 的自我销毁 (Self-Destruct)
-	// 因为这个菜单页通常是作为一个弹窗 (Popup) 加到屏幕上的
-	// 当我们通知管家切状态后，必须手动把这个菜单自己从屏幕上扒下来，
-	// 否则它会永远挡在 Login 界面上面
-	// ==========================================
-	this->RemoveFromParent();
+
+/**
+ * UGameMenuPage::OnViewShown
+ *
+ * View 绑定后由 UIViewService 调用
+ */
+void UGameMenuPage::OnViewShown()
+{
+    if (Text_Hint)
+    {
+        Text_Hint->SetVisibility(ESlateVisibility::Hidden);
+    }
 }

@@ -296,3 +296,41 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	UE_LOG(LogTemp, Warning, TEXT("[Damage] Server_ReportHit: %s -> %s, Damage=%.1f, Bone=%s, Heavy=%d"),
 		*GetName(), *Victim->GetName(), FinalDamage, *BoneName.ToString(), bIsHeavy);
 }
+
+
+// ==========================================
+// 【P0】WithValidation 验证实现 - 防止客户端伪造伤害数据
+// ==========================================
+
+/**
+ * Server_ReportHit_Validate
+ * 校验: 伤害值在合法范围 (0~10000), HitActor 非空, 位置不是 NaN
+ */
+bool ABaseWeapon::Server_ReportHit_Validate(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy)
+{
+	// 1. HitActor 必须存在
+	if (!IsValid(HitActor))
+	{
+		return false;
+	}
+
+	// 2. 伤害值在合理范围 (防止负数/极大值注入)
+	if (Damage < 0.0f || Damage > 10000.0f)
+	{
+		return false;
+	}
+
+	// 3. 位置/法线不能是 NaN/无限大
+	if (HitLocation.ContainsNaN() || HitNormal.ContainsNaN())
+	{
+		return false;
+	}
+
+	// 4. 法线应该是单位向量 (容差 0.01)
+	if (FMath::Abs(HitNormal.Size() - 1.0f) > 0.01f)
+	{
+		return false;
+	}
+
+	return true;
+}

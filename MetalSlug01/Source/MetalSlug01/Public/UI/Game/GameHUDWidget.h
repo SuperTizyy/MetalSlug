@@ -11,6 +11,7 @@
 #include "Data/Enums/CombatEnums.h"
 // 引入 ERoomMatchMode 等房间枚举
 #include "Data/Enums/RoomEnums.h"
+#include "Components/CharacterEvents.h"
 #include "GameHUDWidget.generated.h"
 
 // 前向声明所有用到的子控件
@@ -66,6 +67,21 @@ public:
 	 * 注意: 这里是最适合做订阅绑定的地方
 	 */
 	virtual void NativeConstruct() override;
+
+	/**
+	 * Widget 从视口移除时调用
+	 * 用途: 清理 CharacterEvents 订阅, 防止 Widget 销毁后回调残留
+	 */
+	virtual void NativeDestruct() override;
+
+	/**
+	 * 【2026-07-01 P0 新增】Tick 兜底:
+	 *   若 TryBindToCharacterEvents 重试 10 次仍失败 (例如服务器 Possess 慢, 或 Pawn 后续才生成),
+	 *   原架构会永久丢失订阅 → 头像永远不显示。
+	 *   NativeTick 每帧检查: 若已订阅但 Pawn 已变, 重新订阅; 若未订阅且 Pawn 可用, 重置重试并重新尝试。
+	 *   频率: 每秒 1 次 (节流), 避免每帧 Tick 的性能浪费。
+	 */
+	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 
 	// ==========================================
 	// 2. 公开接口（被其他类调用）
@@ -371,10 +387,82 @@ protected:
 	UFUNCTION()
 	void OnReturnToLobbyClicked();
 
+	// ==========================================
+	// 7. CharacterEvents 订阅 (2026-07-01 新增 - 依赖倒置核心)
+	// ==========================================
+
+	/**
+	 * 【2026-07-01 新增】尝试订阅 CharacterEvents 组件
+	 * 流程: NativeConstruct → TryBindToGameState → TryBindToCharacterEvents
+	 *       通过 PlayerController -> Pawn -> CharacterEvents 链获取组件
+	 * 失败: 延迟重试 (TimerHandle: CharacterEventsRetryTimerHandle, 最多 10 次)
+	 */
+	void TryBindToCharacterEvents();
+
+	/** 清理 CharacterEvents 订阅 (在 Character 切换 Pawn 时调用) */
+	void UnbindFromCharacterEvents();
+
+	/** 头像加载完毕回调 */
+	UFUNCTION()
+	void OnCharacterIconReady(const FString& CharacterID, class UTexture2D* Icon);
+
+	/** 血量变化回调 */
+	UFUNCTION()
+	void OnHealthChanged(float Current, float Max);
+
+	/** 能量变化回调 */
+	UFUNCTION()
+	void OnEnergyChanged(float Current, float Max);
+
+	/** AC 值变化回调 */
+	UFUNCTION()
+	void OnACValueChanged(int32 NewAC);
+
+	/** ACE 值变化回调 (无排名) */
+	UFUNCTION()
+	void OnACEValueChanged(int32 NewACE);
+
+	/** ACE 值 + 排名颜色变化回调 */
+	UFUNCTION()
+	void OnACEWithRankChanged(int32 NewACE, EACERankType RankType);
+
+	/** 武器图标加载完毕回调 */
+	UFUNCTION()
+	void OnWeaponIconReady(const FString& WeaponID, class UTexture2D* Icon);
+
 private:
 	/**
 	 * 暂存当局击杀数（由 OnEnterSettlement 传入，在 OnShowFinalSettlement 中使用）
 	 */
 	int32 LastAttackerKills = 0;
 	int32 LastDefenderKills = 0;
+
+	// ==========================================
+	// CharacterEvents 订阅状态 (2026-07-01 新增)
+	// ==========================================
+
+	/** 缓存当前订阅的 CharacterEvents 组件 (用于取消订阅) */
+	UPROPERTY()
+	UCharacterEvents* CachedCharacterEvents;
+
+	/** CharacterEvents 延迟绑定定时器句柄 */
+	UPROPERTY()
+	FTimerHandle CharacterEventsRetryTimerHandle;
+
+	/** CharacterEvents 重试计数器 (最大 10 次, 防止无限重试) */
+	int32 CharacterEventsRetryCount = 0;
+
+	/**
+	 * 【2026-07-01 P0 新增】NativeTick 兜底计时器:
+	 *   每秒检查一次 CharacterEvents 订阅状态, 解决 10 次重试后仍未订阅的"死局"场景
+	 *   (例如 Pawn 在第 11 秒才被 Possess 进来, 此时重试已结束 → 永远丢订阅)
+	 */
+	float CharacterEventsFallbackTimer = 0.0f;
+
+	/**
+	 * 【2026-07-01 P0 新增】兜底检查: 每秒 1 次
+	 *   - 已订阅但 Pawn 已变 → 退订重订
+	 *   - 未订阅且有 Pawn → 重置重试并重新尝试
+	 */
+	void TickFallbackCheck(float DeltaTime);
 };

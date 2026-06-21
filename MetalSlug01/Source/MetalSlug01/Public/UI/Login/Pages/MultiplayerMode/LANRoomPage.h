@@ -11,6 +11,8 @@
 #include "Blueprint/UserWidget.h"
 // 【新增】引入在线会话接口的头文件
 #include "Interfaces/OnlineSessionInterface.h"
+// 【P0】SessionManager API 所需的结构体
+#include "Systems/Session/SessionResult.h"
 // UE 自动生成的头文件
 #include "LANRoomPage.generated.h"
 
@@ -49,24 +51,50 @@ class METALSLUG01_API ULANRoomPage : public UUserWidget
 	GENERATED_BODY()
 
 public:
-	// ==========================================
-	// 1. UI 跳转配置区域
-	// ==========================================
+    // ==========================================
+    // 1. UI 跳转配置区域
+    // ==========================================
 
-	/**
-	 * 主菜单页面类
-	 * 用途: 在编辑器中选择 WBP_GameMenu 蓝图类
-	 * 点击"返回主菜单"按钮后动态创建并显示此页面
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UUserWidget> GameMenuClass;
+    /**
+     * 【架构升级】原 GameMenuClass 已删除
+     * 返回主菜单现在走 UGameFlowSubsystem::TransitToState(EMatchState::MainMenu)
+     * 由 UIViewService 自动接管主菜单创建
+     */
 
-	/**
-	 * 房间条目 Widget 类
-	 * 用途: 用于在房间列表中显示单个房间的 UI
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class URoomLabelWidget> RoomLabelClass;
+    /**
+     * 【架构升级】原 RoomLabelClass 已重构
+     * 房间条目 Widget 类（用于房间列表）
+     * 仍然保留为 EditDefaultsOnly, 但创建/回收由 ULANRoomPresenter 统一管理
+     * View 不再直接 CreateWidget (违反 V 层单一职责)
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+    TSubclassOf<class URoomLabelWidget> RoomLabelClass;
+
+    // ==========================================
+    // 【架构升级】View 标准接口
+    // ==========================================
+
+    /**
+     * IView 接口: View 绑定后由 UIViewService 调用
+     * 内部自动: 绑定 ULANRoomPresenter 多播事件 + 启动搜索
+     */
+    UFUNCTION(BlueprintCallable, Category = "LANRoomPage")
+    void OnViewShown();
+
+    /**
+     * IView 接口: View 解除绑定时由 UIViewService 调用
+     * 内部自动: 解绑 ULANRoomPresenter 多播事件 + 停止搜索定时器
+     */
+    UFUNCTION(BlueprintCallable, Category = "LANRoomPage")
+    void OnViewHidden();
+
+    // ==========================================
+    // 【架构升级】Presenter 多播回调（OnViewShown/Hidden 用）
+    // ==========================================
+
+    UFUNCTION() void HandlePresenterStateChangedForView();
+    UFUNCTION() void HandlePresenterRoomListRefreshedForView();
+    UFUNCTION() void HandlePresenterErrorForView(const FString& ErrorMessage);
 
 protected:
 	// ==========================================
@@ -214,13 +242,9 @@ protected:
 	 * 用途: 关联 DT_MapInfo
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Data Config")
-	UDataTable* MapInfoDataTable;
+	TObjectPtr<UDataTable> MapInfoDataTable;
 
 private:
-	// ==========================================
-	// 6. 按钮点击响应函数
-	// ==========================================
-
 	/** 大厅层: 打开创房弹窗 */
 	UFUNCTION() void OnShowCreateRoomClicked();
 
@@ -236,10 +260,7 @@ private:
 	/** 创房层: 隐藏创房弹窗 */
 	UFUNCTION() void OnHideCreateRoomClicked();
 
-	/** 房间内层: 离开房间 */
-	UFUNCTION() void OnLeaveRoomClicked();
-
-	/** 房间内层: 切换准备状态 */
+	/** 切换准备状态 */
 	UFUNCTION() void OnToggleReadyClicked();
 
 	// ==========================================
@@ -279,6 +300,13 @@ private:
 	void OnCreateSessionComplete(FName SessionName, bool bWasSuccessful);
 
 	/**
+	 * 【P0 架构升级】SessionManager CreateRoom 单播回调（Dynamic 委托, 必须是 UFUNCTION）
+	 * 收到后转交 OnCreateSessionComplete 走 OpenLevel ?listen 流程
+	 */
+	UFUNCTION()
+	void OnCreateRoomFromManager(bool bWasSuccessful, const FString& ErrorMessage);
+
+	/**
 	 * 创建会话完成的委托句柄（用于注销清理）
 	 */
 	FDelegateHandle CreateSessionCompleteDelegateHandle;
@@ -305,6 +333,13 @@ private:
 	 */
 	void OnDestroySessionComplete(FName SessionName, bool bWasSuccessful);
 
+	/**
+	 * 【P0 架构升级】SessionManager DestroyRoom 单播回调（Dynamic 委托, 必须是 UFUNCTION）
+	 * 用于创房前清理旧房间: 销毁完后转 HostRealSession 创新房
+	 */
+	UFUNCTION()
+	void OnDestroyRoomBeforeCreateFromManager(bool bWasSuccessful, const FString& ErrorMessage);
+
 	/** 销毁会话完成的委托句柄 */
 	FDelegateHandle DestroySessionCompleteDelegateHandle;
 
@@ -313,6 +348,13 @@ private:
 
 	/** 搜索完成的引擎回调 */
 	void OnFindSessionsComplete(bool bWasSuccessful);
+
+	/**
+	 * 【P0 架构升级】SessionManager.OnRoomsFound 多播事件回调
+	 * 内部把 FRoomSessionResult 还原为 SessionSearch 并转交 OnFindSessionsComplete
+	 */
+	UFUNCTION()
+	void OnRoomsFoundFromManager(const TArray<FRoomSessionResult>& Rooms);
 
 	/** 搜索完成的委托句柄（退订凭证） */
 	FDelegateHandle FindSessionsCompleteDelegateHandle;
@@ -343,11 +385,22 @@ private:
 	 */
 	void OnAccountCheckFindSessionsComplete(bool bWasSuccessful);
 
+	/**
+	 * 【P0 架构升级】SessionManager FindRooms 单播回调（Dynamic 委托, 必须是 UFUNCTION）
+	 * 用于创房前同号检查: 内部缓存 Rooms 后转 OnAccountCheckFindSessionsComplete
+	 */
+	UFUNCTION()
+	void OnAccountCheckFindRoomsFromManager(bool bWasSuccessful, const TArray<FRoomSessionResult>& Rooms);
+
 	/** 创房前搜索的委托句柄(独立于常规搜索,避免冲突) */
 	FDelegateHandle AccountCheckFindSessionsDelegateHandle;
 
-	/** 创房前搜索的临时结果缓存(回调里用) */
-	TSharedPtr<class FOnlineSessionSearch> AccountCheckSessionSearch;
+	/**
+	 * 【P0】同号检查的 FRoomSessionResult 缓存（替代原 AccountCheckSessionSearch）
+	 * 由 OnAccountCheckFindRoomsFromManager 填充, OnAccountCheckFindSessionsComplete 读取
+	 */
+	UPROPERTY()
+	TArray<FRoomSessionResult> AccountCheckRoomsCache;
 
 	/**
 	 * 同号检查通过后, 真正开始执行创房流程
@@ -411,15 +464,47 @@ private:
 	FString CurrentSelectedRoomName;
 
 	/**
+	 * 【架构升级】当前选中的房间条目 widget 引用 (弱引用, 避免 ClearChildren 后悬空)
+	 * 用途:
+	 *   - HandleRoomSelected 中直接缓存 SelectedRoomWidget, 高亮判断使用引用相等
+	 *   - 列表重绘时, 用 RoomName 匹配 + 引用回填, 恢复高亮态
+	 * 设计理由: 弱引用避免阻止 GC, 但 IsValid 检查仍能识别已销毁的 widget
+	 */
+	TWeakObjectPtr<URoomLabelWidget> CurrentSelectedRoomWidget;
+
+	/**
 	 * 房间条目被点击时的回调（用于高亮选中）
+	 * 【架构升级】参数从 FString RoomName 改为 URoomLabelWidget* SelectedRoomWidget
+	 * 原因: 旧设计依赖字符串传递, 若 widget 缓存房间名为空则按钮永远不可用
+	 *       新设计: 外层通过 widget 引用直接读取, 数据源单一可信
 	 */
 	UFUNCTION()
-	void HandleRoomSelected(FString RoomName);
+	void HandleRoomSelected(URoomLabelWidget* SelectedRoomWidget);
 
 	/**
 	 * 底层加入房间完成后的回调
 	 */
-	void OnJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result);
+	/**
+	 * 【大厂 P0 架构】加入房间完成回调（绑定 OnlineSubsystem 单播委托）
+	 *
+	 * 签名设计: 多接一个 FString ConnectString 入参，由 SessionManager
+	 *           通过 OnJoinRoomFromManager 传入（解析自 GetResolvedConnectString）。
+	 *           不再硬编码 127.0.0.1:7777，跨机器部署时仍能正确连接房主 IP。
+	 *
+	 * 保留 FName / EOnJoinSessionCompleteResult::Type 入参，向后兼容
+	 * 老调用方（如有 Blueprint 绑定）。
+	 */
+	void OnJoinSessionComplete(
+		FName SessionName,
+		EOnJoinSessionCompleteResult::Type Result,
+		const FString& ConnectString);
+
+	/**
+	 * 【P0 架构升级】SessionManager JoinRoom 单播回调（Dynamic 委托, 必须是 UFUNCTION）
+	 * 收到后转交 OnJoinSessionComplete 走 ClientTravel 流程
+	 */
+	UFUNCTION()
+	void OnJoinRoomFromManager(bool bWasSuccessful, const FString& ConnectString);
 
 	/**
 	 * 加入房间的委托句柄
@@ -436,4 +521,20 @@ private:
 	 * 声明一个委托对象（相当于订阅单）
 	 */
 	FOnFindSessionsCompleteDelegate FindSessionsCompleteDelegate;
+
+	// ==========================================
+	// 【大厂 DRY】创房按钮状态管理（所有创房路径统一复用）
+	// ==========================================
+
+	/**
+	 * 统一禁用创建按钮（异步操作开始时调用）
+	 * 注意: 只能在 .cpp 实现, 因为 .h 里 UButton 仅前向声明,
+	 *       无法在 .h 内联调用 SetIsEnabled (C2027 未定义类型)
+	 */
+	void DisableCreateRoomButton();
+
+	/**
+	 * 统一重新启用创建按钮（所有创房失败/终止路径统一调用）
+	 */
+	void ReEnableCreateRoomButton();
 };

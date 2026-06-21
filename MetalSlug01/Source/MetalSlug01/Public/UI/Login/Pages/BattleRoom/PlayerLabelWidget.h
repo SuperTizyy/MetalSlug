@@ -25,9 +25,12 @@ class UButton;
  * - 房主可看到"踢人"按钮，点击调用 PC->Server_KickPlayer
  *
  * 架构理念:
- * 1. 单一职责: 只是一个 UI 列表项，所有数据由 RoomInsidePage 注入
- * 2. 状态机通过 SetReadyState/SetAsHost/SetAsAI 切换
- * 3. 绝对防御: SetAsHost 时无论权限如何都隐藏踢人按钮（防自踢）
+ * 1. 单一职责: 只是一个 UI 列表项,所有数据由 RoomInsidePage 注入
+ * 2. 状态机通过 SetReadyState/SetAsHost/SetAsAI/ApplyIdentity 切换
+ * 3. 绝对防御: SetAsHost 时无论权限如何都隐藏踢人按钮 (防自踢)
+ * 4. Model-View 分离: CachedPlayerName 是数据源, 控件只是 View 表现
+ * 5. 房主/AI 身份永久化: 内部 bIsHostEntry/bIsAIEntry 状态位阻止 SetReadyState
+ *    把 Text_IsReady 反向恢复出来 (Bug1 修复)
  */
 UCLASS()
 class METALSLUG01_API UPlayerLabelWidget : public UUserWidget
@@ -56,12 +59,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "PlayerLabel")
 	void SetPlayerName(const FString& InPlayerName);
 
-	/**
-	 * 获取当前条目的玩家名
-	 * @return 玩家名
-	 */
-	UFUNCTION(BlueprintCallable, Category = "PlayerLabel")
-	FString GetPlayerName() const;
+/**
+ * 获取当前条目的玩家名
+ * @return 玩家名
+ * 【大厂模式】: 与 RoomLabelWidget 一致, 直接读数据缓存, 不反读 TextBlock
+ *               即使 Text_PlayerName 未绑定也能正确返回
+ */
+UFUNCTION(BlueprintCallable, Category = "PlayerLabel")
+FString GetPlayerName() const;
 
 	/**
 	 * 控制"踢人"按钮的显示与隐藏
@@ -99,6 +104,15 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	class UTextBlock* Text_IsReady;
 
+	/**
+	 * 【大厂数据缓存】: 玩家名缓存, 与 RoomLabelWidget 的 CachedRoomName 同源设计
+	 * Model-View 分离: SetPlayerName 同时写缓存 + 写 UI, GetPlayerName 直接读缓存
+	 * 原因: 旧实现反读 Text_PlayerName, 一旦控件被 SetAsHost 改了后缀就拿不到原始名
+	 *        现在: GetPlayerName 返回原始名, OnRemoveButtonClicked 也据此拿被踢者
+	 */
+	UPROPERTY()
+	FString CachedPlayerName;
+
 public:
 	// ==========================================
 	// 4. 状态机设置接口
@@ -108,21 +122,53 @@ public:
 	 * 设置准备状态
 	 * @param bIsReady 是否已准备
 	 * 用途: 控制文字"已准备/未准备"和颜色
+	 * 【大厂防御】房主/AI 不应该有准备状态, 该接口在内部被 IsHostEntryOrAI 拦截
 	 */
 	void SetReadyState(bool bIsReady);
 
 	/**
 	 * 设置该标签是否属于房主
-	 * 副作用: 自动追加"（房主）"后缀，隐藏准备文本，强制隐藏踢人按钮
+	 * 副作用:
+	 *   1. 自动追加"（房主）"后缀
+	 *   2. 永久隐藏 Text_IsReady (房主无准备概念)
+	 *   3. 强制隐藏踢人按钮 (防自踢)
 	 * @param bIsHost 是否为房主
 	 */
 	void SetAsHost(bool bIsHost);
 
 	/**
 	 * 设置该标签属于 AI 玩家
-	 * 副作用: 隐藏准备文本
+	 * 副作用: 永久隐藏 Text_IsReady (AI 无准备概念)
 	 */
 	void SetAsAI();
+
+	/**
+	 * 【大厂 P0】视图查询接口: 该条目当前是否被标记为房主
+	 * 用途: URoomInsidePage 可据此决定是否需要重新应用隐藏逻辑
+	 */
+	UFUNCTION(BlueprintPure, Category = "PlayerLabel")
+	bool IsHostEntry() const { return bIsHostEntry; }
+
+	/**
+	 * 【大厂 P0】视图查询接口: 该条目当前是否被标记为 AI
+	 */
+	UFUNCTION(BlueprintPure, Category = "PlayerLabel")
+	bool IsAIEntry() const { return bIsAIEntry; }
+
+	/**
+	 * 【大厂 P0】权威身份覆写: 由 URoomInsidePage 在收到 OnHostChanged 事件后
+	 * 调用, 用于"创建时未识别为房主 → 后期 GameState 同步下来后"再补一次刷新。
+	 *
+	 * 流程:
+	 *   1. RefreshRoomUI 创建玩家条目时, 用 RoomStateService 快照判定房主
+	 *      → 如果本地 HostPlayerName 还没下发, 会暂时漏判为普通玩家
+	 *   2. 之后 RoomStateService 同步完成, URoomInsidePage 收到 OnRoomServiceHostChanged(true)
+	 *   3. URoomInsidePage 调用本接口, 强制把"自己那条"标为房主
+	 *
+	 * @param bIsHostEntry  是否为房主条目
+	 * @param bIsAIEntry   是否为 AI 条目
+	 */
+	void ApplyIdentity(bool bIsHostEntry, bool bIsAIEntry);
 
 private:
 	// ==========================================
@@ -135,4 +181,15 @@ private:
 	 */
 	UFUNCTION()
 	void OnRemoveButtonClicked();
+
+	/**
+	 * 【大厂 P0 内部状态机】: 玩家身份标记
+	 * 用途:
+	 *   - 房主条目永远没有"准备"概念 → Text_IsReady 永久隐藏
+	 *   - AI 条目永远没有"准备"概念   → Text_IsReady 永久隐藏
+	 *   - 房主条目永远不能被自己踢   → Btn_RemovePlayer 永久隐藏
+	 * 这样 SetReadyState 被调用时, 不会反向把这俩类型的 Text_IsReady 恢复出来
+	 */
+	bool bIsHostEntry = false;
+	bool bIsAIEntry = false;
 };

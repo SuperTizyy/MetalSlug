@@ -15,8 +15,8 @@
 // 引入 GameFlowSubsystem（用于订阅状态变化）
 #include "Systems/GameFlowSubsystem.h"
 
-// 引入房间 GameState（用于获取倒计时等数据）
-#include "Systems/RoomGameState.h"
+// 【架构升级】改为通过 URoomStateService 读取比赛数据, View 不再直引 RoomGameState
+#include "Services/RoomStateService.h"
 
 // 引入 GameHUDWidget（用于显示战斗 HUD）
 #include "UI/Game/GameHUDWidget.h"
@@ -140,19 +140,18 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 			// 显示准星（由 GameHUD 统一管理）
 			GameHUDWidget->ShowCrosshair();
 
-			// 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
-			if (UWorld* World = GetWorld())
-			{
-				if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
-				{
-					GameHUDWidget->UpdateRemainingRoundsText(RoomGS->CurrentRound);
-					GameHUDWidget->OnMatchModeChangedForHUD(RoomGS->CurrentMatchMode);
-				}
-				else
-				{
-					UE_LOG(LogUI, Warning, TEXT("[MyGameHUD] RoomGameState is NULL when refreshing HUD!"));
-				}
-			}
+// 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
+		// 【架构升级】改为通过 URoomStateService 读取（不直引 RoomGameState）
+		if (URoomStateService* StateService = URoomStateService::Get(this))
+		{
+			const FMatchSnapshot Snapshot = StateService->GetMatchSnapshot();
+			GameHUDWidget->UpdateRemainingRoundsText(Snapshot.CurrentRound);
+			GameHUDWidget->OnMatchModeChangedForHUD(Snapshot.MatchMode);
+		}
+		else
+		{
+			UE_LOG(LogUI, Warning, TEXT("[MyGameHUD] RoomStateService 不可用, 无法刷新倒计时"));
+		}
 		}
 
 		UE_LOG(LogUI, Log, TEXT("[MyGameHUD] 切换至战斗UI, 成功展示主HUD与准星"));

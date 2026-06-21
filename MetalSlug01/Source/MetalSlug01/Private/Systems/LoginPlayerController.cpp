@@ -6,17 +6,15 @@
 // 引入本控制器头文件
 #include "Systems/LoginPlayerController.h"
 
-// 引入 GameFlowSubsystem 头文件（用于订阅状态变化）
-#include "Systems/GameFlowSubsystem.h"
-
-// 引入 UE UserWidget 基类
-#include "Blueprint/UserWidget.h"
-
-// 引入测试配置类（用于开发期"直通大厅"开关）
-#include "Tools/MetalSlugTestSettings.h"
-
-// 引入账号子系统（用于读取当前登录账号 / 触发 MockLogin）
-#include "Systems/Account/AccountSubsystem.h"
+// ==========================================
+// 【P0 架构清理 2026.06.28】
+//   移除以下不再使用的头文件:
+//   - GameFlowSubsystem.h       (PC 不再主动查询/切换状态)
+//   - Blueprint/UserWidget.h    (PC 不再创建 Widget)
+//   - MetalSlugTestSettings.h   (开发测试模式移交给 UIViewService 或独立测试入口)
+//   - AccountSubsystem.h        (MockLogin 改由 UIViewService/账号服务编排)
+//   - UIViewService.h           (PC 不再主动 ShowPanel, 由 UIViewService 自己响应 OnStateChanged)
+// ==========================================
 
 
 // ==========================================
@@ -27,11 +25,19 @@
  * ALoginPlayerController::BeginPlay
  *
  * 登录地图控制器的初始化入口
- * 1. 强制显示鼠标 + UIOnly 输入模式
- * 2. 订阅 GameFlowSubsystem 状态变化
- * 3. 特殊检查: 是否开启"开发测试直通大厅"
- *    - 是: 触发 MockLogin + 0.2s 延迟切到 MainLobby
- *    - 否: 0.2s 延迟后根据当前状态挂载登录页或大厅页
+ * ==========================================
+ * 【大厂架构 - P0 修复 2026.06.28】
+ * ==========================================
+ * 职责划分:
+ *   - PC: 只做"PC 自身硬件配置" (鼠标 / 输入模式)
+ *   - UIViewService: 统一监听 GameFlow.OnStateChanged, 自动 ShowPanel
+ *   - GameFlowSubsystem: 状态机编排 (包括 PostLoadMapWithWorld → MainLobby 主动覆盖)
+ *
+ * 关键教训: 之前版本中, LoginPC 在 BeginPlay 里延迟 0.2s 主动 ShowPanel,
+ *   导致状态切到 MainLobby 后又被旧值捕获的 Login 状态覆盖回 LoginPage。
+ *   这是典型的"职责越界 + 时序竞争"反模式。
+ *
+ * 现在: BeginPlay 仅做硬件初始化, 不参与 UI 拉起编排。
  */
 void ALoginPlayerController::BeginPlay()
 {
@@ -41,186 +47,35 @@ void ALoginPlayerController::BeginPlay()
 	bShowMouseCursor = true;
 	SetInputMode(FInputModeUIOnly());
 
-	FString CurrentMap = GetWorld()->GetMapName();
+	// ==========================================
+	// 【架构清理 - P0】删除 LoginPC 的 0.2s 延迟主动 ShowPanel
+	// ==========================================
+	// 原因:
+	//   1. UIViewService 已订阅 GameFlow::OnStateChanged, 会自动 ShowPanel
+	//   2. LoginPC 的延迟 ShowPanel 会"二次覆盖" UIViewService 的自动拉起
+	//   3. 值捕获的旧状态会导致 PostLoadMapWithWorld 的新状态被反转覆盖
+	//      (例如: 退房回 L_Login 时, PostLoadMapWithWorld 切到 MainLobby,
+	//       但 LoginPC 的 0.2s 延迟回调在 BeginPlay 时已捕获 Login 状态,
+	//       200ms 后会 ShowPanel(Login), 把 LANRoomPage 覆盖回 LoginPage)
+	//
+	// 之前: 9.54.43 的修复之后用户报告"还是老样子没解决" → 根因就是这里
+	//
+	// 现在: LoginPC 完全不参与 UI 编排, 只配置 PC 硬件 (鼠标/输入)
+	// ==========================================
 
-	if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
+	if (!GetWorld()->GetMapName().Contains(TEXT("L_Login")))
 	{
-		// 1. 订阅管家的广播频道（让本控制器能响应状态切换）
-		FlowSubsystem->OnStateChanged.AddDynamic(this, &ALoginPlayerController::OnFlowStateChanged);
-
-		// 2. 确保在 L_Login 地图中才执行逻辑（防止错位关卡调用本类）
-		if (GetWorld()->GetMapName().Contains(TEXT("L_Login")))
-		{
-			// ==========================================
-			// 【架构拦截点】: 检查是否开启了开发测试模式
-			// ==========================================
-			// GetDefault 性能极高，直接获取类的默认对象 (CDO)
-			const UMetalSlugTestSettings* TestConfig = GetDefault<UMetalSlugTestSettings>();
-
-			// 如果配置存在，且勾选了"直通大厅"
-			if (TestConfig && TestConfig->bSkipLoginDirectToLobby)
-			{
-				// 1. 处理伪登录: 加入判空逻辑
-				//    如果玩家已经有名字了（说明是从房间退回来的），就不再重新生成随机名
-				if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
-				{
-					if (AccountSub->GetCurrentLoggedInUser().IsEmpty())
-					{
-						// 触发 MockLogin 生成测试账号
-						AccountSub->MockLoginForTesting();
-					}
-				}
-
-				// 2. 【核心修复】: 引入 0.2 秒安全延时，并处理 GameInstance 的状态残留问题
-				FTimerHandle TestInitHandle;
-				GetWorld()->GetTimerManager().SetTimer(TestInitHandle, FTimerDelegate::CreateLambda([this, FlowSubsystem]()
-				{
-					// 检查管家目前是不是已经是大厅状态（退房后残留的状态）
-					if (FlowSubsystem->GetCurrentState() == EMatchState::MainLobby)
-					{
-						// 如果状态没变，TransitToState 不会工作，必须强制手动拉起大厅 UI
-						OnFlowStateChanged(EMatchState::MainLobby);
-					}
-					else
-					{
-						// 如果是游戏刚启动，走标准的状态切换流程
-						FlowSubsystem->TransitToState(EMatchState::MainLobby);
-					}
-				}), 0.2f, false);
-
-				// 【极度关键】: 直接 return！切断后续正常的 UI 挂载和状态初始化逻辑
-				return;
-			}
-
-			// ==========================================
-			// 正常的线上业务逻辑: 走到这里说明没开作弊开关
-			// ==========================================
-			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
-
-			// 0.2 秒安全延时，解决"视口未就绪"导致的 UI 吞噬问题
-			FTimerHandle InitHandle;
-			GetWorld()->GetTimerManager().SetTimer(InitHandle, FTimerDelegate::CreateLambda([this, CurrentState]()
-			{
-				if (CurrentState == EMatchState::MainLobby)
-				{
-					// 当前状态已经是大厅，直接拉起 UI
-					OnFlowStateChanged(EMatchState::MainLobby);
-				}
-				else if (CurrentState == EMatchState::Login)
-				{
-					// 当前状态是登录，挂载登录页
-					OnFlowStateChanged(EMatchState::Login);
-				}
-				else
-				{
-					// 其他异常状态，强制切回登录
-					if (UGameFlowSubsystem* FS = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
-					{
-						FS->TransitToState(EMatchState::Login);
-					}
-				}
-			}), 0.2f, false);
-		}
-		else
-		{
-			if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, FString::Printf(TEXT("[LoginPC Debug] 不在 L_Login 地图中，跳过 UI 挂载逻辑")));
-		}
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red,
+			FString::Printf(TEXT("[LoginPC Debug] 不在 L_Login 地图中，跳过 PC 硬件初始化")));
+		return;
 	}
 }
 
-
-// ==========================================
-// 2. 状态变化响应
-// ==========================================
-
 /**
- * ALoginPlayerController::OnFlowStateChanged
- *
- * GameFlowSubsystem 状态变化回调
- * - Login: 销毁所有 UI，创建登录页
- * - MainLobby: 销毁登录页，创建主菜单页
- * - 其他: 统统销毁
+ * ALoginPlayerController::EndPlay
+ * 销毁期: 仅保留 Super 调用 (无订阅需要解绑)
  */
-void ALoginPlayerController::OnFlowStateChanged(EMatchState NewState)
+void ALoginPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// ==========================================
-	// 状态 1: 登录阶段
-	// ==========================================
-	if (NewState == EMatchState::Login)
-	{
-		// 强杀可能残留的大厅 UI
-		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
-		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
-
-		// 【关键校验点】: 检查蓝图类是否有效
-		if (LoginUIClass)
-		{
-			// 动态创建登录页 Widget
-			ActiveLoginWidget = CreateWidget<UUserWidget>(this, LoginUIClass);
-			if (ActiveLoginWidget)
-			{
-				// 9999 是 ZOrder，确保在所有 UI 之上
-				ActiveLoginWidget->AddToViewport(9999);
-			}
-			else
-			{
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] CreateWidget 返回空！"));
-			}
-		}
-	}
-	// ==========================================
-	// 状态 2: 主菜单阶段（单人/多人模式选择）
-	// ==========================================
-	else if (NewState == EMatchState::MainMenu)
-	{
-		// 销毁登录页（如果存在）
-		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
-		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
-
-		// 动态创建主菜单页 Widget（GameMenuUIClass 对应的主菜单蓝图）
-		if (GameMenuUIClass)
-		{
-			ActiveLobbyWidget = CreateWidget<UUserWidget>(this, GameMenuUIClass);
-			if (ActiveLobbyWidget)
-			{
-				ActiveLobbyWidget->AddToViewport();
-			}
-			else
-			{
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] OnFlowStateChanged: CreateWidget 返回空!"));
-			}
-		}
-	}
-	// ==========================================
-	// 状态 3: 局域网房间大厅阶段（房间列表）
-	// ==========================================
-	else if (NewState == EMatchState::MainLobby)
-	{
-		// 销毁主菜单页（如果存在）
-		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
-		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
-
-		// 动态创建局域网房间页 Widget（LANRoomUIClass 对应的局域网房间蓝图）
-		if (LANRoomUIClass)
-		{
-			ActiveLobbyWidget = CreateWidget<UUserWidget>(this, LANRoomUIClass);
-			if (ActiveLobbyWidget)
-			{
-				ActiveLobbyWidget->AddToViewport();
-			}
-			else
-			{
-				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] OnFlowStateChanged: CreateWidget 返回空!"));
-			}
-		}
-	}
-	// ==========================================
-	// 其他状态: 统统销毁
-	// ==========================================
-	else
-	{
-		// 干干净净地离开
-		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
-		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
-	}
+	Super::EndPlay(EndPlayReason);
 }

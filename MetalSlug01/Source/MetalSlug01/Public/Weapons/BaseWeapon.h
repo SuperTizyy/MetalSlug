@@ -138,7 +138,7 @@ public:
 	 * 报告命中（Server RPC）
 	 * 流程: 客户端检测到命中后调用，服务器执行伤害
 	 */
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_ReportHit(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy);
 
 protected:

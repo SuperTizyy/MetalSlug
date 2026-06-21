@@ -40,9 +40,14 @@
 #include "Systems/GameFlowSubsystem.h"
 
 // 引入账号子系统（用于获取登录用户信息）
+// 【架构修正】PlayerController 也走 AccountService 门面访问账号数据
 #include "Systems/Account/AccountSubsystem.h"
+#include "Services/AccountService.h"
 
-// 引入 UE 静态函数库（用于 OpenLevel/SetGamePaused 等）
+// 【P0】RoomPlayerController 也走 SessionManager 门面访问会话
+#include "Systems/Session/SessionManagerSubsystem.h"
+
+// 引入 UE 静态函数库（用于 OpenLevel 等）
 #include "Kismet/GameplayStatics.h"
 
 // 引入在线子系统（用于管理 Session）
@@ -71,6 +76,16 @@
 void ARoomPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// ==========================================
+	// 【DEBUG-SET-5-A】RoomPC 上线: 切图后第一个 ARoomPlayerController BeginPlay 触发
+	// ==========================================
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S5-A][RoomPC::BeginPlay] PID=%u WorldName=%s IsLocal=%d NetMode=%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		IsLocalPlayerController() ? 1 : 0,
+		(int32)GetWorld()->GetNetMode());
 
 	// 初始化 ESC 菜单状态标志为关闭
 	bIsEscMenuOpen = false;
@@ -355,59 +370,105 @@ void ARoomPlayerController::Client_ForceLeaveRoom_Implementation()
 /**
  * ARoomPlayerController::ExecuteLeaveRoom
  *
- * 真正执行断网和跳地图的底层逻辑
- * 1. 销毁本地的 Session（通知底层解散局域网）
- * 2. 0.5s 延时后通过 GameFlowSubsystem 切换到 MainLobby
+ * 【大厂标准 - P0 修复 v2】真正执行退房底层逻辑 (单地图常驻模式)
  *
- * 【架构修正】: 不在 lambda 中直接调用 Controller 成员。
- * 改为通过 World 重新获取 GameInstance 和 Subsystem，
- * 避免 Controller 在地图切换过程中被销毁导致的崩溃或卡死。
+ * 设计原则:
+ *   - 状态机只负责状态 (GameFlowSubsystem 不再在 MainLobby 跳图)
+ *   - 业务方 (本函数) 主动 OpenLevel 回 L_Login + 主动预约 MainLobby
+ *
+ * 流程 (修复版):
+ *   1. 销毁本地的 Session (DestroyRoom 内部清理 NetDriver)
+ *   2. 主动告诉 GameFlowSubsystem: "下一张地图加载完后, 我要 MainLobby"
+ *      → 关键: 这一步不再依赖脆弱的本地 Lambda, 而是写到跨地图持久的 Subsystem
+ *   3. 主动 OpenLevel(L_Login, ?offline) - 跳回常驻大厅地图
+ *   4. 新地图加载完成后:
+ *      - 新 GameInstance 的 BootToLogin 会先把状态设到 Login (显示 LoginPage)
+ *      - 然后 GameFlowSubsystem::HandlePostLoadMapWithWorld 触发
+ *      - 看到 bHasPendingStateOnNextLoad=true → 强制 TransitToState(MainLobby)
+ *      - UIViewService 自动 ShowPanel(LANRoom) → 玩家看到大厅页 😊
+ *
+ * 为什么从"本地 Lambda 订阅"改成"Subsystem 持久化"?
+ *   - 旧实现: RoomPC 在 ExecuteLeaveRoom 里订阅 PostLoadMapWithWorld
+ *     → OpenLevel 触发 PC EndPlay → EndPlay 抢先 Remove 委托 → 永远收不到回调 😡
+ *   - 新实现: GameFlowSubsystem 自己订阅 PostLoadMapWithWorld
+ *     → Subsystem 跨地图持久, 不会被 EndPlay 解绑
+ *     → 业务方只需要登记意图 (RequestStateOnNextLoad), 不需要关心订阅生命周期
+ *
+ * 单一大厂铁律: 跨地图的意图必须放在跨地图持久的层 (Subsystem), 不能放在即将销毁的 Actor (PC) 上
  */
 void ARoomPlayerController::ExecuteLeaveRoom()
 {
-	// 1. 销毁本地的 Session（通知底层解散局域网）
-	if (IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get())
+	// 1. 【P0】销毁 Session: 走 SessionManager->DestroyRoom (异步, 不直调 OnlineSubsystem)
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (IOnlineSessionPtr SessionInterface = OnlineSub->GetSessionInterface())
+		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
 		{
-			SessionInterface->DestroySession(NAME_GameSession);
+			SessionManager->DestroyRoom(FOnDestroyRoomComplete());
 		}
 	}
 
-	// ==========================================
-	// 【架构修正】: 不在 lambda 中直接调用 Controller 成员
-	// ==========================================
-	// 使用 TWeakObjectPtr<UWorld> 捕获当前 World，防止 World 已销毁时强引用导致崩溃
-	FTimerHandle TravelTimer;
-	GetWorld()->GetTimerManager().SetTimer(TravelTimer, [WeakWorld = TWeakObjectPtr<UWorld>(GetWorld())]()
-	{
-		// 安全检查: World 是否还有效
-		if (!WeakWorld.IsValid())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] World已失效，无法返回大厅"));
-			return;
-		}
+	// 2. 【大厂标准】主动 OpenLevel 回 L_Login
+	//    ?offline 参数: 强制 UE 引擎清理底层 NetDriver, 防止端口死锁
+	UWorld* World = GetWorld();
+	if (!World) return;
 
-		UWorld* World = WeakWorld.Get();
-		if (UGameInstance* GI = World->GetGameInstance())
+	// 3. 【大厂标准 - P0 修复】告诉 GameFlowSubsystem: 下一张地图加载完后, 我要 MainLobby
+	//    这一步替代了旧的 PostLoadMapWithWorld Lambda 订阅
+	//    关键: 不再依赖脆弱的"PC 生命周期内 Lambda", 而是写到跨地图持久的 Subsystem
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 		{
-			// 优先走"管家"通道，让管家自动调用带 ?offline 的 OpenLevel
-			if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
-			{
-				FlowSubsystem->TransitToState(EMatchState::MainLobby);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] GameFlowSubsystem为空，直接 OpenLevel 回大厅"));
-				// 兜底: 直接跳地图回登录地图
-				UGameplayStatics::OpenLevel(GI, FName("L_Login"), true, TEXT("?offline"));
-			}
+			FlowSubsystem->RequestStateOnNextLoad(EMatchState::MainLobby);
 		}
 		else
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[RoomPlayerController] GameInstance为空，无法返回大厅"));
+			UE_LOG(LogTemp, Error, TEXT("[RoomPlayerController] ExecuteLeaveRoom: GameFlowSubsystem 不可用, 退房后可能跳错页面"));
 		}
-	}, 0.5f, false);
+	}
+
+	// 4. 【P0 兼容】保留旧的 PostLoadMapWithWorld Lambda 作为兜底 (防御性编程)
+	//    虽然 Subsystem 已经接管, 但万一未来有边界情况 (如多次 OpenLevel) 让 Subsystem 错过了
+	//    这个兜底可以保证最后一道防线仍然能切到 MainLobby
+	//    EndPlay 中仍然会 Remove, 但因为 Subsystem 那层已经处理了, 不会重复触发 (TransitToState 有幂等保护)
+	if (!LeaveRoomSafeHandle.IsValid())
+	{
+		LeaveRoomSafeHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddLambda(
+			[WeakSelf = TWeakObjectPtr<ARoomPlayerController>(this), this](UWorld* LoadedWorld)
+			{
+				// 防御 1: 自己是否还活着 (新地图加载期间可能销毁)
+				if (!WeakSelf.IsValid()) return;
+
+				// 防御 2: 加载的必须是 L_Login (目标地图)
+				if (!LoadedWorld || !LoadedWorld->GetMapName().Contains(TEXT("L_Login"))) return;
+
+				// 防御 3: 拿到新 World 的 GI + GameFlowSubsystem
+				UGameInstance* NewGI = LoadedWorld->GetGameInstance();
+				if (!NewGI) return;
+
+				UGameFlowSubsystem* NewFlow = NewGI->GetSubsystem<UGameFlowSubsystem>();
+				if (!NewFlow)
+				{
+					UE_LOG(LogTemp, Error, TEXT("[RoomPlayerController] PostLoadMapWithWorld(兜底): 新地图找不到 GameFlowSubsystem"));
+					return;
+				}
+
+				// 兜底: 如果当前还是 Login (说明 Subsystem 那层没处理), 强制切到 MainLobby
+				// 大厂设计: 幂等保护, 即使 Subsystem 已经切到 MainLobby, 再调一次也是 no-op
+				if (NewFlow->GetCurrentState() != EMatchState::MainLobby)
+				{
+					UE_LOG(LogTemp, Log, TEXT("[RoomPlayerController] PostLoadMapWithWorld(兜底): 主动切到 MainLobby"));
+					NewFlow->TransitToState(EMatchState::MainLobby);
+				}
+
+				// 一次性事件, 处理完后立即解绑
+				FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(LeaveRoomSafeHandle);
+				LeaveRoomSafeHandle.Reset();
+			});
+	}
+
+	// 5. 最后才执行 OpenLevel (确保订阅/预约在先, 不会错过事件)
+	UGameplayStatics::OpenLevel(World, FName("L_Login"), true, TEXT("?offline"));
 }// ==========================================
 // 5. 告诉服务器的 RPC 逻辑
 // ==========================================
@@ -543,6 +604,38 @@ void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& Play
 			ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
 			if (TargetPC && TargetPC->MyPlayerName == PlayerNameToKick)
 			{
+				// ==========================================
+				// 【2026-06-30 P0 修复】踢人前必须先清理 AccountAuthority 的 TMap 条目
+				// ----------------------------------------------------------------------
+				// 旧根因：
+				//   Server_KickPlayer 只通知了被踢客户端 Client_BeKicked() + 调 RemovePlayerFromRoom
+				//   → 但 Client_BeKicked 走 ExecuteLeaveRoom 直接跳图，没经过 AccountAuthority 清理
+				//   → AccountAuthority.OnlineAccounts 残留被踢玩家 (Username, OldSessionId)
+				//   → 被踢玩家重进时，DelayedSendPlayerInfo 生成 NEW SessionId
+				//   → HandleLoginRequest 走"情况 2: 同 Username 不同 SessionId" → 拒绝
+				//   → Client_LoginResult(bReject=true) → 弹 Overlay_LANRoomConflict
+				// 修复：在告知客户端被踢前，在房主权威表里显式调 HandleLogoutRequest
+				//       清掉对应的 (Username, SessionId) 条目，给"想重新加入"留出通道
+				// ==========================================
+				if (AccountAuthority.IsValid())
+				{
+					if (!TargetPC->MyAccountUsername.IsEmpty() && !TargetPC->MyAccountSessionId.IsEmpty())
+					{
+						AccountAuthority->HandleLogoutRequest(
+							TargetPC->MyAccountUsername,
+							TargetPC->MyAccountSessionId);
+
+						UE_LOG(LogTemp, Log,
+							TEXT("[Authority] Server_KickPlayer: 已清理 TMap 中 [%s] 的旧 SessionId (允许重进)"),
+							*TargetPC->MyAccountUsername);
+					}
+					else
+					{
+						// 【兜底】：万一被踢 PC 上 Username/SessionId 为空，走模糊匹配清理
+						AccountAuthority->HandleControllerDestroyed(TargetPC);
+					}
+				}
+
 				// 通知目标客户端被踢
 				TargetPC->Client_BeKicked();
 
@@ -585,8 +678,7 @@ void ARoomPlayerController::Server_ToggleReady_Implementation(bool bIsReady)
  */
 void ARoomPlayerController::Server_RequestStartGame_Implementation()
 {
-	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));
-	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		// 1. 校验所有玩家已准备
 		if (GM->CheckAllPlayersReady())
@@ -684,6 +776,17 @@ void ARoomPlayerController::Server_RequestSpawn_Implementation()
  */
 void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 {
+	// ==========================================
+	// 【DEBUG-SET-5-B】RoomPC 收到状态变化广播: 它是怎么处理 UI 的？
+	// ==========================================
+	UE_LOG(LogTemp, Error,
+		TEXT("[DEBUG-S5-B][RoomPC::OnFlowStateChanged] PID=%u WorldName=%s NewState=%d RoomUIWidget=%p RoomUIInViewport=%d"),
+		FPlatformProcess::GetCurrentProcessId(),
+		*GetWorld()->GetName(),
+		(int32)NewState,
+		RoomUIWidget,
+		(RoomUIWidget && RoomUIWidget->IsInViewport()) ? 1 : 0);
+
 	// 【状态 A: 正在房间内等待】
 	if (NewState == EMatchState::InRoom)
 	{
@@ -732,10 +835,7 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 				HUDWidget->HideEscMenu();
 			}
 
-			// 恢复输入模式和游戏状态
-			SetInputMode(FInputModeGameOnly());
-			bShowMouseCursor = false;
-			UGameplayStatics::SetGamePaused(this, false);
+			// 恢复输入模式（ESC 菜单关闭时状态已同步，无需重复 SetGamePaused）
 		}
 
 		// 销毁计分板 Widget
@@ -1068,7 +1168,7 @@ void ARoomPlayerController::OnEscPressed()
 /**
  * ShowEscMenu
  *
- * 显示 ESC 菜单（暂停游戏 + UIOnly 输入 + 鼠标显示）
+ * 显示 ESC 菜单（仅本机切换 InputMode，不影响其他客户端，不使用全局 Pause）
  */
 void ARoomPlayerController::ShowEscMenu()
 {
@@ -1084,18 +1184,15 @@ void ARoomPlayerController::ShowEscMenu()
 		UE_LOG(LogTemp, Error, TEXT("[ESC] ShowEscMenu 获取 GameHUDWidget 失败！"));
 	}
 
-	// 设置输入模式: UIOnly，鼠标可操作
+	// 设置输入模式: UIOnly，鼠标可操作（仅阻塞本机输入，不影响其他客户端）
 	SetInputMode(FInputModeUIOnly());
 	bShowMouseCursor = true;
-
-	// 暂停游戏
-	UGameplayStatics::SetGamePaused(this, true);
 }
 
 /**
  * HideEscMenu
  *
- * 隐藏 ESC 菜单（恢复游戏 + GameOnly 输入 + 鼠标隐藏）
+ * 隐藏 ESC 菜单（仅本机恢复 InputMode，不使用全局 Pause）
  */
 void ARoomPlayerController::HideEscMenu()
 {
@@ -1114,9 +1211,6 @@ void ARoomPlayerController::HideEscMenu()
 	// 恢复输入模式: GameOnly
 	SetInputMode(FInputModeGameOnly());
 	bShowMouseCursor = false;
-
-	// 恢复游戏
-	UGameplayStatics::SetGamePaused(this, false);
 }
 
 
@@ -1209,43 +1303,8 @@ void ARoomPlayerController::Server_NotifyAccountLogout_Implementation(const FStr
 }
 
 
-/**
- * Server_RequestIsAccountOnline_Implementation
- *
- * 房主端: 查表, 通过 Client_ReceiveIsAccountOnline 回包
- * (当前版本未主动调用, 保留供"显示在线列表"等扩展用)
- */
-void ARoomPlayerController::Server_RequestIsAccountOnline_Implementation(const FString& Username)
-{
-	if (!HasAuthority())
-	{
-		return;
-	}
-
-	bool bOnline = false;
-	if (AccountAuthority.IsValid())
-	{
-		bOnline = AccountAuthority->IsAccountOnline(Username);
-	}
-
-	// 回包给发起查询的客户端
-	Client_ReceiveIsAccountOnline(Username, bOnline);
-}
-
-
-/**
- * Client_ReceiveIsAccountOnline_Implementation
- * 收到"某账号是否在线"的回包
- * (扩展用, 当前为空实现)
- */
-void ARoomPlayerController::Client_ReceiveIsAccountOnline_Implementation(const FString& Username, bool bOnline)
-{
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::White,
-			FString::Printf(TEXT("[Account] %s 在线状态: %s"), *Username, bOnline ? TEXT("是") : TEXT("否")));
-	}
-}
+// 【P0 清理】删除未使用的 RPC 实现: Server_RequestIsAccountOnline / Client_ReceiveIsAccountOnline
+// (YAGNI: 等真有需求时再加回)
 
 
 /**
@@ -1272,11 +1331,11 @@ void ARoomPlayerController::SyncRoomAccountsToSession()
 		return;
 	}
 
-	// 从 AccountSubsystem 获取房主自己的账号名
+	// 【架构修正】走 AccountService 门面
 	FString HostAccountName = TEXT("");
-	if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
+	if (UAccountService* AccountService = UAccountService::Get(this))
 	{
-		HostAccountName = AccountSub->GetCurrentLoggedInUser();
+		HostAccountName = AccountService->GetCurrentUser();
 	}
 
 	// 获取在线子系统接口
@@ -1494,6 +1553,15 @@ void ARoomPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		World->GetTimerManager().ClearTimer(HeartbeatTimerHandle);
 	}
 
+	// 0.5 【大厂标准 - P0 兜底】清理退房流程订阅的 PostLoadMapWithWorld 全局委托
+	//     原因: PC 在 OpenLevel 完成前被销毁 (例如玩家断线), Lambda 会变成野指针
+	//           必须主动 Remove, 否则引擎下次跳图会回调到一个失效的 PC
+	if (LeaveRoomSafeHandle.IsValid())
+	{
+		FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(LeaveRoomSafeHandle);
+		LeaveRoomSafeHandle.Reset();
+	}
+
 	// 1. 客户端: 发下线通知(无论房主是否在, 都发, 不等回包)
 	//    注意: PC 已开始销毁, RPC 可能发不出去, 但还是尝试一下
 	if (!MyAccountUsername.IsEmpty() && !MyAccountSessionId.IsEmpty())
@@ -1510,5 +1578,38 @@ void ARoomPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		SyncRoomAccountsToSession();
 	}
 
+	// 3. 【P1 修复】解绑 GameFlow 状态订阅, 防止 PC 销毁后野指针回调
+	//    (AddDynamic 是 UFUNCTION 反射, 不通过 GC, 必须显式 RemoveDynamic)
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			FlowSubsystem->OnStateChanged.RemoveDynamic(this, &ARoomPlayerController::OnFlowStateChanged);
+		}
+	}
+
 	Super::EndPlay(EndPlayReason);
+}
+
+
+// ==========================================
+// 【P0】WithValidation 验证实现 - 防止客户端伪造 RPC 参数
+// ==========================================
+
+/**
+ * Server_RequestStartGame_Validate
+ * 客户端无参数, 无需校验, 但 WithValidation 要求有 Validate 函数
+ */
+bool ARoomPlayerController::Server_RequestStartGame_Validate()
+{
+	return true;
+}
+
+/**
+ * Server_RequestSpawn_Validate
+ * 客户端无参数, 无需校验
+ */
+bool ARoomPlayerController::Server_RequestSpawn_Validate()
+{
+	return true;
 }

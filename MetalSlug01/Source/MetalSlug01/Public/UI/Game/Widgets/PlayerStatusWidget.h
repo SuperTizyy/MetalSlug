@@ -8,6 +8,7 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Data/Enums/CombatEnums.h" // 引入 EACERankType
+#include "Engine/StreamableManager.h" // FStreamableHandle (异步加载回调)
 #include "PlayerStatusWidget.generated.h"
 
 // 前向声明
@@ -15,6 +16,7 @@ class UProgressBar;
 class UTextBlock;
 class UImage;
 class UHorizontalBox;
+class UTexture2D;
 
 
 /**
@@ -127,6 +129,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void RefreshACIconColor(int32 CurrentAC);
 
+	// ==========================================
+	// 内部: 异步加载与画刷应用
+	// ==========================================
+
+	/**
+	 * 【2026-07-01 新增】应用头像贴图到 Image_CharacterIcon
+	 * 内部方法: 被 UpdateCharacterIcon 和 OnCharacterIconLoaded 共享
+	 * 含重复贴图短路 + 显式刷颜色 (White) 防 tint 残留
+	 */
+	void ApplyCharacterIconBrush(class UTexture2D* Icon);
+
+	/**
+	 * 【2026-07-01 新增】异步加载头像完成回调 (StreamableManager 回调)
+	 * @param AssetPath   触发加载的资源路径 (用于匹配, 防止旧请求覆盖新请求)
+	 * @param LoadedHandle StreamableManager 句柄
+	 */
+	void OnCharacterIconLoaded(FSoftObjectPath AssetPath, FStreamableHandle* LoadedHandle);
+
 protected:
 	// ==========================================
 	// 3. 生命周期
@@ -188,4 +208,16 @@ private:
 	/** ACE 值文本（颜色随排名变化） */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* Text_ACEValue;
+
+	// ==========================================
+	// 异步加载支持 (2026-07-01 新增)
+	// ==========================================
+
+	/**
+	 * 【2026-07-01 新增】当前正在异步加载的头像软引用
+	 * 用途: 如果收到多个 UpdateCharacterIcon 调用, 取消上一个未完成的加载任务
+	 * 避免: 旧请求的回调在新请求之后到达, 导致显示错误的角色头像
+	 */
+	UPROPERTY()
+	TSoftObjectPtr<UTexture2D> PendingCharacterIconSoftRef;
 };

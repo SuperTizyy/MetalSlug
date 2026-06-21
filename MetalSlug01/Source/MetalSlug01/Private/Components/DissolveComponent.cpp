@@ -21,15 +21,18 @@ void UDissolveComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 订阅 HealthComponent 死亡事件（如果 Owner 有的话）
-	// 这样外部不需要手动调用 StartDissolve，HealthComponent 死亡自动触发
-	if (ACharacter* OwnerChar = Cast<ACharacter>(GetOwner()))
-	{
-		if (UHealthComponent* HealthComp = OwnerChar->FindComponentByClass<UHealthComponent>())
-		{
-			HealthComp->OnDeath.AddUniqueDynamic(this, &UDissolveComponent::OnOwnerDeath);
-		}
-	}
+	// 【2026-07-01 P0 重构】移除 OnDeath 订阅, 改为外部主动调用 StartDissolveImmediate
+	//
+	// 旧架构 bug:
+	//   - DissolveComponent::OnOwnerDeath 用 DissolveDelay=5s 定时器启动溶解
+	//   - 但 RespawnDelaySeconds=3s, 复活定时器比溶解早 2 秒触发
+	//   - 角色被销毁, 溶解流程永远跑不到 → 身体"立马消失"
+	//
+	// 新架构:
+	//   - BaseCharacter::ExecuteDeathLocal 直接调 StartDissolveImmediate (无延迟)
+	//   - 溶解速度由 DissolveSpeed 控制, 典型 1.0~2.0 秒内完成
+	//   - RespawnDelaySeconds 必须 > 溶解完成时间, 否则角色提前销毁看不到溶解
+	//   - 集中编排: 死亡 → 立即溶解 → 等待溶解完成 → 复活 → 销毁旧角色
 }
 
 
@@ -47,18 +50,71 @@ void UDissolveComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void UDissolveComponent::OnOwnerDeath()
 {
-	// 死亡后延迟 DissolveDelay 秒再开始溶解
-	if (UWorld* World = GetWorld())
+	// 【2026-07-01 P0 重构】原代码使用 DissolveDelay=5s 定时器, 与 RespawnDelay=3s 冲突
+	// 新设计: 立即启动溶解, 不用任何延迟
+	UE_LOG(LogCombat, Warning, TEXT("[DissolveComponent] OnOwnerDeath 触发: 立即启动溶解 (无延迟)"));
+
+	// 立即开始溶解效果 (无延迟)
+	StartDissolveEffect();
+}
+
+
+/**
+ * 【2026-07-01 P0 新增】立即启动溶解 (公开 API)
+ * 死亡流程编排: BaseCharacter::ExecuteDeathLocal 调用, 替代旧 BeginPlay 订阅 OnDeath
+ * 这样死亡编排器可以精确控制溶解时序 (与复活定时器协调)
+ */
+void UDissolveComponent::StartDissolveImmediate()
+{
+	UE_LOG(LogCombat, Warning, TEXT("[DissolveComponent] StartDissolveImmediate: 立即开始溶解"));
+	StartDissolveEffect();
+}
+
+
+void UDissolveComponent::CollectWeaponDynamicMaterials(UMeshComponent* WeaponMesh)
+{
+	if (!WeaponMesh)
 	{
-		World->GetTimerManager().ClearTimer(DissolveTimerHandle);
-		World->GetTimerManager().SetTimer(
-			DissolveTimerHandle,
-			this,
-			&UDissolveComponent::StartDissolveEffect,
-			DissolveDelay,
-			false
-		);
+		UE_LOG(LogCombat, Warning, TEXT("[DissolveComponent] CollectWeaponDynamicMaterials: WeaponMesh 为空, 跳过武器溶解"));
+		return;
 	}
+
+	// 防御性检查: 武器是否已被销毁/标记为 pending kill
+	if (!IsValid(WeaponMesh) || WeaponMesh->IsBeingDestroyed())
+	{
+		UE_LOG(LogCombat, Warning, TEXT("[DissolveComponent] CollectWeaponDynamicMaterials: 武器 Mesh 已失效, 跳过溶解"));
+		return;
+	}
+
+	UE_LOG(LogCombat, Log,
+		TEXT("[DissolveComponent] CollectWeaponDynamicMaterials: %s (Materials=%d)"),
+		*WeaponMesh->GetName(), WeaponMesh->GetNumMaterials());
+
+	// 为武器每个材质槽创建动态材质实例, 加入驱动队列
+	for (int32 i = 0; i < WeaponMesh->GetNumMaterials(); i++)
+	{
+		UMaterialInstanceDynamic* DynMat = WeaponMesh->CreateDynamicMaterialInstance(i, DissolveMaterial);
+		if (DynMat)
+		{
+			DynamicMaterials.Add(DynMat);
+		}
+	}
+
+	// 如果溶解流程已经在跑 (Tick 已激活), 新加入的材质会自动在下一帧被驱动
+	if (!bIsDissolving)
+	{
+		bIsDissolving = true;
+		CurrentDissolveValue = 0.0f;
+		UE_LOG(LogCombat, Log, TEXT("[DissolveComponent] 启动武器溶解 (手动触发)"));
+	}
+}
+
+
+void UDissolveComponent::CollectAllDynamicMaterials()
+{
+	// 重置幂等标志后重新收集 - 允许在 OnDeath 之前主动触发
+	bMaterialsCollected = false;
+	CollectDynamicMaterials();
 }
 
 

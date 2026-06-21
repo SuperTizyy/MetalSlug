@@ -9,6 +9,9 @@
 // 引入 Net/UnrealNetwork.h（DOREPLIFETIME 宏的来源）
 #include "Net/UnrealNetwork.h"
 
+// 【P0】OnRep_HostPlayerName 内部转发给 URoomService 事件总线
+#include "Services/RoomService.h"
+
 // 引入房间 PlayerState
 #include "Systems/Core/RoomPlayerState.h"
 
@@ -429,4 +432,54 @@ void ARoomGameState::MulticastEnterSettlement_Implementation(int32 InAttackerKil
 
 	// 广播进入结算事件，让所有客户端显示 Text_GameOver
 	OnEnterSettlement.Broadcast(InAttackerKills, InDefenderKills);
+}
+
+
+// ==========================================
+// 【P0 架构升级】房主变更 OnRep 回调
+// ==========================================
+
+/**
+ * OnRep_HostPlayerName
+ *
+ * 服务端修改 HostPlayerName 后自动同步到所有客户端
+ * 职责: 把变更转发给 URoomService.BroadcastHostChanged, 让 UI 订阅者收到"我是不是房主"通知
+ *
+ * 注意:
+ *  - 服务器本身不会触发 OnRep, 所以服务端调用 TransferHostTo 时也要手动广播
+ *  - 这里只处理客户端 OnRep 路径
+ *
+ * 实现规范:
+ *  - 走 URoomService::GetCurrentAccountName() 而非直接读 PC->MyPlayerName
+ *  - 避免 #include RoomPlayerController.h 头文件依赖, 也符合"业务层不直读 UPROPERTY"大厂规范
+ */
+void ARoomGameState::OnRep_HostPlayerName()
+{
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] OnRep_HostPlayerName: 新房主 = %s"), *HostPlayerName);
+
+	// 【P0】转发给 URoomService 事件总线 (客户端路径)
+	if (HasAuthority())
+	{
+		// 服务端不走 OnRep, 但若手动调用也兼容 (防重入)
+		return;
+	}
+
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 【P0 架构修正】走 URoomService 门面, 不直读 PC->MyPlayerName
+	// GetCurrentAccountName() 内部已经处理了 PC/LocalPlayer 的兼容读取, 是统一访问入口
+	FString LocalAccountName;
+	if (URoomService* RoomService = URoomService::Get(this))
+	{
+		LocalAccountName = RoomService->GetCurrentAccountName();
+	}
+
+	const bool bIsHostNow = !LocalAccountName.IsEmpty()
+		&& LocalAccountName.Equals(HostPlayerName, ESearchCase::IgnoreCase);
+
+	URoomService::BroadcastHostChanged(World, bIsHostNow);
 }

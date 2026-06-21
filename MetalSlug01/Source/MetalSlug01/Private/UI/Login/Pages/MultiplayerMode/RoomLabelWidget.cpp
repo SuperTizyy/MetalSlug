@@ -40,13 +40,24 @@ bool URoomLabelWidget::Initialize()
 /**
  * URoomLabelWidget::SetRoomName
  *
- * 设置房间名文本
+ * 设置房间名: 同时写 UI 和数据缓存
+ * 设计理由: Model-View 分离, View 内部缓存数据, 不依赖 UI 反读
  */
 void URoomLabelWidget::SetRoomName(const FString& InRoomName)
 {
+	// 【Bug2 修复】先写缓存 (数据源)
+	CachedRoomName = InRoomName;
+
+	// 再写 UI
 	if (Text_RoomName)
 	{
 		Text_RoomName->SetText(FText::FromString(InRoomName));
+	}
+	else
+	{
+		// 【大厂诊断】: TextBlock 漏绑会导致房间名不显示, 必须给出明确告警
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLabelWidget] Text_RoomName 控件未绑定! 请检查 WBP_RoomLabel 里是否拖入了同名的 TextBlock (类型必须为 UTextBlock)"));
 	}
 }
 
@@ -54,18 +65,12 @@ void URoomLabelWidget::SetRoomName(const FString& InRoomName)
 /**
  * URoomLabelWidget::GetRoomName
  *
- * 从 Text_RoomName 反向读出
- * 用途: OnRoomItemClicked 广播时用
- * 防御性: Text_RoomName 为空时返回空字符串
+ * 【Bug2 修复】直接读数据缓存, 不再从 TextBlock 反读
+ * 优势: 即使 Text_RoomName 未绑定, 房间名也能正确返回
  */
 FString URoomLabelWidget::GetRoomName() const
 {
-	// 如果文本框有效，返回里面的文本内容；否则返回空字符串
-	if (Text_RoomName)
-	{
-		return Text_RoomName->GetText().ToString();
-	}
-	return FString();
+	return CachedRoomName;
 }
 
 
@@ -135,16 +140,21 @@ void URoomLabelWidget::SetRoomState(bool bIsPlaying)
  * URoomLabelWidget::OnRoomItemClicked
  *
  * 玩家点击这个条目时触发
- * 1. 广播 OnRoomSelected 事件，参数是房间名
+ * 1. 广播 OnRoomSelected 事件, 参数为 widget 自身引用
  * 2. 屏幕调试
+ *
+ * 【架构升级】: 由广播字符串改为广播 widget 引用
+ * 原因: 旧设计 GetRoomName() 依赖 CachedRoomName, 若 CachedRoomName 为空外层收不到房间名
+ *       新设计: 外层通过 widget 引用直接调用 GetRoomName(), 数据源单一可信
  */
 void URoomLabelWidget::OnRoomItemClicked()
 {
-	// 【新增】当玩家点击这个条目时，把自己的房间名广播出去
-	OnRoomSelected.Broadcast(GetRoomName());
+	// 【架构升级】广播 widget 自身引用, 不广播字符串
+	OnRoomSelected.Broadcast(this);
 
 	if (GEngine)
 	{
-		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan, FString::Printf(TEXT("你点击了房间: %s"), *GetRoomName()));
+		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Cyan,
+			FString::Printf(TEXT("你点击了房间: %s"), *GetRoomName()));
 	}
 }

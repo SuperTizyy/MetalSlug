@@ -380,6 +380,21 @@ void UAccountRoomAuthority::SyncAccountsToSessionSettings(IOnlineSessionPtr Sess
 		AllAccountsStr,
 		EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 
+	// ==========================================
+	// 【2026-06-30 P0 Bug2 修复 - 撤销版】此处不再写 TOTAL_PLAYERS_WITH_AI
+	//
+	// 旧版 (2026-06-29) 我在这里顺手推送了 (AccountCount + 1),
+	// 但算法有 bug: AccountCount 起始 1 + 数 '|' 数量 → "host|client|" 数 2 个 '|'
+	//   → AccountCount = 1 + 2 = 3 → TotalRealPlayers = 3 + 1 = 4 ❌
+	// 即真实人数只有 2 (房主 + 1 普通玩家), 客户端却显示 4
+	//
+	// 新版: TOTAL_PLAYERS_WITH_AI 由 URoomInsidePage 单一权威推送
+	//   - 房主端: RefreshRoomUI 末尾拿 (AttackCount + DefenseCount) 推
+	//   - 这个值已经包含 AI (因为 RefreshRoomUI 会创建 AI 标签进 VBox)
+	//   - 客户端: URoomService.bIsHost = false, BroadcastRoomPlayerCount 内部护栏静默忽略
+	// 这样无论在哪一侧, 都只有一条 UpdateSession 路径, 不会双重计数
+	// ==========================================
+
 	// 调用 UpdateSession 将修改推送给局域网内的所有客户端
 	SessionInterface->UpdateSession(NAME_GameSession, NamedSession->SessionSettings, true);
 
@@ -389,7 +404,7 @@ void UAccountRoomAuthority::SyncAccountsToSessionSettings(IOnlineSessionPtr Sess
 	{
 		if (Ch == TEXT('|')) { AccountCount++; }
 	}
-	UE_LOG(LogTemp, Log, TEXT("[Authority] SyncAccountsToSessionSettings: 已同步 %d 个账号到 ROOM_ACCOUNTS [%s]"), AccountCount, *AllAccountsStr);
+	UE_LOG(LogTemp, Log, TEXT("[Authority] SyncAccountsToSessionSettings: 已同步 %d 个账号到 ROOM_ACCOUNTS [%s] (TOTAL_PLAYERS_WITH_AI 由 URoomInsidePage 单一推送)"), AccountCount, *AllAccountsStr);
 }
 
 

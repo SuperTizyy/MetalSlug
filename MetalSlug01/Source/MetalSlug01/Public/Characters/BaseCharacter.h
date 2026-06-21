@@ -23,6 +23,8 @@
 #include "Components/EnergyComponent.h"
 #include "Components/DissolveComponent.h"
 #include "Components/FootstepComponent.h"
+#include "Components/CharacterEvents.h"
+#include "Components/HealthRegenComponent.h"
 
 // 引入 DataTable 行结构体（引擎 FindRow 模板需要）
 #include "Data/Tables/WeaponTableRow.h"
@@ -160,7 +162,7 @@ public:
 	// ==========================================
 	// 1. 核心组件 (第三人称视角)
 	// ==========================================
-protected:
+public:
 	// ===== 改造: 业务组件（健康/能量/溶解/脚步）已抽离为独立 Component =====
 	// 设计: BaseCharacter 创建并持有 4 个业务 Component, 后续业务代码可逐步迁移
 	// 行为兼容: 当前 BaseCharacter 内部仍维护同名字段, 两者并存; 后续批次将字段删除
@@ -173,6 +175,15 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Energy")
 	UEnergyComponent* EnergyComponent;
 
+	/**
+	 * 【2026-07-01 新增】角色事件总线组件
+	 * 用途: BaseCharacter 通过它向 UI 层广播 7 个状态事件 (头像/血量/能量/AC/ACE/武器)
+	 * 订阅方: UGameHUDWidget (在 NativeConstruct 中订阅)
+	 * 优势: 消除 BaseCharacter → GameHUDWidget 的直接依赖, 实现依赖倒置
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|CharacterEvents")
+	UCharacterEvents* CharacterEvents;
+
 	/** 溶解特效 (死亡后材质渐隐) */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Dissolve")
 	UDissolveComponent* DissolveComponent;
@@ -180,6 +191,15 @@ protected:
 	/** 脚步音效 (地面检测 + 音效播放) */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Footstep")
 	UFootstepComponent* FootstepComponent;
+
+	/**
+	 * 【2026-07-01 新增】生命回复组件 (自治)
+	 * 用途: 把原本散落在 BaseCharacter::Tick() 里的回血回蓝逻辑独立化
+	 * 默认 bEnableAutoRegen=false (格斗游戏设计: 被攻击后血量保持不变)
+	 * 蓝图可配置开启 (例如 Boss 战的护盾回复)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Regen")
+	UHealthRegenComponent* HealthRegenComponent;
 
 	/**
 	 * 第三人称专属的"自拍杆" (弹簧臂)
@@ -341,42 +361,42 @@ protected:
 	// ==========================================
 protected:
 	/**
-	 * 停止移动后开始回复的时间（秒）
+	 * 【2026-07-01 P0 重构】停止移动后开始回复的时间（秒）
+	 *
+	 * 架构决策: 本游戏的战斗模式不允许自动回血 (格斗游戏设计原则)
+	 *   - 被攻击后血量应该保持不变, 直到下次治疗或死亡
+	 *   - 能量 (AC/ACE) 也不自动回复, 由连击/技能系统产生
+	 *
+	 * 保留此接口的原因:
+	 *   - 蓝图子类可能扩展 (例如 Boss 战的护盾回复)
+	 *   - 测试模式可能临时开启 (GameMode 钩子)
+	 *
+	 * 当前默认值: 关闭 (HealthRegenRate=0 / EnergyRegenRate=0)
+	 *   如果未来需要开启, 直接修改默认值即可
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
 	float RegenerationDelay = 2.0f;
 
 	/**
-	 * 生命回复速度（每秒）
+	 * 【2026-07-01 P0 重构】生命回复速度（每秒）
+	 *
+	 * 默认值 0.0: 关闭自动回血 (格斗游戏设计)
+	 * 设为 > 0 才开启自动回血
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
-	float HealthRegenRate = 5.0f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float HealthRegenRate = 0.0f;
 
 	/**
-	 * 能量回复速度（每秒）
+	 * 【2026-07-01 P0 重构】能量回复速度（每秒）
+	 *
+	 * 默认值 0.0: 关闭自动回能量
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration")
-	float EnergyRegenRate = 10.0f;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|Regeneration", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float EnergyRegenRate = 0.0f;
 
-	/**
-	 * 最后移动时间
-	 */
-	float LastMoveTime;
-
-	/**
-	 * 是否正在回复
-	 */
-	bool bIsRegenerating;
-
-	/**
-	 * 开始回复（由 Tick 或定时器调用）
-	 */
-	void StartRegeneration();
-
-	/**
-	 * 停止回复（角色开始移动时调用）
-	 */
-	void StopRegeneration();
+	// 注: LastMoveTime / bIsRegenerating / StartRegeneration / StopRegeneration 已于 2026-07-01
+	//     抽离到 UHealthRegenComponent, 此处不再保留字段/方法, 避免双轨不一致
+	//     访问请通过 HealthRegenComponent 组件
 
 	/**
 	 * 【2026-06-15 重构】: 死亡状态锁 (防止鞭尸) 委托给 HealthComponent
@@ -404,9 +424,46 @@ protected:
 	void Die();
 
 	/**
+	 * 【2026-07-01 新增】HealthComponent 死亡事件回调
+	 * 服务器: 走击杀结算 + Multicast_Die + StartRespawnTimer (经由 Die())
+	 * 客户端: 本地执行死亡流程 (经由 ExecuteDeathLocal())
+	 */
+	UFUNCTION()
+	void OnHealthComponentDeath();
+
+	/**
+	 * 【2026-07-01 新增】本地执行死亡流程
+	 * 客户端通过 HealthComponent->OnRep_bIsDead 触发, 无需 Multicast RPC
+	 * 服务器 Die() 内部也复用此方法
+	 */
+	void ExecuteDeathLocal();
+
+	/**
+	 * 【2026-07-01 新增】死亡序列幂等标志
+	 * 服务器和客户端可能通过多个路径触发死亡流程:
+	 *   - 服务器: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() → Multicast_Die (服务器自己)
+	 *   - 客户端: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal()
+	 *            + Multicast_Die RPC → ExecuteDeathLocal()
+	 * 用 bDeathSequenceStarted 保证 ExecuteDeathLocal 核心步骤只执行一次
+	 */
+	UPROPERTY(Transient)
+	bool bDeathSequenceStarted = false;
+
+	/**
 	 * 启用布娃娃物理（角色真实死亡时调用）
 	 */
 	void EnableRagdoll();
+
+	/**
+	 * 【2026-07-01 新增】武器死亡处理（统一入口）
+	 * @param Weapon  要处理的武器 (调用前会拷贝 CurrentWeapon, 内部置空已由调用方处理)
+	 * 职责:
+	 *   - Detach 武器与角色骨骼
+	 *   - 激活武器 Mesh 物理模拟
+	 *   - 调用 DissolveComponent 收集武器材质 (修复 FindComponentByClass 找不到的 bug)
+	 *   - 仅服务器调用 Weapon->SetLifeSpan() 实现单一销毁权威
+	 */
+	void DropAndFadeWeapon(ABaseWeapon* Weapon);
 
 	/**
 	 * 布娃娃启用定时器句柄
@@ -419,16 +476,31 @@ protected:
 	FTimerHandle CharacterIconRefreshTimerHandle;
 
 	/**
+	 * 【P0 修复 2026-06-29】角色图标重试计数器 (与 HUD 重试计数器配对, 防止日志洪水)
+	 */
+	int32 CurrentIconRetryCount = 0;
+
+	/**
 	 * HUD 刷新延迟重试定时器
 	 */
 	FTimerHandle HUDRefreshTimerHandle;
 
 	/**
-	 * 【2026-06-15 重构】: 死亡流程 - 武器延迟销毁定时器句柄
-	 * 原代码为局部变量 (BaseCharacter.cpp L1457),会在栈帧结束时丢失句柄
-	 * 改为成员变量,允许 EndPlay 或新一轮死亡时主动 ClearTimer
+	 * 【P0 修复 2026-06-29】HUD 重试计数器
+	 * 用途: 防止 HUD 永远拿不到时 RetryRefreshHUD 进入死循环刷屏
+	 * 上限: 20 次 (10 秒后停止)
+	 * 重置: HUD 成功获取 / EndPlay / 主动 ClearTimer 时清零
 	 */
-	FTimerHandle WeaponDestroyTimerHandle;
+	int32 CurrentHUDRetryCount = 0;
+
+	/**
+	 * 【2026-07-01 重构】: 武器延迟销毁时间 (秒)
+	 * 原 WeaponDestroyTimerHandle 是用于服务器/客户端各自手动调度 Destroy 的,
+	 *   导致重复销毁语义混乱。现改为 SetLifeSpan, 由 UE 单一权威自动销毁。
+	 * 默认 3.0 秒: 玩家能看到武器掉地物理动画 + 溶解特效, 同时小于 RespawnDelaySeconds 保证重生前清理完毕
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Death", meta = (ClampMin = "0.5", ClampMax = "30.0"))
+	float WeaponDestroyDelaySeconds = 3.0f;
 
 	/**
 	 * 缓存角色 ID，延迟刷新时使用（避免循环触发服务器 RPC）
@@ -443,8 +515,13 @@ protected:
 
 	/**
 	 * 复活延迟时间（秒），死亡时传递给 PlayerController 启动定时器
+	 *
+	 * 【2026-07-01 P0 调整】必须大于角色溶解完成时间
+	 * 溶解时长 = 1.0 / DissolveSpeed 秒 (DissolveSpeed=1.5 → ~0.67s)
+	 * 默认 3.0s: 给溶解 + 死亡动画 + 武器掉地留足视觉时间
+	 * 如果 DissolveSpeed 调小 (溶解变慢), 需同步调大 RespawnDelaySeconds
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Respawn")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Respawn", meta = (ClampMin = "1.0", ClampMax = "30.0"))
 	float RespawnDelaySeconds = 3.0f;
 
 
@@ -473,39 +550,64 @@ public:
 
 
 	// ==========================================
-	// UI连接
+	// UI连接 【2026-07-01 重构 v2: 事件总线模式】
 	// ==========================================
-	// 【2026-06-15 重构】: 跨层依赖集中化
-	// 历史: BaseCharacter.cpp 中曾有 50+ 处直接访问 GameHUDWidget / MyGameHUD
-	// 现状: 收敛到 2 个 helper 函数 (RefreshHUDFromCurrentState / TryResolveHUDWidget)
-	//      集中点位于 cpp 文件底部 "UI Bridge (跨层访问点)" 区段
-	// 待优化: 长期应改为 UI 订阅 HealthComponent->OnHealthChanged 事件
-	//        实现真正的依赖倒置 (UI→Core 单向), 当前阶段先收敛
+	// 历史 (2026-06-15): BaseCharacter → GameHUDWidget 直接 Push
+	// 现状 (2026-07-01): BaseCharacter → CharacterEvents → GameHUDWidget (依赖倒置)
+	// 说明:
+	//   - GameHUDWidget / TryResolveHUDWidget / RefreshHUDFromCurrentState
+	//     保留仅用于内部重试/向后兼容，不再被新代码使用
+	//   - 所有新事件通过 CharacterEvents 组件广播，由 GameHUDWidget 订阅
 	// ==========================================
 protected:
 	/**
-	 * 游戏 HUD 引用
-	 * 用途: 通过它刷新血条/能量/武器图标
-	 * @note 外部代码请勿直接访问, 走 helper 函数
+	 * 【内部使用】游戏 HUD 引用
+	 * 用途: 仅用于 RetryRefreshHUD / RetryRefreshCharacterIcon 等重试逻辑
+	 * 新代码请勿直接访问，通过 CharacterEvents 事件订阅机制
 	 */
 	UPROPERTY()
 	UGameHUDWidget* GameHUDWidget;
 
-	// === UI Bridge Helper (2026-06-15 新增) ===
 	/**
-	 * 【UI Bridge】从 PlayerController 安全获取 GameHUDWidget 引用
-	 * @param bLogWarning 失败时是否打 Warning 日志 (默认 true)
-	 * @return 是否成功解析 (true 表示 GameHUDWidget 非空)
-	 * @note 替代散落在 30+ 处的 HUD 获取样板代码
+	 * 【仅内部使用】从 PlayerController 安全获取 GameHUDWidget 引用
+	 * @note 仅用于延迟刷新重试 (RetryRefreshHUD / RetryRefreshCharacterIcon)
+	 *       新代码通过 CharacterEvents 事件总线订阅，不应调用此方法
 	 */
 	bool TryResolveHUDWidget(bool bLogWarning = true);
 
 	/**
-	 * 【UI Bridge】一次性推送所有角色状态到 HUD
-	 * 推送内容: 血量/能量/AC/ACE
-	 * @note 替代散落在 10+ 处的 UpdateXxx 调用
+	 * 【仅内部使用】一次性推送所有角色状态到 HUD (向后兼容)
+	 * @note 仅用于向后兼容，不再被新代码调用
 	 */
 	void RefreshHUDFromCurrentState();
+
+	// ==========================================
+	// 事件广播方法 (替代直接 HUD Push)
+	// ==========================================
+	/**
+	 * 【2026-07-01 新增】广播头像加载事件
+	 * 调用时机: GetCharacterAvatarFromTable 加载完毕后
+	 * 注意: 内部已包含 IsLocallyControlled() 检查，只在本地玩家调用
+	 */
+	void BroadcastCharacterIconReady(const FString& CharID, UTexture2D* Icon);
+
+	/**
+	 * 【2026-07-01 新增】广播 AC 值变化事件
+	 * 调用时机: OnRep_ACValue 中
+	 */
+	void BroadcastACValueChanged(int32 NewAC);
+
+	/**
+	 * 【2026-07-01 新增】广播 ACE 值变化事件 (含排名)
+	 * 调用时机: RefreshACEWithRank 中
+	 */
+	void BroadcastACEWithRankChanged(int32 NewACE, EACERankType RankType);
+
+	/**
+	 * 【2026-07-01 新增】广播武器图标加载完毕事件
+	 * 调用时机: RefreshWeaponIconOnHUD 中
+	 */
+	void BroadcastWeaponIconReady(const FString& WeaponID, UTexture2D* Icon);
 
 
 	// ==========================================
@@ -702,7 +804,7 @@ protected:
 	/**
 	 * 客户端向服务器请求挥刀（带着连击序号，告诉大家播第几个动作）
 	 */
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
 
 	/**
@@ -850,9 +952,11 @@ public:
 protected:
 	/**
 	 * 服务器调用，通知所属客户端刷新自己的头像图标
+	 * @param InCharacterID 角色 ID
+	 * @param Avatar        头像贴图（服务器查表后直接传递，解决客户端 GetAuthGameMode 为 nullptr 的问题）
 	 */
 	UFUNCTION(Client, Reliable)
-	void Client_RefreshCharacterIcon(const FString& InCharacterID);
+	void Client_RefreshCharacterIcon(const FString& InCharacterID, class UTexture2D* Avatar);
 
 	/**
 	 * HUD 未就绪时的延迟重试回调

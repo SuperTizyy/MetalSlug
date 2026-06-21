@@ -12,6 +12,9 @@
 // 引入胶囊体组件
 #include "Components/CapsuleComponent.h"
 
+// 引入 PhysicsAsset (UE_LOG 中需要 GetPhysicsAsset()->GetName(), 需要完整类型)
+#include "PhysicsEngine/PhysicsAsset.h"
+
 // 引入 Net/UnrealNetwork.h（DOREPLIFETIME 宏的来源）
 #include "Net/UnrealNetwork.h"
 
@@ -84,6 +87,8 @@ ABaseCharacter::ABaseCharacter()
 	EnergyComponent   = CreateDefaultSubobject<UEnergyComponent>(TEXT("EnergyComponent"));
 	DissolveComponent = CreateDefaultSubobject<UDissolveComponent>(TEXT("DissolveComponent"));
 	FootstepComponent = CreateDefaultSubobject<UFootstepComponent>(TEXT("FootstepComponent"));
+	CharacterEvents  = CreateDefaultSubobject<UCharacterEvents>(TEXT("CharacterEvents"));
+	HealthRegenComponent = CreateDefaultSubobject<UHealthRegenComponent>(TEXT("HealthRegenComponent"));
 
 	// ==========================================
 	// 角色模型设置
@@ -105,9 +110,7 @@ ABaseCharacter::ABaseCharacter()
 	ACValue = 0;
 	ACEValue = 0;
 
-	// 初始化回复系统
-	LastMoveTime = 0.0f;
-	bIsRegenerating = false;
+	// 注: 回复系统状态已抽离到 HealthRegenComponent, 此处不再初始化字段
 
 	// 6. 初始化连击系统状态
 	bIsHoldingLightAttack = false;
@@ -146,6 +149,18 @@ void ABaseCharacter::BeginPlay()
 	if (HealthComponent)
 	{
 		HealthComponent->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthChanged_Callback);
+
+		// 【2026-07-01 新增】订阅死亡事件
+		// 服务器: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die
+		// 客户端: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal
+		HealthComponent->OnDeath.AddUniqueDynamic(this, &ABaseCharacter::OnHealthComponentDeath);
+	}
+
+	// 【2026-07-01 新增】: CharacterEvents 初始化检查
+	// 如果 CharacterEvents 未正确挂载，打一条 Error，便于调试
+	if (!CharacterEvents)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] CharacterEvents 组件未挂载!"));
 	}
 }
 
@@ -161,11 +176,127 @@ void ABaseCharacter::BeginPlay()
  */
 void ABaseCharacter::OnHealthChanged_Callback(float NewHealth)
 {
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
-	if (TryResolveHUDWidget(false) && HealthComponent)
+	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播, 替代直接 GameHUDWidget Push
+	// 优势: UI 层自主订阅, BaseCharacter 不再依赖 GameHUDWidget
+	if (!CharacterEvents || !HealthComponent)
 	{
-		GameHUDWidget->UpdateHealth(NewHealth, HealthComponent->GetMax());
-		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(NewHealth), FMath::CeilToInt(HealthComponent->GetMax()));
+		return;
+	}
+	CharacterEvents->OnHealthChangedDelegate.Broadcast(NewHealth, HealthComponent->GetMax());
+}
+
+
+/**
+ * ABaseCharacter::OnHealthComponentDeath
+ *
+ * 【2026-07-01 新增】HealthComponent->OnDeath 事件回调
+ *
+ * 架构升级: 死亡入口统一化
+ *   旧架构 (依赖 TakeDamage 主动调 Die):
+ *     - 任何绕过 TakeDamage 的死亡 (脚本伤害 / 自杀 / 调试命令) 都不会触发 Die
+ *     - 客户端死亡完全依赖 Multicast_Die RPC, 网络抖动会丢
+ *   新架构 (HealthComponent->OnDeath 事件总线):
+ *     - 服务器: HealthComponent::ApplyDamage 内部 Broadcast → 本回调 → 走击杀结算 + Multicast_Die
+ *     - 客户端: HealthComponent::OnRep_bIsDead 内部 Broadcast → 本回调 → 本地死亡流程
+ *     - 任何修改 HealthComponent->bIsDead 的路径都会自动触发
+ */
+void ABaseCharacter::OnHealthComponentDeath()
+{
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseCharacter][OnHealthComponentDeath] 触发死亡: Pawn=%s HasAuth=%d"),
+		*GetName(), HasAuthority() ? 1 : 0);
+
+	if (HasAuthority())
+	{
+		// 服务器: 走完整流程 (击杀结算 + Multicast_Die + 复活定时器)
+		Die();
+	}
+	else
+	{
+		// 客户端: 本地直接执行死亡流程 (无需 Multicast)
+		// 注: Multicast_Die 也可能会到达, ExecuteDeathLocal 是幂等的 (CurrentWeapon 置空后第二次会跳过)
+		ExecuteDeathLocal();
+	}
+}
+
+
+/**
+ * ABaseCharacter::ExecuteDeathLocal
+ *
+ * 【2026-07-01 新增】本地执行死亡流程 (客户端用, 服务器也可用)
+ * 与 Multicast_Die_Implementation 的区别:
+ *   - 不调 StartRespawnTimer (复活只在服务器调)
+ *   - 不调 ResetAC (仅服务器重置)
+ *   - 其他 (武器掉落/溶解/胶囊体/动画/布娃娃) 完全一致
+ *
+ * 幂等保证: 可能被多次调用 (服务器 Die() 走 Multicast_Die RPC 触发服务器, 客户端又通过 OnRep_bIsDead 触发)
+ *   - bDeathSequenceStarted 标志保证只首次执行核心步骤
+ *   - 重复调用仅 ResetAC + StartRespawnTimer
+ *
+ * 死亡流程时序 (t=0 死亡瞬间):
+ *   - t=0: 武器立即溶解 + 角色立即溶解 + 胶囊体透明 + 禁用移动 + 死亡动画
+ *   - t=0.7*DeathMontageDuration: 启动 Ragdoll
+ *   - t=DissolveDuration: 角色和武器溶解完毕
+ *   - t=RespawnDelaySeconds: 复活定时器到期, 销毁旧角色
+ *
+ * 时序约束 (大厂架构规范):
+ *   RespawnDelaySeconds > DissolveDuration + DeathMontageDuration
+ *   否则身体溶解到一半就被销毁, 视觉效果断裂
+ */
+void ABaseCharacter::ExecuteDeathLocal()
+{
+	// 幂等检查: 死亡序列已开始则跳过核心步骤
+	if (bDeathSequenceStarted)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[BaseCharacter][ExecuteDeathLocal] 幂等跳过: Pawn=%s"),
+			*GetName());
+		return;
+	}
+	bDeathSequenceStarted = true;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseCharacter][ExecuteDeathLocal] Pawn=%s HasAuth=%d Weapon=%s"),
+		*GetName(), HasAuthority() ? 1 : 0,
+		CurrentWeapon ? *CurrentWeapon->GetName() : TEXT("nullptr"));
+
+	// 1. 武器掉落
+	if (CurrentWeapon)
+	{
+		DropAndFadeWeapon(CurrentWeapon);
+		CurrentWeapon = nullptr;
+	}
+
+	// 2. 胶囊体透明 + 禁用移动
+	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
+	{
+		MoveComp->StopMovementImmediately();
+		MoveComp->DisableMovement();
+	}
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+
+	// 3. 死亡动画 + 定时布娃娃
+	float AnimDuration = 0.1f;
+	if (DeathMontage)
+	{
+		AnimDuration = PlayAnimMontage(DeathMontage);
+	}
+	float TimeToRagdoll = AnimDuration > 0.1f ? (AnimDuration * 0.7f) : 0.1f;
+	GetWorldTimerManager().SetTimer(RagdollTimerHandle, this, &ABaseCharacter::EnableRagdoll, TimeToRagdoll, false);
+
+	// 4. 【2026-07-01 P0 修复】角色身体溶解 - 立即启动, 不再用 DissolveDelay 定时器
+	// 旧架构 bug: DissolveComponent::OnOwnerDeath 用 DissolveDelay=5s 定时器
+	//              复活定时器 3s 就触发销毁, 角色没机会溶解 → 身体"立马消失"
+	// 新架构: 死亡编排器 (ExecuteDeathLocal) 显式控制溶解时序, 立即启动
+	if (DissolveComponent)
+	{
+		DissolveComponent->StartDissolveImmediate();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][ExecuteDeathLocal] DissolveComponent 未挂载! 角色将无法溶解"));
 	}
 }
 
@@ -196,9 +327,8 @@ void ABaseCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		FTimerManager& TM = World->GetTimerManager();
 
 		// 清理死亡流程相关的 timer
-		// 这两个 timer 在快速死亡-重生-再死亡场景下会产生残留,必须显式清理
+		// 注: WeaponDestroy 已改为服务器 SetLifeSpan, 不再使用 TimerHandle
 		// 注: DissolveTimerHandle 已迁移到 DissolveComponent, 由其自行清理
-		TM.ClearTimer(WeaponDestroyTimerHandle);
 		TM.ClearTimer(RagdollTimerHandle);
 
 		// 清理延迟重试 timer
@@ -221,7 +351,7 @@ void ABaseCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
  * 每帧调用
  * 关键:
  * 1. 摄像机阻尼减震回弹（下蹲/起立时镜头平滑）
- * 2. 生命/能量回复系统（仅服务器，停止移动 N 秒后开始回血回蓝）
+ * 2. 【2026-07-01 重构】生命/能量回复已抽离到 UHealthRegenComponent
  * 3. 死亡溶解特效（值达到 1.1 时销毁）
  */
 void ABaseCharacter::Tick(float DeltaTime)
@@ -237,46 +367,7 @@ void ABaseCharacter::Tick(float DeltaTime)
 		CameraBoom->TargetOffset.Z = FMath::FInterpTo(CameraBoom->TargetOffset.Z, 0.0f, DeltaTime, CrouchCameraSmoothSpeed);
 	}
 
-	// ==========================================
-	// 生命/能量回复系统
-	// ==========================================
-	if (!IsDead() && HasAuthority())
-	{
-		// 检测角色是否在移动
-		FVector Velocity = GetVelocity();
-		bool bIsMoving = !Velocity.IsNearlyZero(0.1f);
-
-		if (bIsMoving)
-		{
-			LastMoveTime = GetWorld()->GetTimeSeconds();
-			StopRegeneration();
-		}
-		else
-		{
-			// 静止超过设定时间后开始回复
-			float TimeSinceLastMove = GetWorld()->GetTimeSeconds() - LastMoveTime;
-			if (TimeSinceLastMove >= RegenerationDelay && !bIsRegenerating)
-			{
-				StartRegeneration();
-			}
-		}
-
-		// 执行回复
-		if (bIsRegenerating)
-		{
-			// 回复生命值 - 【2026-06-15 重构】通过 HealthComponent
-			if (HealthComponent && HealthComponent->GetCurrent() < HealthComponent->GetMax())
-			{
-				HealthComponent->Heal(HealthRegenRate * DeltaTime);
-			}
-
-			// 回复能量值 - 【2026-06-15 重构】通过 EnergyComponent
-			if (EnergyComponent)
-			{
-				EnergyComponent->Add(EnergyRegenRate * DeltaTime);
-			}
-		}
-	}
+	// 注: 血量/能量回复已由 HealthRegenComponent 自治 (默认 bEnableAutoRegen=false, 格斗游戏设计)
 }
 
 
@@ -451,14 +542,15 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
  */
 void ABaseCharacter::OnRep_ACValue()
 {
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
-	if (IsLocallyControlled() && TryResolveHUDWidget(false))
+	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播
+	if (!CharacterEvents)
 	{
-		GameHUDWidget->UpdateACValue(ACValue);
-
-		// AC 变化时重新查询排名并刷新 ACE 颜色
-		RefreshACEWithRank();
+		return;
 	}
+	CharacterEvents->OnACValueChanged.Broadcast(ACValue);
+
+	// AC 变化时重新查询排名并刷新 ACE 颜色 (内部也改用事件)
+	RefreshACEWithRank();
 }
 
 
@@ -469,15 +561,18 @@ void ABaseCharacter::OnRep_ACValue()
  */
 void ABaseCharacter::OnRep_ACEValue()
 {
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
-	if (IsLocallyControlled() && TryResolveHUDWidget(false))
+	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播
+	// OnRep_ACEValue 在所有客户端上触发, CharacterEvents 组件本身在本地,
+	// 所以这里的广播天然只在本地执行 (不需要额外的 IsLocallyControlled 守卫)
+	if (!CharacterEvents)
 	{
-		// 刷新 ACE 数值（独立于排名的更新）
-		GameHUDWidget->UpdateACEValue(ACEValue);
-
-		// ACE 变化时也需要查询排名（因为其他玩家的 ACE 变化也会影响你的排名）
-		RefreshACEWithRank();
+		return;
 	}
+	// 刷新 ACE 数值 (无排名, 用默认白色)
+	CharacterEvents->OnACEValueChanged.Broadcast(ACEValue);
+
+	// ACE 变化时也需要查询排名 (因为其他玩家的 ACE 变化也会影响你的排名)
+	RefreshACEWithRank();
 }
 
 
@@ -494,10 +589,6 @@ void ABaseCharacter::OnRep_ACEValue()
  */
 void ABaseCharacter::RefreshCharacterIcon()
 {
-	// 【核心修复】: 本地角色直接在服务器侧走一遍 Client RPC 流程
-	// 服务器先拿到 CharacterID，再通知所属客户端刷新头像
-	// 这样远程玩家也能看到其他人的头像图标了
-
 	FString CharID;
 	if (APlayerState* PS = GetPlayerState<APlayerState>())
 	{
@@ -512,8 +603,13 @@ void ABaseCharacter::RefreshCharacterIcon()
 		CharID = TEXT("Warrior");
 	}
 
-	// 服务器通知所属客户端刷新头像（每个客户端只刷新自己 HUD 上对应玩家的头像）
-	Client_RefreshCharacterIcon(CharID);
+	// 【2026-07-01 重构 v2】: 服务器直接查表获取头像贴图并传递给客户端
+	// 原因: GetAuthGameMode 在客户端上可能为 nullptr, 导致客户端查表失败产生白板
+	// 新架构: 服务器侧查表, 通过 RPC 传递 UTexture2D* (UE 支持 Client RPC 传 UObject*)
+	UTexture2D* Avatar = GetCharacterAvatarFromTable(CharID);
+
+	// 服务器通知所属客户端刷新头像 (Avatar 由服务器传递, 避免客户端查表失败)
+	Client_RefreshCharacterIcon(CharID, Avatar);
 }
 
 
@@ -521,36 +617,39 @@ void ABaseCharacter::RefreshCharacterIcon()
  * Client_RefreshCharacterIcon_Implementation
  *
  * Client RPC: 在所属客户端上刷新头像
- * 网络架构说明: 此函数在"所有客户端"上执行
- * 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像
- * 所以这里用 IsLocallyControlled() 做最终过滤
+ * 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播事件
+ *
+ * 架构变更:
+ *   - 旧: 服务器只传 CharacterID, 客户端自己查 DataTable (GetAuthGameMode 在客户端为 nullptr, 导致白板)
+ *   - 新: 服务器直接传递 UTexture2D* Avatar, 客户端通过 CharacterEvents->OnCharacterIconReady 广播
+ *
+ * IsLocallyControlled 守卫说明:
+ *   Client RPC 按 UE 语义只在所属客户端上执行,
+ *   加 IsLocallyControlled() 是双保险, 防止未来 UE 语义变化或被意外 Multicast 时污染 HUD
  */
-void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID)
+void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar)
 {
-	// 【网络架构说明】:
-	// 此函数在"所有客户端"上执行，包括本地玩家和远程玩家
-	// 但每个客户端的 HUD 上只显示"该客户端自己控制的角色"的头像
-	// 所以这里用 IsLocallyControlled() 做最终过滤 —— 只有本地玩家才刷新自己的 HUD
+	// 【P0 双保险】: 必须是本机玩家才允许改本机 HUD
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
 
 	// 缓存 ID，延迟刷新时使用
 	CachedCharacterIDForIcon = InCharacterID;
 
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
+	// HUD 未就绪 → 延迟重试 (保留重试机制, CharacterEvents 组件本身也受 HUD 生命周期影响)
 	if (!TryResolveHUDWidget())
 	{
-		// HUD 仍未就绪，延迟重试（使用成员变量 TimerHandle 确保计时器正确创建）
-		UE_LOG(LogTemp, Warning, TEXT("[Icon] HUD 未就绪，延迟刷新，InCharacterID=%s"), *InCharacterID);
+		UE_LOG(LogTemp, Warning, TEXT("[Icon] HUD 未就绪, 延迟刷新, InCharacterID=%s"), *InCharacterID);
 		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
 		return;
 	}
 
-	// 刷新角色头像
-	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(InCharacterID))
-	{
-		GameHUDWidget->UpdateCharacterIcon(Avatar);
-	}
+	// 通过 CharacterEvents 广播头像事件 (替代直接 GameHUDWidget Push)
+	BroadcastCharacterIconReady(InCharacterID, Avatar);
 
-	// 同时刷新武器图标（从 PlayerSpawnDataCache 获取 WeaponID）
+	// 刷新武器图标
 	RefreshWeaponIconOnHUD();
 }
 
@@ -560,25 +659,91 @@ void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& I
  *
  * 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑
  * 跳过服务器中转
+ *
+ * 【P0 修复 2026-06-29】: 加最大重试次数 + 防御性检查, 与 RetryRefreshHUD 保持一致
  */
 void ABaseCharacter::RetryRefreshCharacterIcon()
 {
-	// 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑，跳过服务器中转
-	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标，CachedID=%s"), *CachedCharacterIDForIcon);
+	// ==========================================
+	// 【P0 防御 1】: Character 或 World 已失效 → 停止重试
+	// ==========================================
+	if (!IsValid(this) || !GetWorld())
+	{
+		return;
+	}
+
+	// ==========================================
+	// 【P0 防御 2】: 2026-07-01 新增 - 仅本机玩家需要刷新 HUD
+	// 与 Client_RefreshCharacterIcon_Implementation 保持一致, 防止非本地玩家的
+	// 定时器意外跑起来污染本机 HUD
+	// ==========================================
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
+
+	// ==========================================
+	// 【P0 防御 3】: 最大重试次数限制
+	// ==========================================
+	const int32 MaxRetries = 20;
+	CurrentIconRetryCount++;
+	if (CurrentIconRetryCount >= MaxRetries)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] RetryRefreshCharacterIcon 达到最大重试次数 (%d 次), 放弃"), CurrentIconRetryCount);
+		CurrentIconRetryCount = 0;
+		GetWorld()->GetTimerManager().ClearTimer(CharacterIconRefreshTimerHandle);
+		return;
+	}
 
 	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
 	if (!TryResolveHUDWidget())
 	{
-		// HUD 仍未就绪，再次延迟重试
+		// HUD 仍未就绪, 继续重试 (降级为 Log)
+		UE_LOG(LogTemp, Verbose, TEXT("[Icon] HUD 未就绪, 重试中... (%d/%d), CachedID=%s"),
+			CurrentIconRetryCount, MaxRetries, *CachedCharacterIDForIcon);
 		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
 		return;
 	}
 
 	// HUD 已就绪，直接刷新（使用缓存的 ID）
-	if (UTexture2D* Avatar = GetCharacterAvatarFromTable(CachedCharacterIDForIcon))
+	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标, CachedID=%s (重试 %d 次后成功)"),
+		*CachedCharacterIDForIcon, CurrentIconRetryCount);
+	CurrentIconRetryCount = 0;  // 成功 → 重置
+
+	// ==========================================
+	// 【2026-07-01 P0 修复】"事件 + 缓存"双轨制补发:
+	//   - 优先从 CharacterEvents 缓存拉取 (服务器原始 Avatar)
+	//   - 缓存为空时再尝试 GetCharacterAvatarFromTable (但客户端 GetAuthGameMode 为 nullptr, 必然失败)
+	//   - 这样: 若 BaseCharacter 之前已 Broadcast 过头像 (即便没订阅者), 我们仍能从缓存拿到
+	// ==========================================
+	UTexture2D* Avatar = nullptr;
+	FString CharIDToBroadcast = CachedCharacterIDForIcon;
+
+	if (CharacterEvents)
 	{
-		GameHUDWidget->UpdateCharacterIcon(Avatar);
+		// 1. 优先: 从缓存拉 (服务器已 Broadcast 过的 Avatar)
+		FString CachedID;
+		UTexture2D* CachedAvatar = nullptr;
+		if (CharacterEvents->GetCachedCharacterIcon(CachedID, CachedAvatar))
+		{
+			Avatar = CachedAvatar;
+			CharIDToBroadcast = CachedID;
+			UE_LOG(LogTemp, Log,
+				TEXT("[Icon] RetryRefreshCharacterIcon: 从 CharacterEvents 缓存取 Avatar, CachedID=%s, Avatar=%s"),
+				*CachedID, Avatar ? *Avatar->GetName() : TEXT("nullptr"));
+		}
+		else
+		{
+			// 2. 兜底: 客户端查表 (但 GetAuthGameMode 在客户端为 nullptr, 几乎必然 nullptr)
+			Avatar = GetCharacterAvatarFromTable(CachedCharacterIDForIcon);
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Icon] RetryRefreshCharacterIcon: 缓存为空, 客户端查表失败 (预期), Avatar=%s"),
+				Avatar ? *Avatar->GetName() : TEXT("nullptr"));
+		}
 	}
+
+	BroadcastCharacterIconReady(CharIDToBroadcast, Avatar);
 	RefreshWeaponIconOnHUD();
 }
 
@@ -588,15 +753,10 @@ void ABaseCharacter::RetryRefreshCharacterIcon()
  *
  * 刷新武器图标到 HUD
  * 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
+ * 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播，替代直接 GameHUDWidget Push
  */
 void ABaseCharacter::RefreshWeaponIconOnHUD()
 {
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
-	if (!TryResolveHUDWidget(false) || !GameHUDWidget->GetWidget_WeaponPanel())
-	{
-		return;
-	}
-
 	// 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
 	FString WeaponID;
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
@@ -609,9 +769,16 @@ void ABaseCharacter::RefreshWeaponIconOnHUD()
 		}
 	}
 
-	if (!WeaponID.IsEmpty())
+	if (WeaponID.IsEmpty())
 	{
-		GameHUDWidget->UpdateWeaponIconFromID(WeaponID);
+		return;
+	}
+
+	// 【2026-07-01 重构 v2】: 通过 CharacterEvents 广播武器图标事件
+	// 由 GameHUDWidget 订阅并异步加载
+	if (CharacterEvents)
+	{
+		CharacterEvents->OnWeaponIconReady.Broadcast(WeaponID, nullptr);
 	}
 }
 
@@ -651,7 +818,9 @@ UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
  */
 void ABaseCharacter::RefreshACEWithRank()
 {
-	if (!IsLocallyControlled() || !GameHUDWidget)
+	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播 ACE + 排名颜色事件
+	// IsLocallyControlled 守卫: ACE 排名只对本机玩家有意义
+	if (!IsLocallyControlled() || !CharacterEvents)
 	{
 		return;
 	}
@@ -696,12 +865,8 @@ void ABaseCharacter::RefreshACEWithRank()
 		RankType = EACERankType::White;
 	}
 
-	// 7. 刷新 HUD（数字用 ACEValue，排名决定颜色）
-	// 【2026-06-15 重构】: 添加 HUD 就绪检查
-	if (TryResolveHUDWidget(false))
-	{
-		GameHUDWidget->UpdateACEWithRank(ACEValue, RankType);
-	}
+	// 7. 通过 CharacterEvents 广播 ACE + 排名颜色 (替代直接 GameHUDWidget Push)
+	CharacterEvents->OnACEWithRankChanged.Broadcast(ACEValue, RankType);
 }
 
 
@@ -724,46 +889,25 @@ bool ABaseCharacter::ConsumeEnergy(float Amount)
 		return false;
 	}
 
-	// 消耗能量后停止回复
+	// 消耗能量后打断回复 (有动作表示玩家活跃)
 	const bool bSuccess = EnergyComponent->Consume(Amount);
 	if (bSuccess)
 	{
-		StopRegeneration();
+		if (HealthRegenComponent)
+		{
+			HealthRegenComponent->NotifyDamageTaken();
+		}
 	}
 	return bSuccess;
 }
 
 
 // ==========================================
-// 9. 回复系统
+// 9. 回复系统 【2026-07-01 抽离】
 // ==========================================
-
-/**
- * StartRegeneration
- *
- * 开始回复（标记 bIsRegenerating=true）
- */
-void ABaseCharacter::StartRegeneration()
-{
-	if (!bIsRegenerating)
-	{
-		bIsRegenerating = true;
-	}
-}
-
-
-/**
- * StopRegeneration
- *
- * 停止回复（角色开始移动时调用）
- */
-void ABaseCharacter::StopRegeneration()
-{
-	if (bIsRegenerating)
-	{
-		bIsRegenerating = false;
-	}
-}
+// 注: 血量/能量回复已抽离到 UHealthRegenComponent (自治组件, 默认关闭)
+// 旧代码 (StartRegeneration/StopRegeneration) 已废弃, 字段和方法已删除
+// 访问请通过 HealthRegenComponent 组件
 
 
 // ==========================================
@@ -909,10 +1053,10 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
  */
 void ABaseCharacter::Move(const FInputActionValue& Value)
 {
-	// 死亡状态和暂停状态都不能移动
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	// 死亡状态不能移动
+	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead()) return;
-	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	FVector2D MovementVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
@@ -929,8 +1073,7 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 		AddMovementInput(ForwardDirection, MovementVector.Y);
 		AddMovementInput(RightDirection, MovementVector.X);
 
-		// 记录移动时间，用于回复系统
-		LastMoveTime = GetWorld()->GetTimeSeconds();
+		// 注: LastMoveTime 已抽离到 HealthRegenComponent, 通过速度检测自动维护
 	}
 }
 
@@ -942,10 +1085,10 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
  */
 void ABaseCharacter::Look(const FInputActionValue& Value)
 {
-	// 死亡状态和暂停状态都不能转动视角
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	// 死亡状态不能转动视角
+	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead()) return;
-	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	FVector2D LookAxisVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
@@ -972,10 +1115,10 @@ void ABaseCharacter::Look(const FInputActionValue& Value)
  */
 void ABaseCharacter::LightAttack_Pressed()
 {
-	// 死人、暂停状态、武器未装备都不能攻击
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	// 死人、武器未装备不能攻击
+	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead() || !CurrentWeapon) return;
-	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// 下蹲攻击权限拦截
 	// 如果你正蹲着，并且这把武器禁止下蹲攻击，直接 return，无视玩家按键
@@ -1058,10 +1201,10 @@ void ABaseCharacter::ExecuteComboSequence()
  */
 void ABaseCharacter::HeavyAttack()
 {
-	// 死人、武器未装备、暂停状态都不能重击
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	// 死人、武器未装备不能重击
+	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead() || !CurrentWeapon) return;
-	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// 【新增】: 重击同样需要检查下蹲权限
 	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
@@ -1080,10 +1223,10 @@ void ABaseCharacter::HeavyAttack()
  */
 void ABaseCharacter::UseSkill()
 {
-	// 死亡状态和暂停状态都不能释放技能
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
+	// 死亡状态不能释放技能
+	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead()) return;
-	if (UGameplayStatics::IsGamePaused(this)) return;
 
 	// TODO: 技能系统具体实现
 	// 这里可以扩展为技能槽系统，支持多个技能
@@ -1275,11 +1418,22 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 	UE_LOG(LogTemp, Warning, TEXT("[Health] 服务器扣血完成: Damage=%.1f, NewHealth=%.1f/%.1f, Dead=%d, Auth=%d"),
 		ActualApplied, GetCurrentHealth(), GetMaxHealth(), IsDead(), HasAuthority());
 
-	// 3. 判定生死
-	// 【2026-06-15 重构】: 改用 IsDead() 委托给 Component
+	// 3. 【2026-07-01 P0 新增】通知回血组件: 被打断了, 必须重新等 RegenerationDelay 才能回血
+	// 即使默认 HealthRegenRate=0, 仍调用一次以重置内部状态 (防止未来开启回血时残留计时)
+	if (HasAuthority() && HealthRegenComponent)
+	{
+		HealthRegenComponent->NotifyDamageTaken();
+	}
+
+	// 4. 判定生死
+	// 【2026-07-01 重构】: 死亡流程不再由 TakeDamage 主动调 Die() 触发
+	//   旧: TakeDamage → Die() → Multicast_Die  (依赖 TakeDamage 调用路径)
+	//   新: TakeDamage → HealthComponent::ApplyDamage → OnDeath.Broadcast
+	//       → BaseCharacter::OnHealthComponentDeath (BeginPlay 已订阅) → Die()
+	//   优势: 任何修改 HealthComponent 的路径都会触发, 不再依赖 TakeDamage
 	if (IsDead())
 	{
-		// 服务器处理击杀结算
+		// 服务器处理击杀结算 (仅在这里, 不在 Die() 内, 避免事件驱动路径重复触发)
 		if (HasAuthority())
 		{
 			// 获取击杀方式（从武器获取）
@@ -1323,7 +1477,9 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 			}
 		}
 
-		Die();
+		// 【移除 Die()】死亡流程已由 HealthComponent::OnDeath 事件驱动:
+		//   ApplyDamage 内部 OnDeath.Broadcast → OnHealthComponentDeath → Die()
+		//   客户端通过 OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal
 	}
 
 	return ActualDamage;
@@ -1339,9 +1495,17 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
  */
 void ABaseCharacter::Die()
 {
-	// 只有服务器能宣判死亡
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
-	if (!HasAuthority() || IsDead()) return;
+	// 【2026-07-01 P0 修复】原代码: if (!HasAuthority() || IsDead()) return;
+	//   修复原因: HealthComponent::ApplyDamage 已经把 bIsDead 设为 true (line 65)
+	//     TakeDamage 也已经做过 IsDead() 短路 (line 1353)
+	//     所以 Die() 内再次检查 IsDead() 必然短路 → Multicast_Die 永远不触发
+	//   新设计: 死亡入口唯一化 (HealthComponent::OnDeath 事件驱动, TakeDamage 主动调用)
+	//            IsDead() 只用于外部查询, 不用于内部短路
+	if (!HasAuthority()) return;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseCharacter][Die] 执行死亡流程: Pawn=%s, HasAuthority=%d"),
+		*GetName(), HasAuthority() ? 1 : 0);
 
 	// 告诉所有客户端: 这个人死了，准备看布娃娃
 	Multicast_Die();
@@ -1361,106 +1525,162 @@ void ABaseCharacter::Die()
 /**
  * Multicast_Die_Implementation
  *
- * NetMulticast 实现: 死亡动画在所有机器上播放
- * 1. 标记死亡状态
- * 2. 重置 AC/ACE（仅服务器）
- * 3. 武器掉落与销毁（延迟 1 秒）
- * 4. 启动溶解特效定时器
- * 5. 禁用移动、调整胶囊体碰撞
- * 6. 播放死亡动画 + 定时开启布娃娃
+ * NetMulticast 实现: 死亡流程在所有机器上执行
+ *
+ * 【2026-07-01 架构升级】本函数已被简化为客户端兜底通道
+ *   服务器流程: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() → Multicast_Die (兜底) → 服务器本地 ExecuteDeathLocal
+ *   客户端流程: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal()
+ *   本 RPC 同时作为:
+ *     1. 服务器死亡事件传播给客户端的主通道 (即便 bIsDead Replicated 延迟, 客户端也能立刻收到)
+ *     2. 服务器本地兜底 (防止服务器侧 OnHealthComponentDeath 事件未订阅时仍能进入死亡流程)
  */
 void ABaseCharacter::Multicast_Die_Implementation()
 {
-	// 【2026-06-15 重构】: bIsDead 字段已下沉到 HealthComponent
-	// 死亡状态由 Component 内部 ApplyDamage 触发 (TakeDamage → HealthComponent->ApplyDamage)
-	// 这里不再需要写 bIsDead
-
-	// 死亡时重置AC和ACE（HasAuthority确保只在服务器执行，避免重复复制冲突）
+	// 服务器专属: 重置 AC/ACE
 	if (HasAuthority())
 	{
 		ResetAC();
 	}
 
-	// ==========================================
-	// 【终极重构】: 武器掉落与销毁系统
-	// ==========================================
-	if (CurrentWeapon)
+	// 执行本地死亡流程 (幂等, CurrentWeapon 已被 nullptr 后再次进入会被 if 短路)
+	ExecuteDeathLocal();
+
+	// 复活定时器仅服务器需要
+	if (HasAuthority())
 	{
-		// 方案 A: 如果想让武器掉落在地上（推荐保留一段时间供拾取）
-		// 1. 彻底断开与死人手的骨骼绑定
-		CurrentWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-
-		// 2. 找到武器的模型组件，激活真实的物理模拟，让它当啷掉在地上
-		UMeshComponent* WeaponMesh = CurrentWeapon->FindComponentByClass<UMeshComponent>();
-		if (WeaponMesh)
+		if (AController* MyController = GetController())
 		{
-			// 开启碰撞，确保它能砸在地上而不是掉出世界
-			WeaponMesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
-			WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
-			// 开启物理重力
-			WeaponMesh->SetSimulatePhysics(true);
-		}
-
-		// 3. 【核心修复】: 延迟销毁武器
-		// 立即将 CurrentWeapon 置空，防止 OnRep 触发 Attach 逻辑
-		ABaseWeapon* WeaponToDestroy = CurrentWeapon;
-		CurrentWeapon = nullptr;
-
-		// 【关键时序】: 武器销毁延迟必须小于 RespawnDelaySeconds（默认 3.0 秒）
-		// 确保武器一定在角色重生前被清理，防止新武器还没生成就处理旧武器的 OnRep
-		// 【2026-06-15 修复】: 原为局部 FTimerHandle,会导致新一轮死亡时无法取消旧 timer,可能并发销毁
-		// 改为成员变量,EndPlay 或重复死亡时可主动 ClearTimer
-		GetWorldTimerManager().ClearTimer(WeaponDestroyTimerHandle);
-		GetWorldTimerManager().SetTimer(WeaponDestroyTimerHandle, [WeaponToDestroy]()
-		{
-			// 使用 IsValid 检查对象是否有效（避免调用已销毁的对象）
-			if (IsValid(WeaponToDestroy))
+			if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(MyController))
 			{
-				WeaponToDestroy->Destroy();
+				PC->StartRespawnTimer(RespawnDelaySeconds);
 			}
-		}, 1.0f, false);
+		}
 	}
+}
 
-	// 溶解特效由 DissolveComponent 自治（订阅 HealthComponent->OnDeath 事件自动触发）
-	// 【2026-06-15 重构】: 原手动 SetTimer 启动溶解已迁移到 DissolveComponent::OnOwnerDeath
 
-	// 1. 禁用移动（禁止角色操作移动，但不能禁用 Controller 输入）
-	// 【核心修复】: 绝对不能调用 PC->DisableInput()
-	// ESC/Tab 是 PlayerController 级别的 Enhanced Input 回调，不是 Character 级别
-	// 调用 DisableInput 会导致玩家死亡后无法呼出 ESC 菜单和计分板
-	GetCharacterMovement()->DisableMovement();
-
-	// 2. 核心防穿模: 让胶囊体变透明，不阻挡别人走路，也不阻挡摄像机
-	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
-	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
-
-	// 3. 播放死亡动画
-	float AnimDuration = 0.1f;
-	if (DeathMontage)
+/**
+ * DropAndFadeWeapon
+ *
+ * 【大厂 P0 修复】武器死亡处理
+ *
+ * 旧实现的 3 个 bug:
+ *   1. 服务器和客户端都调度 1 秒后 Destroy 同一把武器 (服务器先 Destroy, 客户端 timer 1 秒后 IsValid=false → 静默 no-op, 但语义混乱)
+ *   2. 1 秒延迟太短, 玩家根本看不到武器掉地的物理动画
+ *   3. 武器的溶解特效永远不生效, 因为 DissolveComponent::GetOwnerWeaponMesh() 在已 Detach 的 Owner 上用 FindComponentByClass 找不到
+ *
+ * 新实现:
+ *   - 服务器: SetLifeSpan(3.0f) - 让 UE 在 3 秒后自动销毁, 单一权威
+ *   - 所有机器: 立刻给武器 Mesh 启物理 + 取消 Attach + 通知 DissolveComponent 溶解武器材质
+ *   - 溶解组件不再依赖 Owner 查找武器, 而是由死亡流程主动传入武器引用
+ */
+void ABaseCharacter::DropAndFadeWeapon(ABaseWeapon* Weapon)
+{
+	if (!IsValid(Weapon))
 	{
-		AnimDuration = PlayAnimMontage(DeathMontage);
+		return;
 	}
 
-	// 4. 定时开启布娃娃 (比如动画总长的 70% 处开启，顺带解决插地问题)
-	float TimeToRagdoll = AnimDuration > 0.1f ? (AnimDuration * 0.7f) : 0.1f;
-	GetWorldTimerManager().SetTimer(RagdollTimerHandle, this, &ABaseCharacter::EnableRagdoll, TimeToRagdoll, false);
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] DropAndFadeWeapon: %s (Auth=%d)"),
+		*Weapon->GetName(), HasAuthority() ? 1 : 0);
+
+	// 1. 取消武器与角色的骨骼绑定
+	//    KeepWorldTransform: 武器保持在世界中的当前位置, 不会跳到原点
+	Weapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+	// 2. 激活武器 Mesh 物理模拟 + 碰撞, 让它掉地上
+	UMeshComponent* WeaponMesh = Weapon->FindComponentByClass<UMeshComponent>();
+	if (WeaponMesh)
+	{
+		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+		WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
+		WeaponMesh->SetSimulatePhysics(true);
+		WeaponMesh->WakeAllRigidBodies();
+		WeaponMesh->SetEnableGravity(true);
+	}
+
+	// 3. 【P0 修复】武器溶解 - 不依赖 Owner 查找, 直接传入武器 Mesh
+	//    旧代码 DissolveComponent::GetOwnerWeaponMesh 用 FindComponentByClass<UMeshComponent> 在 Char 上找,
+	//    但武器 Detach 后已不在 Char 的子组件里 → 永远找不到 → 武器**永不溶解**
+	if (DissolveComponent && WeaponMesh)
+	{
+		DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh);
+	}
+
+	// 4. 【P0 修复】统一销毁授权 - 仅服务器调用 SetLifeSpan
+	//    客户端通过 Actor 的 OnDestroyed 自动同步移除, 不需要客户端各自销毁
+	//    这解决了"服务器销毁后, 客户端的 1 秒 timer 还在跑"的不一致问题
+	if (HasAuthority())
+	{
+		Weapon->SetLifeSpan(WeaponDestroyDelaySeconds);
+	}
 }
 
 /**
  * EnableRagdoll
  *
- * 启用布娃娃物理
- * 1. 打断所有还在播的动画
- * 2. 将控制权完全交给物理资产
+ * 启用布娃娃物理（UE 标准 5 步）
+ *
+ * 之前的 bug: 仅有 StopAnimMontage + SetCollisionProfileName + SetSimulatePhysics,
+ *   缺了 3 个关键步骤, 物理模拟被 CharacterMovement 强制覆盖, Mesh 不会真的倒下
+ *
+ * UE 官方标准流程:
+ *   1. 打断所有动画 (避免动画蒙太奇继续驱动骨骼, 与物理冲突)
+ *   2. 禁用 CharacterMovement (MOVE_None, 让 Movement Component 不再强制控制 Mesh)
+ *   3. 设置 Mesh 碰撞为 Ragdoll profile (项目设置里要预定义)
+ *   4. SetAllBodiesSimulatePhysics(true) + bBlendPhysics=true (关键: 让 Mesh 的 root 与胶囊体解耦)
+ *   5. WakeAllRigidBodies() (强制所有物理骨骼激活, 否则可能因 sleep 而不响应)
+ *
+ * @note 物理资产 PhysicsAsset 必须在 BP/资产侧配置正确, 否则骨骼没有碰撞体
+ * @note 调用前必须确保胶囊体碰撞已设为 Ignore Pawn (Multicast_Die 已做)
  */
 void ABaseCharacter::EnableRagdoll()
 {
-	// 1. 打断所有还在播的动画
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (!MeshComp)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] EnableRagdoll: GetMesh() 为空, 无法启用布娃娃"));
+		return;
+	}
+
+	// 1. 打断所有还在播的动画 (蒙太奇会与物理模拟冲突, 必须停掉)
 	StopAnimMontage();
 
-	// 2. 将控制权完全交给物理资产
-	GetMesh()->SetCollisionProfileName(TEXT("Ragdoll"));
-	GetMesh()->SetSimulatePhysics(true);
+	// 2. 【P0 修复】禁用 CharacterMovement
+	// 原因: 角色死亡后 Movement Component 仍在每帧强制 Mesh 跟随 Capsule 移动,
+	//       这会**完全覆盖** Mesh 的物理模拟结果, 导致 Mesh 像被钉在 Capsule 上一样不倒下
+	//       这是"布娃娃不倒下"bug 的**根因**
+	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
+	{
+		MoveComp->StopMovementImmediately();        // 立即清零所有速度
+		MoveComp->DisableMovement();                 // 禁用所有移动模式
+		MoveComp->SetComponentTickEnabled(false);    // 关闭 Movement 的 Tick, 彻底不再干预 Mesh
+	}
+
+	// 3. 碰撞 Profile 切换到 Ragdoll (项目设置里要预定义 "Ragdoll" profile)
+	MeshComp->SetCollisionProfileName(TEXT("Ragdoll"));
+
+	// 4. 【P0 修复】bBlendPhysics = true
+	// 原因: 当 bBlendPhysics 为 false 时, UE 仍然把 Mesh 视作"由动画驱动", 物理只是辅助
+	//       必须设为 true 才能让物理完全接管 Mesh 骨骼链
+	//       这是 UE Ragdoll 官方教程明确要求的**关键标志**
+	MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	MeshComp->SetAllBodiesSimulatePhysics(true);
+	MeshComp->bBlendPhysics = true;
+
+	// 5. 【P0 修复】唤醒所有刚体
+	// 原因: 物理骨骼初始可能处于 Sleep 状态, 不会响应重力
+	//       强制唤醒确保重力立即作用于所有骨骼
+	MeshComp->WakeAllRigidBodies();
+
+	// 6. 【关键】Mesh 不再跟随 Capsule (因为 Movement 已关, 但显式声明避免边缘情况)
+	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] EnableRagdoll: 已启用布娃娃 (Mesh=%s, PhysicsAsset=%s)"),
+		*MeshComp->GetName(),
+		*GetNameSafe(MeshComp->GetPhysicsAsset()));
 }
 
 
@@ -1472,13 +1692,13 @@ void ABaseCharacter::EnableRagdoll()
  * StartCrouch
  *
  * 实现下蹲函数
- * 只有没死、没暂停的时候才能蹲
+ * 只有没死的时候才能蹲
+ * 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+ * 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
  */
 void ABaseCharacter::StartCrouch()
 {
-	// 只有没死、没暂停的时候才能蹲
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
-	if (!IsDead() && !UGameplayStatics::IsGamePaused(this))
+	if (!IsDead())
 	{
 		Crouch(); // 调用 UE ACharacter 自带的神级下蹲函数
 	}
@@ -1490,11 +1710,12 @@ void ABaseCharacter::StartCrouch()
  *
  * 解除下蹲
  * 自带起立函数（它会自动检测头顶有没有障碍物，有的话会保持蹲着）
+ * 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
+ * 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
  */
 void ABaseCharacter::StopCrouch()
 {
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
-	if (!IsDead() && !UGameplayStatics::IsGamePaused(this))
+	if (!IsDead())
 	{
 		UnCrouch(); // 调用自带的起立函数 (它会自动检测头顶有没有障碍物，有的话会保持蹲着)
 	}
@@ -1551,6 +1772,14 @@ void ABaseCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightA
 void ABaseCharacter::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
+
+	// 【2026-07-01 P0 新增】重生时重置回血状态
+	// PossessedBy 在角色出生和复活时触发, 此时需要重置 LastMoveTime 和 bIsRegenerating
+	// 防止旧角色残留状态影响新角色
+	if (HealthRegenComponent)
+	{
+		HealthRegenComponent->ResetRegenerationState();
+	}
 
 	// 通过 PlayerController 获取 HUD 实例并缓存
 	if (APlayerController* PC = Cast<APlayerController>(NewController))
@@ -1621,26 +1850,71 @@ void ABaseCharacter::PossessedBy(AController* NewController)
  * RetryRefreshHUD
  *
  * HUD 延迟刷新重试
+ *
+ * 【P0 修复】: 加最大重试次数 + 防御性检查, 防止死循环刷屏
+ *
+ * 根因 (2026-06-29):
+ *   - 旧实现: HUD 拿不到 → 调度下一次重试 → 永远拿不到 → 永远调度 → 日志洪水
+ *   - 触发场景: 玩家 ClientTravel 到战斗地图, AMyGameHUD 未及时初始化,
+ *     RetryRefreshHUD 进入死循环, 每 0.5 秒打一行 Warning 日志
+ *
+ * 设计原则:
+ *   1. 最大重试 20 次 (10 秒后停止), 避免无限制循环
+ *   2. 失败后降级为 Log 等级, 不再 Warning 刷屏
+ *   3. EndPlay 中已 ClearTimer, 但若 Character 没销毁就走到这里, 加 IsValid 防御
  */
 void ABaseCharacter::RetryRefreshHUD()
 {
+	// ==========================================
+	// 【P0 防御 1】: Character 或 World 已销毁 → 停止重试
+	// 设计理由: 玩家可能已经退出战斗场景, BaseCharacter 处于 PendingKill 状态,
+	//          此时重试无意义, 必须立即停止
+	// ==========================================
+	if (!IsValid(this) || !GetWorld())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] RetryRefreshHUD: Character/World 已失效, 停止重试"));
+		return;
+	}
+
+	// ==========================================
+	// 【P0 防御 2】: 最大重试次数限制
+	// 设计理由: 防止 HUD 永远拿不到时无限循环刷屏 (每 0.5 秒一行日志)
+	//          20 次 = 10 秒, 足够 HUD 完成异步初始化
+	// ==========================================
+	const int32 MaxRetries = 20;
+	CurrentHUDRetryCount++;
+	if (CurrentHUDRetryCount >= MaxRetries)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] RetryRefreshHUD 达到最大重试次数 (%d 次), 放弃. HUD 永远不可用, 请检查 MyGameHUD::InitGameHUDWidget 时序"),
+			CurrentHUDRetryCount);
+		// 重置计数器, 防止下次又从这里开始累计
+		CurrentHUDRetryCount = 0;
+		// 显式 ClearTimer 防止 SetTimer 残留
+		GetWorld()->GetTimerManager().ClearTimer(HUDRefreshTimerHandle);
+		return;
+	}
+
 	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
 	if (!TryResolveHUDWidget())
 	{
-		// HUD 仍未就绪，继续延迟重试
-		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败，再次重试"));
+		// HUD 仍未就绪，继续延迟重试 (降级为 Log, 避免日志洪水)
+		UE_LOG(LogTemp, Verbose, TEXT("[BaseCharacter] HUD 重试刷新中... (%d/%d)"), CurrentHUDRetryCount, MaxRetries);
 		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
 		return;
 	}
 
 	if (!GameHUDWidget->GetWidget_PlayerStatus())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] HUD 重试刷新仍然失败，再次重试"));
+		// Widget_PlayerStatus BindWidget 仍未完成, 继续重试 (降级为 Log)
+		UE_LOG(LogTemp, Verbose, TEXT("[BaseCharacter] Widget_PlayerStatus 未就绪, 重试中... (%d/%d)"), CurrentHUDRetryCount, MaxRetries);
 		GetWorld()->GetTimerManager().SetTimer(HUDRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshHUD, 0.5f, false);
 		return;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] HUD 刷新成功"));
+	// 成功 → 重置计数器
+	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] HUD 刷新成功 (重试 %d 次后)"), CurrentHUDRetryCount);
+	CurrentHUDRetryCount = 0;
 	// 【2026-06-15 重构】: 全量刷新
 	RefreshHUDFromCurrentState();
 	RefreshACEWithRank();
@@ -2115,11 +2389,11 @@ void ABaseCharacter::PlayFootstepSound(FVector Location)
 
 
 // ==========================================
-// 【2026-06-15 新增】UI Bridge 区段
+// 【2026-06-15 新增，2026-07-01 重构 v2】UI Bridge 区段
 // 作用: 集中所有跨层访问 (Core/Characters → UI/Game/Systems)
-// 历史: 修复前 50+ 处散落访问, 修改需要改 50+ 个地方
-// 现状: 集中在 2 个 helper 函数中
-// 待优化: 长期应改为 UI 订阅 HealthComponent 事件 (依赖倒置)
+// 历史: 修复前 50+ 处散落访问
+// 现状 (2026-07-01): 大部分改用 CharacterEvents 事件广播, 仅保留重试逻辑使用 GameHUDWidget
+// 说明: TryResolveHUDWidget / RefreshHUDFromCurrentState 仅供内部重试使用
 // ==========================================
 
 /**
@@ -2216,4 +2490,97 @@ void ABaseCharacter::RefreshHUDFromCurrentState()
 	// AC / ACE
 	GameHUDWidget->UpdateACValue(ACValue);
 	GameHUDWidget->UpdateACEValue(ACEValue);
+}
+
+
+// ==========================================
+// 4. 事件广播方法 (2026-07-01 新增)
+// 替代直接 GameHUDWidget Push, 实现依赖倒置
+// ==========================================
+
+/**
+ * BroadcastCharacterIconReady
+ *
+ * 广播角色头像加载完毕事件
+ * 调用链: Client_RefreshCharacterIcon_Implementation → BroadcastCharacterIconReady
+ */
+void ABaseCharacter::BroadcastCharacterIconReady(const FString& CharID, UTexture2D* Icon)
+{
+	if (!CharacterEvents)
+	{
+		return;
+	}
+
+	// 【2026-07-01 P0 修复】"事件 + 缓存"双轨制
+	// 先写缓存, 再 Broadcast, 保证订阅者订阅时能从缓存拿到最新值
+	CharacterEvents->SetCachedCharacterIcon(CharID, Icon);
+	CharacterEvents->OnCharacterIconReady.Broadcast(CharID, Icon);
+}
+
+
+/**
+ * BroadcastACValueChanged
+ *
+ * 广播 AC 防护服值变化事件
+ * 调用链: OnRep_ACValue → BroadcastACValueChanged
+ */
+void ABaseCharacter::BroadcastACValueChanged(int32 NewAC)
+{
+	if (!CharacterEvents)
+	{
+		return;
+	}
+
+	// 【2026-07-01 P0 修复】事件 + 缓存双轨
+	CharacterEvents->SetCachedACValue(NewAC);
+	CharacterEvents->OnACValueChanged.Broadcast(NewAC);
+}
+
+
+/**
+ * BroadcastACEWithRankChanged
+ *
+ * 广播 ACE 击杀数 + 排名颜色变化事件
+ * 调用链: RefreshACEWithRank → BroadcastACEWithRankChanged
+ */
+void ABaseCharacter::BroadcastACEWithRankChanged(int32 NewACE, EACERankType RankType)
+{
+	if (!CharacterEvents)
+	{
+		return;
+	}
+
+	// 【2026-07-01 P0 修复】事件 + 缓存双轨
+	CharacterEvents->SetCachedACEState(NewACE, RankType);
+	CharacterEvents->OnACEWithRankChanged.Broadcast(NewACE, RankType);
+}
+
+
+/**
+ * BroadcastWeaponIconReady
+ *
+ * 广播武器图标加载完毕事件
+ * 调用链: RefreshWeaponIconOnHUD → BroadcastWeaponIconReady
+ */
+void ABaseCharacter::BroadcastWeaponIconReady(const FString& WeaponID, UTexture2D* Icon)
+{
+	if (!CharacterEvents)
+	{
+		return;
+	}
+	CharacterEvents->OnWeaponIconReady.Broadcast(WeaponID, Icon);
+}
+
+
+// ==========================================
+// 【P0】WithValidation 验证实现 - 防止客户端伪造攻击参数
+// ==========================================
+
+/**
+ * Server_PlayAttackAnim_Validate
+ * 校验: 连击序号在合法范围 (0~10 涵盖连击表), bIsHeavy 是 bool
+ */
+bool ABaseCharacter::Server_PlayAttackAnim_Validate(bool bIsHeavy, int32 InComboIndex)
+{
+	return InComboIndex >= 0 && InComboIndex <= 10;
 }

@@ -9,6 +9,8 @@
 #include "CoreMinimal.h"
 // 包含用户控件基类，所有 UI 蓝图的 C++ 父类必须包含此文件
 #include "Blueprint/UserWidget.h"
+// 【架构升级】引入 IViewModel 接口, 实现 View 完全无感知数据源
+#include "UI/Framework/IViewModel.h"
 // 自动生成的反射头文件，必须放在最后一个包含
 #include "LoginPage.generated.h"
 
@@ -17,6 +19,7 @@ class UEditableTextBox;
 class UButton;
 class UTextBlock;
 class UOverlay;
+class UAccountService; // 【架构升级】账号业务门面（替代直接依赖 UAccountSubsystem）
 
 /**
  * @class ULoginPage
@@ -24,33 +27,33 @@ class UOverlay;
  *
  * 职责说明:
  * - 提供账号/密码输入与登录/注册按钮
- * - 调用 UAccountSubsystem 验证账号
- * - 登录成功后切换至 EMatchState::MainLobby 状态，并跳转主菜单
+ * - 调用 UAccountService 验证账号（不直接读 UAccountSubsystem）
+ * - 登录成功后通过 UGameFlowSubsystem 切到 EMatchState::MainMenu
  * - 提供"退出游戏"按钮
  *
  * 架构理念:
- * 1. UI 解耦: 通过类引用（TSubclassOf）动态创建主菜单
- * 2. 全局唯一: 通过 GameInstance->GetSubsystem 获取账号子系统
- * 3. 工业级防呆: 双开同账号互踢检测
+ * 1. View 完全无感知数据源: 只调 UAccountService, 不直接读 UAccountSubsystem
+ * 2. 全局唯一: 通过 GameInstance->GetSubsystem 获取 Service
+ * 3. 工业级防呆: 双开同账号互踢检测（由 UAccountService 内部完成）
  * 4. 状态机驱动: 登录成功后通知 GameFlowSubsystem 切状态
  */
 UCLASS()
 class METALSLUG01_API ULoginPage : public UUserWidget
 {
-	GENERATED_BODY()
+    GENERATED_BODY()
 
 public:
-	// ==========================================
-	// 蓝图可配置
-	// ==========================================
+    // ==========================================
+    // 【架构升级】View 标准接口
+    // ==========================================
 
-	/**
-	 * 主菜单页面类
-	 * 用途: 在编辑器中选择 WBP_GameMenu 蓝图类
-	 * 登录成功后动态创建并显示此页面
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
-	TSubclassOf<class UUserWidget> GameMenuClass;
+    /**
+     * IView 接口: View 绑定 ViewModel 后由 UIViewService 调用
+     * 此处我们没有强制的 ViewModel（账号数据简单），但保留 OnViewShown 接口
+     * 便于未来扩展为完整的 MVVM
+     */
+    UFUNCTION(BlueprintCallable, Category = "LoginPage")
+    void OnViewShown();
 
 protected:
 	// ==========================================

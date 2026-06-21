@@ -63,7 +63,7 @@ float UHealthComponent::ApplyDamage(float DamageAmount)
 	if (CurrentHealth <= 0.0f && !bIsDead)
 	{
 		bIsDead = true;
-		UE_LOG(LogCombat, Verbose, TEXT("[HealthComponent] 死亡: Owner=%s"), *GetOwner()->GetName());
+		UE_LOG(LogCombat, Warning, TEXT("[HealthComponent] 服务器触发 OnDeath: Owner=%s"), *GetOwner()->GetName());
 		OnDeath.Broadcast();
 	}
 
@@ -94,4 +94,17 @@ void UHealthComponent::OnRep_CurrentHealth()
 	// 服务器端的 OnRep_CurrentHealth 不会被调用,所以服务器必须主动 Broadcast
 	// (见 ApplyDamage 中)
 	OnHealthChanged.Broadcast(CurrentHealth);
+}
+
+
+void UHealthComponent::OnRep_bIsDead()
+{
+	// 【2026-07-01 P0 新增】客户端收到 bIsDead=true 时,触发 OnDeath 事件
+	// 这样客户端无需依赖 Multicast_Die RPC 也能进入死亡流程
+	//
+	// 服务器端在 ApplyDamage 已经触发过 OnDeath.Broadcast (不会重复触发)
+	// OnRep_bIsDead 仅在客户端被调用 → 保证 OnDeath 在每台机器上恰好触发一次
+	UE_LOG(LogCombat, Warning, TEXT("[HealthComponent] OnRep_bIsDead: 客户端收到死亡状态 (Owner=%s)"),
+		*GetNameSafe(GetOwner()));
+	OnDeath.Broadcast();
 }
