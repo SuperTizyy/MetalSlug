@@ -167,11 +167,6 @@ private:
 	TMap<FString, FAccountRecord> AccountData;
 
 	/**
-	 * 物理硬盘上 .sav 存档文件的名称
-	 */
-	const FString SaveSlotName = TEXT("LocalAccountDataSlot");
-
-	/**
 	 * 私有底层工具: 从硬盘上的 .sav 文件中读取数据，并填充到内存的 AccountData 中
 	 */
 	void LoadDataFromDisk();
@@ -185,4 +180,13 @@ private:
 	 * 记录当前这个游戏窗口登录的账号名
 	 */
 	FString CurrentLoggedInUser;
+
+	/**
+	 * 计算当前客户端窗口对应的存档槽名
+	 * 核心: 用 GameInstance 的索引拼接在槽名后，实现多窗口独立存档
+	 *       Client 1 → LocalAccountDataSlot_0.sav
+	 *       Client 2 → LocalAccountDataSlot_1.sav
+	 * @return 带窗口后缀的存档槽名
+	 */
+	FString GetSaveSlotName() const;
 };

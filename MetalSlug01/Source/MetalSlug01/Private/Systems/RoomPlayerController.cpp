@@ -3,8 +3,11 @@
 // ==========================================
 // 头文件包含区
 // ==========================================
-// 引入本控制器头文件
+// 【UE规范】本控制器头文件必须第一个引入
 #include "Systems/RoomPlayerController.h"
+
+// 引入账号在线状态权威表（RoomPlayerController.h 只有前向声明，此处需要完整定义）
+#include "Systems/Room/AccountRoomAuthority.h"
 
 // 引入角色基类（用于 Spawn 相关操作）
 #include "Characters/BaseCharacter.h"
@@ -29,7 +32,6 @@
 
 // 引入房间 GameMode（用于调用房间管理接口）
 #include "Systems/RoomGameMode.h"
-#include "Systems/Room/AccountRoomAuthority.h"
 
 // 引入房间 GameState（用于查询比赛信息）
 #include "Systems/RoomGameState.h"
@@ -1164,6 +1166,10 @@ void ARoomPlayerController::Server_NotifyAccountLogin_Implementation(const FStri
 	// 调用权威表的核心入口(里面会发 Client_LoginResult)
 	AccountAuthority->HandleLoginRequest(Username, SessionId, this);
 
+	// 每次有玩家登录后，同步账号列表到 SessionSettings 并广播
+	// 注意: HandleLoginRequest 内部已处理完同号冲突，这里只负责同步列表
+	SyncRoomAccountsToSession();
+
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Cyan,
@@ -1196,6 +1202,9 @@ void ARoomPlayerController::Server_NotifyAccountLogout_Implementation(const FStr
 	if (AccountAuthority.IsValid())
 	{
 		AccountAuthority->HandleLogoutRequest(Username, SessionId);
+
+		// 每次有玩家下线后，同步账号列表到 SessionSettings 并广播
+		SyncRoomAccountsToSession();
 	}
 }
 
@@ -1240,6 +1249,49 @@ void ARoomPlayerController::Client_ReceiveIsAccountOnline_Implementation(const F
 
 
 /**
+ * SyncRoomAccountsToSession
+ *
+ * 房主端专用: 将 AccountRoomAuthority 中的所有在线账号列表同步到 SessionSettings
+ * 并调用 UpdateSession 广播到局域网，供其他客户端在加入前查询
+ *
+ * 写入流程:
+ * 1. 从 AccountSubsystem 获取 HOST_ACCOUNT（房主自己的账号）
+ * 2. 从 AccountRoomAuthority 获取所有已登录玩家的账号
+ * 3. 合并后写入 ROOM_ACCOUNTS（HOST_ACCOUNT 在第一位）
+ * 4. 调用 UpdateSession 推送更新
+ *
+ * 调用场景:
+ * - Server_NotifyAccountLogin_Implementation (玩家加入时)
+ * - Server_NotifyAccountLogout_Implementation (玩家离开时)
+ * - EndPlay (PC 销毁时的兜底清理)
+ */
+void ARoomPlayerController::SyncRoomAccountsToSession()
+{
+	if (!HasAuthority() || !AccountAuthority.IsValid())
+	{
+		return;
+	}
+
+	// 从 AccountSubsystem 获取房主自己的账号名
+	FString HostAccountName = TEXT("");
+	if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
+	{
+		HostAccountName = AccountSub->GetCurrentLoggedInUser();
+	}
+
+	// 获取在线子系统接口
+	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	if (!OnlineSub || !OnlineSub->GetSessionInterface().IsValid())
+	{
+		return;
+	}
+
+	// 委托给 AccountRoomAuthority 完成实际的 Session 同步
+	AccountAuthority->SyncAccountsToSessionSettings(OnlineSub->GetSessionInterface(), HostAccountName);
+}
+
+
+/**
  * Client_LoginResult_Implementation
  *
  * 客户端: 收到房主回包
@@ -1253,7 +1305,7 @@ void ARoomPlayerController::Client_LoginResult_Implementation(bool bSuccess, con
 	if (bReject)
 	{
 		// 调 BP 可调函数, 内部会找到当前 LoginPage 并弹框
-		HandleForcedKickNotification(Reason);
+		HandleForcedKickNotification();
 		return;
 	}
 
@@ -1334,7 +1386,7 @@ void ARoomPlayerController::SendHeartbeat()
  *       LoginPage 的 [确认] 按钮回登录页(也不退出账号)
  *       想退出账号 → 用户自己点 GameMenuPage 的 Btn_BackToLogin
  */
-void ARoomPlayerController::HandleForcedKickNotification(const FString& Reason)
+void ARoomPlayerController::HandleForcedKickNotification()
 {
 	// ==========================================
 	// 1. 优先找 LANRoomPage (玩家在大厅/选房时被拒的场景)
@@ -1344,9 +1396,7 @@ void ARoomPlayerController::HandleForcedKickNotification(const FString& Reason)
 		UFunction* ShowFunc = LANPageWidget->FindFunction(TEXT("ShowLANRoomConflictDialog"));
 		if (ShowFunc)
 		{
-			struct { FString Reason; } Params;
-			Params.Reason = Reason;
-			LANPageWidget->ProcessEvent(ShowFunc, &Params);
+			LANPageWidget->ProcessEvent(ShowFunc, nullptr);
 
 			if (GEngine)
 			{
@@ -1455,6 +1505,9 @@ void ARoomPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	if (HasAuthority() && AccountAuthority.IsValid())
 	{
 		AccountAuthority->HandleControllerDestroyed(this);
+
+		// 房主下线后，同步账号列表更新（只含 HOST_ACCOUNT，无其他在线玩家）
+		SyncRoomAccountsToSession();
 	}
 
 	Super::EndPlay(EndPlayReason);

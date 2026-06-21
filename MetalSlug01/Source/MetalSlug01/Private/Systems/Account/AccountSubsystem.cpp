@@ -194,10 +194,10 @@ bool UAccountSubsystem::TryRegister(const FString& Username, const FString& Pass
 void UAccountSubsystem::LoadDataFromDisk()
 {
 	// 向操作系统询问，硬盘的指定路径下有没有我们的存档文件
-	if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, 0))
+	if (UGameplayStatics::DoesSaveGameExist(GetSaveSlotName(), 0))
 	{
 		// 如果有文件，就把它读出来，并强制转换为我们的顺丰纸箱类型（UAccountSaveGame）
-		UAccountSaveGame* LoadedGame = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0));
+		UAccountSaveGame* LoadedGame = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(GetSaveSlotName(), 0));
 
 		// 确保纸箱没破（读取成功）
 		if (LoadedGame)
@@ -224,10 +224,10 @@ void UAccountSubsystem::SaveDataToDisk()
 	UAccountSaveGame* SaveGameInstance = nullptr;
 
 	// 先尝试找一下以前有没有用过的旧纸箱（避免覆盖掉里面可能存在的其他数据）
-	if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, 0))
+	if (UGameplayStatics::DoesSaveGameExist(GetSaveSlotName(), 0))
 	{
 		// 找到旧纸箱，拿过来用
-		SaveGameInstance = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0));
+		SaveGameInstance = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(GetSaveSlotName(), 0));
 	}
 	else
 	{
@@ -242,7 +242,7 @@ void UAccountSubsystem::SaveDataToDisk()
 		SaveGameInstance->AccountRecords = this->AccountData;
 
 		// 呼叫引擎底层快递员，把这个纸箱物理写入到电脑硬盘里!
-		UGameplayStatics::SaveGameToSlot(SaveGameInstance, SaveSlotName, 0);
+		UGameplayStatics::SaveGameToSlot(SaveGameInstance, GetSaveSlotName(), 0);
 	}
 }
 
@@ -378,4 +378,22 @@ void UAccountSubsystem::MockLoginForTesting()
 const FAccountRecord* UAccountSubsystem::GetAccountRecord(const FString& AccountName) const
 {
 	return AccountData.Find(AccountName);
+}
+
+
+/**
+ * GetSaveSlotName
+ *
+ * 计算当前客户端窗口对应的存档槽名
+ * 用 GameInstance 的索引区分不同窗口，实现多窗口独立存档
+ * PIE 多开: GI->GetIndex() 返回 0, 1, 2...
+ * 打包多开: 每个独立进程各自从 0 开始
+ */
+FString UAccountSubsystem::GetSaveSlotName() const
+{
+	UWorld* World = GetWorld();
+	const int32 UniqueId = (World && World->GetFirstPlayerController())
+		? World->GetFirstPlayerController()->GetUniqueID()
+		: 0;
+	return FString::Printf(TEXT("LocalAccountDataSlot_%d"), UniqueId);
 }

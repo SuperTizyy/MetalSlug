@@ -291,20 +291,61 @@ void ULANRoomPage::OnEnterRoomClicked()
 		}
 	}
 
-	// 3. 找到目标房间后，调用底层接口加入它
-	if (TargetRoomResult)
+	// 3. 获取当前登录账号
+	FString MyAccountName = TEXT("");
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
-		if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
 		{
-
-			// 绑定加入完成的回调
-			JoinSessionCompleteDelegateHandle = OnlineSub->GetSessionInterface()->AddOnJoinSessionCompleteDelegate_Handle(
-				FOnJoinSessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnJoinSessionComplete));
-
-			// 执行真正的加入指令
-			OnlineSub->GetSessionInterface()->JoinSession(0, NAME_GameSession, *TargetRoomResult);
+			MyAccountName = AccountSub->GetCurrentLoggedInUser();
 		}
+	}
+
+	// 4. 查目标房间的 HOST_ACCOUNT + ROOM_ACCOUNTS，逐一与当前账号比对
+	//    ROOM_ACCOUNTS 由房主端在每次玩家登录/登出时通过 UpdateSession 广播
+	//    包含: [HOST_ACCOUNT, 玩家1, 玩家2, ...]
+	if (TargetRoomResult && !MyAccountName.IsEmpty())
+	{
+		// 4a. 先查 HOST_ACCOUNT（房主账号）
+		FString TargetHostAccount = TEXT("");
+		TargetRoomResult->Session.SessionSettings.Get(FName("HOST_ACCOUNT"), TargetHostAccount);
+
+		if (!TargetHostAccount.IsEmpty() &&
+			TargetHostAccount.Equals(MyAccountName, ESearchCase::IgnoreCase))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] 同账号 [%s] 创建的房间，禁止加入"), *CurrentSelectedRoomName);
+			ShowLANRoomConflictDialog();
+			return;
+		}
+
+		// 4b. 再查 ROOM_ACCOUNTS（所有已在房间内的玩家账号，已序列化为管道符分隔字符串）
+		FString RoomAccountsStr;
+		TargetRoomResult->Session.SessionSettings.Get(FName("ROOM_ACCOUNTS"), RoomAccountsStr);
+
+		TArray<FString> RoomAccounts;
+		RoomAccountsStr.ParseIntoArray(RoomAccounts, TEXT("|"), true);
+
+		for (const FString& RoomAccount : RoomAccounts)
+		{
+			if (RoomAccount.Equals(MyAccountName, ESearchCase::IgnoreCase))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[LANRoomPage] 当前账号 [%s] 已在房间中，禁止重复加入"), *MyAccountName);
+				ShowLANRoomConflictDialog();
+				return;
+			}
+		}
+	}
+
+	// 5. 所有检查通过 → 正常加入房间
+	IOnlineSubsystem* OnlineSub = IOnlineSubsystem::Get();
+	if (OnlineSub && OnlineSub->GetSessionInterface().IsValid())
+	{
+		// 绑定加入完成的回调
+		JoinSessionCompleteDelegateHandle = OnlineSub->GetSessionInterface()->AddOnJoinSessionCompleteDelegate_Handle(
+			FOnJoinSessionCompleteDelegate::CreateUObject(this, &ULANRoomPage::OnJoinSessionComplete));
+
+		// 执行真正的加入指令
+		OnlineSub->GetSessionInterface()->JoinSession(0, NAME_GameSession, *TargetRoomResult);
 	}
 }
 
@@ -640,32 +681,18 @@ void ULANRoomPage::OnConfirmCreateRoomClicked()
 	}
 
 	// ==========================================
-	// 2. 【核心新增】真实重名校验: 检查房间名是否已被占用
-	// ==========================================
-	// CurrentDisplayedRooms 是我们通过 3秒定时器 实时从局域网搜回来的真实房间名列表
-	if (CurrentDisplayedRooms.Contains(PendingRoomName))
-	{
-		if (Text_CreateRoomHint)
-		{
-			Text_CreateRoomHint->SetText(FText::FromString(TEXT("该房间名已存在，请换一个名称!")));
-			Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
-		}
-		return; // 发现重名，直接拦截，绝对不往下执行创房代码
-	}
-
 	// 2. 准备调用引擎底层接口创建真实的局域网会话 (Session)
 	if (Text_CreateRoomHint)
 	{
-		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在检查同账号房间，请稍候...")));
+		Text_CreateRoomHint->SetText(FText::FromString(TEXT("正在检查大厅，请稍候...")));
 		Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 	}
 
 	// ==========================================
-	// 【核心修复】: 创房前先 FindSessions 查大厅
-	//                防止"同账号已有建房"的情况
+	// 账号本地存储，创房前先 FindSessions 查大厅
+	// - 同账号已有建房 → 弹"已有此账户创建的房间"提示，阻止创房
+	// - 无/非同号 → 继续走真正的创房流程
 	// ==========================================
-	// 不在这里直接创房, 而是把"创房"动作放到 OnAccountCheckFindSessionsComplete 里
-	// (类似 OnCreateSessionComplete 的延迟逻辑)
 	FindSessionsForAccountCheck();
 }
 
@@ -745,6 +772,16 @@ void ULANRoomPage::HostRealSession()
 			}
 		}
 		SessionSettings.Set(FName("HOST_ACCOUNT"), HostAccountName, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+
+		// ==========================================
+		// 【新增】: 写入初始房间账号列表 ROOM_ACCOUNTS
+		// 包含: [HOST_ACCOUNT]
+		// 房主端在每次玩家登录/登出时通过 UpdateSession 动态更新此列表
+		// 供其他客户端在加入前扫描，防止同账号重复进入
+		// 注意: OnlineSubsystemNull 只导出了 FString 版本的 Set/Get，故用管道符序列化
+		// ==========================================
+		FString InitialRoomAccountsStr = HostAccountName + TEXT("|");
+		SessionSettings.Set(FName("ROOM_ACCOUNTS"), InitialRoomAccountsStr, EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
 
 		// 执行底层创建命令，NAME_GameSession 是引擎默认的当前游戏会话宏
 		Sessions->CreateSession(0, NAME_GameSession, SessionSettings);
@@ -996,7 +1033,7 @@ void ULANRoomPage::OnAccountCheckFindSessionsComplete(bool bWasSuccessful)
 				if (Text_CreateRoomHint)
 				{
 					Text_CreateRoomHint->SetText(FText::FromString(
-						FString::Printf(TEXT("已有此账户 [%s] 创建的房间，请更换账户重试"), *MyAccountName)));
+						FString::Printf(TEXT("此账号在别的客户端已经登陆并创房，您无法创建房间，请更换账号重新登陆！"))));
 					Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
 				}
 
@@ -1083,7 +1120,7 @@ void ULANRoomPage::ProceedToCreateRoomAfterCheck()
  *  1. 显示 Overlay_LANRoomConflict + Text_ConflictMsg
  *  2. 改输入模式为 UIOnly(确保鼠标能点按钮)
  */
-void ULANRoomPage::ShowLANRoomConflictDialog(const FString& Reason)
+void ULANRoomPage::ShowLANRoomConflictDialog()
 {
 	// 1. 显示对话框容器
 	if (Overlay_LANRoomConflict)
@@ -1094,15 +1131,10 @@ void ULANRoomPage::ShowLANRoomConflictDialog(const FString& Reason)
 	// 2. 显示提示文本
 	if (Text_ConflictMsg)
 	{
-		// 给玩家清晰的提示: 冲突原因 + 操作
-		const FString FullMessage = FString::Printf(
-			TEXT("%s\n\n点 [确认] 返回大厅"),
-			*Reason);
-		Text_ConflictMsg->SetText(FText::FromString(FullMessage));
+		Text_ConflictMsg->SetText(FText::FromString(TEXT("此账号在别的客户端已经登陆并创房，您无法创建房间，请更换账号重新登陆！")));
 	}
 
 	// 3. 输入模式切到 UIOnly + 显示鼠标
-	// 优先用 GetOwningPlayer()，拿不到时用 World->GetFirstPlayerController() 兜底
 	APlayerController* PC = GetOwningPlayer();
 	if (!PC && GetWorld())
 	{
@@ -1120,7 +1152,7 @@ void ULANRoomPage::ShowLANRoomConflictDialog(const FString& Reason)
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow,
-			FString::Printf(TEXT("[LANRoomPage] 弹冲突对话框: %s"), *Reason));
+			TEXT("[LANRoomPage] 弹冲突对话框"));
 	}
 }
 

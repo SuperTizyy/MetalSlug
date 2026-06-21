@@ -492,7 +492,7 @@ public:
 	 *       保持 BP 端和 C++ 端的解耦
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Account")
-	void HandleForcedKickNotification(const FString& Reason);
+	void HandleForcedKickNotification();
 
 	/**
 	 * 辅助: 在当前 World 上按类名查找 UUserWidget 实例
@@ -501,6 +501,18 @@ public:
 	 * @return 第一个匹配的 UUserWidget, 找不到返回 nullptr
 	 */
 	UUserWidget* FindWidgetByClassName(const FString& ClassName) const;
+
+	/**
+	 * SyncRoomAccountsToSession
+	 *
+	 * 房主端专用: 将 AccountRoomAuthority 中的所有在线账号列表同步到 SessionSettings
+	 * 并调用 UpdateSession 广播到局域网，供其他客户端在加入前查询
+	 *
+	 * 调用场景:
+	 * - Server_NotifyAccountLogin_Implementation (玩家加入时)
+	 * - Server_NotifyAccountLogout_Implementation (玩家离开时)
+	 */
+	void SyncRoomAccountsToSession();
 
 	/**
 	 * 钩子: PC 销毁时通知权威表清理
