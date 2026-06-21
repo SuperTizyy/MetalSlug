@@ -258,7 +258,7 @@ private:
 	 *  - 改输入模式为 UIOnly + 显示鼠标
 	 */
 	UFUNCTION(BlueprintCallable, Category = "LANRoom|Account")
-	void ShowLANRoomConflictDialog(const FString& Reason);
+	void ShowLANRoomConflictDialog();
 
 	/**
 	 * 确认按钮回调: 玩家点"确认" → 切回大厅(不退出账号)

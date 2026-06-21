@@ -3,13 +3,16 @@
 // ==========================================
 // 头文件包含区
 // ==========================================
-// 本类自己的声明
+// 本类自己的声明（会自动包含 .generated.h）
 #include "Systems/Room/AccountRoomAuthority.h"
-// 引入 ARoomPlayerController 以调用其 Client RPC
+// 引入 ARoomPlayerController 的完整定义（调用 Client_LoginResult RPC）
+// 注意：AccountRoomAuthority.h 只有前向声明，此处需要完整类定义
 #include "Systems/RoomPlayerController.h"
 // 引入引擎的 TimerManager 以做延迟强踢
 #include "Engine/World.h"
 #include "TimerManager.h"
+// 引入 OnlineSessionSettings 完整定义（FNamedOnlineSession 等）
+#include "OnlineSessionSettings.h"
 
 
 // ==========================================
@@ -45,7 +48,7 @@ bool UAccountRoomAuthority::HandleLoginRequest(
 	ARoomPlayerController* RequesterPC)
 {
 	// 输入校验: 账号或 SessionId 为空直接拒绝
-	if (Username.IsEmpty() || SessionId.IsEmpty() || !IsValid(RequesterPC))
+	if (Username.IsEmpty() || SessionId.IsEmpty() || RequesterPC == nullptr)
 	{
 		RequesterPC->Client_LoginResult(false, TEXT("参数错误"), false);
 		return false;
@@ -136,7 +139,7 @@ void UAccountRoomAuthority::HandleLogoutRequest(
  */
 void UAccountRoomAuthority::HandleControllerDestroyed(ARoomPlayerController* PC)
 {
-	if (!IsValid(PC))
+	if (PC == nullptr)
 	{
 		return;
 	}
@@ -253,9 +256,13 @@ void UAccountRoomAuthority::StartSweepTimer(UWorld* World)
 	// 防御: 防止重复启动
 	World->GetTimerManager().ClearTimer(SweepTimerHandle);
 
-	FTimerDelegate SweepDelegate = FTimerDelegate::CreateLambda([this]()
+	FTimerDelegate SweepDelegate = FTimerDelegate::CreateLambda([WeakAuthority = TWeakObjectPtr<UAccountRoomAuthority>(this)]()
 	{
-		SweepDeadSessions(15.0f);
+		if (!WeakAuthority.IsValid())
+		{
+			return;
+		}
+		WeakAuthority->SweepDeadSessions(15.0f);
 	});
 
 	World->GetTimerManager().SetTimer(
@@ -294,14 +301,100 @@ ARoomPlayerController* UAccountRoomAuthority::FindControllerByUsername(const FSt
 {
 	if (const FAccountSessionState* Existing = OnlineAccounts.Find(Username))
 	{
-		return Existing->PC.Get();
+		ARoomPlayerController* PC = Existing->PC.Get();
+		if (IsValid(PC))
+		{
+			return PC;
+		}
 	}
 	return nullptr;
 }
 
 
 // ==========================================
-// 4. (旧版强踢流程已删除)
+// 4. 在线账号列表查询与 Session 同步
+// ==========================================
+
+/**
+ * GetAllOnlineAccountNames
+ *
+ * 获取当前所有在线账号名列表（不含 HOST_ACCOUNT）
+ * @return OnlineAccounts 中所有 Key 的副本
+ */
+TArray<FString> UAccountRoomAuthority::GetAllOnlineAccountNames() const
+{
+	TArray<FString> Result;
+	OnlineAccounts.GetKeys(Result);
+	return Result;
+}
+
+
+/**
+ * SyncAccountsToSessionSettings
+ *
+ * 将当前所有在线账号列表同步写入 SessionSettings 的 ROOM_ACCOUNTS 字段
+ * 并调用 UpdateSession 使其广播到大厅，供其他客户端查询
+ *
+ * 写入格式:
+ * - ROOM_ACCOUNTS: 包含 HOST_ACCOUNT 在内的所有在线账号（字符串数组）
+ *                  HOST_ACCOUNT 排在第一位（方便客户端扫描）
+ *
+ * @param SessionInterface 在线会话接口（由调用方从 GameInstance 传入）
+ * @param MyAccountName 房主的 HOST_ACCOUNT（不加入 OnlineAccounts，但一并写入 ROOM_ACCOUNTS）
+ */
+void UAccountRoomAuthority::SyncAccountsToSessionSettings(IOnlineSessionPtr SessionInterface, const FString& MyAccountName)
+{
+	if (!SessionInterface.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Authority] SyncAccountsToSessionSettings: SessionInterface 无效"));
+		return;
+	}
+
+	// 从 SessionInterface 拿到当前 NamedSession 的可变引用
+	FNamedOnlineSession* NamedSession = SessionInterface->GetNamedSession(NAME_GameSession);
+	if (!NamedSession)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Authority] SyncAccountsToSessionSettings: NamedSession 不存在"));
+		return;
+	}
+
+	// 将账号列表序列化为单条 FString（OnlineSubsystemNull 只导出了 FString 版本的 Set/Get）
+	FString AllAccountsStr;
+	for (const TPair<FString, FAccountSessionState>& Pair : OnlineAccounts)
+	{
+		if (!Pair.Key.IsEmpty())
+		{
+			AllAccountsStr += Pair.Key + TEXT("|");
+		}
+	}
+
+	// 追加房主账号（放在最前）
+	if (!MyAccountName.IsEmpty())
+	{
+		AllAccountsStr = MyAccountName + TEXT("|") + AllAccountsStr;
+	}
+
+	// 写入 ROOM_ACCOUNTS 并广播更新
+	NamedSession->SessionSettings.Set(
+		FName("ROOM_ACCOUNTS"),
+		AllAccountsStr,
+		EOnlineDataAdvertisementType::ViaOnlineServiceAndPing);
+
+	// 调用 UpdateSession 将修改推送给局域网内的所有客户端
+	SessionInterface->UpdateSession(NAME_GameSession, NamedSession->SessionSettings, true);
+
+	// 简单统计账号数：数管道符数量（末尾空串不计入）
+	int32 AccountCount = AllAccountsStr.IsEmpty() ? 0 : 1;
+	for (const TCHAR& Ch : AllAccountsStr)
+	{
+		if (Ch == TEXT('|')) { AccountCount++; }
+	}
+	UE_LOG(LogTemp, Log, TEXT("[Authority] SyncAccountsToSessionSettings: 已同步 %d 个账号到 ROOM_ACCOUNTS [%s]"), AccountCount, *AllAccountsStr);
+}
+
+
+// ==========================================
+// 5. (旧版强踢流程已删除)
 // ==========================================
 // 旧版 NotifyForcedKick / DelayedForceLeave 已删除
 // 新版语义: 房主端不踢旧 PC, 只拒绝新 PC 进房

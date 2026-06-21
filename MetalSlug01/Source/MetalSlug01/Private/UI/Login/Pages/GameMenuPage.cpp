@@ -14,6 +14,8 @@
 #include "Systems/GameFlowSubsystem.h"
 // 引入 AccountSubsystem（用于 Logout 解锁账号）
 #include "Systems/Account/AccountSubsystem.h"
+// 引入登录地图控制器（用于切换子页面）
+#include "Systems/LoginPlayerController.h"
 
 
 // ==========================================
@@ -106,21 +108,15 @@ void UGameMenuPage::OnSinglePlayerClicked()
  */
 void UGameMenuPage::OnMultiplePlayerClicked()
 {
-	// 【核心跳转逻辑】: 动态生成局域网大厅 UI 并销毁当前主菜单
-	// 检查我们是否在蓝图里配置了局域网大厅的类
-	if (LANRoomClass)
+	// ==========================================
+	// 【架构修正】: 通过 GameFlowSubsystem 切换状态
+	// TransitToState(MainLobby) -> 广播 OnStateChanged -> OnFlowStateChanged(MainLobby) -> 创建 LANRoomUI
+	// ==========================================
+	if (UGameInstance* GI = GetWorld()->GetGameInstance())
 	{
-		// 使用 CreateWidget 在内存中生成局域网大厅菜单的实例
-		UUserWidget* LANRoomWidget = CreateWidget<UUserWidget>(GetWorld(), LANRoomClass);
-
-		// 确保生成成功
-		if (LANRoomWidget)
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 		{
-			// 将局域网大厅添加到玩家的屏幕上
-			LANRoomWidget->AddToViewport();
-
-			// 【过河拆桥】把自己（当前的主菜单页面）从屏幕上彻底销毁
-			this->RemoveFromParent();
+			FlowSubsystem->TransitToState(EMatchState::MainLobby);
 		}
 	}
 }

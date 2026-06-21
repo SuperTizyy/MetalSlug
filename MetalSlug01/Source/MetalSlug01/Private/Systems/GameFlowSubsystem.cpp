@@ -93,6 +93,7 @@ void UGameFlowSubsystem::TransitToState(EMatchState NewState)
 	// 2. 广播状态改变事件
 	// ==========================================
 	// 通知所有订阅 OnStateChanged 的 Controller/UI 准备切换
+	// 此时 CurrentState 已经是 NewState，所有 Handler 拿到的参数即为新状态
 	OnStateChanged.Broadcast(CurrentState);
 
 	// ==========================================
@@ -139,16 +140,21 @@ void UGameFlowSubsystem::HandleStateEntry(EMatchState State)
 		}
 		break;
 
+	case EMatchState::MainMenu:
+		// 主菜单态：不跳转地图，留在 L_Login
+		// 管家通过广播让 LoginPlayerController 切换 UI（GameMenuPage）
+		break;
+
 	case EMatchState::MainLobby:
-		// 如果当前不在登录地图（例如玩家刚从沙漠战斗房间退房出来），则物理跳转回去
+		// 大厅态（局域网房间）：不跳转地图，留在 L_Login
+		// 管家通过广播让 LoginPlayerController 切换 UI（LANRoomPage）
+		// 如果玩家刚从战斗地图退房出来，需要先切回 L_Login
 		if (!CurrentMapName.Contains(TEXT("L_Login")))
 		{
 			// 【架构规范】: 从多人联机关卡退回单机主菜单，必须加 "?offline" 参数！
 			// 作用: 强制 UE 引擎清理底层的 NetDriver 网络连接，防止端口被死锁占用
 			UGameplayStatics::OpenLevel(this, FName("L_Login"), true, TEXT("?offline"));
 		}
-		// 如果已经在 L_Login，那就什么都不做
-		// 管家会通过广播让 LoginPlayerController 自己切 UI
 		break;
 
 	case EMatchState::InRoom:

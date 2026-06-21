@@ -1,8 +1,11 @@
+#pragma once
+
 // ==========================================
 // 头文件包含说明
 // ==========================================
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
+#include "Interfaces/OnlineSessionInterface.h"
 #include "AccountRoomAuthority.generated.h"
 
 class APlayerController;
@@ -18,28 +21,23 @@ class ARoomPlayerController;
  * - PC: 指向该玩家当前的 PlayerController（用于反向寻址做"强踢"）
  * - LoginAt: 上线时间戳（调试用）
  */
-USTRUCT()
-struct FAccountSessionState
+USTRUCT(BlueprintType)
+struct METALSLUG01_API FAccountSessionState
 {
 	GENERATED_BODY()
 
-	/** 客户端在进房时生成的唯一标识（FGuid::NewGuid().ToString()） */
 	UPROPERTY()
 	FString SessionId;
 
-	/** 指向该玩家的 PlayerController 指针 */
 	UPROPERTY()
 	TWeakObjectPtr<ARoomPlayerController> PC;
 
-	/** 上线时间戳 */
 	UPROPERTY()
 	FDateTime LoginAt;
 
-	/** 最后收到心跳的时间戳(用于检测异常掉线) */
 	UPROPERTY()
 	FDateTime LastHeartbeatAt;
 
-	/** 默认构造 */
 	FAccountSessionState()
 		: SessionId(TEXT(""))
 		, PC(nullptr)
@@ -52,22 +50,8 @@ struct FAccountSessionState
 /**
  * @class UAccountRoomAuthority
  * @brief 房主端（ListenServer）上的"账号在线状态权威表"
- *
- * 职责说明:
- * - 维护 TMap<Username, FAccountSessionState>，记录"谁在哪个 PC 上、用哪个 SessionId"
- * - 接收客户端的 Server_NotifyLogin / Server_NotifyLogout
- * - 判定"账号是否冲突"并触发强踢流程
- *
- * 架构理念:
- * 1. 单例: 跟随 RoomGameMode 生命周期，只在 ListenServer 端实例化
- * 2. 线程安全: 仅在游戏线程访问，不需要加锁
- * 3. 弱引用: PC 用 TWeakObjectPtr 防止崩溃时悬挂
- *
- * 注意:
- * - 加入者（Client）端不会创建本类的实例
- * - 离线（未开房）时也不会创建
  */
-UCLASS()
+UCLASS(BlueprintType)
 class METALSLUG01_API UAccountRoomAuthority : public UObject
 {
 	GENERATED_BODY()
@@ -133,6 +117,20 @@ public:
 	 * 根据账号名找到对应的 PC（用于强踢）
 	 */
 	ARoomPlayerController* FindControllerByUsername(const FString& Username) const;
+
+	/**
+	 * 获取当前所有在线账号名列表（供 UI/外部同步 SessionSettings 使用）
+	 * @return 账号名数组（不含 HOST_ACCOUNT，它由创房逻辑单独维护）
+	 */
+	TArray<FString> GetAllOnlineAccountNames() const;
+
+	/**
+	 * 将当前在线账号列表同步写入 SessionSettings 并调用 UpdateSession
+	 * 由 RoomPlayerController 在每次 HandleLoginRequest / HandleLogoutRequest 后调用
+	 * @param SessionInterface 在线会话接口（由调用方从 GameInstance 传入）
+	 * @param MyAccountName 房主的 HOST_ACCOUNT（不加入 OnlineAccounts，但一并写入 ROOM_ACCOUNTS）
+	 */
+	void SyncAccountsToSessionSettings(IOnlineSessionPtr SessionInterface, const FString& MyAccountName);
 
 	/**
 	 * 调试用: 获取在线账号数量

@@ -27,7 +27,8 @@ enum class EMatchState : uint8
 {
 	PreLogin		UMETA(DisplayName = "Pre-Login"),       // 预加载/Logo 阶段（目前预留，用于启动 Logo 展示）
 	Login			UMETA(DisplayName = "Login"),           // 登录态：在此展示账号输入界面
-	MainLobby		UMETA(DisplayName = "Main Lobby"),      // 大厅态：选角、匹配、主菜单
+	MainMenu		UMETA(DisplayName = "Main Menu"),       // 主菜单态：单人/多人模式选择（不跳转地图，留在 L_Login）
+	MainLobby		UMETA(DisplayName = "Main Lobby"),      // 大厅态：局域网房间列表/匹配（不跳转地图，留在 L_Login）
 	InRoom			UMETA(DisplayName = "In Room"),         // 房间态：局域网房间等待对战
 	Battleing		UMETA(DisplayName = "Battleing"),       // 战斗态：核心对战关卡内
 	PostBattle		UMETA(DisplayName = "Post Battle")      // 结算态：战斗结束展示成绩

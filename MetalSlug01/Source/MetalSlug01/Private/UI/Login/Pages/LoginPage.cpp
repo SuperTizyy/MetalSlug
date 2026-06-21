@@ -147,31 +147,14 @@ void ULoginPage::OnLoginButtonClicked()
 				Text_Hint->SetVisibility(ESlateVisibility::Visible);
 
 				// ==========================================
-				// 【关键修复】: 登录成功后必须切换到 MainLobby 状态!
-				// 否则状态一直是 Login (1)，点击返回登录时会被拦截
+				// 【关键修复】: 登录成功后必须切换到 MainMenu 状态!
+				// TransitToState(MainMenu) -> 广播 OnStateChanged -> OnFlowStateChanged(MainMenu) -> 创建 GameMenuPage
 				// ==========================================
 				if (UGameFlowSubsystem* FlowSubsystem = GameInstance->GetSubsystem<UGameFlowSubsystem>())
 				{
-					FlowSubsystem->TransitToState(EMatchState::MainLobby);
+					FlowSubsystem->TransitToState(EMatchState::MainMenu);
 				}
-
-				// 动态生成大厅 UI 并销毁登录 UI
-				// 检查我们是否在蓝图里配置了大厅菜单的类
-				if (GameMenuClass)
-				{
-					// 使用 CreateWidget 在内存中生成大厅菜单的实例
-					UUserWidget* GameMenuWidget = CreateWidget<UUserWidget>(GetWorld(), GameMenuClass);
-
-					// 确保生成成功
-					if (GameMenuWidget)
-					{
-						// 将大厅菜单添加到玩家的屏幕上
-						GameMenuWidget->AddToViewport();
-
-						// 【过河拆桥】把自己（当前的登录页面）从屏幕上彻底销毁
-						this->RemoveFromParent();
-					}
-				}
+				// 不再手动 CreateWidget 和 RemoveFromParent，ALoginPlayerController 会处理
 
 			}
 			else

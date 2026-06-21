@@ -51,8 +51,15 @@ protected:
 	TSubclassOf<UUserWidget> LoginUIClass;
 
 	/**
-	 * 局域网大厅界面的蓝图类（在 BP_LoginPlayerController 中配置）
-	 * 目的: 动态 CreateWidget 创建大厅 UI
+	 * 主菜单界面的蓝图类（在 BP_LoginPlayerController 中配置）
+	 * 目的: 登录成功后进入 MainLobby 状态时，动态创建主菜单 UI
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
+	TSubclassOf<UUserWidget> GameMenuUIClass;
+
+	/**
+	 * 局域网房间界面的蓝图类（在 BP_LoginPlayerController 中配置）
+	 * 目的: 点击"多人模式"时，动态创建局域网房间 UI
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "UI Config")
 	TSubclassOf<UUserWidget> LANRoomUIClass;
@@ -62,6 +69,7 @@ protected:
 	 * @param NewState 新的全局流程状态
 	 * 触发时机: UGameFlowSubsystem::TransitToState 被调用时
 	 */
+	
 	UFUNCTION()
 	void OnFlowStateChanged(EMatchState NewState);
 

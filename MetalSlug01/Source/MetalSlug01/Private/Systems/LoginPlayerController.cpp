@@ -137,9 +137,9 @@ void ALoginPlayerController::BeginPlay()
  * ALoginPlayerController::OnFlowStateChanged
  *
  * GameFlowSubsystem 状态变化回调
- * - Login: 销毁大厅 UI，创建登录页
- * - MainLobby: 销毁登录 UI，创建大厅页
- * - 其他: 销毁所有 UI
+ * - Login: 销毁所有 UI，创建登录页
+ * - MainLobby: 销毁登录页，创建主菜单页
+ * - 其他: 统统销毁
  */
 void ALoginPlayerController::OnFlowStateChanged(EMatchState NewState)
 {
@@ -169,21 +169,48 @@ void ALoginPlayerController::OnFlowStateChanged(EMatchState NewState)
 		}
 	}
 	// ==========================================
-	// 状态 2: 主大厅阶段
+	// 状态 2: 主菜单阶段（单人/多人模式选择）
 	// ==========================================
-	else if (NewState == EMatchState::MainLobby)
+	else if (NewState == EMatchState::MainMenu)
 	{
 		// 销毁登录页（如果存在）
 		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
 		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
 
-		// 动态创建大厅页 Widget
+		// 动态创建主菜单页 Widget（GameMenuUIClass 对应的主菜单蓝图）
+		if (GameMenuUIClass)
+		{
+			ActiveLobbyWidget = CreateWidget<UUserWidget>(this, GameMenuUIClass);
+			if (ActiveLobbyWidget)
+			{
+				ActiveLobbyWidget->AddToViewport();
+			}
+			else
+			{
+				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] OnFlowStateChanged: CreateWidget 返回空!"));
+			}
+		}
+	}
+	// ==========================================
+	// 状态 3: 局域网房间大厅阶段（房间列表）
+	// ==========================================
+	else if (NewState == EMatchState::MainLobby)
+	{
+		// 销毁主菜单页（如果存在）
+		if (ActiveLoginWidget) { ActiveLoginWidget->RemoveFromParent(); ActiveLoginWidget = nullptr; }
+		if (ActiveLobbyWidget) { ActiveLobbyWidget->RemoveFromParent(); ActiveLobbyWidget = nullptr; }
+
+		// 动态创建局域网房间页 Widget（LANRoomUIClass 对应的局域网房间蓝图）
 		if (LANRoomUIClass)
 		{
 			ActiveLobbyWidget = CreateWidget<UUserWidget>(this, LANRoomUIClass);
 			if (ActiveLobbyWidget)
 			{
 				ActiveLobbyWidget->AddToViewport();
+			}
+			else
+			{
+				if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 20.0f, FColor::Red, TEXT("[LoginPC Debug 错误] OnFlowStateChanged: CreateWidget 返回空!"));
 			}
 		}
 	}
