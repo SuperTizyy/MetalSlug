@@ -6,6 +6,8 @@
 // 引入本类头文件
 #include "Characters/BaseCharacter.h"
 
+#include "GenericTeamAgentInterface.h"
+
 // 引入摄像机组件
 #include "Camera/CameraComponent.h"
 
@@ -104,6 +106,10 @@ ABaseCharacter::ABaseCharacter()
 	// 业务组件初始化: 由各 Component 自治 (均已开启 Replicated)
 	// HealthComponent 和 EnergyComponent 的初值在 CreateDefaultSubobject 时由 UPROPERTY 默认值决定
 	// 如需自定义初值，可在蓝图子类中覆盖 UPROPERTY 的默认值
+
+	// 【Phase 1 重构】阵营默认值: 默认人类阵营 (FGenericTeamId(0))
+	// 外部旧代码可通过 SetFactionTag() 切换 (Human vs Zombie)
+	// 注意: 不再初始化 TeamID 字段 (字段已废弃, 派生属性从 FactionTag 派生)
 
 	// 初始化AC/ACE系统
 	MaxAC = 100;
@@ -1296,6 +1302,35 @@ void ABaseCharacter::EndAttackState()
 	// 收刀时，彻底解除移动锁定
 	bIsMovementLocked = false;
 	GetCharacterMovement()->MaxWalkSpeed = 600.0f; // 恢复正常速度
+}
+
+
+/**
+ * 【Phase 3 大厂架构】OnAIRequestAttack — AI 攻击的公共入口
+ *
+ * 设计:
+ *   - 把 protected LightAttack_Pressed 暴露给 AI 子系统
+ *   - 内部走与玩家轻击完全一致的链路（连击序号+蒙太奇+RPC）
+ *   - AI 不需要关心"我是不是在连击中", 内部状态机自动处理
+ *
+ * 安全检查:
+ *   - IsDead: 死了不能打
+ *   - CurrentWeapon: 没武器不能打（AI 应该有武器, 但防御性检查）
+ *   - 下蹲检查: 与玩家逻辑一致
+ */
+void ABaseCharacter::OnAIRequestAttack()
+{
+	// 死了不能打（与 LightAttack_Pressed 一致）
+	if (IsDead()) return;
+
+	// 没武器不能打
+	if (!CurrentWeapon) return;
+
+	// AI 不会下蹲, 此处省略 bIsCrouched 检查
+	// （LightAttack_Pressed 里的下蹲检查是给玩家准备的, AI 用不上）
+
+	// 直接调用, 走与玩家完全一致的连击逻辑
+	LightAttack_Pressed();
 }
 
 
@@ -2569,6 +2604,107 @@ void ABaseCharacter::BroadcastWeaponIconReady(const FString& WeaponID, UTexture2
 		return;
 	}
 	CharacterEvents->OnWeaponIconReady.Broadcast(WeaponID, Icon);
+}
+
+
+// ==========================================
+// 【Phase 1 重构】 IGenericTeamAgentInterface 实现
+//
+// 设计: GameplayTag 是单一真实源 (Single Source of Truth).
+//       uint8 GetTeamID() 是派生属性 (从 FactionTag 推 0/1),
+//       仅供旧代码兼容. 新代码全部用 GetGenericTeamId/GetTeamAttitudeTowards.
+// ==========================================
+
+FGenericTeamId ABaseCharacter::ResolveGenericTeamIdFromTag(FGameplayTag InTag)
+{
+	// 单例 enum 到 ID 的硬编码表 — 仅 Phase 1 用, 后续通过 DataTable 配
+	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"))))
+	{
+		return FGenericTeamId(0); // Player
+	}
+	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"))))
+	{
+		return FGenericTeamId(1); // Zombie
+	}
+	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"))))
+	{
+		return FGenericTeamId(2);
+	}
+	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Neutral"))))
+	{
+		return FGenericTeamId::NoTeam;
+	}
+	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Hostile.All"))))
+	{
+		// UE 5.6 中 FGenericTeamId 没有 ::Hostile 静态成员, 用 FGenericTeamId(255) 约定
+		return FGenericTeamId(255);
+	}
+	return FGenericTeamId::NoTeam;
+}
+
+void ABaseCharacter::SetGenericTeamId(const FGenericTeamId& NewTeamID)
+{
+	// 把 FGenericTeamId 反向写回 FactionTag (用于运行时感染/阵营切换)
+	const int32 Id = NewTeamID.GetId();
+	if (Id == 0)       FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"));
+	else if (Id == 1)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"));
+	else if (Id == 2)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"));
+	else               FactionTag = FGameplayTag();
+}
+
+FGenericTeamId ABaseCharacter::GetGenericTeamId() const
+{
+	if (FactionTag.IsValid())
+	{
+		return ResolveGenericTeamIdFromTag(FactionTag);
+	}
+	// 兼容: 没设 FactionTag 时回退到默认人类阵营
+	return FGenericTeamId(0);
+}
+
+ETeamAttitude::Type ABaseCharacter::GetTeamAttitudeTowards(const AActor& Other) const
+{
+	if (const IGenericTeamAgentInterface* OtherTeamAgent =
+		Cast<IGenericTeamAgentInterface>(&Other))
+	{
+		const FGenericTeamId OtherTeamId = OtherTeamAgent->GetGenericTeamId();
+		const FGenericTeamId MyTeamId = GetGenericTeamId();
+
+		// 同阵营 = Friendly
+		if (MyTeamId == OtherTeamId && OtherTeamId != FGenericTeamId::NoTeam)
+		{
+			return ETeamAttitude::Friendly;
+		}
+
+		// 显式 Hostile 标记 (UE 5.6 中没有 ::Hostile 静态, 用 (255) 数字)
+		const FGenericTeamId HostileId(255);
+		if (OtherTeamId == HostileId || MyTeamId == HostileId)
+		{
+			return ETeamAttitude::Hostile;
+		}
+
+		// 否则按 ID 分组: 偶数阵营互相 Friendly, 奇数阵营互相对立 (简单启发式)
+		const bool bOtherEvenTeam = (OtherTeamId.GetId() % 2) == 0;
+		const bool bMyEvenTeam     = (MyTeamId.GetId() % 2) == 0;
+		if (bOtherEvenTeam == bMyEvenTeam && MyTeamId != FGenericTeamId::NoTeam)
+		{
+			return ETeamAttitude::Friendly;
+		}
+		return ETeamAttitude::Hostile;
+	}
+	return ETeamAttitude::Neutral;
+}
+
+uint8 ABaseCharacter::GetTeamID() const
+{
+	// 【Phase 1 重构】派生属性 — 从 FactionTag 反推 uint8, 仅旧代码用
+	switch (GetGenericTeamId().GetId())
+	{
+	case 0: return 0; // Faction.Player -> 攻方
+	case 1: return 1; // Faction.Zombie -> 守方
+	case 2: return 2;
+	default: return 0;
+	}
 }
 
 

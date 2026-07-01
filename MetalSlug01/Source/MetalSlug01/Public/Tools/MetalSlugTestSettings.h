@@ -1,5 +1,7 @@
-﻿#pragma once
-
+﻿// ==========================================
+// 头文件包含说明
+// ==========================================
+#pragma once
 // 包含核心最小化组件
 #include "CoreMinimal.h"
 // 包含开发者设置模块的基类
@@ -19,7 +21,7 @@
  * 4. 生产环境默认值关闭: 避免线上包携带开启的作弊功能
  *
  * 当前配置项:
- * - bSkipLoginDirectToLobby: 跳过登录直通大厅（测试用）
+ * - bSkipLoginDirectToLobby: 跳过登录自动当测试房主 (调试用, 2026.07.03 P0 重构)
  */
 UCLASS(Config=Game, defaultconfig, meta=(DisplayName="MetalSlug Debug Settings"))
 class METALSLUG01_API UMetalSlugTestSettings : public UDeveloperSettings
@@ -36,7 +38,29 @@ public:
 	// 登录跳过配置
 	// ==========================================
 
-	// 测试开关：勾选后，启动登录地图时将直接跳过账号登录，并分配随机身份直通联机大厅
-	UPROPERTY(Config, EditAnywhere, Category = "UI Flow Testing", meta = (ToolTip="开启后无视正常流程，自动分配伪装账号并进入大厅"))
+	// ==========================================
+	// 【大厂 P0 修复 2026.07.03】测试房主模式开关
+	// ==========================================
+	// 勾选后行为:
+	//   1. GameFlow 启动时调用 AccountSubsystem::MockLoginForTesting() 注入测试身份
+	//      → CurrentLoggedInUser = "TestUser_XXXX" (随机, 多开不重名)
+	//   2. 调用 RoomService::EnterSkipToHostMode() 显式标房主
+	//      → bIsHost = true + 广播 OnHostChanged(true)
+	//      → RoomInsidePage 立即以"房主"形态显示按钮 (StartGame / OpenAI)
+	//   3. 根据启动地图类型分发:
+	//      - L_Login  (主菜单地图) → TransitToState(MainLobby) → 显示 LANRoomPage
+	//      - 战斗地图              → OnInterrupted.Broadcast(RoomInside) → 显示 RoomInsidePage
+	//
+	// 与旧版本的差异:
+	//   - 旧: 直接 TransitToState(MainLobby), 假设启动地图是 L_Login
+	//        战斗地图启动时会被"自愈"链路推回 InRoom, 房主按钮不显示 (BUG)
+	//   - 新: 显式分两步走, 战斗地图启动也能正常显示房主 UI
+	//
+	// 安全:
+	//   - 生产环境默认 false
+	//   - 不会写盘 (MockLogin 临时身份)
+	//   - 关闭游戏后自动销毁
+	// ==========================================
+	UPROPERTY(Config, EditAnywhere, Category = "UI Flow Testing", meta = (ToolTip="开启后跳过登录, 自动以测试房主身份进入房间页 (战斗地图启动也能正确显示房主 UI)"))
 	bool bSkipLoginDirectToLobby;
 };

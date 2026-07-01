@@ -1,425 +1,114 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
-
-// ==========================================
+﻿// ==========================================
 // 头文件包含区
 // ==========================================
 // 包含当前子系统的头文件
 #include "Systems/Account/AccountSubsystem.h"
-// 包含虚幻引擎提供的静态工具函数类（用于执行 LoadGame 和 SaveGame）
-#include "Kismet/GameplayStatics.h"
-// 【关键引入】必须包含我们用来"装箱"的 SaveGame 类头文件
-#include "Data/Account/AccountSaveGame.h"
+// 仓储层 (用于测试身份自愈式创建 Record)
+#include "Systems/Account/LocalAccountRepository.h"
+// GUID 生成
+#include "Misc/Guid.h"
+// 屏幕调试
+#include "Engine/Engine.h"
+// GameInstance (用于获取 Subsystem)
+#include "Engine/GameInstance.h"
 
 
 // ==========================================
-// 1. 子系统生命周期
+// 1. 生命周期
 // ==========================================
 
-/**
- * Initialize
- *
- * 子系统初始化函数
- * 时机: 当游戏实例启动时引擎自动调用
- * 目的: 把硬盘里的旧账号全部"搬进"内存里
- */
 void UAccountSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
-	// 先调用父类的初始化逻辑
 	Super::Initialize(Collection);
 
-	// 游戏一启动，立刻调用读取函数，把硬盘里的旧账号全部"搬进"内存里
-	LoadDataFromDisk();
+	// 进程启动时生成一次会话 Token, 整个客户端生命周期不变
+	SessionToken = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+
+	UE_LOG(LogTemp, Log, TEXT("[AccountSession] Initialize 完成, SessionToken=%s"),
+		*SessionToken.Right(8));
 }
 
 
 // ==========================================
-// 2. 登录/注册/登出
+// 2. 会话操作 (纯内存, 不写硬盘)
 // ==========================================
 
-/**
- * TryLogin
- *
- * 供 UI 调用的登录验证函数
- * 关键: 因为是双开测试，另一个窗口可能刚刚改了存档
- * 所以每次尝试登录前必须先从硬盘重新读取一次最新数据
- *
- * @param Username 玩家输入的账号
- * @param Password 玩家输入的密码
- * @return 登录成功返回 true，失败返回 false
- */
-bool UAccountSubsystem::TryLogin(const FString& Username, const FString& Password)
+void UAccountSubsystem::SetCurrentUser(const FString& Username)
 {
-	// 【关键!】因为你是双开测试，另一个窗口可能刚刚改了存档
-	// 所以每次尝试登录前，必须先从硬盘重新读取一次最新数据
-	LoadDataFromDisk();
-
-	if (AccountData.Contains(Username))
-	{
-		if (AccountData[Username].Password == Password)
-		{
-			// 如果密码对上了，检查是不是已经在线了
-			if (AccountData[Username].bIsOnline)
-			{
-				return false; // 拦截! 账号已在其他地方登录
-			}
-
-			// ==========================================
-			// 登录成功，开始"上锁"
-			// ==========================================
-			AccountData[Username].bIsOnline = true; // 修改内存状态
-			CurrentLoggedInUser = Username;         // 记住当前窗口的登录人
-			SaveDataToDisk();                       // 立刻物理写死到硬盘，通知其他窗口
-			return true;
-		}
-	}
-
-	// 如果账号不存在，或者密码不匹配，统统返回 false 拒绝登录
-	return false;
+	CurrentLoggedInUser = Username;
+	UE_LOG(LogTemp, Log, TEXT("[AccountSession] SetCurrentUser = %s"), *Username);
 }
 
-
-/**
- * IsAccountOnline
- *
- * 检查某个账号是否已经在线
- * 查岗前先读硬盘，获取另一个窗口写进去的最新状态
- */
-bool UAccountSubsystem::IsAccountOnline(const FString& Username)
+void UAccountSubsystem::ClearSession()
 {
-	// 查岗前先读硬盘，获取另一个窗口写进去的最新状态
-	LoadDataFromDisk();
-	if (AccountData.Contains(Username))
-	{
-		return AccountData[Username].bIsOnline;
-	}
-	return false;
-}
-
-
-/**
- * Logout
- *
- * 登出并解锁
- * 1. 如果当前没人登录，也要兜底扫描全表, 把所有 bIsOnline=true 都还原为 false (防止僵死锁)
- * 2. 先从硬盘拿最新数据覆盖内存，再去字典里找
- * 3. 把字典里所有 bIsOnline 记录全部置为 false, 写入硬盘
- * 4. 清空本地窗口的登录记录
- *
- * 【2026-06-30 P0 修复】"返回登录界面后用相同账号登录被拒" 根因防御
- * 旧 bug:
- *   GameMenuPage 点 [返回登录] → AccountSubsystem::Logout() 在 CurrentLoggedInUser 为空时
- *   直接 early-return → 不写硬盘 → 硬盘里的 bIsOnline 永远是 true
- *   → Login Page 用同账号再次登录 → IsAccountOnline() 读硬盘 → 仍然 true → 拒绝
- * 修复: 即使 CurrentLoggedInUser 为空, 也要遍历整张字典, 把所有 bIsOnline=true 的记录
- *       全部清零, 写盘. 保证"返回登录"就是"完全退出所有账号状态".
- */
-void UAccountSubsystem::Logout()
-{
-	// 1. 先从硬盘拿最新数据覆盖内存 (确保看到的是最新状态, 而不是内存里可能过期的脏数据)
-	LoadDataFromDisk();
-
-	// 2. 【核心 P0 修复】遍历整张字典, 强制把所有 bIsOnline=true 的条目统统置 false
-	//    这样做的好处:
-	//    a) CurrentLoggedInUser 为空时也能兜底清理 (例如双开测试中另一个窗口残留上锁)
-	//    b) 单窗口内即使已经退过号, 这次再点返回登录时也能彻底重置
-	bool bAnyCleared = false;
-	for (auto& Pair : AccountData)
-	{
-		if (Pair.Value.bIsOnline)
-		{
-			Pair.Value.bIsOnline = false;
-			bAnyCleared = true;
-		}
-	}
-
-	// 3. 只要动过数据, 就必须写盘 (失败也要打日志)
-	if (bAnyCleared)
-	{
-		SaveDataToDisk();
-		UE_LOG(LogTemp, Log, TEXT("[Account] Logout: 已强制清零所有 bIsOnline 标记, 已写盘"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Verbose, TEXT("[Account] Logout: 内存中已无在线账号, 跳过写盘"));
-	}
-
-	// 4. 无论如何, 本地窗口的登录记录必须被清空
-	const FString OldLoggedInUser = CurrentLoggedInUser;
+	const FString Old = CurrentLoggedInUser;
 	CurrentLoggedInUser.Empty();
-
-	if (!OldLoggedInUser.IsEmpty())
+	if (!Old.IsEmpty())
 	{
-		UE_LOG(LogTemp, Log, TEXT("[Account] Logout: 已退出登录 [%s]"), *OldLoggedInUser);
-	}
-}
-
-
-/**
- * Deinitialize
- *
- * 游戏关闭时的安全兜底
- * 玩家直接强退游戏时，自动触发登出解锁，防止账号永久卡死
- */
-void UAccountSubsystem::Deinitialize()
-{
-	// 玩家直接强退游戏时，自动触发登出解锁，防止账号永久卡死
-	Logout();
-	Super::Deinitialize();
-}
-
-
-/**
- * TryRegister
- *
- * 供 UI 调用的注册新号函数
- * 1. 在内存里查一下，防止玩家注册一个已经被别人注册过的名字
- * 2. 使用有参构造函数把账号密码装进档案袋
- * 3. 存进内存字典
- * 4. 立刻调用保存函数，把最新的内存状态固化到硬盘里
- */
-bool UAccountSubsystem::TryRegister(const FString& Username, const FString& Password)
-{
-	// 【关键!】双开/多端测试时, 另一个窗口可能刚注册了同名账号
-	// 必须先从硬盘重新读取一次最新数据, 否则内存里的 AccountData 是过期的
-	// 也会导致 SaveDataToDisk() 整表覆盖时把别人写的内容吞掉
-	LoadDataFromDisk();
-
-	// 先在内存里查一下，防止玩家注册一个已经被别人注册过的名字
-	if (AccountData.Contains(Username))
-	{
-		// 账号已被占用，拒绝注册
-		return false;
-	}
-
-	// 【核心打包过程】使用你在 DynamicTable.h 里写的有参构造函数，把账号密码装进档案袋
-	FAccountRecord NewRecord(Username, Password);
-
-	// 把这个新的档案袋，以账号为 Key，存进内存字典里
-	AccountData.Add(Username, NewRecord);
-
-	// 既然有了新账号，必须立刻调用保存函数，把最新的内存状态固化到硬盘里，防止玩家突然断电
-	SaveDataToDisk();
-
-	// 注册成功并保存完毕
-	return true;
-}
-
-
-// ==========================================
-// 3. 硬盘读写底层工具
-// ==========================================
-
-/**
- * LoadDataFromDisk
- *
- * 底层工具: 从硬盘读取数据
- * 1. 询问操作系统硬盘指定路径下有没有我们的存档文件
- * 2. 如果有，读取并强制转换为 UAccountSaveGame
- * 3. 把纸箱里的历史字典赋值覆盖给我们内存里的大账本
- */
-void UAccountSubsystem::LoadDataFromDisk()
-{
-	// 向操作系统询问，硬盘的指定路径下有没有我们的存档文件
-	if (UGameplayStatics::DoesSaveGameExist(GetSaveSlotName(), 0))
-	{
-		// 如果有文件，就把它读出来，并强制转换为我们的顺丰纸箱类型（UAccountSaveGame）
-		UAccountSaveGame* LoadedGame = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(GetSaveSlotName(), 0));
-
-		// 确保纸箱没破（读取成功）
-		if (LoadedGame)
-		{
-			// 把纸箱里面装的历史字典，直接赋值覆盖给我们内存里的大账本
-			AccountData = LoadedGame->AccountRecords;
-		}
-	}
-}
-
-
-/**
- * SaveDataToDisk
- *
- * 底层工具: 把当前内存写入硬盘
- * 1. 先尝试找一下以前有没有用过的旧纸箱（避免覆盖其他数据）
- * 2. 如果是第一次玩，硬盘上连文件都没有，则凭空制造一个新纸箱
- * 3. 把内存大账本放进纸箱
- * 4. 物理写入到电脑硬盘
- */
-void UAccountSubsystem::SaveDataToDisk()
-{
-	// 先声明一个纸箱指针
-	UAccountSaveGame* SaveGameInstance = nullptr;
-
-	// 先尝试找一下以前有没有用过的旧纸箱（避免覆盖掉里面可能存在的其他数据）
-	if (UGameplayStatics::DoesSaveGameExist(GetSaveSlotName(), 0))
-	{
-		// 找到旧纸箱，拿过来用
-		SaveGameInstance = Cast<UAccountSaveGame>(UGameplayStatics::LoadGameFromSlot(GetSaveSlotName(), 0));
-	}
-	else
-	{
-		// 如果是玩家第一次玩游戏，硬盘上连文件都没有，我们就用引擎函数凭空制造一个新纸箱
-		SaveGameInstance = Cast<UAccountSaveGame>(UGameplayStatics::CreateSaveGameObject(UAccountSaveGame::StaticClass()));
-	}
-
-	// 确保我们现在手里确实有一个可以用的纸箱
-	if (SaveGameInstance)
-	{
-		// 把内存里最新的大账本（AccountData），放进纸箱的 AccountRecords 变量里
-		SaveGameInstance->AccountRecords = this->AccountData;
-
-		// 呼叫引擎底层快递员，把这个纸箱物理写入到电脑硬盘里!
-		UGameplayStatics::SaveGameToSlot(SaveGameInstance, GetSaveSlotName(), 0);
+		UE_LOG(LogTemp, Log, TEXT("[AccountSession] ClearSession, 旧用户 = %s"), *Old);
 	}
 }
 
 
 // ==========================================
-// 4. 战备偏好记忆
+// 3. 调试接口 (跳过登录)
 // ==========================================
 
-/**
- * GetLastSelectedCharacter
- *
- * 获取上次选中的角色名
- * 查不到就返回空字符串
- */
-FString UAccountSubsystem::GetLastSelectedCharacter()
-{
-	// 确保当前有玩家登录，并且大账本里有他
-	if (!CurrentLoggedInUser.IsEmpty() && AccountData.Contains(CurrentLoggedInUser))
-	{
-		return AccountData[CurrentLoggedInUser].LastSelectedCharacter;
-	}
-	return TEXT(""); // 查不到就返回空字符串
-}
-
-
-/**
- * SaveLastSelectedCharacter
- *
- * 保存选中的角色名
- * 1. 修改内存里的记录
- * 2. 立刻存盘（防止游戏闪退导致没存上）
- */
-void UAccountSubsystem::SaveLastSelectedCharacter(const FString& CharacterName)
-{
-	if (!CurrentLoggedInUser.IsEmpty() && AccountData.Contains(CurrentLoggedInUser))
-	{
-		// 1. 修改内存里的记录
-		AccountData[CurrentLoggedInUser].LastSelectedCharacter = CharacterName;
-
-		// 2. 立刻呼叫快递员，把最新状态物理写入本地硬盘! (防止游戏闪退导致没存上)
-		SaveDataToDisk();
-	}
-}
-
-
-/**
- * GetLastSelectedWeapon
- *
- * 获取当前账号上次选中的武器名
- * @param BackpackSlot 背包槽位（1 或 2）
- */
-FString UAccountSubsystem::GetLastSelectedWeapon(int32 BackpackSlot)
-{
-	if (!CurrentLoggedInUser.IsEmpty() && AccountData.Contains(CurrentLoggedInUser))
-	{
-		return BackpackSlot == 1 ? AccountData[CurrentLoggedInUser].LastSelectedWeapon1 : AccountData[CurrentLoggedInUser].LastSelectedWeapon2;
-	}
-	return TEXT("");
-}
-
-
-/**
- * SaveLastSelectedWeapon
- *
- * 实时保存当前账号选中的武器名到硬盘
- * @param BackpackSlot 背包槽位（1 或 2）
- * @param WeaponRowName 武器行名
- */
-void UAccountSubsystem::SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName)
-{
-	if (!CurrentLoggedInUser.IsEmpty() && AccountData.Contains(CurrentLoggedInUser))
-	{
-		if (BackpackSlot == 1) AccountData[CurrentLoggedInUser].LastSelectedWeapon1 = WeaponRowName;
-		else if (BackpackSlot == 2) AccountData[CurrentLoggedInUser].LastSelectedWeapon2 = WeaponRowName;
-
-		SaveDataToDisk(); // 立刻存盘
-	}
-}
-
-
-// ==========================================
-// 5. 调试/测试接口
-// ==========================================
-
-/**
- * MockLoginForTesting
- *
- * 执行伪装登录逻辑，专供跳过登录页面的测试使用
- * 1. 生成一个四位随机十六进制后缀的名字（如 "TestUser_A3F1"）
- *    多开客户端时，每个窗口都会获得不同的身份
- * 2. 构造一个临时的档案袋
- * 3. 将当前窗口的登录人设置为这个临时账号
- * 4. 故意不调用 SaveDataToDisk()
- *    临时测试账号只存在于本次运行的内存中
- */
 void UAccountSubsystem::MockLoginForTesting()
 {
 	// 1. 生成一个四位随机十六进制后缀的名字，例如 "TestUser_A3F1"
 	// 这样多开客户端时，每个窗口都会获得不同的身份，联机逻辑(如踢人)就不会因重名而崩溃
-	FString MockName = FString::Printf(TEXT("TestUser_%04X"), FMath::RandRange(0, 0xFFFF));
+	const FString MockName = FString::Printf(TEXT("TestUser_%04X"), FMath::RandRange(0, 0xFFFF));
 
-	// 2. 构造一个临时的档案袋，注入内存大账本中
-	if (!AccountData.Contains(MockName))
-	{
-		FAccountRecord DummyRecord(MockName, TEXT("DebugPassword"));
-		DummyRecord.bIsOnline = true; // 直接强制上锁为在线状态
-		// 赋予一个默认角色，防止进入对战读取偏好时崩溃
-		DummyRecord.LastSelectedCharacter = TEXT("BaseWarrior");
-
-		AccountData.Add(MockName, DummyRecord);
-	}
-
-	// 3. 将当前窗口的登录人设置为这个临时账号
+	// 2. 把当前窗口的登录人设置为这个临时账号
 	CurrentLoggedInUser = MockName;
 
-	// 4. 【核心细节】: 我们故意【不调用】SaveDataToDisk()!
-	// 这样临时测试账号只存在于本次运行的内存中，关闭游戏后自动销毁，绝不污染真实存档
+	// 3. 【架构升级】同步在 Repository 里创建一条空 Record, 让偏好查询/写入链路自洽
+	//
+	// 设计动机 (2026-07-03 bug fix):
+	//   - 之前 MockLogin 只写 Session.CurrentLoggedInUser, 不写 Repository.AccountRecords
+	//   - 导致 AccountService::GetLastSelectedWeapon(...) 永远返回 "" (Record 找不到)
+	//   - 房间页面 InitDefaultWeapons 拿不到默认武器 → PC->Server_SelectLoadout 传空串
+	//   - GM 兜底 "Knife" → DT_WeaponInfo 找不到 Knife 行 → 武器不显示
+	//
+	// 现在做法:
+	//   - 利用 Repository 自愈式 Save (Record 不存在则自动创建)
+	//   - 模拟"用户首次登录, 系统自动建档"的真实业务流
+	//   - 因为 MockName 是内存临时账号, 关闭游戏后随进程销毁, 不污染真实存档
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (ULocalAccountRepository* Repo = GI->GetSubsystem<ULocalAccountRepository>())
+		{
+			// 触发自愈式 Save, 自动建档 (空字符串 = "尚未选择")
+			Repo->SaveLastSelectedCharacter(MockName, TEXT(""));
+			Repo->SaveLastSelectedWeapon(MockName, 1, TEXT(""));
+			Repo->SaveLastSelectedWeapon(MockName, 2, TEXT(""));
 
+			UE_LOG(LogTemp, Log,
+				TEXT("[AccountSession] MockLoginForTesting: 已在 Repository 创建临时 Record (User='%s')"),
+				*MockName);
+		}
+	}
+
+	// 4. 【核心细节】: 我们故意【不调用】任何 SaveDataToDisk()
+	// 临时测试账号只存在于本次运行的内存中, 关闭游戏后自动销毁, 绝不污染真实存档
 	if (GEngine)
 	{
-		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green, FString::Printf(TEXT("[测试模式] 分配临时身份: %s"), *MockName));
+		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Green,
+			FString::Printf(TEXT("[测试模式] 分配临时身份: %s"), *MockName));
 	}
 }
 
 
-/**
- * GetAccountRecord
- *
- * 获取玩家档案的安全只读指针
- * @param AccountName 账号名
- * @return FAccountRecord 指针（找不到返回 nullptr）
- */
+// ==========================================
+// 4. 兼容占位
+// ==========================================
+
 const FAccountRecord* UAccountSubsystem::GetAccountRecord(const FString& AccountName) const
 {
-	return AccountData.Find(AccountName);
-}
-
-
-/**
- * GetSaveSlotName
- *
- * 计算当前客户端窗口对应的存档槽名
- * 用 GameInstance 的索引区分不同窗口，实现多窗口独立存档
- * PIE 多开: GI->GetIndex() 返回 0, 1, 2...
- * 打包多开: 每个独立进程各自从 0 开始
- */
-FString UAccountSubsystem::GetSaveSlotName() const
-{
-	UWorld* World = GetWorld();
-	const int32 UniqueId = (World && World->GetFirstPlayerController())
-		? World->GetFirstPlayerController()->GetUniqueID()
-		: 0;
-	return FString::Printf(TEXT("LocalAccountDataSlot_%d"), UniqueId);
+	// 旧接口已废弃: 真实查询请走 ULocalAccountRepository::FindRecord
+	// 这里返回 nullptr 是为了让旧蓝图"if (Record != nullptr)" 逻辑不会崩
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[AccountSession] GetAccountRecord 已废弃, 请改用 ULocalAccountRepository::FindRecord"));
+	return nullptr;
 }

@@ -33,30 +33,26 @@ void UMetalSlugGameInstance::Init()
 	UE_LOG(LogGameFlow, Log, TEXT("[GameInstance] 第一阶段完成：所有 Subsystem 已 Initialize"));
 
 	// ==========================================
-	// 第二阶段: 编排启动序列 (大厂核心模式)
+	// 第二阶段: 大厂编排层 (大厂 P0 修复 2026.07.03)
 	// ==========================================
-	// 此时:
-	// - 所有 Subsystem 已就绪
-	// - UIViewService 已订阅 GameFlow::OnStateChanged
-	// - UIViewService 已同步初始状态 (但拿到的是 PreLogin, 不显示任何面板)
+	// 重大修复:
+	//   旧方案在此处主动调 GameFlowSubsystem::BootToLogin()
+	//   但 Subsystem::Initialize 内部已经把 BootToLogin 删除 (时机问题)
+	//   现在改由 PostLoadMapWithWorld 统一调度 (时序保证 World 已加载)
 	//
-	// 我们主动触发 PreLogin → Login 转换:
-	// - GameFlowSubsystem::BootToLogin() 内部调用 TransitToState(Login)
-	// - TransitToState 广播 OnStateChanged(Login)
-	// - UIViewService 收到事件 → 在 StateToPanelMap 中查找 Login 对应面板
-	// - 调用 ShowPanel(Login) → 显示 LoginPage 蓝图
+	// 如果在这里调 BootToLogin, 会触发 TransitToState(Login) →
+	//   HandleStateEntry(Login) 会 OpenLevel("L_Login") (若当前不在 Login 地图)
+	//   → 打开登录地图, 玩家看到登录页
 	//
-	// 这就是大厂 Single Source of Truth: 一个事件驱动所有 UI
-
-	if (UGameFlowSubsystem* FlowSubsystem = GetSubsystem<UGameFlowSubsystem>())
-	{
-		UE_LOG(LogGameFlow, Log, TEXT("[GameInstance] 第二阶段：触发 BootToLogin (PreLogin → Login)"));
-		FlowSubsystem->BootToLogin();
-	}
-	else
-	{
-		UE_LOG(LogGameFlow, Error, TEXT("[GameInstance] 未找到 GameFlowSubsystem！无法启动游戏流程"));
-	}
+	// 但 PIE 入口是战斗地图时 (Japanese_Temple_Demo), OpenLevel 会切图
+	//   → 新 World 也会走 PostLoadMapWithWorld → BootToLogin
+	//   → 这是冗余触发, 且可能在切图过程中 UI 闪烁
+	//
+	// 大厂方案: 让 PostLoadMapWithWorld (单一入口) 负责启动
+	//          GameInstance 不再主动 Boot (避免重复)
+	// ==========================================
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[GameInstance] 第二阶段：状态启动已统一迁移至 PostLoadMapWithWorld (大厂 P0 修复 2026.07.03)"));
 
 	UE_LOG(LogGameFlow, Log, TEXT("[GameInstance] 启动编排完成"));
 }

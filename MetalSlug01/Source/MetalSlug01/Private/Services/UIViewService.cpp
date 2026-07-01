@@ -1,4 +1,4 @@
-// 版权声明：在项目设置的描述页面填写您的版权信息。
+﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 #include "Services/UIViewService.h"
 #include "Systems/GameFlowSubsystem.h"
@@ -62,15 +62,16 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 		LANRoomConfig.InputMode = EUIInputMode::UIOnly;
 		PanelConfigs.Add(EUIPanel::LANRoom, LANRoomConfig);
 
-		// RoomInside 面板配置 (房间内等待)
-		FPanelConfig RoomInsideConfig;
-		if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Login/WBP_RoomInsidePage.WBP_RoomInsidePage_C")))
-		{
-			RoomInsideConfig.WidgetClass = CLS;
-		}
-		RoomInsideConfig.bPreloadOnInit = false;
-		RoomInsideConfig.InputMode = EUIInputMode::UIOnly;
-		PanelConfigs.Add(EUIPanel::RoomInside, RoomInsideConfig);
+		// 【大厂 P0 修复 2026.07.03】RoomInside 面板由 RoomPlayerController 接管创建
+		// ==========================================
+		// 旧设计: UIViewService 也创建 RoomInside, 导致 RoomPC 又创建一遍 → 重复 UI
+		// 新设计: UIViewService 不创建 RoomInside, 完全交给 RoomPlayerController 负责
+		//   → RoomInside UI 与 RoomPC 的聊天消息系统绑定紧密 (AddChatMessage 等)
+		//   → RoomPC 自己创建 + 自己管理生命周期, 避免跨服务同步状态
+		// ==========================================
+		// 注意: 不再添加 PanelConfigs[EUIPanel::RoomInside]
+		//       不再添加 StateToPanelMap[EMatchState::InRoom]
+		//       RoomPC::OnFlowStateChanged(InRoom) 是唯一创建入口
 
 		// BattleHUD 面板配置 (战斗 HUD)
 		FPanelConfig BattleHUDConfig;
@@ -83,10 +84,11 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 		PanelConfigs.Add(EUIPanel::BattleHUD, BattleHUDConfig);
 
 		// 状态 → 面板映射
+		// 【大厂 P0 修复 2026.07.03】InRoom 不再映射到 RoomInside (由 RoomPC 接管)
 		StateToPanelMap.Add(EMatchState::Login, EUIPanel::Login);
 		StateToPanelMap.Add(EMatchState::MainMenu, EUIPanel::MainMenu);
 		StateToPanelMap.Add(EMatchState::MainLobby, EUIPanel::LANRoom);
-		StateToPanelMap.Add(EMatchState::InRoom, EUIPanel::RoomInside);
+		// 故意不添加: InRoom → RoomInside (RoomPlayerController 负责创建)
 	}
 
 	// 订阅 GameFlow 状态变化
@@ -103,47 +105,41 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 			UE_LOG(LogUI, Log, TEXT("[UIViewService] OnStateChanged + OnInterrupted 订阅成功, CurrentState=%d"),
 				(int32)FlowSubsystem->GetCurrentState());
 
-			// 【大厂核心修复 2026.06.28】订阅后立即同步当前状态
-			// 问题:
-			//   GameFlowSubsystem::Initialize → BootToLogin → Broadcast(Login) 发生在
-			//   UIViewService::Initialize 完成订阅之前 → UIViewService 错过 BootToLogin 广播
-			//   PostLoadMapWithWorld (路径 B 延迟同步) 也因为时序问题未触发
-			//   → 玩家永远看不到登录页
+			// ==========================================
+			// 【大厂 P0 修复 2026.07.03】删除 Initialize 阶段的"立即同步"逻辑
+			// ==========================================
+			// 旧代码 (大厂事故复盘 2026.07.03):
+			//   Initialize 阶段主动调 ShowPanelWhenPCReady 创建 widget
+			//   此时 PC 可能未就绪, 即使 PC 存在, GetWorld() 返回的是 GameInstance 关联的"当前 World"
+			//   在 PIE 启动过程中, "当前 World"可能是 Editor World 或 半初始化的 PIE World
+			//   → 创建的 widget 绑到错误的 World
+			//   → widget 加入了错误 World 的 GameViewport
+			//   → 当真正的 PIE World 完全加载, OnGameFlowStateChanged 再次触发
+			//   → ShowPanelWhenPCReady 守卫看到 ActivePanel==Panel && bWidgetStillValid=true
+			//   → 跳过 ExecuteShowPanel, 玩家永远看不到 LoginPage (widget 在错误 World 中)
 			//
-			// 方案: 订阅后立即查询当前状态，如果当前状态需要面板，直接拉起
-			//       这是"观察者模式"的最佳实践: 订阅后主动同步初始状态
-			EMatchState CurrentState = FlowSubsystem->GetCurrentState();
-			if (EUIPanel* PanelPtr = StateToPanelMap.Find(CurrentState))
-			{
-				// 【大厂核心修复 2026.06.28】用 ShowPanelWhenPCReady 包装
-				// PC 可能尚未就绪，由 ShowPanelWhenPCReady 负责等待
-				ShowPanelWhenPCReady(*PanelPtr);
-
-				// 【大厂核心修复 2026.06.28 - 补充】
-				// 如果 ShowPanelWhenPCReady 设置了 PendingShowPanel（PC 还未就绪），
-				// 此时我们在 Initialize 中，PC 大概率已可用。直接清掉定时器并同步一次。
-				if (PendingShowPanel != EUIPanel::None)
-				{
-					UWorld* World = GetWorld();
-					if (World) World->GetTimerManager().ClearTimer(PCReadyTimerHandle);
-					PCReadyCheckCount = 0;
-					ExecuteShowPanel(PendingShowPanel);
-					PendingShowPanel = EUIPanel::None;
-				}
-			}
-			else if (CurrentState == EMatchState::Battleing)
-			{
-				// Battleing 状态: 隐藏所有 UI（由 MyGameHUD 处理 HUD 显示）
-				HideAllPanels();
-				SetInputMode(EUIInputMode::GameOnly);
-			}
-
-			// 【大厂标准】在 Subsystem 启动时预创建高频面板（避免战斗中卡顿）
-			PreloadConfiguredPanels();
+			// 新规则 (Single Source of Truth):
+			//   1. Initialize 只挂管线 (订阅 OnStateChanged)
+			//   2. 不创建任何 widget, 不预加载任何面板
+			//   3. 状态推进完全由 OnGameFlowStateChanged 驱动
+			//   4. OnGameFlowStateChanged 通过 PostLoadMapWithWorld 触发
+			//      → 此时 World 已就绪, PC 已 ready, 100% 能正确拉起
+			//   5. 跨 World 复用检查由 ShowPanelWhenPCReady 守卫承担
+			//      (检查 widget 是否属于当前 World, 否则强制重建)
+			//
+			// 旧代码 (完全删除):
+			//   EMatchState CurrentState = FlowSubsystem->GetCurrentState();
+			//   if (EUIPanel* PanelPtr = StateToPanelMap.Find(CurrentState))
+			//   {
+			//       ShowPanelWhenPCReady(*PanelPtr);
+			//       ...
+			//   }
+			//   PreloadConfiguredPanels();  // ← 同样删除 (PC 未就绪)
+			// ==========================================
 		}
 	}
 
-	UE_LOG(LogUI, Log, TEXT("[UIViewService] 初始化完成"));
+	UE_LOG(LogUI, Log, TEXT("[UIViewService] 初始化完成 (状态推进完全由 OnGameFlowStateChanged 驱动)"));
 }
 
 void UUIViewService::Deinitialize()
@@ -174,6 +170,14 @@ void UUIViewService::Deinitialize()
 	}
 	PreloadedWidgets.Empty();
 
+	// 【大厂 P0 修复 v4 2026.07.03】重置全部状态, 防止下次 PIE 启动时残留
+	//   旧设计只重置 ActiveWidget, 但 ActivePanel/PendingShowPanel 仍残留
+	//   → 下次 PIE: ActivePanel==Login && bWidgetStillValid==true(假阳性) → 守卫拦截 → UI 不显示
+	ActivePanel = EUIPanel::None;
+	PendingShowPanel = EUIPanel::None;
+	PCReadyCheckCount = 0;
+	bIsInInterrupted = false;
+
 	Super::Deinitialize();
 }
 
@@ -191,44 +195,68 @@ void UUIViewService::ShowPanelWhenPCReady(EUIPanel Panel)
 	if (Panel == EUIPanel::None) return;
 
 	// ==========================================
-	// 【DEBUG-SET-4-C】ShowPanel 守卫检查: 这次走到 Show 分支还是被守卫跳过？
+	// 【大厂 P0 修复 v4 2026.07.03】彻底重构守卫: 用 IsInViewport 作为唯一"已显示"凭证
 	// ==========================================
+	// 旧问题 (v3):
+	//   bWidgetInCurrentWorld = (Widget->GetWorld() == CurrentWorld)
+	//   → 但 UE 5.6 的 UUserWidget 并不强绑 World (Epic 官方: "user widgets are never bound to a world")
+	//   → 即使在错误 World 创建, 仍可能 GetWorld()==CurrentWorld
+	//   → 守卫永远命中, ExecuteShowPanel 永远走不到 → Login UI 永远不显示
+	//
+	// 大厂架构真理:
+	//   唯一可靠判断"widget 已显示"的凭证 = IsInViewport() == true
+	//   - IsValidLowLevel()==true 只是"对象没死", 不能证明"已显示"
+	//   - GetWorld()==CurrentWorld 只是"世界一致", 不能证明"已显示"
+	//   - 只有 IsInViewport()==true 才能证明"真的在 viewport 中"
+	//
+	// 新守卫:
+	//   bWidgetReallyShown = IsValidLowLevel() && IsInViewport()
+	//   若 ActivePanel==Panel && bWidgetReallyShown → 跳过 (用户已在看 UI)
+	//   否则 → 走 ExecuteShowPanel (强制重建/重 Add)
+	// ==========================================
+	UWorld* CurrentWorld = GetWorld();
+
+	const bool bObjectAlive = ActiveWidget && ActiveWidget->IsValidLowLevel();
+	const bool bWidgetReallyShown = bObjectAlive && ActiveWidget->IsInViewport();
+	const bool bWidgetInSameWorld = bObjectAlive && ActiveWidget->GetWorld() == CurrentWorld;
+
+	// 【DEBUG-SET-4-C】日志: 增加 IsInViewport 字段 (核心诊断点)
 	UE_LOG(LogTemp, Error,
-		TEXT("[DEBUG-S4-C][ShowPanelWhenPCReady] PID=%u WorldName=%s Panel=%d ActivePanel=%d bWidgetStillValid=%d ActiveWidgetIsInViewport=%d"),
+		TEXT("[DEBUG-S4-C][ShowPanelWhenPCReady] PID=%u WorldName=%s Panel=%d ActivePanel=%d "
+			 "bObjectAlive=%d bWidgetReallyShown=%d bWidgetInSameWorld=%d "
+			 "ActiveWidgetWorld=%s CurrentWorld=%s"),
 		FPlatformProcess::GetCurrentProcessId(),
-		*GetWorld()->GetName(),
+		CurrentWorld ? *CurrentWorld->GetName() : TEXT("NULL"),
 		(int32)Panel,
 		(int32)ActivePanel,
-		(ActiveWidget && ActiveWidget->IsValidLowLevel()) ? 1 : 0,
-		(ActiveWidget && ActiveWidget->IsInViewport()) ? 1 : 0);
+		bObjectAlive ? 1 : 0,
+		bWidgetReallyShown ? 1 : 0,
+		bWidgetInSameWorld ? 1 : 0,
+		bObjectAlive && ActiveWidget->GetWorld() ? *ActiveWidget->GetWorld()->GetName() : TEXT("NULL"),
+		CurrentWorld ? *CurrentWorld->GetName() : TEXT("NULL"));
 
-	// ==========================================
-	// 【大厂 P0 修复 v2】Widget 损坏检测
-	// ==========================================
-	// 场景: BroadcastNetworkFailure (?closed) 触发 BeginTearingDown,
-	//       OnGameFlowStateChanged(3) 被调用 → ShowPanelWhenPCReady(3)
-	//       此时 ActiveWidget 已被 Slate::InvalidateAllWidgets 标记失效，
-	//       但 ActivePanel 仍为 3。
-	//       如果仅用 "ActivePanel == Panel" 做守卫，会跳过 ExecuteShowPanel，
-	//       导致 ActiveWidget 永远为 null，UI 消失。
-	// 修复: 即使目标 Panel 与当前相同，也检查 Widget 是否有效，
-	//       无效则强制重建。
-	// ==========================================
-	const bool bWidgetStillValid = ActiveWidget && ActiveWidget->IsValidLowLevel();
+	// 【大厂 P0 修复 v4】跨 World 缓存清理 (即使对象"看起来活着")
+	// 场景: PreloadedWidgets 里残留旧 World 创建的 widget
+	//       这些 widget 当前可能在 IsValidLowLevel 但 IsInViewport==false (世界已切换)
+	PurgePreloadedWidgetsForCurrentWorld();
 
-	// 【大厂 P0 修复 v2】Widget 损坏时强制重建（即使 Panel ID 相同）
-	if (ActivePanel == Panel && !bWidgetStillValid)
+	// 【大厂 P0 修复 v4】核心守卫: 只有"真的在 viewport 中"才算已显示
+	if (ActivePanel == Panel && bWidgetReallyShown)
 	{
-		UE_LOG(LogUI, Log,
-			TEXT("[UIViewService] ShowPanelWhenPCReady: Widget 已损坏但 ActivePanel 相同，强制重建 Panel=%d"),
+		UE_LOG(LogUI, Verbose,
+			TEXT("[UIViewService] ShowPanelWhenPCReady: Panel=%d 已在 viewport 中显示, 跳过 (幂等保护)"),
 			(int32)Panel);
-		// 不 return，继续走 ExecuteShowPanel 重建
+		return;
 	}
 
-	// 相同面板守卫: 仅当 Widget 有效时才跳过
-	if (ActivePanel == Panel && bWidgetStillValid)
+	// 【大厂 P0 修复 v4】自愈: 状态匹配但 widget 未显示 → 强制重建
+	if (ActivePanel == Panel && !bWidgetReallyShown && bObjectAlive)
 	{
-		return;
+		UE_LOG(LogUI, Warning,
+			TEXT("[UIViewService] ShowPanelWhenPCReady: Panel=%d 状态匹配但 widget 未显示 (IsInViewport=false), 强制销毁重建"),
+			(int32)Panel);
+		DestroyActivePanel();
+		// 不 return, 继续走 ExecuteShowPanel
 	}
 
 	// PC 就绪检查同上
@@ -323,10 +351,11 @@ void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 	// ==========================================
 	// 【DEBUG-SET-4-D】真正进入 Show 逻辑: 即将销毁旧面板+显示新面板
 	// ==========================================
+	UWorld* CurrentWorld = GetWorld();
 	UE_LOG(LogTemp, Error,
-		TEXT("[DEBUG-S4-D][ExecuteShowPanel] PID=%u WorldName=%s Panel=%d HasPreloaded=%d"),
+		TEXT("[DEBUG-SET-4-D][ExecuteShowPanel] PID=%u WorldName=%s Panel=%d HasPreloaded=%d"),
 		FPlatformProcess::GetCurrentProcessId(),
-		*GetWorld()->GetName(),
+		CurrentWorld ? *CurrentWorld->GetName() : TEXT("NULL"),
 		(int32)Panel,
 		PreloadedWidgets.Contains(Panel) ? 1 : 0);
 
@@ -335,6 +364,19 @@ void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 
 	// 优先从预创建缓存拿
 	UUserWidget* WidgetToShow = PreloadedWidgets.FindRef(Panel);
+
+	// 【大厂 P0 修复 2026.07.03】跨 World 检查
+	// 缓存里的 widget 可能是旧 World 的, 即使存在也不能用
+	// 这种情况在 PIE 重启 / 跨图加载时常见
+	if (WidgetToShow && (WidgetToShow->GetWorld() != CurrentWorld || !WidgetToShow->IsValidLowLevel()))
+	{
+		UE_LOG(LogUI, Warning,
+			TEXT("[UIViewService] ExecuteShowPanel: 预创建 widget 跨 World 或失效 (Panel=%d), 清除缓存走现场创建路径"),
+			(int32)Panel);
+		PreloadedWidgets.Remove(Panel);
+		WidgetToShow = nullptr;
+	}
+
 	if (!WidgetToShow)
 	{
 		// 缓存中没有，当场创建
@@ -351,6 +393,21 @@ void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 
 	ActiveWidget->AddToViewport();
 	ActiveWidget->SetVisibility(ESlateVisibility::Visible);
+
+	// 【大厂 P0 修复 v4 2026.07.03】AddToViewport 后立即验证
+	//   若 IsInViewport 仍为 false, 说明 Slate 状态异常 (InvalidateAllWidgets 时序竞争)
+	//   强制二次 AddToViewport 兜底
+	if (!ActiveWidget->IsInViewport())
+	{
+		UE_LOG(LogUI, Warning,
+			TEXT("[UIViewService] ExecuteShowPanel: AddToViewport 后仍未显示 (Panel=%d), 二次重试"),
+			(int32)Panel);
+		ActiveWidget->AddToViewport();
+	}
+
+	UE_LOG(LogUI, Log,
+		TEXT("[DEBUG-S4-E][ExecuteShowPanel-Show] Panel=%d Widget=%s IsInViewport=%d"),
+		(int32)Panel, *ActiveWidget->GetName(), ActiveWidget->IsInViewport() ? 1 : 0);
 
 	// 应用输入模式
 	if (FPanelConfig* Config = PanelConfigs.Find(Panel))
@@ -402,14 +459,45 @@ void UUIViewService::OnGameFlowStateChanged(EMatchState NewState)
 	// ==========================================
 	// 【DEBUG-SET-4-A】GameFlow 状态变化: 谁动了 UI？
 	// ==========================================
+	UWorld* CurrentWorld = GetWorld();
 	UE_LOG(LogTemp, Error,
-		TEXT("[DEBUG-S4-A][OnGameFlowStateChanged] PID=%u WorldName=%s NewState=%d ActivePanel=%d ActiveWidget=%p ActiveWidgetIsInViewport=%d"),
+		TEXT("[DEBUG-S4-A][OnGameFlowStateChanged] PID=%u WorldName=%s NewState=%d ActivePanel=%d ActiveWidget=%p ActiveWidgetIsInViewport=%d ActiveWidgetWorld=%s"),
 		FPlatformProcess::GetCurrentProcessId(),
-		*GetWorld()->GetName(),
+		CurrentWorld ? *CurrentWorld->GetName() : TEXT("NULL"),
 		(int32)NewState,
 		(int32)ActivePanel,
 		ActiveWidget.Get(),
-		(ActiveWidget && ActiveWidget->IsInViewport()) ? 1 : 0);
+		(ActiveWidget && ActiveWidget->IsInViewport()) ? 1 : 0,
+		(ActiveWidget && ActiveWidget->GetWorld()) ? *ActiveWidget->GetWorld()->GetName() : TEXT("NULL"));
+
+	// ==========================================
+	// 【大厂 P0 修复 2026.07.03】World 切换检测: 销毁任何跨 World 残留
+	// ==========================================
+	// 场景: PIE 启动/重开, 旧 World 的 widget 残留在 UIViewService 中
+	//       (之前是 Editor World 的 widget, 之后 PIE 创建新 World, 但 ActiveWidget 还指向 Editor World 的 widget)
+	// 修复: 任何 GameFlow 状态变化时, 检测 ActiveWidget 是不是当前 World 的, 不是就清掉
+	//
+	// 为什么在 OnGameFlowStateChanged 里做 (而不是只 ShowPanelWhenPCReady)?
+	//   ShowPanelWhenPCReady 守卫只针对"目标 Panel == ActivePanel"的情况
+	//   但 PostLoadMapWithWorld 第一次 broadcast (NewState=Login, ActivePanel=None) 时不会触发守卫
+	//   ActiveWidget 此时可能是旧 World 的脏数据, 不清理就会用脏数据 CreateAndShowPanel
+	// ==========================================
+	if (ActiveWidget && ActiveWidget->IsValidLowLevel())
+	{
+		UWorld* WidgetWorld = ActiveWidget->GetWorld();
+		if (WidgetWorld != CurrentWorld)
+		{
+			UE_LOG(LogUI, Warning,
+				TEXT("[UIViewService] OnGameFlowStateChanged: 检测到跨 World widget 残留 (WidgetWorld=%s, CurrentWorld=%s), 主动销毁"),
+				WidgetWorld ? *WidgetWorld->GetName() : TEXT("NULL"),
+				CurrentWorld ? *CurrentWorld->GetName() : TEXT("NULL"));
+			// 强制销毁, 不走 DestroyActivePanel (它会调 SetVisibility, 但 widget 在旧 World 已失效)
+			ActiveWidget = nullptr;
+			ActivePanel = EUIPanel::None;
+			// 同步清理 PreloadedWidgets
+			PurgePreloadedWidgetsForCurrentWorld();
+		}
+	}
 
 	// 【大厂可观测性】OnScreenDebugMessage 不受控制台日志过滤器影响，确保随时可见
 	if (GEngine)
@@ -445,6 +533,27 @@ void UUIViewService::OnGameFlowStateChanged(EMatchState NewState)
 	{
 		// 【大厂核心修复】用 ShowPanelWhenPCReady 包装，确保 PC 未就绪时也能正确等待
 		ShowPanelWhenPCReady(*PanelPtr);
+
+		// ==========================================
+		// 【大厂 P0 修复 v4 2026.07.03】终极防御性自愈 (Last-Resort Reconciliation)
+		// ==========================================
+		// 场景: 即便 ShowPanelWhenPCReady 全部走完, ActiveWidget 仍可能处于
+		//       "对象存在 + ActivePanel==Panel + IsInViewport==false" 的诡异状态
+		// 根因: 可能是 Slate 在某帧 InvalidateAllWidgets 导致 widget 被踢出 viewport,
+		//       或 HUD BeginPlay 主动同步状态时序竞争
+		// 大厂模式: 同步广播路径末尾再做一次 Reconcile (协调/再对齐)
+		//          → 若 ActivePanel 匹配但 IsInViewport==false → 强制 AddToViewport
+		//          → 这是 State 触发的最后一道防线, 不依赖任何缓存
+		// ==========================================
+		if (ActiveWidget && ActiveWidget->IsValidLowLevel() &&
+			ActivePanel == *PanelPtr && !ActiveWidget->IsInViewport())
+		{
+			UE_LOG(LogUI, Warning,
+				TEXT("[UIViewService] Reconcile: ActivePanel=%d 但 widget 未显示, 强制 AddToViewport (Widget=%s)"),
+				(int32)*PanelPtr, *ActiveWidget->GetName());
+			ActiveWidget->AddToViewport();
+			ActiveWidget->SetVisibility(ESlateVisibility::Visible);
+		}
 	}
 	else if (NewState == EMatchState::Battleing)
 	{
@@ -517,11 +626,26 @@ void UUIViewService::CreateAndShowPanel(EUIPanel Panel)
 	InjectViewModelForPanel(Panel, NewWidget);
 
 	NewWidget->AddToViewport();
+
+	// 【大厂 P0 修复 v4 2026.07.03】AddToViewport 后立即验证
+	//   Slate::InvalidateAllWidgets 时序竞争可能导致 AddToViewport 后 IsInViewport 仍为 false
+	//   强制二次 AddToViewport 兜底
+	if (!NewWidget->IsInViewport())
+	{
+		UE_LOG(LogUI, Warning,
+			TEXT("[UIViewService] CreateAndShowPanel: AddToViewport 后仍未显示 (Panel=%d), 二次重试"),
+			(int32)Panel);
+		NewWidget->AddToViewport();
+	}
+
 	ActiveWidget = NewWidget;
 	ActivePanel = Panel;
 
 	SetInputMode(Config->InputMode);
 
+	UE_LOG(LogUI, Log,
+		TEXT("[DEBUG-S4-E][CreateAndShowPanel-Show] Panel=%d Widget=%s IsInViewport=%d"),
+		(int32)Panel, *NewWidget->GetName(), NewWidget->IsInViewport() ? 1 : 0);
 	UE_LOG(LogUI, Log, TEXT("[UIViewService] 现场创建并显示面板: %d"), (int32)Panel);
 }
 
@@ -622,6 +746,43 @@ void UUIViewService::DestroyActivePanel()
         ActiveWidget = nullptr;
     }
     ActivePanel = EUIPanel::None;
+}
+
+void UUIViewService::PurgePreloadedWidgetsForCurrentWorld()
+{
+    // 【大厂 P0 修复 2026.07.03】跨 World 残留清理
+    // 思路: 遍历 PreloadedWidgets, 移除所有"不属于当前 World"的 widget
+    // 这些 widget 是 PIE 启动前或上一个 PIE World 留下来的, 现在已经无效
+    UWorld* CurrentWorld = GetWorld();
+    if (!CurrentWorld) return;
+
+    TArray<EUIPanel> ToRemove;
+    for (const auto& Pair : PreloadedWidgets)
+    {
+        UUserWidget* Widget = Pair.Value;
+        if (!Widget || !Widget->IsValidLowLevel() || Widget->GetWorld() != CurrentWorld)
+        {
+            ToRemove.Add(Pair.Key);
+        }
+    }
+
+    for (EUIPanel Panel : ToRemove)
+    {
+        UUserWidget* Widget = PreloadedWidgets.FindRef(Panel);
+        if (Widget)
+        {
+            // 从 viewport 移除 (如果还在)
+            // 【修复 C4996 弃用警告 2026.07.03】RemoveFromViewport 已弃用, 改用 RemoveFromParent
+            if (Widget->IsInViewport())
+            {
+                Widget->RemoveFromParent();
+            }
+        }
+        PreloadedWidgets.Remove(Panel);
+        UE_LOG(LogUI, Log,
+            TEXT("[UIViewService] PurgePreloadedWidgetsForCurrentWorld: 清理 Panel=%d (跨 World)"),
+            (int32)Panel);
+    }
 }
 
 APlayerController* UUIViewService::GetLocalPlayerController() const

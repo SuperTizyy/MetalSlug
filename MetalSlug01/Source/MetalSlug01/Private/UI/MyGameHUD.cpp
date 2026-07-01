@@ -32,7 +32,15 @@
  * HUD 初始化入口
  * 1. 提前在后台创建所有游戏 HUD 并隐藏（对象池/预加载思维）
  * 2. 向 GameFlowSubsystem 订阅状态变化
- * 3. 防呆: 主动同步初始状态
+ *
+ * 【大厂 P0 修复 2026.07.03】移除主动同步初始状态
+ *   旧设计: BeginPlay 末尾调 OnGameFlowStateChanged(GetCurrentState())
+ *   问题: HUD 在 L_Login 地图的 BeginPlay 时, World 已就绪但 Slate 还未完成首次 paint
+ *         → OnGameFlowStateChanged → UIViewService ShowPanel → AddToViewport
+ *         → 紧接着 UE 的 InvalidateAllWidgets 把刚 Add 的 widget 踢出
+ *         → UI 永远不可见
+ *   新设计: 完全依赖 UIViewService::OnGameFlowStateChanged 的自愈/兜底
+ *         → HUD 不主动同步, 避免与 PostLoadMapWithWorld 的 broadcast 竞争
  */
 void AMyGameHUD::BeginPlay()
 {
@@ -50,8 +58,9 @@ void AMyGameHUD::BeginPlay()
 		{
 			FlowSubsystem->OnStateChanged.AddDynamic(this, &AMyGameHUD::OnGameFlowStateChanged);
 
-			// 防呆设计: 刚出生时主动问一下现在的状态，同步初始表现
-			OnGameFlowStateChanged(FlowSubsystem->GetCurrentState());
+			// 【大厂 P0 修复 2026.07.03】不再主动同步初始状态
+			//   由 UIViewService 通过 PostLoadMapWithWorld 路径 B 延迟 broadcast 兜底
+			//   HUD 不抢 World-ready 信号, 避免与 Slate InvalidateAllWidgets 时序竞争
 		}
 	}
 }

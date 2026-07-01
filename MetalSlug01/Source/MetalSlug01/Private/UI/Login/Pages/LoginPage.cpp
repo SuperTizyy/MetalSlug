@@ -152,8 +152,8 @@ void ULoginPage::OnLoginButtonClicked()
                 {
                 case EAccountLoginResult::Success:            return FText::FromString(TEXT("登录成功! 正在进入游戏..."));
                 case EAccountLoginResult::EmptyInput:         return FText::FromString(TEXT("账号或密码不能为空!"));
-                case EAccountLoginResult::AccountOnline:      return FText::FromString(TEXT("该账号已在其他地方登录!"));
                 case EAccountLoginResult::InvalidCredentials: return FText::FromString(TEXT("账号不存在或密码错误!"));
+                case EAccountLoginResult::AccountLocked:      return FText::FromString(TEXT("账号已被服务端锁定!"));
                 case EAccountLoginResult::InternalError:      return FText::FromString(TEXT("登录失败, 请稍后再试!"));
                 default:                                      return FText::FromString(TEXT("未知错误"));
                 }

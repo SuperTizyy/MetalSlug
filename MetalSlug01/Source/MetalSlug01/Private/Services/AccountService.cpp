@@ -1,12 +1,15 @@
-// 版权声明：在项目设置的描述页面填写您的版权信息。
-
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "Services/AccountService.h"
 #include "Systems/Account/AccountSubsystem.h"
+#include "Systems/Account/LocalAccountRepository.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "Engine/GameInstance.h"
 
+
 // ==========================================
-// 静态访问器
+// 1. 静态访问器
 // ==========================================
 
 UAccountService* UAccountService::Get(const UObject* WorldContextObject)
@@ -19,68 +22,63 @@ UAccountService* UAccountService::Get(const UObject* WorldContextObject)
 	return GI->GetSubsystem<UAccountService>();
 }
 
+
 // ==========================================
-// 业务接口
+// 2. 业务接口
 // ==========================================
 
 EAccountLoginResult UAccountService::Login(const FString& Username, const FString& Password)
 {
-	// 业务前置校验（V 层无感）
+	// 2.1 前置校验: 输入
 	if (Username.IsEmpty() || Password.IsEmpty())
 	{
 		return EAccountLoginResult::EmptyInput;
 	}
 
-	UGameInstance* GI = GetGameInstance();
-	if (!GI) return EAccountLoginResult::InternalError;
+	// 2.2 拿到 Repository (业务层)
+	ULocalAccountRepository* Repo = GetRepository();
+	if (!Repo) return EAccountLoginResult::InternalError;
 
-	UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>();
-	if (!AccountSub) return EAccountLoginResult::InternalError;
-
-	// 业务校验：账号是否在线
-	if (AccountSub->IsAccountOnline(Username))
-	{
-		return EAccountLoginResult::AccountOnline;
-	}
-
-	// 业务校验：账号密码是否正确
-	if (!AccountSub->TryLogin(Username, Password))
+	// 2.3 业务校验: 本地是否存在 + 密码是否匹配
+	// 【关键】这里不再做"账号是否在线" 的本地判断
+	// 因为双开客户端是独立 .sav, 本地判断必然错误, 应留给后端权威
+	if (!Repo->VerifyCredentials(Username, Password))
 	{
 		return EAccountLoginResult::InvalidCredentials;
 	}
 
-	// 登录成功：触发状态切换（V 层完全无感知）
-	OnLoginSuccess();
+	// 2.4 业务成功: 写会话 + 切状态
+	OnLoginSuccess(Username);
 	return EAccountLoginResult::Success;
 }
 
 bool UAccountService::Register(const FString& Username, const FString& Password)
 {
-	if (Username.IsEmpty() || Password.IsEmpty()) return false;
+	ULocalAccountRepository* Repo = GetRepository();
+	if (!Repo) return false;
 
-	UGameInstance* GI = GetGameInstance();
-	if (!GI) return false;
-
-	UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>();
-	if (!AccountSub) return false;
-
-	return AccountSub->TryRegister(Username, Password);
+	const EAccountRegisterResult Result = Repo->Register(Username, Password);
+	return Result == EAccountRegisterResult::Success;
 }
 
 void UAccountService::Logout()
 {
-	UGameInstance* GI = GetGameInstance();
-	if (!GI) return;
-
-	if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+	// 1. 清理会话 (纯内存, 不写硬盘)
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		AccountSub->Logout();
+		if (UAccountSubsystem* Session = GI->GetSubsystem<UAccountSubsystem>())
+		{
+			Session->ClearSession();
+		}
 	}
 
-	// 触发状态切换到 Login
-	if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+	// 2. 状态机回到 Login
+	if (UGameInstance* GI = GetGameInstance())
 	{
-		FlowSubsystem->TransitToState(EMatchState::Login);
+		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		{
+			FlowSubsystem->TransitToState(EMatchState::Login);
+		}
 	}
 }
 
@@ -88,77 +86,84 @@ FString UAccountService::GetCurrentUser() const
 {
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		if (UAccountSubsystem* Session = GI->GetSubsystem<UAccountSubsystem>())
 		{
-			return AccountSub->GetCurrentLoggedInUser();
+			return Session->GetCurrentLoggedInUser();
 		}
 	}
 	return TEXT("");
 }
 
+
 // ==========================================
-// 偏好查询（V 层无感地访问持久化偏好）
+// 3. 偏好查询 (委托给 Repository)
 // ==========================================
 
 FString UAccountService::GetLastSelectedCharacter() const
 {
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			return AccountSub->GetLastSelectedCharacter();
-		}
-	}
-	return TEXT("Default");
+	const FString User = GetCurrentUser();
+	if (User.IsEmpty()) return TEXT("Default");
+	ULocalAccountRepository* Repo = GetRepository();
+	return Repo ? Repo->GetLastSelectedCharacter(User) : TEXT("Default");
 }
 
 void UAccountService::SaveLastSelectedCharacter(const FString& CharacterName)
 {
-	if (UGameInstance* GI = GetGameInstance())
+	const FString User = GetCurrentUser();
+	if (User.IsEmpty()) return;
+	if (ULocalAccountRepository* Repo = GetRepository())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			AccountSub->SaveLastSelectedCharacter(CharacterName);
-		}
+		Repo->SaveLastSelectedCharacter(User, CharacterName);
 	}
 }
 
 FString UAccountService::GetLastSelectedWeapon(int32 BackpackSlot) const
 {
-	if (UGameInstance* GI = GetGameInstance())
-	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			return AccountSub->GetLastSelectedWeapon(BackpackSlot);
-		}
-	}
-	return TEXT("Default");
+	const FString User = GetCurrentUser();
+	if (User.IsEmpty()) return TEXT("Default");
+	ULocalAccountRepository* Repo = GetRepository();
+	return Repo ? Repo->GetLastSelectedWeapon(User, BackpackSlot) : TEXT("Default");
 }
 
 void UAccountService::SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName)
 {
-	if (UGameInstance* GI = GetGameInstance())
+	const FString User = GetCurrentUser();
+	if (User.IsEmpty()) return;
+	if (ULocalAccountRepository* Repo = GetRepository())
 	{
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
-		{
-			AccountSub->SaveLastSelectedWeapon(BackpackSlot, WeaponRowName);
-		}
+		Repo->SaveLastSelectedWeapon(User, BackpackSlot, WeaponRowName);
 	}
 }
 
+
 // ==========================================
-// 私有
+// 4. 私有工具
 // ==========================================
 
-void UAccountService::OnLoginSuccess()
+ULocalAccountRepository* UAccountService::GetRepository() const
 {
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
-		{
-			// 登录成功 → 跳转到主菜单状态
-			// UIViewService 监听状态变化 → 销毁 LoginPage + 创建 GameMenuPage
-			FlowSubsystem->TransitToState(EMatchState::MainMenu);
-		}
+		return GI->GetSubsystem<ULocalAccountRepository>();
+	}
+	return nullptr;
+}
+
+void UAccountService::OnLoginSuccess(const FString& Username)
+{
+	UGameInstance* GI = GetGameInstance();
+	if (!GI) return;
+
+	// 1) 写会话
+	if (UAccountSubsystem* Session = GI->GetSubsystem<UAccountSubsystem>())
+	{
+		Session->SetCurrentUser(Username);
+	}
+
+	// 2) 状态机跳转到主菜单
+	// UIViewService 监听状态变化 → 销毁 LoginPage + 创建 GameMenuPage
+	if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+	{
+		FlowSubsystem->TransitToState(EMatchState::MainMenu);
 	}
 }

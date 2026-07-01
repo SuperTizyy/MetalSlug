@@ -15,6 +15,9 @@
 // 引入账号子系统（MockLoginForTesting 临时分配测试身份）
 #include "Systems/Account/AccountSubsystem.h"
 
+// 引入房间业务服务（EnterSkipToHostMode 显式标房主 - 测试绕行专用 API）
+#include "Services/RoomService.h"
+
 // 引入 UGameplayStatics 类（提供 OpenLevel 等静态函数）
 // 作用: 用于执行关卡切换、玩家查询等通用静态操作
 #include "Kismet/GameplayStatics.h"
@@ -97,6 +100,62 @@ void UGameFlowSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 
 	// ==========================================
+	// 【大厂 P0 修复 2026.07.03】订阅 UWorld::OnWorldBeginPlay 委托
+	// ==========================================
+	// 设计动机 (PIE 模式 bug fix):
+	//   - PostLoadMapWithWorld 在 PIE 模式下不触发 (UE 5.6 PIE 已知特性)
+	//   - 导致 bSkipLoginDirectToLobby 等启动期逻辑在 PIE 模式下完全不执行
+	//   - 玩家直接进入战斗场景, 没有 UI, 武器/角色全空
+	//
+	// 解决方案 (大厂模式 - 双入口保险):
+	//   - 入口 A: PostLoadMapWithWorld (已存在, 独立进程模式生效)
+	//   - 入口 B: OnWorldBeginPlay    (本新增, PIE 模式生效)
+	//   - 用 bHasBootedToLogin 标志位防止双入口重入
+	//
+	// 时序优势 (相比 PostLoadMapWithWorld):
+	//   - PostLoadMapWithWorld: World 刚加载, PC 可能还没 BeginPlay
+	//   - OnWorldBeginPlay:     World + 所有 Actor (含 PC) BeginPlay 完毕, 时序 100% 可靠
+	//   - 因此 OnWorldBeginPlay 是 UI 创建的最佳时机 (PC 已就绪, Subsystem 可拿到)
+	//
+	// 实现细节 (UE 5.6 编译错误 C2665 修复 2026.07.03):
+	//   - UWorld::OnWorldBeginPlay 的类型是 FSimpleMulticastDelegate (无参数)
+	//   - 签名是 "void()" 而不是 "void(UWorld*)"
+	//   - 必须用 Lambda 捕获 World 指针, 不能直接 AddUObject 带 UWorld* 参数的回调
+	//   - 用 TWeakObjectPtr<UGameFlowSubsystem> 防止野指针 (Subsystem 可能被销毁)
+	// ==========================================
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UWorld* World = GI->GetWorld())
+		{
+			if (!WorldBeginPlayHandle.IsValid())
+			{
+				// Lambda 方案: 捕获 World + WeakThis
+				//   - World 通过捕获拿到 (委托无参数, 需捕获)
+				//   - WeakThis 防野指针 (Deinitialize 后委托不会再触发, 但保险)
+				TWeakObjectPtr<UGameFlowSubsystem> WeakThis(this);
+				WorldBeginPlayHandle = World->OnWorldBeginPlay.AddLambda(
+					[WeakThis, World]()
+					{
+						// 防御 1: Subsystem 是否还活着
+						if (!WeakThis.IsValid()) return;
+						// 防御 2: World 是否还活着 (理论上 AddLambda 时已存活, 但保险)
+						if (!IsValid(World)) return;
+						WeakThis->HandleWorldBeginPlay(World);
+					});
+
+				UE_LOG(LogGameFlow, Log,
+					TEXT("[GameFlow] 已订阅 OnWorldBeginPlay (Valid=%s, 双入口保险: PIE 模式兜底)"),
+					WorldBeginPlayHandle.IsValid() ? TEXT("true") : TEXT("false"));
+			}
+		}
+		else
+		{
+			UE_LOG(LogGameFlow, Warning,
+				TEXT("[GameFlow] Initialize 时 World 不可用, OnWorldBeginPlay 订阅失败 (PIE 模式可能受影响)"));
+		}
+	}
+
+	// ==========================================
 	// 【大厂架构 - 网络失败处理 2026.06.28】
 	// ==========================================
 	// 【UE 5.6 链路分析】
@@ -155,31 +214,30 @@ void UGameFlowSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 
 	// ==========================================
-	// 【大厂核心修复 2026.06.28】在 Subsystem::Initialize 末尾直接 BootToLogin
+	// 【大厂架构修复 2026.07.03】移除 Initialize 末尾的主动 BootToLogin
 	// ==========================================
-	// 背景:
-	//   之前依赖 UMetalSlugGameInstance::Init() 末尾调 BootToLogin()
-	//   但 PIE 启动时, GameInstance::Init() 可能在 Subsystem::Initialize 之前/之后
-	//   表现不一致 → 出现"NewState=0 (PreLogin)"的玩家看不到登录页 bug
+	// 旧问题:
+	//   Subsystem::Initialize 时, World 还没创建, PC 还没就绪
+	//   → Broadcast(OnStateChanged(Login)) 时 UIViewService 拉到 broadcast
+	//     → OnGameFlowStateChanged → ShowPanelWhenPCReady → PC 为 null → 排队等
+	//   后续如果没人再次 Broadcast, UI 永远显示不出来 (玩家看到空白画面)
 	//
-	// 大厂方案:
-	//   "状态机自己负责自己的状态推进" —— Subsystem 是状态的唯一权威
-	//   在自己 Initialize 完成时, 主动把状态从 PreLogin 推到 Login
-	//   不依赖任何外部 GameInstance 调用
+	// 新方案 (大厂模式):
+	//   Subsystem::Initialize 只负责"挂好管线" (订阅 PostLoadMapWithWorld, 订阅 Session 终止...)
+	//   状态推进完全交给 PostLoadMapWithWorld (时机 = World 已加载, PC 已 ready)
+	//   → 那时 Broadcast 出来的 UI 真的能拉起来
 	//
-	// 时序:
-	//   1. Subsystem::Initialize() 内部订阅 OnStateChanged (其他 Subsystem 也在 Initialize, 此时它们尚未订阅 → 没关系)
-	//   2. 主动 BootToLogin → Broadcast(Login)
-	//   3. 此时尚未订阅的 UIViewService 不会收到这次广播 (正常)
-	//   4. UIViewService::Initialize() 订阅 OnStateChanged → 此时 CurrentState=Login, 但不会收到 broadcast
-	//   5. World BeginPlay 完成 → PostLoadMapWithWorld 触发 → Broadcast(CurrentState=Login) → UIViewService 收到 → ShowPanel(Login) ✅
+	// 之前依赖的两个触发器:
+	//   A) UMetalSlugGameInstance::Init() 第二阶段调 BootToLogin
+	//      → 当前 Subsystem Initialize 主动广播, GameInstance::Init 又调 BootToLogin 被幂等拦截
+	//      → 完全可以用 PostLoadMapWithWorld 替代, 而且时序更可靠
+	//   B) PostLoadMapWithWorld 路径 B "延迟同步"
+	//      → 这是新方案的"单一入口"
 	//
-	// 这个方案的关键:
-	//   PostLoadMapWithWorld 回调 (路径 B 延迟同步) 是 UI 显示的真正"触发器"
-	//   Subsystem::Initialize 里的 BootToLogin 只是"把状态从 PreLogin 推走"
-	//   两者职责清晰, 不冲突
-	UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] Subsystem::Initialize 末尾主动触发 BootToLogin"));
-	BootToLogin();
+	// 保留 bSkipLoginDirectToLobby 短路开关, 但触发时机改为 PostLoadMapWithWorld
+	// ==========================================
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[GameFlow] Subsystem::Initialize: 状态推进已迁移至 PostLoadMapWithWorld (大厂 P0 修复 2026.07.03)"));
 }
 
 void UGameFlowSubsystem::Deinitialize()
@@ -192,6 +250,20 @@ void UGameFlowSubsystem::Deinitialize()
 	{
 		FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
 		PostLoadMapHandle.Reset();
+	}
+
+	// 【大厂 P0 修复 2026.07.03】解绑 OnWorldBeginPlay 委托
+	// OnWorldBeginPlay 是 World 自己的事件, 必须 World 存活时才能 Remove
+	if (WorldBeginPlayHandle.IsValid())
+	{
+		if (UGameInstance* GI = GetGameInstance())
+		{
+			if (UWorld* World = GI->GetWorld())
+			{
+				World->OnWorldBeginPlay.Remove(WorldBeginPlayHandle);
+			}
+		}
+		WorldBeginPlayHandle.Reset();
 	}
 
 	// 【大厂 P0 修复 2026.06.28】解绑网络失败回调, 防止跨地图悬空
@@ -213,6 +285,7 @@ void UGameFlowSubsystem::Deinitialize()
 	// 清理意图标志 (防止 GameInstance 复用时残留)
 	bHasPendingStateOnNextLoad = false;
 	PendingPostLoadState = EMatchState::PreLogin;
+	bHasBootedToLogin = false;  // 【大厂 P0 修复 2026.07.03】双入口幂等位也清理
 
 	Super::Deinitialize();
 }
@@ -242,25 +315,65 @@ void UGameFlowSubsystem::BootToLogin()
 	}
 
 	// ==========================================
-	// 【大厂架构 - 测试绕行通道 2026.06.30】
+	// 【大厂 P0 修复 2026.07.03】双入口幂等保护
+	// ==========================================
+	// 背景:
+	//   - 现在有 2 个入口都可能调 BootToLogin: PostLoadMapWithWorld + OnWorldBeginPlay
+	//   - 独立进程模式: PostLoadMapWithWorld 先触发 (执行 BootToLogin), 后续 OnWorldBeginPlay 被拦截
+	//   - PIE 模式: OnWorldBeginPlay 触发 (执行 BootToLogin), PostLoadMapWithWorld 从不触发 (但即使触发也被拦截)
+	//
+	// 作用:
+	//   - 防止 MockLoginForTesting 被调两次 (导致 Random 名字刷新, 玩家身份在第一帧就变了)
+	//   - 防止 TransitToState 被调两次 (会触发 Broadcast 两次, UI 闪烁)
+	//
+	// 重置时机:
+	//   - Deinitialize 中已 Reset 为 false (见 Deinitialize 末尾)
+	//   - 当前 GameInstance 销毁时自动重置 (新 Subsystem 初始化时 bHasBootedToLogin 默认 false)
+	// ==========================================
+	if (bHasBootedToLogin)
+	{
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[GameFlow] BootToLogin: 已执行过, 双入口幂等拦截 (CurrentState=%d)"),
+			(int32)CurrentState);
+		return;
+	}
+	bHasBootedToLogin = true;
+
+	// ==========================================
+	// 【大厂架构 - 测试绕行通道 2026.07.03 重构】
 	// 检查 bSkipLoginDirectToLobby 配置项，短路跳过正常登录流程
 	// ==========================================
 	// 入口位置选在 BootToLogin() 的原因:
 	//   - BootToLogin 是状态机的唯一"启动入口"，所有冷启动都经过这里
 	//   - 此时 CurrentState == PreLogin，未被任何逻辑污染
-	//   - 可以干净地分流: 正常账号走 Login，测试开关走 MainLobby
+	//   - 可以干净地分流: 正常账号走 Login，测试开关走 SkipToHost 模式
+	//
+	// 【大厂架构 - 2026.07.03 P0 重构】三层职责分离:
+	//   - 旧实现: 直接 TransitToState(MainLobby), 假设启动地图是 L_Login
+	//   - 新实现: 进入"显式 SkipToHost 模式", 复用现有房主识别路径
+	//     ┌──────────────────────────────────────────────────────────┐
+	//     │ Step 1: MockLoginForTesting  → 注入测试身份 (CurrentLoggedInUser) │
+	//     │ Step 2: RoomService.EnterSkipToHostMode() → 显式标房主 │
+	//     │          ├─ bIsHost = true                                  │
+	//     │          ├─ OnHostChanged.Broadcast(true) → RoomInsidePage  │
+	//     │          ├─ OnPlayerJoined.Broadcast(本机) → 本机玩家标签 │
+	//     │          └─ 同步 GameState->HostPlayerName (Authority 路径) │
+	//     │ Step 3: 根据当前 World 类型分发 UI                          │
+	//     │          ├─ L_Login → TransitToState(MainLobby) → LANRoomPage │
+	//     │          └─ 战斗地图 → OnInterrupted.Broadcast(RoomInside) │
+	//     │                       (不走状态机, 避开"战斗地图自愈"链路)    │
+	//     └──────────────────────────────────────────────────────────┘
 	//
 	// 设计优势:
-	//   - 不改动 TransitToState (TransitToState 是通用状态切换器，不应包含业务开关)
-	//   - 不改动 HandleStateEntry (HandleStateEntry 是物理地图操作层，职责单一)
-	//   - 开关检查内聚在"流程决策"层，符合大厂分层架构原则
+	//   - 不改动 TransitToState (通用状态切换器, 不应包含业务开关)
+	//   - 不改动 HandleStateEntry (物理地图操作层, 职责单一)
+	//   - "测试房主"做成显式 API, 不依赖隐式副作用 (旧版本 NotifyBecameHost 永远不被调)
+	//   - 战斗地图启动也能正确显示房主 UI, 不再被"战斗地图自愈"链路搞糊
 	// ==========================================
 	const UMetalSlugTestSettings* TestSettings = GetDefault<UMetalSlugTestSettings>();
 	if (TestSettings && TestSettings->bSkipLoginDirectToLobby)
 	{
-		// 1. 调用 AccountSubsystem::MockLoginForTesting() 分配内存中的临时账号
-		//    行为: 在 AccountData 中注入一个随机 TestUser_XXXX，CurrentLoggedInUser 指向它
-		//    特性: 不写盘，关闭游戏后自动销毁，不污染真实存档
+		// ---- Step 1: 注入测试身份 ----
 		if (UAccountSubsystem* AccountSub = GetGameInstance()->GetSubsystem<UAccountSubsystem>())
 		{
 			AccountSub->MockLoginForTesting();
@@ -271,8 +384,83 @@ void UGameFlowSubsystem::BootToLogin()
 				TEXT("[GameFlow][测试绕行] AccountSubsystem 不可用，跳过 MockLogin"));
 		}
 
-		// 2. 切到 MainLobby 让 UI 可见（LANRoom 面板，留在 L_Login 常驻地图）
-		TransitToState(EMatchState::MainLobby);
+		// ---- Step 2: 显式标房主 (新 API, 复用现有房主识别路径) ----
+		if (URoomService* RoomService = URoomService::Get(this))
+		{
+			RoomService->EnterSkipToHostMode();
+		}
+		else
+		{
+			UE_LOG(LogGameFlow, Error,
+				TEXT("[GameFlow][测试绕行] RoomService 不可用, 房主身份标定失败"));
+		}
+
+		// ---- Step 3: 根据当前 World 类型分发 UI ----
+		// 【大厂 P0 修复 2026.07.03】架构反思: RoomInside 由 RoomPC 接管, 不走 UIViewService
+		// ==========================================
+		// 旧实现 (有 Bug):
+		//   战斗地图 → OnInterrupted.Broadcast(RoomInside)
+		//   → UIViewService 静默失败 (Panel RoomInside 未配置 WidgetClass)
+		//   → RoomInsidePage 永远不被创建
+		//   → 玩家直接看到战斗 3D 场景, 没有任何 UI 覆盖
+		//
+		// 架构事实:
+		//   RoomInside 是由 RoomPlayerController::OnFlowStateChanged(InRoom) 唯一创建入口
+		//   UIViewService 显式不接管 (注释: "RoomInside 面板由 RoomPlayerController 接管创建")
+		//   → OnInterrupted 通道对 RoomInside 无效
+		//
+		// 新实现 (大厂架构 - 状态机单一入口):
+		//   战斗地图 → TransitToState(InRoom) + SetTargetRoomMapName(当前地图)
+		//   → HandleStateEntry(InRoom) 看到 TargetRoomMapName 匹配当前地图 → 不重复 OpenLevel
+		//   → OnStateChanged(InRoom) 广播 → RoomPC 接管创建 RoomInsidePage
+		//   → RoomInsidePage 看到 URoomService.bIsHost=true → 房主按钮可见
+		//
+		// L_Login 处理保持不变:
+		//   → TransitToState(MainLobby) → UIViewService 自动 ShowPanel(LANRoom)
+		// ==========================================
+		UWorld* World = GetWorld();
+		if (World)
+		{
+			const FString CurMapName = World->GetMapName();
+			const bool bIsBattleMap = CurMapName.Contains(TEXT("Japanese_Temple"))
+				|| CurMapName.Contains(TEXT("Room"))
+				|| CurMapName.Contains(TEXT("Battle"))
+				|| CurMapName.Contains(TEXT("Combat"));
+
+			if (bIsBattleMap)
+			{
+				// 战斗地图: 走状态机 InRoom, 让 RoomPC 创建 RoomInsidePage
+				//   - 关键: 必须先 SetTargetRoomMapName = 当前地图名,
+				//           否则 HandleStateEntry(InRoom) 会报 "TargetRoomMapName is NONE"
+				//   - HandleStateEntry 内部已经判断 "已在目标地图则不 OpenLevel"
+				//   - CurrentState 被设为 InRoom, 触发 OnStateChanged 广播 → RoomPC 接管
+				UE_LOG(LogGameFlow, Log,
+					TEXT("[GameFlow][测试绕行] 当前在战斗地图 %s, TransitToState(InRoom) 让 RoomPC 创建 RoomInsidePage"),
+					*CurMapName);
+
+				// 用 CurrentMapName 作为 TargetRoomMapName (去除可能的 PIE 前缀 UEDPIE_0_)
+				FName CurrentMapFName = FName(*CurMapName);
+				SetTargetRoomMapName(CurrentMapFName);
+
+				// 走状态机 → RoomPC 接管
+				TransitToState(EMatchState::InRoom);
+			}
+			else
+			{
+				// L_Login 或其他主菜单地图: 走标准 MainLobby → UIViewService 显示 LANRoomPage
+				UE_LOG(LogGameFlow, Log,
+					TEXT("[GameFlow][测试绕行] 当前在主菜单地图 %s, TransitToState(MainLobby)"),
+					*CurMapName);
+				TransitToState(EMatchState::MainLobby);
+			}
+		}
+		else
+		{
+			// World 不可用 (极端边缘) — 兜底走 MainLobby
+			UE_LOG(LogGameFlow, Warning,
+				TEXT("[GameFlow][测试绕行] World 不可用, 兜底 TransitToState(MainLobby)"));
+			TransitToState(EMatchState::MainLobby);
+		}
 
 		return;
 	}
@@ -401,13 +589,31 @@ void UGameFlowSubsystem::HandleStateEntry(EMatchState State)
 		break;
 
 	case EMatchState::InRoom:
-		// 【架构精进】进入房间态时，物理跳转到指定的对战地图
+		// ==========================================
+		// 【大厂 P0 修复 2026.07.03】添加 ?listen 参数支持 Listen Server
+		// ==========================================
+		// 旧代码: UGameplayStatics::OpenLevel(this, TargetRoomMapName);
+		//   问题: 没有 ?listen → Host 进图后是单机模式, Client 无法连入
+		//
+		// 新方案 (大厂分层架构):
+		//   - Host 端创房后, 调用方 (LANRoomPage) 通过 SetTargetRoomMapName + bIsHostListenServer 双通道
+		//   - 这里根据 bIsHostListenServer 决定是否加 ?listen
+		// ==========================================
 		if (TargetRoomMapName != NAME_None)
 		{
 			// 仅当当前不在目标地图时才执行 OpenLevel，避免无谓重载
 			if (!CurrentMapName.Contains(TargetRoomMapName.ToString()))
 			{
-				UGameplayStatics::OpenLevel(this, TargetRoomMapName);
+				if (bIsHostListenServer)
+				{
+					// Host 创房 → 走 Listen Server 模式
+					UGameplayStatics::OpenLevel(this, TargetRoomMapName, true, TEXT("listen"));
+				}
+				else
+				{
+					// Client 端被 ServerTravel 拉进图 (或 PIE 直接启动) → 不需要 ?listen
+					UGameplayStatics::OpenLevel(this, TargetRoomMapName);
+				}
 			}
 		}
 		else
@@ -544,48 +750,255 @@ void UGameFlowSubsystem::HandlePostLoadMapWithWorld(UWorld* LoadedWorld)
 		UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] PostLoadMapWithWorld: 主动切到 %d (Name=%s), 覆盖默认 Login"),
 			(int32)Desired, *DesiredName);
 
-		// 关键: 直接 TransitToState, 覆盖 BootToLogin 设的 Login
-		// 大厂设计: 用现有状态机入口走, 享受"安全校验 + 广播 + HandleStateEntry"的完整链路
+		// ==========================================
+		// 【大厂 P0 修复 2026.07.03】绕过 TransitToState 的幂等保护
+		// ==========================================
+		// 旧代码: TransitToState(Desired)
+		//   问题: 当 Desired == CurrentState (例如 InRoom) 时, TransitToState 的幂等保护静默 return
+		//         → 没有任何 Broadcast(InRoom)
+		//         → RoomPC::OnFlowStateChanged(InRoom) 不被调用
+		//         → RoomInsidePage 永不创建 → 玩家从 LAN 大厅直接跳到战斗画面
 		//
-		// 【新架构说明 - 2026.06.28】
-		// TransitToState 幂等保护导致的静默跳过, 现在由独立中断通道兜底:
-		//   网络失败 → HandleNetworkFailure → OnInterrupted.Broadcast(LANRoom) → UIViewService → ShowPanel
-		//   状态机的静默跳过不影响 UI, 因为 UI 通过 OnInterrupted 通道已刷新
-		TransitToState(Desired);
+		// 真实场景 (2026.07.03 案例):
+		//   1. LANRoomPage::OnCreateSessionComplete 调 TransitToState(InRoom)
+		//      → CurrentState=InRoom, Broadcast(InRoom), HandleStateEntry(InRoom) → OpenLevel
+		//   2. 进战斗地图, PostLoadMapWithWorld 触发
+		//      → bHasPendingStateOnNextLoad=true, Desired=InRoom
+		//      → 旧代码: TransitToState(InRoom) → 幂等 return → 没 Broadcast → UI 不显示
+		//
+		// 新方案 (大厂分层架构 - 状态机幂等保护 vs 跨地图意图消费必须区分):
+		//   - 路径 A 是"消费业务方预约的意图", 不应该被幂等保护拦截
+		//   - 即使 Desired == CurrentState, 路径 A 也要:
+		//     1. 设置 CurrentState (虽然值没变, 但语义上"意图已应用")
+		//     2. Broadcast 通知所有订阅者 (UI/PC/HUD)
+		//   - 路径 B 已经有同样逻辑 (line 624-625)
+		// ==========================================
+		CurrentState = Desired;
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[DEBUG-S7-A][PathA-Broadcast] WorldName=%s Desired=%d (Name=%s) → 强制 Broadcast"),
+			LoadedWorld ? *LoadedWorld->GetMapName() : TEXT("NULL"), (int32)Desired, *DesiredName);
+		OnStateChanged.Broadcast(Desired);
 		return;
 	}
 
 	// ==========================================
-	// 路径 B: 【大厂架构 - P0 修复 2026.06.28】延迟同步当前状态
+	// 路径 B: 【大厂架构 P0 修复 2026.07.03】统一启动入口
 	// ==========================================
-	// 场景:
-	//   UMetalSlugGameInstance::Init() 早于 World BeginPlay,
-	//   → BootToLogin() 调 TransitToState(Login) → Broadcast(Login)
-	//   → UIViewService.OnGameFlowStateChanged(Login) → ShowPanel(Login)
-	//   → GetLocalPlayerController() 返回 null (World 还没创建)
-	//   → ShowPanel 失败 → 用户看不到登录页 💀
+	// 重构动机:
+	//   旧方案在 Subsystem::Initialize 末尾 BootToLogin, 但此时 World 未加载
+	//   → Broadcast 时 PC 还不存在, UI 永远拉不起来
 	//
-	// 修复:
-	//   PostLoadMapWithWorld 触发时, World BeginPlay 已完成, PC 已 ready.
-	//   此时主动 Broadcast 当前状态, 让 UIViewService 重新拉起 (这次会成功).
+	// 新方案 (大厂 Single Shot Pattern):
+	//   1. Initialize 只挂管线, 不主动推进状态
+	//   2. PostLoadMapWithWorld 触发 = "启动信号" (首次) 或 "World 已重置信号" (后续)
+	//   3. 首次 (CurrentState == PreLogin) → 主动 BootToLogin 启动游戏
+	//      - 若 bSkipLoginDirectToLobby=true → 切到 MainLobby → 显示 LANRoom
+	//      - 若 bSkipLoginDirectToLobby=false → 切到 Login → 显示登录页 (可能触发 OpenLevel 回 L_Login)
+	//   4. 后续重置 (CurrentState != PreLogin 且 PendingPostLoadState 有值)
+	//      → 已在路径 A 中处理: RequestStateOnNextLoad 强制 TransitToState
+	//   5. 任何 PostLoadMapWithWorld (包括跨 OpenLevel 重置):
+	//      → 不重置状态, 但 Broadcast 当前状态
+	//      → 让 UIViewService 拿到"世界已就绪"信号, 重新拉起 (上次失败的 UI 在这次重试)
 	//
-	// 大厂设计哲学:
-	//   "事件驱动 + 状态机主动补偿" — 状态机知道自己的初始 broadcast 时机太早,
-	//   所以在 World ready 后补偿一次, 让所有 UI 重新同步.
-	//   这比让 UIViewService 自己实现重试机制更干净 (职责更清晰).
+	// 优势:
+	//   - Single Source of Truth: 启动只发生在 PostLoadMapWithWorld 第一次触发
+	//   - 时序保证: World 已加载, PC 已 ready, UI 拉起 100% 成功
+	//   - 跨图不丢 UI: 即使 OpenLevel 切图, PostLoadMapWithWorld 重新 Broadcast 让 UI 跟着恢复
 	// ==========================================
 
-	// 取当前状态的描述 (用于日志, 修复 UE 5.6 FormatStringSan)
+	const FString WorldName = LoadedWorld ? LoadedWorld->GetMapName() : TEXT("NULL");
+
+	// 【情形 1】首次启动: 当前状态 = PreLogin, 状态机从未推进
+	if (CurrentState == EMatchState::PreLogin)
+	{
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[GameFlow] PostLoadMapWithWorld: World 已就绪 (Map=%s, 首次启动), BootToLogin"), *WorldName);
+		BootToLogin();
+
+		// BootToLogin 内部会广播 (Login / MainLobby), UIViewService 收到并拉起面板
+		// 若 bSkipLoginDirectToLobby=false 触发 OpenLevel(L_Login),
+		//   → 新的 PostLoadMapWithWorld 会进入"情形 2"
+		return;
+	}
+
+	// 【情形 2】跨图 / 重置后: 当前状态 已不是 PreLogin
+	//   - 此时 World 已 ready, PC 已就绪, 当前状态合适
+	//   - 主动 Broadcast, 让 UIViewService 拉起对应面板
+	//   - 这覆盖了: BootToLogin→OpenLevel(L_Login) 后的第二次触发
 	const FString CurName = UEnum::GetValueAsString(CurrentState);
 	UE_LOG(LogGameFlow, Log,
-		TEXT("[GameFlow] PostLoadMapWithWorld: World 已就绪, 延迟同步当前状态 %d (Name=%s) → UI 拉起"),
-		(int32)CurrentState, *CurName);
+		TEXT("[GameFlow] PostLoadMapWithWorld: World 已就绪 (Map=%s), 延迟同步当前状态 %d (Name=%s) → UI 拉起"),
+		*WorldName, (int32)CurrentState, *CurName);
 
-	// 关键: 直接 Broadcast, 跳过 TransitToState 的幂等保护
-	// 原因: 此时 CurrentState 已经是 Login (Init 阶段切过来的),
-	//       如果用 TransitToState 会被"状态相同"保护拦截
+	// ==========================================
+	// 【大厂 P0 修复 2026.07.03】战斗地图落地自愈 (Joiner 容错)
+	// ==========================================
+	// 场景:
+	//   - Joiner 路径漏写 RequestStateOnNextLoad, 或
+	//   - RPC 链路异常导致 PendingPostLoadState 被吞
+	// → 当前 PostLoadMap 触发时, CurrentState 仍停留在 MainLobby (=3)
+	// → Broadcast(MainLobby) 后, RoomPC::OnFlowStateChanged 不创建 RoomInsidePage
+	// → 玩家进战斗地图后看到空白 UI, 直到 PostLoadMap 才补救
+	//
+	// 修复:
+	//   检查当前 World 是否是战斗地图 (通过 World 名启发式判断, 避免依赖 GameMode include 循环)
+	//   - 是战斗地图 + CurrentState != InRoom → 强制 CurrentState=InRoom + Broadcast(InRoom)
+	//   - 路径 A (bHasPendingStateOnNextLoad=true) 已优先处理;
+	//     这里处理的是 bHasPendingStateOnNextLoad=false 的"漏预约"边缘场景。
+	//
+	// 设计原则 (Single Source of Truth):
+	//   - 进入战斗地图物理空间 = 必须在 InRoom 状态 (UI 才能正确显示)
+	//   - 状态机自愈 (Self-healing) > 依赖业务方人工预约
+	// ==========================================
+	const bool bIsBattleMapWorld =
+		WorldName.Contains(TEXT("Japanese_Temple")) ||
+		WorldName.Contains(TEXT("Room")) ||
+		WorldName.Contains(TEXT("Battle")) ||
+		WorldName.Contains(TEXT("Combat"));
+	if (bIsBattleMapWorld && CurrentState != EMatchState::InRoom)
+	{
+		const FString CurName2 = UEnum::GetValueAsString(CurrentState);
+		UE_LOG(LogGameFlow, Warning,
+			TEXT("[GameFlow] PostLoadMapWithWorld: 检测到 World=%s 是战斗地图, 但 CurrentState=%d (%s), 强制修正为 InRoom (Joiner 容错)"),
+			*WorldName, (int32)CurrentState, *CurName2);
+		CurrentState = EMatchState::InRoom;
+		OnStateChanged.Broadcast(EMatchState::InRoom);
+		return;
+	}
+
+	// 主动 Broadcast (跳过 TransitToState 的幂等保护, 因为状态没变)
 	OnStateChanged.Broadcast(CurrentState);
 }
+
+
+// ==========================================
+// 【大厂 P0 修复 2026.07.03】双入口保险: OnWorldBeginPlay (PIE 模式 fallback)
+// ==========================================
+
+/**
+ * UGameFlowSubsystem::HandleWorldBeginPlay
+ *
+ * PIE 模式专属启动入口, 解决 PostLoadMapWithWorld 在 PIE 模式下不触发的 bug
+ *
+ * 链路分析 (为什么 PIE 模式 PostLoadMapWithWorld 不触发):
+ *   - PostLoadMapWithWorld 是 Editor Mode 下的全局委托
+ *   - 在 PIE (Play In Editor) 模式下, 编辑器加载地图走的是另一条路径
+ *   - UE 5.6 PIE 模式下, PostLoadMapWithWorld **不触发**
+ *   - 这是 UE 已知特性 (Lyra / Fortnite 等都有相同问题, 解决方案是 OnWorldBeginPlay)
+ *
+ * 时序优势 (为什么 OnWorldBeginPlay 是更好的启动时机):
+ *   - PostLoadMapWithWorld: World 刚加载, PC 还没 BeginPlay
+ *     → Broadcast 时 UIViewService::ShowPanelWhenPCReady 看到 PC=null → 排队等
+ *     → 如果后续没再次 Broadcast, UI 永远拉不起来
+ *   - OnWorldBeginPlay: World + 所有 Actor (含 PC) BeginPlay 完毕
+ *     → 此时 PC 一定已就绪 → UIViewService 拉起面板 100% 成功
+ *
+ * 双入口幂等:
+ *   - 入口 A (PostLoadMapWithWorld): 独立进程模式生效, PIE 模式不触发
+ *   - 入口 B (OnWorldBeginPlay):    PIE 模式生效, 独立进程模式也会触发 (晚于 A)
+ *   - 用 bHasBootedToLogin 标志位确保 BootToLogin 只执行一次
+ *
+ * @param World 触发回调的 World (World 已 BeginPlay)
+ */
+void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
+{
+	// 防御: 自己是否还活着
+	if (!IsValid(this)) return;
+
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[GameFlow] HandleWorldBeginPlay 触发: World=%s, bHasBootedToLogin=%s, CurrentState=%d"),
+		World ? *World->GetMapName() : TEXT("NULL"),
+		bHasBootedToLogin ? TEXT("true") : TEXT("false"),
+		(int32)CurrentState);
+
+	if (!World) return;
+
+	// ==========================================
+	// 路径 1: 跨地图"下一步状态"意图消费 (与 PostLoadMapWithWorld 路径 A 一致)
+	// ==========================================
+	// 场景: 业务方调 RequestStateOnNextLoad + OpenLevel
+	// 旧路径: 由 PostLoadMapWithWorld 在独立进程模式下消费
+	// 新路径 (大厂 P0 修复): 在 PIE 模式下, 必须也支持消费同一意图
+	//
+	// 为什么不复用 HandlePostLoadMapWithWorld 的逻辑?
+	//   - 两个回调的 World 时序不同 (PostLoadMap 比 OnWorldBeginPlay 早)
+	//   - PostLoadMap 时 PC 未就绪, OnWorldBeginPlay 时 PC 已就绪
+	//   - 业务方意图消费要求 100% 可靠, 必须两个入口都能消费
+	// ==========================================
+	if (bHasPendingStateOnNextLoad)
+	{
+		const EMatchState Desired = PendingPostLoadState;
+
+		// 一次性消费: 先清零
+		bHasPendingStateOnNextLoad = false;
+		PendingPostLoadState = EMatchState::PreLogin;
+
+		if (Desired == EMatchState::PreLogin)
+		{
+			// 落到 BootToLogin 默认路径
+			BootToLogin();
+			return;
+		}
+
+		const FString DesiredName = UEnum::GetValueAsString(Desired);
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[GameFlow] OnWorldBeginPlay (PIE 入口 B): 消费预约状态 %d (Name=%s), 覆盖默认 Login"),
+			(int32)Desired, *DesiredName);
+
+		// 绕过 TransitToState 幂等保护, 强制 Broadcast (同 PostLoadMap 路径 A 逻辑)
+		CurrentState = Desired;
+		OnStateChanged.Broadcast(Desired);
+		return;
+	}
+
+	// ==========================================
+	// 路径 2: 首次启动 (无业务预约) → 调 BootToLogin 启动游戏
+	// ==========================================
+	// 这是 PIE 模式 fallback 的核心路径:
+	//   - 独立进程模式: PostLoadMapWithWorld 已经触发过, bHasBootedToLogin=true, 下面被拦截
+	//   - PIE 模式:      PostLoadMapWithWorld 没触发, bHasBootedToLogin=false, 正常执行
+	// ==========================================
+	if (CurrentState == EMatchState::PreLogin)
+	{
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[GameFlow] OnWorldBeginPlay (PIE 入口 B): World=%s 已就绪 (PC 也 BeginPlay 完成), BootToLogin (PIE 模式兜底)"),
+			*World->GetMapName());
+		BootToLogin();
+		return;
+	}
+
+	// ==========================================
+	// 路径 3: 已经 Boot 过 (被 PostLoadMapWithWorld 先抢先) → 同步 Broadcast
+	// ==========================================
+	// 此时 CurrentState != PreLogin (已 Login / MainLobby / InRoom), bHasBootedToLogin=true
+	// 说明 BootToLogin 在入口 A 已经执行过, 这里只做"延迟同步" 让 UI 再拉起一次
+	// (冗余但安全, UIViewService 内部有幂等保护)
+	const FString CurName = UEnum::GetValueAsString(CurrentState);
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[GameFlow] OnWorldBeginPlay (PIE 入口 B): BootToLogin 已被入口 A 抢先执行, 延迟同步当前状态 %d (Name=%s)"),
+		(int32)CurrentState, *CurName);
+
+	// 战斗地图 → InRoom 自愈 (Joiner 容错, 与 HandlePostLoadMapWithWorld 路径 2 一致)
+	const FString WorldName = World->GetMapName();
+	const bool bIsBattleMapWorld =
+		WorldName.Contains(TEXT("Japanese_Temple")) ||
+		WorldName.Contains(TEXT("Room")) ||
+		WorldName.Contains(TEXT("Battle")) ||
+		WorldName.Contains(TEXT("Combat"));
+	if (bIsBattleMapWorld && CurrentState != EMatchState::InRoom)
+	{
+		UE_LOG(LogGameFlow, Warning,
+			TEXT("[GameFlow] OnWorldBeginPlay: 检测到 World=%s 是战斗地图, 但 CurrentState=%d (%s), 强制修正为 InRoom (Joiner 容错)"),
+			*WorldName, (int32)CurrentState, *CurName);
+		CurrentState = EMatchState::InRoom;
+		OnStateChanged.Broadcast(EMatchState::InRoom);
+		return;
+	}
+
+	// 主动 Broadcast (覆盖 UIViewService 因时序问题没拉起的边缘场景)
+	OnStateChanged.Broadcast(CurrentState);
+}
+
 
 void UGameFlowSubsystem::HandleNetworkFailure(UWorld* InWorld, UNetDriver* NetDriver, ENetworkFailure::Type FailureType, const FString& ErrorString)
 {

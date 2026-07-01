@@ -157,6 +157,24 @@ public:
 	UFUNCTION(BlueprintPure, Category = "MetalSlug|GameFlow")
 	FName GetTargetRoomMapName() const { return TargetRoomMapName; }
 
+	/**
+	 * 【大厂 P0 修复 2026.07.03】设置是否以 Listen Server 模式进入战斗地图
+	 *
+	 * 使用场景:
+	 *   - Host 创房成功 → SetIsHostListenServer(true) + SetTargetRoomMapName + TransitToState(InRoom)
+	 *     → HandleStateEntry(InRoom) 内部 OpenLevel(... ?listen)
+	 *   - Client 端被 ServerTravel 拉进图 (不需要 ?listen)
+	 *     → SetIsHostListenServer(false)
+	 *   - PIE 直接启动战斗地图 (Test Settings bStartInBattleMap)
+	 *     → 默认 false, 不加 ?listen
+	 *
+	 * 大厂原则 (Single Source of Truth):
+	 *   Host/Client 区分逻辑从 LANRoomPage 上移到 GameFlowSubsystem
+	 *   HandleStateEntry 不需要关心调用方是谁, 只看 bIsHostListenServer
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|GameFlow")
+	void SetIsHostListenServer(bool bInIsHost) { bIsHostListenServer = bInIsHost; }
+
 	// ==========================================
 	// 【P0 架构升级】跨地图"下一步状态"意图机制
 	// ==========================================
@@ -198,6 +216,28 @@ public:
 	 */
 	void HandlePostLoadMapWithWorld(UWorld* LoadedWorld);
 
+	/**
+	 * @brief 【大厂 P0 修复 2026.07.03】OnWorldBeginPlay 回调
+	 *
+	 * 设计动机 (PIE 模式 bug fix):
+	 *   - PostLoadMapWithWorld 在独立进程模式 (独立窗口启动) 下正常触发
+	 *   - 但在 PIE 模式 (编辑器内 Play) 下, 首张地图加载时 PostLoadMapWithWorld **不触发**
+	 *   - 导致 bSkipLoginDirectToLobby 等启动期逻辑在 PIE 模式下完全不执行
+	 *   - 玩家直接进入战斗场景, 没有任何 UI, 武器/角色全空
+	 *
+	 * 解决方案 (大厂模式 - 双入口保险):
+	 *   - 增加 OnWorldBeginPlay 入口作为 PIE 模式下的 fallback
+	 *   - OnWorldBeginPlay 是 UWorld 自己的事件, UE 5.6 PIE 模式下 100% 触发
+	 *   - 用 bHasBootedToLogin 标志位防止双入口重入
+	 *
+	 * 时序优势 (相比 PostLoadMapWithWorld):
+	 *   - PostLoadMapWithWorld: World 刚加载, PC 还没 BeginPlay (不可靠)
+	 *   - OnWorldBeginPlay:     World + PC + 所有 Actor BeginPlay 完毕 (稳定)
+	 *
+	 * @param World 触发回调的 World
+	 */
+	void HandleWorldBeginPlay(UWorld* World);
+
 private:
 	/**
 	 * 内部记录当前状态，默认给一个未初始化的预加载状态
@@ -220,6 +260,14 @@ private:
 	 */
 	UPROPERTY(Transient)
 	FName TargetRoomMapName = NAME_None;
+
+	/**
+	 * 【大厂 P0 修复 2026.07.03】是否以 Listen Server 模式进入 InRoom
+	 *   - true: Host 创房后进图, OpenLevel 加 ?listen
+	 *   - false: Client 端被拉进图, 或 PIE 直接启动战斗地图
+	 */
+	UPROPERTY(Transient)
+	bool bIsHostListenServer = false;
 
 	// ==========================================
 	// 【P0 架构升级】跨地图"下一步状态"意图持久化字段
@@ -245,6 +293,29 @@ private:
 	 *       跨地图持久, 不会被 PC 的 EndPlay 抢先解绑.
 	 */
 	FDelegateHandle PostLoadMapHandle;
+
+	/**
+	 * 【大厂 P0 修复 2026.07.03】OnWorldBeginPlay 委托句柄
+	 *
+	 * PIE 模式 fallback 入口, 解决 PostLoadMapWithWorld 在 PIE 模式下不触发的 bug
+	 * World 是 UObject, World::OnWorldBeginPlay 委托是 UE 标准事件, PIE 100% 触发
+	 */
+	FDelegateHandle WorldBeginPlayHandle;
+
+	/**
+	 * 【大厂 P0 修复 2026.07.03】是否已经执行过 BootToLogin (跨入口幂等保护)
+	 *
+	 * 设计动机:
+	 *   - 双入口 (PostLoadMapWithWorld + OnWorldBeginPlay) 都需要在合适的时机触发
+	 *   - 但同一 GameInstance 生命周期内, BootToLogin **只需要执行一次**
+	 *   - 用 bHasBootedToLogin 标志位防止两个入口重复触发
+	 *
+	 * 重置时机:
+	 *   - 当前 GameInstance 销毁 → Deinitialize → 不需要重置 (Subsystem 一起死)
+	 *   - 切图 (跨 GameInstance) → 新 Subsystem 初始化时 bHasBootedToLogin 默认 false
+	 */
+	UPROPERTY(Transient)
+	bool bHasBootedToLogin = false;
 
 	/**
 	 * 【大厂 P0 修复 2026.06.28】网络失败回调句柄

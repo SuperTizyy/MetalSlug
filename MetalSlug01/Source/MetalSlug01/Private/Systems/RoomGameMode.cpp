@@ -44,6 +44,9 @@
 // 引入武器基类
 #include "Weapons/BaseWeapon.h"
 
+// 【Phase 1 新增】MeleeAIController (AI 真实生成需要 Spawn)
+#include "Systems/MeleeAIController.h"
+
 // 再次引入 Kismet 静态函数库（重复包含，无副作用，便于阅读）
 #include "Kismet/GameplayStatics.h"
 
@@ -64,6 +67,14 @@
 
 // 引入胶囊体组件（用于获取角色位置）
 #include "Components/CapsuleComponent.h"
+
+// 【Phase 2】AI 数据驱动层
+#include "Systems/BaseAIController.h"
+#include "Systems/AI/AIRuntimeConfigComponent.h"
+#include "Data/AI/AIProfileAsset.h"
+#include "Data/AI/AIBehaviorConfigSO.h"
+#include "GameFramework/PlayerController.h"
+#include "AIController.h"
 
 
 // ==========================================
@@ -280,15 +291,330 @@ void ARoomGameMode::BroadcastSystemMessage(const FString& Message)
 
 
 /**
- * AddAIToRoom
+ * AddAIToRoom（兼容老 API — DEPRECATED）
  *
- * 添加 AI 玩家到指定队伍
- * 当前为占位实现，工业级做法是 Spawn 一个带有 PlayerState 的 AIController
+ * 设计: 仍然可用但内部转发给 AddAIByRequest.
+ *       旧蓝图/老蓝图测试节点不会因此报错.
+ *
+ * Phase 2 推荐改用 AddAIByRequest(FAISpawnRequest).
  */
 void ARoomGameMode::AddAIToRoom(bool bToAttackTeam, const FString& CharacterName, int32 Count)
 {
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Yellow, TEXT("注意: AI 添加逻辑将在 PlayerState 彻底接管后重构！"));
-	// 真正的工业级做法是: 直接在这里 Spawn 一个带有 PlayerState 的 AIController
+	if (Count <= 0)
+	{
+		return;
+	}
+
+	FAISpawnRequest Request;
+	Request.Mode = ERoomMatchMode::Melee;            // 老调用默认走 Melee (向后兼容)
+	Request.Team = bToAttackTeam ? ERoomTeam::Attack : ERoomTeam::Defense;
+	Request.CharacterRowName = FName(*CharacterName);
+	Request.Count = Count;
+	Request.ProfileTag = DefaultProfileTag;          // 兜底 Tag
+	Request.bUseTeamSpawnPoint = true;
+
+	const int32 Spawned = AddAIByRequest(Request);
+
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameMode][DEPRECATED] AddAIToRoom -> AddAIByRequest 已生成 %d/%d"), Spawned, Count);
+}
+
+
+/**
+ * AddAIByRequest — Phase 2 模式化 Spawn 主入口
+ *
+ * 流程:
+ *   1. TryResolveProfile  → Profile
+ *   2. SpawnAIInternal     → 生成 Controller + Pawn + Possess + Profile 注入
+ *   3. 计数 + 返回
+ *
+ * 注意: 即使 Profile 为 nullptr, SpawnAIInternal 仍可以兜底 (生成裸 Base + 不跑 BT),
+ *       这样策划忘配 Profile 时不至于崩溃, 只是 Profile 默认值生效.
+ */
+int32 ARoomGameMode::AddAIByRequest(const FAISpawnRequest& Request)
+{
+	if (Request.Count <= 0)
+	{
+		return 0;
+	}
+
+	UAIProfileAsset* Profile = TryResolveProfile(Request.Mode, Request.ProfileTag);
+	if (!Profile)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] AddAIByRequest: Mode=%d Tag=%s 未找到 Profile, 走兜底裸 AI"),
+			(int32)Request.Mode, *Request.ProfileTag.ToString());
+	}
+
+	return SpawnAIInternal(Request, Profile);
+}
+
+
+/**
+ * TryResolveProfile — 按 Mode + Tag 多级兜底查找
+ *
+ * 查询顺序:
+ *   1. ProfilesByMode[Mode].Profiles[Tag]                  (精确命中)
+ *   2. ProfilesByMode[Mode].Profiles[DefaultProfileTag]    (模式默认)
+ *   3. ProfilesByMode[Melee].Profiles[DefaultProfileTag]   (跨模式兜底)
+ *   4. nullptr                                            (让调用方报警/降级)
+ */
+UAIProfileAsset* ARoomGameMode::TryResolveProfile(ERoomMatchMode Mode, FGameplayTag ProfileTag) const
+{
+	// 1. 精确命中
+	if (const FAIProfileRegistry* Registry = ProfilesByMode.Find(Mode))
+	{
+		if (const TSoftObjectPtr<UAIProfileAsset>* Soft = Registry->Profiles.Find(ProfileTag))
+		{
+			if (UAIProfileAsset* Loaded = Soft->LoadSynchronous())
+			{
+				return Loaded;
+			}
+		}
+		// 模式存在但 Tag 没配 — 尝试模式默认 Tag
+		if (DefaultProfileTag.IsValid())
+		{
+			if (auto* Soft2 = Registry->Profiles.Find(DefaultProfileTag))
+			{
+				if (UAIProfileAsset* Loaded = Soft2->LoadSynchronous())
+				{
+					return Loaded;
+				}
+			}
+		}
+	}
+
+	// 2. 跨模式兜底 — 用 Melee 的默认
+	if (Mode != ERoomMatchMode::Melee)
+	{
+		if (const FAIProfileRegistry* MeleeRegistry = ProfilesByMode.Find(ERoomMatchMode::Melee))
+		{
+			if (DefaultProfileTag.IsValid())
+			{
+				if (auto* Soft3 = MeleeRegistry->Profiles.Find(DefaultProfileTag))
+				{
+					if (UAIProfileAsset* Loaded = Soft3->LoadSynchronous())
+					{
+						return Loaded;
+					}
+				}
+			}
+		}
+	}
+
+	return nullptr;  // 找不到 — 让调用方决定怎么办
+}
+
+
+/**
+ * GetModeRules — 简化查表
+ *
+ * 设计: 策划在 BP_RoomGameMode 配置 ModeRulesByMode, 这里一行拿到.
+ *       找不到时返回默认值 (AttackFaction="Faction.Player", DefenseFaction="Faction.Zombie")
+ *       这是为兼容老代码 (GameMode.cpp 里 384行 的 hardcode)
+ */
+bool ARoomGameMode::GetModeRules(ERoomMatchMode Mode, FAIModeRules& OutRules) const
+{
+	if (const FAIModeRules* Found = ModeRulesByMode.Find(Mode))
+	{
+		OutRules = *Found;
+		return true;
+	}
+
+	// 兜底: 沿用老的硬编码 (Attack→Player, Defense→Zombie)
+	OutRules = FAIModeRules();
+	OutRules.AttackTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"), false);
+	OutRules.DefenseTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"), false);
+	OutRules.bRoundBased = (Mode == ERoomMatchMode::Zombie);
+	OutRules.TotalRounds = ZombieTotalRounds;
+	return false;
+}
+
+
+/**
+ * SpawnAIInternal — 实际生成动作 (Phase 2 模式化)
+ *
+ * 设计:
+ *   - 完全接管 AddAIToRoom 老代码的 Spawn 链路
+ *   - Profile -> Controller Class 由 Profile.ControllerClass 决定 (留空兜 DefaultControllerClass)
+ *   - FactionTag 从 ModeRules 取 — 老代码 hardcode "Faction.Player/Zombie" 退役
+ *   - Possess 后调 InitializeFromProfile, 走 Phase 1 链路 (感知+BT+阵营协议)
+ *
+ * @return 实际生成数
+ */
+int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileAsset* Profile)
+{
+	if (!Profile && !DefaultControllerClass)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] SpawnAIInternal: Profile 为空且 DefaultControllerClass 也为空, 无法生成 AI"));
+		return 0;
+	}
+
+	// 1. 查 CharacterDataTable 拿 Pawn Class
+	TSubclassOf<ABaseCharacter> AIPawnClass = nullptr;
+	if (Request.CharacterRowName != NAME_None && CharacterDataTable)
+	{
+		static const FString Ctx(TEXT("SpawnAIInternal"));
+		if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(Request.CharacterRowName, Ctx))
+		{
+			if (!Row->CharacterBlueprint.IsNull())
+			{
+				AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
+			}
+		}
+	}
+
+	// Fallback: 没填 CharacterRowName 时, 尝试用 Profile.ProfileTag 的 DisplayName 反查
+	// (设计: Profile.Tag 命名规范时, 等同于 Character DT 行名)
+	if (!AIPawnClass && Profile && CharacterDataTable)
+	{
+		const FString DerivedRowName = Profile->ProfileTag.ToString();
+		if (!DerivedRowName.IsEmpty())
+		{
+			static const FString Ctx2(TEXT("SpawnAIInternal.Fallback"));
+			if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(FName(*DerivedRowName), Ctx2))
+			{
+				if (!Row->CharacterBlueprint.IsNull())
+				{
+					AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
+				}
+			}
+		}
+	}
+
+	if (!AIPawnClass)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] SpawnAIInternal: CharRowName='%s' Profile='%s' 都查不到 Pawn, 跳过"),
+			*Request.CharacterRowName.ToString(), *GetNameSafe(Profile));
+		return 0;
+	}
+
+	// 2. 决定 Controller Class (Profile > 默认)
+	TSubclassOf<AAIController> ControllerClass = DefaultControllerClass;
+	if (Profile && Profile->ControllerClass)
+	{
+		ControllerClass = Profile->ControllerClass;
+	}
+	if (!ControllerClass)
+	{
+		ControllerClass = ABaseAIController::StaticClass();
+	}
+
+	// 3. 决定 FactionTag (从 ModeRules 取 — 替代硬编码)
+	FAIModeRules Rules;
+	GetModeRules(Request.Mode, Rules);
+	const FGameplayTag DesiredFaction =
+		(Request.Team == ERoomTeam::Attack) ? Rules.AttackTeamFaction : Rules.DefenseTeamFaction;
+
+	// 4. 循环 Spawn
+	int32 SpawnedCount = 0;
+	for (int32 i = 0; i < Request.Count; ++i)
+	{
+		const FString AIName = FString::Printf(
+			TEXT("AI_%s_%d"),
+			Profile ? *Profile->DisplayName.ToString() : TEXT("NPC"),
+			AINextID++);
+
+		// 4a. 出生点
+		FVector SpawnLoc = FVector::ZeroVector;
+		FRotator SpawnRot = FRotator::ZeroRotator;
+		if (Request.bUseTeamSpawnPoint)
+		{
+			ScanAndCachePlayerStarts(false);
+			AActor* SpawnPt = GetAvailableSpawnPointForTeam(Request.Team, true);
+			if (SpawnPt)
+			{
+				SpawnLoc = SpawnPt->GetActorLocation();
+				SpawnRot = SpawnPt->GetActorRotation();
+			}
+		}
+
+		// 4b. Spawn Controller
+		FActorSpawnParameters SP;
+		SP.Owner = this;
+		SP.Name = FName(*FString::Printf(TEXT("AIC_%s"), *AIName));
+
+		AAIController* AIC = GetWorld()->SpawnActor<AAIController>(
+			ControllerClass, SpawnLoc, SpawnRot, SP);
+
+		if (!AIC)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameMode] SpawnAIController 失败 (Class=%s)"), *GetNameSafe(ControllerClass));
+			continue;
+		}
+
+		// 4c. Spawn Pawn + Possess
+		FActorSpawnParameters PawnSP;
+		PawnSP.Owner = AIC;
+		PawnSP.Instigator = nullptr;
+
+		ABaseCharacter* AIPawn = GetWorld()->SpawnActor<ABaseCharacter>(
+			AIPawnClass, SpawnLoc, SpawnRot, PawnSP);
+
+		if (!AIPawn)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[RoomGameMode] Spawn AIPawn '%s' 失败"), *AIPawnClass->GetName());
+			AIC->Destroy();
+			continue;
+		}
+
+		AIC->Possess(AIPawn);
+
+		// 4d. Faction Tag
+		if (DesiredFaction.IsValid())
+		{
+			AIPawn->SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(DesiredFaction));
+		}
+
+		// 4e. 【Phase 1 核心】调 InitializeFromProfile 注入感知 + BT
+		if (Profile)
+		{
+			if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+			{
+				BaseAIC->InitializeFromProfile(Profile);
+			}
+		}
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameMode] AI 生成: %s, Mode=%d, Team=%d, Faction=%s, Class=%s"),
+			*AIName, (int32)Request.Mode, (int32)Request.Team,
+			*DesiredFaction.ToString(), *GetNameSafe(ControllerClass));
+
+		++SpawnedCount;
+	}
+
+	if (SpawnedCount > 0)
+	{
+		BroadcastSystemMessage(FString::Printf(TEXT("已添加 %d 名 AI 参战"), SpawnedCount));
+	}
+
+	return SpawnedCount;
+}
+
+
+/**
+ * GetEffectiveHuntPolicy — 从 AI 拿它当前生效的 HuntPolicy
+ *
+ * 设计: 调用方不想暴露 ABaseAIController 类给 BP, GameMode 做转发.
+ *       Profile 为空时给默认 NearestDistance (与 Phase 1 一致).
+ */
+FAIHuntPolicy ARoomGameMode::GetEffectiveHuntPolicy(ABaseCharacter* AI) const
+{
+	if (!AI)
+	{
+		return FAIHuntPolicy();
+	}
+	AController* Ctrl = AI->GetController();
+	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Ctrl))
+	{
+		if (UAIProfileAsset* Profile = BaseAIC->GetCurrentProfile())
+		{
+			return Profile->HuntPolicy;
+		}
+	}
+	return FAIHuntPolicy();
 }
 
 
@@ -325,73 +651,224 @@ void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bo
 // ==========================================
 
 /**
- * RequestTargetForAI
+ * RequestTargetForAI — Phase 2 重构
  *
- * AI 向上帝申请一个目标
- * 算法:
- *   第一轮: 优先找完全落单的（包揽孤狼）
- *   第二轮: 如果没有落单的，执行"仇恨均摊"（让分数高的敌人优先被分配，但保证多 AI 分散追杀）
+ * 设计:
+ *   - 不再写死"按分数排序"
+ *   - 走 ScoreCandidateForAI 对每个候选评分
+ *   - 按 Policy.Strategy 选策略 (Nearest/Random/HighestScore/Mother-Weight)
+ *   - 反扎堆均摊: 用 Policy.AntiHuddleWeight 调整分
  *
- * @param RequestingAI 请求分配的 AI
- * @return 分配的敌人目标（找不到返回 nullptr）
+ * 候选筛选前置:
+ *   - GetAllAliveEnemiesFor 已经过滤"异阵营 + 活着"
+ *   - 这里再加一层 Policy.MaxChaseDistance / MinHealthThreshold 过滤
+ *
+ * 评分逻辑见 ScoreCandidateForAI — 这里按策略聚合
  */
 ABaseCharacter* ARoomGameMode::RequestTargetForAI(ABaseCharacter* RequestingAI)
 {
 	if (!RequestingAI) return nullptr;
 
-	// 1. 获取场上所有的存活敌人
+	// 0. 拿 Profile.HuntPolicy — 决定后面怎么选
+	const FAIHuntPolicy Policy = GetEffectiveHuntPolicy(RequestingAI);
+
+	// 1. 取候选 (同队伍 vs 异阵营已经过滤)
 	TArray<ABaseCharacter*> AllEnemies = GetAllAliveEnemiesFor(RequestingAI);
 	if (AllEnemies.Num() == 0) return nullptr;
 
-	// 2. 根据战绩/分数对敌人进行降序排序 (把第一名排在最前面)
-	AllEnemies.Sort([](const ABaseCharacter& A, const ABaseCharacter& B) {
-		// 假设你的 PlayerState 里有 GetScore() 或者 GetKills()
-		return A.GetPlayerState()->GetScore() > B.GetPlayerState()->GetScore();
+	// 2. 距离预过滤（超过最大追击距离的直接剔除）
+	AllEnemies.RemoveAll([this, &Policy, RequestingAI](ABaseCharacter* Enemy)
+	{
+		if (!Enemy) return true;
+		const float Dist = FVector::Dist(Enemy->GetActorLocation(), RequestingAI->GetActorLocation());
+		if (Dist > Policy.MaxChaseDistance) return true;
+		return false;
 	});
 
-	// ==========================================
-	// 🌊 第一轮: 优先找完全落单的 (包揽孤狼)
-	// ==========================================
+	if (AllEnemies.Num() == 0) return nullptr;
+
+	// ============================================================
+	// 3. 锁定优先策略（核心新逻辑）
+	//
+	// 需求规则：
+	//   - 优先选"未被任何其他 AI 锁定"的目标
+	//   - 已锁定目标只能分配给已锁定它的 AI（通过 ExcludeAI 排除）
+	//   - 所有候选都被锁 → 选被锁人数最少的
+	//   - 分数相同时取距离最近
+	// ============================================================
+
+	TArray<ABaseCharacter*> UnlockedEnemies;
+	TArray<ABaseCharacter*> LockedEnemies;
+
 	for (ABaseCharacter* Enemy : AllEnemies)
 	{
-		if (GetAttackerCount(Enemy) == 0)
+		if (IsTargetLockedByOthers(Enemy, RequestingAI))
 		{
-			// 找到一个没人盯的！分配给他
-			AIHuntingMap.Add(RequestingAI, Enemy); // Add 会自动覆盖同一个 AI 之前的记录
-			return Enemy;
+			LockedEnemies.Add(Enemy);
+		}
+		else
+		{
+			UnlockedEnemies.Add(Enemy);
 		}
 	}
 
-	// ==========================================
-	// 🔥 第二轮: 如果没有落单的，执行"仇恨均摊"
-	// ==========================================
-	int32 MinAttackers = 999999;
+	// 优先从"未锁定"列表里选最佳（分数最高的）
 	ABaseCharacter* BestTarget = nullptr;
+	float BestScore = -1.f;
 
-	for (ABaseCharacter* Enemy : AllEnemies)
+	// 候选范围：先 try unlocked，没有才用 locked
+	TArray<ABaseCharacter*>& PrimaryPool = (UnlockedEnemies.Num() > 0) ? UnlockedEnemies : LockedEnemies;
+
+	for (ABaseCharacter* Enemy : PrimaryPool)
 	{
-		int32 CurrentAttackers = GetAttackerCount(Enemy);
-
-		// 【算法神来之笔】: 注意这里是严格小于 (<)
-		// 因为 AllEnemies 已经是按排名从高到低排好了。
-		// 当出现平局时 (比如第一名有1个AI，第二名也有1个AI)，
-		// 由于第一名先被遍历，MinAttackers 变成了 1，
-		// 轮到第二名时，1 < 1 为假，所以依然会保留第一名
-		if (CurrentAttackers < MinAttackers)
+		const float Score = ScoreCandidateForAI(RequestingAI, Enemy, Policy);
+		if (Score > BestScore)
 		{
-			MinAttackers = CurrentAttackers;
+			BestScore = Score;
 			BestTarget = Enemy;
 		}
 	}
 
-	if (BestTarget)
+	// 如果 primary pool 分数相同，用距离打破平局
+	if (PrimaryPool.Num() > 1 && BestTarget)
 	{
-		// 均摊分配成功
-		AIHuntingMap.Add(RequestingAI, BestTarget);
-		return BestTarget;
+		float BestDist = FVector::Dist(BestTarget->GetActorLocation(), RequestingAI->GetActorLocation());
+		for (ABaseCharacter* Enemy : PrimaryPool)
+		{
+			if (Enemy == BestTarget) continue;
+			const float Score = ScoreCandidateForAI(RequestingAI, Enemy, Policy);
+			if (FMath::Abs(Score - BestScore) < KINDA_SMALL_NUMBER)
+			{
+				const float Dist = FVector::Dist(Enemy->GetActorLocation(), RequestingAI->GetActorLocation());
+				if (Dist < BestDist)
+				{
+					BestDist = Dist;
+					BestTarget = Enemy;
+				}
+			}
+		}
 	}
 
-	return nullptr;
+	// 4. 写入猎人账本（覆盖旧目标）
+	if (BestTarget)
+	{
+		AIHuntingMap.Add(RequestingAI, BestTarget);
+	}
+
+	return BestTarget;
+}
+
+
+/**
+ * ScoreCandidateForAI — 对单个候选敌人评分 (0~1, 越大越适合)
+ *
+ * 综合得分 = Σ (权重 × 归一化维度) − 反扎堆惩罚
+ *
+ * 维度权重 (HuntPolicy 字段):
+ *   - DistanceWeight        (距离越近 → 分越高)
+ *   - ScoreWeight           (积分越高 → 分越高)
+ *   - TimeRemainingWeight   (剩余时间越少 → 分越高, 母体策略)
+ *   - AntiHuddleWeight      (被多个 AI 锁定 → 减分)
+ *
+ * 归一化方式: 距离归一到 [0, MaxChaseDistance]; 积分暂用 PS->GetScore() / 100.f 上限.
+ *             剩余时间从 GameState 取 (TODO: GameState 还没暴露 TimeRemainingSec 字段).
+ */
+float ARoomGameMode::ScoreCandidateForAI(ABaseCharacter* RequestingAI,
+	ABaseCharacter* Candidate, const FAIHuntPolicy& Policy) const
+{
+	if (!RequestingAI || !Candidate) return 0.f;
+
+	// --- 维度归一值 (0~1) ---
+	float DistanceScore = 0.f;
+	if (Policy.DistanceWeight > 0.f && Policy.MaxChaseDistance > 0.f)
+	{
+		const float Dist = FVector::Dist(
+			Candidate->GetActorLocation(),
+			RequestingAI->GetActorLocation());
+		DistanceScore = FMath::Clamp(1.f - (Dist / Policy.MaxChaseDistance), 0.f, 1.f);
+	}
+
+	float PlayerScoreScore = 0.f;
+	if (Policy.ScoreWeight > 0.f)
+	{
+		// 设计: 玩家积分上限假设 100, 大于 1.0 直接封顶
+		const float PS_Score = Candidate->GetPlayerState()
+			? Candidate->GetPlayerState()->GetScore() : 0.f;
+		PlayerScoreScore = FMath::Clamp(PS_Score / 100.f, 0.f, 1.f);
+	}
+
+	float TimeRemainingScore = 0.f;
+	if (Policy.TimeRemainingWeight > 0.f)
+	{
+		// 母体策略专用: 用 GameState.MatchEndTime 反推
+		// 没有 TimeRemainingSec 字段时退化为 0.5 (中性), 不影响排名
+		if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+		{
+			const float Secs = GS->GetMatchRemainingSeconds();
+			const float MaxSecs = 600.f; // 兜底: 10分钟上限
+			TimeRemainingScore = 1.f - FMath::Clamp(Secs / MaxSecs, 0.f, 1.f);
+		}
+	}
+
+	// --- 反扎堆惩罚 ---
+	// 用 IsTargetLockedByOthers: 排除自己锁的情况，只有被别人锁才扣分
+	float AntiHuddle = 0.f;
+	if (Policy.AntiHuddleWeight > 0.f)
+	{
+		// IsTargetLockedByOthers 排除 RequestingAI 自己，所以自己锁的不算被占用
+		const bool bLockedByOthers = const_cast<ARoomGameMode*>(this)->
+			IsTargetLockedByOthers(Candidate, RequestingAI);
+		// 被锁 = 惩罚值; 未被锁 = 0
+		AntiHuddle = bLockedByOthers ? Policy.AntiHuddleWeight : 0.f;
+	}
+
+	// --- 综合加权 ---
+	const float Composite =
+		Policy.DistanceWeight       * DistanceScore
+		+ Policy.ScoreWeight        * PlayerScoreScore
+		+ Policy.TimeRemainingWeight* TimeRemainingScore
+		- Policy.AntiHuddleWeight   * AntiHuddle;
+
+	return FMath::Clamp(Composite, 0.f, 1.f);
+}
+
+
+/**
+ * GetAllAliveEnemiesFor
+ *
+ * 遍历全场, 找出对这个 AI 来说所有活着的敌人
+ * 过滤规则:
+ *   1. 不能是空指针
+ *   2. 不能是正在请求的 AI 自己
+ *   3. 目标必须是活着的
+ *   4. 走 IGenericTeamAgentInterface::GetTeamAttitudeTowards (而非 GetTeamID)
+ */
+TArray<ABaseCharacter*> ARoomGameMode::GetAllAliveEnemiesFor(ABaseCharacter* RequestingAI)
+{
+	TArray<ABaseCharacter*> AliveEnemies;
+	if (!RequestingAI) return AliveEnemies;
+
+	TArray<AActor*> AllCharacters;
+	UGameplayStatics::GetAllActorsOfClass(this, ABaseCharacter::StaticClass(), AllCharacters);
+
+	for (AActor* Actor : AllCharacters)
+	{
+		ABaseCharacter* Char = Cast<ABaseCharacter>(Actor);
+
+		// 过滤条件: 1)非空 2)不是自己 3)不是死亡的
+		if (Char && Char != RequestingAI && !Char->GetIsDead())
+		{
+			// 【Phase 2】阵营过滤走 IGenericTeamAgentInterface 原生协议
+			// 不再依赖 GetTeamID() 这个内部 uint8 (Pawn 子类暴露它, 但与项目无关)
+			const ETeamAttitude::Type Attitude = RequestingAI->GetTeamAttitudeTowards(*Char);
+			if (Attitude == ETeamAttitude::Hostile)
+			{
+				AliveEnemies.Add(Char);
+			}
+		}
+	}
+
+	return AliveEnemies;
 }
 
 
@@ -419,31 +896,6 @@ void ARoomGameMode::ReleaseTarget(ABaseCharacter* RequestingAI)
  *   2. 不能是正在请求的 AI 自己
  *   3. 目标必须是活着的
  */
-TArray<ABaseCharacter*> ARoomGameMode::GetAllAliveEnemiesFor(ABaseCharacter* RequestingAI)
-{
-	TArray<ABaseCharacter*> AliveEnemies;
-	if (!RequestingAI) return AliveEnemies;
-
-	TArray<AActor*> AllCharacters;
-	// 瞬间获取当前地图里所有的 ABaseCharacter
-	UGameplayStatics::GetAllActorsOfClass(this, ABaseCharacter::StaticClass(), AllCharacters);
-
-	for (AActor* Actor : AllCharacters)
-	{
-		ABaseCharacter* Char = Cast<ABaseCharacter>(Actor);
-
-		// 过滤条件: 1)非空 2)不是自己 3)不是死亡的
-		if (Char && Char != RequestingAI && !Char->GetIsDead())
-		{
-			// TODO: 等你以后做了队伍系统，这里还要加一句 && Char->TeamID != RequestingAI->TeamID
-			AliveEnemies.Add(Char);
-		}
-	}
-
-	return AliveEnemies;
-}
-
-
 /**
  * GetAttackerCount
  *
@@ -463,6 +915,37 @@ int32 ARoomGameMode::GetAttackerCount(ABaseCharacter* TargetEnemy)
 		}
 	}
 	return Count;
+}
+
+
+/**
+ * IsTargetLocked — 某个敌人是否已被锁定（任意 AI 锁定即算锁定）
+ * 用于 BT/AI 侧查询：遇到一个敌人时判断"这个人还能不能抢"
+ */
+bool ARoomGameMode::IsTargetLocked(ABaseCharacter* TargetEnemy)
+{
+	if (!TargetEnemy) return false;
+	// 猎人大于 0 即被锁定
+	return GetAttackerCount(TargetEnemy) > 0;
+}
+
+
+/**
+ * IsTargetLockedByOthers — 某个敌人是否被指定 AI 以外的人锁定
+ * 用于评分系统：排除自己已锁定的情况
+ */
+bool ARoomGameMode::IsTargetLockedByOthers(ABaseCharacter* TargetEnemy, ABaseCharacter* ExcludeAI)
+{
+	if (!TargetEnemy) return false;
+	int32 Count = 0;
+	for (const auto& Pair : AIHuntingMap)
+	{
+		if (IsValid(Pair.Key) && !Pair.Key->IsDead() && Pair.Value == TargetEnemy && Pair.Key != ExcludeAI)
+		{
+			Count++;
+		}
+	}
+	return Count > 0;
 }
 
 
@@ -558,13 +1041,14 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	}
 
 	// 最终结果仍然为空，则用默认值兜底
+	// 【2026-07-03 重构】: 不再硬编码 "Warrior" / "Knife", 改走数据驱动兜底 (ResolveFallbackCharacterRow / ResolveFallbackWeaponRow)
 	if (FinalCharID.IsEmpty() || FinalCharID == TEXT("Default"))
 	{
-		FinalCharID = TEXT("Warrior");
+		FinalCharID = ResolveFallbackCharacterRow();
 	}
 	if (FinalWeaponID.IsEmpty())
 	{
-		FinalWeaponID = TEXT("Knife");
+		FinalWeaponID = ResolveFallbackWeaponRow();
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("[Spawn] Resolved spawn data: Char='%s', Weapon='%s'"), *FinalCharID, *FinalWeaponID);
@@ -661,8 +1145,13 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 		UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualSpawn success: %s at %s"),
 			*SpawnedChar->GetName(), *SpawnLoc.ToString());
 
-		// 设置角色的 TeamID（用于战斗系统和 AI 识别）
-		SpawnedChar->TeamID = (PlayerTeam == ERoomTeam::Attack) ? 0 : 1;
+		// 【Phase 1 重构】阵营设置: 走 IGenericTeamAgentInterface 而不是直接 TeamID
+		const FGameplayTag Faction =
+			(PlayerTeam == ERoomTeam::Attack)
+				? FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"))
+				: FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"));
+		SpawnedChar->SetGenericTeamId(
+			ABaseCharacter::ResolveGenericTeamIdFromTag(Faction));
 
 		// Step 4: Possess（会触发 PossessedBy -> SpawnAndEquipWeapon 自动装备武器）
 		PlayerToSpawn->Possess(SpawnedChar);
@@ -744,8 +1233,9 @@ void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 	// 如果有缓存数据，使用自定义的生成逻辑（确保使用基于队伍的出生点）
 	if (CachedData)
 	{
-		FString CharID = CachedData->CharID.IsEmpty() ? TEXT("Warrior") : CachedData->CharID;
-		FString WeaponID = CachedData->WeaponID.IsEmpty() ? TEXT("Knife") : CachedData->WeaponID;
+		// 【2026-07-03 重构】: 兜底走数据驱动 (不再硬编码 "Warrior"/"Knife")
+		FString CharID = CachedData->CharID.IsEmpty() ? ResolveFallbackCharacterRow() : CachedData->CharID;
+		FString WeaponID = CachedData->WeaponID.IsEmpty() ? ResolveFallbackWeaponRow() : CachedData->WeaponID;
 
 		UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer (cached): Char='%s', Weapon='%s'"), *CharID, *WeaponID);
 
@@ -885,8 +1375,13 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 				if (AController* PlayerController = Cast<AController>(PS->GetOwner()))
 				{
 					// 【修复】: 全面使用 Getter 替换被删除的本地变量
-					FString FinalChar = PS->GetSelectedCharacterID().IsEmpty() ? TEXT("Warrior") : PS->GetSelectedCharacterID();
-					FString FinalWeapon = PS->GetSelectedWeapon1ID().IsEmpty() ? TEXT("Knife") : PS->GetSelectedWeapon1ID();
+					// 【2026-07-03 重构】: 兜底走数据驱动 (不再硬编码 "Warrior"/"Knife")
+					FString FinalChar = PS->GetSelectedCharacterID().IsEmpty()
+						? ResolveFallbackCharacterRow()
+						: PS->GetSelectedCharacterID();
+					FString FinalWeapon = PS->GetSelectedWeapon1ID().IsEmpty()
+						? ResolveFallbackWeaponRow()
+						: PS->GetSelectedWeapon1ID();
 
 					// 调用您已经写好的 HandlePlayerRequestSpawn 进行生成
 					HandlePlayerRequestSpawn(PlayerController, FinalChar, FinalWeapon);
@@ -1347,4 +1842,80 @@ bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
 	BroadcastSystemMessage(FString::Printf(TEXT("玩家【%s】成为新房主"), *TargetHost));
 
 	return true;
+}
+
+
+// ==========================================
+// 8. 数据驱动兜底 (2026-07-03 重构)
+// ==========================================
+
+/**
+ * ResolveFallbackWeaponRow
+ *
+ * 从 WeaponDataTable 解析一个有效的武器 RowName (3 级兜底)
+ *
+ * 设计动机:
+ *   - 旧硬编码 TEXT("Knife") 与 DT_WeaponInfo 实际 RowName ("Knife01"/"WQ001") 对不上
+ *   - 导致 bSkipLoginDirectToLobby 等测试路径下武器永远生成失败
+ *
+ * 兜底策略:
+ *   1. WeaponDataTable 第一行 (数据驱动)
+ *   2. MetalSlugGameDefaults::FallbackWeaponRowName (绝对底线, DT 未配置时)
+ *   3. 全部失败时返回空字符串 + 打 Error 日志
+ *
+ * @return 武器 RowName (正常情况绝不为空)
+ */
+FString ARoomGameMode::ResolveFallbackWeaponRow() const
+{
+	// L1: 数据驱动 - 取 DT 第一行
+	if (WeaponDataTable)
+	{
+		const TArray<FName> RowNames = WeaponDataTable->GetRowNames();
+		if (RowNames.Num() > 0)
+		{
+			const FString FirstRow = RowNames[0].ToString();
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomGameMode] ResolveFallbackWeaponRow: 数据驱动命中, RowName='%s' (来自 WeaponDataTable 第一行)"),
+				*FirstRow);
+			return FirstRow;
+		}
+	}
+
+	// L2: 全局兜底常量
+	UE_LOG(LogTemp, Warning,
+		TEXT("[RoomGameMode] ResolveFallbackWeaponRow: WeaponDataTable 为空或无行, 退到全局兜底 '%s'. 请检查 BP_RoomGameMode 的 WeaponDataTable 配置!"),
+		*MetalSlugGameDefaults::FallbackWeaponRowName);
+	return MetalSlugGameDefaults::FallbackWeaponRowName;
+}
+
+
+/**
+ * ResolveFallbackCharacterRow
+ *
+ * 从 CharacterDataTable 解析一个有效的角色 RowName (3 级兜底)
+ *
+ * @see ResolveFallbackWeaponRow (同款策略)
+ * @return 角色 RowName (正常情况绝不为空)
+ */
+FString ARoomGameMode::ResolveFallbackCharacterRow() const
+{
+	// L1: 数据驱动 - 取 DT 第一行
+	if (CharacterDataTable)
+	{
+		const TArray<FName> RowNames = CharacterDataTable->GetRowNames();
+		if (RowNames.Num() > 0)
+		{
+			const FString FirstRow = RowNames[0].ToString();
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomGameMode] ResolveFallbackCharacterRow: 数据驱动命中, RowName='%s' (来自 CharacterDataTable 第一行)"),
+				*FirstRow);
+			return FirstRow;
+		}
+	}
+
+	// L2: 全局兜底常量
+	UE_LOG(LogTemp, Warning,
+		TEXT("[RoomGameMode] ResolveFallbackCharacterRow: CharacterDataTable 为空或无行, 退到全局兜底 '%s'. 请检查 BP_RoomGameMode 的 CharacterDataTable 配置!"),
+		*MetalSlugGameDefaults::FallbackCharacterRowName);
+	return MetalSlugGameDefaults::FallbackCharacterRowName;
 }

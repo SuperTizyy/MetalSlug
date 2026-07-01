@@ -626,6 +626,83 @@ void ULANRoomPage::OnJoinSessionComplete(
 
 		bIsTraveling = true; // 标记正在跳转, NativeDestruct 时不再误判为房主离开
 
+		// ==========================================
+		// 【大厂 P0 修复 2026.07.03】Joiner 跨地图"下一步状态"预约
+		// ==========================================
+		// 旧问题 (root cause of "Joiner 进战斗地图后 RoomInsidePage 不显示"):
+		//   - Joiner 在 LANRoomPage (state=MainLobby) 点 "进入房间" → SessionManager JoinRoom → ClientTravel
+		//   - ClientTravel 跨地图后 PostLoadMapWithWorld 触发
+		//   - 此时 bHasPendingStateOnNextLoad == false (Joiner 路径从未登记过意图)
+		//   - 走 PostLoadMapWithWorld "情形 2": 直接 Broadcast(CurrentState)
+		//   - CurrentState 仍是 MainLobby (=3), 不是 InRoom (=4)
+		//   - RoomPC::OnFlowStateChanged(MainLobby) 不创建 RoomInsidePage → 玩家卡在黑屏
+		//
+		// 新方案 (大厂 Single Source of Truth):
+		//   1. ClientTravel 之前, 显式登记意图: "我下一张地图加载完后要 InRoom"
+		//   2. 同时把目标地图名 (从 SessionSettings.MAP_NAME 读) + ListenServer=false 都告诉 GameFlow
+		//   3. PostLoadMapWithWorld 路径 A 看到 PendingPostLoadState=InRoom
+		//      → 强制 CurrentState=InRoom + Broadcast(InRoom)
+		//      → RoomPC 收到 → 创建 RoomInsidePage ✓
+		//
+		// 大厂铁律: 跨地图的意图必须放到跨地图持久的层 (GameFlowSubsystem)
+		//           不能依赖脆弱的 PC 生命周期或巧合的 OpenLevel 参数
+		// ==========================================
+		if (UGameInstance* GI = GetGameInstance())
+		{
+			if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+			{
+				// (1) 从已选中的 SessionSearch 结果里取目标地图名
+				FString TargetMapName = TEXT("");
+				if (SessionSearch.IsValid())
+				{
+					// 取列表中当前 SelectedRoom 对应的索引
+					int32 SelectedIndex = INDEX_NONE;
+					if (List_Rooms)
+					{
+						TArray<UWidget*> AllChildren = List_Rooms->GetAllChildren();
+						for (int32 i = 0; i < AllChildren.Num(); ++i)
+						{
+							if (AllChildren[i] == CurrentSelectedRoomWidget.Get())
+							{
+								SelectedIndex = i;
+								break;
+							}
+						}
+					}
+
+					if (SessionSearch->SearchResults.IsValidIndex(SelectedIndex))
+					{
+						SessionSearch->SearchResults[SelectedIndex].Session.SessionSettings.Get(FName("MAP_NAME"), TargetMapName);
+					}
+				}
+
+				if (!TargetMapName.IsEmpty())
+				{
+					FlowSubsystem->SetTargetRoomMapName(FName(*TargetMapName));
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[LANRoomPage][Joiner] 无法从 SessionSettings 读到 MAP_NAME, SetTargetRoomMapName 跳过 (兜底会从 World 反查)"));
+				}
+
+				// (2) 明确告诉 GameFlow: 我不是 Listen Server (我是客户端被 ServerTravel 拉进图)
+				FlowSubsystem->SetIsHostListenServer(false);
+
+				// (3) 关键: 跨地图意图预约 —— 下张地图加载完后强制切到 InRoom
+				FlowSubsystem->RequestStateOnNextLoad(EMatchState::InRoom);
+
+				UE_LOG(LogTemp, Log,
+					TEXT("[LANRoomPage][Joiner] 已预约 PostLoadMap 状态 → InRoom (Map=%s, IsHost=false)"),
+					*TargetMapName);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[LANRoomPage][Joiner] GameFlowSubsystem 不可用, 跨地图意图未登记 → 可能 UI 不显示!"));
+			}
+		}
+
 		// 让当前玩家的控制器带着真实 IP，瞬间飞进房主的世界
 		if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
 		{
@@ -1153,36 +1230,74 @@ void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessfu
 		// ==========================================
 		FName TargetMapName = PendingMapLevelName.IsNone() ? FName("L_Room") : PendingMapLevelName;
 
-		// ==========================================
-		// 构建网络传输的 URL Options
-		// ?listen : 告诉引擎以 Listen Server（监听服务器）模式打开此关卡
-		// ==========================================
-		FString URLOptions = TEXT("?listen");
-
-		/* * 【高级架构扩展建议】:
-		 * 如果你需要根据 PendingGameMode 强行替换当前地图的 GameMode，可以拼接到 URL 中
-		 * 例如: URLOptions += FString::Printf(TEXT("?game=%s"), *TargetGameModeClassPath);
-		 * 目前若你的地图已经在编辑器 World Settings 里配置了正确的 GameMode，则无需这行
-		 */
-
 		// 日志追踪: 帮助快速定位多端跳转问题
 		if (GEngine)
 		{
 			GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, FString::Printf(TEXT("创房成功! 正在作为服务器跳转至关卡: %s"), *TargetMapName.ToString()));
 		}
 
-		// 执行绝对跳转 (TRAVEL_Absolute)
 		// ==========================================
-		// 【DEBUG-SET-3-B】即将 OpenLevel (Host 端触发 ServerTravel)
+		// 【大厂 P0 修复 2026.07.03】走 GameFlowSubsystem 状态机统一调度
 		// ==========================================
+		// 旧方案 (修复前): 直接 UGameplayStatics::OpenLevel(GetWorld(), TargetMapName, true, URLOptions)
+		//   问题: 绕过 TransitToState(InRoom) → HandleStateEntry 不触发 → Broadcast 不发
+		//       → RoomPC::OnFlowStateChanged(InRoom) 永远不会被调用
+		//       → RoomInsidePage 永不创建 → 房主看不到"开始游戏"按钮 → 创房没意义
+		//
+		// 新方案 (大厂分层架构 - Single Source of Truth):
+		//   1. SetTargetRoomMapName → GameFlowSubsystem 缓存目标地图名
+		//   2. TransitToState(InRoom) → 状态机统一调度
+		//      → HandleStateEntry(InRoom) 内部 OpenLevel (走 ?listen)
+		//      → OnStateChanged.Broadcast(InRoom)
+		//      → 进入战斗地图后 PostLoadMapWithWorld 路径 B 再次 Broadcast(InRoom)
+		//      → RoomPC::OnFlowStateChanged(InRoom) 创建 RoomInsidePage
+		//   3. 后续由 RoomInsidePage 的"开始游戏"按钮 → TransitToState(Battleing)
+		// ==========================================
+		if (UGameInstance* GI = GetGameInstance())
+		{
+			if (UGameFlowSubsystem* FlowSub = GI->GetSubsystem<UGameFlowSubsystem>())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[DEBUG-SET-3-C][OnCreateSessionComplete→TransitToState] PID=%u TargetMap=%s → TransitToState(InRoom)"),
+					FPlatformProcess::GetCurrentProcessId(),
+					*TargetMapName.ToString());
+
+				// 1. 缓存目标地图名 (HandleStateEntry(InRoom) 内部会读这个值)
+				FlowSub->SetTargetRoomMapName(TargetMapName);
+
+				// 【大厂 P0 修复 2026.07.03】Host 创房 → 标记 Listen Server
+				//   HandleStateEntry(InRoom) 看到 bIsHostListenServer=true 会加 ?listen
+				FlowSub->SetIsHostListenServer(true);
+
+				// 2. 【大厂 P0 修复 2026.07.03】跨地图意图登记 (关键! Client 端必备)
+				//    场景: Host 创房后 ServerTravel 把 Client 拉到战斗地图
+				//          Client 进图时 CurrentState 还是 MainLobby (3)
+				//          PostLoadMapWithWorld 路径 B 只会 Broadcast(CurrentState=3) → Client 永远看不到 InRoom UI
+				//    解决: RequestStateOnNextLoad 把 "InRoom" 意图持久化到 Subsystem
+				//          → PostLoadMapWithWorld 路径 A 识别意图 → 强制 TransitToState(InRoom)
+				//          → Host/Client 全部正确进入 InRoom 状态
+				FlowSub->RequestStateOnNextLoad(EMatchState::InRoom);
+
+				// 3. 走状态机统一调度 (而不是直接 OpenLevel)
+				FlowSub->TransitToState(EMatchState::InRoom);
+				return; // 后续流程由 GameFlow 接管, 不再直接 OpenLevel
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[LANRoomPage] OnCreateSessionComplete: GameFlowSubsystem 不可用, 回退到直接 OpenLevel"));
+			}
+		}
+
+		// 【回退路径】: GameFlowSubsystem 不可用时, 才用直接 OpenLevel (兜底)
+		FString URLOptions = TEXT("?listen");
 		UE_LOG(LogTemp, Error,
-			TEXT("[DEBUG-SET-3-B][OpenLevel-Host] PID=%u WorldName=%s TargetMap=%s URL=%s IsInViewport=%d"),
+			TEXT("[DEBUG-SET-3-B][OpenLevel-Host-Fallback] PID=%u WorldName=%s TargetMap=%s URL=%s IsInViewport=%d"),
 			FPlatformProcess::GetCurrentProcessId(),
 			*GetWorld()->GetName(),
 			*TargetMapName.ToString(),
 			*URLOptions,
 			IsInViewport() ? 1 : 0);
-
 		UGameplayStatics::OpenLevel(GetWorld(), TargetMapName, true, URLOptions);
 	}
 	else

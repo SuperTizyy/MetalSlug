@@ -1,10 +1,7 @@
-// 版权声明：在项目设置的描述页面填写您的版权信息。
-
-#pragma once
-
 // ==========================================
 // 头文件包含说明
 // ==========================================
+#pragma once
 // UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
 // 必须包含自动生成的反射文件，且必须放在所有的 include 的最下面！
@@ -17,22 +14,18 @@
 
 /**
  * @struct FAccountRecord
- * @brief 玩家账号记录结构体
+ * @brief 玩家账号档案（持久化单元）
  *
- * 职责说明:
- * - 将玩家的单个账号所有相关信息打包
- * - 由 UAccountSubsystem 持有
- * - 配合 USaveGame 写入硬盘
- *
- * 架构理念:
- * 1. USTRUCT(BlueprintType): 允许蓝图使用
- * 2. SaveGame 标记: 只有标记的字段才会被序列化到硬盘
- * 3. 默认构造: 所有字段默认初始化
- * 4. 重载构造: 支持一行代码打包（注册时）
+ * 【大厂架构原则：Single Source of Truth per Account】
+ * - 本结构只描述"账号本身"的属性：用户名、密码哈希、战备偏好。
+ * - 不再持有 bIsOnline 字段。
+ *   原因：bIsOnline 是"会话状态"，属于运行期 Session 而非账号档案。
+ *   旧实现把会话状态写进持久化档案，导致多客户端各自维护一份"在线否"的真相
+ *   → 互踢失效 / 双开时互相覆盖彼此的锁状态 / 暴力 Logout 清错盘。
  *
  * 安全提示:
  * - Password 实际商业项目应存哈希值（这里明文仅供学习）
- * - bIsOnline 是软锁, 真正的多端登入还需要服务端校验
+ * - 战备偏好（角色/武器）与账号绑定，玩家更换角色时持久化到本档案。
  */
 USTRUCT(BlueprintType)
 struct FAccountRecord
@@ -53,13 +46,6 @@ public:
 	 */
 	UPROPERTY(SaveGame)
 	FString Password;
-
-	/**
-	 * 在线状态锁
-	 * 用途: 防止同一个账号被多开登录
-	 */
-	UPROPERTY(SaveGame)
-	bool bIsOnline;
 
 	/**
 	 * 【新增】记录该账号最后一次选择的战备角色
@@ -90,7 +76,6 @@ public:
 		// 默认初始化为空字符串
 		Username = TEXT("");
 		Password = TEXT("");
-		bIsOnline = false; // 默认不在线
 		LastSelectedCharacter = TEXT("");
 		LastSelectedWeapon1 = TEXT("");
 		LastSelectedWeapon2 = TEXT("");
@@ -106,7 +91,6 @@ public:
 	{
 		Username = InUsername;
 		Password = InPassword;
-		bIsOnline = false; // 注册时默认不在线
 		LastSelectedCharacter = TEXT("");
 		LastSelectedWeapon1 = TEXT("");
 		LastSelectedWeapon2 = TEXT("");

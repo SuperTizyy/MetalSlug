@@ -30,6 +30,15 @@
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
 
+// 【Phase 1】 阵营 GameplayTag (为后续 IGenericTeamAgentInterface 升级预留)
+#include "GameplayTagContainer.h"
+
+// 【Phase 1】AI 数据驱动 Profile (前置声明, 头文件不依赖 AIProfileAsset.h 加快编译)
+class UAIProfileAsset;
+
+// 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
+#include "GenericTeamAgentInterface.h"
+
 // UE 自动生成的头文件（必须放在最后）
 #include "BaseCharacter.generated.h"
 
@@ -67,7 +76,7 @@ class UGameHUDWidget;             // 游戏 HUD 容器
  * 4. 蓝图友好：所有关键参数都暴露给蓝图可配置
  */
 UCLASS()
-class METALSLUG01_API ABaseCharacter : public ACharacter
+class METALSLUG01_API ABaseCharacter : public ACharacter, public IGenericTeamAgentInterface
 {
 	GENERATED_BODY()
 
@@ -107,22 +116,49 @@ public:
 	bool GetIsDead() const { return IsDead(); }
 
 	// ==========================================
-	// 阵营系统 (0=人类, 1=丧尸)
+	// 阵营系统 — 【Phase 1 重构】走 IGenericTeamAgentInterface (UE5 官方阵营协议)
 	// ==========================================
 
 	/**
-	 * 阵营 ID
-	 * 0 = 攻方/人类
-	 * 1 = 守方/丧尸
+	 * 【Phase 1 重构】
+	 * 原 uint8 TeamID 字段已废弃。
+	 * 新体系: 实现 IGenericTeamAgentInterface::GetGenericTeamId(), AIPerception 直接读取
+	 * 原 TeamID 字段保留为派生属性 (uint8 GetTeamID() 从内部 FactionTag 派生),
+	 * 仅供旧代码 (RoomGameMode/SpawnTable) 兼容用, 不再是数据源。
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat|Team")
-	uint8 TeamID = 0; // 默认是人类
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Team",
+        meta = (Categories = "Faction"))
+	FGameplayTag FactionTag;
+
+	/** 阵营对外只读视图 — 由 Build.cs 中的 RoomGameMode/BaseAIController 兼容调用 */
+	uint8 GetTeamID() const;
+
+	/** 【Phase 1 新增】IGenericTeamAgentInterface — UE5 官方阵营协议入口 */
+	virtual void SetGenericTeamId(const FGenericTeamId& NewTeamID) override;
+	virtual FGenericTeamId GetGenericTeamId() const override;
+	virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const override;
 
 	/**
-	 * 获取阵营 ID（供 AI 和 GameMode 调用）
+	 * 【Phase 1】阵营的 GameplayTag 形式 (统一入口)
+	 * 设计: 全工程只有这里一处负责 FactionTag ↔ FGenericTeamId 互转
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Team")
-	uint8 GetTeamID() const { return TeamID; }
+	FGameplayTag GetFactionTag() const { return FactionTag; }
+
+	/** Faction -> FGenericTeamId 静态映射 (0=Player, 1=Zombie, 2=Friendly, 3=Neutral, 255=Hostile) */
+	static FGenericTeamId ResolveGenericTeamIdFromTag(FGameplayTag InTag);
+
+	/**
+	 * 【Phase 1 新增】AI Profile 资产引用
+	 * 用途: 让编辑器里直接摆的 AI Pawn 也能拿到 Profile (无需走 RoomGameMode.AddAIToRoom)
+	 * 用法:
+	 *   1. 在 BP_GruntAI Details → Default Melee Profile 拖入 DA_MeleeGrunt
+	 *   2. BP_MeleeAIController::BeginPlay → Cast to Pawn → Get "Melee Profile" → SetupMeleeAI
+	 *
+	 * 也可以走代码注入: AGameMode::AddAIToRoom 调用 AIC->SetupMeleeAI(Profile) 时无需此字段
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI")
+	TObjectPtr<UAIProfileAsset> MeleeProfile;
 
 protected:
 	/**
@@ -795,6 +831,19 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void EndAttackState();
+
+	/**
+	 * 【Phase 3 大厂架构】AI 触发攻击的统一公共入口
+	 *
+	 * 设计: 把原本 protected 的 LightAttack_Pressed 暴露给 AI 子系统调用
+	 *       AI BTTask 通过本接口触发连击, 内部逻辑与玩家轻击完全一致
+	 *       （连击序号递增 + 播放蒙太奇 + Server_PlayAttackAnim RPC）
+	 *
+	 * 调用方: UBTTask_MeleeAttack / 后续 AI Controller 子类
+	 * 安全: 内部已做 IsDead/CurrentWeapon 检查, 死亡/无武器时静默返回
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	void OnAIRequestAttack();
 
 
 	// ==========================================

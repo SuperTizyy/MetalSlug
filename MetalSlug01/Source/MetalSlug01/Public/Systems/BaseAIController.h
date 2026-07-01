@@ -1,40 +1,39 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+﻿// Copyright (c) 2026.
 
 #pragma once
 
 // ==========================================
 // 头文件包含说明
 // ==========================================
-// UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
 
-// 引入 UE 原生 AAIController 类（基类）
 #include "AIController.h"
-
-// 感知类型所需 (FAIStimulus 等)
 #include "Perception/AIPerceptionTypes.h"
-
-// UE 自动生成的头文件
+#include "GenericTeamAgentInterface.h"
+#include "Data/AI/AIProfileAsset.h" // 【Phase 1】FOnAIBehaviorConfigLoaded
+#include "Systems/AI/AIBehaviorTypes.h"
 #include "BaseAIController.generated.h"
 
 // 前置声明（加快编译）
 class UAIPerceptionComponent;
 class UBehaviorTree;
+class UAIRuntimeConfigComponent;
+class UAIBlackboardKeyRegistrySubsystem;
 
 /**
- * @class ABaseAIController
- * @brief 项目所有 AI 控制器的 C++ 基类
+ * ABaseAIController
+ * 项目所有 AI 控制器的 C++ 基类
  *
- * 职责说明:
- * - 提供全局通用的 AI 感知系统（眼睛/耳朵）
- * - 提供行为树（Behavior Tree）启动入口
- * - 提供阵营（TeamID）系统和敌我判定接口
- * - 触发"近距离目标"机制（写入黑板 ImmediateTarget）
- *
- * 架构理念:
- * 1. 统一入口: 所有 AI 共享感知和行为树驱动逻辑
- * 2. 敌我判定: 基于 TeamID 阵营比对，子类可覆写
- * 3. 行为树中断: 极近距离检测到敌人时，强行写入黑板打断 BT
+ * 【Phase 1 重构】一次性切换到 UE5 阵营协议:
+ *   - 砍掉自造的 uint8 TeamID + Cast<ABaseCharacter> 阵营判定
+ *   - 阵营判定走 IGenericTeamAgentInterface::GetTeamAttitudeTowards (UE5 原生)
+ *   - AIPerception 检测到目标时, 引擎自己询问敌我, 自动决定是否回调 OnTargetPerceptionUpdated
+ *   - 行为树参数 (250 / 1500 / 1800 / 90) 全部下沉到 UAIBehaviorConfigSO (RuntimeConfigComponent 提供)
+ *   - 行为树启动走 UAIProfileAsset 异步加载; 老直启字段已废
+ */
+/**
+ * 【UE 5.6 修复】 AAIController 已经继承 IGenericTeamAgentInterface
+ * 我们只需 override, 不必重复声明接口冒. 重写 GetGenericTeamId / GetTeamAttitudeTowards 即可.
  */
 UCLASS()
 class METALSLUG01_API ABaseAIController : public AAIController
@@ -42,80 +41,96 @@ class METALSLUG01_API ABaseAIController : public AAIController
 	GENERATED_BODY()
 
 public:
-	/**
-	 * 构造函数
-	 * 目的: 创建 AI 感知组件（具体感官配置留给子类）
-	 */
 	ABaseAIController();
 
+	/**
+	 * 入口: 由 GameMode/Spawner 在生成 AI 后调用
+	 * 行为契约:
+	 *   - Profile → 同步 LoadBehaviorConfigSync → ApplyConfig → async LoadBehaviorTree → RunBehaviorTree
+	 *   - Profile 为空: 标记无 Profile 状态, 调用 RunLegacyIfPossible 走 fallback (Blueprint 默认 BT)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	void InitializeFromProfile(UAIProfileAsset* InProfile);
+
+	/** 难度热注入 */
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	void SetDifficultyTier(EAIDifficultyTier NewTier);
+
+	/** 统一读 Config 入口 */
+	UFUNCTION(BlueprintPure, Category = "AI")
+	UAIRuntimeConfigComponent* GetRuntimeConfig() const { return RuntimeConfig; }
+
+	/**
+	 * 【Phase 2】公开读取当前 Profile — 让 GameMode 等外部系统不用 friend 也能拿到
+	 * 设计: 当前生效的 AI Profile (可能为 nullptr, 表示走 Legacy)
+	 */
+	UFUNCTION(BlueprintPure, Category = "AI")
+	UAIProfileAsset* GetCurrentProfile() const { return CurrentProfile; }
+
+	/** 获取黑板键名解析器 */
+	UFUNCTION(BlueprintPure, Category = "AI|Blackboard")
+	UAIBlackboardKeyRegistrySubsystem* GetKeyRegistry() const;
+
+	/**
+	 * 【Phase 1 重构】AI 自身阵营
+	 * 设计: 走 IGenericTeamAgentInterface (不再自造 uint8 TeamID)
+	 * 默认 ID=255 (Hostile), 由 InitializeFromProfile 根据 Profile.FactionTag 切到具体阵营
+	 */
+	virtual void SetGenericTeamId(const FGenericTeamId& NewTeamID) override;
+	virtual FGenericTeamId GetGenericTeamId() const override;
+	virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const override;
+
 protected:
-	/**
-	 * UE 原生生命周期: 在 AI 控制器被初始化时调用
-	 * 目的: 绑定感知事件、启动行为树
-	 */
 	virtual void BeginPlay() override;
+	virtual void OnPossess(APawn* InPawn) override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
-	// ==========================================
-	// 1. 全局通用组件
-	// ==========================================
-
-	/**
-	 * AI 感知系统（眼睛/耳朵等）
-	 * 用途: 检测周围的 Actor 状态变化
-	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI")
 	UAIPerceptionComponent* AIPerception;
 
-	/**
-	 * AI 行为树
-	 * 用途: 在 BeginPlay 时自动 RunBehaviorTree
-	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "AI")
-	UBehaviorTree* AIBehaviorTree;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI")
+	TObjectPtr<UAIRuntimeConfigComponent> RuntimeConfig;
 
-	// ==========================================
-	// 2. 留给子类重写的通用接口 (Virtual)
-	// ==========================================
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI")
+	TObjectPtr<UAIProfileAsset> CurrentProfile;
 
 	/**
-	 * 感知触发时的统一入口
-	 * 子类可覆写以扩展特殊处理
-	 * @param Actor 感知到的 Actor
-	 * @param Stimulus 刺激信息
+	 * 【Phase 1 重构】感知触发的单一入口
+	 * 设计:
+	 *   - 引擎已通过 IGenericTeamAgentInterface 把敌我对错处理完毕, 这里不再做 Cast<ABaseCharacter>
+	 *   - 极近距离时把目标覆盖写入 BB 的 ImmediateTarget Key (由 Subsystem 解析名)
+	 *   - 距离阈值从 RuntimeConfig->GetScaledCombat().OverrideBTDistance 读取
 	 */
 	UFUNCTION()
 	virtual void OnTargetDetected(AActor* Actor, FAIStimulus Stimulus);
 
-	/**
-	 * 判断敌我的通用逻辑
-	 * 子类可覆写以实现特殊判定规则
-	 * @param TargetActor 目标 Actor
-	 * @return 是否为敌人
-	 */
-	virtual bool IsEnemy(AActor* TargetActor);
-
-	// ==========================================
-	// 阵营系统 (0=人类, 1=丧尸)
-	// ==========================================
+private:
+	void OnProfileLoaded();
+	void RegisterBlackboardKeys();
+	void StartBehaviorTreeFromProfile();
+	void RunLegacyBehaviorTree();
 
 	/**
-	 * AI 阵营 ID
-	 * 0 = 攻方/人类
-	 * 1 = 守方/丧尸
+	 * 【Phase 2 共用层】按 Profile->Perception 配 AIPerception
+	 * 设计: 把"刀战专属"的 ConfigurePerceptionFromConfig 收归 Base
+	 *       所有 AI 派生类 (Melee/Zombie/Boss) 都不用再写一遍
+	 * 调用时机: OnProfileLoaded 之后, BT 启动之前
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI|Team")
-	uint8 TeamID = 0; // 默认是 0
+	void ConfigurePerceptionFromConfig();
 
-public:
-	/**
-	 * 获取阵营 ID（供其他人读取）
-	 */
-	UFUNCTION(BlueprintCallable, Category = "AI|Team")
-	uint8 GetTeamID() const { return TeamID; }
+	/** FOnAIBehaviorConfigLoaded 句柄, 跨 OnProfileLoaded 暂存 */
+	FOnAIBehaviorConfigLoaded ProfileLoadedDelegate;
 
+protected:
 	/**
-	 * 修改阵营 ID（生化模式感染时调用）
+	 * 【Phase 1】派生类钩子入口
+	 * 设计: 派生类 SetupMeleeAI 重写感知配置后, 必须调用本方法触发 BT 启动
+	 * 行为:
+	 *   - 已开始 BT (bBehaviorTreeStarted): 直接返回
+	 *   - 未开始: 走 Config 同步+异步加载路径
 	 */
-	UFUNCTION(BlueprintCallable, Category = "AI|Team")
-	void SetTeamID(uint8 NewTeamID) { TeamID = NewTeamID; }
+	void StartBehaviorTreeFromConfig();
+
+private:
+	bool bBehaviorTreeStarted = false;
 };

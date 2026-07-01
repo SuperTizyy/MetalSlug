@@ -191,6 +191,78 @@ void URoomService::NotifyBecameClient()
 	}
 }
 
+// ==========================================
+// 【大厂 P0 修复 2026.07.03】测试房主模式
+// ==========================================
+
+/**
+ * URoomService::EnterSkipToHostMode
+ *
+ * 显式 API: 同步把本机标记为"独立进程房主", 用于"勾选跳过登录"测试场景
+ *
+ * 行为:
+ *   1. 幂等: 若已是 Host 直接返回
+ *   2. 设 bIsHost = true + 广播 OnHostChanged(true)
+ *   3. 广播 OnPlayerJoined(LocalAccountName) — 触发本机玩家标签显示
+ *   4. 服务器 (Authority) 同步 GameState->HostPlayerName = 本机账号
+ *      → 客户端 OnRep_HostPlayerName 自动触发 (在 LAN Room 模式)
+ *
+ * 设计动机:
+ *   旧架构"勾选跳过登录"只调 MockLoginForTesting + TransitToState(MainLobby),
+ *   但 URoomService::bIsHost 永远为 false (没人调 NotifyBecameHost),
+ *   导致 RoomInsidePage 永远把本机当成普通玩家, 房主按钮全 Collapsed。
+ *   新架构用显式 API 标 Host, 复用了所有下游 UI 的房主识别路径,
+ *   业务流自洽, 不再依赖隐式副作用。
+ */
+void URoomService::EnterSkipToHostMode()
+{
+	// 幂等保护: 已是 Host 不重复广播
+	if (bIsHost)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomService] EnterSkipToHostMode: 已是 Host, 跳过重复标定 (LocalAccount=%s)"),
+			*GetCurrentAccountName());
+		return;
+	}
+
+	const FString LocalAccountName = GetCurrentAccountName();
+	if (LocalAccountName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomService] EnterSkipToHostMode: LocalAccountName 为空! 请确保先调 MockLoginForTesting"));
+		// 即便为空, 仍标 Host, 后续 RefreshRoomUI 会兜底
+	}
+
+	// 1. 标 Host + 广播
+	bIsHost = true;
+	OnHostChanged.Broadcast(true);
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomService] EnterSkipToHostMode: 本机已成为测试房主 (LocalAccount=%s)"),
+		*LocalAccountName);
+
+	// 2. 广播本机加入 — 触发本机玩家标签立即显示 (走订阅者, 不依赖 PlayerState 同步时延)
+	OnPlayerJoined.Broadcast(LocalAccountName);
+
+	// 3. 服务器权威: 同步 GameState->HostPlayerName, 让 LAN Room 模式 OnRep 链路也能工作
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+		{
+			// 仅当 PC 有 Authority (PIE ListenServer 或独立进程) 才写 HostPlayerName
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				if (PC->HasAuthority() && !LocalAccountName.IsEmpty())
+				{
+					GS->HostPlayerName = LocalAccountName;
+					UE_LOG(LogTemp, Log,
+						TEXT("[RoomService] EnterSkipToHostMode: 已同步 GameState->HostPlayerName=%s"),
+						*LocalAccountName);
+				}
+			}
+		}
+	}
+}
+
 void URoomService::BroadcastHostChanged(const UObject* WorldContextObject, bool bIsHostNow)
 {
 	if (URoomService* Service = Get(WorldContextObject))

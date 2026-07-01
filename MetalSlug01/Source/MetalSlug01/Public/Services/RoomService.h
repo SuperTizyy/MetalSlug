@@ -90,6 +90,30 @@ public:
 	/** 通知 RoomService 本实例是 Client */
 	void NotifyBecameClient();
 
+	/**
+	 * 【大厂 P0 修复 2026.07.03】进入"测试房主"模式
+	 *
+	 * 业务场景:
+	 *   - 开发者通过 Project Settings 勾选"跳过登录自动当房主"
+	 *   - GameFlow 启动时检测到勾选 → 调本接口
+	 *   - 本机立即被识别为独立进程房主, 无需走 SessionManager 创房成功回调
+	 *
+	 * 与 NotifyBecameHost 的差异:
+	 *   - NotifyBecameHost: 依赖 LANRoomPresenter 创房成功, 异步, 走真实 Session
+	 *   - EnterSkipToHostMode: 同步, 纯本地状态, 不创 Session, 不走 RPC
+	 *
+	 * 幂等保护:
+	 *   - 重复调用安全, 仅在状态变化时广播事件
+	 *
+	 * 副作用:
+	 *   - bIsHost = true
+	 *   - 广播 OnHostChanged(true) → RoomInsidePage 立即刷新房主按钮
+	 *   - 广播 OnPlayerJoined(LocalAccountName) → 本机玩家标签显示
+	 *   - 同步 GameState->HostPlayerName = 本机账号 (若有 Authority)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "RoomService")
+	void EnterSkipToHostMode();
+
 	/** 当前是否是 Host */
 	bool IsHost() const { return bIsHost; }
 

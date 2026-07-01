@@ -1,12 +1,9 @@
 // ==========================================
-// 玩家生成/出生数据表行
-// 关联: DT_PlayerSpawnData
-// 替代: 原 StaticTable.h 中的 FPlayerSpawnData 段
+// 头文件包含区
 // ==========================================
-#pragma once
-
 #include "CoreMinimal.h"
 #include "Engine/DataTable.h"
+#include "GameplayTagContainer.h"
 #include "SpawnTableRow.generated.h"
 
 class ABaseWeapon;
@@ -34,8 +31,17 @@ struct FPlayerSpawnData : public FTableRowBase
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn Data")
 	TSoftClassPtr<ABaseCharacter> StartingCharacter;
 
-	/** 出生阵营 (0=攻方, 1=守方) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn Data")
+	/**
+	 * 【Phase 1 重构】出生阵营 (用 GameplayTag, 走 IGenericTeamAgentInterface)
+	 * 示例值: Faction.Player / Faction.Zombie
+	 * 兼容: 同时保留 TeamID int32 用于旧 DataTable 资产迁移期
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn Data",
+		meta = (Categories = "Faction"))
+	FGameplayTag FactionTag;
+
+	/** 旧字段 - 保留 1 次迁移期, 之后 DataTable 资产迁移完毕可移除 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn Data|Deprecated")
 	int32 TeamID = 0;
 
 	/** 是否主机玩家 (用于权威生成逻辑) */

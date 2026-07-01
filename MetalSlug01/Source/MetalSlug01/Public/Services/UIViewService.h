@@ -150,6 +150,18 @@ private:
 	/** 销毁当前面板 */
 	void DestroyActivePanel();
 
+	/**
+	 * 【大厂 P0 修复 2026.07.03】清理 PreloadedWidgets 中所有不属于当前 World 的残留 widget
+	 *
+	 * 触发场景:
+	 *   PIE 启动 → 新 World 创建 → 旧 World 的预创建 widget 还残留在 PreloadedWidgets 中
+	 *   这些 widget 属于旧 World, 即使 IsValidLowLevel() 也返回 true
+	 *   → 后续 ExecuteShowPanel 用缓存里的"老" widget 失败 (World 已切换)
+	 *
+	 * 设计: 在 ShowPanelWhenPCReady 检测到跨 World widget 时调用
+	 */
+	void PurgePreloadedWidgetsForCurrentWorld();
+
 	/** 为指定面板注入 ViewModel（核心解耦点） */
 	void InjectViewModelForPanel(EUIPanel Panel, UUserWidget* NewWidget);
 

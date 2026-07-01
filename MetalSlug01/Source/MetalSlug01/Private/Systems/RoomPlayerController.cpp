@@ -39,10 +39,14 @@
 // 引入 GameFlowSubsystem（流程大管家）
 #include "Systems/GameFlowSubsystem.h"
 
+// 引入房间业务服务（EnterSkipToHostMode 显式标房主 - 用于 RoomPC 战斗地图兜底）
+#include "Services/RoomService.h"
+
 // 引入账号子系统（用于获取登录用户信息）
 // 【架构修正】PlayerController 也走 AccountService 门面访问账号数据
 #include "Systems/Account/AccountSubsystem.h"
 #include "Services/AccountService.h"
+#include "Systems/Account/LocalAccountRepository.h"
 
 // 【P0】RoomPlayerController 也走 SessionManager 门面访问会话
 #include "Systems/Session/SessionManagerSubsystem.h"
@@ -93,16 +97,64 @@ void ARoomPlayerController::BeginPlay()
 	// 仅本地玩家控制器才需要订阅（Dedicated Server 端 Controller 不订阅）
 	if (IsLocalPlayerController())
 	{
-		// 【新架构：向大管家报到】
-		// 通过 GameInstance 拿到 UGameFlowSubsystem 单例
+		// ==========================================
+		// 【大厂 P0 修复 2026.07.03】删除无条件 TransitToState(InRoom)
+		// ==========================================
+		// 旧代码问题:
+		//   RoomPC::BeginPlay 无条件调用 TransitToState(InRoom)
+		//   → 当 PIE 入口是战斗地图 (Japanese_Temple_Demo) 时, 此时状态机还是 PreLogin (0)
+		//   → 立刻被强行推到 InRoom (4), 完全跳过 Login → MainMenu → MainLobby
+		//   → bSkipLoginDirectToLobby=false 时, 玩家想看到登录页 → 看不到
+		//   → TargetRoomMapName 还是 NAME_None → 报错 "TargetRoomMapName is NONE"
+		//
+		// 新规则 (大厂分层架构):
+		//   - 状态机推进 100% 由 GameFlowSubsystem 统一调度
+		//     → 任何状态切换都必须经 GameFlow::TransitToState()
+		//     → 启动入口是 PostLoadMapWithWorld, 不是 RoomPC::BeginPlay
+		//   - RoomPC 只负责"监听状态变化 → 响应", 不能主动 push 状态
+		//     → "刚加载进战斗地图必须进入 InRoom" 的逻辑
+		//     → 应该由 PostLoadMapWithWorld (LogGameFlow 启动点) + RoomGameMode 处理
+		//     → 不应该让 RoomPC 在 BeginPlay 越权做事
+		//   - 若确实需要在战斗地图启动后立刻进入 InRoom 状态
+		//     → 应在 RoomGameMode::StartPlay / OnPostLogin 通过 GameFlow::TransitToState
+		//     → 不在 RoomPC::BeginPlay (PC 还没 Possess Pawn, 时序也不对)
+		//
+		// 本次修复只做"删除 RoomPC 的越权调度", 状态推进由 GameFlow 启动入口完成
+		// ==========================================
 		if (UGameFlowSubsystem* FlowSubsystem = GetGameInstance()->GetSubsystem<UGameFlowSubsystem>())
 		{
-			// 订阅管家的状态变化广播
+			// 仅订阅, 不再主动调用 TransitToState
 			FlowSubsystem->OnStateChanged.AddDynamic(this, &ARoomPlayerController::OnFlowStateChanged);
 
-			// 主动同步状态: 刚加载进战斗地图时，强制进入房间态
-			// 目的: 触发 RoomUI 的挂载
-			FlowSubsystem->TransitToState(EMatchState::InRoom);
+			// 【大厂补充日志】让本次 BeginPlay 的人能清楚"为什么不主动切到 InRoom"
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomPC::BeginPlay] 仅订阅 OnStateChanged, 状态推进交由 GameFlow 启动入口 (CurrentState=%d)"),
+				(int32)FlowSubsystem->GetCurrentState());
+
+			// ==========================================
+			// 【大厂 P0 修复 2026.07.03】自我同步 (Self-sync): 订阅后立即消费一次当前状态
+			// ==========================================
+			// 时序竞争场景:
+			//   1. Subsystem::HandlePostLoadMapWithWorld 在 PostLoadMap 触发 Broadcast(InRoom)
+			//   2. 我们在 BeginPlay 才 AddDynamic → 已经错过这次广播
+			//   3. RoomPC 永远不知道"InRoom", RoomUIWidget 不创建 → 玩家卡屏
+			//
+			// 解决方案:
+			//   BeginPlay 时主动检查 CurrentState, 如果物理位置上应该 InRoom 但实际不是,
+			//   主动调一次 OnFlowStateChanged(CurrentState) 触发 UI 创建
+			//
+			// 大厂原则 (Self-healing):
+			//   - 不要相信外部时序, 自己兜底同步一次
+			//   - OnFlowStateChanged 内部有幂等保护 (RoomUIWidget 已存在则不再创建), 多次调用安全
+			// ==========================================
+			const EMatchState NowState = FlowSubsystem->GetCurrentState();
+			if (NowState == EMatchState::InRoom || NowState == EMatchState::Battleing)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[RoomPC::BeginPlay] 自我同步: CurrentState=%d, 主动调 OnFlowStateChanged (修复订阅晚于广播的时序竞争)"),
+					(int32)NowState);
+				OnFlowStateChanged(NowState);
+			}
 		}
 
 		// 延迟 2 秒再发玩家信息（等待底层网络连接稳固 + 存档读取完成）
@@ -130,14 +182,16 @@ void ARoomPlayerController::DelayedSendPlayerInfo()
 
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		// 拿到账号子系统
-		if (UAccountSubsystem* AccountSub = GI->GetSubsystem<UAccountSubsystem>())
+		// 走新架构: AccountService 拿会话用户名, Repository 拿偏好记录
+		UAccountService* AccountService = UAccountService::Get(this);
+		ULocalAccountRepository* Repo = GI->GetSubsystem<ULocalAccountRepository>();
+		if (AccountService && Repo)
 		{
-			// 读取当前登录的用户名
-			MyName = AccountSub->GetCurrentLoggedInUser();
+			// 1) 读取当前登录的用户名
+			MyName = AccountService->GetCurrentUser();
 
-			// 从账号记录中拿到上次的角色/武器偏好
-			const FAccountRecord* MyRecord = AccountSub->GetAccountRecord(MyName);
+			// 2) 从仓储层拿档案
+			const FAccountRecord* MyRecord = Repo->FindRecord(MyName);
 			if (MyRecord)
 			{
 				UE_LOG(LogTemp, Warning, TEXT("[Room] DelayedSendPlayerInfo: Char='%s', W1='%s', W2='%s'"),
@@ -801,6 +855,97 @@ void ARoomPlayerController::OnFlowStateChanged(EMatchState NewState)
 			if (RoomUIWidget)
 			{
 				RoomUIWidget->AddToViewport();
+			}
+		}
+	}
+	// 【大厂 P0 兜底修复 2026.07.03】状态机漏推到 InRoom, 但 World 已是战斗地图
+	// ----------------------------------------------------------------------
+	// 场景: Joiner 路径 LANRoomPage 漏写 RequestStateOnNextLoad(InRoom)
+	//       → PostLoadMapWithWorld 路径 B Broadcast(CurrentState=MainLobby)
+	//       → RoomPC 收到的是 MainLobby 而不是 InRoom
+	//       → 走到"状态 C: 退出战斗"分支, 把 HUD 关掉, 不创建 RoomUI
+	//
+	// 修复: 当 NewState=MainLobby 但 World 是战斗地图 (GameMode 是 RoomGameMode 派生)
+	//       按 InRoom 处理 → 创建 RoomInsidePage + 设置 UI 输入
+	//
+	// 设计原则: "物理位置"是真理, 状态机值是同步用的派生量
+	//           World 已经加载到战斗地图 = 物理上已经在 InRoom, 必须显示房间 UI
+	//
+	// 【大厂 P0 修复 2026.07.03】防御性房主身份标定
+	// 场景: 勾选"跳过登录"后, GameFlow 启动时已调 RoomService.EnterSkipToHostMode()
+	//       但本机可能不是第一次走此分支 (例如: 玩家从 L_Login 进了战斗地图, 又被退回到 MainLobby)
+	//       → 这里再调一次 EnterSkipToHostMode() 是幂等的 (内部 if (bIsHost) return 保护)
+	//       → 防御性兜底: 万一 RoomService 状态被异常清空, 也能恢复
+	// ==========================================
+	else if (NewState == EMatchState::MainLobby && GetWorld())
+	{
+		const FString CurMapName = GetWorld()->GetMapName();
+		const bool bIsInBattleMap =
+			CurMapName.Contains(TEXT("Japanese_Temple")) ||
+			CurMapName.Contains(TEXT("Room")) ||
+			CurMapName.Contains(TEXT("Battle")) ||
+			CurMapName.Contains(TEXT("Combat"));
+		if (bIsInBattleMap)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[RoomPC][P0-Fallback] NewState=MainLobby 但 World=%s 是战斗地图, 按 InRoom 处理 (Joiner 容错)"),
+				*CurMapName);
+
+			// 主动同步 GameFlowSubsystem 的状态 (避免后续 PostLoadMapWithWorld 又 Broadcast MainLobby)
+			if (UGameInstance* GI = GetGameInstance())
+			{
+				if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+				{
+					// 【防御性房主身份标定 2026.07.03】
+					// 场景: 勾选跳过登录时 GameFlow 已标 Host, 但跨图/状态重置后可能丢失
+					// 这里幂等再调一次, 内部 bIsHost 已为 true 时直接 return
+					if (URoomService* RoomService = URoomService::Get(this))
+					{
+						RoomService->EnterSkipToHostMode();
+					}
+
+					if (FlowSubsystem->GetCurrentState() != EMatchState::InRoom)
+					{
+						FlowSubsystem->TransitToState(EMatchState::InRoom);
+						// 注意: TransitToState 会递归触发 OnFlowStateChanged(InRoom)
+						// 这里直接 return, 不要继续走下方"状态 C"分支
+						return;
+					}
+				}
+			}
+
+			// 如果 GameFlowSubsystem 不可用 (理论上不可能), 自己手动走房间 UI 创建
+			bShowMouseCursor = true;
+			SetInputMode(FInputModeUIOnly());
+			if (RoomUIClass && !RoomUIWidget)
+			{
+				RoomUIWidget = CreateWidget<URoomInsidePage>(this, RoomUIClass);
+				if (RoomUIWidget)
+				{
+					RoomUIWidget->AddToViewport();
+				}
+			}
+		}
+		else
+		{
+			// 普通 MainLobby (L_Login 大厅) → 销毁 RoomUI (玩家已离开战斗地图回到大厅)
+			if (RoomUIWidget)
+			{
+				RoomUIWidget->RemoveFromParent();
+				RoomUIWidget = nullptr;
+			}
+			if (bIsEscMenuOpen)
+			{
+				bIsEscMenuOpen = false;
+				if (UGameHUDWidget* HUDWidget = GetGameHUDWidget())
+				{
+					HUDWidget->HideEscMenu();
+				}
+			}
+			if (ScoreboardWidgetInstance)
+			{
+				ScoreboardWidgetInstance->RemoveFromParent();
+				ScoreboardWidgetInstance = nullptr;
 			}
 		}
 	}
