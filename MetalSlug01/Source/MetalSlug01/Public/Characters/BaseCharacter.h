@@ -747,8 +747,53 @@ protected:
 	/**
 	 * 当前角色 ID（用于查找挂载配置）
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Attachment")
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Attachment")
 	FString CharacterID;
+
+	/**
+	 * 【P0 大厂架构 2026.07.03 19:35】Spawn 时刻预定的武器 ID
+	 *
+	 * 设计: AI 跟玩家走完全相同的武器 Spawn 链路 (SpawnAndEquipWeapon),
+	 *       但 AI 没有 PlayerState, 不能像玩家那样从 PS 读 SelectionWeapon1.
+	 *
+	 * 写入时机:
+	 *   - 服务器 SpawnAIInternal 后 (Possess 之前):
+	 *       AIPawn->SpawnWeaponID = Profile.WeaponID (从数据驱动配置来)
+	 *   - 已存在的玩家不变 (玩家依然从 PS 读)
+	 *
+	 * 读取时机:
+	 *   - PossessedBy 中, 优先读 SpawnWeaponID, 找不到再走 PS 路径
+	 *
+	 * 安全: 玩家流程不碰这字段, 互不干扰
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Attachment")
+	FString SpawnWeaponID;
+
+public:
+	/**
+	 * 【P0 大厂封装 2026.07.03 19:43】统一的武器/角色预填入口
+	 *
+	 * 为什么用 setter 而不是直接写 public 字段:
+	 *   - 字段访问控制: protected 让外部需要 friend 或 public 函数
+	 *   - setter 可以在内部加日志/校验 (例如非空检查/格式规范化)
+	 *   - 蓝图也能调, 编辑器友好
+	 *
+	 * 调用方:
+	 *   - ARoomGameMode::SpawnAIInternal (AI 路径)
+	 *   - 未来其他 Spawn 路径 (例如 NPC 商店)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Attachment")
+	void SetSpawnLoadout(const FString& InCharacterID, const FString& InWeaponID)
+	{
+		if (!InCharacterID.IsEmpty()) CharacterID = InCharacterID;
+		if (!InWeaponID.IsEmpty())    SpawnWeaponID = InWeaponID;
+	}
+
+	/** 只读 getter, 给 AI Controller 用 */
+	UFUNCTION(BlueprintPure, Category = "Combat|Attachment")
+	const FString& GetSpawnWeaponID() const { return SpawnWeaponID; }
+
+protected:
 
 	/**
 	 * 全局攻击锁: 正在挥刀吗？

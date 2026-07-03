@@ -26,6 +26,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/TimerHandle.h"
 #include "BehaviorTree/BTTaskNode.h"
 #include "BTTask_MeleeAttack.generated.h"
 
@@ -89,6 +90,12 @@ protected:
 
 private:
 	/**
+	 * 【P0 修复】取 Actor 中心点 (胶囊体中心 / 包围盒中心 / 偏移)
+	 * 取代直接用 GetActorLocation() (脚底位置导致距离虚高)
+	 */
+	FVector GetCenterLocation(const AActor* Actor) const;
+
+	/**
 	 * 执行真正的攻击逻辑
 	 * 条件：Token 可用 + 距离在 AttackRange 内
 	 */
@@ -114,4 +121,8 @@ private:
 	 * 检查 Token 是否可用
 	 */
 	bool IsAttackTokenReady(UBehaviorTreeComponent& OwnerComp) const;
+
+private:
+	/** 攻击冷却 Timer 句柄（防止重复设置） */
+	FTimerHandle AttackCooldownTimerHandle;
 };

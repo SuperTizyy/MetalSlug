@@ -27,7 +27,9 @@ UFootstepComponent::UFootstepComponent()
 
 void UFootstepComponent::PlayFootstep(ACharacter* OwnerChar, const FVector& Location)
 {
-	UWorld* World = GetWorld();
+	// 【P1 修复】安全校验：优先用 OwnerChar 的 World，而非 Component 自己的 World
+	// Component 的 World 在某些边缘情况下可能为空（如 AI 重生时）
+	UWorld* World = OwnerChar ? OwnerChar->GetWorld() : GetWorld();
 	if (!World || !OwnerChar)
 	{
 		return;
@@ -79,6 +81,8 @@ void UFootstepComponent::PlayFootstep(ACharacter* OwnerChar, const FVector& Loca
 	QueryParams.bReturnPhysicalMaterial = true;
 	QueryParams.AddIgnoredActor(OwnerChar);
 
+	// 【P2 修复】使用 TraceChannel 而非盲选通道，确保能命中地面
+	// 若追踪失败（AI 在空中或地形特殊），SoundToPlay 已在上面确定，仍然播放音效
 	if (World->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, FootstepTraceChannel, QueryParams))
 	{
 		if (UPhysicalMaterial* PhysMat = HitResult.PhysMaterial.Get())
@@ -86,6 +90,12 @@ void UFootstepComponent::PlayFootstep(ACharacter* OwnerChar, const FVector& Loca
 			UE_LOG(LogTemp, VeryVerbose, TEXT("[FootstepComponent] Surface=%s"),
 				*PhysMat->GetName());
 		}
+	}
+	else
+	{
+		// 追踪失败时记录调试信息，但仍然播放脚步声（避免 AI 完全没声音）
+		UE_LOG(LogTemp, VeryVerbose, TEXT("[FootstepComponent] 地面追踪失败 Loc=(%.1f, %.1f, %.1f), 仍播放脚步声"),
+			Location.X, Location.Y, Location.Z);
 	}
 
 	// 随机音高变化（0.9~1.1，更自然的听感）

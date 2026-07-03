@@ -84,6 +84,7 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Tick(float DeltaSeconds) override;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI")
 	UAIPerceptionComponent* AIPerception;
@@ -111,12 +112,43 @@ private:
 	void RunLegacyBehaviorTree();
 
 	/**
+	 * 【P0 大厂架构 2026.07.03 19:22】主动扫描最近的敌方 Character
+	 * 当 AIPerception 失效 / SightR 不够 / Perception 初始化未完成时的兜底
+	 * 用阵营接口找最近敌人, 返回 ScanRange 内最近的
+	 * @param MyCharacter  自身 Character (用于计算距离)
+	 * @return 最近的敌方 Character, 没找到返回 nullptr
+	 */
+	AActor* ScanForNearestEnemy(ACharacter* MyCharacter);
+
+	/**
 	 * 【Phase 2 共用层】按 Profile->Perception 配 AIPerception
 	 * 设计: 把"刀战专属"的 ConfigurePerceptionFromConfig 收归 Base
 	 *       所有 AI 派生类 (Melee/Zombie/Boss) 都不用再写一遍
 	 * 调用时机: OnProfileLoaded 之后, BT 启动之前
 	 */
 	void ConfigurePerceptionFromConfig();
+
+	/**
+	 * 【P0 架构升级 2026.07.03】启动期一次性全景诊断
+	 * 输出 4 项关键状态: Profile / 阵营 / 感知 / NavMesh
+	 * 任何一项异常用 Error 级别, 方便一次扫描日志看清全局
+	 * 调用时机: OnProfileLoaded 末尾 (配置完成后), BeginPlay (兜底)
+	 */
+	void DiagnoseAndLogBootStatus() const;
+
+	/**
+	 * 【P0 架构升级 2026.07.03】C++ 层 MoveTo 兜底
+	 * 设计原则 (大厂):
+	 *   "永远不要让单点故障 (BT 树设计错) 拖垮整个 AI 系统"
+	 *   BT 树可能是 .uasset 二进制, 出错不好修.
+	 *   本函数在 C++ 层每 0.3s 检查一次: 如果 TargetActor 存在但 AI 没在追, 主动 MoveTo.
+	 *   - 仅在距离 > AttackRange 且 BB 没标记 InCombat 时触发
+	 *   - 不与 BT 树冲突: MoveToLocation 是异步的, BT 重跑会自然接管
+	 *   - 攻击范围 (<=AttackRange) 时让 BT Attack task 接管, C++ 不抢
+	 *
+	 * 调用时机: Tick (BeginPlay 启用 PrimaryActorTick.bCanEverTick)
+	 */
+	void TickChaseFallback();
 
 	/** FOnAIBehaviorConfigLoaded 句柄, 跨 OnProfileLoaded 暂存 */
 	FOnAIBehaviorConfigLoaded ProfileLoadedDelegate;
@@ -133,4 +165,19 @@ protected:
 
 private:
 	bool bBehaviorTreeStarted = false;
+
+	/**
+	 * 【P0 架构升级 2026.07.03】C++ 层 MoveTo 兜底的节流计时
+	 * 避免每帧 MoveTo 浪费 CPU, 0.3s 检查一次足够 (AI 不会感知到 0.3s 内的位置变化)
+	 */
+	float TimeSinceLastChaseCheck = 0.f;
+
+	/**
+	 * 【P0 架构升级 2026.07.03 19:14】AddMovementInput 兜底方案的目标缓存
+	 * 设计: 每 0.3s 从 BB 读一次目标, 中间帧复用缓存
+	 *  - 避免每帧 BB->GetValueAsObject (哈希查询, 浪费 CPU)
+	 *  - 目标失效 (Player 死亡/丢失) 时缓存自然失效 (TWeakObjectPtr)
+	 * 用 TWeakObjectPtr 而非裸指针: Player 死亡时不会野指针
+	 */
+	TWeakObjectPtr<AActor> CachedChaseTarget;
 };

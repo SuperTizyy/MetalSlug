@@ -36,17 +36,17 @@ public:
 	void PlayFootstep(ACharacter* OwnerChar, const FVector& Location);
 
 protected:
-	/** 地面检测射线向下长度（cm） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Trace")
-	float TraceDistance = 150.0f;
+	/** 地面检测射线向下长度（cm），过大值会穿到楼层下方 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Trace", meta = (ClampMin = "5.0", ClampMax = "100.0"))
+	float TraceDistance = 10.0f;
 
-	/** 地面检测射线起始偏移（向上抬避免穿模） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Trace")
-	float TraceStartOffset = 100.0f;
+	/** 地面检测射线起始偏移（向上抬以避免穿模） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Trace", meta = (ClampMin = "0.0", ClampMax = "50.0"))
+	float TraceStartOffset = 5.0f;
 
-	/** 地面检测碰撞通道 */
+	/** 地面检测碰撞通道 — 必须用能返回物理材质的通道 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Trace")
-	TEnumAsByte<ECollisionChannel> FootstepTraceChannel = ECC_Visibility;
+	TEnumAsByte<ECollisionChannel> FootstepTraceChannel = ECC_PhysicsBody;
 
 public:
 	/** 下蹲时的脚步声资源 */

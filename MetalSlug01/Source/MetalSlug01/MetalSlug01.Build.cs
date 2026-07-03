@@ -14,7 +14,10 @@ public class MetalSlug01 : ModuleRules
 			"SlateCore","OnlineSubsystem", "OnlineSubsystemNull", "OnlineSubsystemUtils","DeveloperSettings","AIModule",
 			// 【大厂 P0 修复 2026.06.28】ENetworkFailure::Type 来自 NetCore 模块
 			// 用于 GameFlowSubsystem 的 HandleNetworkFailure 回调参数类型
-			"NetCore" });
+			"NetCore",
+			// 【P0 链接修复 2026.07.03】UNavigationSystemV1 / ARecastNavMesh 来自 NavigationSystem 模块
+			// 用于 BaseAIController 启动期 NavMesh 可用性探测
+			"NavigationSystem" });
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });

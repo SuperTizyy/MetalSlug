@@ -99,8 +99,18 @@ void UAnimNotify_Footstep::Notify(
 
 	FVector FootLocation = GetFootstepLocation(MeshComp);
 
-	// 编辑器预览时 MeshComp->GetWorld() 可能无效，直接跳过音效播放
-	UWorld* World = MeshComp->GetWorld();
+	// 【P2 修复】安全获取 World：优先从 MeshComp 获取
+	// FAnimNotifyEventReference 在部分 UE5 版本中不含 GetWorld()，
+	// 改用 MeshComp->GetOwner()->GetWorld()，比直接用 MeshComp->GetWorld() 更可靠
+	UWorld* World = nullptr;
+	if (AActor* Owner = MeshComp->GetOwner())
+	{
+		World = Owner->GetWorld();
+	}
+	if (!World)
+	{
+		World = MeshComp->GetWorld();
+	}
 	if (!World || !FootstepSound)
 	{
 		return;
@@ -113,7 +123,7 @@ void UAnimNotify_Footstep::Notify(
 	}
 
 	UGameplayStatics::PlaySoundAtLocation(
-		this,
+		MeshComp,
 		FootstepSound,
 		FootLocation,
 		FRotator::ZeroRotator,

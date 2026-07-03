@@ -93,6 +93,35 @@ public:
         meta = (AllowAbstract = "false"))
     TSubclassOf<class AAIController> ControllerClass;
 
+    /**
+     * 【P0 大厂架构 2026.07.03 19:35】AI 武器 RowName
+     *
+     * 设计: AI 也是角色, 跟玩家一样需要武器. 但 AI 的武器选择不是玩家临时选,
+     *       而是 AI 类型固定的 (刀战 AI = Knife01, 枪战 AI = 枪枪, etc.)
+     *       所以挂在 Profile 上, 数据驱动, 不在 SpawnRequest 里.
+     *
+     * 查找逻辑:
+     *   - SpawnAIInternal: 读 Profile.WeaponID → 写入 ABaseCharacter.SpawnWeaponID (服务器上)
+     *   - PossessedBy: 读 Pawn.SpawnWeaponID (优先), 回退 PS (玩家)
+     *
+     * 编辑器填法:
+     *   DA_AIProfile_MeleeGrunt -> WeaponID = "WQ001" (刀战默认武器)
+     *   留空 = 不生成武器 (跟 AI 设计意图一致, 比如诱饵)
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Identity",
+        meta = (DisplayName = "Weapon RowName (DT_WeaponInfo)"))
+    FName WeaponID = NAME_None;
+
+    /**
+     * 【P0 大厂架构 2026.07.03 19:35】AI 角色 RowName (DT_CharacterInfo)
+     *
+     * 用途: 跟 Request.CharacterRowName 解耦 — 即使 SpawnRequest 留空,
+     *       Profile 自己可以指定默认角色. SpawnAIInternal 用 Profile.CharacterRowName 兜底.
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Identity",
+        meta = (DisplayName = "Character RowName (DT_CharacterInfo)"))
+    FName CharacterRowName = NAME_None;
+
     /** 同步加载 Config (用于 PIE 测试 / 单机关卡) */
     UFUNCTION(BlueprintCallable, Category = "AI|Profile")
     UAIBehaviorConfigSO* LoadBehaviorConfigSync();

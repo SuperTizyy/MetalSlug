@@ -560,6 +560,19 @@ int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileA
 			continue;
 		}
 
+		// 【P0 修复 2026.07.03 19:35】把 Profile 的武器/角色配置写入 Pawn 字段
+		// PossessedBy 中会读这些字段 → 调 SpawnAndEquipWeapon → 武器到手
+		// 注意: 必须在 Possess 之前写, 这样 PossessedBy 时已经能看到
+		if (Profile)
+		{
+			const FString DesiredCharID =
+				Profile->CharacterRowName.IsNone()
+					? Request.CharacterRowName.ToString()
+					: Profile->CharacterRowName.ToString();
+			const FString DesiredWeaponID = Profile->WeaponID.IsNone() ? FString() : Profile->WeaponID.ToString();
+			AIPawn->SetSpawnLoadout(DesiredCharID, DesiredWeaponID);
+		}
+
 		AIC->Possess(AIPawn);
 
 		// 4d. Faction Tag
@@ -578,9 +591,10 @@ int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileA
 		}
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomGameMode] AI 生成: %s, Mode=%d, Team=%d, Faction=%s, Class=%s"),
+			TEXT("[RoomGameMode] AI 生成: %s, Mode=%d, Team=%d, Faction=%s, Class=%s, Weapon='%s'"),
 			*AIName, (int32)Request.Mode, (int32)Request.Team,
-			*DesiredFaction.ToString(), *GetNameSafe(ControllerClass));
+			*DesiredFaction.ToString(), *GetNameSafe(ControllerClass),
+			*AIPawn->GetSpawnWeaponID());
 
 		++SpawnedCount;
 	}

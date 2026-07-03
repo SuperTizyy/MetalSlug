@@ -1854,29 +1854,74 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	RefreshCharacterIcon();
 
 	// 仅在服务器执行
-	if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
+	if (HasAuthority())
 	{
-		// 设置当前角色ID（用于查找武器挂载配置）
-		CharacterID = PS->GetSelectedCharacterID();
+		FString WeaponID;
 
-		// 【修复】: 优先从 RoomGameMode 缓存读取武器ID（绕过 PlayerState 网络复制时序问题）
-		FString WeaponID = PS->GetSelectedWeapon1ID();
-		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+		// 【P0 修复 2026.07.03 19:35】三路兜底 — 让 AI 也能拿到武器
+		//
+		// Layer 1 (AI 路径): Pawn.SpawnWeaponID 由 SpawnAIInternal 写入 (从 Profile.WeaponID 读)
+		// Layer 2 (玩家路径): PlayerState.GetSelectedWeapon1ID (原代码)
+		// Layer 3 (玩家兜底): RoomGameMode::GetPlayerSpawnData 缓存
+		//
+		// 大厂原则: 关键行为不能依赖单一路径 — PS 没拿到时用 Cache 再尝试
+
+		// Layer 1: AI 路径
+		if (!SpawnWeaponID.IsEmpty())
 		{
-			FString CachedCharID;
-			FString CachedWeaponID;
-			if (GM->GetPlayerSpawnData(NewController->GetUniqueID(), CachedCharID, CachedWeaponID))
+			WeaponID = SpawnWeaponID;
+			UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using AI-profile weapon: %s, char: %s"),
+				*WeaponID, *CharacterID);
+		}
+
+		// Layer 2: 玩家路径
+		if (WeaponID.IsEmpty())
+		{
+			if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
 			{
-				WeaponID = CachedWeaponID;
-				if (!CachedCharID.IsEmpty())
+				// 设置当前角色ID（用于查找武器挂载配置）
+				if (CharacterID.IsEmpty())
 				{
-					CharacterID = CachedCharID;
+					CharacterID = PS->GetSelectedCharacterID();
 				}
-				UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using cached weapon: %s, char: %s"), *CachedWeaponID, *CachedCharID);
+
+				WeaponID = PS->GetSelectedWeapon1ID();
+				UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using PlayerState weapon: %s"),
+					*WeaponID);
 			}
 		}
 
-		SpawnAndEquipWeapon(WeaponID);
+		// Layer 3: GameMode 缓存兜底 (绕过 PS 网络复制时序问题)
+		if (WeaponID.IsEmpty())
+		{
+			if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+			{
+				FString CachedCharID;
+				FString CachedWeaponID;
+				if (GM->GetPlayerSpawnData(NewController->GetUniqueID(), CachedCharID, CachedWeaponID))
+				{
+					WeaponID = CachedWeaponID;
+					if (!CachedCharID.IsEmpty() && CharacterID.IsEmpty())
+					{
+						CharacterID = CachedCharID;
+					}
+					UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using cached weapon: %s, char: %s"),
+						*CachedWeaponID, *CachedCharID);
+				}
+			}
+		}
+
+		// 最终兜底: 没有武器就跳过 Spawn (不会崩, AI 也可能是无武器单位)
+		if (!WeaponID.IsEmpty())
+		{
+			SpawnAndEquipWeapon(WeaponID);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[PossessedBy] 没找到武器ID, 跳过武器 Spawn. AI=%s, HasPS=%d"),
+				*GetNameSafe(this),
+				NewController->GetPlayerState<ARoomPlayerState>() ? 1 : 0);
+		}
 	}
 }
 
@@ -2617,39 +2662,56 @@ void ABaseCharacter::BroadcastWeaponIconReady(const FString& WeaponID, UTexture2
 
 FGenericTeamId ABaseCharacter::ResolveGenericTeamIdFromTag(FGameplayTag InTag)
 {
-	// 单例 enum 到 ID 的硬编码表 — 仅 Phase 1 用, 后续通过 DataTable 配
-	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"))))
+	// 【P0 大厂架构修复 2026.07.03】改为查表 + 严格匹配父级 Faction.X
+	// 旧版坑: 漏匹配 Faction.Enemy, AI 走 Profile.FactionTag="Faction.Enemy" → 走到末尾 return NoTeam
+	//        → Controller::SetGenericTeamId(NoTeam) 把 Pawn FactionTag 清空
+	//        → 下一帧 GetGenericTeamId() fallback 到 FGenericTeamId(0) = Player 阵营
+	//        → AIPerception 看到玩家后用阵营协议判定为 Friendly → 永远看不到
+	//
+	// 新版:
+	//   1. 用 TMap 集中维护 (添加新阵营不用动控制流)
+	//   2. 严格 MatchesTagExact, 避免 "Faction.Enemy" 误匹配 "Faction.EnemyBoss"
+	//   3. 兜底: 不认识的 FactionTag 一律返回 NoTeam(255), 不再污染为 0(Player)
+	//   4. 首次调用时懒初始化表 (避免模块启动期 GameplayTag 表未就绪)
+
+	static TMap<FName, FGenericTeamId> TagToTeamId;
+	static bool bTableInitialized = false;
+	if (!bTableInitialized)
 	{
-		return FGenericTeamId(0); // Player
+		TagToTeamId.Add(TEXT("Faction.Player"),     FGenericTeamId(0));
+		TagToTeamId.Add(TEXT("Faction.Zombie"),     FGenericTeamId(1));
+		TagToTeamId.Add(TEXT("Faction.FriendlyAI"), FGenericTeamId(2));
+		TagToTeamId.Add(TEXT("Faction.Neutral"),    FGenericTeamId::NoTeam);
+		TagToTeamId.Add(TEXT("Faction.Enemy"),      FGenericTeamId(1)); // 【P0 关键】MeleeAI 走这个
+		TagToTeamId.Add(TEXT("Faction.Hostile.All"),FGenericTeamId(255));
+		bTableInitialized = true;
 	}
-	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"))))
-	{
-		return FGenericTeamId(1); // Zombie
-	}
-	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"))))
-	{
-		return FGenericTeamId(2);
-	}
-	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Neutral"))))
+
+	if (!InTag.IsValid())
 	{
 		return FGenericTeamId::NoTeam;
 	}
-	if (InTag.MatchesTag(FGameplayTag::RequestGameplayTag(TEXT("Faction.Hostile.All"))))
+
+	if (const FGenericTeamId* Found = TagToTeamId.Find(InTag.GetTagName()))
 	{
-		// UE 5.6 中 FGenericTeamId 没有 ::Hostile 静态成员, 用 FGenericTeamId(255) 约定
-		return FGenericTeamId(255);
+		return *Found;
 	}
+
+	// 【P0 兜底】未识别 → NoTeam(255), 不再返回 0 (避免把 AI 误标为玩家阵营)
 	return FGenericTeamId::NoTeam;
 }
 
 void ABaseCharacter::SetGenericTeamId(const FGenericTeamId& NewTeamID)
 {
-	// 把 FGenericTeamId 反向写回 FactionTag (用于运行时感染/阵营切换)
+	// 【P0 修复 2026.07.03】反向写回 FactionTag, 跟正向 Resolve 严格对齐
+	// 旧版坑: ID=1 写 Faction.Zombie, 但 AI 配的是 Faction.Enemy, 下一帧 Resolve 会再算回 ID=1
+	//        → 反复横跳不影响功能, 但日志难追. 现在: 写 Faction.Enemy 保持命名稳定.
 	const int32 Id = NewTeamID.GetId();
-	if (Id == 0)       FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"));
-	else if (Id == 1)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"));
-	else if (Id == 2)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"));
-	else               FactionTag = FGameplayTag();
+	if (Id == 0)         FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"));
+	else if (Id == 1)    FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Enemy")); // 跟正向表一致
+	else if (Id == 2)    FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"));
+	else if (Id == 255)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Hostile.All"));
+	else                 FactionTag = FGameplayTag(); // NoTeam → 空 tag
 }
 
 FGenericTeamId ABaseCharacter::GetGenericTeamId() const
@@ -2658,8 +2720,10 @@ FGenericTeamId ABaseCharacter::GetGenericTeamId() const
 	{
 		return ResolveGenericTeamIdFromTag(FactionTag);
 	}
-	// 兼容: 没设 FactionTag 时回退到默认人类阵营
-	return FGenericTeamId(0);
+	// 【P0 修复 2026.07.03】无 FactionTag 时回退到 NoTeam(255), 不再默认 0(Player)
+	// 原理: AI 没配阵营时应该是 "非玩家" 的兜底, 跟 Resolve 表末尾的 NoTeam 对齐
+	//      之前默认 0 会导致: AI 没配 Profile → 跟玩家同阵营 → 不追玩家 (本次 bug 链的源头)
+	return FGenericTeamId::NoTeam;
 }
 
 ETeamAttitude::Type ABaseCharacter::GetTeamAttitudeTowards(const AActor& Other) const
