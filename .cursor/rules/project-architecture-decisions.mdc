@@ -1,0 +1,374 @@
+---
+description: MetalSlug 项目架构决策记录 — AI 架构从 C++ 直决策重构为 BT 为主、C++ 为辅
+globs:
+alwaysApply: true
+---
+
+# MetalSlug 项目架构记忆
+
+## 1. 核心架构决策(2026-07-07 晚定)
+
+### AI 架构路线
+**决策**:**BT 为主,C++ 为辅**。
+- BT 负责"何时做"(决策)
+- C++ 负责"怎么做"(原子能力)
+- **禁止**:在 BTTask 的 ExecuteTask 里写 if/else 距离/HP 判断
+- **允许**:在 BTTask 里调用 AController / UAnimInstance 等引擎 API
+
+### 理由
+1. 未来敌人状态数会从 3 个增至 8+(追击/攻击/退避/受伤/呼叫/换弹/眩晕/死亡)
+2. switch/if-else 状态超过 5 个会爆炸
+3. BT 是 UE 官方 + 90% 大厂标准
+4. BT 节点粒度天然抗抖动(决策频率 1~5Hz,不是 60Hz)
+
+## 2. 当前 AI 实现状态(v18)
+
+### 已完成
+- BTTask_MeleeAttack.cpp: BT 入口,但**内部用 C++ 决策**(借 BT 壳做 C++ 事)
+- BaseAIController / MeleeAIController: 控制器层
+- AIRuntimeConfigComponent: 配置注入(Data Asset + Actor Component)
+- AIBehaviorConfigSO: DataAsset 集中配置(AttackRange、Hyst、Refractory Period 等)
+- AIBehaviorTypes: 共享枚举(EArrivalDecision)
+
+### 抖动防护三件套(已落地)
+1. **Hysteresis** — `AIBehaviorConfigSO::AttackRangeHysteresis`(默认 0,建议 5~15)
+2. **Refractory Period** — 200ms 决策锁定(`BTTask_MeleeAttack.cpp` 内)
+3. **Single Decision Per Tick** — 每 Tick 只产生一个决策,避免抖动
+
+### 抖动根因记录
+- D 每帧在 ±3cm 跳(玩家移动 + NavMesh + 动画 + 同步)
+- 单点比较 → 决策翻转
+- MoveTo 每帧取消重发 → 原地蹭脚
+
+## 3. 明天(2026-07-08)重构路线图
+
+### Step 1: 原子库(半天,12 个文件)
+```
+Source/MetalSlug01/AI/
+├── Tasks/
+│   ├── BTTask_FaceTarget.{h,cpp}           # 面向目标
+│   ├── BTTask_MoveToTarget.{h,cpp}         # MoveTo Actor
+│   ├── BTTask_MoveAwayFromTarget.{h,cpp}   # 后退
+│   ├── BTTask_PlayAttackMontage.{h,cpp}    # 播攻击动画
+│   ├── BTTask_WaitMontageFinish.{h,cpp}    # 等动画结束
+│   ├── BTTask_PlayDeath.{h,cpp}            # 死亡 + Destroy
+│   └── BTTask_CallReinforcement.{h,cpp}    # 呼叫同伴
+├── Services/
+│   ├── BTService_UpdateBlackboard.{h,cpp}  # 0.1s 更新距离/HP
+│   └── BTService_UpdatePerception.{h,cpp}  # 感知系统
+└── Decorators/
+    ├── BTDecorator_DistanceCheck.{h,cpp}   # 距离区间
+    ├── BTDecorator_HPThreshold.{h,cpp}     # 血量阈值
+    └── BTDecorator_HasTarget.{h,cpp}       # 有无目标
+```
+
+### Step 2: 画第一个 BT(半天)
+```
+BT_Grunt (编辑器):
+└─ Selector (根)
+    ├─ Sequence "Retreat"
+    │   ├─ Decorator: Distance < (AR - Hyst)
+    │   ├─ BTTask_FaceTarget
+    │   └─ BTTask_MoveAwayFromTarget
+    ├─ Sequence "Attack"
+    │   ├─ Decorator: Distance ∈ [AR-Hyst, AR+Hyst]
+    │   ├─ BTTask_FaceTarget
+    │   ├─ BTTask_PlayAttackMontage
+    │   └─ BTTask_WaitMontageFinish
+    └─ Sequence "Chase"
+        ├─ Decorator: Distance > (AR + Hyst)
+        ├─ BTTask_FaceTarget
+        └─ BTTask_MoveToTarget
+
+Service_TickDistance 挂根: 每 0.1s 更新 BB.Distance
+```
+
+### Step 3: 抖动验证(2h)
+- 对比 BT vs 旧 C++ 实现
+- 测距离边界、HP 边界
+
+### Step 4: 删除旧逻辑(2h)
+- BTTask_MeleeAttack.cpp 里的 if/else 决策全部下放
+- 改用原子 Task 组合
+
+### Step 5: 扩展性验证(半天)
+- 加第 4 个状态(Stun)
+- 只改 BT 资源,不改 C++
+
+## 4. 关键设计规范
+
+### Blackboard Key 命名(共享 schema)
+```
+TargetActor         (Object)   - 玩家
+DistanceToTarget    (Float)    - 距玩家,0.1s 更新
+SelfActor           (Object)   - 自己
+HealthPercent       (Float)    - 血量百分比,0.1s 更新
+bHasTarget          (Bool)     - 是否有目标
+HomeLocation        (Vector)   - 出生点
+PatrolRadius        (Float)    - 巡逻半径
+```
+
+### Service 频率
+- 距离/HP 更新:0.1s (10Hz)
+- 感知系统:0.1s
+- 决策级状态(死亡/眩晕):实时(Frame)
+
+### Task 同步/异步
+```cpp
+EBTNodeResult::InProgress  // 异步(等动画、等 MoveTo),必须绑回调
+EBTNodeResult::Succeeded   // 同步完成
+EBTNodeResult::Failed      // 失败
+```
+
+### 抖动防护参数(留作可调)
+| 参数 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| AttackRange | 180cm | 100~500 | 攻击距离 |
+| AttackRangeHysteresis | 0cm | 5~15 | 迟滞区间(默认 0,Refractory 兜底) |
+| DecisionRefractoryPeriod | 0.2s | 0.1~0.5 | 决策锁定时长 |
+
+### 大厂抗抖动 5 层(参考)
+```
+Layer 5: 动画插值 (UE 内置 BlendSpace,默认有)
+Layer 4: 决策锁定 (Refractory 200ms — 我们有)
+Layer 3: 死区迟滞 (Hyst 5~15 — ConfigSO 可调)
+Layer 2: 距离 EMA 平滑 (大厂标配,我们缺)
+Layer 1: 比较钝化 (>= AR+5 而非 > AR,我们缺)
+```
+**明天决定是否补 Layer 2(Lerp 平滑)**。
+
+## 5. 禁止模式(我之前犯过的错)
+
+### 反模式 1:借 BT 壳做 C++ 决策
+```cpp
+// 错误:v1~v18 我们一直这样写
+UBTTask_MeleeAttack::ExecuteTask(...) {
+    while (true) {
+        float D = GetDistance();
+        if (D < AR) Retreat();   // 决策在 C++
+        else Chase();             // 决策在 C++
+    }
+}
+```
+**禁止再写这种代码**。
+
+### 反模式 2:Hyst=0 + 死板边界
+**禁止**用单点比较 `<` 或 `>`,必须用区间 `[AR-Hyst, AR+Hyst]`。
+
+### 反模式 3:不绑异步回调
+```cpp
+// 错误:ExecuteTask 永远不返回 InProgress,BT 卡死
+PlayAnim();
+return Succeeded;  // 动画还没播就返回了
+```
+**正确**:返回 `InProgress`,绑 `OnMontageEnded` 委托,在回调里返回 `Succeeded/Failed`。
+
+## 6. 用户偏好
+
+### 语言
+- 中文回复,中文代码注释
+
+### 工作风格
+- 喜欢理解"为什么",不只是"怎么做"
+- 重视架构可扩展性,愿意为未来投入
+- 偏好架构原则先讲清,再写代码
+- 愿意听大厂案例对比,作为决策参考
+
+### 沟通偏好
+- 问"为什么"时,给底层原理 + 类比 + 工业案例
+- 决策时给多个选项 + 推荐项 + 理由
+- 不喜欢模糊回答,要"明确答案 + 理由"
+
+## 7. 关键文件清单(明天开始前确认存在)
+
+```
+MetalSlug01/Source/MetalSlug01/
+├── AI/
+│   ├── AIBehaviorTypes.h           # 共享枚举
+│   ├── AIBehaviorConfigSO.h/cpp    # DataAsset (含 AttackRange, AttackRangeHysteresis)
+│   ├── AIRuntimeConfigComponent.h/cpp  # 组件
+│   ├── BaseAIController.h/cpp      # 基础控制器
+│   ├── MeleeAIController.h/cpp     # 近战控制器
+│   ├── BaseCharacter.h/cpp         # 基础角色
+│   ├── Decorators/
+│   │   ├── BTDecorator_DistanceCheck.h/cpp   # v2: SourceMode=FromAttackRange (单一数据源)
+│   │   ├── BTDecorator_HPThreshold.h/cpp
+│   │   └── BTDecorator_CooldownReady.h/cpp
+│   ├── Services/
+│   │   ├── BTService_UpdateDistance.h/cpp
+│   │   ├── BTService_UpdateHealth.h/cpp
+│   │   └── BTService_RefreshTarget.h/cpp
+│   └── Tasks/
+│       ├── BTTask_PlayAttackMontage.h/cpp
+│       ├── BTTask_WaitMontageFinish.h/cpp
+│       ├── BTTask_PlayDeath.h/cpp
+│       ├── BTTask_MoveAwayFromTarget.h/cpp
+│       └── BTTask_KeepDistanceToTarget.h/cpp  # v19 新增: Chase 距离维持闭环
+├── Combat/  (待补)
+└── Input/   (待补)
+
+MetalSlug01/Content/
+├── Blueprints/AI/
+│   ├── BP_MeleeGrunt.uasset               # 敌人蓝图
+│   └── DA_AIBehaviorConfig_MeleeGrunt.uasset  # 配置 DA
+└── AI/
+    └── BT_Grunt.uasset                    # v19: Chase 用 BTTask_KeepDistanceToTarget
+```
+
+## 8. v19 (2026.07.09) Chase 距离维持闭环重构 (大厂架构)
+
+### 旧实现 (v18) 痛点
+```
+Sequence (Chase)
+├─ Decorator: DistanceCheck, Mode=GreaterThan, MaxDistance=200  (硬编码)
+├─ Rotate To Face BB Entry
+└─ Move To (Target=TargetActor, AcceptanceRadius=60)
+```
+**根因链**:
+1. UE 原生 `MoveTo` 是"寻路到终点"语义, **不是"维持距离"** —— 玩家朝 AI 冲 → AI 还在走过去 → 被穿过
+2. `AcceptanceRadius` 是"停下半径",距离判定完全交给 BT 静态数字,与玩家位置实时变化脱节
+3. BT 编辑器硬编码 `165/195/200`,策划改 AR=250 全失效
+4. Attack Max=195 与 Chase Max=200 之间存在 5cm 灰色区 → Selector 反复横跳 → 原地蹭脚
+
+### 新架构 (v19 单一数据源 + 闭环控制)
+```
+Sequence (Chase)
+├─ Decorator: DistanceCheck, SourceMode=FromAttackRange, Mode=GreaterThan, PlusMargin=0
+├─ Rotate To Face BB Entry
+└─ BTTask_KeepDistanceToTarget (TargetKey=TargetActor)
+```
+
+`BTTask_KeepDistanceToTarget` 原子能力:
+- 不是"寻路到终点",而是"维持距离"的闭环控制
+- 实时 Tick 测距 (走 ABaseAIController::ComputeActorCenterDistance 统一算法)
+- 进入 [AR-Hyst, AR+Hyst] 区间 → 立即 `FinishLatentTask(Succeeded)`
+- 玩家冲过来 (D < AR-Hyst) → 反向 MoveTo 后退 (BackoffMove)
+- 100ms 节流 (kMinMoveRequestIntervalSeconds) 防高频重发
+
+### 单一数据源 (大厂原则 v19 落地)
+`ConfigSO.Combat.AttackRange` 是 AI 距离阈值的**唯一真理**:
+- `BTDecorator_DistanceCheck`: `SourceMode=FromAttackRange` + `PlusMargin` 偏移
+- `BTTask_KeepDistanceToTarget`: `ResolveEffectiveThresholds()` 从同一来源读
+- 策划改 AR=300, BT 编辑器 0 改动 → 自动生效
+
+### 抗抖动 5 层 (v19 完整版)
+| Layer | 机制 | 负责 | 默认 |
+|---|---|---|---|
+| 5 | 动画插值 | UE BlendSpace (内置) | 默认 |
+| 4 | 决策迟滞 | BTTask KeepDistance Tick 实时测距 | 60Hz |
+| 3 | 死区迟滞 | ConfigSO.AttackRangeHysteresis | 5cm |
+| 2 | 距离 EMA 平滑 | (v19 暂未加,BT 层 Decorator 给迟滞区间补偿) | — |
+| 1 | 比较钝化 | `>= <=` 而非 `> <` | 内置 |
+
+## 9. v24 (2026.07.10) 武器溶解 — 职责对等 + 武器自治 (大厂架构)
+
+### 旧实现 (v23) 痛点 — 跨边界调用 + 责任错位
+
+```
+ABaseCharacter::DropAndFadeWeapon(Weapon)
+  └─ DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh)   ← 跨边界!
+       └─ 把武器的 MID 加到角色 DissolveComponent 自己的 DynamicMaterials 数组
+            └─ Tick 时一起驱动 (角色组件驱动武器材质)
+```
+
+**根因链 (3 个根因)**:
+1. **责任错位**: 角色的 DissolveComponent 驱动武器的材质 (跨职责)
+2. **时序耦合**: 武器 Detach 后, 角色组件还 hold 武器 MID 引用 → UE Actor 销毁时 GC 抖动
+3. **协议未满足**: 武器材质蓝图没调用 MF_Dissolve → 即便驱动也是 no-op → 武器永不溶解
+
+### 新架构 (v24) — 武器自治 + 职责对等
+
+```
+// 武器自己持有溶解组件 — 与身体完全对称
+ABaseCharacter
+  └─ UDissolveComponent              (驱动角色身体 Mesh)
+
+ABaseWeapon
+  └─ UWeaponDissolveComponent        (驱动武器 Mesh)  ← 自治!
+```
+
+**调用链**:
+```
+ABaseCharacter::ExecuteDeathLocal()
+  └─ DropAndFadeWeapon(Weapon)
+       ├─ 1. Weapon->DetachFromActor()               (Detach)
+       ├─ 2. WeaponMesh->SetSimulatePhysics(true)    (物理模拟)
+       ├─ 3. Weapon->StartDissolve()                 (委托给武器)
+       │     └─ WeaponDissolveComponent->StartDissolve()
+       │          ├─ 收集自己 Mesh 的 MID            (零跨边界)
+       │          ├─ 协议验证: 是否有 DissolveAmount 参数 (不满足则报警)
+       │          └─ 启动 Tick, 累加 DissolveAmount
+       └─ 4. SetLifeSpan(3.0s)                       (服务器权威销毁)
+```
+
+### 大厂原则 (v24 落地)
+
+| 原则 | 旧 (v23) | 新 (v24) |
+|---|---|---|
+| **职责对等** | 角色组件驱动武器材质 | 武器组件驱动武器材质 |
+| **零跨边界** | 跨边界引用武器 MID | 武器管自己, 角色不穿透 |
+| **单一协议** | 武器走的是"角色协议" | 武器走的是"武器协议" (与身体完全一致) |
+| **零兜底** | 武器材质不满足协议 → 静默 no-op | 不满足协议 → 显式 Log(Warning) 报警, 让美术修材质 |
+| **销毁时序** | 客户端 timer + 服务器 SetLifeSpan 双轨 | 仅服务器 SetLifeSpan (UE 网络同步自动传播) |
+
+### 协议 (武器材质蓝图侧)
+
+武器材质蓝图必须:
+1. 调用 `MF_Dissolve` Material Function (作为 Material Function Call 节点)
+2. MF_Dissolve 节点有 `DissolveAmount` 标量参数输入
+3. MF_Dissolve 的输出连到 Emissive (或 Opacity)
+
+**未满足时 C++ 行为 (零兜底)**:
+- `WeaponDissolveComponent::ValidateMaterialHasDissolveParameter` 检测到缺失
+- 打印 `LogCombat, Warning` 告知具体哪个 Slot 哪个 Mesh
+- Tick 仍会驱动 (SetScalarParameterValue 是 UE no-op, 不会崩)
+- 视觉效果: 武器不溶解, 但也不会异常
+
+**修复方法**: 美术在武器材质蓝图 (M_WeaponKnife 等) 中加 MF_Dissolve 节点, 编译保存即可。
+
+### 抗抖动 5 层 — 武器部分 (v24)
+
+武器溶解不参与 AI 抗抖动 (无距离/HP/时间敏感性), 但有生命周期抗抖动:
+
+| 层 | 机制 | 负责 |
+|---|---|---|
+| 1 | 幂等: 多次 StartDissolve 第二次起 no-op | UWeaponDissolveComponent |
+| 2 | Mesh 失效检测: Ensure + Log(Error), Tick 不开 | UWeaponDissolveComponent |
+| 3 | 协议验证: 没 DissolveAmount 参数 → 报警 | UWeaponDissolveComponent |
+| 4 | 完成回调: 广播 OnWeaponDissolveFinished | UWeaponDissolveComponent |
+| 5 | 销毁分离: 组件不调 Destroy, UE SetLifeSpan 控 | ABaseCharacter::DropAndFadeWeapon |
+
+### 关键文件清单 (v24 新增/修改)
+
+```
+新增:
++ MetalSlug01/Source/MetalSlug01/Public/Components/WeaponDissolveComponent.h
++ MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDissolveComponent.cpp
+
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Weapons/BaseWeapon.h
+    + WeaponDissolveComponent 子对象
+    + StartDissolve() 公开方法
+    + IsDissolving() 查询方法
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/BaseWeapon.cpp
+    + 构造函数中 CreateDefaultSubobject<UWeaponDissolveComponent>
+    + StartDissolve() 实现: 委托给组件
+    + IsDissolving() 实现
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+    ~ DropAndFadeWeapon: 改用 Weapon->StartDissolve() (替代 DissolveComponent->CollectWeaponDynamicMaterials)
+~ MetalSlug01/Source/MetalSlug01/Public/Components/DissolveComponent.h
+    - 删 CollectWeaponDynamicMaterials, CollectAllDynamicMaterials, GetOwnerWeaponMesh, DissolveMaterial 字段
+    - 保留 StartDissolveImmediate (身体溶解入口)
+~ MetalSlug01/Source/MetalSlug01/Private/Components/DissolveComponent.cpp
+    - 删武器相关代码, 简化为只管身体溶解
+```
+
+- [ ] 读 BTTask_MeleeAttack.cpp 现状
+- [ ] 读 BaseAIController.cpp / MeleeAIController.cpp
+- [ ] 读 AIBehaviorConfigSO.h 看参数列表
+- [ ] 写 12 个原子 C++ 类
+- [ ] 在 UE 编辑器画 BT_Grunt
+- [ ] 验证 BT 跑通
+- [ ] 对比旧实现,确认无抖动
+- [ ] 删除旧 C++ 决策代码
+- [ ] 加第 4 状态验证可扩展性

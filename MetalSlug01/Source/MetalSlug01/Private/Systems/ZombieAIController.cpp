@@ -61,7 +61,8 @@ void AZombieAIController::SetupZombieAI(UAIProfileAsset* ZombieProfile)
 	InitializeFromProfile(ZombieProfile);
 
 	// 4. 配置感知 (走 Config 里读到的 SightParams, 不再硬编码)
-	//    Base.OnTargetDetected 距离阈值也从 RuntimeConfig->GetScaledCombat().OverrideBTDistance 读
+	//    Base.OnTargetDetected 距离阈值也从 RuntimeConfig->GetScaledCombat().AttackRange 读
+	//    【P0 v5 2026.07.07】OverrideBTDistance 字段已删除, NearbyThreat 触发距离统一 = AttackRange
 	if (AIPerception && RuntimeConfig && RuntimeConfig->GetConfig())
 	{
 		// Biochemical AI 默认视觉参数与刀战不同 — 走 Profile 配

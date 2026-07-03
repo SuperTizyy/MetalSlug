@@ -763,8 +763,12 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 				}
 			}
 
-			// 【核心修复】: 启动服务器倒计时，确保 OnMatchTimerTick 每秒递减
-			GM->StartMatchTimer();
+			// 【P0 架构升级 2026.07.06 17:15】调用 PerformGameStart 触发 OnBattleStarted 广播
+			// 修复: 之前 Server_RequestStartGame_Implementation 直接调 StartMatchTimer,
+			//       完全绕过了 PerformGameStart, 导致 RoomGameMode::OnBattleStarted 永远不广播
+			//       → AI 控制器订阅 OnBattleStarted 但永远收不到 → AI 永远不启动 BT → AI 完全不动
+			// PerformGameStart 内部已调 StartMatchTimer, 不会重复
+			GM->PerformGameStart();
 		}
 		else
 		{

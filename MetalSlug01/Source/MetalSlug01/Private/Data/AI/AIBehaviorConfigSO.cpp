@@ -37,7 +37,9 @@ FAICombatParams UAIBehaviorConfigSO::GetScaledCombat(EAIDifficultyTier Tier) con
     Out.Damage           *= Scale;
     Out.AttackRange      *= Scale;
     Out.AttackCooldown   /= FMath::Max(Scale, KINDA_SMALL_NUMBER); // 高难度冷却更短
-    Out.OverrideBTDistance *= Scale;
+    // 【P0 v5 2026.07.07】OverrideBTDistance 字段已从 FAICombatParams 删除 (用户硬要求)
+    //   距离语义统一到 AttackRange (一值三用: AI 停下距离 / 攻击触发距离 / NearbyThreat 阈值)
+    //   见 ABaseAIController::UpdateNearbyThreatByDistance 与 TickChaseFallback
     return Out;
 }
 

@@ -9,7 +9,7 @@
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
 #include "GameplayTagContainer.h"
-#include "Systems/AI/AIBehaviorTypes.h"  // 【Phase 2】注入 EAIRole / FAIHuntPolicy
+#include "Systems/AI/AIBehaviorTypes.h"  // 【Phase 2】注入 EAIRole
 #include "AIProfileAsset.generated.h"
 
 class UAIBehaviorConfigSO;
@@ -121,6 +121,44 @@ public:
     UPROPERTY(EditDefaultsOnly, Category = "Identity",
         meta = (DisplayName = "Character RowName (DT_CharacterInfo)"))
     FName CharacterRowName = NAME_None;
+
+    /**
+     * 【P0 大厂架构 2026.07.06 19:25】AI 攻击间隔（Profile 级覆盖）
+     *
+     * 目的: 让策划在 AIProfileAsset 上直接控制"AI 多长时间打一次",
+     *       不用每次都打开 AIBehaviorConfigSO + 难度表去改.
+     *       实战中"AI 持续连击"问题常因为间隔太小 / 没配默认值, 暴露在这里更直观.
+     *
+     * 取值优先级（自上而下短路求值）:
+     *   1. Profile.AttackInterval > 0        → 直接用这个值
+     *   2. Profile.AttackInterval <= 0       → 回退 AIBehaviorConfigSO.Combat.AttackCooldown
+     *   3. 还没拿到 Config                    → 兜底 1.5s
+     *
+     * 范围建议:
+     *   - 0.5 ~ 1.0s : 狂暴 Boss / Boss 阶段二 (密集连击, 给玩家压迫感)
+     *   - 1.2 ~ 1.8s : 普通近战 AI (默认, 玩家可以反应)
+     *   - 2.0 ~ 3.5s : 笨重型僵尸 / 重武器 AI (慢, 但伤害高)
+     *
+     * 注意: 这个值只控制"两次攻击之间的最短间隔", 不会让 Combo 段内部也变慢
+     *       (Combo1 段动画完整播放由 OnAIAttackMontageEnded 事件回调保证).
+     *
+     * < 0 = 用 ConfigSO 默认; 0 = 禁止攻击; > 0 = 自定义间隔
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Combat",
+        meta = (ClampMin = "-1.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "5.0",
+                DisplayName = "Attack Interval (秒, -1=用Config默认)"))
+    float AttackInterval = -1.0f;
+
+    /**
+     * 【P0 2026.07.06 19:25】攻击间隔的有效获取函数
+     *
+     * 用途: BTTask / AIController 一行代码拿到最终间隔, 不用关心回退链
+     *       复用 ConfigSO 已有的 GetScaledCombat().AttackCooldown 做二级回退
+     *
+     * @return 最终攻击间隔（秒）; 0 表示禁止攻击
+     */
+    UFUNCTION(BlueprintPure, Category = "AI|Profile")
+    float GetEffectiveAttackInterval() const;
 
     /** 同步加载 Config (用于 PIE 测试 / 单机关卡) */
     UFUNCTION(BlueprintCallable, Category = "AI|Profile")

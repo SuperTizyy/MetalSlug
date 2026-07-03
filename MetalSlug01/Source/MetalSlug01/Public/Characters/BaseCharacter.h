@@ -30,6 +30,14 @@
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
 
+// 【P0 2026.07.06】引入 FOnMontageEnded 委托类型 (AI 攻击蒙太奇结束回调需要)
+//
+// 【关键】FOnMontageEnded 实际定义在 Animation/AnimInstance.h 中 (不是 AnimMontage.h),
+//        它是 UAnimInstance 的 Montage_SetEndDelegate 接口使用的动态委托类型
+// 注: 我们用 UAnimInstance::OnMontageEnded.AddDynamic(...) 绑定回调,
+//     所以 BaseCharacter.h 不需要暴露 FOnMontageEnded 成员 (UHT 只需看到函数指针)
+#include "Animation/AnimInstance.h"
+
 // 【Phase 1】 阵营 GameplayTag (为后续 IGenericTeamAgentInterface 升级预留)
 #include "GameplayTagContainer.h"
 
@@ -159,6 +167,34 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI")
 	TObjectPtr<UAIProfileAsset> MeleeProfile;
+
+	/**
+	 * 【P0 大厂架构 2026.07.06】Profile 直接设置武器/角色入口
+	 *
+	 * 设计: SetSpawnLoadout 空实现导致 AI 无法拿武器.
+	 *       改为: 存一份 Profile 引用, 后续 PossessedBy 直接从 Profile 读 WeaponID/CharacterID.
+	 *
+	 * 调用方: AMeleeAIController::SetupMeleeAI (关卡预放 AI 自举)
+	 *
+	 * 为什么不改 SetSpawnLoadout:
+	 *   - 已有代码依赖其签名, 改实现可能破坏玩家路径
+	 *   - Profile 存成员变量更直观, Debug 时一眼看清来源
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Profile")
+	void SetMeleeProfile(UAIProfileAsset* InProfile);
+
+	/**
+	 * 【P0 大厂架构 2026.07.06】从缓存的 Profile 同步武器/角色数据
+	 *
+	 * 调用方: PossessedBy (在读取 SpawnWeaponID 之前先调用本方法)
+	 *
+	 * 逻辑:
+	 *   1. 检查 MeleeProfile 是否有效
+	 *   2. 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
+	 *   3. 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
+	 *   4. 输出诊断日志
+	 */
+	void SyncWeaponFromProfile();
 
 protected:
 	/**
@@ -771,7 +807,7 @@ protected:
 
 public:
 	/**
-	 * 【P0 大厂封装 2026.07.03 19:43】统一的武器/角色预填入口
+	 * 【P0 大厂封装 2026.07.03】统一的武器/角色预填入口
 	 *
 	 * 为什么用 setter 而不是直接写 public 字段:
 	 *   - 字段访问控制: protected 让外部需要 friend 或 public 函数
@@ -780,13 +816,25 @@ public:
 	 *
 	 * 调用方:
 	 *   - ARoomGameMode::SpawnAIInternal (AI 路径)
-	 *   - 未来其他 Spawn 路径 (例如 NPC 商店)
+	 *   - AMeleeAIController::SetupMeleeAI (关卡预放 AI 路径)
+	 *
+	 * 【P0 大厂架构重构 2026.07.06】:
+	 *   - 原实现: 仅在 !InXXXID.IsEmpty() 时写入, 导致 Profile.WeaponID=""
+	 *     时直接跳过, SpawnWeaponID 永远为空
+	 *   - 新实现: 无论是否为空都写入, 确保外部覆盖意图被尊重
+	 *   - 大厂原则: 显式赋值优于隐式跳过, 日志清晰可追溯
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Attachment")
 	void SetSpawnLoadout(const FString& InCharacterID, const FString& InWeaponID)
 	{
-		if (!InCharacterID.IsEmpty()) CharacterID = InCharacterID;
-		if (!InWeaponID.IsEmpty())    SpawnWeaponID = InWeaponID;
+		UE_LOG(LogTemp, Log,
+			TEXT("[BaseCharacter] SetSpawnLoadout: InCharID='%s', InWeaponID='%s', Old CharID='%s', Old WeaponID='%s'"),
+			*InCharacterID, *InWeaponID, *CharacterID, *SpawnWeaponID);
+
+		// 【P0 修复 2026.07.06】: 无论是否为空都写入, 不再跳过空字符串
+		// 原因: Profile.WeaponID="" 时应显式清空, 而非保留旧值
+		CharacterID = InCharacterID;
+		SpawnWeaponID = InWeaponID;
 	}
 
 	/** 只读 getter, 给 AI Controller 用 */
@@ -878,17 +926,28 @@ public:
 	void EndAttackState();
 
 	/**
-	 * 【Phase 3 大厂架构】AI 触发攻击的统一公共入口
+	 * 【P0 大厂架构修复 2026.07.06】AI 专用轻攻击 — 不复用玩家连击状态机
 	 *
-	 * 设计: 把原本 protected 的 LightAttack_Pressed 暴露给 AI 子系统调用
-	 *       AI BTTask 通过本接口触发连击, 内部逻辑与玩家轻击完全一致
-	 *       （连击序号递增 + 播放蒙太奇 + Server_PlayAttackAnim RPC）
+	 * 根因分析:
+	 *   旧路径 OnAIRequestAttack -> LightAttack_Pressed -> 设置 bIsMovementLocked + MaxWalkSpeed=0
+	 *   -> EndAttackState (由动画蓝图 NotifyEnd 调用) -> 清除锁
+	 *   问题: AI 攻击不走动画蓝图的 NotifyEnd 回调链, EndAttackState 从未被调用
+	 *   结果: bIsMovementLocked 永远为 true, AI 永远无法移动 (用户原话: "原地攻击")
 	 *
-	 * 调用方: UBTTask_MeleeAttack / 后续 AI Controller 子类
-	 * 安全: 内部已做 IsDead/CurrentWeapon 检查, 死亡/无武器时静默返回
+	 * 修复方案:
+	 *   AI 专用攻击路径, 完全独立于玩家连击状态机:
+	 *   - 不设置 bIsMovementLocked (AI 攻击时不锁定移动)
+	 *   - 不设置 bIsAttacking (不触发连击状态)
+	 *   - 直接播放攻击动画 + Server RPC (与玩家攻击视觉一致)
+	 *   - AI 持续追逐 + 持续尝试攻击, 攻击动画播放期间也能移动
+	 *
+	 * 架构优势:
+	 *   - 与玩家逻辑完全解耦: 玩家改连击系统不影响 AI
+	 *   - 攻击动画播放期间 AI 仍能移动: 不会出现"原地挥刀"
+	 *   - 代码最小变更: 只加一个函数, 不改现有玩家逻辑
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
-	void OnAIRequestAttack();
+	bool OnAIRequestAttack_Simple();
 
 
 	// ==========================================
@@ -907,6 +966,147 @@ protected:
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
 
+	/**
+	 * 【P0 大厂架构 2026.07.06 重构】AI 攻击伤害上报（服务器权威）
+	 *
+	 * 背景: 旧版 AI 攻击只播动画 (OnAIRequestAttack_Simple) → 引擎回调
+	 *       → 玩家/AI 都没扣血, 因为:
+	 *         (a) AI 攻击路径没调 StartWeaponTrace (没人触发武器刀刃扫掠)
+	 *         (b) ConfigSO.Damage 字段从未被读 (死数据)
+	 *         (c) BaseWeapon.LightDamageBody 也未生效 (Trace 没开)
+	 *
+	 * 修复: AI 攻击时, 由 BaseCharacter 自己向服务器上报命中
+	 *       伤害值 = AIConfig.Damage (带难度缩放)
+	 *       流程: OnAIRequestAttack_Simple → PlayAnimMontage → 等待蒙太奇 NotifyBegin
+	 *           → Server_ReportAIAttackHit (服务器) → ApplyPointDamage → 扣血
+	 *
+	 * 为什么不复用 BaseWeapon::Server_ReportHit?
+	 *   - 武器 Server_ReportHit 接收 bIsHeavy + BoneName 后用武器字段自己算伤害
+	 *   - AI 通道要的是 ConfigSO 控制 (不是武器控制), 走武器会被 LightDamageBody 覆盖
+	 *   - 两条通道独立: 玩家按武器, AI 按 Config, 互不干扰
+	 *
+	 * @param HitActor  受击目标 (服务器校验: 必须是 ABaseCharacter 且未死)
+	 * @param Damage    伤害值 (服务器还会再校验范围, 防作弊)
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_ReportAIAttackHit(AActor* HitActor, float Damage);
+
+
+	// ==========================================
+	// 【P0 2026.07.06 大厂架构重构】AI 攻击蒙太奇事件驱动
+	// ==========================================
+public:
+	/**
+	 * AI 攻击蒙太奇结束回调（事件驱动, 不依赖 BT 距离检查）
+	 *
+	 * 【大厂架构 - 事件驱动 vs 轮询驱动】
+	 *   旧设计 (轮询):
+	 *     - BT TickTask 每帧检查距离, 距离 > AttackRange 就 StopMontage 打断
+	 *     - 玩家在蒙太奇播放期间走开 → AI 被打断 → Combo1 永远播不完
+	 *     - 严重违反"用户期望: 攻击必须播放完整 Combo1 段"
+	 *
+	 *   新设计 (事件驱动):
+	 *     - OnAIRequestAttack_Simple 启动蒙太奇时, 绑定 UAnimInstance::OnMontageEnded
+	 *     - Combo1 自然播放完成 → 引擎回调 → OnAIAttackMontageEnded
+	 *     - 收到回调后再通知 AIController 攻击真正结束 → BT 进入冷却
+	 *
+	 * 优势:
+	 *   - 保证 Combo1 段完整播放 (符合用户要求)
+	 *   - 不再依赖 BT 距离检查决定动画生命周期
+	 *   - 即使玩家跑远, 蒙太奇也播完 (AI 攻击看起来"认真", 不是立刻放弃)
+	 *   - 蒙太奇结束后才进入冷却, 状态机清晰
+	 *
+	 * @param Montage        结束的蒙太奇指针 (UAnimInstance::OnMontageEnded 必须的签名参数)
+	 * @param bInterrupted   true = 被其他动画/StopMontage 打断; false = 自然播完
+	 *
+	 * 【关键】必须是 UFUNCTION + 签名 (UAnimMontage*, bool)
+	 *        因为我们要绑定到 UAnimInstance::OnMontageEnded (DECLARE_DYNAMIC_MULTICAST_DELEGATE)
+	 *        该委托要求 UFUNCTION 才能 AddDynamic
+	 */
+	UFUNCTION()
+	void OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInterrupted);
+
+protected:
+	/**
+	 * 【P0 大厂架构 2026.07.06 19:25】上次 AI 攻击的时间戳 (秒, FPlatformTime::Seconds)
+	 *
+	 * 用途: OnAIRequestAttack_Simple 入口的本地节流兜底
+	 *       即使 BTTask 的 bHasAttackToken + Cooldown Timer 全部失效,
+	 *       Character 自己手里还有这道墙, 防止 AI 持续连击到玩家
+	 *
+	 * 设计要点:
+	 *   - 默认 0.0 = 从未攻击过 (第一次永远放行)
+	 *   - 用 C++ 成员而不是 BB Key: 不依赖 BT/BP, 跨 BT 重启保持
+	 *   - 跟 bIsCurrentlyAttacking 互补: 一个管"动作状态", 一个管"节流时间"
+	 */
+	double LastAIAttackTimeSeconds = 0.0;
+
+	/**
+	 * 上次 AI 攻击请求时播放的蒙太奇指针
+	 * 用于在 OnMontageEnded 回调时验证 Montage 是否"我们自己触发的"
+	 * (UAnimInstance::OnMontageEnded 是 multicast, 所有蒙太奇结束都会广播一次)
+	 * 由 UPROPERTY 持有, 防止 GC 回收导致野指针
+	 */
+	UPROPERTY()
+	TObjectPtr<UAnimMontage> CachedAIMontage = nullptr;
+
+	/**
+	 * 是否在等待 AI 攻击蒙太奇回调
+	 * 设计: 每次启动新攻击时设 true, 收到正确 Montage 的回调后 false
+	 *       超时机制: TickChaseFallback 通过 SetCurrentlyAttacking 5s 兜底
+	 * 用 bool 比再创建 FName 标识简单 — 单 AI 单任务
+	 */
+	UPROPERTY()
+	bool bIsWaitingForAIMontageCallback = false;
+
+
+	// ==========================================
+	// 【P0 2026.07.07 大厂架构重构】AI/玩家攻击伤害来源标识
+	// ==========================================
+	// 背景: AI 攻击要走"trace 命中"而不是"动画开始瞬间扣血",
+	//       这是用户原话 — "AI 攻击扣血时机应该像玩家一样用武器射线"
+	//
+	// 大厂设计:
+	//   玩家路径 (LightAttack_Pressed → 蒙太奇 → AnimNotify → StartWeaponTrace):
+	//     - 不设此标志, 默认 false
+	//     - 武器 Tick 命中 → Server_ReportHit → 用 LightDamageBody/Head (玩家字段)
+	//
+	//   AI 路径 (OnAIRequestAttack_Simple → 蒙太奇 → 同样的 AnimNotify → StartWeaponTrace):
+	//     - 攻击发起时 SetAttackerIsAI(true)
+	//     - 武器 Tick 命中 → Server_ReportHit → 用 ConfigSO.Damage (AI 字段)
+	//     - 蒙太奇结束 → SetAttackerIsAI(false)
+	//
+	// 关键: 玩家和 AI **完全共用同一套 AnimNotify + trace + Server_ReportHit 代码路径**
+	//       只在伤害来源决策上根据 bIsCurrentlyAttackerAI 切换, 单一职责
+	//
+	// 为什么不放在 BaseWeapon 上:
+	//   - BaseWeapon 是无状态组件 (给玩家/AI 都装同一把刀)
+	//   - "这把刀正在被 AI 用还是玩家用" 不是武器的属性, 是攻击者的属性
+	//   - 因此属于 ABaseCharacter 的状态, 武器 Tick 通过 GetOwner()->bIsCurrentlyAttackerAI 读
+	// ============================================================
+public:
+	/**
+	 * 【P0 2026.07.07 大厂架构重构】设置攻击者是否 AI
+	 *
+	 * 调用方:
+	 *   - 玩家 LightAttack_Pressed: 不需要调, 默认 false
+	 *   - AI OnAIRequestAttack_Simple: 攻击发起时设 true, 蒙太奇结束回调 false
+	 *
+	 * 用途: 让 BaseWeapon::Tick 在 trace 命中时知道应该用 ConfigSO.Damage 还是 LightDamageBody
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	void SetAttackerIsAI(bool bIsAI) { bIsCurrentlyAttackerAI = bIsAI; }
+
+	/**
+	 * 攻击者是否为 AI (供 BaseWeapon::Tick 读取)
+	 */
+	UFUNCTION(BlueprintPure, Category = "Combat|AI")
+	bool IsAttackerAI() const { return bIsCurrentlyAttackerAI; }
+
+	/** 【P0 2026.07.07】攻击者是否 AI (公开读, 武器 Tick 用) */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Combat|AI")
+	bool bIsCurrentlyAttackerAI = false;
+
 
 	// ==========================================
 	// 供上帝 (GameMode) 调用的装备武器接口
@@ -918,6 +1118,21 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip);
+
+
+	/**
+	 * 【P0 大厂架构 2026.07.06】武器生成请求入口（对外暴露）
+	 *
+	 * 设计: SpawnAndEquipWeapon 是 protected (仅内部逻辑使用).
+	 *       但关卡预放 AI 需要在 Controller 侧主动触发武器生成.
+	 *       所以对外暴露一个 public 包装, 让 AMeleeAIController::SetupMeleeAI 可以调用.
+	 *
+	 * 调用方: AMeleeAIController::SetupMeleeAI (OnPossess 末尾手动触发武器生成)
+	 *
+	 * 内部直接调 SpawnAndEquipWeapon, 复用完整链路 (查表/挂载/HUD).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	void RequestWeaponSpawn(FString WeaponID);
 
 
 	// ==========================================

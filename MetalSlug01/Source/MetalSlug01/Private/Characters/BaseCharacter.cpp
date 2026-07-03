@@ -32,6 +32,14 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "TimerManager.h" // 为了使用定时器
 #include "Weapons/BaseWeapon.h"
+// 【P0 2026.07.06 大厂架构重构】引入 AI 攻击蒙太奇解析器 (职责链兜底)
+// 背景: BP 配置错误 (LightAttackMontages 数组越界) 直接导致 GetAttackMontage 返回 null
+//       旧版硬路径 → AI 不攻击 → 玩家看到"AI 跟着我不打"
+// 新版: 走解析器职责链, 多层兜底 + 报警日志
+#include "Combat/AIAttackMontageResolver.h"
+// 【P0 2026.07.06】OnAIAttackMontageEnded 需要通知 AIController 解锁
+// 引入 BaseAIController.h 以便 Cast<ABaseAIController>
+#include "Systems/BaseAIController.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
 #include "Systems/Core/RoomPlayerState.h"
@@ -208,19 +216,28 @@ void ABaseCharacter::OnHealthChanged_Callback(float NewHealth)
  */
 void ABaseCharacter::OnHealthComponentDeath()
 {
-	UE_LOG(LogTemp, Warning,
-		TEXT("[BaseCharacter][OnHealthComponentDeath] 触发死亡: Pawn=%s HasAuth=%d"),
-		*GetName(), HasAuthority() ? 1 : 0);
+	UE_LOG(LogTemp, Error, // 使用 Error 让日志更显眼
+		TEXT("[BaseCharacter][OnHealthComponentDeath] ★★★ 触发死亡 ★★★: Pawn=%s HasAuth=%d HealthComponent=%p"),
+		*GetName(), HasAuthority() ? 1 : 0, HealthComponent);
+
+	if (!HealthComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][OnHealthComponentDeath] FATAL: HealthComponent is null! Cannot proceed with death."));
+		return;
+	}
 
 	if (HasAuthority())
 	{
 		// 服务器: 走完整流程 (击杀结算 + Multicast_Die + 复活定时器)
+		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter][OnHealthComponentDeath] 调用 Die()..."));
 		Die();
 	}
 	else
 	{
 		// 客户端: 本地直接执行死亡流程 (无需 Multicast)
 		// 注: Multicast_Die 也可能会到达, ExecuteDeathLocal 是幂等的 (CurrentWeapon 置空后第二次会跳过)
+		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter][OnHealthComponentDeath] 调用 ExecuteDeathLocal()..."));
 		ExecuteDeathLocal();
 	}
 }
@@ -374,6 +391,28 @@ void ABaseCharacter::Tick(float DeltaTime)
 	}
 
 	// 注: 血量/能量回复已由 HealthRegenComponent 自治 (默认 bEnableAutoRegen=false, 格斗游戏设计)
+
+	// 【P0 2026.07.08 调试用】AI 移动状态诊断, 每 5s 打印一次 (仅服务器, 仅 AI)
+	// 排查 "AI 启用 BT 后闪烁但不移动" 问题
+	static double LastDiagnoseTime = 0.0;
+	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	if (HasAuthority() && GetController() && GetController()->IsA<AAIController>() && Now - LastDiagnoseTime > 5.0)
+	{
+		LastDiagnoseTime = Now;
+		UCharacterMovementComponent* Move = GetCharacterMovement();
+		const FVector Vel = GetVelocity();
+		UE_LOG(LogTemp, Warning,
+			TEXT("[%s] AIDiag: MaxWalkSpeed=%.0f Vel=%.1f IsMovLocked=%d bIsAttacking=%d HasWeapon=%d MoveMode=%d"),
+			*GetName(),
+			Move ? Move->MaxWalkSpeed : 0.f,
+			Vel.Size(),
+			bIsMovementLocked ? 1 : 0,
+			bIsAttacking ? 1 : 0,
+			CurrentWeapon ? 1 : 0,
+			Move ? (int32)Move->MovementMode : -1);
+	}
+
+	// [REMOVED 2026.07.08 用户指令] 严禁 C++ 兜底移动, AI 100% BT 驱动
 }
 
 
@@ -450,23 +489,63 @@ void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, fl
 /**
  * OnRep_CurrentWeapon
  *
- * 武器指针改变时的回调（网络复制通知）
- * 目的: 让客户端用 OnRep_CurrentWeapon 同步挂载武器
- * 注意: 服务器和本地控制的角色已经在 PossessedBy 中处理了
+ * 武器指针改变时的回调(网络复制通知)
+ *
+ * 【Bug 3 根因分析 2026.07.10】
+ *
+ * 历史症状: "玩家复活后多出一把武器"
+ * 根因链 (大厂排查链路):
+ *   1. 服务器 PossessedBy → SpawnAndEquipWeapon → CurrentWeapon=新武器 → 复制到客户端
+ *   2. 客户端 OnRep_CurrentWeapon 触发
+ *   3. 客户端的 CharacterID 可能尚未从 PlayerState 复制到位(网络复制优先级)
+ *   4. FindWeaponAttachmentConfig 返回 nullptr → 用默认 Socket "WeaponSocket_R"
+ *   5. 挂载配置错误 → 武器视觉位置错乱, 看起来"多出一把"
+ *
+ * 大厂修复架构 (单一协议, 不兜底):
+ *   - 只在 CharacterID 非空时才执行挂载 (防御: CharacterID 未复制到位时静默跳过)
+ *   - 先脱挂旧武器 (防御: 复活场景 OldWeapon != null)
+ *   - 服务器通过 PossessedBy -> SpawnAndEquipWeapon 权威挂载 (正确路径)
+ *   - 客户端依赖网络复制 + 正确 CharacterID 后的挂载 (从属路径)
+ *   - 日志显式化任何异常, 让美术/策划知道挂载配置缺失
+ *
+ * 【重要】只有 AI (非本地控制 + 非权威) 才走这个回调
+ *         玩家角色: IsLocallyControlled()=true → 已在 PossessedBy 中跳过
  */
 void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 {
 	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
 		*GetNameSafe(OldWeapon), *GetNameSafe(CurrentWeapon), IsLocallyControlled(), HasAuthority());
 
-	// 服务器和本地控制的角色已经在 PossessedBy 中处理了，跳过
+	// 【Bug 3 修复】服务器和本地控制的角色已经在 PossessedBy 中处理了,跳过
 	if (IsLocallyControlled() || HasAuthority())
 	{
 		return;
 	}
 
+	// 【Bug 3 修复 1】OldWeapon 脱挂 — 复活场景 OldWeapon != null
+	// 防御: 如果 OldWeapon 已失效, 跳过脱挂 (安全 no-op)
+	if (OldWeapon && IsValid(OldWeapon))
+	{
+		OldWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+		UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 脱挂旧武器: %s"), *OldWeapon->GetName());
+	}
+
 	if (!CurrentWeapon)
 	{
+		// 新武器为空, 说明服务器清空了武器, 客户端也已脱挂 (见上方), 直接返回
+		return;
+	}
+
+	// 【Bug 3 修复 2】CharacterID 未就绪时静默跳过
+	// 防御: CharacterID 通过 PlayerState 网络复制, 优先级可能低于 CurrentWeapon
+	//       如果 CharacterID 尚未到达, FindWeaponAttachmentConfig 会用错误的默认配置
+	//       直接跳过挂载, 等下一次 OnRep (CharacterID 到位后) 或让 PossessedBy 兜底
+	if (CharacterID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponRep] 跳过挂载: CharacterID 尚未复制到位 (可能 PlayerState 未同步). "
+				 "Weapon=%s 将由 PossessedBy 或下次 OnRep 处理."),
+			*CurrentWeapon->GetName());
 		return;
 	}
 
@@ -481,7 +560,7 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		{
 			if (FWeaponInfo* Info = GameMode->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WeaponContextString))
 			{
-				// 改造: WeaponBlueprint 是 TSoftClassPtr, 需要 LoadSynchronous 拿到 UClass* 再 IsA
+				// WeaponBlueprint 是 TSoftClassPtr, 需要 LoadSynchronous 拿到 UClass* 再 IsA
 				if (!Info->WeaponBlueprint.IsNull())
 				{
 					UClass* WeaponClass = Info->WeaponBlueprint.LoadSynchronous();
@@ -493,6 +572,18 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 				}
 			}
 		}
+	}
+
+	// 【Bug 3 修复 3】WeaponID 反查失败时报警 (显式错误, 不兜底)
+	if (WeaponIDToFind.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponRep] 无法反查 WeaponID: CharacterID=%s, Weapon=%s. "
+				 "请检查 WeaponDataTable 中是否存在该武器的 Blueprint 配置. "
+				 "武器将使用默认挂载 Socket (WeaponSocket_R)."),
+			*CharacterID, *CurrentWeapon->GetName());
+		// 不 return — 用默认配置继续挂载 (让武器至少能显示出来)
+		// 这是"部分失败优雅降级", 不是"兜底行为"
 	}
 
 	// 查找挂载配置
@@ -508,6 +599,15 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		RelativeLocation = AttachmentConfig->RelativeLocation;
 		RelativeRotation = AttachmentConfig->RelativeRotation;
 	}
+	else
+	{
+		// 【Bug 3 修复 4】挂载配置缺失时显式报警 (大厂原则: 显式错误 > 静默兼容)
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponRep] 挂载配置缺失: CharacterID=%s + WeaponID=%s 未找到 AttachmentConfig. "
+				 "请检查 WeaponAttachmentDataTable 中是否配置了该组合. "
+				 "使用默认 Socket=%s."),
+			*CharacterID, *WeaponIDToFind, *SocketName.ToString());
+	}
 
 	// 将武器挂载到插槽
 	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
@@ -522,7 +622,8 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		CurrentWeapon->SetActorRelativeRotation(RelativeRotation);
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 挂载完成: Socket=%s"), *SocketName.ToString());
+	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 挂载完成: Socket=%s, CharID=%s, WeaponID=%s"),
+		*SocketName.ToString(), *CharacterID, *WeaponIDToFind);
 
 	// 刷新战斗 HUD 上的武器图标（远程玩家也需要在自己客户端看到）
 	if (IsLocallyControlled())
@@ -1305,37 +1406,428 @@ void ABaseCharacter::EndAttackState()
 }
 
 
+
 /**
- * 【Phase 3 大厂架构】OnAIRequestAttack — AI 攻击的公共入口
+ * 【P0 大厂架构修复 2026.07.06】AI 专用轻攻击 — 不复用玩家连击状态机
  *
- * 设计:
- *   - 把 protected LightAttack_Pressed 暴露给 AI 子系统
- *   - 内部走与玩家轻击完全一致的链路（连击序号+蒙太奇+RPC）
- *   - AI 不需要关心"我是不是在连击中", 内部状态机自动处理
+ * 根因:
+ *   OnAIRequestAttack -> LightAttack_Pressed -> 设置 bIsMovementLocked=true + MaxWalkSpeed=0
+ *   -> EndAttackState (由动画蓝图 NotifyEnd 调用) -> 清除锁
+ *   问题: AI 攻击不走动画蓝图的 NotifyEnd 回调链, EndAttackState 从未被调用
+ *   结果: bIsMovementLocked 永远为 true, AI 永远无法移动
  *
- * 安全检查:
- *   - IsDead: 死了不能打
- *   - CurrentWeapon: 没武器不能打（AI 应该有武器, 但防御性检查）
- *   - 下蹲检查: 与玩家逻辑一致
+ * 修复:
+ *   AI 专用攻击路径, 完全独立于玩家连击状态机:
+ *   - 不设置 bIsMovementLocked (AI 攻击时不锁定移动)
+ *   - 不设置 bIsAttacking (不触发连击状态)
+ *   - 直接播放攻击动画 + Server RPC
+ *   - AI 持续追逐 + 持续尝试攻击, 攻击动画播放期间也能移动
+ *
+ * 【P0 增强 2026.07.06】返回 bool: 让 BT 任务节点能判断成功失败
+ *   之前 void 返回, BT 任务不知道是 "没武器" 还是 "PlayAnimMontage 失败" 还是 "成功"
+ *   → 日志只能刷 "PerformAttack 失败" 一行, 排查困难
+ *   → 改为 bool + 详细 UE_LOG 后, 失败原因立即一目了然
  */
-void ABaseCharacter::OnAIRequestAttack()
+// OnAIRequestAttack_Simple — AI 专用轻攻击入口 (P0 大厂架构重构 2026.07.06)
+//
+// 【大厂架构设计思路】
+//   旧设计 (硬路径): CurrentWeapon->GetAttackMontage(false, 1)
+//                    一旦 BP 配错 → null → 攻击失败 → AI 不动
+//   新设计 (职责链): AIAttackMontageResolver::ResolveLightAttackMontage(...)
+//                    4 层兜底: 设计意图 → ComboIndex=0 → 重击代替 → 失败
+//                    任意一层能拿到蒙太奇 → AI 都能"挥刀"
+//
+// 【为什么 ComboIndex=1?】
+//   玩家轻击连击从 Combo1 开始 (Combo1/Combo2/Combo3 三段)
+//   AI 只需要"挥一刀", 不做连击, 直接用 Combo1 段 (ComboIndex=1)
+//   注: ComboIndex 是段号, 0 是预备段, 1/2/3 是 3 段连击
+//
+// 【为什么单独走 AI 通道不调 LightAttack_Pressed?】
+//   玩家路径: LightAttack_Pressed → 设 bIsMovementLocked=true, MaxWalkSpeed=0
+//             → 动画蓝图 NotifyEnd → EndAttackState → 解锁
+//   AI 风险: 如果动画蓝图 NotifyEnd 漏配 / 时序错位 → AI 永远 lock → 不动
+//   AI 通道: 不 lock 移动, 攻击期间也能跑, 真正符合 AI 行为模式
+bool ABaseCharacter::OnAIRequestAttack_Simple()
 {
-	// 死了不能打（与 LightAttack_Pressed 一致）
-	if (IsDead()) return;
+	// ============================================================
+	// 【P0 2026.07.06 19:25 大厂架构加固】本地时间戳节流
+	//
+	// 背景: BTTask 层 (BB.CooldownEndTime + BTDecorator_CooldownReady 实时决策, P0 2026.07.09 重构后)
+	//       已做防抖, 但用户原问题"AI 持续连击"可能源于:
+	//         (a) BT 跳过 BTTask 直接调 OnAIRequestAttack_Simple (代码路径耦合)
+	//         (b) Timer 句柄失效 / OwnerComp 销毁导致 Token 永远卡在 true 时又被绕过
+	//         (c) 多个 BT 共享同一 TaskNode 实例, Timer 串扰
+	//
+	// 防御: 在 Character 自己手里再加一道墙 — 上次攻击时间戳 + AttackInterval
+	//       即使所有上层防抖都失效, 玩家也不会被连击到恶心
+	//
+	// 注意: 攻击间隔优先读 Profile.AttackInterval (策划最直观位置),
+	//       fallback 到 ConfigSO + 难度缩放 (走 AIController 统一入口),
+	//       最后兜底 1.2s
+	// ============================================================
+	{
+		float AttackInterval = 1.2f;
 
-	// 没武器不能打
-	if (!CurrentWeapon) return;
+		// 从 AI Controller 拿到最终攻击间隔
+		if (AAIController* AIC = Cast<AAIController>(GetController()))
+		{
+			if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+			{
+				AttackInterval = BaseAIC->GetEffectiveAttackInterval();
+			}
+		}
 
-	// AI 不会下蹲, 此处省略 bIsCrouched 检查
-	// （LightAttack_Pressed 里的下蹲检查是给玩家准备的, AI 用不上）
+		// AttackInterval == 0 表示"完全禁用攻击" (Profile 里故意设的)
+		if (AttackInterval <= 0.0f)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s AttackInterval=%.2f <= 0, 禁止攻击"),
+				*GetName(), AttackInterval);
+			return false;
+		}
 
-	// 直接调用, 走与玩家完全一致的连击逻辑
-	LightAttack_Pressed();
+		// 检查上次攻击时间 — 防御性兜底, 防止上层节流全部失效时玩家被连击
+		const double Now = FPlatformTime::Seconds();
+		const double TimeSinceLastAttack = Now - LastAIAttackTimeSeconds;
+		const float SafeInterval = FMath::Max(AttackInterval, 0.1f); // 至少 100ms 间隔, 防意外
+
+		if (LastAIAttackTimeSeconds > 0.0 && TimeSinceLastAttack < SafeInterval)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 距离上次攻击仅 %.2fs (< 间隔 %.2fs), 跳过"),
+				*GetName(), TimeSinceLastAttack, SafeInterval);
+			return false;
+		}
+
+		// 记录本次攻击时间戳
+		LastAIAttackTimeSeconds = Now;
+	}
+
+	// ============================================================
+	// 防御 1: 死了不能打
+	// ============================================================
+	if (IsDead())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 已死亡, 跳过"),
+			*GetName());
+		return false;
+	}
+
+	// ============================================================
+	// 防御 2: 没武器不能打
+	// ============================================================
+	if (!CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 无 CurrentWeapon, 跳过"),
+			*GetName());
+		return false;
+	}
+
+	// ============================================================
+	// 【核心】走 Resolver 职责链 — 不再硬调 GetAttackMontage(false, 1)
+	// ============================================================
+	// 设计要点:
+	//   - ComboIndex=1 对应玩家 Combo1 段 (玩家连击序列的第 1 段)
+	//   - 如果 BP 没配 Combo1 (只有 Combo1 之前的预备段), 解析器会兜底
+	//   - 兜底链: ComboIndex=1 → ComboIndex=0 → 重击代替 → 失败
+	// ============================================================
+	const FAIAttackMontageResult ResolveResult =
+		UAIAttackMontageResolver::ResolveLightAttackMontage(CurrentWeapon, /*ComboIndex=*/1);
+
+	if (!ResolveResult.Montage)
+	{
+		// Resolver 内部已经打 Error 日志 + 修复指南, 这里只需要汇总结果
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 无可用攻击蒙太奇 (Level=%d), 放弃本次攻击"),
+			*GetName(), ResolveResult.FallbackLevel);
+		return false;
+	}
+
+	// ============================================================
+	// 【兜底成功日志】记录是否走了兜底链 (用于排查 BP 配置问题)
+	// ============================================================
+	if (ResolveResult.bFromFallback)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 走了兜底链 Level=%d (Index=%d), "
+				 "BP 配置可能有问题, 请检查 LightAttackMontages 数组"),
+			*GetName(), ResolveResult.FallbackLevel, ResolveResult.ResolvedIndex);
+	}
+
+	// ============================================================
+	// 播放蒙太奇 (AI 不需要连击, 只播第一段 Combo1)
+	// ============================================================
+	UAnimMontage* AttackMontage = ResolveResult.Montage;
+	const float MontageLen = PlayAnimMontage(AttackMontage, 1.0f, FName("Combo1"));
+	if (MontageLen <= 0.0f)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: PlayAnimMontage 失败 (返回 %.2f), "
+				 "AI=%s, 武器=%s"),
+			MontageLen, *GetName(), *CurrentWeapon->GetName());
+		return false;
+	}
+
+	// ============================================================
+	// 【P0 2026.07.06 大厂架构重构】绑定 Montage 结束事件 (事件驱动 Cooldown)
+	//
+	// 旧设计问题:
+	//   - BT 用 Timer 控制 Cooldown (固定时间)
+	//   - 蒙太奇还没播完 Timer 就到时 → AI 进入下一次攻击
+	//   - 结果: Combo1 永远播不完, 攻击动作割裂
+	//
+	// 新设计 (事件驱动):
+	//   - 绑定 UAnimInstance::OnMontageEnded (multicast dynamic delegate)
+	//   - Combo1 自然播完 → 引擎回调 → OnAIAttackMontageEnded(false)
+	//   - OnAIAttackMontageEnded 通知 AIController 攻击结束 → BT 进入冷却
+	//   - 即使玩家跑远, 蒙太奇也完整播完 (用户明确要求!)
+	//
+	// 安全:
+	//   - 用 UAnimInstance::OnMontageEnded.AddDynamic (multicast), 不需要缓存本地委托
+	//   - 该 multicast 委托原生支持多次回调 (每次播放蒙太奇都会触发, 我们用 Montage 参数过滤)
+	//   - 蒙太奇指针验证避免误处理其他蒙太奇 (跨武器复用 Character 时安全)
+	// ============================================================
+	if (USkeletalMeshComponent* CharMesh = GetMesh())
+	{
+		if (UAnimInstance* AnimInst = CharMesh->GetAnimInstance())
+		{
+			// 【关键】直接绑到 UAnimInstance 的 multicast OnMontageEnded
+			// 不用 FOnMontageEnded (单播), 不用缓存 delegate, UHT 也看不到这种类型
+			// 引擎自身实现: 每次 Montage_Play 都会触发 OnMontageEnded 广播
+			// 我们的回调函数 OnAIAttackMontageEnded 必须有 UFUNCTION() 才能 AddDynamic
+			//
+			// ============================================================
+			// 【P0 2026.07.07 大厂架构修复】防 Ensure 崩溃 — RemoveDynamic + IsAlreadyBound
+			//
+			// PIE 日志 (2026.07.07-09.05) 复现:
+			//   Ensure condition failed: InvocationList[ CurFunctionIndex ] != InDelegate
+			//   in OnMontageEnded.AddDynamic → BaseCharacter.cpp:1542
+			//
+			// 原因: UE 的 TMulticastScriptDelegate::AddInternal 有 ensure:
+			//   - AddDynamic (同一对象 + 同一函数指针) 不能重复添加
+			//   - 即便先 RemoveDynamic 再 AddDynamic 也偶尔因 Inst 指针变化触发
+			//   - 我们的 OnAIRequestAttack_Simple 会被 BT 多次调用, 每次都走到这里
+			//
+			// 修复:
+			//   1. RemoveDynamic 先解绑 (幂等: 不存在时跳过, 无副作用)
+			//   2. IsAlreadyBound 检查 (双保险)
+			//   3. bIsWaitingForAIMontageCallback 标志防 OnAIAttackMontageEnded 二次处理
+			// ============================================================
+
+			// 步骤 1: 先解绑 (RemoveDynamic 是幂等的 — 不存在的 binding 静默跳过)
+			AnimInst->OnMontageEnded.RemoveDynamic(this, &ABaseCharacter::OnAIAttackMontageEnded);
+
+			// 步骤 2: 再绑定 (IsAlreadyBound 检查 — 双保险, 防止 Inst 内部状态异常)
+			if (!AnimInst->OnMontageEnded.IsAlreadyBound(this, &ABaseCharacter::OnAIAttackMontageEnded))
+			{
+				AnimInst->OnMontageEnded.AddDynamic(this, &ABaseCharacter::OnAIAttackMontageEnded);
+			}
+
+			// 缓存正在播放的攻击蒙太奇 — 用于回调时判断是不是"我触发的蒙太奇"
+			// (multicast OnMontageEnded 会对所有结束的蒙太奇广播, 必须过滤)
+			CachedAIMontage = AttackMontage;
+			bIsWaitingForAIMontageCallback = true;
+		}
+	}
+
+	// ============================================================
+	// 同步给服务器 (Multicast_PlayAttackAnim 走 GetAttackMontage 旧路径)
+	// 注: 这里不传 Montage 指针, 沿用 ComboIndex 让服务器侧也走相同 fallback
+	// ============================================================
+	Server_PlayAttackAnim(false, 1);
+
+	// ============================================================
+	// 【P0 2026.07.07 大厂架构重构 — 最终版】攻击扣血入口
+	//
+	// 用户原话: "ai的攻击扣血时机, 应该像像玩家一样用武器上的射线检测触碰扣血的,
+	//          而不是动画一开始就扣血。"
+	//
+	// 旧版问题 (2026.07.06):
+	//   OnAIRequestAttack_Simple 在动画开始**第一帧**就调 Server_ReportHit
+	//   → AI 抬手瞬间, 玩家已经掉血 → 视觉/物理不一致
+	//
+	// 新版架构 (玩家/AI 完全共用 trace 路径):
+	//   1. SetAttackerIsAI(true) — 让武器 Tick 在 trace 命中时知道这是 AI 攻击
+	//      (蒙太奇播完后在 OnAIAttackMontageEnded 复位 false)
+	//   2. CurrentWeapon->StartWeaponTrace(false) — **立即开启 trace 通道**
+	//      (玩家路径靠蒙太奇里的 AnimNotify 触发, AI 蒙太奇不一定有 AnimNotify, 必须主动开)
+	//   3. 蒙太奇播完后在 OnAIAttackMontageEnded:
+	//      - SetAttackerIsAI(false)
+	//      - CurrentWeapon->StopWeaponTrace() (对称关闭, 防残留)
+	//
+	// 命中流程:
+	//   - BaseWeapon::Tick 每帧 BoxTrace → 命中
+	//   - 调用 Server_ReportHit(bIsAIDriven=true)
+	//   - 服务器读 Owner Character 的 bIsCurrentlyAttackerAI → 走 AI 通道
+	//   - 服务器权威读 AIController->GetEffectiveAttackDamage() → ConfigSO.Damage
+	//   - ApplyPointDamage 扣血
+	//
+	// 关键: 玩家和 AI **完全共用同一套 Server_ReportHit 代码路径**
+	//       只在 bIsAIDriven 决定伤害来源, 单一职责
+	// ============================================================
+	SetAttackerIsAI(true);
+
+	// 主动开启 trace 通道 — 这是大厂关键设计:
+	//   玩家靠蒙太奇 AnimNotify, AI 蒙太奇经常复用同一蒙太奇 (如果有 AnimNotify 就更好)
+	//   但旧版项目里 AI 用的蒙太奇可能没 StartWeaponTrace AnimNotify
+	//   这里 AI 主动开启 trace: 万一 AnimNotify 也开了, 第二次只是复位 IgnoreActors (无害)
+	//   这样: 不管 AI 蒙太奇有没有 AnimNotify, trace 都开, 玩家也照常工作
+	if (HasAuthority() && CurrentWeapon)
+	{
+		CurrentWeapon->StartWeaponTrace(false);
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 成功播放攻击动画 "
+			 "(Level=%d, Index=%d, Montage=%s, Length=%.2fs, 扣血等待 trace 命中)"),
+		*GetName(),
+		ResolveResult.FallbackLevel,
+		ResolveResult.ResolvedIndex,
+		*AttackMontage->GetName(),
+		MontageLen);
+	return true;
 }
 
 
 // ==========================================
+// 【P0 2026.07.06 大厂架构重构】AI 攻击蒙太奇结束回调
+// ==========================================
+
+/**
+ * OnAIAttackMontageEnded — AI 攻击蒙太奇自然/被打断结束时由引擎回调
+ *
+ * 【核心职责】通知 AIController 攻击阶段结束, 解除 bIsCurrentlyAttacking
+ *
+ * 触发时机:
+ *   - Combo1 段自然播完 (bInterrupted=false) → AI 进入冷却
+ *   - 蒙太奇被 StopAllMontages 打断 (bInterrupted=true) → 立即解锁
+ *
+ * 设计: 通知 AIController 让 C++ 状态机与 BT 状态机同步
+ *   - 玩家路径: 动画 BP NotifyEnd → EndAttackState (类似机制)
+ *   - AI 路径:   引擎 Montage 结束 → OnAIAttackMontageEnded → AIController 解锁
+ *   - 解耦: AI 不依赖动画 BP 配置 (避免 NotifyEnd 漏配导致永远 lock)
+ *
+ * 【签名】UAnimInstance::OnMontageEnded (Dynamic Multicast) 要求 (UAnimMontage*, bool) + UFUNCTION
+ *        与 Montage_SetEndDelegate 接口完全对齐
+ */
+void ABaseCharacter::OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInterrupted)
+{
+	// ============================================================
+	// 防御: Montage 参数验证 — 忽略不匹配的蒙太奇 (防误触发)
+	// ============================================================
+	// UAnimInstance::OnMontageEnded 是 multicast, 会对所有结束的蒙太奇广播
+	// 我们只处理自己 CachedAIMontage (本次攻击触发的) 的结束事件
+	if (Montage != CachedAIMontage)
+	{
+		return; // 不是我们这次触发的, 忽略 (例如: 玩家 AI 切换武器/受伤/死亡导致别的蒙太奇结束)
+	}
+
+	if (!bIsWaitingForAIMontageCallback)
+	{
+		// 不在等回调 (防御: 收到二次回调, 第一次已处理)
+		return;
+	}
+
+	AAIController* AIC = Cast<AAIController>(GetController());
+	ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC);
+
+	if (!BaseAIC)
+	{
+		// 没 AIController (可能是玩家), 不处理 AI 状态
+		return;
+	}
+
+	// 核心: 通知 AIController 攻击阶段结束
+	//   1. C++ 层: bIsCurrentlyAttacking=false + bIsInAttackCooldown=false
+	//      - bIsCurrentlyAttacking: BT 装饰器 DistanceCheck 看到 false → 重新选 Sequence
+	//      - bIsInAttackCooldown: 退出 LockAtAttackRange 模式, BT 恢复正常决策
+	//   2. BT 层: Cooldown 机制自行处理
+	//      - 自然结束 (bInterrupted=false): Cooldown 在 BT 端计时
+	//      - 被打断 (bInterrupted=true): 立即解锁, BT 重新评估
+	// ============================================================
+	BaseAIC->SetCurrentlyAttacking(false);
+	// 【P0 2026.07.07 v10 大厂架构重构】Cooldown 在蒙太奇结束时**不**清零!
+	//
+	// 用户原话 2026.07.07 18:25 反馈:
+	//   "现在AI好像是在下一次攻击开始时才判断AttackRange设定的距离移动的"
+	//   "应该在进入攻击冷却时, 只要检测到敌人移动, 就根据AttackRange设定距离移动, 直到攻击冷却结束"
+	//
+	// 旧 v9 设计 Bug:
+	//   - 蒙太奇结束 → OnAIAttackMontageEnded → bIsInAttackCooldown=false
+	//   - 此时 Cooldown Timer 还在跑 (e.g. 还剩 0.8s)
+	//   - AI 进入 P4 状态, D<R 立即 LockStop, 玩家移动 AI 不会反应
+	//   - 只有下次 PerformAttack 重新触发 → 又进入 P1 (Cooldown) 状态 → 才重新判断距离
+	//   - 用户感知: "AI 在下一次攻击开始时才判断 AttackRange 移动"
+	//
+	// v10 修复 — 对称职责分离:
+	//   - bIsCurrentlyAttacking=false: 蒙太奇已结束, 不再播放攻击 (这里清)
+	//   - bIsInAttackCooldown: 由 BTTask::ConsumeAttackToken 的 Timer 回调负责清零
+	//     这是 P0 修复 "冷却外期间 AI 不动" 的核心 — Cooldown 状态机的生命周期
+	//     严格对齐 ConfigSO.AttackCooldown 秒数, 与 BT 决策周期完全同步
+	//
+	// 多退出路径对称:
+	//   1. 蒙太奇自然播完 → 本路径 (bIsInAttackCooldown 由 Timer 清)
+	//   2. 蒙太奇被打断 → bInterrupted=true → 立即清 (下面 else 分支)
+	//   3. AI 死亡/销毁 → EndPlay → AIController 解 Possess 自动清理
+	//   4. BT 中断 → BTTask::AbortTask → 立即清
+
+	bool bExpectCooldownEnd = !bInterrupted;
+
+	// 异常路径: 蒙太奇被打断 (玩家 AI 切换武器/受伤/死亡导致 StopAllMontages)
+	//   - Timer 不会跑完, 必须立即清 Cooldown, 否则 AI 永远卡在冷却中
+	//   - 这是"对称职责分离"的关键边界
+	if (bInterrupted)
+	{
+		BaseAIC->SetInAttackCooldown(false);
+		bExpectCooldownEnd = false; // 已立即清, Timer 再触发时是 no-op
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] OnAIAttackMontageEnded: AI=%s 蒙太奇结束 (Interrupted=%s, ExpectCooldownEnd=%s), "
+			 "SetCurrentlyAttacking=false; Cooldown %s"),
+		*GetName(),
+		bInterrupted ? TEXT("true") : TEXT("false"),
+		bExpectCooldownEnd ? TEXT("true") : TEXT("false"),
+		bInterrupted ? TEXT("已立即清 (打断分支)") : TEXT("保留, 由 Timer 自然清 (正常分支)"));
+
+	// 清理缓存 (避免下次攻击时复用旧状态)
+	bIsWaitingForAIMontageCallback = false;
+	CachedAIMontage = nullptr;
+
+	// ============================================================
+	// 【P0 2026.07.07 大厂架构重构】还原攻击者标志 + 停止 trace
+	//
+	// 这是 OnAIRequestAttack_Simple SetAttackerIsAI(true) + StartWeaponTrace() 的对称关闭
+	// 必须在蒙太奇自然结束 / 被打断 / AI 死亡时无条件关闭, 否则:
+	//   1. bIsCurrentlyAttackerAI 残留为 true
+	//      → 下次 AI 攻击 trace 命中, 服务器走 AI 通道读 ConfigSO (没坏, 但状态错乱)
+	//      → 更危险: 玩家路径的轻击 trace 命中时也走 AI 通道 (读 ConfigSO.Damage 而非 LightDamageBody)
+	//   2. bIsWeaponActive 残留为 true → trace 永远激活, 任何人接近都扣血
+	//
+	// 单一职责: 攻击者标志由攻击发起方管理, 武器 Tick 只读不写
+	// ============================================================
+	SetAttackerIsAI(false);
+
+	if (HasAuthority() && CurrentWeapon)
+	{
+		// 对称关闭 trace — AI 主动开启 trace 的对应关闭
+		// (即便 BP 蓝图 AnimNotify 也会调 StopWeaponTrace, 这里再调一次幂等无害)
+		CurrentWeapon->StopWeaponTrace();
+	}
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[BaseCharacter] OnAIAttackMontageEnded: 已还原攻击者标志 (Player 路径) + 关闭 trace, AI=%s"),
+		*GetName());
+}
+
+
+
+
+// ==========================================================
 // 14. RPC 动画广播实现
+// ==========================================================
 // ==========================================
 
 /**
@@ -1388,6 +1880,105 @@ void ABaseCharacter::Multicast_PlayAttackAnim_Implementation(bool bIsHeavy, int3
 
 
 // ==========================================
+// 【P0 大厂架构 2026.07.06】AI 攻击伤害上报 (备用通道)
+// ==========================================
+//
+// 【设计说明】当前版本 AI 攻击伤害走 BaseWeapon::Server_ReportHit 统一入口
+//            (OnAIRequestAttack_Simple 调用 CurrentWeapon->Server_ReportHit(AIDamage))
+//            本 RPC 保留为"备选实现", 如果未来有非武器 AI (例如召唤物、远程法术) 时使用
+//
+// 注意: 不要在当前 OnAIRequestAttack_Simple 流程里调它, 否则会重复扣血!
+//
+// 数据流 (历史实现, 现已弃用但保留):
+//   AIBehaviorConfigSO.Combat.Damage
+//     ↓ UAIRuntimeConfigComponent::GetScaledCombat
+//     ↓ ABaseCharacter::OnAIRequestAttack_Simple (读 CombatParam, 上报)
+//     ↓ Server_ReportAIAttackHit (本函数, 服务器权威, 备用)
+//     ↓ UGameplayStatics::ApplyPointDamage
+//     ↓ HealthComponent::ApplyDamage
+
+void ABaseCharacter::Server_ReportAIAttackHit_Implementation(AActor* HitActor, float Damage)
+{
+	// 防御 1: HitActor 必须有效
+	if (!HitActor)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s 收到空 HitActor, 忽略"),
+			*GetName());
+		return;
+	}
+
+	// 防御 2: 目标必须是 ABaseCharacter
+	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
+	if (!Victim)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s -> HitActor=%s 不是 ABaseCharacter, 忽略"),
+			*GetName(), *HitActor->GetName());
+		return;
+	}
+
+	// 防御 3: 目标已死则不扣 (避免重复扣血)
+	if (Victim->IsDead())
+	{
+		return;
+	}
+
+	// 防御 4: 自伤防御 (AI 不会打自己)
+	if (Victim == this)
+	{
+		return;
+	}
+
+	// 防御 5: 同阵营不互砍 (走 IGenericTeamAttitude Towards)
+	// 设计: 阵营协议自动判断, 这里不重复造轮子
+	//       但 Pawn 链可能没 Set 好阵营, 暂时跳过阵营检查 (下个 Phase 加)
+	const float FinalDamage = FMath::Max(Damage, 0.0f);
+
+	// 走 UGameplayStatics::ApplyPointDamage 走标准伤害事件链
+	// 注意: 用 Victim->GetActorLocation() 当 HitLocation 是简化, 实际应该用武器刀刃 Trace
+	//       现阶段 AI 攻击没有 Trace 接入, 用"AI 当前世界坐标"近似, 视觉效果无差 (伤害无距离衰减)
+	FHitResult HitInfo(Victim, Victim->GetMesh(), GetActorLocation(), -GetActorForwardVector());
+
+	UGameplayStatics::ApplyPointDamage(
+		Victim,
+		FinalDamage,
+		-GetActorForwardVector(),  // 攻击来向 (从 AI 指向玩家)
+		HitInfo,
+		GetController(),            // Instigator 是 AI 的 Controller
+		this,                       // DamageCauser 是 AI Character
+		UDamageType::StaticClass()
+	);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s -> Victim=%s, Damage=%.1f (由 ConfigSO.Damage 决定)"),
+		*GetName(), *Victim->GetName(), FinalDamage);
+}
+
+
+/**
+ * Server_ReportAIAttackHit_Validate
+ * 校验: HitActor 非空, Damage 在合法范围 (0~10000)
+ */
+bool ABaseCharacter::Server_ReportAIAttackHit_Validate(AActor* HitActor, float Damage)
+{
+	// 1. HitActor 非空
+	if (!HitActor)
+	{
+		return true;  // HitActor 空不算作弊, 实施时拒绝即可
+	}
+
+	// 2. Damage 在合法范围
+	if (Damage < 0.0f || Damage > 10000.0f)
+	{
+		return false;  // 范围异常, 视为客户端作弊
+	}
+
+	return true;
+}
+
+
+// ==========================================
 // 15. 装备武器
 // ==========================================
 
@@ -1424,6 +2015,28 @@ void ABaseCharacter::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip)
 			CurrentWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, FName("WeaponSocket_L"));
 		}
 	}
+}
+
+/**
+ * ABaseCharacter::RequestWeaponSpawn
+ *
+ * 【P0 大厂架构 2026.07.06】武器生成请求入口（对外暴露）
+ *
+ * 设计: SpawnAndEquipWeapon 是 protected (仅内部逻辑使用).
+ *       但关卡预放 AI 需要在 Controller 侧主动触发武器生成.
+ *       所以对外暴露一个 public 包装, 让 AMeleeAIController::SetupMeleeAI 可以调用.
+ *
+ * 调用方: AMeleeAIController::SetupMeleeAI (OnPossess 末尾手动触发武器生成)
+ *
+ * 内部直接调 SpawnAndEquipWeapon, 复用完整链路 (查表/挂载/HUD).
+ */
+void ABaseCharacter::RequestWeaponSpawn(FString WeaponID)
+{
+	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] RequestWeaponSpawn: WeaponID=%s, Pawn=%s"),
+		*WeaponID, *GetName());
+
+	// 直接调内部 protected 方法, 复用完整链路
+	SpawnAndEquipWeapon(WeaponID);
 }
 
 
@@ -1522,38 +2135,90 @@ float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& 
 
 
 /**
- * Die
+ * Die — 统一死亡入口 (玩家 & AI 共用)
  *
- * 服务器专用: 死亡逻辑
- * 1. 告诉所有客户端: 这个人死了
- * 2. 启动 PlayerController 上的复活定时器
+ * 【大厂架构重构 2026.07.10 - P0 关键修复 v2】
+ *
+ * 设计原则:
+ *   - Die() 负责: 服务器校验 + 武器清理 + 派发复活请求 + 广播死亡 + 销毁 Pawn
+ *   - 顺序: 先派发复活 (因为 GetController() 在 Pawn 销毁后可能返回 nullptr)
+ *   - 复活逻辑完全委托给 ARoomGameMode::RequestRespawn
+ *
+ * 【P0 2026.07.10 v2 关键修复】
+ *
+ * 历史 bug (v1):
+ *   Die() 先销毁 Pawn, 再调用 RequestRespawn(GetController())
+ *   Pawn 销毁后, Controller.GetPawn() == nullptr, Controller 可能失效
+ *   → RequestRespawn 没有被调用
+ *   → AI 永远不复活
+ *
+ * 新实现:
+ *   1. 武器清理: StopWeaponTrace + SetAttackerIsAI(false)
+ *   2. 【先派发复活】在销毁 Pawn 前调用 RequestRespawn
+ *   3. 广播死亡: Multicast_Die (布娃娃等视觉效果)
+ *   4. 销毁 Pawn: this->Destroy()
+ *
+ * 调用链:
+ *   HealthComponent::ApplyDamage -> TakeDamage -> Die()
+ *   Die() -> RequestRespawn (先派发, 避免 Pawn 销毁后 Controller 失效)
+ *        -> Multicast_Die (广播死亡)
+ *        -> Destroy Pawn
  */
 void ABaseCharacter::Die()
 {
-	// 【2026-07-01 P0 修复】原代码: if (!HasAuthority() || IsDead()) return;
-	//   修复原因: HealthComponent::ApplyDamage 已经把 bIsDead 设为 true (line 65)
-	//     TakeDamage 也已经做过 IsDead() 短路 (line 1353)
-	//     所以 Die() 内再次检查 IsDead() 必然短路 → Multicast_Die 永远不触发
-	//   新设计: 死亡入口唯一化 (HealthComponent::OnDeath 事件驱动, TakeDamage 主动调用)
-	//            IsDead() 只用于外部查询, 不用于内部短路
+	// 服务器权威校验
 	if (!HasAuthority()) return;
 
 	UE_LOG(LogTemp, Warning,
 		TEXT("[BaseCharacter][Die] 执行死亡流程: Pawn=%s, HasAuthority=%d"),
 		*GetName(), HasAuthority() ? 1 : 0);
 
-	// 告诉所有客户端: 这个人死了，准备看布娃娃
-	Multicast_Die();
+	// 【P0 2026.07.10 武器清理】必须在 Pawn 销毁前
+	if (CurrentWeapon)
+	{
+		SetAttackerIsAI(false);
+		CurrentWeapon->StopWeaponTrace();
+	}
 
-	// 【核心修复】: 复活定时器必须放在 PlayerController 上
-	// 如果定时器在角色上，死亡后角色被销毁（或者等待新角色替代），定时器会被清除
+	// 【P0 2026.07.10 v2 关键修复】先派发复活请求
+	// 原因: Pawn 销毁后, Controller 的 Pawn 引用失效, GetController() 可能返回 nullptr
+	//       RequestRespawn 需要从 Controller 获取 Profile, 必须在 Pawn 销毁前调用
+	// 引用方式: 先保存 Controller 指针 (Pawn 销毁后指针仍有效, 只是 GetPawn() 返回 nullptr)
 	if (AController* MyController = GetController())
 	{
-		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(MyController))
+		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 		{
-			PC->StartRespawnTimer(RespawnDelaySeconds);
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter][Die] 派发复活请求: Controller=%s (Pawn=%s 即将销毁)"),
+				*MyController->GetName(), *GetName());
+			GM->RequestRespawn(MyController, false);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][Die] Cannot find ARoomGameMode, skipping respawn for Pawn=%s"),
+				*GetName());
 		}
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][Die] Controller 已为空, 无法派发复活请求! Pawn=%s"),
+			*GetName());
+	}
+
+	// 【P0 2026.07.10 v3】广播死亡视觉效果给客户端
+	// ExecuteDeathLocal 处理: 武器掉落/溶解, 胶囊体透明, 死亡动画, 布娃娃
+	// 注意: 服务器端也调用, 但服务器即将销毁 Pawn, 所以实际上不会有视觉效果
+	ExecuteDeathLocal();
+
+	// 【P0 2026.07.10 v2/v3】销毁 Pawn
+	// RequestRespawn 已在上面派发, 现在销毁 Pawn 是安全的
+	// 旧武器随 Pawn 一起销毁, 不会再攻击玩家
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseCharacter][Die] 销毁 Pawn: %s"),
+		*GetName());
+	Destroy(); // ABaseCharacter 继承自 AActor, Destroy() 是 AActor 的方法
 }
 
 
@@ -1597,17 +2262,25 @@ void ABaseCharacter::Multicast_Die_Implementation()
 /**
  * DropAndFadeWeapon
  *
- * 【大厂 P0 修复】武器死亡处理
+ * 【大厂 P0 2026.07.10 重构】武器死亡处理
  *
- * 旧实现的 3 个 bug:
+ * 历史 bug (v22 及以前):
  *   1. 服务器和客户端都调度 1 秒后 Destroy 同一把武器 (服务器先 Destroy, 客户端 timer 1 秒后 IsValid=false → 静默 no-op, 但语义混乱)
  *   2. 1 秒延迟太短, 玩家根本看不到武器掉地的物理动画
  *   3. 武器的溶解特效永远不生效, 因为 DissolveComponent::GetOwnerWeaponMesh() 在已 Detach 的 Owner 上用 FindComponentByClass 找不到
  *
- * 新实现:
+ * 历史修复 (v23):
+ *   调 DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh) 把武器的 MID 加到角色 DissolveComponent 数组
+ *   → 责任错位 (角色的组件驱动武器的材质)
+ *   → 跨边界引用 (武器 Detach 后, 角色 Component 还 hold 武器 MID, 销毁时序混乱)
+ *   → 武器材质蓝图没调用 MF_Dissolve → 武器依然不溶解
+ *
+ * 新实现 (2026.07.10 大厂架构 — 职责对等):
  *   - 服务器: SetLifeSpan(3.0f) - 让 UE 在 3 秒后自动销毁, 单一权威
- *   - 所有机器: 立刻给武器 Mesh 启物理 + 取消 Attach + 通知 DissolveComponent 溶解武器材质
- *   - 溶解组件不再依赖 Owner 查找武器, 而是由死亡流程主动传入武器引用
+ *   - 所有机器: 立刻给武器 Mesh 启物理 + 取消 Attach + 调 Weapon->StartDissolve()
+ *   - 武器自治: 武器自己持有 WeaponDissolveComponent, 管自己的溶解
+ *   - 角色不再穿透调用, 零跨边界引用
+ *   - 武器材质蓝图必须调用 MF_Dissolve (单一协议, 与身体完全一致)
  */
 void ABaseCharacter::DropAndFadeWeapon(ABaseWeapon* Weapon)
 {
@@ -1635,13 +2308,20 @@ void ABaseCharacter::DropAndFadeWeapon(ABaseWeapon* Weapon)
 		WeaponMesh->SetEnableGravity(true);
 	}
 
-	// 3. 【P0 修复】武器溶解 - 不依赖 Owner 查找, 直接传入武器 Mesh
-	//    旧代码 DissolveComponent::GetOwnerWeaponMesh 用 FindComponentByClass<UMeshComponent> 在 Char 上找,
-	//    但武器 Detach 后已不在 Char 的子组件里 → 永远找不到 → 武器**永不溶解**
-	if (DissolveComponent && WeaponMesh)
-	{
-		DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh);
-	}
+	// 3. 【P0 2026.07.10 大厂重构】武器溶解 — 委托给武器自己
+	//    老路径: DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh)  (跨边界)
+	//    新路径: Weapon->StartDissolve()  (职责对等, 武器自治)
+	//
+	//    设计 (类比身体 DissolveComponent):
+	//      身体溶解: ABaseCharacter::DissolveComponent 驱动自己的身体 Mesh
+	//      武器溶解: ABaseWeapon::WeaponDissolveComponent 驱动自己的武器 Mesh
+	//      零跨边界: 武器 Detach 后, 它的 Component 随 Actor 继续工作
+	//
+	//    协议 (与身体一致 — 零兜底):
+	//      武器材质蓝图必须调用 MF_Dissolve 节点 (有 DissolveAmount 参数)
+	//      协议不满足时, WeaponDissolveComponent 内部 Log(Warning) 报警
+	//      C++ 不静默兜底, 不兼容老材质
+	Weapon->StartDissolve();
 
 	// 4. 【P0 修复】统一销毁授权 - 仅服务器调用 SetLifeSpan
 	//    客户端通过 Actor 的 OnDestroyed 自动同步移除, 不需要客户端各自销毁
@@ -1799,6 +2479,90 @@ void ABaseCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightA
 // ==========================================
 
 /**
+ * ABaseCharacter::SetMeleeProfile
+ *
+ * 【P0 大厂架构 2026.07.06】Profile 直接注入武器/角色配置
+ *
+ * 设计: SetSpawnLoadout 只做字段写入, 不承担"来源解析"职责.
+ *       本方法负责从 UAIProfileAsset 解析 WeaponID/CharacterRowName,
+ *       然后调用 SetSpawnLoadout 写入.
+ *
+ * 调用方: AMeleeAIController::SetupMeleeAI (关卡预放 AI 自举路径)
+ */
+void ABaseCharacter::SetMeleeProfile(UAIProfileAsset* InProfile)
+{
+	// 存 Profile 引用, 后续 PossessedBy 可直接用
+	MeleeProfile = InProfile;
+
+	if (!InProfile)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] SetMeleeProfile: InProfile 为空, 跳过武器/角色配置"));
+		return;
+	}
+
+	// 从 Profile 解析 WeaponID (FName -> FString)
+	FString WeaponIDStr;
+	if (!InProfile->WeaponID.IsNone())
+	{
+		WeaponIDStr = InProfile->WeaponID.ToString();
+	}
+
+	// 从 Profile 解析 CharacterRowName (FName -> FString)
+	FString CharIDStr;
+	if (!InProfile->CharacterRowName.IsNone())
+	{
+		CharIDStr = InProfile->CharacterRowName.ToString();
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] SetMeleeProfile: Profile=%s, DesiredCharID='%s', DesiredWeaponID='%s'"),
+		*InProfile->GetName(), *CharIDStr, *WeaponIDStr);
+
+	// 调用 SetSpawnLoadout 写入 (新实现: 无论是否为空都写入)
+	SetSpawnLoadout(CharIDStr, WeaponIDStr);
+}
+
+/**
+ * ABaseCharacter::SyncWeaponFromProfile
+ *
+ * 【P0 大厂架构 2026.07.06】从缓存的 Profile 同步武器/角色数据
+ *
+ * 调用方: PossessedBy (在读取 SpawnWeaponID 之前调用)
+ *
+ * 逻辑:
+ *   1. 检查 MeleeProfile 是否有效
+ *   2. 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
+ *   3. 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
+ *   4. 诊断日志记录同步结果
+ */
+void ABaseCharacter::SyncWeaponFromProfile()
+{
+	if (!MeleeProfile)
+	{
+		// 没有缓存的 Profile, 直接返回
+		return;
+	}
+
+	// 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
+	if (SpawnWeaponID.IsEmpty() && !MeleeProfile->WeaponID.IsNone())
+	{
+		SpawnWeaponID = MeleeProfile->WeaponID.ToString();
+		UE_LOG(LogTemp, Log,
+			TEXT("[BaseCharacter] SyncWeaponFromProfile: 填充 SpawnWeaponID='%s' from Profile"),
+			*SpawnWeaponID);
+	}
+
+	// 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
+	if (CharacterID.IsEmpty() && !MeleeProfile->CharacterRowName.IsNone())
+	{
+		CharacterID = MeleeProfile->CharacterRowName.ToString();
+		UE_LOG(LogTemp, Log,
+			TEXT("[BaseCharacter] SyncWeaponFromProfile: 填充 CharacterID='%s' from Profile"),
+			*CharacterID);
+	}
+}
+
+/**
  * PossessedBy
  *
  * 当 AI/Player 控制器附身时调用
@@ -1858,13 +2622,18 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	{
 		FString WeaponID;
 
-		// 【P0 修复 2026.07.03 19:35】三路兜底 — 让 AI 也能拿到武器
+		// 【P0 大厂架构 2026.07.06】四路兜底 — 让 AI 也能拿到武器
 		//
-		// Layer 1 (AI 路径): Pawn.SpawnWeaponID 由 SpawnAIInternal 写入 (从 Profile.WeaponID 读)
+		// Layer 0 (Profile 路径): MeleeProfile->WeaponID (关卡预放 AI)
+		// Layer 1 (AI 路径): Pawn.SpawnWeaponID 由 SpawnAIInternal 写入
 		// Layer 2 (玩家路径): PlayerState.GetSelectedWeapon1ID (原代码)
 		// Layer 3 (玩家兜底): RoomGameMode::GetPlayerSpawnData 缓存
 		//
-		// 大厂原则: 关键行为不能依赖单一路径 — PS 没拿到时用 Cache 再尝试
+		// 大厂原则: 关键行为不能依赖单一路径
+
+		// Layer 0: 从缓存的 Profile 同步武器/角色配置 (关卡预放 AI 专用)
+		// 调用 SyncWeaponFromProfile 会检查 MeleeProfile, 如果有效则填充空的 SpawnWeaponID
+		SyncWeaponFromProfile();
 
 		// Layer 1: AI 路径
 		if (!SpawnWeaponID.IsEmpty())
@@ -2013,6 +2782,21 @@ void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
 	if (WeaponID.IsEmpty())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponID 为空，直接返回"));
+		return;
+	}
+
+	// 【P0 修复 2026.07.10 v2】幂等性检查 - 防止重复生成武器
+	// 根因: PossessedBy 和 SetupMeleeAI 在同一帧内都调用了 SpawnAndEquipWeapon
+	//        导致生成了两个武器,旧武器没有被销毁,飞出去成为残留物
+	// 根因链:
+	//   1. PossessedBy 先调用 SpawnAndEquipWeapon → 生成 BP_Weapon_Knife_C_4 → 挂载
+	//   2. SetupMeleeAI 再调用 SpawnAndEquipWeapon → 生成 BP_Weapon_Knife_C_5 → 覆盖 CurrentWeapon
+	//   3. C_4 没有被销毁,留在场景中 → AI 死亡时 detach + 物理模拟 → 飞出去
+	// 修复: 检查当前是否已有武器, 有则跳过
+	if (IsValid(CurrentWeapon))
+	{
+		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 已有武器 %s, 跳过生成 — WeaponID=[%s]"),
+			*CurrentWeapon->GetName(), *WeaponID);
 		return;
 	}
 

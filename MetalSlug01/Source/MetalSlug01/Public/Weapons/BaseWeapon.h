@@ -17,6 +17,8 @@
 // UE 自动生成的头文件
 #include "BaseWeapon.generated.h"
 
+class UWeaponDissolveComponent;
+
 /**
  * @class ABaseWeapon
  * @brief 项目所有武器的 C++ 基类
@@ -56,23 +58,77 @@ public:
 	 */
 	virtual void Tick(float DeltaTime) override;
 
+	/**
+	 * 【P0 2026.07.07 大厂架构】销毁兜底 — EndPlay 时清理通道状态
+	 * 防止:
+	 *   - 武器销毁时 AI 通道残留为 true, 影响其他复用 Character 的人
+	 *   - 状态泄漏到下一关卡 (跨关卡 GC 抖动)
+	 */
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
 
 	// ==========================================
 	// 武器激活接口
 	// ==========================================
 
 	/**
-	 * 开启武器刀刃伤害判定
+	 * 开启武器刀刃伤害判定（玩家路径，由 AnimNotify 调用）
+	 *
+	 * 【P0 2026.07.07】与 AI 通道互斥
+	 *   如果当前 bIsAIWeaponActive=true,本调用被忽略(避免双扣血)
+	 *   玩家挥刀期间如果 AI 通道被外部错误开启,本调用也设 false 防止冲突
+	 *
 	 * @param bIsHeavyAttack 是否为重击（决定伤害数值和动画）
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void StartWeaponTrace(bool bIsHeavyAttack);
 
 	/**
-	 * 关闭武器刀刃伤害判定
+	 * 关闭武器刀刃伤害判定（玩家路径）
+	 *
+	 * 【P0 2026.07.07】不会关闭 AI 通道,两个通道独立管理
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void StopWeaponTrace();
+
+	/**
+	 * 【P0 2026.07.07 大厂架构重构 — DEPRECATED】开启 AI 伤害通道
+	 *
+	 * 历史背景 (现已废弃):
+	 *   旧版 AI 攻击通过 Server_ReportHit(Damage=ConfigSO.Damage) 走 DamageOverride,
+	 *   BP_Weapon_Knife 蓝图 AnimNotify 同时调 StartWeaponTrace 开了 trace,
+	 *   导致一次挥刀扣两次血 (trace = LightDamageBody + AI = ConfigSO.Damage)。
+	 *   旧修复: AI 通道与 trace 通道互斥, 用 bIsAIWeaponActive 屏蔽 trace。
+	 *
+	 * 新架构 (2026.07.07 重构后):
+	 *   玩家和 AI **完全共用同一套 trace 路径**
+	 *   - 不再需要"AI 屏蔽 trace"的互斥机制
+	 *   - 伤害来源决策由 Server_ReportHit 读 Owner.bIsCurrentlyAttackerAI 决定
+	 *   - AI 通道字段 bIsAIWeaponActive / IsAIWeaponActive() / SetAIWeaponActive() 全部删除
+	 *
+	 * 当前: 本函数变为 no-op, 保留仅为兼容遗留调用方
+	 *       玩家/AI 都通过 startWeaponTrace → Tick BoxTrace → trace 命中 → 扣血
+	 *
+	 * 调用方: ABaseCharacter::OnAIRequestAttack_Simple (已不再调用, 删除中)
+	 *
+	 * @deprecated 2026.07.07 — 旧版 AI 通道与 trace 互斥机制已废弃
+	 *                       玩家/AI 共用 trace, 由 Owner Character 的 bIsCurrentlyAttackerAI 决定伤害
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI",
+		meta = (DeprecatedProperty, DeprecationMessage = "已废弃 2026.07.07, 玩家/AI 共用 trace 路径, 用 BaseCharacter::SetAttackerIsAI 替代"))
+	void SetAIWeaponActive(bool bActivate) { (void)bActivate; }
+
+	/**
+	 * 查询 AI 通道是否激活
+	 *
+	 * 【P0 2026.07.07 大厂架构重构 — DEPRECATED】已废弃
+	 *   AI 通道字段已删除, 本接口为兼容保留, 永远返回 false
+	 *
+	 * @deprecated 2026.07.07 — AI 不再有独立通道, 全走 trace
+	 */
+	UFUNCTION(BlueprintPure, Category = "Combat|AI",
+		meta = (DeprecatedProperty, DeprecationMessage = "已废弃 2026.07.07, 永远返回 false"))
+	bool IsAIWeaponActive() const { return false; }
 
 
 	// ==========================================
@@ -81,8 +137,23 @@ public:
 
 	/**
 	 * 武器基础伤害（兜底用）
+	 *
+	 * 【P0 2026.07.06 重构】已废弃 — 不再被读
+	 *
+	 * 历史:
+	 *   - 旧版设计: 武器有一个统一的"基础伤害"字段, 各种攻击都从这里派生
+	 *   - 实际: 该字段从未被 C++ 读过, LightDamageBody/Head/Heavy 才是真正的伤害源
+	 *
+	 * 当前:
+	 *   - AI 通道: 走 ABaseAIController::GetEffectiveAttackDamage() → ConfigSO.Damage
+	 *   - 玩家通道: 走 BaseWeapon::Server_ReportHit → LightDamageBody/Head/Heavy
+	 *   - BaseDamage 字段保留 (BlueprintReadWrite) 以免破坏现有 BP, 但不参与实际伤害计算
+	 *
+	 * 新设计: 武器的"统一伤害"概念被拆为 LightDamageBody/Head/Heavy 三个精确字段
+	 *         AI 行为配置走 ConfigSO, 不再受武器"基础伤害"字段干扰
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat",
+		meta = (DeprecatedProperty, DeprecationMessage = "已废弃, AI 通道走 ConfigSO.Damage, 玩家通道走 LightDamageBody/Head/Heavy"))
 	float BaseDamage = 20.0f;
 
 	/**
@@ -115,6 +186,12 @@ protected:
 	 */
 	bool bIsCurrentAttackHeavy = false;
 
+	// 【P0 2026.07.07 大厂架构重构 — 已删除】 bIsAIWeaponActive 字段
+	//
+	// 历史: 旧版 AI 通道与 trace 互斥机制的标志, Tick 用它跳过 trace
+	// 当前: 玩家/AI 共用同一 trace 路径, 不再需要互斥
+	// 替代: 由 ABaseCharacter::bIsCurrentlyAttackerAI 替代 (基于攻击者状态而非武器状态)
+
 	/**
 	 * 记录这一刀已经砍中过的人，防止一刀对同一个人造成多次伤害
 	 */
@@ -136,10 +213,29 @@ public:
 
 	/**
 	 * 报告命中（Server RPC）
+	 *
+	 * 【P0 2026.07.07 大厂架构重构】新增 bIsAIDriven 参数
+	 *   - bIsAIDriven=false (玩家路径,默认): 走武器字段重算 (LightDamageBody/Head/Heavy)
+	 *   - bIsAIDriven=true  (AI 路径):     强制走 DamageOverride, 不读武器字段
+	 *     这是修复"AI 一次攻击造成两种伤害"的核心:
+	 *       旧版 AI 调用时 Damage=AIDamage, 但代码仍会兜底 if (bIsHeavy) else, 走武器字段
+	 *       → 若 BP 把 LightDamageBody 改了, AI 伤害被覆盖
+	 *       → 加上 bIsAIDriven 后, AI 通道完全独立, ConfigSO.Damage 单一真值源
+	 *
 	 * 流程: 客户端检测到命中后调用，服务器执行伤害
+	 *
+	 * @param HitActor    受击目标 (服务器校验: 必须是 ABaseCharacter 且未死)
+	 * @param Damage      伤害值
+	 *                      - 玩家路径: 传 0.0f, 服务器按部位 + bIsHeavy 重算
+	 *                      - AI 路径:   传 ConfigSO.Damage (已难度缩放), 服务器直接用
+	 * @param HitLocation 命中世界坐标 (服务器校验 NaN)
+	 * @param HitNormal   命中法线 (服务器校验单位向量)
+	 * @param BoneName    骨骼名 (玩家路径用于判定爆头)
+	 * @param bIsHeavy    是否重击
+	 * @param bIsAIDriven 是否 AI 通道 (强制走 DamageOverride, 默认 false 玩家路径)
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_ReportHit(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy);
+	void Server_ReportHit(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy, bool bIsAIDriven = false);
 
 protected:
 	/**
@@ -226,4 +322,52 @@ public:
 	 * @return 对应的 AnimMontage
 	 */
 	UAnimMontage* GetAttackMontage(bool bIsHeavy, int32 ComboIndex = 0) const;
+
+
+	// ==========================================
+	// 5. 溶解特效（2026.07.10 大厂 P0 重构 — 职责对等）
+	// ==========================================
+public:
+	/**
+	 * 【大厂 P0 2026.07.10】武器死亡溶解入口 — 公开唯一接口
+	 *
+	 * 死亡流程调用: ABaseCharacter::DropAndFadeWeapon
+	 *
+	 * 设计原则 (类比身体溶解):
+	 *   - 身体溶解: ABaseCharacter 持有 UDissolveComponent → 驱动自己的 Mesh
+	 *   - 武器溶解: ABaseWeapon 持有 UWeaponDissolveComponent → 驱动自己的 Mesh
+	 *   - 职责对等: 武器管自己的溶解, 角色不再穿透调用
+	 *   - 零跨边界: 武器 Detach 后完全自治, 不依赖角色任何状态
+	 *
+	 * 调用时序 (大厂规范):
+	 *   1. 武器必须已 Detach (Mesh 不再跟随角色骨骼)
+	 *   2. 武器必须已启用物理模拟 (SetSimulatePhysics(true))
+	 *   3. 调本方法 → UWeaponDissolveComponent 收集自己 Mesh 的 MID
+	 *   4. Tick 累加 DissolveAmount → 材质完成溶解动画
+	 *   5. 角色 SetLifeSpan(3.0) → UE 引擎在 3 秒后自动 Destroy
+	 *
+	 * 协议 (与身体一致 — 零兜底):
+	 *   - 武器材质蓝图必须调用 MF_Dissolve 节点 (有 DissolveAmount 参数)
+	 *   - 协议不满足时, 组件 Log(Warning) 报警 (在 CollectDynamicMaterials 阶段)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Dissolve")
+	void StartDissolve();
+
+	/**
+	 * 查询武器是否正在溶解中
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Dissolve")
+	bool IsDissolving() const;
+
+	/**
+	 * 武器溶解组件 — 自治组件, 拥有自己的生命周期
+	 *
+	 * 设计:
+	 *   - 在 ABaseWeapon 构造函数中 CreateDefaultSubobject 创建
+	 *   - 武器 Actor 销毁时, Component 随 Actor 自动销毁
+	 *   - 武器 Detach 后, Component 继续工作 (Actor 还在, 组件还在)
+	 *   - 角色不再穿透调用, 零跨边界引用
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	TObjectPtr<UWeaponDissolveComponent> WeaponDissolveComponent;
 };

@@ -99,12 +99,13 @@ void UHealthComponent::OnRep_CurrentHealth()
 
 void UHealthComponent::OnRep_bIsDead()
 {
-	// 【2026-07-01 P0 新增】客户端收到 bIsDead=true 时,触发 OnDeath 事件
+	// 【P0 2026-07-01 P0 新增】客户端收到 bIsDead=true 时,触发 OnDeath 事件
 	// 这样客户端无需依赖 Multicast_Die RPC 也能进入死亡流程
 	//
 	// 服务器端在 ApplyDamage 已经触发过 OnDeath.Broadcast (不会重复触发)
 	// OnRep_bIsDead 仅在客户端被调用 → 保证 OnDeath 在每台机器上恰好触发一次
-	UE_LOG(LogCombat, Warning, TEXT("[HealthComponent] OnRep_bIsDead: 客户端收到死亡状态 (Owner=%s)"),
-		*GetNameSafe(GetOwner()));
+	UE_LOG(LogTemp, Error, // 使用 Error 让日志更显眼
+		TEXT("[HealthComponent] ★★★ OnRep_bIsDead ★★★: 客户端收到死亡状态 Owner=%s bIsDead=%d"),
+		*GetNameSafe(GetOwner()), bIsDead ? 1 : 0);
 	OnDeath.Broadcast();
 }

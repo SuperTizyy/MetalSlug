@@ -225,6 +225,39 @@ public:
 	bool bSkipRoomPhaseForTesting;
 
 	// ==========================================
+	// 【架构升级 2026.07.06 17:00】战斗开始广播
+	// 解决: AI 出生后立即 RunBehaviorTree, 玩家还在大厅就追玩家
+	//       改为: AI 启动 BT 时检查 BattleInProgress, 不在则等本事件
+	// ==========================================
+
+	/**
+	 * 战斗开始广播事件 (服务器触发, 仅一次, 客户端 GameMode 不存在可忽略)
+	 * AI 等订阅者收到此事件后才激活 BT
+	 */
+	DECLARE_MULTICAST_DELEGATE(FOnBattleStartedSignature);
+	/** 战斗开始委托 (单播多订阅), AI 控制器订阅它来激活 BT */
+	FOnBattleStartedSignature OnBattleStarted;
+
+	/**
+	 * 是否已经广播过 OnBattleStarted (幂等保护, 重复调用 PerformGameStart 不会重复触发)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Game State")
+	bool bBattleStartedBroadcasted;
+
+	/**
+	 * 【P0 2026.07.10 v27】是否正在执行 SpawnAllPlayersIntoBattle
+	 *
+	 * 用途: 防止引擎的 RestartPlayer 与 SpawnAllPlayersIntoBattle 冲突
+	 * 流程:
+	 *   1. PerformGameStart -> SetTimer(SpawnAllPlayersIntoBattle)
+	 *   2. SpawnAllPlayersIntoBattle 开始时: bSpawnInProgress = true
+	 *   3. 如果引擎自动调用 RestartPlayer, RestartPlayer 检测到 bSpawnInProgress=true, 直接返回
+	 *   4. SpawnAllPlayersIntoBattle 结束时: bSpawnInProgress = false
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Game State")
+	bool bSpawnInProgress;
+
+	// ==========================================
 	// 开发测试模式: 默认发放的角色与武器
 	// ==========================================
 
@@ -436,6 +469,25 @@ protected:
 	 */
 	virtual void RestartPlayer(AController* NewPlayer) override;
 
+// ==========================================
+// 复活管理
+// ==========================================
+
+public:
+	/**
+	 * 【大厂架构重构 2026.07.06】统一复活入口 (玩家 & AI 共用)
+	 *
+	 * 设计原则:
+	 *   - 复活逻辑集中化, 避免在 BaseCharacter::Die() 中直接 Cast 判断 Controller 类型
+	 *   - Die() 只负责死亡事件派发, 复活决策由 GameMode 统一处理
+	 *   - 支持玩家和 AI 两种 Controller 的复活流程
+	 *
+	 * @param DeadController 死亡的 Controller (玩家或 AI)
+	 * @param bImmediateRespawn 是否跳过复活延迟立即复活
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Game|Respawn")
+	void RequestRespawn(AController* DeadController, bool bImmediateRespawn = false);
+
 	/**
 	 * @brief 权威校验通过后，真正执行开局指令下发与状态流转
 	 */
@@ -455,6 +507,16 @@ protected:
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
 	float MatchStartDelay = 3.0f;
+
+	/**
+	 * 【大厂架构重构 2026.07.06】复活延迟 (秒)
+	 *
+	 * 设计: 原本复活延迟硬编码在 BaseCharacter.RespawnDelaySeconds
+	 *       新设计: 在 GameMode 统一定义, 保持与 MatchStartDelay 一致的可配置风格
+	 *       BaseCharacter::RespawnDelaySeconds 仍保留作为默认值兜底
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
+	float RespawnDelaySeconds = 3.0f;
 
 	/**
 	 * 总局数（每边达到这个胜局数时比赛结束）

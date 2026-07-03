@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -98,6 +98,7 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	// 目的: 开发期不配置房间也能直接开打
 	CurrentRoomState = ERoomState::WaitingInRoom;
 	bSkipRoomPhaseForTesting = true;
+	bBattleStartedBroadcasted = false;
 
 	// 配置引擎的标准框架类
 	GameStateClass = ARoomGameState::StaticClass();
@@ -110,6 +111,12 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 
 	// 必须从底层硬编码绑定默认的 HUD 类，确保 MyGameHUD 会伴随玩家出生
 	HUDClass = AMyGameHUD::StaticClass();
+
+	// 【P0 2026.07.07 v9 大厂架构】启动期单元自检
+	// 距离决策函数 ComputeArrivalDecision 的 12 个状态组合全部跑一遍
+	// 失败立即 Error 日志, 但不影响游戏启动 (避免游戏卡住)
+	// 目的: 任何 v9 状态机改错, 启动期就能发现, 不用等 PIE 看 AI 行为
+	ABaseAIController::SelfTestArrivalDecision();
 }
 
 
@@ -420,10 +427,12 @@ bool ARoomGameMode::GetModeRules(ERoomMatchMode Mode, FAIModeRules& OutRules) co
 		return true;
 	}
 
-	// 兜底: 沿用老的硬编码 (Attack→Player, Defense→Zombie)
+	// 兜底: 沿用老的硬编码 (Attack→Zombie/AI, Defense→Player)
+	// 根因: Melee模式中"攻方"是玩家(活人)，"守方"是AI(Grunt)
+	//       而阵营ID中 Player=0, Zombie=1, 所以 AttackTeam应该是Zombie, DefenseTeam应该是Player
 	OutRules = FAIModeRules();
-	OutRules.AttackTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"), false);
-	OutRules.DefenseTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"), false);
+	OutRules.AttackTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"), false);
+	OutRules.DefenseTeamFaction = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"), false);
 	OutRules.bRoundBased = (Mode == ERoomMatchMode::Zombie);
 	OutRules.TotalRounds = ZombieTotalRounds;
 	return false;
@@ -443,6 +452,38 @@ bool ARoomGameMode::GetModeRules(ERoomMatchMode Mode, FAIModeRules& OutRules) co
  */
 int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileAsset* Profile)
 {
+	// 【P0 2026.07.10 v23 大厂架构修复】入口诊断
+	//
+	// 历史 bug: 复活 lambda 调用 SpawnAIInternal(*RequestCopy, nullptr) 时没有任何 ERROR 日志
+	//   → 看起来"复活流程正常", 但新 AIC 没有 Profile → 没有 BT → "静默失败"
+	//   → 用户观察: "AI 死了没复活" (实际是复活了但没配置)
+	//
+	// 新架构 (大厂原则: 错误显式化 > 静默兜底):
+	//   入口处立即打印 Profile 状态, 任何 nullptr 立即 ERROR
+	//   让"Profile 是否到达 SpawnAIInternal"成为显式可观测的事实
+	if (Profile)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[SpawnAIInternal] 入口: Profile=%s FactionTag=%s CharacterRowName=%s WeaponID=%s Mode=%d Team=%d"),
+			*Profile->GetName(),
+			*Profile->FactionTag.ToString(),
+			*Profile->CharacterRowName.ToString(),
+			*Profile->WeaponID.ToString(),
+			(int32)Request.Mode, (int32)Request.Team);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[SpawnAIInternal] 入口: Profile 为空! "
+				 "AI 不会获得 BehaviorTree / 感知配置 / 武器配置. "
+				 "根因排查: 复活调用方 RequestRespawn 必须传非空 Profile, 见 BaseAIController::InitializeFromProfile. "
+				 "Mode=%d Team=%d CharacterRowName=%s"),
+			(int32)Request.Mode, (int32)Request.Team,
+			*Request.CharacterRowName.ToString());
+		// 不立即 return — 仍然允许生成"无 Profile 的空壳 AI", 由调用方看到 ERROR 日志后定位
+		// 这是大厂原则"错误显式化": 让问题可见, 而非静默丢弃 spawn 请求
+	}
+
 	if (!Profile && !DefaultControllerClass)
 	{
 		UE_LOG(LogTemp, Error,
@@ -575,19 +616,63 @@ int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileA
 
 		AIC->Possess(AIPawn);
 
-		// 4d. Faction Tag
-		if (DesiredFaction.IsValid())
-		{
-			AIPawn->SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(DesiredFaction));
-		}
-
 		// 4e. 【Phase 1 核心】调 InitializeFromProfile 注入感知 + BT
+		// 注意: InitializeFromProfile 内部会设置 FactionTag (来自 Profile.FactionTag)
+		// 所以 Faction 设置必须在 InitializeFromProfile 之后, 让 ModeRules 阵营覆盖 Profile 阵营
 		if (Profile)
 		{
 			if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
 			{
 				BaseAIC->InitializeFromProfile(Profile);
+
+				// 【P0 2026.07.10 v23 大厂架构修复】复活成功验证
+				//
+				// 历史 bug: InitializeFromProfile(nullptr) 内部直接 return, 不抛错
+				//   → 旧 AIC 没 BT → 新 AI "死了没复活" 静默失败
+				//   → 即使 Profile 非空, InitializeFromProfile 内 LoadBehaviorConfigSync 返回 nullptr
+				//     也会 return, RuntimeConfig 没 Config
+				//
+				// 新架构 (大厂原则: 错误显式化 > 静默兜底):
+				//   Spawn 后立即验证 AIC 拿到了 Profile + RuntimeConfig 拿到了 Config
+				//   任何环节为 nullptr 立即 ERROR, 让"AI 复活失败"成为显式可见的事实
+				UAIProfileAsset* AICProfileAfter = BaseAIC->GetCurrentProfile();
+				if (!AICProfileAfter)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[SpawnAIInternal] ⚠ 复活验证失败: AIC '%s' InitializeFromProfile 后 CurrentProfile 仍为空! "
+							 "根因排查: UAIProfileAsset 在 InitializeFromProfile 内被清空, 或 Profile 加载失败."),
+						*BaseAIC->GetName());
+				}
+				else if (AICProfileAfter != Profile)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[SpawnAIInternal] ⚠ 复活验证失败: AIC '%s' 拿到的 Profile 与传入的不一致! "
+							 "Expected=%s, Got=%s. "
+							 "根因排查: InitializeFromProfile 内被外部覆盖."),
+						*BaseAIC->GetName(),
+						*Profile->GetName(), *AICProfileAfter->GetName());
+				}
+				else
+				{
+					UE_LOG(LogTemp, Log,
+						TEXT("[SpawnAIInternal] ✓ 复活验证通过: AIC '%s' 成功拿到 Profile=%s"),
+						*BaseAIC->GetName(), *AICProfileAfter->GetName());
+				}
 			}
+		}
+		else
+		{
+			// 【P0 2026.07.10 v23】Profile 为空时, AIC 没有 BT / Config, 提前报错
+			UE_LOG(LogTemp, Error,
+				TEXT("[SpawnAIInternal] ⚠ AIC '%s' 因 Profile 为空, 不会获得 BT / RuntimeConfig — 这是一个 '僵尸 AI', 会立即站桩. "
+					 "调用方必须保证 Profile 非空."),
+				*AIC->GetName());
+		}
+
+		// 4d. Faction Tag (必须在 InitializeFromProfile 之后, 确保 ModeRules 阵营覆盖 Profile.FactionTag)
+		if (DesiredFaction.IsValid())
+		{
+			AIPawn->SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(DesiredFaction));
 		}
 
 		UE_LOG(LogTemp, Log,
@@ -1080,25 +1165,66 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 	}
 
 	// ==========================================
-	// 【核心修复】: 绕过 RestartPlayer 的时序问题，手动完成整个生成流程
+	// 【P0 v28 关键修复】如果玩家已经有正确的 Pawn，跳过生成
+	// 
+	// 问题根因:
+	//   - SpawnAllPlayersIntoBattle 定时器可能重复触发
+	//   - 每次触发都调用 HandlePlayerRequestSpawn
+	//   - HandlePlayerRequestSpawn 销毁当前 Pawn，生成新 Pawn
+	//   - 结果: 玩家 Pawn 不断被重建，玩家感觉"角色被替换了"
+	//
+	// 修复:
+	//   - 先查表获取角色类
+	//   - 检查当前 Pawn 是否已经是正确的类
+	//   - 如果是，跳过销毁和重新生成
+	//   - 只有 Pawn 类不匹配时才重新生成
 	// ==========================================
 
 	// Step 1: 查表获取角色类
+	// 【P0 2026.07.10 v3 修复】用 FinalCharID 而不是 CharRowName
+	// 根因: CharRowName 是入参，可能为空，但 FinalCharID 已经解析过（有缓存或默认值）
 	TSubclassOf<ABaseCharacter> CharClassToSpawn = nullptr;
-	if (!CharRowName.IsEmpty() && CharRowName != TEXT("Default") && CharacterDataTable)
+	if (!FinalCharID.IsEmpty() && FinalCharID != TEXT("Default") && CharacterDataTable)
 	{
 		static const FString CharCtx(TEXT("ManualSpawn"));
-		if (FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharRowName), CharCtx))
+		if (FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*FinalCharID), CharCtx))
 		{
 			if (!Info->CharacterBlueprint.IsNull())
 			{
 				CharClassToSpawn = Info->CharacterBlueprint.LoadSynchronous();
 				UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualChar lookup '%s' -> %s"),
-					*CharRowName, *GetNameSafe(CharClassToSpawn));
+					*FinalCharID, *GetNameSafe(CharClassToSpawn));
 			}
 		}
 	}
 	if (!CharClassToSpawn) CharClassToSpawn = DefaultPawnClass;
+
+	// 【P0 v28】检查是否需要重新生成 Pawn
+	// 如果玩家已经有正确的 Pawn，直接跳过生成
+	APawn* ExistingPawn = PlayerToSpawn->GetPawn();
+	bool bNeedsRespawn = true;
+
+	if (ExistingPawn)
+	{
+		// 检查当前 Pawn 是否是期望的类
+		if (ExistingPawn->GetClass() == CharClassToSpawn)
+		{
+			// 当前 Pawn 已经是正确的类，跳过销毁和重新生成
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: Pawn=%s 已经是正确的类 '%s', 跳过重新生成"),
+				*ExistingPawn->GetName(), *GetNameSafe(CharClassToSpawn));
+			bNeedsRespawn = false;
+		}
+		else
+		{
+			// 当前 Pawn 类不匹配，需要销毁并重新生成
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: Pawn 类不匹配, 销毁旧 Pawn: %s (类=%s), 生成新 Pawn: %s"),
+				*ExistingPawn->GetName(), *GetNameSafe(ExistingPawn->GetClass()), *GetNameSafe(CharClassToSpawn));
+			ExistingPawn->Destroy();
+			bNeedsRespawn = true;
+		}
+	}
 
 	// ==========================================
 	// 【新增】: 根据队伍分配出生点
@@ -1139,40 +1265,67 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 		UE_LOG(LogTemp, Error, TEXT("[Spawn] WARNING: No spawn point found! Using default location at (0, 0, 200)"));
 	}
 
-	// Step 3: 手动 Spawn 角色
+	// Step 3: 手动 Spawn 角色（仅当需要重新生成时）
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.Owner = PlayerToSpawn;
 	SpawnParams.Instigator = PlayerToSpawn->GetPawn();
 
-	// 【关键】: 先销毁旧 Pawn，防止重复生成（旧的默认角色遗留问题）
-	if (APawn* OldPawn = PlayerToSpawn->GetPawn())
+	ABaseCharacter* SpawnedChar = nullptr;
+
+	if (bNeedsRespawn)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[Spawn] Destroying old Pawn: %s"), *OldPawn->GetName());
-		OldPawn->Destroy();
-	}
+		SpawnedChar = GetWorld()->SpawnActor<ABaseCharacter>(
+			CharClassToSpawn, SpawnLoc, SpawnRot, SpawnParams);
 
-	ABaseCharacter* SpawnedChar = GetWorld()->SpawnActor<ABaseCharacter>(
-		CharClassToSpawn, SpawnLoc, SpawnRot, SpawnParams);
+		if (SpawnedChar)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualSpawn success: %s at %s"),
+				*SpawnedChar->GetName(), *SpawnLoc.ToString());
 
-	if (SpawnedChar)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[Spawn] ManualSpawn success: %s at %s"),
-			*SpawnedChar->GetName(), *SpawnLoc.ToString());
+			// 【Phase 1 重构】阵营设置: 走 IGenericTeamAgentInterface 而不是直接 TeamID
+			// Melee模式: Attack=攻方(玩家)=Faction.Player, Defense=守方(AI)=Faction.Zombie
+			// 注意: HandlePlayerRequestSpawn 只给玩家调用, 所以 PlayerTeam=Attack 对应 Faction.Player
+			const FGameplayTag Faction =
+				(PlayerTeam == ERoomTeam::Attack)
+					? FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"))
+					: FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"));
+			SpawnedChar->SetGenericTeamId(
+				ABaseCharacter::ResolveGenericTeamIdFromTag(Faction));
 
-		// 【Phase 1 重构】阵营设置: 走 IGenericTeamAgentInterface 而不是直接 TeamID
-		const FGameplayTag Faction =
-			(PlayerTeam == ERoomTeam::Attack)
-				? FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"))
-				: FGameplayTag::RequestGameplayTag(TEXT("Faction.Zombie"));
-		SpawnedChar->SetGenericTeamId(
-			ABaseCharacter::ResolveGenericTeamIdFromTag(Faction));
-
-		// Step 4: Possess（会触发 PossessedBy -> SpawnAndEquipWeapon 自动装备武器）
-		PlayerToSpawn->Possess(SpawnedChar);
+			// Step 4: Possess（会触发 PossessedBy -> SpawnAndEquipWeapon 自动装备武器）
+			PlayerToSpawn->Possess(SpawnedChar);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[Spawn] ManualSpawn FAILED for Char='%s'"), *CharRowName);
+		}
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error, TEXT("[Spawn] ManualSpawn FAILED for Char='%s'"), *CharRowName);
+		// 【P0 v29 关键修复】跳过重新生成时，仍然需要 Possess
+		//
+		// 问题根因:
+		//   - 引擎生成 Pawn 后，Controller 可能没有正确 Possess
+		//   - 武器装备依赖于 PossessedBy 事件
+		//   - 如果不 Possess，武器就不会被装备
+		//
+		// 修复:
+		//   - 检查当前 Pawn 是否有效
+		//   - 如果有效，调用 Possess（即使已经 Possess，重复 Possess 也会触发 PossessedBy）
+		//   - PossessedBy 中会检查武器是否已装备，不会重复生成武器
+		ExistingPawn = PlayerToSpawn->GetPawn();
+		if (ExistingPawn && Cast<ABaseCharacter>(ExistingPawn))
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: Pawn=%s 存在，调用 Possess 确保武器装备"),
+				*ExistingPawn->GetName());
+			PlayerToSpawn->Possess(ExistingPawn);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: bNeedsRespawn=false 但 Pawn 不存在！需要重新生成"));
+		}
 	}
 }
 
@@ -1186,9 +1339,27 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
  */
 UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AController* InController)
 {
-	FString CharID = TEXT("(no cache)");
-	if (!InController) return DefaultPawnClass;
+	if (!InController) return nullptr;
 
+	// 【P0 v27 关键修复】对于 AI Controller，不要 fallback 到 DefaultPawnClass
+	//
+	// 根因:
+	//   - AI Controller 调用此函数时，PlayerSpawnDataCache 没有数据（AI 没有 PlayerState）
+	//   - 旧代码 fallback 到 DefaultPawnClass，而 DefaultPawnClass = BP_SWAT_C（玩家角色）
+	//   - 结果: 引擎使用 BP_SWAT_C 生成 Pawn，AI Controller 控制了玩家角色！
+	//
+	// 修复:
+	//   - 对于 AAIController，直接返回 nullptr，让引擎跳过默认 Pawn 生成
+	//   - AI 的 Pawn 生成完全由我们的 RequestRespawn -> SpawnAIInternal 流程控制
+	if (Cast<AAIController>(InController))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] GetDefaultPawnClass: AI Controller=%s, 返回 nullptr (AI Pawn 由 RequestRespawn 控制)"),
+			*InController->GetName());
+		return nullptr;
+	}
+
+	FString CharID = TEXT("(no cache)");
 	// 【核心修复】: 优先从 GameMode 本地缓存读取角色 ID（绕过 PlayerState 复制时序问题）
 	FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(InController->GetUniqueID());
 	if (CachedData && !CachedData->CharID.IsEmpty())
@@ -1224,7 +1395,8 @@ UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AControll
 		}
 	}
 
-	// 兜底方案: 如果没选，返回一个默认类
+	// 【P0 v27】玩家 Controller fallback 到 DefaultPawnClass
+	// AI Controller 在前面已经返回 nullptr，所以不会走到这里
 	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Falling back to DefaultPawnClass=%s"),
 		DefaultPawnClass ? *DefaultPawnClass->GetName() : TEXT("NULL"));
 	return DefaultPawnClass;
@@ -1236,10 +1408,33 @@ UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AControll
  *
  * 引擎底层 RestartPlayer 的钩子
  * 作用: 如果有缓存数据，使用自定义的生成逻辑（确保使用基于队伍的出生点）
+ *
+ * 【P0 2026.07.10 v27 关键修复】防止与 SpawnAllPlayersIntoBattle 冲突
+ *
+ * 问题:
+ *   - 日志显示游戏开始时出现 "[Spawn] Falling back to DefaultPawnClass"
+ *   - 这说明引擎自动调用了 RestartPlayer (生成了 Pawn)
+ *   - 然后 SpawnAllPlayersIntoBattle 又调用了 HandlePlayerRequestSpawn (销毁旧 Pawn, 生成新 Pawn)
+ *   - 这导致了额外的 Pawn 生成和销毁，可能造成混乱
+ *
+ * 修复:
+ *   - 在 SpawnAllPlayersIntoBattle 期间，RestartPlayer 直接返回，不干扰
+ *   - 因为 SpawnAllPlayersIntoBattle 已经正确处理了玩家生成
  */
 void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 {
 	if (!NewPlayer) return;
+
+	// 【P0 v27】如果正在 SpawnAllPlayersIntoBattle 期间，不允许 RestartPlayer 干扰
+	// SpawnAllPlayersIntoBattle 会在 bSpawnInProgress=true 时进行玩家生成
+	// 这防止了引擎的自动 RestartPlayer 与我们手动调用 SpawnAllPlayersIntoBattle 冲突
+	// 注意: 复活流程中 bSpawnInProgress 应该是 false, 所以复活不受影响
+	if (bSpawnInProgress)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] RestartPlayer 跳过: bSpawnInProgress=true, SpawnAllPlayersIntoBattle 正在执行中"));
+		return;
+	}
 
 	// 从缓存中读取角色和武器数据
 	FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(NewPlayer->GetUniqueID());
@@ -1262,6 +1457,329 @@ void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 	UE_LOG(LogTemp, Warning, TEXT("[Spawn] RestartPlayer: No cache found, falling back to Super"));
 	Super::RestartPlayer(NewPlayer);
 }
+
+
+/**
+ * RequestRespawn — 统一复活入口 (玩家 & AI 共用)
+ *
+ * 【大厂架构重构 2026.07.06】
+ *
+ * 设计原则:
+ *   - 复活逻辑集中化, Die() 只负责死亡事件派发, 复活决策由 GameMode 统一处理
+ *   - 玩家复活走 HandlePlayerRequestSpawn (复用开局生成逻辑, 保证角色/武器/出生点一致)
+ *   - AI 复活走 AIProfile 驱动的新 Pawn 生成, 复用 SpawnAIInternal 流程
+ *   - 支持延迟复活 (bImmediateRespawn=false 时走复活定时器, true 时立即复活)
+ *
+ * @param DeadController  死亡的 Controller (玩家 ARoomPlayerController 或 AI AAIController)
+ * @param bImmediateRespawn  true=立即复活, false=使用复活延迟定时器
+ */
+void ARoomGameMode::RequestRespawn(AController* DeadController, bool bImmediateRespawn)
+{
+	if (!DeadController)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[Respawn] RequestRespawn: DeadController is null!"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[Respawn] RequestRespawn: Controller=%s, Type=%s, bImmediate=%d"),
+		*DeadController->GetName(),
+		*GetNameSafe(DeadController->GetClass()),
+		bImmediateRespawn);
+
+	// 根据 Controller 类型分发给不同复活路径
+	if (Cast<ARoomPlayerController>(DeadController))
+	{
+		// ======================================
+		// 路径 A: 玩家复活 (复用 HandlePlayerRequestSpawn)
+		// ======================================
+		FPlayerSpawnData* CachedData = PlayerSpawnDataCache.Find(DeadController->GetUniqueID());
+		if (CachedData)
+		{
+			FString CharID   = CachedData->CharID.IsEmpty() ? ResolveFallbackCharacterRow() : CachedData->CharID;
+			FString WeaponID = CachedData->WeaponID.IsEmpty() ? ResolveFallbackWeaponRow() : CachedData->WeaponID;
+
+			if (bImmediateRespawn)
+			{
+				// 立即复活: 直接调生成逻辑
+				UE_LOG(LogTemp, Warning, TEXT("[Respawn] Player immediate respawn: Char='%s', Weapon='%s'"), *CharID, *WeaponID);
+				HandlePlayerRequestSpawn(DeadController, CharID, WeaponID);
+			}
+			else
+			{
+				// 延迟复活: 使用 TFunction + lambda 捕获变量
+				// UE 5.6 SetTimer 优先接受 TFunction, 避免了 BindUObject 的 const-ref 参数匹配问题
+				TWeakObjectPtr<AController> ControllerWeak = DeadController;
+				const FString CharIDCopy = CharID;
+				const FString WeaponIDCopy = WeaponID;
+				FTimerHandle LocalRespawnHandle;
+				GetWorld()->GetTimerManager().SetTimer(LocalRespawnHandle,
+					[this, ControllerWeak, CharIDCopy, WeaponIDCopy]()
+					{
+						if (AController* C = ControllerWeak.Get())
+						{
+							HandlePlayerRequestSpawn(C, CharIDCopy, WeaponIDCopy);
+						}
+					},
+					RespawnDelaySeconds, false);
+				UE_LOG(LogTemp, Warning, TEXT("[Respawn] Player delayed respawn scheduled in %.1f seconds"), RespawnDelaySeconds);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[Respawn] Player has no spawn cache, skipping respawn"));
+		}
+	}
+	else if (Cast<AAIController>(DeadController))
+	{
+		// ======================================
+		// 路径 B: AI 复活 (复用 SpawnAIInternal 流程)
+		// ======================================
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(DeadController))
+		{
+			UAIProfileAsset* Profile = BaseAIC->GetCurrentProfile();
+
+			// 从 GameState 读取当前 MatchMode (GameMode 本身没有 CurrentMatchMode 成员)
+			ERoomMatchMode MatchMode = ERoomMatchMode::Melee;
+			if (ARoomGameState* GS = GetGameState<ARoomGameState>())
+			{
+				MatchMode = GS->CurrentMatchMode;
+			}
+
+			// 【P0 2026.07.10 v24 大厂架构修复】AI 复活 Team 派生
+			ERoomTeam RespawnTeam = ERoomTeam::Defense;
+			{
+				const FGenericTeamId DeadTeamId = BaseAIC->GetGenericTeamId();
+				const int32 DeadTeamInt = DeadTeamId.GetId();
+				if (DeadTeamInt == 1) // Attack 阵营 TeamID=1
+				{
+					RespawnTeam = ERoomTeam::Attack;
+				}
+				else if (DeadTeamInt == 2) // Defense 阵营 TeamID=2
+				{
+					RespawnTeam = ERoomTeam::Defense;
+				}
+				else if (Profile && Profile->FactionTag.IsValid())
+				{
+					const FString TagStr = Profile->FactionTag.ToString();
+					if (TagStr.Contains(TEXT("Offense")) || TagStr.Contains(TEXT("Attack")))
+					{
+						RespawnTeam = ERoomTeam::Attack;
+					}
+					else if (TagStr.Contains(TEXT("Defense")))
+					{
+						RespawnTeam = ERoomTeam::Defense;
+					}
+				}
+			}
+
+			// 构建 AI 复活请求
+			FAISpawnRequest Request;
+			Request.Mode  = MatchMode;
+			Request.Team  = RespawnTeam;
+			Request.Count = 1;
+
+			// 【P0 2026.07.10 v24 关键修复】CharacterRowName 必须有值
+			// 优先级: Profile->CharacterRowName > "Grunt" (AI 默认角色行名)
+			Request.CharacterRowName = NAME_None;
+			FString ProfileCharRowName = TEXT("(none)");
+			if (Profile && !Profile->CharacterRowName.IsNone())
+			{
+				ProfileCharRowName = Profile->CharacterRowName.ToString();
+				
+				// 【P0 2026.07.10 v26 关键验证】防止 AI 使用玩家角色 ID
+				// 
+				// 根因: DA_AIProfile_MeleeGrunt.CharacterRowName 被错误配置为 'JS001' (玩家角色 ID)
+				// 结果: AI 复活时查表得到 BP_SWAT (玩家 Blueprint), AIController 控制玩家角色
+				//
+				// 检测规则: JS 开头的 ID 通常是玩家角色, AI 应该使用非 JS 前缀的 ID
+				// (如果你的 AI 角色 ID 也以 JS 开头, 请修改这里的检测逻辑)
+				if (ProfileCharRowName.StartsWith(TEXT("JS")))
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Respawn] AI 复活配置错误: Profile.CharacterRowName='%s' 看起来是玩家角色 ID!"
+							 " AI 不应该使用玩家角色 Blueprint。"
+							 " 请在 DA_AIProfile_MeleeGrunt 中将 CharacterRowName 改为 AI 角色 ID (如 'Grunt')。"
+							 " 当前使用默认 'Grunt' 作为安全兜底, AI 会正常复活."),
+						*ProfileCharRowName);
+					Request.CharacterRowName = FName(TEXT("Grunt"));
+				}
+				else
+				{
+					Request.CharacterRowName = Profile->CharacterRowName;
+				}
+			}
+			else
+			{
+				// 【P0 v24】当 Profile->CharacterRowName 为空时，使用默认 AI 角色行名
+				Request.CharacterRowName = FName(TEXT("Grunt"));
+				UE_LOG(LogTemp, Warning,
+					TEXT("[Respawn] AI 复活: Profile->CharacterRowName 为空, 使用默认 'Grunt' 作为角色行名"));
+			}
+
+			// 【P0 2026.07.10 v24 关键修复】AIController 不销毁，只重新生成 Pawn
+			// 
+			// 用户明确要求: "AIController 要一直存在才对吧？"
+			// 
+			// 旧架构问题:
+			//   - Die() 销毁 Pawn, RequestRespawn 销毁 Controller
+			//   - 每次复活都创建新的 Controller, 导致 Controller 数量不断增加
+			//
+			// 新架构 (大厂标准):
+			//   - Controller 一直存在, 只销毁并重新生成 Pawn
+			//   - 新 Pawn 被同一个 Controller Possess
+			//   - 这样 Controller 的 Profile/BT/状态全部保留
+			//
+			// 流程:
+			//   1. Die() 销毁 Pawn (已完成)
+			//   2. Controller 变成无 Pawn 状态
+			//   3. RequestRespawn 只生成新 Pawn, Possess 给现有 Controller
+			//   4. Controller 保持不变
+
+			// 【P0 v24】只生成 Pawn, 复用现有 Controller, 不销毁 Controller
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Respawn] AI 复活: Controller=%s 复用, 只生成新 Pawn"),
+				*DeadController->GetName());
+
+			// 查表获取角色类
+			TSubclassOf<ABaseCharacter> AIPawnClass = nullptr;
+			FString BlueprintPath = TEXT("(null)");
+			if (CharacterDataTable)
+			{
+				static const FString Ctx(TEXT("AIRespawn"));
+				if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(Request.CharacterRowName, Ctx))
+				{
+					if (!Row->CharacterBlueprint.IsNull())
+					{
+						AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
+						BlueprintPath = Row->CharacterBlueprint.GetLongPackageName();
+						UE_LOG(LogTemp, Warning,
+							TEXT("[Respawn] AI 复活查表: CharacterRowName='%s' -> Blueprint='%s' -> Class='%s'"),
+							*Request.CharacterRowName.ToString(),
+							*BlueprintPath,
+							*GetNameSafe(AIPawnClass));
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[Respawn] AI 复活查表失败: Row.CharacterBlueprint 为空, CharacterRowName='%s'"),
+							*Request.CharacterRowName.ToString());
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Respawn] AI 复活查表失败: CharacterDataTable 中没有 '%s' 这一行"),
+						*Request.CharacterRowName.ToString());
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] AI 复活查表失败: CharacterDataTable 未设置"));
+			}
+
+			if (!AIPawnClass)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] AI 复活失败: 查不到 PawnClass, CharacterRowName='%s'"),
+					*Request.CharacterRowName.ToString());
+				return;
+			}
+
+			// 获取出生点
+			FVector SpawnLoc = FVector::ZeroVector;
+			FRotator SpawnRot = FRotator::ZeroRotator;
+			ScanAndCachePlayerStarts(false);
+			if (AActor* SpawnPt = GetAvailableSpawnPointForTeam(Request.Team, true))
+			{
+				SpawnLoc = SpawnPt->GetActorLocation();
+				SpawnRot = SpawnPt->GetActorRotation();
+			}
+
+			// 生成新 Pawn
+			FActorSpawnParameters PawnSP;
+			PawnSP.Owner = DeadController;
+			PawnSP.Instigator = nullptr;
+
+			ABaseCharacter* NewPawn = GetWorld()->SpawnActor<ABaseCharacter>(
+				AIPawnClass, SpawnLoc, SpawnRot, PawnSP);
+
+			// 【P0 v27 修复】AI 复活失败时，必须返回错误，不能 fallback 到 DefaultPawnClass
+			// 
+			// 根因: 
+			//   - 当 GetAvailableSpawnPointForTeam 返回 nullptr 时，SpawnLoc = 原点
+			//   - 原点有碰撞，SpawnActor 失败
+			//   - 旧代码 fallback 到 DefaultPawnClass（可能是 BP_SWAT_C，玩家角色）
+			//   - 结果: AI Controller 控制了玩家角色！
+			//
+			// 修复:
+			//   - SpawnActor 失败时，直接返回错误，不 fallback
+			//   - 这样可以清楚地看到 AI 复活失败的日志
+			//   - 同时添加出生点诊断日志
+			if (!NewPawn)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] AI Pawn Spawn 失败: Class=%s, SpawnLoc=%s, SpawnRot=%s, 原因可能是出生点不可用或位置有碰撞"),
+					*GetNameSafe(AIPawnClass),
+					*SpawnLoc.ToString(),
+					*SpawnRot.ToString());
+
+				// 【P0 v27】添加出生点诊断
+				UE_LOG(LogTemp, Warning, TEXT("[Respawn] 出生点诊断: Team=%d, AttackStarts=%d, DefenseStarts=%d"),
+					Request.Team, AttackSpawnPoints.Num(), DefenseSpawnPoints.Num());
+				if (AttackSpawnPoints.Num() > 0)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[Respawn] Attack 出生点列表:"));
+					for (APlayerStart* Start : AttackSpawnPoints)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("  - %s @ %s"),
+							*Start->GetName(), *Start->GetActorLocation().ToString());
+					}
+				}
+
+				return;
+			}
+
+			// 设置武器配置 (与 SpawnAIInternal 一致)
+			if (Profile)
+			{
+				FString DesiredCharID = Profile->CharacterRowName.IsNone()
+					? Request.CharacterRowName.ToString()
+					: Profile->CharacterRowName.ToString();
+				FString DesiredWeaponID = Profile->WeaponID.IsNone() ? FString() : Profile->WeaponID.ToString();
+				NewPawn->SetSpawnLoadout(DesiredCharID, DesiredWeaponID);
+			}
+
+			// 【P0 2026.07.10 v25 关键修复】Possess 不触发 OnPossess
+			// 
+			// 根因分析:
+			//   - OnPossess 只在引擎第一次将 Controller 附身到 Pawn 时调用
+			//   - 当 Controller 已经存在时 (像 AI 复活这种场景), Possess 不会再次调用 OnPossess
+			//   - 结果: SetupMeleeAI 不会被调用, AI 没有 Profile/BT/武器
+			//
+			// 修复:
+			//   - Possess 之后显式调用 SetupMeleeAI
+			//   - 这与关卡预放 AI 的 OnPossess 自举逻辑完全一致
+			//   - Profile 强引用保证 SetupMeleeAI 不会拿到 nullptr
+			DeadController->Possess(NewPawn);
+			if (AMeleeAIController* MeleeAIC = Cast<AMeleeAIController>(DeadController))
+			{
+				MeleeAIC->SetupMeleeAI(Profile);
+				UE_LOG(LogTemp, Warning,
+					TEXT("[Respawn] AI 复活: SetupMeleeAI 已调用, Controller=%s, Pawn=%s, Profile=%s"),
+					*DeadController->GetName(), *NewPawn->GetName(), *GetNameSafe(Profile));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[Respawn] AI 复活成功 (非 Melee AIC): Controller=%s, Pawn=%s"),
+					*DeadController->GetName(), *NewPawn->GetName());
+			}
+		}
+	}
+}
+
 
 
 // ==========================================
@@ -1354,6 +1872,17 @@ void ARoomGameMode::PerformGameStart()
 		MatchStartDelay,
 		false // 只执行一次
 	);
+
+	// 【P0 架构升级 2026.07.06 17:00】广播战斗开始事件
+	// 解决: AI 出生后立即 RunBehaviorTree, 玩家还在大厅就追玩家 (用户原话"还没点开始游戏 AI 就开始攻击人")
+	// AI 控制器订阅 OnBattleStarted, 收到后才会激活 BT (RunBehaviorTree)
+	// 幂等保护: 多次调用 PerformGameStart 不会重复广播 (例如调试重启)
+	if (!bBattleStartedBroadcasted)
+	{
+		bBattleStartedBroadcasted = true;
+		OnBattleStarted.Broadcast();
+		UE_LOG(LogTemp, Log, TEXT("[RoomGameMode] PerformGameStart: OnBattleStarted 已广播 (AI 将激活 BT)"));
+	}
 }
 
 
@@ -1364,9 +1893,14 @@ void ARoomGameMode::PerformGameStart()
  * 1. 先扫描并缓存出生点
  * 2. 遍历 GameState.PlayerArray
  * 3. 为每个玩家调用 HandlePlayerRequestSpawn
+ *
+ * 【P0 2026.07.10 v27】bSpawnInProgress 标志用于防止 RestartPlayer 干扰
  */
 void ARoomGameMode::SpawnAllPlayersIntoBattle()
 {
+	// 【P0 v27】设置标志，防止 RestartPlayer 干扰
+	bSpawnInProgress = true;
+
 	UE_LOG(LogTemp, Warning, TEXT("[Spawn] SpawnAllPlayersIntoBattle called!"));
 
 	// 【新增】: 在生成玩家前，先扫描并缓存地图中的所有出生点
@@ -1409,6 +1943,9 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 	}
 
 	BroadcastSystemMessage(TEXT("战斗开始！"));
+
+	// 【P0 v27】清除标志，允许 RestartPlayer 正常工作
+	bSpawnInProgress = false;
 }
 
 

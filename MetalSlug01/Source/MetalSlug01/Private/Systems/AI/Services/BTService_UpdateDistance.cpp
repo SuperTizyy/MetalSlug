@@ -1,0 +1,111 @@
+// Copyright (c) 2026.
+//
+// 【P0 v22 BT 原子库】BTService — 距离观察 (派生原始事实)
+//
+// 架构定位:
+//   - 本 Service 只派生世界事实 (DistanceToTarget + bHasTarget + AttackRange)
+//   - 决策全部交给 BTDecorator_C++ 决策节点
+
+#include "Systems/AI/Services/BTService_UpdateDistance.h"
+
+#include "BehaviorTree/BehaviorTreeComponent.h"
+#include "AIController.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "GameFramework/Pawn.h"
+
+#include "Data/AI/AIBehaviorConfigSO.h"
+#include "Systems/AI/AIRuntimeConfigComponent.h"
+#include "Systems/BaseAIController.h"
+
+UBTService_UpdateDistance::UBTService_UpdateDistance()
+{
+	NodeName = TEXT("Update Distance");
+
+	// 派生量周期: 0.1s = 10Hz
+	Interval = 0.1f;
+	RandomDeviation = 0.f;
+	bTickIntervals = true;
+
+	// 配置风格一致: 全部走 FBlackboardKeySelector
+	TargetKey.AddObjectFilter(this,
+		GET_MEMBER_NAME_CHECKED(UBTService_UpdateDistance, TargetKey),
+		AActor::StaticClass());
+
+	DistanceKey.AddFloatFilter(this,
+		GET_MEMBER_NAME_CHECKED(UBTService_UpdateDistance, DistanceKey));
+
+	HasTargetKey.AddBoolFilter(this,
+		GET_MEMBER_NAME_CHECKED(UBTService_UpdateDistance, HasTargetKey));
+
+	AttackRangeKey.AddFloatFilter(this,
+		GET_MEMBER_NAME_CHECKED(UBTService_UpdateDistance, AttackRangeKey));
+}
+
+FString UBTService_UpdateDistance::GetStaticDescription() const
+{
+	return FString::Printf(
+		TEXT("每 %.2fs 派生 BB:\n"
+			 "- DistanceToTarget (cm)\n"
+			 "- bHasTarget\n"
+			 "- AttackRange (cm, 派生 ConfigSO)"),
+		Interval);
+}
+
+void UBTService_UpdateDistance::TickNode(
+	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
+{
+	Super::TickNode(OwnerComp, NodeMemory, DeltaSeconds);
+
+	UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
+	if (!BB)
+	{
+		return;
+	}
+
+	AAIController* AIC = OwnerComp.GetAIOwner();
+	if (!AIC)
+	{
+		return;
+	}
+
+	APawn* AIPawn = AIC->GetPawn();
+	if (!AIPawn)
+	{
+		BB->SetValueAsFloat(DistanceKey.SelectedKeyName, -1.f);
+		BB->SetValueAsBool(HasTargetKey.SelectedKeyName, false);
+		return;
+	}
+
+	// 读目标
+	UObject* TargetObj = BB->GetValueAsObject(TargetKey.SelectedKeyName);
+	AActor* TargetActor = Cast<AActor>(TargetObj);
+
+	if (!TargetActor)
+	{
+		BB->SetValueAsFloat(DistanceKey.SelectedKeyName, -1.f);
+		BB->SetValueAsBool(HasTargetKey.SelectedKeyName, false);
+		return;
+	}
+
+	// 算距离
+	float Distance = ABaseAIController::ComputeActorCenterDistance(AIPawn, TargetActor);
+
+	BB->SetValueAsFloat(DistanceKey.SelectedKeyName, Distance);
+	BB->SetValueAsBool(HasTargetKey.SelectedKeyName, true);
+
+	// 派生 AttackRange (含难度缩放)
+	if (AttackRangeKey.SelectedKeyName != NAME_None)
+	{
+		if (const ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+		{
+			if (const UAIRuntimeConfigComponent* RuntimeConfig = BaseAIC->GetRuntimeConfig())
+			{
+				if (const UAIBehaviorConfigSO* Config = RuntimeConfig->GetConfig())
+				{
+					float AR = RuntimeConfig->GetScaledCombat().AttackRange;
+					BB->SetValueAsFloat(AttackRangeKey.SelectedKeyName, AR);
+				}
+			}
+		}
+	}
+}

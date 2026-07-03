@@ -47,44 +47,22 @@ enum class EAIDifficultyTier : uint8
     Insane    UMETA(DisplayName = "Insane"),     // 1.8x 数值
 };
 
-/**
- * AI 目标选择策略
- * 设计: 不同模式/角色 用不同策略选目标.
- *       走"策略对象模式"而不是巨型 if 分叉:
- *         - Melee   : NearestDistance  (够近就追)
- *         - Zombie  : RandomValid      (公平猎杀)
- *         - Mother  : TimeAttitudeWeight (剩余时间权重最高)
- *
- * 注意: 模式=RoomGameMode/ProjectSettings, 角色=Profile.AIRole
- *       这两层正交, 不能写死 if-and-only-if.
- */
-UENUM(BlueprintType)
-enum class EAIHuntStrategy : uint8
-{
-    NearestDistance       UMETA(DisplayName = "最近距离"),           // 刀战 default
-    RandomValid           UMETA(DisplayName = "随机有效"),           // 生化 default
-    HighestScore          UMETA(DisplayName = "最高积分"),           // 复仇者
-    TimeAttitudeWeighted  UMETA(DisplayName = "剩余时间加权"),       // 生化母体 (CF 经典)
-    Custom                UMETA(DisplayName = "自定义扩展"),
-};
+// EAIHuntStrategy 已在下方正式定义 (见 FAIHuntPolicy 前)
 
-/**
- * Blackboard Key 集中注册 (用 Tag 描述, 编译期可校验)
- * 设计: 所有 BT/BTTask 读 Key 时, 通过 UAIBlackboardKeyRegistrySubsystem::ResolveKey 解析
- *       严禁在任何 C++ / BP 中直接出现 "ImmediateTarget" 这种裸字符串字面量
- */
 UENUM(BlueprintType)
 enum class EAIBlackboardKey : uint8
 {
-    TargetActor       UMETA(DisplayName = "TargetActor"),      // 仲裁分配的锁定目标（由 BTService 写入）
-    NearbyThreat      UMETA(DisplayName = "NearbyThreat"),      // 极近距离遭遇的敌人（OverrideBTDistance 触发时写入）
-    HomeLocation      UMETA(DisplayName = "HomeLocation"),      // AI 出生点（巡逻/回家用）
-    LastKnownLocation UMETA(DisplayName = "LastKnownLocation"), // 目标丢失前的最后位置
-    bIsInCombat       UMETA(DisplayName = "bIsInCombat"),      // 是否在战斗中
-    bHasAttackToken   UMETA(DisplayName = "bHasAttackToken"),  // 攻击令牌（防抖标志）
-    PatrolPath        UMETA(DisplayName = "PatrolPath"),       // 巡逻路径数据
-    CurrentPhase      UMETA(DisplayName = "CurrentPhase"),     // 当前行为阶段（预留）
-    PhaseTimer        UMETA(DisplayName = "PhaseTimer"),       // 阶段计时器
+	TargetActor     UMETA(DisplayName = "TargetActor"),     // 仲裁分配的锁定目标（由 BTService_RefreshTarget 写入）
+	NearbyThreat    UMETA(DisplayName = "NearbyThreat"),     // 极近距离遭遇的敌人（AttackRange 范围内时写入）
+	bIsInCombat     UMETA(DisplayName = "bIsInCombat"),     // 是否在战斗中
+	// 【P0 2026.07.09 架构重构】删除 bHasAttackToken
+	//   原用途: BTService_UpdateBlackboard 周期写 Token (上帝 Service 反模式)
+	//   现在: BTDecorator_CooldownReady 直接实时读 World.Time vs BB.CooldownEndTime, 不需要中间态
+	//   保留枚举条目仅作兼容: 旧 BP / Sequence 仍可能引用, 编译期给个明显提示
+	//   后续 P1 清理: BB_AI_Melee.uasset 删除这个 Key 后, 本条目可彻底删除
+	bHasAttackToken_DEPRECATED UMETA(Hidden, DisplayName = "bHasAttackToken (DEPRECATED - 2026.07.09, 用 Decorator_CooldownReady 替代)"),
+	// 【P0 2026.07.06】C++ 与 BT 通信: BT Attack task 内部标志 - C++ TickChaseFallback 看到此标志才停止 AddMovementInput
+	bIsAttackingNow UMETA(DisplayName = "bIsAttackingNow"),
 };
 
 /**
@@ -123,9 +101,14 @@ struct FAIPerceptionParams
 };
 
 /**
- * 战斗参数 - 替换 BaseAIController.cpp 第 93 行硬编码 250.0f
- * 注意: 重命名默认值, 旧值是 250, 这里暴露 OverrideBTDistance 给编辑器配置.
- *       之前写死 OverrideBTDistance = 250.f; 改造后由策划在 DA 里填, 默认 250 不变.
+ * 战斗参数 - AI 战斗相关数值集中管理
+ *
+ * 【P0 2026.07.07 大厂架构】距离参数合并
+ *   原 OverrideBTDistance 字段已删除 — 用户原话:
+ *     "OverrideBTDistance 其实可以就用 AttackRange 参数代替即可,
+ *      进入 AttackRange 武器攻击范围,就是极近距离"
+ *   现 NearbyThreat 触发距离 = AttackRange (见 ABaseAIController::UpdateNearbyThreatByDistance)
+ *   语义: AttackRange 同时承担 (a) AI 停下距离 (b) 攻击触发距离 (c) NearbyThreat 阈值
  */
 USTRUCT(BlueprintType)
 struct FAICombatParams
@@ -138,19 +121,121 @@ struct FAICombatParams
 
     /** 攻击冷却 (秒) */
     UPROPERTY(EditDefaultsOnly, Category = "Combat", meta = (ClampMin = "0.0"))
-    float AttackCooldown = 1.2f;
+    float AttackCooldown = 5.f;
 
-    /** 单次攻击伤害 */
-    UPROPERTY(EditDefaultsOnly, Category = "Combat", meta = (ClampMin = "0.0"))
+    /**
+     * 【P0 大厂架构 2026.07.06 重构】AI 攻击基础伤害（默认值）
+     *
+     * 数据流 (修复后):
+     *   FAICombatParams::Damage (策划配置)
+     *     ↓ UAIRuntimeConfigComponent::GetScaledCombat (难度缩放: Hard=1.3x, Easy=0.8x)
+     *     ↓ ABaseCharacter::OnAIRequestAttack_Simple (AI 攻击入口应用)
+     *     ↓ Server_ReportHit_AI (新加的 RPC, 服务器权威)
+     *     ↓ UGameplayStatics::ApplyPointDamage (扣血)
+     *
+     * 历史 (为什么之前没生效):
+     *   旧版 AI 攻击路径只播动画 (PlayAnimMontage), 没调 StartWeaponTrace / Server_ReportHit
+     *   → ConfigSO.Damage 永远不读, AI 攻击 0 伤害
+     *   重构后: AI 攻击自动按 ConfigSO.Damage 扣血, 跟玩家攻击走相同的 Server 扣血流程
+     *
+     * 与武器 LightDamageBody 的关系 (大厂设计):
+     *   - BaseWeapon.LightDamageBody = 武器固有属性 (这把刀砍谁都打 20)
+     *   - AIBehaviorConfigSO.Damage = AI 行为修正 (这个 AI 用刀时, 无论啥刀, 都打 12)
+     *   - 最终伤害 = DamageOverride (AI 传) > 0 ? DamageOverride : Weapon.LightDamageBody
+     *   - 这是经典"行为参数化": 同一把刀给不同 AI, 伤害可以不同 (Boss 武器 = +50%, 杂兵 = -30%)
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Combat",
+        meta = (ClampMin = "0.0", ClampMax = "1000.0"))
     float Damage = 12.f;
+
+    /**
+     * 【P0 2026.07.06】AI 攻击爆头伤害（可选）
+     *
+     * 设计: 大厂 AI 行为配置会区分身体/爆头, 例如狙击手 AI 爆头 1.5x, 杂兵爆头 2.0x
+     *       < 0 = 禁用爆头检测 (跟玩家一样不打头)
+     *       = 0 = 用 Damage 作为爆头伤害 (1x, 等同身体)
+     *       > 0 = 自定义爆头伤害值
+     *
+     * 当前实现状态: 数据已加, 实际爆头检测需要在 AI 攻击时做 Trace (下个 Phase)
+     *              现在先让 OnAIRequestAttack_Simple 用 Damage (身体) 扣血
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Combat",
+        meta = (ClampMin = "-1.0", ClampMax = "1000.0"))
+    float DamageHeadshot = -1.f;
 
     /** 弹药类型 (GameplayTag) - 留给武器系统 Phase 3 接入 */
     UPROPERTY(EditDefaultsOnly, Category = "Combat", meta = (Categories = "Weapon.AmmoType"))
     FGameplayTag AmmoType;
 
-    /** 极近距离 (cm) - 进入该距离时强制覆盖 BT 写 ImmediateTarget */
-    UPROPERTY(EditDefaultsOnly, Category = "Combat", meta = (ClampMin = "0.0", ClampMax = "1000.0"))
-    float OverrideBTDistance = 250.f;
+    /**
+     * 【P0 2026.07.07 大厂架构重构】攻击时是否允许移动
+     *
+     * 用途: 控制 AI 攻击蒙太奇播放期间是否允许移动
+     *
+     * 行为:
+     *   - true (默认, 向后兼容): 攻击中仍可渐进减速到位 (ComputeArrivalDecision 正常决策)
+     *   - false: 攻击蒙太奇播放期间强制 LockStop, 只有 OnMontageEnded 回调后恢复移动
+     *
+     * 典型场景:
+     *   - bAllowMovementDuringAttack = true:  "冲锋型" AI, 边冲边砍 (如 Boss 冲刺攻击)
+     *   - bAllowMovementDuringAttack = false: "站桩型" AI, 站定后才砍 (如近战杂兵)
+     *
+     * 单一数据源: ConfigSO.Combat.bAllowMovementDuringAttack → AIRuntimeConfigComponent.GetScaledCombat()
+     *             任何调用方 (ComputeArrivalDecision / BTTask / 蓝图调试) 走同一路径, 无状态分裂
+     */
+    UPROPERTY(EditDefaultsOnly, Category = "Combat")
+    bool bAllowMovementDuringAttack = true;
+
+    /**
+     * 【P0 大厂架构 2026.07.07 加固】冷却期间距离维持的迟滞缓冲 (厘米)
+     *
+     * 设计意图:
+     *   解决 AI 在 AttackRange 边界处抖动问题 — 在 [AR-Hyst, AR+Hyst] 区间不调整,
+     *   只有超出迟滞区间才触发 Chase / 后退,避免帧间反复切换方向
+     *
+     *   - 玩家距离从 250 → 240 时: 仍在迟滞区, AI 保持原行为 (不抖动)
+     *   - 玩家距离从 240 → 200 时: 离开迟滞区, AI 立即开始后退
+     *
+     * v13 用户反馈 2026.07.07 19:30 — 字段删除:
+     *   "AttackRangeHysteresis 感觉没什么用啊, 删掉吧"
+     *   "正常后退即可, 无需这个参数"
+     *
+     * v17 用户反馈 2026.07.07 20:20 — 修正 v13 删除判断:
+     *   "现在都没问题了, 只有一个问题, 就是 ai 会原地走动"
+     *   → 用 C++ 硬编码 30cm 暂时绕开 (字段未恢复)
+     *
+     * v18 用户反馈 2026.07.07 20:35 — 真正的根因暴露:
+     *   "AI 会走到敌人面前但不攻击, 必须玩家朝向 AI 走一点路才能被攻击"
+     *   根因: v17 Hyst=30 硬编码让边界上沿变成 AR+30=210, AI 在 200cm 距离时
+     *         就 LockStop, 不追到 180cm 攻击范围 → BTTask 永远不触发
+     *   用户明确诉求: "把 Hyst 暴露到 ConfigSO 出来, 我好方便调试"
+     *   → v18 重新加回字段 (用户请求), 默认 0 (与 v13 用户初衷一致),
+     *     Refractory Period 200ms 引擎层兜底抗抖动, 但 Hyst 可调
+     *
+     * v18 移除原因 (大厂原则 — 减熵) → 已撤回:
+     *   - ConfigSO 字段层**重新暴露** (v18 用户明确请求"我好方便调试")
+     *   - 默认 = 0 (与 v13 用户 19:30 原话"正常后退即可,无需这个参数" 一致)
+     *   - 引擎层 Refractory Period 200ms 仍保留抗抖动
+     *   - 用户调试时可以填任意正值 (如 10~30cm) 试迟滞区间效果
+     *
+     * v18 行为:
+     *   - Hyst = ConfigSO.Combat.AttackRangeHysteresis (默认 0, 可调)
+     *   - 边界区间 [AR-Hyst, AR+Hyst]: D ∈ 区间 → LockStop
+     *   - 跨区间决策翻转由 Refractory Period (200ms, 扩展为任何决策切换) 抑制
+     *   - 默认值 = 0 时, 与 v13 完全一致 (单点 AR 边界, 抗抖动靠 Refractory)
+     *
+     * 对 AI 行为的可观察影响 (Hyst=0 默认):
+     *   - 单点 AR 边界: D < AR → Chase(-0.7), D == AR → 立刻 LockStop
+     *   - AI 永远会追到 AR 边界 (不会卡在 AR+Hyst 远处不动)
+     *   - 抗抖动由 Refractory Period (200ms) 兜底 (不依赖 Hyst)
+     *   - 用户可以填 5~30 测试不同的迟滞效果
+     */
+    // v18 恢复 — 用户 2026.07.07 20:35 反馈"AI 走到敌人面前但不攻击, 把 Hyst 暴露 ConfigSO 出来",
+    //              Hyst=30 硬编码让 AI 卡在 AR+30=210 处不动, 无法进入 AR=180 攻击范围.
+    //              默认 0 (与 v13 用户 19:30 原意"正常后退即可"一致), 用户可调试时填 5~30 测试.
+    UPROPERTY(EditDefaultsOnly, Category = "Combat", meta = (ClampMin = "0.0", ClampMax = "100.0",
+        ToolTip = "AttackRange boundary hysteresis (cm). Default 0 means sharp boundary. Set 5-30 to test debouncing. Refractory Period (200ms) provides engine-level anti-jitter regardless of this value."))
+    float AttackRangeHysteresis = 0.f; // v18 恢复 (v13 删, v17 C++ 硬编码, v18 用户明确请求重新暴露)
 };
 
 /**
@@ -189,22 +274,24 @@ struct FAIDebugParams
     FColor DebugColor = FColor::Red;
 };
 
+// 【P0 2026.07.07 大厂架构清理】FAIHuntPolicy 暂保留 — RoomGameMode.cpp FAIModeRules 间接引用了此类型
+//   已确认: RequestTargetForAI 零调用方, 属于潜在死代码, 但当前被依赖链约束, 暂保留
+
 /**
- * 【Phase 2 模式化】目标选择策略配置
- * 设计:
- *   - 替代 RoomGameMode::RequestTargetForAI 里的巨型 if/else
- *   - 每条 Profile 按自己的 Strategy 选目标 (刀战=Nearest, 生化=Random, 母体=TimeAttitude)
- *   - 反扎堆仍由 GameMode 负责 (Lock 账本), 这里是"如何挑选"的算法
- *
- * 行为:
- *   - Nearest: 在候选人列表里选距离最近的, 距离平方 < 权重阈值
- *   - RandomValid: 随机抽一个未被攻击/未死的
- *   - HighestScore: PS->GetScore() 最高的 (排名优先)
- *   - TimeAttitudeWeighted: 隐身时间最少 + 距离近的, 综合权重 (CF 母体算法)
- *
- * 权重字段说明 (字段命名统一):
- *   - 0 = 不用; 1.0 = 唯一指标; 0~1 = 与其他指标混合.
- *   例: Mother 用 DistanceWeight=0.2, ScoreWeight=0.0, TimeRemainingWeight=0.8
+ * 目标选择策略枚举 — 被 FAIHuntPolicy 引用
+ */
+UENUM(BlueprintType)
+enum class EAIHuntStrategy : uint8
+{
+    NearestDistance      UMETA(DisplayName = "最近距离"),
+    RandomValid        UMETA(DisplayName = "随机有效"),
+    HighestScore       UMETA(DisplayName = "最高积分"),
+    TimeAttitudeWeighted UMETA(DisplayName = "剩余时间加权"),
+    Custom             UMETA(DisplayName = "自定义扩展"),
+};
+
+/**
+ * 目标选择策略配置 — Phase 2 模式化
  */
 USTRUCT(BlueprintType)
 struct FAIHuntPolicy
@@ -333,33 +420,26 @@ struct FAIModeRules
  * 将 EAIBlackboardKey 枚举映射到 BB 资产中的 FName
  * 设计: Subsystem 在 Initialize 时把枚举和 BB Key 一一对应
  *       任意读 Key 处均通过 Subsystem::ResolveKey(EAIBlackboardKey::TargetActor) 拿到 FName
+ *
+ * 【P0 2026.07.09 架构重构】
+ *   - 冷却 BB Key "CooldownEndTime" 仍保留 (BTTask_PlayAttackMontage 一次性写, Decorator_CooldownReady 实时读)
+ *   - "bHasAttackToken" 字符串常量保留 (兜底兼容, BTService 残留代码若还在读就返回空 FName 等同清空)
+ *   - 强烈建议未来 P1 清理: 从 BB_AI_Melee.uasset 删除 "bHasAttackToken" Key 后, 此字符串常量可彻底移除
  */
 namespace AIBlackboardKeyNames
 {
-    constexpr const TCHAR* TargetActor       = TEXT("TargetActor");
-    constexpr const TCHAR* NearbyThreat      = TEXT("NearbyThreat");    // 极近距离遭遇（替代旧 ImmediateTarget）
-    constexpr const TCHAR* HomeLocation      = TEXT("HomeLocation");
-    constexpr const TCHAR* LastKnownLocation = TEXT("LastKnownLocation");
-    constexpr const TCHAR* bIsInCombat       = TEXT("bIsInCombat");
-    constexpr const TCHAR* bHasAttackToken   = TEXT("bHasAttackToken");
-    constexpr const TCHAR* PatrolPath        = TEXT("PatrolPath");
-    constexpr const TCHAR* CurrentPhase      = TEXT("CurrentPhase");
-    constexpr const TCHAR* PhaseTimer        = TEXT("PhaseTimer");
+    // 原始事实 (BTService 派生)
+    constexpr const TCHAR* TargetActor      = TEXT("TargetActor");
+    constexpr const TCHAR* DistanceToTarget = TEXT("DistanceToTarget");
+    constexpr const TCHAR* bHasTarget      = TEXT("bHasTarget");
+    constexpr const TCHAR* AttackRange     = TEXT("AttackRange");
 
-    static FName Get(EAIBlackboardKey Key)
-    {
-        switch (Key)
-        {
-        case EAIBlackboardKey::TargetActor:       return FName(TargetActor);
-        case EAIBlackboardKey::NearbyThreat:      return FName(NearbyThreat);
-        case EAIBlackboardKey::HomeLocation:       return FName(HomeLocation);
-        case EAIBlackboardKey::LastKnownLocation:  return FName(LastKnownLocation);
-        case EAIBlackboardKey::bIsInCombat:        return FName(bIsInCombat);
-        case EAIBlackboardKey::bHasAttackToken:     return FName(bHasAttackToken);
-        case EAIBlackboardKey::PatrolPath:         return FName(PatrolPath);
-        case EAIBlackboardKey::CurrentPhase:       return FName(CurrentPhase);
-        case EAIBlackboardKey::PhaseTimer:         return FName(PhaseTimer);
-        default:                                   return NAME_None;
-        }
-    }
+    // 派生事实 (BTService 派生)
+    constexpr const TCHAR* HealthPercent   = TEXT("HealthPercent");
+    constexpr const TCHAR* CooldownEndTime = TEXT("CooldownEndTime");
+
+    // C++ 与 BT 通信
+    constexpr const TCHAR* bIsAttackingNow = TEXT("bIsAttackingNow");
+
+    // 【v22】精简: AttackRangeMin / AttackRangeMax 已从 BB 移除, 决策改由 C++ Decorator 内计算
 }
