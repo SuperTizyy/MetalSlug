@@ -7,27 +7,27 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "Data/Enums/CombatEnums.h" // 引入 EKillStreakType 枚举
+#include "Data/Enums/CombatEnums.h"
 #include "KillStreakWidget.generated.h"
 
 class UImage;
-
 
 /**
  * @class UKillStreakWidget
  * @brief 击杀图标组件
  *
- * 简化逻辑:
- * - 只使用 Image_Kill 显示击杀图标
- * - 每次击杀开启 1 分钟计时，1 分钟内持续击杀则累加连杀数
- * - 爆头击杀使用 Headshot 图标，也记录在总击杀数内
- * - 根据击杀数量查询数据表显示对应图标
+ * v41 大厂架构重构:
+ * 1. 数据驱动: 所有参数通过 SetKillStreakConfig 注入
+ * 2. 零兜底: 超时后必须显示单人击杀图标, 不能静默消失
+ * 3. 单一职责: 只负责连杀 UI 逻辑, 不持有配置资产引用
  *
- * 架构理念:
- * 1. 数据驱动: 图标资源全部从 DT_KillStreakIconInfo 读取
- * 2. 双定时器: 1 分钟连杀计时 + 3 秒图标自动隐藏
- * 3. 图标优先级: 爆头 > 一杀~五杀
- * 4. 注入式数据表: 由 GameHUDWidget 通过 SetKillStreakIconDataTable 注入
+ * Bug 修复记录 (v41):
+ * - 旧版: OnKillStreakExpired 只重置计数器, 不更新图标
+ *         → 超时后显示的是旧连杀图标 (如三杀), 而不是单人击杀
+ * - 新版: OnKillStreakExpired 重置后立即显示单人击杀图标
+ *
+ * @note KillStreakIconDataTable 由 GameHUDWidget 通过 SetKillStreakIconDataTable 注入
+ * @note KillStreakConfig 参数由 GameHUDWidget 通过 SetKillStreakConfig 注入
  */
 UCLASS()
 class METALSLUG01_API UKillStreakWidget : public UUserWidget
@@ -43,7 +43,7 @@ public:
 	 * 记录一次击杀
 	 * 时机: 每次玩家击杀时由 GameHUDWidget 调用
 	 * @param bIsHeadshot 是否为爆头
-	 * 流程: 累加 CurrentKillStreak -> 重置 1 分钟计时 -> 更新图标 -> 启动 3 秒自动隐藏
+	 * 流程: 累加 CurrentKillStreak -> 重置计时 -> 更新图标 -> 启动隐藏计时
 	 */
 	UFUNCTION(BlueprintCallable, Category = "KillStreak")
 	void RecordKill(bool bIsHeadshot);
@@ -56,17 +56,20 @@ public:
 	int32 GetCurrentKillStreak() const { return CurrentKillStreak; }
 
 	/**
-	 * 获取连杀图标数据表
-	 */
-	class UDataTable* GetKillStreakIconDataTable() const { return KillStreakIconDataTable; }
-
-	/**
 	 * 设置连杀图标数据表
 	 * 用途: 由 GameHUDWidget 注入
 	 * @param InDataTable 关联 DT_KillStreakIconInfo
 	 */
 	UFUNCTION(BlueprintCallable, Category = "KillStreak")
-	void SetKillStreakIconDataTable(class UDataTable* InDataTable) { KillStreakIconDataTable = InDataTable; }
+	void SetKillStreakIconDataTable(class UDataTable* InDataTable);
+
+	/**
+	 * 设置连杀系统配置
+	 * 用途: 由 GameHUDWidget 注入 (KillStreakDuration / KillStreakIconDisplayDuration)
+	 * @param InConfig 连杀配置
+	 */
+	UFUNCTION(BlueprintCallable, Category = "KillStreak")
+	void SetKillStreakConfig(float InKillStreakDuration, float InIconDisplayDuration);
 
 protected:
 	// ==========================================
@@ -93,85 +96,79 @@ private:
 	UImage* Image_Kill;
 
 	// ==========================================
-	// 4. 连杀计时系统
+	// 4. 连杀状态
 	// ==========================================
 
 	/** 当前连杀计数 */
 	int32 CurrentKillStreak = 0;
 
-	/**
-	 * 连杀计时器
-	 * 用途: 1 分钟内持续击杀则累加；超时则重置
-	 */
-	FTimerHandle KillStreakTimer;
-
-	/** 连杀有效时间（秒） */
-	float KillStreakDuration = 60.0f;
-
-	/**
-	 * 上一次是否爆头
-	 * 用途: 图标优先级判断
-	 */
+	/** 上一次是否爆头 */
 	bool bLastKillWasHeadshot = false;
 
 	// ==========================================
-	// 5. 数据表（由 GameHUDWidget 注入，不暴露到蓝图）
+	// 5. 计时器
+	// ==========================================
+
+	/** 连杀计时器 */
+	FTimerHandle KillStreakTimer;
+
+	/** 图标显示定时器 */
+	FTimerHandle IconDisplayTimer;
+
+	/** 连杀超时回调 */
+	UFUNCTION()
+	void OnKillStreakExpired();
+
+	/** 隐藏图标回调 */
+	UFUNCTION()
+	void HideIcon();
+
+	// ==========================================
+	// 6. 数据表
 	// ==========================================
 
 	/**
 	 * 连杀图标数据表
 	 * 关联: DT_KillStreakIconInfo
 	 */
+	UPROPERTY()
 	class UDataTable* KillStreakIconDataTable;
 
+	/**
+	 * 连杀系统配置 (v41 新增 - 数据驱动)
+	 * 由 GameHUDWidget 通过 SetKillStreakConfig 注入
+	 */
+	float KillStreakDuration = 10.0f;
+	float KillStreakIconDisplayDuration = 3.0f;
+
 	// ==========================================
-	// 6. 图标显示定时
+	// 7. 核心逻辑
 	// ==========================================
 
 	/**
-	 * 图标显示定时器
-	 * 用途: 3 秒后自动隐藏图标
+	 * 根据击杀情况更新图标
+	 * @param Kills 当前连杀数
+	 * @param bIsHeadshot 是否爆头
 	 */
-	FTimerHandle IconDisplayTimer;
-
-	/** 图标自动隐藏时间（秒） */
-	float IconDisplayDuration = 3.0f;
-
-	/**
-	 * 隐藏图标回调
-	 * 时机: IconDisplayTimer 到期
-	 */
-	UFUNCTION()
-	void HideIcon();
-
-	/**
-	 * 连杀超时回调
-	 * 时机: KillStreakTimer 到期（1 分钟内无击杀）
-	 * 用途: 重置 CurrentKillStreak = 0
-	 */
-	UFUNCTION()
-	void OnKillStreakExpired();
-
-	/**
-	 * 根据击杀情况更新图标（核心逻辑）
-	 * 1. 获取 EKillStreakType
-	 * 2. 从数据表取图标
-	 * 3. 设置 Image_Kill 的画刷
-	 */
-	void UpdateKillIcon();
+	void UpdateKillIcon(int32 Kills, bool bIsHeadshot);
 
 	/**
 	 * 从数据表获取图标
 	 * @param StreakType 连杀类型
-	 * @return 图标贴图（找不到返回 nullptr）
+	 * @return 图标贴图
 	 */
 	UTexture2D* GetKillStreakIcon(EKillStreakType StreakType);
 
 	/**
 	 * 根据击杀数转换为连杀类型
-	 * 规则: 爆头优先 -> 否则按 1~5 杀
 	 * @param Kills 当前连杀数
 	 * @param bIsHeadshot 是否爆头
 	 */
 	EKillStreakType GetKillStreakType(int32 Kills, bool bIsHeadshot) const;
+
+	/**
+	 * 显示图标 (封装 Show/Hide)
+	 * @param bVisible 是否显示
+	 */
+	void SetIconVisibility(bool bVisible);
 };

@@ -23,18 +23,16 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 
 	// ==========================================
-	// 【大厂标准】面板配置初始化 (只执行一次)
+	// 【v54.5.1 Bug 修复】删除 static bool bConfigsInitialized 守卫
+	//   旧实现: static bool 静态守卫让配置只在第一次 Initialize 执行
+	//     根因: PIE 模式下 GameInstance 被销毁重建，第二次 Initialize 不再填充 PanelConfigs
+	//     → StateToPanelMap.Num()=0 → OnGameFlowStateChanged 全都不显示
+	//   新实现: 直接填充（UGameInstanceSubsystem 生命周期内只 Initialize 一次，静态守卫是多余防御）
 	// ==========================================
-	// 原因: UGameInstanceSubsystem 只会被创建一次，但 Initialize() 可能在某些边缘情况被调用多次
-	// 方案: 用 static bool 保护，即使多次 Initialize 也安全
-	static bool bConfigsInitialized = false;
-	if (!bConfigsInitialized)
-	{
-		bConfigsInitialized = true;
 
-		// Login 面板配置 (登录页)
-		FPanelConfig LoginConfig;
-		if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Login/WBP_LoginPage.WBP_LoginPage_C")))
+	// Login 面板配置 (登录页)
+	FPanelConfig LoginConfig;
+	if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Login/WBP_LoginPage.WBP_LoginPage_C")))
 		{
 			LoginConfig.WidgetClass = CLS;
 		}
@@ -89,7 +87,6 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 		StateToPanelMap.Add(EMatchState::MainMenu, EUIPanel::MainMenu);
 		StateToPanelMap.Add(EMatchState::MainLobby, EUIPanel::LANRoom);
 		// 故意不添加: InRoom → RoomInside (RoomPlayerController 负责创建)
-	}
 
 	// 订阅 GameFlow 状态变化
 	if (UGameInstance* GI = GetGameInstance())
@@ -787,9 +784,18 @@ void UUIViewService::PurgePreloadedWidgetsForCurrentWorld()
 
 APlayerController* UUIViewService::GetLocalPlayerController() const
 {
-	UWorld* World = GetWorld();
-	if (!World) return nullptr;
-	return World->GetFirstPlayerController();
+	// 【v54.5 Bug 修复】不能用 World->GetFirstPlayerController()
+	//   旧实现: NM_ListenServer 模式下 GetFirstPlayerController() 返回服务器 PlayerController
+	//           服务器 PC 绑到服务器 World → widget 不在客户端 Viewport 中 → Login 页面不显示
+	//   新实现: 用 GameInstance.GetFirstGamePlayer() → GetPlayerController() 正确返回本地客户端 PlayerController
+	//   原理: GetFirstGamePlayer() 是 UE 5.x GameInstance 层的权威玩家 API, 不依赖 NetMode
+	UGameInstance* GI = GetGameInstance();
+	if (!GI) return nullptr;
+
+	ULocalPlayer* FirstPlayer = GI->GetFirstGamePlayer();
+	if (!FirstPlayer) return nullptr;
+
+	return FirstPlayer->GetPlayerController(GetWorld());
 }
 
 // ==========================================

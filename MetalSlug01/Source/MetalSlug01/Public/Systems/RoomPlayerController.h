@@ -11,6 +11,10 @@
 // 引入 UE 原生 APlayerController 类（基类）
 #include "GameFramework/PlayerController.h"
 
+// 【2026.07.11 v28】FAISpawnRequest 类型 (Server_QueueAIForBattleSpawn 参数)
+//   注意: 必须在 .generated.h **之前** include, 这是 UE 反射系统的硬规则
+#include "Systems/AI/AIBehaviorTypes.h"
+
 // UE 自动生成的头文件
 #include "RoomPlayerController.generated.h"
 
@@ -196,13 +200,16 @@ public:
 	void Server_KickPlayer(const FString& PlayerNameToKick);
 
 	/**
-	 * 房主请求添加 AI
-	 * @param bToAttackTeam AI 加入攻/守
-	 * @param CharacterName AI 角色名
-	 * @param Count AI 数量
+	 * 【2026.07.11 v28 大厂架构重构】房主请求添加 AI (大厅入队, 战斗 Spawn)
+	 *
+	 * 旧 (v24) 行为: Server_AddAI → GM->AddAIToRoom → 立刻 Spawn Pawn, 大厅阶段 AI 已生成
+	 * 新 (v28) 行为: Server_QueueAIForBattleSpawn → GM->QueueAIForBattleSpawn → 只入队
+	 *                → 战斗开始时 SpawnAllPlayersIntoBattle 消费队列 → 阵营复活点 Spawn
+	 *
+	 * @param Request 完整 FAISpawnRequest (FactionTag/CharacterRowName/WeaponID/Count 等) 【v54】ProfileTag 已删除
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_AddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count);
+	void Server_QueueAIForBattleSpawn(const FAISpawnRequest& Request);
 
 	/**
 	 * 玩家发送聊天消息

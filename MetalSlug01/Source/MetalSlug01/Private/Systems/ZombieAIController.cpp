@@ -10,8 +10,8 @@
 #include "Systems/ZombieAIController.h"
 
 #include "Characters/BaseCharacter.h"
-#include "Data/AI/AIProfileAsset.h"
 #include "Data/AI/AIBehaviorConfigSO.h"
+#include "Data/Faction/FactionTags.h"
 #include "Systems/AI/AIRuntimeConfigComponent.h"
 #include "Systems/AI/AIBehaviorTypes.h"
 #include "Engine/World.h"
@@ -34,45 +34,92 @@ AZombieAIController::AZombieAIController()
  *   3. 配 Perception (走 Config.SightConfig)
  *   4. 触发 BT 启动
  *
- * 不在 GameMode 里写死这个方法的调用 — GameMode 通过 Profile.ControllerClass 反射决定
+ * 不在 GameMode 里写死这个方法的调用 — GameMode 通过 ConfigSO.LevelPlacedAIControllerClass 反射决定
  * 调用 SetupMeleeAI 还是 SetupZombieAI (未来有其他模式同理)
  */
-void AZombieAIController::SetupZombieAI(UAIProfileAsset* ZombieProfile)
+void AZombieAIController::SetupZombieAI(UAIBehaviorConfigSO* ZombieConfig)
 {
-	if (!ZombieProfile)
+	if (!ZombieConfig)
 	{
 		return;
 	}
 
-	// 1. ApplyConfig (与 MeleeAIController 同链路)
-	UAIBehaviorConfigSO* Config = ZombieProfile->LoadBehaviorConfigSync();
-	if (Config && RuntimeConfig)
+	// 【2026.07.11 v26.5 大厂原则】关卡预放路径兜底 — 缓存 Pawn.FactionTag 到 CachedFactionTag
+	// (与 MeleeAIController::SetupMeleeAI 同样的兜底逻辑, 详见 MeleeAIController.cpp 注释)
+	if (!CachedFactionTag.IsValid())
 	{
-		RuntimeConfig->ApplyConfig(Config);
+		if (ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn()))
+		{
+			if (MyPawn->FactionTag.IsValid())
+			{
+				CachedFactionTag = MyPawn->FactionTag;
+				UE_LOG(LogZombieAI, Log,
+					TEXT("[%s] SetupZombieAI: 缓存 Pawn.FactionTag='%s' → CachedFactionTag"),
+					*GetName(), *CachedFactionTag.ToString());
+			}
+		}
+	}
+
+	// 1. ApplyConfig (与 MeleeAIController 同链路)
+	if (RuntimeConfig)
+	{
+		RuntimeConfig->ApplyConfig(ZombieConfig);
 	}
 
 	// 2. Faction 设置 — 走 IGenericTeamAgentInterface
-	if (ZombieProfile->FactionTag.IsValid())
+	// 【v54 大厂架构重构】真理源优先级链 (ConfigSO 不持有 FactionTag — 阵营是运行时属性)
+	//   1. CachedFactionTag (运行时真理源, Spawn 时已写入 — 大厅 AI/已复活 AI)
+	//   2. Pawn.FactionTag (关卡预放 AI 的 BP_GruntAI 细节面板配置的阵营)
+	//   3. Log Error + 不设阵营 (强制修复 BP 配置)
+	FGameplayTag EffectiveFaction = FGameplayTag::EmptyTag;
+	if (CachedFactionTag.IsValid())
 	{
-		SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(ZombieProfile->FactionTag));
+		EffectiveFaction = CachedFactionTag;
+	}
+	else if (ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn()))
+	{
+		if (MyPawn->FactionTag.IsValid()
+			&& FFactionTags::ValidateFactionOrReportError(MyPawn->FactionTag,
+				TEXT("ZombieAIController::SetupZombieAI")))
+		{
+			EffectiveFaction = MyPawn->FactionTag;
+			SetCachedFactionTag(EffectiveFaction);
+		}
 	}
 
-	// 3. 调 Base 入口走 Profile 注入 (感知配置 + BT 启动)
-	InitializeFromProfile(ZombieProfile);
+	if (EffectiveFaction.IsValid())
+	{
+		SetGenericTeamId(FFactionTags::ToGenericTeamId(EffectiveFaction));
+	}
+	else
+	{
+		UE_LOG(LogZombieAI, Error,
+			TEXT("[ZombieAI] SetupZombieAI: AI '%s' 阵营派生失败. "
+			     "CachedFactionTag + Pawn.FactionTag 都为空. "
+			     "【v54 大厂架构】不允许任何兜底. "
+			     "【修复路径】关卡预放 AI: 打开 BP_GruntAI.uasset 细节面板 → Faction Tag 字段配 Faction.Offense/Faction.Defense. "
+			     "大厅入队 AI: 检查 RoomService::RequestAddAI 的 FactionTag 参数."),
+			*GetName());
+	}
+
+	// 3. 调 Base 入口走 Config 注入 (感知配置 + BT 启动)
+	// 【v54 大厂架构重构】参数从 Profile 改 Config (UAIBehaviorConfigSO)
+	InitializeFromConfig(ZombieConfig);
 
 	// 4. 配置感知 (走 Config 里读到的 SightParams, 不再硬编码)
 	//    Base.OnTargetDetected 距离阈值也从 RuntimeConfig->GetScaledCombat().AttackRange 读
 	//    【P0 v5 2026.07.07】OverrideBTDistance 字段已删除, NearbyThreat 触发距离统一 = AttackRange
 	if (AIPerception && RuntimeConfig && RuntimeConfig->GetConfig())
 	{
-		// Biochemical AI 默认视觉参数与刀战不同 — 走 Profile 配
+		// Biochemical AI 默认视觉参数与刀战不同 — 走 ConfigSO 配
 		// 旧版 MeleeAIController 写了 ConfigurePerceptionFromConfig
 		// 这里我们用同样的"读 RuntimeConfig -> 配 Sight"模式
-		// (具体实现在 BaseAIController::InitializeFromProfile 之后, 由 AI 自行配; 此处只是预留扩展点)
+		// (具体实现在 BaseAIController::InitializeFromConfig 之后, 由 AI 自行配; 此处只是预留扩展点)
 	}
 
-	UE_LOG(LogZombieAI, Log, TEXT("[ZombieAI] Setup 完成, Profile=%s, Role=%d"),
-		*ZombieProfile->GetName(), (int32)ZombieProfile->AIRole);
+	UE_LOG(LogZombieAI, Log, TEXT("[ZombieAI] Setup 完成, Config=%s, Faction=%s"),
+		*ZombieConfig->GetName(),
+		EffectiveFaction.IsValid() ? *EffectiveFaction.ToString() : TEXT("<INVALID>"));
 }
 
 

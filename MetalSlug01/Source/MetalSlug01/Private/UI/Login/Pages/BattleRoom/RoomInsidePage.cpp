@@ -23,6 +23,9 @@
 #include "Components/TextBlock.h"
 #include "Components/ScrollBox.h"
 #include "Components/EditableTextBox.h"
+// 【2026.07.11 v29】FPendingAIEntry (路径 B: AI 占位数据) + ARoomGameMode (显式 GM->GetPendingAIInFaction)
+#include "Systems/AI/AIBehaviorTypes.h"
+#include "Systems/RoomGameMode.h"
 #include "Components/Overlay.h"
 #include "Components/UniformGridPanel.h"
 #include "Components/Image.h"
@@ -48,6 +51,7 @@
 #include "Systems/GameFlowSubsystem.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/Core/RoomPlayerState.h"
+#include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
 
 
 // ==========================================
@@ -74,9 +78,35 @@ bool URoomInsidePage::Initialize()
 	// 绑定开始游戏按钮点击事件
 	if (Btn_StartGame) Btn_StartGame->OnClicked.AddDynamic(this, &URoomInsidePage::OnStartGameClicked);
 	// 绑定加入攻方按钮点击事件
-	if (Btn_JoinAttackTeam) Btn_JoinAttackTeam->OnClicked.AddDynamic(this, &URoomInsidePage::OnJoinAttackTeamClicked);
+	// 【2026.07.11 v29.6 诊断】Btn_JoinAttackTeam 为空时显式报错 (BindWidget 没绑上)
+	if (Btn_JoinAttackTeam)
+	{
+		Btn_JoinAttackTeam->OnClicked.AddDynamic(this, &URoomInsidePage::OnJoinAttackTeamClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] Initialize: Btn_JoinAttackTeam 为空! "
+			     "WBP_RoomInsidePage 蓝图里必须有同名 Button 才能 BindWidget 成功. "
+			     "玩家点了 UI 也不会触发切队 → 出生队伍错."));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 15.0f, FColor::Red,
+			TEXT("[致命错误] Btn_JoinAttackTeam 未绑定! 请在 WBP_RoomInsidePage 加同名 Button"));
+	}
 	// 绑定加入守方按钮点击事件
-	if (Btn_JoinDefenseTeam) Btn_JoinDefenseTeam->OnClicked.AddDynamic(this, &URoomInsidePage::OnJoinDefenseTeamClicked);
+	// 【2026.07.11 v29.6 诊断】同上
+	if (Btn_JoinDefenseTeam)
+	{
+		Btn_JoinDefenseTeam->OnClicked.AddDynamic(this, &URoomInsidePage::OnJoinDefenseTeamClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] Initialize: Btn_JoinDefenseTeam 为空! "
+			     "WBP_RoomInsidePage 蓝图里必须有同名 Button 才能 BindWidget 成功. "
+			     "玩家点了 UI 也不会触发切队 → 出生队伍错."));
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 15.0f, FColor::Red,
+			TEXT("[致命错误] Btn_JoinDefenseTeam 未绑定! 请在 WBP_RoomInsidePage 加同名 Button"));
+	}
 	// 绑定切换准备状态按钮点击事件
 	if (Btn_ToggleReady) Btn_ToggleReady->OnClicked.AddDynamic(this, &URoomInsidePage::OnToggleReadyClicked);
 
@@ -328,24 +358,53 @@ void URoomInsidePage::NativeConstruct()
 	PopulateAIPanelData();
 
 	// 从会话设置中读取房间名称和游戏模式，并显示在 UI 上
+	// 【v54.5.1 修复】先显式清空 TextBlock 蓝图默认值 ("-" 或其他垃圾文本),
+	//   再设正确值。如果 GetCurrentSessionDisplayInfo 失败(空 RoomName)，保持清空状态(不显示误导性内容)
 	if (Text_RoomName)
 	{
-		FString DisplayRoomName = TEXT("未命名房间");
+		// 强制清空蓝图 TextBinding / 默认值
+		Text_RoomName->SetText(FText::GetEmpty());
 
-		FString DisplayGameMode = TEXT("默认模式");
+		FString DisplayRoomName;
+		FString DisplayGameMode;
 
 		// 【架构修正】UI 不直读 OnlineSubsystem, 改为通过 SessionManager 获取
 		if (UGameInstance* GI = GetGameInstance())
 		{
 			if (USessionManagerSubsystem* SessionMgr = GI->GetSubsystem<USessionManagerSubsystem>())
 			{
-				SessionMgr->GetCurrentSessionDisplayInfo(DisplayRoomName, DisplayGameMode);
+				const bool bGotInfo = SessionMgr->GetCurrentSessionDisplayInfo(DisplayRoomName, DisplayGameMode);
+				if (!bGotInfo || DisplayRoomName.IsEmpty())
+				{
+					// 【大厂 P0 诊断】skip-login 模式下 GetCurrentSessionDisplayInfo 应该能读到 SkipLoginRoomName
+					//   如果 DisplayRoomName 仍为空，说明 SessionManager::GetCurrentSessionDisplayInfo 有 bug
+					UE_LOG(LogTemp, Error,
+						TEXT("[RoomInsidePage] GetCurrentSessionDisplayInfo 返回空 RoomName! "
+						     "bGotInfo=%d, DisplayRoomName=[%s], DisplayGameMode=[%s]. "
+						     "【大厂诊断】如果 bSkipLoginDirectToLobby=true，检查 SessionManager::GetCurrentSessionDisplayInfo "
+						     "是否正确优先返回 SkipLoginRoomName."),
+						bGotInfo, *DisplayRoomName, *DisplayGameMode);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] SessionManagerSubsystem 获取失败! "
+					     "【大厂诊断】GameInstance 上找不到 SessionManagerSubsystem."));
 			}
 		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] GameInstance 获取失败!"));
+		}
 
-		// 组合房间名称和游戏模式显示文本
-		FString FinalDisplayText = FString::Printf(TEXT("%s-%s"), *DisplayRoomName, *DisplayGameMode);
-		Text_RoomName->SetText(FText::FromString(FinalDisplayText));
+		// 只有 RoomName 非空时才设置 UI（空就是空，不显示误导性默认值）
+		if (!DisplayRoomName.IsEmpty())
+		{
+			FString FinalDisplayText = FString::Printf(TEXT("%s-%s"), *DisplayRoomName, *DisplayGameMode);
+			Text_RoomName->SetText(FText::FromString(FinalDisplayText));
+		}
 	}
 
 	// 【2026-06-29 P0 修复】统一房主按钮可见性
@@ -459,9 +518,16 @@ void URoomInsidePage::OnStartGameClicked()
  */
 void URoomInsidePage::OnJoinAttackTeamClicked()
 {
+	// 【2026.07.11 v29.6 诊断日志】让用户切队 trace 可见
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomInsidePage] OnJoinAttackTeamClicked: 玩家触发加入攻方请求"));
+
 	// 检查攻方人数是否已达到上限（5 人）
 	if (Box_AttackTeam && Box_AttackTeam->GetChildrenCount() >= 5)
 	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomInsidePage] OnJoinAttackTeamClicked: 攻方人数已满, 拒绝切队 (Box_AttackTeam->GetChildrenCount()=%d >= 5)"),
+			Box_AttackTeam->GetChildrenCount());
 		AddSystemMessageToChat(TEXT("系统提示: 攻方人数已满，不可更换队伍!"));
 		return;
 	}
@@ -469,7 +535,14 @@ void URoomInsidePage::OnJoinAttackTeamClicked()
 	// 向服务器请求加入攻方 (true 表示攻方)
 	if (URoomService* RoomService = URoomService::Get(this))
 	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomInsidePage] OnJoinAttackTeamClicked: 调 RoomService::RequestChangeTeam(true)"));
 		RoomService->RequestChangeTeam(true);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] OnJoinAttackTeamClicked: RoomService 为空! 切队链路断了"));
 	}
 }
 
@@ -483,9 +556,16 @@ void URoomInsidePage::OnJoinAttackTeamClicked()
  */
 void URoomInsidePage::OnJoinDefenseTeamClicked()
 {
+	// 【2026.07.11 v29.6 诊断日志】让用户切队 trace 可见
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomInsidePage] OnJoinDefenseTeamClicked: 玩家触发加入守方请求"));
+
 	// 检查守方人数是否已达到上限（5 人）
 	if (Box_DefenseTeam && Box_DefenseTeam->GetChildrenCount() >= 5)
 	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomInsidePage] OnJoinDefenseTeamClicked: 守方人数已满, 拒绝切队 (Box_DefenseTeam->GetChildrenCount()=%d >= 5)"),
+			Box_DefenseTeam->GetChildrenCount());
 		AddSystemMessageToChat(TEXT("系统提示: 守方人数已满，不可更换队伍!"));
 		return;
 	}
@@ -493,7 +573,14 @@ void URoomInsidePage::OnJoinDefenseTeamClicked()
 	// 向服务器请求加入守方 (false 表示守方)
 	if (URoomService* RoomService = URoomService::Get(this))
 	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomInsidePage] OnJoinDefenseTeamClicked: 调 RoomService::RequestChangeTeam(false)"));
 		RoomService->RequestChangeTeam(false);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] OnJoinDefenseTeamClicked: RoomService 为空! 切队链路断了"));
 	}
 }
 
@@ -1123,6 +1210,20 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 	FString SelectedWeapon = ComboBox_AIWeapon->GetSelectedOption();
 	FString SelectedTeam = ComboBox_AITeam->GetSelectedOption();
 
+	// 【v47 大厂原则 - 零兜底】武器选择不能为空
+	if (SelectedWeapon.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] OnConfirmAddAIClicked: 武器选择为空! "
+				"ComboBox_AIWeapon 必须选择一个武器. 拒绝入队."));
+		if (Text_AddAIHint)
+		{
+			Text_AddAIHint->SetText(FText::FromString(TEXT("错误: 请选择武器")));
+			Text_AddAIHint->SetVisibility(ESlateVisibility::Visible);
+		}
+		return;
+	}
+
 	FString CountStr = Input_AICount->GetText().ToString();
 	int32 RequestedAICount = FCString::Atoi(*CountStr);
 
@@ -1164,12 +1265,12 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 		bool bIsAttackTeam = SelectedTeam.Contains(TEXT("攻方"));
 		if (URoomService* RoomService = URoomService::Get(this))
 		{
-			RoomService->RequestAddAI(bIsAttackTeam, SelectedChar, ActualAddCount);
+			RoomService->RequestAddAI(bIsAttackTeam, SelectedChar, SelectedWeapon, ActualAddCount);
 		}
 
 		if (GEngine)
 		{
-			FString DebugMsg = FString::Printf(TEXT("已向服务器请求往%s添加 %d 名AI"), *SelectedTeam, ActualAddCount);
+			FString DebugMsg = FString::Printf(TEXT("已向服务器请求往%s添加 %d 名AI (武器: %s)"), *SelectedTeam, ActualAddCount, *SelectedWeapon);
 			GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, DebugMsg);
 		}
 
@@ -1265,87 +1366,98 @@ void URoomInsidePage::ActivateChatInput()
 /**
  * CheckForNewPlayers
  *
- * 0.5 秒一次的玩家变化检查
- * 1. 通过 URoomStateService 获取攻守方快照数量
- * 2. 维护 KnownPlayerStates（订阅单个玩家的 OnStateChanged, 仍合理: 订阅事件 ≠ 直读数据）
- * 3. 期望人数 != UI 实际人数 -> 触发 RefreshRoomUI
+ * 0.5 秒一次的玩家变化检查 (真人 + AI 占位)
  *
- * 【P0 架构升级】玩家状态读取走 RoomStateService, View 不直接读 GameState/PlayerState
- * (但订阅 PlayerState 事件用于响应单玩家变化是合理的——订阅 ≠ 直读)
+ * 【2026.07.11 v29 大厂架构重构】双数据流检查
+ * 历史 (v28 错误做法):
+ *   走 URoomStateService::GetAttackFactionSnapshots/GetDefenseFactionSnapshots 来填 KnownPlayerStates
+ *     → 这两个函数读 PlayerArray, 但测试模式 MockLogin 不 add PlayerArray → 真人永远空
+ *     → KnownPlayerStates 永远空 → CheckForNewPlayers 不做事
+ *     → 但同时 RefreshRoomUI 内部用同一个空数据源 → Box 永远不显示
+ *
+ * 新 (v29) 原则:
+ *   - 真人 vs AI 是两条独立数据流
+ *   - 真人订阅链直接读 GS->PlayerArray (绕开快照层, 因为快照也是从 PlayerArray 读的, 只是中间多一层)
+ *   - AI 数据根本不入 KnownPlayerStates (它没 PlayerState 可订阅)
+ *   - RefreshRoomUI 自己负责 AI 占位的渲染
+ *
+ * 职责 (Single Responsibility):
+ *   - CheckForNewPlayers: 只维护 KnownPlayerStates (真人订阅链) + 通知 RefreshRoomUI
+ *   - RefreshRoomUI: 真人 + AI 双数据流渲染
  */
 void URoomInsidePage::CheckForNewPlayers()
 {
-	URoomStateService* RoomState = URoomStateService::Get(this);
-	if (!RoomState) return;
-
-	// 合并攻守方快照, 拿到当前所有活跃玩家
-	TArray<FPlayerSnapshot> AllSnapshots;
-	AllSnapshots.Append(RoomState->GetAttackTeamSnapshots());
-	AllSnapshots.Append(RoomState->GetDefenseTeamSnapshots());
+	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
+	ARoomGameMode*   GM = GetWorld()->GetAuthGameMode<ARoomGameMode>();
 
 	bool bNeedsRefresh = false;
 
-	// 用 PlayerName 作为唯一 key, 对比 KnownPlayerStates 维护订阅链
-	// (订阅单个 PlayerState 的 OnStateChanged, 用于响应单玩家变化)
-	for (const FPlayerSnapshot& Snapshot : AllSnapshots)
+	// ==========================================
+	// 路径 A: 真人 (维护 KnownPlayerStates 订阅链)
+	// 【v29】直接读 GS->PlayerArray — 不走 URoomStateService 快照层 (它最终也是读 PlayerArray, 但中间多一层包装)
+	// 大厂原则: 单一真理源 + 减熵 — 减少中间层, 数据流越直越可控
+	// ==========================================
+	if (GS)
 	{
-		const bool bAlreadyKnown = KnownPlayerStates.ContainsByPredicate(
-			[&Snapshot](ARoomPlayerState* PS){ return PS && PS->GetPlayerName() == Snapshot.PlayerName; });
-
-		if (!bAlreadyKnown)
+		// A1. 订阅链新增 (遍历 PlayerArray, 未订阅的 RoomPS 加入订阅)
+		for (APlayerState* GenericPS : GS->PlayerArray)
 		{
-			// 找到对应的 ARoomPlayerState 来订阅其变化事件
-			if (ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>())
+			ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS);
+			if (!RoomPS) continue;
+
+			const bool bAlreadyKnown = KnownPlayerStates.ContainsByPredicate(
+				[RoomPS](ARoomPlayerState* PS){ return PS == RoomPS; });
+
+			if (!bAlreadyKnown)
 			{
-				for (APlayerState* GenericPS : GS->PlayerArray)
-				{
-					if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(GenericPS))
-					{
-						if (RoomPS->GetPlayerName() == Snapshot.PlayerName)
-						{
-							KnownPlayerStates.Add(RoomPS);
-							RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
-							bNeedsRefresh = true;
-							break;
-						}
-					}
-				}
+				KnownPlayerStates.Add(RoomPS);
+				RoomPS->OnStateChanged.AddDynamic(this, &URoomInsidePage::RefreshRoomUI);
+				bNeedsRefresh = true;
+			}
+		}
+
+		// A2. 移除已离开的真人 (PC 失效 / PlayerArray 不再含此 RoomPS)
+		for (int32 i = KnownPlayerStates.Num() - 1; i >= 0; --i)
+		{
+			ARoomPlayerState* TrackedPS = KnownPlayerStates[i];
+			const bool bStillInRoom = TrackedPS && GS->PlayerArray.Contains(TrackedPS);
+
+			if (!IsValid(TrackedPS) || !bStillInRoom)
+			{
+				KnownPlayerStates.RemoveAt(i);
+				bNeedsRefresh = true;
 			}
 		}
 	}
 
-	// 检查是否有玩家离开
-	for (int32 i = KnownPlayerStates.Num() - 1; i >= 0; --i)
+	// ==========================================
+	// UI 刷新触发: 真人 + AI 占位, 与 RefreshRoomUI 渲染口径一致
+	// 【v46 大厂架构修复】改用 GameState.ReplicatedPendingAIQueue (客户端可见)
+	// 旧路径读 GM->GetAllPendingAI() — 但 ARoomGameMode.PendingAIQueue 不是 Replicated,
+	// 客户端读永远为空, 导致 ExpectedTotalCount 不含 AI, RefreshRoomUI 路径 B 永远空
+	// ==========================================
+	const int32 RealPlayerCount = KnownPlayerStates.Num();
+
+	// 【v46 修复】改读 GameState.ReplicatedPendingAIQueue (已同步到客户端)
+	// 直接使用函数开头已声明的 GS 变量
+	int32 AIPlaceholderCount = GS ? GS->ReplicatedPendingAIQueue.Num() : 0;
+	if (!GS && GM)
 	{
-		ARoomPlayerState* TrackedPS = KnownPlayerStates[i];
-		const bool bStillInRoom = TrackedPS && AllSnapshots.ContainsByPredicate(
-			[TrackedPS](const FPlayerSnapshot& S){ return S.PlayerName == TrackedPS->GetPlayerName(); });
-
-		if (!IsValid(TrackedPS) || !bStillInRoom)
-		{
-			KnownPlayerStates.RemoveAt(i);
-			bNeedsRefresh = true;
-		}
+		AIPlaceholderCount = GM->GetAllPendingAI().Num();
+		UE_LOG(LogTemp, Warning, TEXT("[RoomInsidePage] CheckForNewPlayers: GS 为空, fallback 到 GM.GetAllPendingAI (服务端 OK, 客户端永远空)"));
 	}
+	const int32 ExpectedTotalCount = RealPlayerCount + AIPlaceholderCount;
 
-	// 【P0】人数从快照直接拿, 不再从 PS 字段读
-	const int32 ExpectedAttackCount = RoomState->GetAttackTeamSnapshots().Num();
-	const int32 ExpectedDefenseCount = RoomState->GetDefenseTeamSnapshots().Num();
-
-	// 获取 UI 中实际显示的人数
 	int32 UIAttackCount = Box_AttackTeam ? Box_AttackTeam->GetChildrenCount() : 0;
 	int32 UIDefenseCount = Box_DefenseTeam ? Box_DefenseTeam->GetChildrenCount() : 0;
 	int32 RenderedTotalCount = UIAttackCount + UIDefenseCount;
 
-	// 检查是否需要刷新 UI（人数不匹配或队伍分布不一致）
-	if (RenderedTotalCount != KnownPlayerStates.Num() ||
-		ExpectedAttackCount != UIAttackCount ||
-		ExpectedDefenseCount != UIDefenseCount)
+	// 期望人数 != UI 实际 → 刷新
+	if (RenderedTotalCount != ExpectedTotalCount)
 	{
 		bNeedsRefresh = true;
 	}
 
-	// 如果需要刷新，执行 UI 重绘
 	if (bNeedsRefresh)
 	{
 		RefreshRoomUI();
@@ -1357,18 +1469,30 @@ void URoomInsidePage::CheckForNewPlayers()
  * RefreshRoomUI
  *
  * 重新绘制房间 UI，更新所有玩家的显示信息
- * 1. 清空攻守方列表
- * 2. 校验 PlayerLabelClass 是否已配置
- * 3. 获取房主名
- * 4. 遍历 KnownPlayerStates 创建 PlayerLabelWidget
- * 5. 设置 AI/房主/玩家标签样式
- * 6. 设置移除按钮可见性（房主有，且非房主自己）
+ *
+ * 【2026.07.11 v29 大厂架构重构】双数据流渲染
+ * 历史 (v28 错误做法):
+ *   for (const FPlayerSnapshot& Snap : AllSnapshots) — 合并真人 + AI
+ *     → 测试模式 MockLogin 不 add PlayerArray → 真人永远空 → Box 不显示 (用户反馈 bug)
+ *
+ * 新 (v29) 数据流:
+ *   - 真人: KnownPlayerStates (ARoomPlayerState 事件订阅链, 已稳定 v18/v27)
+ *   - AI 占位: GM->GetPendingAIInFaction (显式查询, 不混入真人)
+ *   两者在 UI 层按 FactionTag 分类合并
+ *
+ * 大厂原则:
+ *   - 显式意图: 真人 vs AI 是两条数据流, 各自走自己最可靠的源头
+ *   - 单一真理源: 真人走 PlayerArray (KnownPlayerStates 维护), AI 走 PendingAIQueue
+ *   - 零兜底: 任一数据源为空 → Box 渲染空 (这是合法的真空状态, 不报错)
  */
 void URoomInsidePage::RefreshRoomUI()
 {
 	// 清空攻守方列表
 	if (Box_AttackTeam) Box_AttackTeam->ClearChildren();
 	if (Box_DefenseTeam) Box_DefenseTeam->ClearChildren();
+
+	// 【v46 新增】获取 GameState 引用 (用于读 ReplicatedPendingAIQueue)
+	ARoomGameState* GS = GetWorld() ? GetWorld()->GetGameState<ARoomGameState>() : nullptr;
 
 	// 检查 PlayerLabelClass 是否已配置
 	if (!PlayerLabelClass)
@@ -1456,109 +1580,131 @@ void URoomInsidePage::RefreshRoomUI()
 	}
 
 	UE_LOG(LogTemp, Log,
-		TEXT("[RoomInsidePage] RefreshRoomUI: bAmILocalHost=%d, LocalAccount=[%s], CurrentHostName=[%s]"),
-		bAmILocalHost ? 1 : 0, *LocalAccountName, *CurrentHostName);
+		TEXT("[RoomInsidePage] RefreshRoomUI: bAmILocalHost=%d, LocalAccount=[%s], CurrentHostName=[%s], KnownPlayers=%d"),
+		bAmILocalHost ? 1 : 0, *LocalAccountName, *CurrentHostName, KnownPlayerStates.Num());
 
-	// 遍历所有已知玩家，创建对应的 UI 标签
+	// ==========================================
+	// 【2026.07.11 v29 大厂架构重构】双数据流渲染 (真人 + AI 占位)
+	//
+	// 旧 (v28) 错误做法: 合并真人 + AI (AllSnapshots) — 但 AllSnapshots 用 PlayerArray 填真人
+	//   → 测试模式 MockLogin 不 add PlayerArray → 真人永远空 → Box 不显示 ← 用户反馈 bug
+	//
+	// 新 (v29): 双数据流
+	//   路径 A 真人: KnownPlayerStates (PS 事件订阅链, v18/v27 验证可靠)
+	//   路径 B AI 占位: GM->GetPendingAIInFaction (大厅阶段独有, 战斗时已 Spawn 进 AIController)
+	// ==========================================
+
+	// ==========================================
+	// 路径 A: 真人玩家 (走 KnownPlayerStates)
+	// 大厂原则 - 单一真理源: PS (PlayerState) 是阵营/准备状态的真理源, 直接读 PS 字段 (不再绕道 URoomStateService 快照层)
+	// 旧 (v28) 错误: 用 GetAttackFactionSnapshots 查快照 → 又是绕一层, 还遇到 PlayerArray 空的问题
+	// ==========================================
 	for (ARoomPlayerState* PS : KnownPlayerStates)
 	{
 		if (!IsValid(PS)) continue;
 
-		// 【P0】先取玩家名, 再用快照查 Team/bIsReady（避免直读 PS 字段）
 		const FString PName = PS->GetPlayerName();
 
-		// 确定目标队伍容器
+		// 【大厂原则 - 单一真理源】真人 PS 本身就是真相 — 直接读
+		//   不再用快照层包装 (快照也是从 PS 抄的, 复制过程中可能不同步)
+		FGameplayTag PS_FactionTag = PS->CurrentFactionTag;
+		bool         PS_bIsReady = PS->bIsReady;
+
 		UVerticalBox* TargetBox = nullptr;
-		ERoomTeam PS_Team = ERoomTeam::None;
-		bool PS_bIsReady = false;
-		if (URoomStateService* RoomState = URoomStateService::Get(this))
+		if (PS_FactionTag == FFactionTags::Offense()) TargetBox = Box_AttackTeam;
+		else if (PS_FactionTag == FFactionTags::Defense()) TargetBox = Box_DefenseTeam;
+		else
 		{
-			// 按 Name 在攻守方快照中查找
-			const FPlayerSnapshot* Snap = RoomState->GetAttackTeamSnapshots().FindByPredicate(
-				[&PName](const FPlayerSnapshot& S){ return S.PlayerName == PName; });
-			if (!Snap)
-			{
-				Snap = RoomState->GetDefenseTeamSnapshots().FindByPredicate(
-					[&PName](const FPlayerSnapshot& S){ return S.PlayerName == PName; });
-			}
-			if (Snap)
-			{
-				PS_Team = Snap->Team;
-				PS_bIsReady = Snap->bIsReady;
-			}
+			// 【大厂原则 - 零兜底】无效阵营 → 显式报错 + 不放入任何 Box
+			UE_LOG(LogTemp, Warning,
+				TEXT("[RoomInsidePage] 真人 %s 阵营无效: '%s', 不放入任何容器"),
+				*PName, *PS_FactionTag.ToString());
+			continue;
 		}
-		if (PS_Team == ERoomTeam::Attack) TargetBox = Box_AttackTeam;
-		else if (PS_Team == ERoomTeam::Defense) TargetBox = Box_DefenseTeam;
 
 		if (TargetBox)
 		{
-			// 创建玩家标签 Widget
-			UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
-			if (PlayerLabel)
+			CreatePlayerLabelInBox(
+				TargetBox,
+				PName,
+				/*bIsAI=*/ false,
+				CurrentHostName,
+				bAmILocalHost,
+				LocalAccountName,
+				/*bLabelReady=*/ PS_bIsReady);
+		}
+	}
+
+	// ==========================================
+	// 路径 B: AI 占位 (走 GameState.ReplicatedPendingAIQueue)
+	// 【v46 大厂架构修复】改用 GameState.ReplicatedPendingAIQueue (客户端可见)
+	// 旧路径读 GM->GetPendingAIInFaction — 但 ARoomGameMode.PendingAIQueue 不是 Replicated,
+	// 客户端读永远为空, 导致 AI 占位不显示
+	// ==========================================
+	// 【v46 修复】直接用已有的 GS 变量 (CheckForNewPlayers 已声明)
+	// 攻方 AI 占位
+	if (GS)
+	{
+		const TArray<FPendingAIEntry> PendingAttackAI = GS->ReplicatedPendingAIQueue.FilterByPredicate(
+			[](const FPendingAIEntry& Entry) {
+				return Entry.FactionTag == FFactionTags::Offense();
+			});
+		for (const FPendingAIEntry& Entry : PendingAttackAI)
+		{
+			if (Entry.DisplayName.IsEmpty())
 			{
-				// ==========================================
-				// 【Bug1 修复 - 调用顺序关键】
-				// 必须先 SetPlayerName (写 CachedPlayerName), 再 SetAsHost/SetAsAI (读 CachedPlayerName 拼后缀)
-				// 然后 SetReadyState 才会被 bIsHostEntry / bIsAIEntry 拦截, 不会把 Text_IsReady 显示出来
-				// ==========================================
-				PlayerLabel->SetPlayerName(PName);
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] PendingAI 空 DisplayName, FactionTag='%s' — GM 数据损坏"),
+					*Entry.FactionTag.ToString());
+				continue;
+			}
+			if (Box_AttackTeam)
+			{
+				CreatePlayerLabelInBox(
+					Box_AttackTeam,
+					Entry.DisplayName,
+					/*bIsAI=*/ true,
+					CurrentHostName,
+					bAmILocalHost,
+					LocalAccountName,
+					/*bLabelReady=*/ false);
+			}
+		}
 
-				bool bIsAI = PName.StartsWith(TEXT("[AI]")); // 是否为 AI 玩家
-				bool bIsThisLabelTheHost = (PName == CurrentHostName); // 服务器权威
-
-				// 【Bug1 本地权威兜底】即使 GameState 还没下发 HostPlayerName, 只要本机被标记为 Host,
-				//                 也立即把本地账号对应的 widget 标为房主
-				if (!bIsThisLabelTheHost && bAmILocalHost && !LocalAccountName.IsEmpty() &&
-					PName.Equals(LocalAccountName, ESearchCase::IgnoreCase))
-				{
-					bIsThisLabelTheHost = true;
-				}
-
-				// 先标记身份 (SetAsHost/SetAsAI 会写 bIsHostEntry/bIsAIEntry 状态位)
-				const bool bWasHostBefore = PlayerLabel->IsHostEntry();
-				const bool bWasAIBefore = PlayerLabel->IsAIEntry();
-				if (bIsAI)
-				{
-					PlayerLabel->SetAsAI();
-				}
-				else if (bIsThisLabelTheHost)
-				{
-					PlayerLabel->SetAsHost(true);
-				}
-
-				// 再设置准备状态 — 内部被 bIsHostEntry/bIsAIEntry 拦截, 不会反向污染 Text_IsReady
-				PlayerLabel->SetReadyState(PS_bIsReady);
-
-				// 【大厂 P0 诊断日志 - 2026-06-30】追踪 SetAsHost 是否真的调用成功
-				UE_LOG(LogTemp, Log,
-					TEXT("[RoomInsidePage][Identity-DIAG] PName=[%s] CurrentHostName=[%s] LocalAccount=[%s] bAmILocalHost=%d bIsThisLabelTheHost=%d bIsHostEntryBefore=%d bIsHostEntryAfter=%d"),
-					*PName, *CurrentHostName, *LocalAccountName, bAmILocalHost ? 1 : 0, bIsThisLabelTheHost ? 1 : 0,
-					bWasHostBefore ? 1 : 0, PlayerLabel->IsHostEntry() ? 1 : 0);
-
-				// 只有房主才能看到移除按钮（且不能移除自己）
-				// 【2026-06-30 P0 修复】双路权威: NetMode 优先, URoomService 兜底
-				bool bAmIHost = false;
-				if (UWorld* World = GetWorld())
-				{
-					if (World->GetNetMode() == NM_ListenServer)
-					{
-						bAmIHost = true;
-					}
-				}
-				if (!bAmIHost)
-				{
-					if (URoomService* RoomService = URoomService::Get(this))
-					{
-						bAmIHost = RoomService->IsHost();
-					}
-				}
-				PlayerLabel->SetRemoveButtonVisibility(bAmIHost && !bIsThisLabelTheHost);
-
-				// 添加到对应的队伍容器中
-				TargetBox->AddChild(PlayerLabel);
+		// 守方 AI 占位
+		const TArray<FPendingAIEntry> PendingDefenseAI = GS->ReplicatedPendingAIQueue.FilterByPredicate(
+			[](const FPendingAIEntry& Entry) {
+				return Entry.FactionTag == FFactionTags::Defense();
+			});
+		for (const FPendingAIEntry& Entry : PendingDefenseAI)
+		{
+			if (Entry.DisplayName.IsEmpty())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] PendingAI 空 DisplayName, FactionTag='%s' — GM 数据损坏"),
+					*Entry.FactionTag.ToString());
+				continue;
+			}
+			if (Box_DefenseTeam)
+			{
+				CreatePlayerLabelInBox(
+					Box_DefenseTeam,
+					Entry.DisplayName,
+					/*bIsAI=*/ true,
+					CurrentHostName,
+					bAmILocalHost,
+					LocalAccountName,
+					/*bLabelReady=*/ false);
 			}
 		}
 	}
+
+	// ==========================================
+	// 【2026.07.11 v29 大厂架构重构】RefreshRoomUI 收尾段 (从原 v28 末尾搬回)
+	// 历史: v28 重构时, 把这段收尾段错误地留在了 CreatePlayerLabelInBox 之后
+	//       → 全局作用域, 编译失败 + UpdateHostVisibility / TOTAL_PLAYERS_WITH_AI 推送被静默丢失
+	// v29 修复: 显式搬回 RefreshRoomUI 函数体末尾
+	// ==========================================
 
 	// 【2026-06-29 P0 修复】刷新完成后再次确认房主按钮可见性
 	// 场景: RefreshRoomUI 可能由 OnRoomServiceHostChanged 触发 (此时房主身份刚变),
@@ -1608,6 +1754,116 @@ void URoomInsidePage::RefreshRoomUI()
 			}
 		}
 	}
+}
+
+
+/**
+ * 【2026.07.11 v29 大厂架构重构】内部辅助: 在 Box 里创建单个 PlayerLabel widget
+ *
+ * 设计动机: 旧 (v28) 错误做法 — RefreshRoomUI 内联 70 行 widget 创建/属性设置, 真人 + AI 各一份
+ *   → 重复代码, 易出 bug (用户反馈: AI 移出按钮 / AI 准备按钮显示 等都曾错)
+ * 新 (v29): 抽出本函数, 真人 + AI 共用, **单一入口 + 单一真理**
+ *
+ * 大厂原则:
+ *   - 单一入口: widget 创建 + 所有属性设置只在此一处
+ *   - 显式意图: bIsAI 显式传 — 调用方说明"这条是 AI 还是真人"
+ *   - 零兜底: 各步骤出错显式 Log Error + 不渲染 (而不是"自动选个别的角色")
+ */
+void URoomInsidePage::CreatePlayerLabelInBox(
+	UVerticalBox* TargetBox,
+	const FString& PName,
+	bool bIsAI,
+	const FString& CurrentHostName,
+	bool bAmILocalHost,
+	const FString& LocalAccountName,
+	bool bLabelReady)
+{
+	// 【大厂原则 - 零兜底】入参保护: TargetBox 为 nullptr → 显式报错, 不渲染
+	if (!TargetBox)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] CreatePlayerLabelInBox: TargetBox=nullptr, PName=%s, bIsAI=%d"),
+			*PName, bIsAI ? 1 : 0);
+		return;
+	}
+
+	// 【大厂原则 - 零兜底】入参保护: 空名字 = 数据损坏
+	if (PName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] CreatePlayerLabelInBox: PName 为空, bIsAI=%d"),
+			bIsAI ? 1 : 0);
+		return;
+	}
+
+	// 创建 widget
+	UPlayerLabelWidget* PlayerLabel = CreateWidget<UPlayerLabelWidget>(GetWorld(), PlayerLabelClass);
+	if (!PlayerLabel)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] CreatePlayerLabelInBox: CreateWidget 失败, PName=%s — PlayerLabelClass 未配置?"),
+			*PName);
+		return;
+	}
+
+	// ==========================================
+	// 【Bug1 修复 - 调用顺序关键】
+	// 必须先 SetPlayerName (写 CachedPlayerName), 再 SetAsHost/SetAsAI (读 CachedPlayerName 拼后缀)
+	// 然后 SetReadyState 才会被 bIsHostEntry / bIsAIEntry 拦截, 不会把 Text_IsReady 显示出来
+	// ==========================================
+	PlayerLabel->SetPlayerName(PName);
+
+	// 【大厂 v29 修复】bIsHost 判定走显式字段, 不依赖 PName.StartsWith("[AI]") 字符串约定
+	bool bIsThisLabelTheHost = false;
+	if (!bIsAI) // AI 永远不是房主
+	{
+		bIsThisLabelTheHost = (PName == CurrentHostName); // 服务器权威
+
+		// 【Bug1 本地权威兜底】即使 GameState 还没下发 HostPlayerName, 只要本机被标记为 Host,
+		//                 也立即把本地账号对应的 widget 标为房主
+		if (!bIsThisLabelTheHost && bAmILocalHost && !LocalAccountName.IsEmpty() &&
+			PName.Equals(LocalAccountName, ESearchCase::IgnoreCase))
+		{
+			bIsThisLabelTheHost = true;
+		}
+	}
+
+	// 先标记身份 (SetAsHost/SetAsAI 会写 bIsHostEntry/bIsAIEntry 状态位)
+	if (bIsAI)
+	{
+		PlayerLabel->SetAsAI();
+	}
+	else if (bIsThisLabelTheHost)
+	{
+		PlayerLabel->SetAsHost(true);
+	}
+
+	// 再设置准备状态 — 内部被 bIsHostEntry/bIsAIEntry 拦截, 不会反向污染 Text_IsReady
+	PlayerLabel->SetReadyState(bLabelReady);
+
+	// 只有房主才能看到移除按钮（且不能移除自己）
+	// 【2026-06-30 P0 修复】双路权威: NetMode 优先, URoomService 兜底
+	bool bAmIHost = false;
+	if (UWorld* World = GetWorld())
+	{
+		if (World->GetNetMode() == NM_ListenServer)
+		{
+			bAmIHost = true;
+		}
+	}
+	if (!bAmIHost)
+	{
+		if (URoomService* RoomService = URoomService::Get(this))
+		{
+			bAmIHost = RoomService->IsHost();
+		}
+	}
+	// 【v47 大厂架构修复】AI 占位也显示踢出按钮 (用户明确需求)
+	// 房主可踢 AI 占位 (从 PendingAIQueue 移除), 不会影响已开始战斗的 AI
+	PlayerLabel->SetRemoveButtonVisibility(bAmIHost && !bIsThisLabelTheHost);
+
+	// 添加到对应的队伍容器中
+	TargetBox->AddChild(PlayerLabel);
 }
 
 

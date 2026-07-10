@@ -61,6 +61,25 @@ FAIAttackMontageResult UAIAttackMontageResolver::ResolveLightAttackMontage(
 	const FString WeaponName = GetWeaponDisplayName(Weapon);
 
 	// ============================================================
+	// 【v32 零兜底改造】删除 Level 1 (ComboIndex→0 降级) + Level 2 (重击代替轻击)
+	//
+	// 历史 (v6-v31.x) 反模式:
+	//   Level 1: ComboIndex 越界 → 退到 0 → AI 用错段 → 玩家节奏错乱
+	//   Level 2: 完全没轻击蒙太奇 → 用重击代替 → AI 永远能挥刀, BP 配错被掩盖
+	//
+	// 新架构 (v32 — 单一 Level 0 路径):
+	//   - 只有 Level 0 (设计意图) + Level -1 (Log Error 完全失败) 两种状态
+	//   - BP 没配 LightAttackMontages → Log Error + return Montage=nullptr
+	//   - ComboIndex 越界 → Log Error + return Montage=nullptr (不再降级到 0)
+	//   - 调用方 OnAIRequestAttack_Simple 已合规处理 Montage=nullptr (v25 链, return false)
+	//
+	// 大厂原则 (v32):
+	//   - BP 美术必须严格按 BP 编辑器配 ComboIndex=N 段的 LightAttackMontages
+	//   - 不再"找个能用的蒙太奇蒙混过关"
+	//   - 配置缺失立即 Log Error, BP 美术刷新后再继续
+	// ============================================================
+
+	// ============================================================
 	// Level 0: 设计意图路径 (Weapon->GetAttackMontage(false, ComboIndex))
 	// ============================================================
 	UAnimMontage* Montage = SafeGetMontage(Weapon, false, ComboIndex);
@@ -74,62 +93,21 @@ FAIAttackMontageResult UAIAttackMontageResolver::ResolveLightAttackMontage(
 	}
 
 	// ============================================================
-	// Level 1: 兜底 — 退回到 ComboIndex=0 (通常 BP 只配了第 1 段)
-	// ============================================================
-	if (ComboIndex != 0)
-	{
-		Montage = SafeGetMontage(Weapon, false, 0);
-		if (Montage)
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[AIAttackMontageResolver] 武器=%s 设计意图索引 ComboIndex=%d 未命中, "
-					 "降级到 ComboIndex=0 兜底 (Level 1). %s"),
-				*WeaponName, ComboIndex,
-				*ExplainConfigurationIssue(Weapon, Result));
-
-			Result.Montage = Montage;
-			Result.ResolvedIndex = 0;
-			Result.FallbackLevel = 1;
-			Result.bFromFallback = true;
-			return Result;
-		}
-	}
-
-	// ============================================================
-	// Level 3: 终极兜底 — 用重击蒙太奇代替轻击
-	// 设计意图: AI 至少要"挥刀"给玩家反馈, 不能完全沉默
-	// 注: Level 1 已经尝试过 ComboIndex=0, 若仍未命中说明武器连 0 索引都没有
-	//       此时退而求其次用重击蒙太奇, 让 AI 至少能展示攻击动作
-	// ============================================================
-	Montage = SafeGetMontage(Weapon, true, 0);
-	if (Montage)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[AIAttackMontageResolver] 武器=%s 无可用轻击蒙太奇, "
-				 "降级到重击蒙太奇代替 (Level 2 - 终极兜底). "
-				 "请打开该 BP 资产配置 LightAttackMontages 数组!"),
-			*WeaponName);
-
-		Result.Montage = Montage;
-		Result.ResolvedIndex = INDEX_NONE;
-		Result.FallbackLevel = 2;
-		Result.bFromFallback = true;
-		return Result;
-	}
-
-	// ============================================================
-	// Level -1: 完全失败 — 武器没有任何攻击蒙太奇
+	// Level -1: ComboIndex 越界或没配 (v32 零兜底: 不再降级到 ComboIndex=0)
 	// ============================================================
 	UE_LOG(LogTemp, Error,
-		TEXT("[AIAttackMontageResolver] 武器=%s 完全无攻击蒙太奇 (LightAttackMontages/HeavyAttackMontage 都为空). "
-			 "AI 将无法播放任何攻击动画! %s"),
-		*WeaponName,
-		*ExplainConfigurationIssue(Weapon, Result));
+		TEXT("[AIAttackMontageResolver] 武器=%s 无法解析 LightAttackMontage (ComboIndex=%d). "
+			 "【v32 零兜底】拒绝降级到 ComboIndex=0 / 重击代替. "
+			 "根因: BP 编辑器 LightAttackMontages 数组未配置该 ComboIndex, 或数组为空. "
+			 "请打开 %s 资产 → Class Defaults → Combat → Weapon Animations → "
+			 "在 LightAttackMontages 数组中添加 ComboIndex=%d 对应的 UAnimMontage. "
+			 "AI 本次攻击将放弃 (调用方 OnAIRequestAttack_Simple 已 Log Warning + return false)."),
+		*WeaponName, ComboIndex, *WeaponName, ComboIndex);
 
 	Result.Montage = nullptr;
 	Result.ResolvedIndex = INDEX_NONE;
 	Result.FallbackLevel = -1;
-	Result.bFromFallback = true;
+	Result.bFromFallback = false; // v32: 不算兜底, 算显式失败
 	return Result;
 }
 
@@ -139,10 +117,15 @@ FAIAttackMontageResult UAIAttackMontageResolver::ResolveLightAttackMontage(
 // ==========================================
 
 /**
- * 解析 AI 重击蒙太奇
+ * 解析 AI 重击蒙太奇 (v32 — 零兜底)
  *
- * 重击通常只有一个蒙太奇, 不需要 ComboIndex 循环
- * 但仍兜底: 若重击也为空, 尝试用轻击[0]代替 (让 AI 至少能挥刀)
+ * 历史 (v6-v31.x):
+ *   重击为空 → 降级到轻击[0]代替 (Level 1 兜底) → "AI 至少能挥刀" 幌子下掩盖 BP 配错
+ *
+ * 新架构 (v32):
+ *   - 只有 Level 0 (设计意图) + Level -1 (Log Error 完全失败)
+ *   - 重击没配 → Log Error + return Montage=nullptr (不再降级到轻击)
+ *   - 调用方 AI 攻击失败, BP 美术重配 HeavyAttackMontage
  */
 FAIAttackMontageResult UAIAttackMontageResolver::ResolveHeavyAttackMontage(
 	const ABaseWeapon* Weapon)
@@ -159,7 +142,7 @@ FAIAttackMontageResult UAIAttackMontageResolver::ResolveHeavyAttackMontage(
 
 	const FString WeaponName = GetWeaponDisplayName(Weapon);
 
-	// Level 0: 设计意图
+	// Level 0: 设计意图 — Weapon->GetAttackMontage(true, 0)
 	UAnimMontage* Montage = SafeGetMontage(Weapon, true, 0);
 	if (Montage)
 	{
@@ -170,29 +153,28 @@ FAIAttackMontageResult UAIAttackMontageResolver::ResolveHeavyAttackMontage(
 		return Result;
 	}
 
-	// Level 1: 兜底 — 用轻击[0]代替重击
-	Montage = SafeGetMontage(Weapon, false, 0);
-	if (Montage)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[AIAttackMontageResolver] 武器=%s 重击蒙太奇为空, "
-				 "降级到轻击[0]兜底 (Level 1)"),
-			*WeaponName);
-
-		Result.Montage = Montage;
-		Result.ResolvedIndex = 0;
-		Result.FallbackLevel = 1;
-		Result.bFromFallback = true;
-		return Result;
-	}
-
-	// Level -1: 完全失败
+	// 【v32 零兜底改造】删除 Level 1 (用轻击[0]代替重击) (line 173-187)
+	//
+	// 历史 (v6-v31.x) 反模式:
+	//   重击蒙太奇为空 → 降级到轻击[0]代替 (Level 1)
+	//   AI 永远能挥刀, BP 重击蒙太奇配置错误被永远掩盖
+	//
+	// 新行为 (v32):
+	//   - Log Error + return Montage=nullptr
+	//   - BP 美术必须配 HeavyAttackMontage 才能让 AI 重击
 	UE_LOG(LogTemp, Error,
-		TEXT("[AIAttackMontageResolver] 武器=%s 重击/轻击蒙太奇都为空"),
-		*WeaponName);
+		TEXT("[AIAttackMontageResolver] 武器=%s HeavyAttackMontage 为空! "
+			 "【v32 零兜底】拒绝降级到轻击[0]代替. "
+			 "根因: BP 编辑器 HeavyAttackMontage 字段未配置. "
+			 "请打开 %s 资产 → Class Defaults → Combat → Weapon Animations → "
+			 "设置 HeavyAttackMontage 字段. "
+			 "AI 本次重击将放弃."),
+		*WeaponName, *WeaponName);
 
 	Result.Montage = nullptr;
+	Result.ResolvedIndex = INDEX_NONE;
 	Result.FallbackLevel = -1;
+	Result.bFromFallback = false; // v32: 不算兜底
 	return Result;
 }
 

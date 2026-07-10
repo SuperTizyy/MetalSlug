@@ -9,6 +9,7 @@
 #include "Systems/RoomGameMode.h"
 #include "Data/Enums/CombatEnums.h"
 #include "Data/Tables/WeaponTableRow.h"
+#include "Data/Config/PlayerConfigAsset.h"
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
 #include "UI/Game/Widgets/WeaponPanelWidget.h"
 #include "UI/Game/Widgets/MatchInfoWidget.h"
@@ -81,6 +82,35 @@ void UGameHUDWidget::NativeConstruct()
 		else
 		{
 			UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] KillStreakIconDataTable 未配置!"));
+		}
+
+		// v41 数据驱动: 从 PlayerConfigAsset 读取连杀系统配置
+		// 大厂架构: 玩家配置统一在 DA_PlayerConfig 资产中管理
+		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+		{
+			if (GM->PlayerConfigAsset)
+			{
+				Widget_KillStreak->SetKillStreakConfig(
+					GM->PlayerConfigAsset->KillStreakDuration,
+					GM->PlayerConfigAsset->KillStreakIconDisplayDuration
+				);
+				UE_LOG(LogTemp, Log,
+					TEXT("[GameHUDWidget] KillStreakConfig 已注入: Duration=%.1f, IconDisplay=%.1f"),
+					GM->PlayerConfigAsset->KillStreakDuration, GM->PlayerConfigAsset->KillStreakIconDisplayDuration);
+			}
+			else
+			{
+				// PlayerConfigAsset 未配置, 报错 (零兜底)
+				UE_LOG(LogTemp, Error,
+					TEXT("[GameHUDWidget] GM->PlayerConfigAsset 未配置!"
+						" 请在 GM_RoomGameMode 蓝图中配置 PlayerConfigAsset = DA_PlayerConfig。"));
+				Widget_KillStreak->SetKillStreakConfig(10.0f, 3.0f);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("[GameHUDWidget] 无法获取 RoomGameMode!"));
+			Widget_KillStreak->SetKillStreakConfig(10.0f, 3.0f);
 		}
 	}
 	else
@@ -212,7 +242,7 @@ void UGameHUDWidget::TickFallbackCheck(float DeltaTime)
 	}
 
 	// 场景 2: 未订阅, 但 Pawn 已就绪 → 重置重试计数并重新尝试
-	if (Character && Character->CharacterEvents)
+	if (Character && Character->ResolveCharacterEvents())
 	{
 		UE_LOG(LogTemp, Warning,
 			TEXT("[GameHUDWidget][TickFallback] 未订阅但 Pawn 已就绪, 重置重试计数并重新订阅 (Pawn=%s)"),
@@ -757,9 +787,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 	APlayerController* PC = GetOwningPlayer();
 	ABaseCharacter* Character = PC ? Cast<ABaseCharacter>(PC->GetPawn()) : nullptr;
 
-	if (Character && Character->CharacterEvents)
+	if (Character && Character->ResolveCharacterEvents())
 	{
-		UCharacterEvents* Events = Character->CharacterEvents;
+		UCharacterEvents* Events = Character->ResolveCharacterEvents();
 
 		// 订阅 7 个角色状态事件
 		Events->OnCharacterIconReady.AddDynamic(this,   &UGameHUDWidget::OnCharacterIconReady);
@@ -769,6 +799,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 		Events->OnACEValueChanged.AddDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
 		Events->OnACEWithRankChanged.AddDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
 		Events->OnWeaponIconReady.AddDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+
+		// 【2026.07.14 新增】订阅无敌期状态变化 - 控制复活进度条显示/隐藏
+		Events->OnInvincibilityChanged.AddDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
 
 		CachedCharacterEvents = Events;
 
@@ -798,6 +831,27 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			}
 		}
 
+		// 1.5. 【v40.2 P0 新增】武器图标快照补发 (镜像头像补发)
+		//   根因: 旧版没补发武器图标 → 客户端武器 RPC 比 HUD 订阅早触发 → 武器图标永远丢失
+		//   修复: 主动拉武器图标缓存, 调用 OnWeaponIconReady 模拟补发
+		{
+			FString CachedWeaponID;
+			UTexture2D* CachedWeaponIcon = nullptr;
+			if (Events->GetCachedWeaponIcon(CachedWeaponID, CachedWeaponIcon))
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 补发武器图标: WeaponID=%s, Icon=%s"),
+					*CachedWeaponID,
+					CachedWeaponIcon ? *CachedWeaponIcon->GetName() : TEXT("nullptr (查表失败)"));
+				OnWeaponIconReady(CachedWeaponID, CachedWeaponIcon);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 无武器图标缓存, 等待 CharacterEvents::OnWeaponIconReady 事件"));
+			}
+		}
+
 		// 2. AC 快照补发 (主动拉取, 避免 OnRep_ACValue 比订阅晚触发)
 		{
 			const int32 CachedAC = Events->GetCachedACValue();
@@ -805,6 +859,23 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			{
 				UE_LOG(LogTemp, Verbose, TEXT("[GameHUDWidget][Bind-Snapshot] 补发 AC=%d"), CachedAC);
 				Widget_PlayerStatus->UpdateACValue(CachedAC);
+			}
+		}
+
+		// 【v40.7 新增】无敌期状态快照补发
+		// 根因: 玩家复活时 ActivateSpawnInvincibility 先于 HUD 订阅触发
+		// → OnInvincibilityChanged(true) 事件丢失 → Show() 从未被调用 → 进度条不显示
+		// 修复: HUD 订阅成功后主动检查当前 invincibility 状态，如已激活则立即 Show
+		{
+			if (UHealthComponent* HC = Character->ResolveHealthComponent())
+			{
+				if (HC->IsInvincible() && Widget_RespawnProgress)
+				{
+					UE_LOG(LogTemp, Log,
+						TEXT("[GameHUDWidget][Bind-Snapshot] 检测到当前处于无敌期，强制显示复活进度条. Pawn=%s"),
+						*Character->GetName());
+					Widget_RespawnProgress->Show();
+				}
 			}
 		}
 
@@ -823,24 +894,37 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 
 		// ==========================================
 		// 4. HP / Energy 不缓存, 但仍主动拉一次 (实时性高, 但被订阅频率低, 拉一次保险)
+		// [v40 P0 修复] 必须用 ResolveHealthComponent/ResolveEnergyComponent 而非裸字段
 		// ==========================================
-		if (Widget_PlayerStatus && Character->HealthComponent)
+		if (Widget_PlayerStatus)
 		{
-			Widget_PlayerStatus->UpdateHealth(
-				Character->HealthComponent->GetCurrent(),
-				Character->HealthComponent->GetMax());
-			Widget_PlayerStatus->UpdateHealthText(
-				FMath::CeilToInt(Character->HealthComponent->GetCurrent()),
-				FMath::CeilToInt(Character->HealthComponent->GetMax()));
-		}
-		if (Widget_PlayerStatus && Character->EnergyComponent)
-		{
-			Widget_PlayerStatus->UpdateEnergy(
-				Character->EnergyComponent->GetCurrent(),
-				Character->EnergyComponent->GetMax());
-			Widget_PlayerStatus->UpdateEnergyText(
-				FMath::CeilToInt(Character->EnergyComponent->GetCurrent()),
-				FMath::CeilToInt(Character->EnergyComponent->GetMax()));
+			if (UHealthComponent* HC = Character->ResolveHealthComponent())
+			{
+				Widget_PlayerStatus->UpdateHealth(HC->GetCurrent(), HC->GetMax());
+				Widget_PlayerStatus->UpdateHealthText(
+					FMath::CeilToInt(HC->GetCurrent()),
+					FMath::CeilToInt(HC->GetMax()));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[GameHUDWidget][Bind-Snapshot] ResolveHealthComponent 失败. Pawn=%s"),
+					*Character->GetName());
+			}
+
+			if (UEnergyComponent* EC = Character->ResolveEnergyComponent())
+			{
+				Widget_PlayerStatus->UpdateEnergy(EC->GetCurrent(), EC->GetMax());
+				Widget_PlayerStatus->UpdateEnergyText(
+					FMath::CeilToInt(EC->GetCurrent()),
+					FMath::CeilToInt(EC->GetMax()));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[GameHUDWidget][Bind-Snapshot] ResolveEnergyComponent 失败. Pawn=%s"),
+					*Character->GetName());
+			}
 		}
 
 		// 清理重试定时器
@@ -894,6 +978,7 @@ void UGameHUDWidget::UnbindFromCharacterEvents()
 		CachedCharacterEvents->OnACEValueChanged.RemoveDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
 		CachedCharacterEvents->OnACEWithRankChanged.RemoveDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
 		CachedCharacterEvents->OnWeaponIconReady.RemoveDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+		CachedCharacterEvents->OnInvincibilityChanged.RemoveDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
 
 		CachedCharacterEvents = nullptr;
 		CharacterEventsRetryCount = 0;
@@ -1019,4 +1104,57 @@ void UGameHUDWidget::OnWeaponIconReady(const FString& WeaponID, class UTexture2D
 
 	// Icon 为空: 通过 WeaponID 从 DataTable 加载
 	UpdateWeaponIconFromID(WeaponID);
+}
+
+
+// ==========================================
+// 9. 无敌期进度条控制 (2026.07.14 重构)
+// ==========================================
+
+/**
+ * UGameHUDWidget::OnInvincibilityChanged
+ *
+ * 无敌期状态变化回调 - 控制复活进度条的显示/隐藏
+ *
+ * 【2026.07.14 重构说明】
+ * 旧架构: URespawnProgressWidget 自己订阅事件 + 控制自己的 Show/Hide
+ *        但 Widget_RespawnProgress 的 Visibility 从未被控制 → 进度条不显示
+ *
+ * 新架构 (大厂单一订阅点原则):
+ *   - UGameHUDWidget 是唯一订阅 OnInvincibilityChanged 的地方
+ *   - UGameHUDWidget 直接控制 Widget_RespawnProgress 的 Visibility
+ *   - URespawnProgressWidget 只负责进度条和倒计时文本的内容更新
+ *
+ * @param bIsNowInvincible true=进入无敌期(显示进度条), false=退出无敌期(隐藏进度条)
+ */
+void UGameHUDWidget::OnInvincibilityChanged(bool bIsNowInvincible)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] OnInvincibilityChanged 被调用. bIsNowInvincible=%d"),
+		bIsNowInvincible ? 1 : 0);
+
+	if (!Widget_RespawnProgress)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnInvincibilityChanged: Widget_RespawnProgress 未绑定! "
+				"请在 WBP_GameHUDWidget 蓝图中正确拖入复活进度条控件。"));
+		return;
+	}
+
+	if (bIsNowInvincible)
+	{
+		// 进入无敌期 - 显示进度条（Show() 会记录总时长并立即更新内容）
+		Widget_RespawnProgress->Show();
+		UE_LOG(LogTemp, Display,
+			TEXT("[GameHUDWidget] OnInvincibilityChanged: 进入无敌期, 显示复活进度条。 Widget=%s"),
+			*Widget_RespawnProgress->GetName());
+	}
+	else
+	{
+		// 退出无敌期 - 隐藏进度条
+		Widget_RespawnProgress->Hide();
+		UE_LOG(LogTemp, Display,
+			TEXT("[GameHUDWidget] OnInvincibilityChanged: 退出无敌期, 隐藏复活进度条。 Widget=%s"),
+			*Widget_RespawnProgress->GetName());
+	}
 }

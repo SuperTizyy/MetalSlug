@@ -34,7 +34,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomPlayerLeft, const FString&, P
  * │ RequestChangeTeam│ PC->Server_*        │ GM->ChangePlayerTeam│
  * │ RequestReady     │ PC->Server_Toggle   │ GM->UpdateReady     │
  * │ RequestChat      │ PC->Server_SendChat │ GM->BroadcastChat   │
- * │ RequestAddAI     │ PC->Server_AddAI    │ GM->AddAIToRoom     │
+ * │ RequestAddAI     │ PC->Server_QueueAI  │ GM->QueueAIForBattleSpawn │
+ *                                                 (v28: 只入队, 战斗 Spawn) │
  * │ RequestLoadout   │ PC->Server_Select   │ PS->SetPlayerLoadout│
  * │ RequestStartGame │ PC->Server_Start    │ GM->RequestStartGame│
  * │ RequestLeaveRoom │ SM->DestroySession  │ SM->DestroySession  │
@@ -69,7 +70,7 @@ public:
 	void RequestSendChatMessage(const FString& Message);
 
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
-	void RequestAddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count);
+	void RequestAddAI(bool bToAttackTeam, const FString& CharacterName, const FString& WeaponID, int32 Count);
 
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestSelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName);
@@ -160,6 +161,11 @@ private:
 	class ARoomGameMode* GetRoomGameMode() const;
 	class ARoomPlayerState* GetEffectivePlayerState() const;
 	class APlayerController* GetEffectivePC() const;
+
+	// 【v51 大厂重构 — 已删除】ResolveCharacterInfoRowName 函数已被完全删除
+	//   - 旧 (v49): UI 选 CharacterName → 调本函数反查 RowName → SpawnAIInternal 又反查 PawnClass
+	//   - 新 (v51): RequestAddAI 一次性反查全部字段 (RowName + AIPawnClass + WeaponID)
+	//   - 反查路径只有一条, 完全消除反查分散
 
 private:
 	UPROPERTY(Transient)

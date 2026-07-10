@@ -522,6 +522,36 @@ private:
 	void RefreshRoomUI();
 
 	/**
+	 * 【2026.07.11 v29 大厂架构重构】内部辅助: 在指定 Box 里创建一个 UPlayerLabelWidget
+	 *
+	 * 设计动机:
+	 *   旧 (v28) 错误做法: RefreshRoomUI 内联 70 行 widget 创建/属性设置逻辑, 真人 + AI 各一份
+	 *     → 重复代码, 改一处忘另一处, 易出 bug
+	 *   新 (v29): 抽出 CreatePlayerLabelInBox, 真人 + AI 共用, 单点真理
+	 *
+	 * 大厂原则:
+	 *   - 单一入口: widget 创建 + 属性设置逻辑只在此一处
+	 *   - 显式参数: bIsAI 显式传 (不再依赖 PName.StartsWith("[AI]") 字符串约定)
+	 *   - 零兜底: TargetBox 为空或 PlayerLabel 创建失败 → Log Error + 不渲染 (显式问题)
+	 *
+	 * @param TargetBox 目标阵营容器 (Box_AttackTeam 或 Box_DefenseTeam)
+	 * @param PName 玩家/AI 名字
+	 * @param bIsAI 是否 AI 占位
+	 * @param CurrentHostName 服务器权威房主名
+	 * @param bAmILocalHost 本机是否房主 (从 NetMode 权威判断得来)
+	 * @param LocalAccountName 本机账号名 (兜底本地房主判定)
+	 * @param bLabelReady 该 label 准备状态 (AI 永远 false) — 与类成员 bIsReady 区分
+	 */
+	void CreatePlayerLabelInBox(
+		UVerticalBox* TargetBox,
+		const FString& PName,
+		bool bIsAI,
+		const FString& CurrentHostName,
+		bool bAmILocalHost,
+		const FString& LocalAccountName,
+		bool bLabelReady);
+
+	/**
 	 * 【2026-06-29 P0 修复】统一刷新房主/玩家专属按钮的可见性
 	 * 职责: 根据当前玩家房主身份, 设置 Btn_OpenAIPanel / Btn_StartGame / Btn_ToggleReady 可见性
 	 * 触发点:

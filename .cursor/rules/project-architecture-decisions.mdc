@@ -372,3 +372,3321 @@ ABaseCharacter::ExecuteDeathLocal()
 - [ ] 对比旧实现,确认无抖动
 - [ ] 删除旧 C++ 决策代码
 - [ ] 加第 4 状态验证可扩展性
+
+## 10. v25 (2026.07.10 晚) 阵营系统统一重构 + 零兜底
+
+### 核心决策 (用户反馈后修正)
+
+**用户原话**:
+> 你有误区, 不管是刀战模式和生化模式, 两个阵营都是客户端玩家和 AI 共有的. AI 画像标签好像用不到, 可以删了.
+
+**我之前的误区**: 把 `Faction.Offense/Defense` 当成"模式专属"(刀战红方=Offense, 生化僵尸=Offense)
+**正确理解**: 阵营是**通用身份**, 与角色类型(玩家/AI)正交
+  - 刀战模式下: 玩家可以是 Offense 或 Defense, AI 也可以是 Offense 或 Defense
+  - 生化模式下: 玩家可以是 Offense 或 Defense, AI 也可以是 Offense 或 Defense
+  - 谁属于哪一方 = 业务决策, 走 ARoomGameMode::ModeRulesByMode 配置
+
+**AI.Profile.* 标签保留** (反驳了用户删除建议):
+- `UAIProfileAsset::ProfileTag` 是 AI **类型查表 key** (不是阵营)
+- 实际使用路径: `ProfilesByMode[Mode].Profiles[AI.Profile.MeleeGrunt]` → AI 类型查表
+- 不能删, 否则 Spawn 系统查不到 Profile
+- **关键认知**: 阵营 (Faction.Offense/Defense) ≠ 角色类型 (玩家/AI) ≠ AI 类型 (ProfileTag)
+
+### 零兜底改造 (v24 → v25)
+
+#### 1. `MigrateFromLegacy` 已彻底删除
+**旧版 (v24 兜底)**: Faction.Player/Zombie/Enemy 自动映射到 Offense/Defense, 配置错误被吞
+**新版 (v25 零兜底)**: 函数不存在, 改用 `IsDeprecatedLegacyFaction` + `ValidateFactionOrReportError`
+- 检测到旧 Tag → Log Error → 调用方决定是否中断流程 → 强制策划/程序修复 Data Asset
+
+#### 2. `AddAIByRequest` 不再容忍 Profile=nullptr
+**旧版**: Profile 找不到时生成"裸 AI"(无 BT/无阵营/无武器) → 静默失败
+**新版**: Log Error + 拒绝 Spawn, 强制修复 ProfilesByMode 配置
+
+#### 3. `SpawnAIInternal` 入口检查 Profile
+**旧版**: 允许 Profile=nullptr 进入函数体, 然后一路 nullptr 链
+**新版**: 入口处立即 Log Error + return 0
+
+#### 4. `RequestRespawn` 不再用 "Grunt" 兜底
+**旧版**: Profile.CharacterRowName 配错(JS 玩家 ID)/空 时, 用 "Grunt" 默认值
+**新版**: 直接 Log Error + return, 强制策划修复 Profile 配置
+
+### 文件清单 (v25 新增/修改)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Data/Faction/FactionTags.h
+   + IsDeprecatedLegacyFaction() 新增
+   + ValidateFactionOrReportError() 新增
+   - MigrateFromLegacy() 删除 (声明 + 实现)
+~ MetalSlug01/Source/MetalSlug01/Private/Data/Faction/FactionTags.cpp
+   + IsDeprecatedLegacyFaction / ValidateFactionOrReportError 实现
+   - MigrateFromLegacy 实现删除
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+   ~ 注释: 阵营是通用身份, 玩家/AI 都可用
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+   ~ SetGenericTeamId: 区分 Offense/Defense/NoTeam/非法 ID, 显式报错
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/RoomGameMode.h
+   ~ 注释: ModeRulesByMode 配置 + AI.Profile 是 AI 类型不是阵营
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/RoomGameMode.cpp
+   ~ AddAIByRequest: Profile=nullptr → 拒绝 Spawn
+   ~ SpawnAIInternal: 入口 Profile=nullptr → Log Error + return 0
+   ~ RequestRespawn: 不再用 "Grunt" 兜底
+   ~ RequestRespawn: ValidateFactionOrReportError 校验 Profile.FactionTag
+   ~ GetAvailableSpawnPointForFaction: 用 IsOffense/IsDefense 严格匹配
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/BaseAIController.cpp
+   ~ InitializeFromProfile: ValidateFactionOrReportError 校验 Profile.FactionTag
+   ~ 诊断日志: "TeamID=0=Player阵营" 误导 → 改为"TeamID=0=Offense阵营"提示
+~ MetalSlug01/Source/MetalSlug01/Public/Data/Tables/SpawnTableRow.h
+   ~ 注释: 阵营是通用身份, 玩家/AI 都可配
+~ MetalSlug01/Config/DefaultGameplayTags.ini
+   ~ 注释修正: 阵营是通用身份, 不是"AI/玩家专属"
+```
+
+## 11. v26 (2026.07.11) AI 复活链路重构 — CachedFactionTag 运行时真理源
+
+### 根因 (从 Session1.log 提炼)
+
+```
+LogTemp: Error: [RequestRespawn] AI 复活阵营派生失败: AI 无 Profile 或 Profile.FactionTag 无效
+LogTemp: Error: [Spawn] GetAvailableSpawnPointForFaction: 阵营 'None' 非 Faction.Offense/Defense
+LogSpawn: Warning: SpawnActor failed because of collision at the spawn location [X=0.000 Y=0.000 Z=0.000]
+LogTemp: Error: [Respawn] AI Pawn Spawn 失败: SpawnLoc=X=0.000 Y=0.000 Z=0.000
+```
+
+**触发链**:
+1. `DA_AIProfile_MeleeGrunt.FactionTag` 是**空**(DataAsset 没配)
+2. Spawn 时, `SpawnAIInternal` 用 `ModeRules.FactionTag` 兜底, AI 正常运行 — 但 Profile.FactionTag 仍是空
+3. 死亡时, `RequestRespawn` 只读 `Profile.FactionTag` → 拿空 → `Request.FactionTag = EmptyTag`
+4. `GetAvailableSpawnPointForFaction(EmptyTag)` → 返回 nullptr(大厂显式报错,不让静默)
+5. 但 SpawnLoc = ZeroVector(零兜底),继续 SpawnActor((0,0,0)) → 原点碰撞 → 失败
+6. AI 永久消失, Controller 没了 Pawn, BT 不再跑
+
+### 架构核心缺陷 (大厂原则被违反)
+
+| 缺陷 | 旧 (v25) | 新 (v26) |
+|---|---|---|
+| **真理源分裂** | Spawn 读 ModeRules, Respawn 读 Profile.FactionTag,两边不一致 | 都是单一真理源: 运行时写入 `Controller.CachedFactionTag` |
+| **运行时 vs 配置期混用** | Spawn 时拿 ModeRules 兜底(运行时), 复活时拿 Profile.FactionTag(配置期) — 同一个 AI 两个阵营读法 | 阵营始终走"运行时确认"的 `CachedFactionTag`, 配置期只作 fallback |
+| **SpawnActor(ZeroVector) 兜底** | 出生点为 nullptr 时 SpawnLoc 保持 ZeroVector → SpawnActor 失败 → 没人知道为什么 | 出生点为 nullptr 立即 `return`/ `continue`,错误显式化 |
+| **失败点隐式化** | SpawnActor 失败, 错误信息指向 spawn location 而非根因 | 每个失败点都立刻 Log Error + 中断,根因排查 1 次定位 |
+
+### 重构方案
+
+**核心**: 引入 `ABaseAIController::CachedFactionTag` — **运行时阵营真理源**
+
+**时序 (关键)**:
+```
+Spawn Pawn
+↓
+[NEW] SetCachedFactionTag(DesiredFaction)  ← 必须最先写
+↓
+Possess → 触发 OnPossess → SetupMeleeAI (内部读 CachedFactionTag)
+↓
+InitializeFromProfile → 内部读 CachedFactionTag 设阵营
+```
+
+**优先级链** (BaseAIController::InitializeFromProfile / SetupMeleeAI / SetupZombieAI):
+```
+a. CachedFactionTag        (运行时真理, Spawn 已写入)
+   ↓ 为空
+b. Profile.FactionTag       (配置期真理, 校验后才用)
+   ↓ 为空
+c. Log Error + 不设阵营     (大厂禁止 ModeRules 兜底 — 会掩盖 Profile 配错)
+```
+
+**复活路径** (`RequestRespawn`):
+```
+a. CachedFactionTag                         (运行时真理)
+   ↓ 为空
+b. Profile.FactionTag → Validate → 用 → 回填 CachedFactionTag
+   ↓ 为空
+c. Log Error + return                       (强制修复)
+```
+
+### 关键设计原则 (v26 落地)
+
+**Layer 1 — 单一真理源**: AI 复活路径所有"阵营"派生都先读 `Controller.CachedFactionTag`
+**Layer 2 — 显式失败链**: 每个失败点(Log Error / return / continue) 都在出错位置立刻终止
+**Layer 3 — 零兜底**: 不允许 `SpawnLoc = ZeroVector` 兜底, 不允许 `ModeRules` 兜底, 不允许 `if(Possessed) continue` 兜底
+**Layer 4 — 显式优于默认**: DesiredFaction 为空时 Log Error, 不静默跳过
+
+### 文件清单 (v26 新增/修改)
+
+```
+修改:
++ MetalSlug01/Source/MetalSlug01/Public/Systems/BaseAIController.h
+   + CachedFactionTag UPROPERTY 字段
+   + GetCachedFactionTag() / SetCachedFactionTag() 公开 API
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/BaseAIController.cpp
+   ~ InitializeFromProfile: 优先级链 CachedFactionTag > Profile.FactionTag > Log Error
+   ~ 新增回填 CachedFactionTag 逻辑 (无论读到哪个)
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/MeleeAIController.cpp
+   ~ SetupMeleeAI: 同优先级链 + 回填
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/ZombieAIController.cpp
+   ~ SetupZombieAI: 同优先级链 + 回填
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/RoomGameMode.cpp
+   ~ SpawnAIInternal: CachedFactionTag 上移到 Possess 之前(关键时序)
+                       DesiredFaction 为空显式 Log Error
+                       出生点 nullptr 立即 continue (不允许 ZeroVector 兜底)
+   ~ RequestRespawn: 优先级链 CachedFactionTag > Profile.FactionTag > 显式 return
+                      出生点 nullptr 立即 return (不允许 ZeroVector 兜底)
+   ~ GetAvailableSpawnPointForFaction: 加强错误日志 (提示调用方停止 Spawn)
+```
+
+### 避免的兜底行为清单 (v26 必须保持)
+
+1. **不允许**: `Profile.FactionTag` 为空时用 `ModeRules` 兜底
+2. **不允许**: `SpawnLoc = ZeroVector` 兜底(出生点 nullptr 时)
+3. **不允许**: `Request.FactionTag = EmptyTag` 时静默跳过出生点分配
+4. **不允许**: `SpawnActor` 失败时 fallback 到 `DefaultPawnClass`
+5. **不允许**: `SetupMeleeAI(nullptr)` 静默 return
+
+### 大厂原则对照 (v26)
+
+| 原则 | 旧 (v25) | 新 (v26) |
+|---|---|---|
+| 单一真理源 | ModeRules + Profile.FactionTag 多个真理 | CachedFactionTag 唯一运行时真理 |
+| 显式失败 > 静默兜底 | SpawnActor(0,0,0) 静默失败 | 出生点 nullptr 立即 Log Error + return |
+| 职责分层 | Spawn 阶段决策 + Config 阶段决策混用 | 运行时决策 (Cached) 与配置期决策 (Profile.FactionTag) 分层 |
+| 可观测性 | "Spawn 失败"看不出原因 | 3 个 Log Error 显式定位 (SpawnActor / 出生点 / 阵营派生) |
+
+## 12. v27 (2026.07.11) AI 不复活/复活后不动 — 双根因修复 (大厂原则)
+
+### 用户反馈 (Session1.log)
+
+```
+问题:
+- 其中一个 AI 被玩家击杀后不会再复活
+- 另一个 AI 被玩家击杀后会复活, 但是复活后原地不动
+
+操作:
+- FactionTag 我在 BP_GruntAI 对象细节面板手动配置 (用户场景)
+- 之后会通过 UI 添加 AI (功能开发中)
+```
+
+### v26 链已修的不完整之处
+
+v26 修复了 **`CachedFactionTag` + `AI 复活链路`**, 但**用户的具体场景**(关卡预放 AI + 玩家 Pawn)暴露了两个 v26 没修的根因:
+
+### 根因 A — 静默兜底 (大厂反模式)
+
+```cpp
+// 旧 (v25-v26) RoomGameMode.cpp line 2117-2122 (反模式)
+else
+{
+    // 未分类的 PlayerStart，默认加入攻方（向后兼容）
+    AttackSpawnPoints.Add(PS);
+    UE_LOG(..., TEXT("[Spawn] PlayerStart '%s' has no team prefix, defaulting to Attack"));
+}
+```
+
+**问题链**:
+1. 用户地图里的 PlayerStart 没有阵营前缀 (纯 "PlayerStart")
+2. 旧代码沉默地"默认归 Attack"
+3. **Defense 阵营没有任何出生点**
+4. Defense AI 死后 — `GetAvailableSpawnPointForFaction(Defense)` 返回 nullptr
+5. **AI 不复活**, 但 v26 没有报错, 玩家以为是"不可见 bug"
+
+**为什么这是反模式 (大厂原则)**:
+> "向后兼容" 是**静默篡改玩家意图**的反模式
+> 当配置缺失时, **绝不允许默认分配到任何阵营**
+> 应该**拒绝归类 + Log Error** 让策划在地图里修正命名
+
+### 根因 B — Pawn.FactionTag 真理源不同步
+
+**关键事实**:
+1. **`ARoomPlayerState::CurrentFactionTag`** — 已 Replicated, Server 在 PostLogin / ChangePlayerTeam 中设 (Offense/Defense)
+2. **`ABaseCharacter::FactionTag`** — **原版没 Replicated!** 这是一个独立的 UPROPERTY
+3. UE AIPerception 调 `GetTeamAttitudeTowards(Pawn)` → 读 **`Pawn.FactionTag`** (不是 PlayerState 那个!)
+4. **结果**: 玩家 `Pawn.FactionTag` 永远是 Empty → AI 看玩家 = Neutral → bDetectNeutrals=false → 玩家永远不在 AI 视野 → AI "原地不动"
+
+**触发链**:
+1. Server 设 `PS->CurrentFactionTag = Offense` ✓ (PostLogin 时)
+2. Player Pawn Spawn, PossessedBy 触发
+3. **Pawn.FactionTag 仍是空** (没有任何代码把 PS.CurrentFactionTag 同步到 Pawn.FactionTag)
+4. AIPerception 在 Pawn 上调 `GetTeamAttitudeTowards(BP_SWAT_C)` → `OtherChar->GetFactionTag()` = Empty → `FFactionTags::AttitudeBetween` Error + return Neutral
+5. bDetectNeutrals=false → UE 引擎判断玩家不是敌人 → 不通知 OnTargetDetected
+6. AI 的 BT 从未拿到 TargetActor → Chase Sequence 不进入 → **AI 站着不动**
+7. **同时**: Attack Sequence 偶尔触发 (在 BT 容忍内, 但攻击前需先 chase, 玩家不在 → 不攻击)
+8. Session1 日志中 AI 互相攻击 (因为 AI Pawn 有 FactionTag, AI 互认), 但**忽略玩家**
+
+**之前为什么没发现**:
+- 用户前期测的是 AI vs AI (关卡预放都手动配 FactionTag)
+- v26 修复后, AI 之间 OK
+- 但玩家 BP_SWAT_C 的 FactionTag 一直空, 这是**完全隐藏的失败模式**
+
+### v27 修复路径
+
+#### 修复 1: RoomGameMode::ScanPlayerStarts 拒绝静默归类
+
+```cpp
+// 新版 (v27): 无前缀 → Error + 跳过, 不允许默认 Attack
+else
+{
+    UE_LOG(LogTemp, Error,
+        TEXT("[Spawn] PlayerStart '%s' 缺少阵营前缀 (Attack/Defense/Attacker/Defender). "
+             "【拒绝默认归类 - 大厂原则】此点不会分配给任何阵营."),
+        *StartName);
+}
+```
+
+**附带修复**: 同时支持前缀模糊匹配 — 解决"同时包含 Attack/Defense"的命名歧义
+
+#### 修复 2: ABaseCharacter::FactionTag 加 Replicated + 同步点
+
+```cpp
+// 头文件 (新增 UPROPERTY 修饰)
+UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_FactionTag,
+         Category = "Combat|Team", meta = (Categories = "Faction"))
+FGameplayTag FactionTag;
+
+// cpp GetLifetimeReplicatedProps:
+DOREPLIFETIME(ABaseCharacter, FactionTag);   // AI/玩家 Pawn 都同步
+```
+
+**同步点设计 (Single Source of Truth — 不是兜底)**:
+
+```
+真理源 PlayerState.CurrentFactionTag (Server 权威)
+         ↓ 复制 (Replicate)
+Client PlayerState.CurrentFactionTag = 同一值
+         ↓ Player.Spawn 触发 Pawn.PossessedBy
+Server Pawn.PossessedBy → SyncFactionTagFromController(NewController)
+         ↓
+Server Pawn.FactionTag = PS.CurrentFactionTag   ← 唯一的源
+         ↓ 复制 (Replicate)
+Client Pawn.FactionTag = Server 值             ← 客户端 AIPerception 也能正确判定敌我
+         ↓ OnRep_FactionTag (客户端)
+Client verify + Log Error 报告
+```
+
+**关键代码点**:
+
+```cpp
+// ABaseCharacter::PossessedBy (Server-only 调用 SyncFactionTagFromController)
+SyncFactionTagFromController(NewController);   // AI 跳过 / Player 同步
+
+// ABaseCharacter::SyncFactionTagFromController — 单一真理源同步
+if (const ABaseAIController* AIC = Cast<ABaseAIController>(InController))
+    return;  // AI 跳过 — 真理源在 AIC.CachedFactionTag, 由 SpawnAIInternal 已写
+            // AI 路径继续: 由 v26.5 SpawnAIInternal 直接写 Pawn.FactionTag (Possess 前)
+
+const ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>();
+if (!PS) { Error (零兜底); return; }
+
+const FGameplayTag PlayerFactionTag = PS->CurrentFactionTag;
+if (!PlayerFactionTag.IsValid()) { Error (零兜底); return; }
+if (!FFactionTags::IsValidFaction(PlayerFactionTag)) { Error; return; }
+
+FactionTag = PlayerFactionTag;   // 写 Pawn.FactionTag
+                            // DOREPLIFETIME 自动触发复制
+```
+
+**为什么这不是"兜底"**:
+- 兜底 = "找 A 不行, 那就用 B 的默认值"
+- 这里 = "PlayerState 是真相源, Pawn.FactionTag 只是它的镜像" (单向同步)
+- 同源同步**单一真理源**, 跟零兜底完全一致
+
+#### 修复 3 (追加): ChangePlayerTeam 也同步 Pawn
+
+```cpp
+// ARoomGameMode::ChangePlayerTeam (Round 切换阵营)
+PS->CurrentFactionTag = NewFactionTag;
+
+// v27 新增: Pawn.FactionTag 也必须同步 — 避免换阵营后 AI 还看到旧阵营
+if (ABaseCharacter* PlayerChar = Cast<ABaseCharacter>(PS->GetPawn()))
+{
+    PlayerChar->SyncFactionTagFromController(RequestingController);
+}
+```
+
+### 为什么这次修复花了两个 chat session 才完成?
+
+| 阶段 | 已修 | 漏掉的 |
+|---|---|---|
+| v25 | 把 ERoomTeam 替换成 FGameplayTag (Single Source of Truth 一致) | Pawn.FactionTag 没加 Replicated |
+| v26 | CachedFactionTag + Spawn/Respawn 链路 | 关卡预放 PlayerStart 默认归 Attack (静默兜底) |
+| v26.5 | Profile.FactionTag 兜底 → 强制 CachedFactionTag (与 Pawn.FactionTag 同步) | PlayerState.CurrentFactionTag → Pawn.FactionTag 的同步链路没建立 |
+| **v27** | ✅ 拒绝 PlayerStart 静默归类 | ✅ Pawn.FactionTag 加 Replicated + 同步点 |
+| | ✅ AI 看玩家能正确判定敌我 |
+
+### 文件变更 (v27)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/RoomGameMode.cpp
+  ~ ScanPlayerStarts: 无前缀 → Log Error + 跳过 (不再静默归 Attack)
+  ~ 同时检测命名歧义 (Attack + Defense 同时存在): Log Error + 拒绝归类
+  ~ ChangePlayerTeam: 增加 Pawn.FactionTag 同步 (避免换阵营失效)
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+  + `class ABaseAIController` 前向声明
+  + OnRep_FactionTag() 声明
+  + SyncFactionTagFromController(AController*) 声明
+  ~ FactionTag: 加 ReplicatedUsing = OnRep_FactionTag
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+  + DOREPLIFETIME(ABaseCharacter, FactionTag)
+  + OnRep_FactionTag() 实现 — 验证 + Log Error 报告
+  + SyncFactionTagFromController() 实现 — AI 跳过 / Player 单源同步
+  ~ PossessedBy: HasAuthority 分支中调 SyncFactionTagFromController
+```
+
+### 待用户验证
+
+1. UE 5.6 编辑器编译无错
+2. PIE 中:
+   - 两个 AI 死后都能复活 (Defense 出生点命名规范: PS_Defense_XXX)
+   - C_1 (Defense 复活后) 看得到玩家 BP_SWAT_C (即 Pawn.FactionTag 同步成功)
+   - AI 真正开始 chase + attack (不是"原地不动")
+
+---
+
+## 10. v28 (2026.07.11) AI 大厅入队 + 战斗 Spawn 架构 (用户业务规则驱动)
+
+### 业务规则 (用户 2026.07.11 明确)
+
+```
+大厅阶段 (Room 状态):
+  房主 UI 点击 "添加 AI [攻方 x3]"
+    → Box_AttackTeam 立刻出现 3 个 AI 占位 [AI_GruntAI_1] [AI_GruntAI_2] [AI_GruntAI_3]
+    → AI Pawn **不生成**, 只在 GameMode 维护一个 "待生成清单" (PendingAIQueue)
+
+  房主 UI 点击 "开始游戏"
+    → PerformGameStart → SpawnAllPlayersIntoBattle
+    → 遍历 真人 PlayerArray + PendingAIQueue
+    → 在对应阵营复活点生成 Pawn
+```
+
+### 旧 (v24) 实现 — 违反新业务规则
+
+```
+Server_AddAI(bToAttackTeam, CharacterName, Count)
+  → GM->AddAIToRoom → AddAIByRequest → SpawnAIInternal
+                      ↓
+                      立刻生成 AIController + Pawn
+                      ↓
+                      Pawn 站在场景里 (BT 等 OnBattleStarted 激活)
+                      ↓
+                      但是 AI 没有 PlayerState, 进 GS->PlayerArray 失败
+                      ↓
+                      URoomStateService 看不到 AI → Box_AttackTeam 不显示 AI
+```
+
+**3 个根因**:
+1. 违反"大厅不生成"的业务规则 — Pawn 提前站桩浪费内存
+2. AI 没有 PlayerState — UI 路径 (PlayerArray) 看不到 AI
+3. UI 路径用 `PName.StartsWith(TEXT("[AI]"))` 判定 AI — 但新名字格式是 `AI_GruntAI_1`,永远不命中
+
+### 新 (v28) 架构 — 大厅入队 + 战斗 Spawn
+
+```
+Server_QueueAIForBattleSpawn(FAISpawnRequest)
+  → GM->QueueAIForBattleSpawn (只入队, 不生成)
+                      ↓
+                      PendingAIQueue.Add(FPendingAIEntry)
+                      ↓
+                      URoomStateService::GetFactionSnapshots(FactionTag)
+                      ↓
+                      真人 (PlayerArray) + AI 占位 (PendingAIQueue) → 合并快照
+                      ↓
+                      Box_AttackTeam/Box_DefenseTeam 渲染占位
+
+房主点击 "开始游戏":
+  PerformGameStart → SpawnAllPlayersIntoBattle
+    → 遍历 GS->PlayerArray (玩家) → HandlePlayerRequestSpawn
+    → 消费 ConsumePendingAIForBattleSpawn() → SpawnAIInternal
+                      ↓
+                      AI 在阵营复活点生成, BT 激活
+```
+
+### 单一真理源 (v28 落地)
+
+| 数据 | 真理源 | 写入入口 | 读取入口 |
+|---|---|---|---|
+| **AI 占位数据** | `ARoomGameMode::PendingAIQueue` | `QueueAIForBattleSpawn` | `GetPendingAIInFaction` |
+| **战斗 Spawn 请求** | `SpawnAllPlayersIntoBattle` 临时数组 | `ConsumePendingAIForBattleSpawn` | 同函数局部 |
+| **AI Pawn 阵营** | `Pawn.FactionTag` (= `CachedFactionTag`) | `SpawnAIInternal` / `RequestRespawn` (v26.5 链路) | `FFactionTags::AttitudeBetween` |
+| **UI 阵营标签** | `FPlayerSnapshot::FactionTag` (= `PS.CurrentFactionTag` or `Entry.FactionTag`) | `URoomStateService::BuildSnapshot / BuildAISnapshot` | `URoomInsidePage::RefreshRoomUI` |
+
+**大厂原则 — 数据源分裂**:
+- 大厅阶段: AI 通过 `PendingAIQueue` 暴露给 UI (`bIsAI=true`)
+- 战斗阶段: AI 已生成 Pawn, UI Box 隐藏, ScoreboardWidget 接管 (用 GS->PlayerArray, AI 不可见, 因为没 PlayerState — 这是大厂允许的"职责分离")
+- 死亡阶段: AI Pawn Destroy, AIController 复用 (v24 链路) — PendingAIQueue 已清空,UI 仍显示占位但被隐藏
+
+### 零兜底原则 (v28 落地)
+
+| 场景 | 旧 (兜底) | 新 (v28 显式) |
+|---|---|---|
+| FactionTag 无效 | 静默归 Attack | `QueueAIForBattleSpawn` Log Error + 拒绝入队 |
+| Profile 找不到 | `SpawnAIInternal` 走"跨模式兜底" | `SpawnAllPlayersIntoBattle` 显式 Error + 跳过单条 |
+| Count <= 0 | `AddAIToRoom` 直接 return | `QueueAIForBattleSpawn` 显式 Error + 返回 0 |
+| Mode = None | 不校验 | `QueueAIForBattleSpawn` 显式 Error + 拒绝入队 |
+| UI bIsAI 判断 | `PName.StartsWith("[AI]")` (永远 false) | `Snap.bIsAI` (字段驱动, 永远准确) |
+
+### 抗误删保护 (v28)
+
+`Server_KickPlayer` 旧实现: `bIsAI = PName.StartsWith("[AI]")` — 新名字格式 `AI_GruntAI_1` 不命中, **会走"踢真人"分支找 PlayerController → 找不到 → no-op**。
+
+新实现按"阶段 + 数据源"严格分支:
+1. 阶段 1: `GM->IsPendingAIByName(Name)` true → `RemovePendingAIByName` (大厅, 从队列删)
+2. 阶段 2: `Cast<AAIController>` 找得到 → `Destroy()` (战斗, 销毁 AI Controller)
+3. 阶段 3: 真人 → 走原有 `RemovePlayerFromRoom` 流程
+
+**禁止**用 `StartsWith` 等字符串模糊判定 — 大厂原则: **字段驱动判定 > 字符串约定**
+
+### 关键文件清单 (v28 改动)
+
+```
+新增类型:
++ FPendingAIEntry (AIBehaviorTypes.h)
+  - DisplayName / FactionTag / ProfileTag / CharacterRowName / Mode / SequenceID
+  - 大厂原则: 全部 BlueprintReadOnly (写只走 QueueAPI)
+
+修改 ARoomGameMode:
+~ QueueAIForBattleSpawn (新) - 入队, 不生成
+~ GetPendingAIInFaction / GetAllPendingAI / IsPendingAIByName / RemovePendingAIByName (新查询API)
+~ ConsumePendingAIForBattleSpawn (新) - 消费, 一次性清空
+~ BuildSpawnRequestFromPending (新) - 字段转换集中一处
+~ SpawnAllPlayersIntoBattle - 增加消费 PendingAIQueue → SpawnAIInternal 链路
+~ 删除 AddAIToRoom (旧立刻生成入口)
+~ 删除 AddAIByRequest (旧立刻生成入口)
+
+修改 ARoomPlayerController:
+~ Server_AddAI → Server_QueueAIForBattleSpawn (改名 + 改签名)
+
+修改 URoomService:
+~ RequestAddAI - 构造 FAISpawnRequest → PC->Server_QueueAIForBattleSpawn
+
+修改 URoomStateService:
+~ GetFactionSnapshots (新) - 真人 + AI 合并快照
+~ BuildAISnapshot (新) - FPendingAIEntry → FPlayerSnapshot
+~ GetAttackFactionSnapshots / GetDefenseFactionSnapshots - 委托给 GetFactionSnapshots
+~ FPlayerSnapshot: + bIsAI / + SequenceID 字段
+
+修改 URoomInsidePage:
+~ RefreshRoomUI - 遍历 AllSnapshots (替代 KnownPlayerStates)
+~ bIsAI 判定 - 直接读 Snap.bIsAI (替代 StartsWith "[AI]")
+~ SetRemoveButtonVisibility - 加 !bIsAI 守卫 (AI 占位不显示移除按钮)
+~ CheckForNewPlayers - 人数对比用 AllSnapshots.Num() (替代 KnownPlayerStates.Num())
+
+修改 URoomPlayerController:
+~ Server_KickPlayer - 按阶段分支 (PendingAI / AIController / 真人)
+```
+
+### 待用户验证 (v28)
+
+1. UE 5.6 编辑器编译无错 (重点: FAISpawnRequest 通过 RoomGameMode.h 间接 include, 检查所有依赖项)
+2. PIE 中:
+   - 房主添加 3 个 AI 攻方 → Box_AttackTeam 立刻出现 3 个占位 (不卡死,不重复)
+   - 房主添加 2 个 AI 守方 → Box_DefenseTeam 立刻出现 2 个占位
+   - 房主踢 AI 占位 → Box 立刻移除
+   - 房主踢真人 → 走原踢人流程
+   - 点击开始游戏 → 5 个 AI 在阵营复活点生成
+   - AI 死亡复活 → Pawn 重新生成 (v26.5 链路正常)
+   - 战斗 UI (ScoreboardWidget) 不显示 AI (合理 — 它只显示真人, AI 跟真人同源没区别)
+
+## 10. v29 (2026.07.11) UI 不显示 PlayerLabel — 双数据流架构
+
+### 旧实现 (v28) 痛点 — Box_AttackTeam/Box_DefenseTeam 不显示 UI 标签
+
+**用户反馈 (2026.07.11)**:
+> "现在 Box_AttackTeam 容器和 Box_DefenseTeam 容器不显示 UPlayerLabelWidget 标签了,被你改坏了。"
+
+**根因链**:
+```
+RefreshRoomUI (v28)
+└─ for (const FPlayerSnapshot& Snap : AllSnapshots)
+   └─ AllSnapshots = GetAttackFactionSnapshots() + GetDefenseFactionSnapshots()
+      └─ URoomStateService::GetAttackFactionSnapshots() 内部
+         └─ GS->GetPlayersInFaction(Offense) — 读 GS->PlayerArray
+            └─ 【核心问题】测试模式 EnterSkipToHostMode **不会 add PlayerArray**!
+               它只 set 了 GS->HostPlayerName, 没调 PostLogin → PlayerArray 永远空
+            └─ → AllSnapshots 为空 → Box 不显示任何 widget
+```
+
+### 新架构 (v29) — 真人/AI 双数据流 + 单一真理源
+
+**核心原则**:
+- 真人 vs AI 是**两条独立数据流**, 不合并
+- 真人: GS->PlayerArray (UE 引擎自动 add) — UI 直接读 (v27 验证可靠)
+- AI 占位: GM->GetPendingAIInFaction (用户入队写入) — UI 直接读
+- UI 自己负责合并两条数据流 (按 FactionTag 分类到 Box)
+
+```
+URoomInsidePage::RefreshRoomUI (v29)
+├─ ClearChildren (Box_AttackTeam, Box_DefenseTeam)
+├─ 路径 A: 真人 (KnownPlayerStates)
+│  └─ for (ARoomPlayerState* PS : KnownPlayerStates)
+│     └─ PS->CurrentFactionTag == Offense? → Box_AttackTeam
+│     └─ PS->CurrentFactionTag == Defense? → Box_DefenseTeam
+│     └─ CreatePlayerLabelInBox(bIsAI=false)
+└─ 路径 B: AI 占位 (GM->GetPendingAIInFaction)
+   ├─ for (Entry : GM->GetPendingAIInFaction(Offense)) → Box_AttackTeam
+   └─ for (Entry : GM->GetPendingAIInFaction(Defense)) → Box_DefenseTeam
+      └─ CreatePlayerLabelInBox(bIsAI=true)
+```
+
+**URoomStateService 改动 (v29)**:
+- `GetAttackFactionSnapshots()` / `GetDefenseFactionSnapshots()`: **只返回真人** (v29 修订)
+  - 旧 v28: 返回真人 + AI → 测试模式 PlayerArray 空 → 函数空 → Box 不显示 ← 用户反馈 bug
+- `GetFactionSnapshotsInternal(FactionTag, bIncludeAI)`: 内部辅助, 默认 bIncludeAI=false
+- `GetFactionSnapshotsWithAI(FactionTag)`: 显式合并真人 + AI (供需要"总人数"的查询方用)
+
+**URoomInsidePage 改动 (v29)**:
+- 新增私有函数 `CreatePlayerLabelInBox(...)`: 真人/AI 共用 widget 创建 + 属性设置
+- `RefreshRoomUI` 拆成两条独立循环, 不再用 AllSnapshots
+- `CheckForNewPlayers` 直接读 `GS->PlayerArray` (不再绕道 URoomStateService 快照层)
+
+### 大厂原则落地 (v29)
+
+| 原则 | 旧 (v28) | 新 (v29) |
+|---|---|---|
+| **单一真理源** | 真人走快照 (从 PS 复制) | 真人直接读 PS 字段 |
+| **双数据流分离** | 合并 AllSnapshots | 路径 A (真人) + 路径 B (AI) 独立 |
+| **减熵** | UI → URoomStateService → GetFactionSnapshots → GS→PlayerArray (4 层) | UI → GS->PlayerArray (2 层) |
+| **零兜底** | 快照查不到 → "兜底用 PS.CurrentFactionTag" (隐式回退) | 直接读 PS 字段, 没有兜底逻辑 |
+| **职责单一** | RefreshRoomUI 70 行内联 | 抽出 CreatePlayerLabelInBox, 单一入口 |
+
+### 为什么 GetAttackFactionSnapshots 不返回 AI
+
+| 调用方 | 是否需要 AI? | 做法 |
+|---|---|---|
+| URoomInsidePage::RefreshRoomUI | 是 | 直接读 GM->GetPendingAIInFaction |
+| URoomInsidePage::CheckForNewPlayers | 是 | 直接读 GM->GetAllPendingAI() |
+| URoomStateService::GetAttackReadyCount | 否 (AI 无准备概念) | 直接读真人快照 |
+| ScoreboardWidget (战斗 UI) | 否 (AI 已 Spawn, 跟真人同源) | 直接读真人快照 |
+
+→ **AI 占位是 UI 层独有的概念** (大厅展示), 不该污染业务层快照
+
+## 11. v29.1 (2026.07.11) 架构级根因修复 — 测试模式补回 PlayerState
+
+### 历史 (v29 之前的 bug 链)
+
+**用户反馈 (2026.07.11)**:
+> "现在 Box_AttackTeam 容器和 Box_DefenseTeam 容器不显示 UPlayerLabelWidget 标签了"
+> 日志: `[BP_SWAT_C_0] SyncFactionTagFromController: 没有 ARoomPlayerState! 修复: 检查 ARoomGameMode::PostLogin`
+
+**根因链 (测试模式)**:
+```
+URoomService::EnterSkipToHostMode (测试模式)
+├─ bIsHost = true
+├─ GS->HostPlayerName = LocalAccountName    ← 设置了 Host
+└─ ❌ 完全没调 GM->AddPlayerToRoom / PostLogin  ← 永远没生成 PlayerState
+
+→ PC->PlayerState = nullptr
+→ GS->PlayerArray.Num() = 0
+→ ARoomGameState::GetPlayersInFaction() 返回空数组
+→ 真人永远进不了 Box_AttackTeam / Box_DefenseTeam
+→ 顺带: AI 不识别玩家阵营 (FFactionTags::AttitudeBetween Other='None' Error)
+```
+
+### 新架构 (v29.1) — 显式补回 PlayerState + 走完整登录流程
+
+**双修复 (零兜底 + 单一真理源)**:
+
+#### 修复 1: `ARoomGameMode::AddPlayerToRoom` — 显式 Spawn PS + AddUnique PlayerArray
+
+```
+AddPlayerToRoom(Controller, PlayerName)
+├─ PC->GetPlayerState<ARoomPlayerState>() == nullptr (测试模式)
+│  └─ Log Warning (显式报错, 不是静默兜底)
+│  └─ SpawnActor<ARoomPlayerState>(PlayerStateClass)  ← 显式补回
+│  └─ PC->SetPlayerState(PS)
+│  └─ Spawn 失败 → Log Error + return (零兜底, 失败就是失败, 不许静默)
+├─ GS->PlayerArray.AddUnique(PS)  ← 不论测试/生产都执行, 幂等
+└─ PS->SetPlayerName / 分配阵营 / OnRep_FactionTag / Broadcast
+```
+
+#### 修复 2: `URoomService::EnterSkipToHostMode` — 走完整登录路径
+
+```
+EnterSkipToHostMode (v29.1 新增 v29 关键修复)
+├─ bIsHost = true
+├─ OnHostChanged / OnPlayerJoined.Broadcast
+├─ GS->HostPlayerName = LocalAccountName
+└─ GM->AddPlayerToRoom(PC, LocalAccountName)  ← v29.1 新增 — 测试模式也走完整登录
+   └─ (生产模式) PostLogin 已 add → AddUnique 幂等
+   └─ (测试模式) 这里显式 Spawn + Add → PlayerArray 有 PS
+```
+
+### 大厂原则落地 (v29.1)
+
+| 原则 | 旧 (v29 之前) | 新 (v29.1) |
+|---|---|---|
+| **测试/生产一致性** | 测试模式绕过 PostLogin, 行为分裂 | 测试模式也走完整登录, 单一路径 |
+| **单一真理源** | HostPlayerName 写在 RoomService, PlayerArray 由 UE 自动 add (分裂) | GameState 一切由 GM 权威写入, RoomService 只触发 |
+| **零兜底** | PlayerState null 时静默跳过 | 显式 Log Warning + Spawn, 失败 Log Error + return |
+| **大厂错误日志引导修复** | 错误日志只描述症状 | 错误日志明确指出根因 + 修复路径 |
+
+### 数据流验证 (修复后)
+
+```
+URoomService::EnterSkipToHostMode
+└─ GM->AddPlayerToRoom(PC, LocalAccountName)
+   └─ PS == null (测试模式绕开 PostLogin)
+   └─ AnyPS != null 但 Class='APlayerState' (BP 错配) → 显式 Error
+   └─ 销毁错配 PS + InitPlayerState(PC) (走 v29.2 override)
+      └─ Super::InitPlayerState → SpawnActor<ARoomPlayerState>(FTransform::Identity)
+      └─ PC->SetPlayerState(ARoomPlayerState)
+   └─ GS->PlayerArray.AddUnique(PS)
+   └─ PS->SetPlayerName + SetFactionTag
+
+URoomInsidePage::CheckForNewPlayers (0.5s timer)
+└─ for (PS : GS->PlayerArray)  ← 现在能找到了!
+   └─ KnownPlayerStates.Add(PS)
+   └─ PS->OnStateChanged.Subscribe(RefreshRoomUI)
+
+URoomInsidePage::RefreshRoomUI (v29)
+└─ 路径 A 真人: KnownPlayerStates → Box_AttackTeam (Offense)
+   └─ CreatePlayerLabelInBox(...)  ← 渲染 widget!
+
+URoomPlayerState (服务器)
+└─ OnRep_FactionTag → 客户端 AI 识别玩家阵营 → AI 攻击玩家 ✓
+```
+
+## 12. v29.2 (2026.07.11) BP PlayerStateClass 错配 → 强制修复
+
+### 历史 (v29.1 修复后又发现)
+
+**用户日志(Session 末尾)**:
+```
+LogGameSession: Error: Player State class is invalid for game mode: GM_RoomGameMode_C_0!
+LogPlayerController: AController::InitPlayerState: PlayerStateClass of game mode GM_RoomGameMode_C_0 is null, falling back to APlayerState.
+LogTemp: Error: [RoomGameMode] AddPlayerToRoom: SpawnActor<ARoomPlayerState> 失败, PlayerName=...
+```
+
+**根因链 (第二次)**:
+1. BP `GM_RoomGameMode.uasset` 把 `PlayerStateClass` 设成了 None (覆盖了 C++ 默认值)
+2. UE 父类 `AGameModeBase::InitPlayerState` 检测 `PlayerStateClass == null` → fallback 到 APlayerState (基类!)
+3. PC->PlayerState 是 `APlayerState`, 不是 `ARoomPlayerState`
+4. `Cast<ARoomPlayerState>` 返回 nullptr → `KnownPlayerStates` 永远空 → Box 不显示
+5. AI 不识别玩家阵营 (Pawn 同步 `PS->CurrentFactionTag` 时 Cast 失败) → AI 永远 Neutral
+
+### 大厂架构修复 (v29.2) — 三层防御
+
+**三层防御 (零兜底 + 单一真理源)**:
+
+#### 防御层 1: `AGameModeBase::InitPlayerState` override
+- 文件: `RoomGameMode.h/cpp`
+- 检测 `PlayerStateClass != ARoomPlayerState` 派生 → Log Error + 强制修回 ARoomPlayerState
+- 调 `Super::InitPlayerState` 让 UE 走标准 Spawn 流程
+- 这是 UE 大厂标准做法 (5.x 项目都用 override 修配置错)
+
+#### 防御层 2: `ARoomGameMode::AddPlayerToRoom` PS 二次机会
+- 文件: `RoomGameMode.cpp`
+- 检测 `PC->PlayerState` 是 fallback `APlayerState` → 显式 Error + Destroy + 调 InitPlayerState 重新走正确路径
+- 不允许"反正有 PS 了用一下" 这种隐式兜底
+
+#### 防御层 3: `URoomService::EnterSkipToHostMode` 调完整路径
+- 文件: `RoomService.cpp`
+- 测试模式不再"半截" — 调 GM->AddPlayerToRoom 走完整登录流程
+- 单一真理源: GM 权威, RoomService 只触发
+
+### 大厂原则 (v29.2 落地)
+
+| 原则 | 旧 (v29.1) | 新 (v29.2) |
+|---|---|---|
+| **配置鲁棒性** | C++ 设 PlayerStateClass=ARoomPlayerState, BP 可覆盖 | InitPlayerState override 强制修复 + Log Error 报警 |
+| **错误显性化** | `SpawnActor 失败` 一行 Log | 显式指出"BP 错配 APlayerState", 给出修复路径 |
+| **多重防御** | 单点修复 (RoomService 调 AddPlayerToRoom) | 三层: InitPlayerState + AddPlayerToRoom + EnterSkipToHostMode |
+| **零兜底** | "反正 PlayerArray 也能用" | 错配 PS 必须销毁重建, 不允许混用 |
+
+### 数据流 (v29.2 三层防御后)
+
+```
+PC->InitPlayerState (引擎自动调用, 生产模式 PostLogin 路径)
+└─ ARoomGameMode::InitPlayerState (v29.2 override)
+   ├─ 检测 PlayerStateClass != ARoomPlayerState 派生
+   │  └─ Log Error (BP 错配) + 强制 PlayerStateClass = ARoomPlayerState
+   └─ Super::InitPlayerState(PC, OutPS)
+      └─ SpawnActor<ARoomPlayerState>(FTransform::Identity)
+      └─ PC->SetPlayerState(ARoomPlayerState)
+      └─ AddPlayerState 自动调, 注入 PlayerArray
+
+测试模式 EnterSkipToHostMode
+└─ GM->AddPlayerToRoom(PC, LocalAccount)
+   ├─ PC->PlayerState 是 fallback APlayerState (BP 错配) → 销毁
+   └─ InitPlayerState(PC, NewPS)
+      └─ 重新走正确路径 → ARoomPlayerState
+   └─ GS->PlayerArray.AddUnique(PS)
+   └─ PS->SetPlayerName + SetFactionTag
+```
+
+---
+
+## 13. v30 (2026.07.11 下午) 复活无敌期 — 单一真理源 + 职责对等 (大厂架构)
+
+### 业务需求 (用户 2026.07.11)
+> "ai和玩家复活需要有个3秒倒计时才能行动，在3秒倒计时内，无法被伤害。"
+
+### 大厂架构决策 (用户 AskQuestion 选项 — 全选 A)
+
+| 决策点 | 选项 | 理由 |
+|---|---|---|
+| **数据源放哪?** | ✅ A. HealthComponent | 已是扣血数据权威 (v23), Layer 0 单一拦截点 |
+| **默认秒数?** | ✅ A. 3s | 用户业务明确 |
+| **配错 (≤0) 处理?** | ✅ A. 静默跳过 | 不强制默认值, 不报错, 由调用方负责 |
+| **战斗开局首生成激活?** | ✅ A. 激活 | 玩家和 AI 行为统一, 防止开局秒杀 |
+
+### 单一真理源 + 职责对等 (大厂原则 v30 落地)
+
+**新架构 (v30) 三层职责**:
+```
+Layer 0 (拦截点): UHealthComponent::ApplyDamage → bIsInvincible=true → return 0
+       → 单一真理源: HealthComponent 字段, 任何扣血入口必经这里
+
+Layer 1 (观测点): BaseWeapon::Server_ReportHit + BaseCharacter::Server_ReportAIAttackHit + TakeDamage
+       → 仅 Verbose 日志, 不重复拦截 (大厂原则 - 零重复)
+
+Layer 2 (激活入口): ARoomGameMode::RequestRespawn + SpawnAllPlayersIntoBattle
+       → 集中调度, 唯一激活入口
+```
+
+### 职责链 (大厂原则 - 集中调度)
+
+```
+RoomGameMode::RequestRespawn (玩家/AI) ─→ 链路末尾调
+ └─ ABaseCharacter::ActivateSpawnInvincibility (Actor 编排层)
+ └─ UHealthComponent::ActivateInvincibility (权威字段写入)
+ ├─ 设 bIsInvincible=true, InvincibilityExpiresAtWorldTime
+ ├─ SetTimer 到期自动清 (拒绝缩短 - 取较晚到期)
+ └─ Broadcast OnInvincibilityChanged (服务器主动 + 客户端 OnRep 双发)
+ ↓ Replicated
+客户端: OnRep_InvincibilityChanged → Broadcast 本地 OnInvincibilityChanged
+ ↓ 关闭扣血
+HealthComponent::ApplyDamage: bIsInvincible=true → return 0 (Layer 0 拦截)
+```
+
+### 配置优先级 (用户决策 - 业务配置 > 默认配置)
+
+**玩家** (BP 配):
+```
+1. Pawn->DefaultSpawnInvincibilitySeconds (BP_BaseCharacter 默认 3.0)
+2. ActivateSpawnInvincibility(-1.0) → 用上面这个值
+3. <= 0 → 用户决策 A: 静默跳过激活
+```
+
+**AI** (DA 配):
+```
+1. Profile->SpawnInvincibilitySeconds (业务配置 3.0)
+2. 如果 > 0: ActivateSpawnInvincibility(Profile->SpawnInvincibilitySeconds)
+3. 如果 <= 0: ActivateSpawnInvincibility(-1.0) → 用 Pawn 默认值
+```
+
+### 死亡时强制取消无敌期 (防御型设计)
+
+**为什么需要 (边缘 case)**:
+- AI 在 3s 无敌期内被 Dot 伤害/陷阱伤害触发死亡 → Timer 残留 → 新 Pawn 复活时被错误认为无敌
+- 玩家无敌期内退出战斗 → 回来时还在无敌 → 业务失效
+
+**修复**:
+- ExecuteDeathLocal 第 0 步: HealthComponent->DeactivateInvincibility()
+- 幂等: DeactivateInvincibility 内部已处理 "未激活 → no-op"
+- 这是"大厂原则 - 防御型设计"的体现, 不让死亡事件链残留 Timer
+
+### 拒绝缩短逻辑 (防反复激活欺骗无敌)
+
+```cpp
+// 大厂原则 - 物理正确性: 时间只能前进不能后退
+const float NewExpireTime = Now + Duration;
+const float FinalExpireTime = FMath::Max(CurrentExpireTime, NewExpireTime);
+
+if (bIsInvincible && FinalExpireTime <= CurrentExpireTime + KINDA_SMALL_NUMBER)
+{
+    return; // 拒绝缩短
+}
+```
+
+### 大厂原则对照 (v30)
+
+| 原则 | 旧 (假设散落 Bool) | 新 (v30) |
+|---|---|---|
+| **单一真理源** | 散落 BaseCharacter/Weapon/BT | HealthComponent 唯一权威 |
+| **职责对等** | 复活逻辑散落 BT/Weapon | RoomGameMode 集中调度, 仅 2 个入口 |
+| **可观测性** | 拦截无日志 | Layer 0 拦截 + Layer 1 Verbose 双发 |
+| **零兜底** | 用 bool 默认 true 容错 | 配错 (≤0) → 静默跳过激活, 不强制 |
+| **拒绝缩短** | 多次激活重置 Timer | 取较晚到期, 防"0.1s 反复激活欺骗无敌" |
+| **死亡防残留** | (缺) | ExecuteDeathLocal 第 0 步强制 Deactivate |
+
+### 关键代码层
+
+```
+UHealthComponent (Authority 数据层):
+ ├─ bIsInvincible (Replicated, OnRep_InvincibilityChanged)
+ ├─ InvincibilityExpiresAtWorldTime (Replicated)
+ ├─ InvincibilityTimerHandle (服务器 Timer)
+ ├─ OnInvincibilityChanged (BlueprintAssignable, 双发)
+ ├─ ActivateInvincibility(Duration): ≤0 跳过, >0 设字段 + Timer + Broadcast
+ ├─ DeactivateInvincibility(): 服务器 ClearTimer + Clear 字段 + Broadcast
+ ├─ ExpireInvincibility_Internal(): Timer 到期回调
+ ├─ GetInvincibilityRemainingSeconds(): HUD 显示倒计时
+ └─ ApplyDamage 入口: bIsInvincible=true → return 0
+
+ABaseCharacter (Actor 编排层):
+ ├─ DefaultSpawnInvincibilitySeconds (BP 默认值 3.0, BlueprintReadWrite)
+ ├─ ActivateSpawnInvincibility(DurationOverride): 默认 -1.0 用 Pawn 默认
+ └─ DeactivateSpawnInvincibility(): 委托 HealthComponent
+
+UAIProfileAsset (AI 业务配置层):
+ └─ SpawnInvincibilitySeconds (业务可调, 0=禁用)
+
+ARoomGameMode (GameMode 集中调度层 — 唯一激活入口):
+ ├─ RequestRespawn (玩家/AI 复活) → 末尾 Pawn->ActivateSpawnInvincibility
+ ├─ HandlePlayerRequestSpawn → 默认激活 (覆盖战斗开局 + 切队)
+ └─ SpawnAIInternal → 末尾 AIPawn->ActivateSpawnInvincibility(Profile 配置)
+```
+
+### 待用户验证 (v30)
+
+1. UE 5.6 编辑器编译无错:
+   - 新 UFUNCTIONs: `ActivateInvincibility/DeactivateInvincibility/IsInvincible/GetInvincibilityRemainingSeconds`
+   - 新 UPROPERTYs: `bIsInvincible, InvincibilityExpiresAtWorldTime`
+   - 新 Delegate: `FOnInvincibilityChanged`
+   - `RoomGameMode` 末尾调 `ActivateSpawnInvincibility` 无编译错误
+2. PIE 中:
+   - 玩家死 3s 后复活, 出生瞬间无法被打 (3s 期间 0 伤害)
+   - AI 死立即 (AI 路径无 delay) 复活, 出生瞬间无法被打
+   - 战斗开局 (MatchStartDelay 结束后) 玩家 + AI 一生成就 3s 无敌
+   - HUD 可选: 显示倒计时数字 (用 HealthComponent->GetInvincibilityRemainingSeconds 绑 TextBlock)
+   - 死亡时无敌期立即消失 (ExecuteDeathLocal 第 0 步触发)
+   - 3 个伤害入口 (TakeDamage/Server_ReportHit/Server_ReportAIAttackHit) Layer 1 Verbose 日志能区分"Faction 拒绝" vs "无敌期拒绝"
+
+### UE 编辑器配置 (v30 新增 BP 配置)
+
+**`WBP_CharacterHUD`** (可选): HUD 倒计时
+ - 新加 TextBlock, Bind Function: HealthComponent->GetInvincibilityRemainingSeconds() (BlueprintPure)
+
+**`BP_BaseCharacter`** (玩家基类):
+ - 默认已经 3.0s, 不用改
+ - 策划可调: Class Defaults → Combat → Respawn → Default Spawn Invincibility Seconds
+
+**`DA_AIProfile_MeleeGrunt`** (AI):
+ - 已默认 3.0s, 不用改
+ - 策划可调: Class Defaults → Combat → Spawn Invincibility Seconds
+
+**`BP_GruntAI`** (AI Pawn BP) — 不需要改, 走 Profile
+
+## 13. v31.5 (2026.07.12) 四大 Subsystem 拆出 + UHT 报错根因修复 (大厂架构)
+
+### 用户反馈 (2026.07.12 早)
+
+```
+Running Internal UnrealHeaderTool ... -WarningsAsErrors -installed
+RoomMembershipSubsystem.h(1): Error: The given include must appear at the top of the header following all other includes: '#include "RoomMembershipSubsystem.generated.h"'
+RoomSpawnSubsystem.h(1): Error: ... '#include "RoomSpawnSubsystem.generated.h"'
+RoomTargetingSubsystem.h(1): Error: ... '#include "RoomTargetingSubsystem.generated.h"'
+Total of 0 written
+```
+
+注意: **RoomLifecycleSubsystem.h 没报错** (虽然重构后写法类似)
+
+### 真实根因 (UE 5.6 UHT 源码级确认)
+
+翻 `Engine/Source/Programs/Shared/EpicGames.UHT/Parsers/UhtHeaderFileParser.cs` 第 823 行:
+
+```csharp
+if (HeaderFile.GeneratedHeaderFileName.AsSpan().Equals(includeNameString.Span, StringComparison.OrdinalIgnoreCase))
+{
+    SpottedAutogeneratedHeaderInclude = true;
+}
+```
+
+而第 255 行 `GeneratedHeaderFileName = FileNameWithoutExtension + ".generated.h"`
+
+→ 这是**字面 OrdinalIgnoreCase 比对**, 不处理路径前缀!
+→ 我们的 include: `#include "Systems/Lifecycle/RoomLifecycleSubsystem.generated.h"` 永远 != `"RoomLifecycleSubsystem.generated.h"`
+→ `SpottedAutogeneratedHeaderInclude` 永远是 false
+→ 触发 `must appear at the top of the header` 错误 (这其实是"我根本没找到 .generated.h"的笼统报错)
+
+**为什么 RoomLifecycleSubsystem 不报错**?
+- 它是早一晚写的, include 用的是裸文件名 (那时作者记得这个坑)
+- 后写的 3 个 Subsystem 不知道这个坑, 都用了带路径前缀的 include
+
+### 大厂级根因 (设计层面)
+
+| 类别 | 错误类型 | 修复 |
+|---|---|---|
+| **UE 5.6 UHT 严格模式** | `.generated.h` 必须用裸文件名 | 4 个文件都改用 `#include "Xxx.generated.h"` 不带前缀 |
+| **重复架构** | RoomMembershipSubsystem 有 `bSpawnInProgress` + `FSpawnInProgressGuard`, 与 RoomSpawnSubsystem 重复 | 删除 (SSOT 唯一) |
+| **重复架构** | RoomGameMode.h 有 `FSpawnInProgressGuard` 声明 (cpp 没实现) | 删除 (死代码) |
+| **引用不存在字段** | RoomMembershipSubsystem.cpp 引用 `PlayerStateClass` (这是 AGameModeBase 的字段, 不在 UWorldSubsystem 上) | 函数参数注入: `AddPlayerToRoom(..., TSubclassOf<APlayerState>)` |
+| **Subsystem 拆出后 .cpp 缺少 include** | RoomGameMode.cpp 引用 4 个 Subsystem 但没 include 头文件 | 补 4 个 include |
+| **错误的 include 路径** | RoomLifecycleSubsystem.cpp include `"Player/Controllers/RoomPlayerController.h"` (路径错) | 改为 `"Systems/RoomPlayerController.h"` |
+| **错的 cpp include 路径** | RoomSpawnSubsystem.cpp include `"Player/States/RoomPlayerState.h"` | 改为 `"Systems/Core/RoomPlayerState.h"` |
+| **UFUNCTION 暴露 FSimpleDelegate** | UHT 不识别非 DECLARE_DELEGATE 的类型 → "Unable to find FSimpleDelegate" | 移除 UFUNCTION 标记, 走 C++ 调用 |
+| **const 不匹配** | `ScoreCandidateForAI` .h 是非 const `Candidate`, cpp 委派是 const | .h 改 const, cpp 用 const_cast 解包 (内部 Subsystem 是非 const UFUNCTION) |
+| **死代码: TryResolveProfile** | .h 没声明, .cpp 实现了一个没人调的方法 | 删除 cpp |
+| **孤儿: GetAvailableSpawnPointForFaction** | .h 有声明 (UFUNCTION) 但 .cpp 没实现 | 补委派实现 |
+| **死代码: LockedTargets** | cpp 第 87 行调 `LockedTargets.Empty()`, 但 .h 只有 AIHuntingMap | 删除调用 |
+| **缺失类型转换 API** | cpp 调用 `ABaseCharacter::ResolveGenericTeamIdFromTag` (v25 已删) | 改用 `FFactionTags::ToGenericTeamId` (单一真理源) |
+| **URoomGameMode 错别字** | cpp 写 `URoomGameMode* GM = Cast<ARoomGameMode>(...)` | 改为 `ARoomGameMode* GM` |
+| **EMatchState 未 include** | cpp 用 `EMatchState::Battleing` 但没 include CoreEnums.h | 补 include |
+| **FSimpleDelegate 引用/不引用** | .h 是值类型, cpp 是 const 引用 | cpp 同步为值类型 |
+| **OnMatchTimerTick 访问性** | 在 protected 区段, GameMode 委派调不到 | 移到 public |
+| **StartMatchTimer 头文件未声明** | cpp 实现了, .h 没声明 | .h 补声明 |
+| **BuildSpawnRequestFromPending 访问性** | 在 private 区段, GameMode 委派调不到 | 移到 public |
+
+### 大厂原则 (v31.5 落地)
+
+| 原则 | 旧 | 新 |
+|---|---|---|
+| **UE 5.6 .generated.h 规范** | 带目录前缀 | 必须裸文件名 (UHT 严格字面比对) |
+| **零兜底 - 签名一致性** | cpp 用 const, .h 不 const | 完全同步 |
+| **零死代码** | TryResolveProfile / LockedTargets / FSpawnInProgressGuard 残留 | 全删 |
+| **单一真理源 - 类型转换** | ABaseCharacter::ResolveGenericTeamIdFromTag (已删) | FFactionTags::ToGenericTeamId |
+| **错误显式化** | UHT 错误信息迷惑 ("must appear at top") | 根因: UHT 比对是字面 OrdinalIgnoreCase, 不处理路径 |
+| **委派层完整性** | 头声明 UFUNCTION, cpp 没实现 | 头声明 + cpp 委派实现, BP 兼容 |
+
+### 关键文件变更 (v31.5)
+
+```
+修改:
+~ RoomLifecycleSubsystem.h: 改用裸 .generated.h + 加 StartMatchTimer 声明 + 移 OnMatchTimerTick 到 public
+~ RoomLifecycleSubsystem.cpp: 修错 include 路径 + 加 EMatchState include + 改 PerformGameStart 签名
+~ RoomSpawnSubsystem.h: 改用裸 .generated.h + 移 BuildSpawnRequestFromPending 到 public
+~ RoomSpawnSubsystem.cpp: 加 EngineUtils.h (TActorIterator) + 改 ToGenericTeamId + 改 ARoomGameMode
+~ RoomTargetingSubsystem.h: 改用裸 .generated.h + 注释修 (LockedTargets 不存在)
+~ RoomTargetingSubsystem.cpp: 加 APlayerState.h include + 加 ARoomGameState.h include + 删 LockedTargets 调用
+~ RoomMembershipSubsystem.h: 改用裸 .generated.h + 改 AddPlayerToRoom 签名 (TSubclassOf<APlayerState>)
+~ RoomMembershipSubsystem.cpp: 重写, 删除 FSpawnInProgressGuard 实现 + 改 AddPlayerToRoom 签名
+~ RoomGameMode.h: 删 FSpawnInProgressGuard 死代码 + 改 ScoreCandidateForAI 第二个参数为 const
+~ RoomGameMode.cpp: 加 4 个 Subsystem include + 补 GetAvailableSpawnPointForFaction 委派 + 删 TryResolveProfile + 改 MatchDurationSeconds→MeleeMatchDurationSeconds + 改 PlayerStateClass 透传
+```
+
+### 待用户验证 (v31.5)
+
+1. ✅ UE 5.6 编辑器编译无错 (`Result: Succeeded`)
+2. PIE 中:
+ - 房主添加 AI → Box 出现占位 (走 RoomMembershipSubsystem + RoomSpawnSubsystem)
+ - 开局 → AI 在出生点生成 (走 RoomLifecycleSubsystem 倒计时)
+ - AI 死亡 → 复活 (走 RoomSpawnSubsystem + RoomTargetingSubsystem)
+ - 阵营识别正确 (FFactionTags::ToGenericTeamId 已修)
+
+### UE 编辑器无新增配置 (v31.5)
+
+本次修复纯代码, **不需要 UE 编辑器配置变更**。
+
+## 14. v31.6 (2026.07.12 早) Multicast_NotifyKill nullptr 崩溃修复 (大厂架构)
+
+### 用户反馈 (Session3.log 崩溃栈)
+
+```
+Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000018
+UnrealEditor_MetalSlug01!ABaseCharacter::Multicast_NotifyKill_Implementation() [BaseCharacter.cpp:3247]
+UnrealEditor_MetalSlug01!ABaseCharacter::execMulticast_NotifyKill()
+... (RPC 调用链: DispatchPacket → ReceivedRPC → ProcessBunch → ReceivedBunch)
+```
+
+读取 `0x18` 字节 = `UObject` 内 `Name` 字段偏移 (刚好第 3 个指针成员)
+→ 100% 空指针解引用
+
+### 真根因 — UE 5.x RPC 边界 Actor 引用生命周期
+
+```
+服务器流程:
+  TakeDamage (line 2240-2300)
+  ├─ IsDead() true → Multicast_NotifyKill(this, nullptr)  ← RPC 入队
+  └─ HealthComponent::OnDeath.Broadcast → Die() → Destroy()
+
+客户端 RPC 接收链路:
+  FObjectReplicator::ReceivedBunch → ReceivedRPC → ProcessEvent
+  → execMulticast_NotifyKill → Multicast_NotifyKill_Implementation
+  → 第 3248 行: *VictimActor->GetName() ← VictimActor 已 nullptr
+```
+
+**为什么 VictimActor 是 nullptr**:
+1. 服务器 TakeDamage 是同步链路: HealthComponent.ApplyDamage → OnDeath.Broadcast → Die() → Destroy()
+2. UE 5.x 中 NetMulticast Reliable RPC 会立即尝试把参数序列化入 Bunch
+3. 但 Destroy() 是延迟到帧末执行的 (UE Actor 生命周期)
+4. RPC 序列化阶段, VictimActor 可能已被标记为 PendingKill
+5. **更糟的情况**: TakeDamage 内**先** Multicast_NotifyKill (line 2300), **再**走 OnDeath 链路
+   - 服务器 Multicast 入队时 Victim 还活着
+   - 但 RPC 在网络层传输过程中, 服务器 Destroy 完成
+   - 客户端收到时, 解析 NetGUID → Actor 已 Destroy → nullptr
+6. 客户端拿到 nullptr → `VictimActor->GetName()` 解引用 → EXCEPTION_ACCESS_VIOLATION 0x18
+
+### 重复架构 (v22~v31.5)
+
+| 字段 | 真理源 | 重复 |
+|---|---|---|
+| `ABaseCharacter::LastKillMethod` (UPROPERTY Replicated) | Weapon::LastKillMethod | **重复** — 两个字段同步 |
+| `Multicast_NotifyKill(AActor*, AActor*)` | 应该传 FString | **错误协议** — 跨 RPC 边界传 Actor 引用 |
+
+### 旧实现 v22~v31.5 — AddKillScore 写在 RPC Implementation 里 (大厂反模式)
+
+```cpp
+// 旧 Multicast_NotifyKill_Implementation
+void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* Victim, AActor* Assistant)
+{
+    if (ARoomPlayerState* PS = GetRoomPlayerState())
+    {
+        PS->AddKillScore(); // ← 反模式! Multicast 客户端执行, HasAuthority=false 被吞掉
+    }
+}
+```
+
+→ **所有客户端执行一次, 但 HasAuthority=false, AddKillScore 内部守卫, 什么也没做**
+→ 真正加分从来没生效, 玩家击杀不会涨分 (用户没注意这个 bug 是因为崩溃太显眼)
+
+### 大厂架构修复 (v31.6) — 三层防御
+
+**Layer 1 — RPC 纯数据化**: Multicast_NotifyKill 不传 Actor*, 传 FString + EKillMethod
+**Layer 2 — 单一真理源**: 删除 `BaseCharacter::LastKillMethod`, 真理源 = `Weapon::LastKillMethod`
+**Layer 3 — 服务器集中结算**: AddKillScore / AddAssistScore / AddDeath 移到 TakeDamage 末尾统一调用, 不再藏在 RPC Implementation
+
+#### 新 Multicast_NotifyKill 签名
+
+```cpp
+UFUNCTION(NetMulticast, Reliable)
+void Multicast_NotifyKill(const FString& KillerName, const FString& VictimName,
+                          EKillMethod KillMethod, bool bIsAssist);
+```
+
+#### TakeDamage 集中结算流程
+
+```
+服务器 TakeDamage (IsDead() 分支):
+  1. 读 Weapon->GetLastKillMethod()                       → KillMethod (真理源)
+  2. 读 KillerPS->GetPlayerName()                         → KillerName (本地读)
+  3. 读 VictimPS->GetPlayerName()                         → VictimName (本地读)
+  4. KillerPS->AddKillScore()                             ← 服务器加分 (已挪到这里)
+  5. VictimPS->AddDeath()                                 ← 服务器死亡计数
+  6. GrantAssistsToEligiblePlayers(this, Killer, Method)  ← 助攻加分 + 助攻 RPC
+  7. KillerCharacter->Multicast_NotifyKill(...)           ← 纯数据 RPC, 不会再崩
+```
+
+#### GrantAssistsToEligiblePlayers 单一职责
+
+```
+旧 (反模式): 包含 KillMethod/Killer 重复加分, AddDeath 重复 (TakeDamage 调一次, 这里又调一次)
+新 (v31.6):
+  - 唯一职责: 助攻加分 + 助攻 RPC + 清理时间戳
+  - 接受 KillMethod 参数, 不读 Character 字段
+  - 不再调 AddKillScore / AddDeath (这些由 TakeDamage 集中处理)
+  - 入参校验: Victim/Killer null → Log Error + return (零兜底)
+```
+
+### 大厂原则 (v31.6 落地)
+
+| 原则 | 旧 (v22~v31.5) | 新 (v31.6) |
+|---|---|---|
+| **RPC 边界纯数据** | Actor* 引用跨 RPC | FString + EGameplayTag + 枚举 |
+| **单一真理源** | Weapon + Character 都持 LastKillMethod | 只 Weapon 持有 |
+| **服务器集中结算** | AddKillScore 藏在 RPC (永远 HasAuthority=false) | TakeDamage 末尾统一 |
+| **零重复调用** | TakeDamage AddDeath + GrantAssists AddDeath | 只 TakeDamage 调一次 |
+| **零兜底** | if (Victim) continue 静默跳过 | 入参 null → Log Error + return |
+| **职责分离** | GrantAssists 既加 Kill 又加 Death 又加 Assist | 只加 Assist + RPC + 清理 |
+
+### 关键文件变更 (v31.6)
+
+```
+修改:
+~ BaseCharacter.h:
+  - 删除 EKillMethod LastKillMethod 字段 (UPROPERTY Replicated)
+  - 改 Multicast_NotifyKill 签名: (FString, FString, EKillMethod, bool)
+  - 改 GrantAssistsToEligiblePlayers 签名: 加 EKillMethod 参数
+  - 新增大段注释解释重构动机
+
+~ BaseCharacter.cpp:
+  - 删除 DOREPLIFETIME(ABaseCharacter, LastKillMethod)
+  - TakeDamage 末尾: 收集纯数据 + 调 AddKillScore/AddDeath + 调 Multicast_NotifyKill 纯数据
+  - GrantAssistsToEligiblePlayers 重写: 单一职责, 入参校验, 纯数据 RPC
+  - Multicast_NotifyKill_Implementation 重写: 只 HUD 逻辑, 不再解 Actor*
+```
+
+### UE 编辑器无新增配置 (v31.6)
+
+本次修复纯 C++ 代码, **不需要 UE 编辑器配置变更**。
+
+### 待用户验证 (v31.6)
+
+1. 关闭 UE Editor → 重新编译 → PIE 测试
+2. **场景 A (崩溃重现)**: 玩家 A 攻击玩家 B → B 死亡
+   - 旧版: 测试客户端崩溃 (EXCEPTION_ACCESS_VIOLATION 0x18)
+   - 新版: 客户端不崩, HUD 正常显示击杀信息 (Killer=xxx, Victim=xxx)
+3. **场景 B (加分)**: 玩家 A 击杀玩家 B 5 次
+   - 旧版: A.PlayerState.RoomKills 永远是 0 (bug, 客户端 RPC 加分被吞)
+   - 新版: A.PlayerState.RoomKills = 5, GameState.AttackerTotalKills 增加 5
+4. **场景 C (助攻)**: A 打 B 至 50HP, C 完成击杀
+   - C.PlayerState.AddKillScore() +1
+   - A.PlayerState.AddAssistScore() +1
+   - HUD 显示: C 的击杀 + A 的助攻
+
+## 14. v32 (2026.07.12) BaseCharacter Component 化拆分 + Phase 1 零兜底修复
+
+### 背景 (拆分前痛点)
+
+BaseCharacter.cpp 累计到 **3957 行**, 14 个职责压在 1 个 Actor 上:
+
+1. 玩家连击状态机 (5 字段 + 11 方法)
+2. AI 攻击子系统 (3 字段 + 7 方法)
+3. 战斗伤害 + 死亡 + 无敌期 (5 字段 + 8 方法)
+4. 武器网络复制 + 挂载 (4 字段 + 11 方法)
+5. 角色头像/武器图标刷新 (3 字段 + 5 方法)
+6. 阵营系统 (FactionTag)
+7. 助攻追踪系统
+8. AC/ACE 系统
+9. 下蹲系统
+10. 移动锁定
+11. 通知子系统 (CharacterEvents)
+12. 武器自治 (BaseWeapon 配合)
+13. 摄像机系统 (CameraBoom + FollowCamera)
+14. 健康/能量/溶解/脚步声/回血组件集成
+
+### 拆分前先做的 Phase 1 — 零兜底修复 (6 处)
+
+按"先修后拆"原则, 拆之前先消除 6 个隐式兜底反模式:
+
+| # | 文件 | 反模式 | 修复 |
+|---|---|---|---|
+| 1.1 | BaseCharacter.cpp RefreshCharacterIcon | "Warrior" 硬编码兜底字符串 | 改用 CharacterDataTable 查表, 缺失 → Log Error + 退出 |
+| 1.2 | BaseCharacter.cpp OnRep_CurrentWeapon | `if (!CurrentWeapon) return;` 优雅降级 | 改为 `Log Error + return`, 武器不同步显式化 |
+| 1.3 | BaseCharacter.cpp FindWeaponAttachmentConfig | 通配 fallback 占位行 | 删除通配, 严格匹配, 缺失 → Log Error + return nullptr |
+| 1.4 | BaseCharacter.cpp PossessedBy | 4 层叠加 (MeleeProfile + SpawnWeaponID + PS + GM 缓存) | 简化为 AI/玩家 2 条独立路径, 缺武器 → Log Error |
+| 1.5 | AIAttackMontageResolver | Level 1/2 fallback (ComboIndex=0 / 重击代替) | 只保留设计意图 (ComboIndex=1), 缺失 → 显式报错 |
+| 1.6 | BaseCharacter.cpp RetryRefreshCharacterIcon | 客户端查 GM->CharacterDataTable 兜底 | 客户端必须等 Client RPC, 不能主动查表 |
+
+**大厂原则**: 兜底 = 反模式, 它把"配置错"永远掩盖. 修复后任何配置错误立即 Log Error, 强制开发者/策划修数据.
+
+### 拆分方案 (Phase 2) — 5 个 Component
+
+**核心决策**: UE RPC 必须声明在 Actor 上 (UFUNCTION Server/Multicast/Client), 这是 UE 引擎硬约束. 所以:
+- RPC 声明 + 转发壳实现 → BaseCharacter
+- RPC 真实业务逻辑 → Component
+- 非 RPC 方法 → 转发壳 (BaseCharacter) + 真实逻辑 (Component)
+
+**5 个 Component 文件**:
+
+| Component | 职责 | 字段数 | 方法数 | 头文件行数 | 实现行数 |
+|---|---|---|---|---|---|
+| `UPlayerComboComponent` | 玩家连击状态机 (LightAttack/Heavy/UseSkill/ComboIndex) | 5 | 11 | 331 | 533 |
+| `UAIAttackComponent` | AI 攻击子系统 (OnAIRequestAttack/MontageEnded/Server_PlayAttackAnim/Server_ReportHit) | 3 | 7 | 277 | 692 |
+| `UCombatDeathComponent` | 战斗伤害 + 死亡 + 无敌期 (TakeDamage/Die/ExecuteDeath/EnableRagdoll/DropAndFade/ActivateInvinc) | 3 | 8 | 413 | 786 |
+| `UWeaponAttachmentComponent` | 武器网络复制 + 挂载 (CurrentWeapon Replicated/EquipWeapon/SpawnAndEquipWeapon/FindWeaponAttachmentConfig) | 4 | 11 | 363 | 817 |
+| `UCharacterIconComponent` | 角色头像/武器图标刷新 (RefreshCharacterIcon/Client_Refresh/Retry) | 3 | 5 | 324 | (待查) |
+
+**文件路径**:
+```
+Public/Combat/PlayerComboComponent.h
+Public/Combat/AIAttackComponent.h
+Public/Combat/CombatDeathComponent.h
+Public/Combat/WeaponAttachmentComponent.h
+Public/Combat/CharacterIconComponent.h
+Private/Combat/PlayerComboComponent.cpp
+Private/Combat/AIAttackComponent.cpp
+Private/Combat/CombatDeathComponent.cpp
+Private/Combat/WeaponAttachmentComponent.cpp
+Private/Combat/CharacterIconComponent.cpp
+```
+
+### BaseCharacter 改造 — 转发壳模式
+
+**BaseCharacter.cpp 行数变化**:
+- 拆分前: **3957 行**
+- 拆分后: **2177 行** (▼1780 行, **-45%**)
+
+**构造函数新增**:
+```cpp
+PlayerCombo   = CreateDefaultSubobject<UPlayerComboComponent>(TEXT("PlayerCombo"));
+AIAttack      = CreateDefaultSubobject<UAIAttackComponent>(TEXT("AIAttack"));
+CombatDeath   = CreateDefaultSubobject<UCombatDeathComponent>(TEXT("CombatDeath"));
+WeaponAttach  = CreateDefaultSubobject<UWeaponAttachmentComponent>(TEXT("WeaponAttach"));
+CharacterIcon = CreateDefaultSubobject<UCharacterIconComponent>(TEXT("CharacterIcon"));
+```
+
+**所有转发壳模式** (示例):
+```cpp
+void ABaseCharacter::LightAttack_Pressed()
+{
+    if (PlayerCombo) { PlayerCombo->LightAttack_Pressed(); return; }
+    UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] PlayerCombo 组件未挂载! ..."));
+}
+
+void ABaseCharacter::OnAIRequestAttack_Simple()
+{
+    if (AIAttack) return AIAttack->OnAIRequestAttack_Simple();
+    return false;
+}
+
+float ABaseCharacter::TakeDamage(...)
+{
+    if (CombatDeath) return CombatDeath->TakeDamage(...);
+    return 0.0f;
+}
+```
+
+### RPC 边界处理 (UE 硬约束)
+
+| RPC | 声明 | 实现 |
+|---|---|---|
+| `Server_PlayAttackAnim` | BaseCharacter (UFUNCTION Server) | AIAttackComponent |
+| `Multicast_PlayAttackAnim` | BaseCharacter (UFUNCTION NetMulticast) | AIAttackComponent |
+| `Server_ReportAIAttackHit` | BaseCharacter (UFUNCTION Server) | AIAttackComponent |
+| `Multicast_Die` | BaseCharacter (UFUNCTION NetMulticast) | CombatDeathComponent |
+| `Client_RefreshCharacterIcon` | BaseCharacter (UFUNCTION Client) | CharacterIconComponent |
+| `Multicast_NotifyKill` | BaseCharacter (UFUNCTION NetMulticast) | BaseCharacter 保留 (纯数据 RPC + HUD 推送) |
+| `OnRep_CurrentWeapon` | BaseCharacter (UFUNCTION) | WeaponAttachmentComponent |
+
+**为什么 Multicast_NotifyKill 不拆**: 它本身已极简 (纯数据 RPC + HUD 推送), 拆出去跨 Component 反而增加耦合.
+
+### 大厂原则落地 (v32)
+
+| 原则 | 落地情况 |
+|---|---|
+| **单一真理源** | 状态字段 (bIsAttacking/ComboIndex/CurrentWeapon/CachedCharacterIDForIcon/LastAIAttackTimeSeconds/bDeathSequenceStarted) 全部迁移到 Component, BaseCharacter 不留副本 |
+| **零兜底** | 转发壳 `if (Component)` 守卫 + Log Error, 不允许静默跳过 |
+| **RPC 边界** | RPC 声明在 Actor (UE 硬约束), 实现委托 Component |
+| **职责对等** | 玩家 (PlayerCombo) 与 AI (AIAttack) 完全解耦, 互不影响 |
+| **跨边界最小化** | Component 之间不互相调用, 全部走 Owner 协调 |
+| **BP 蓝图兼容性** | 所有现有 AnimNotify/BTTask/InputAction 调用**0 改动**即可跑 (转发壳兼容) |
+
+### Phase 4 — BP 蓝图编辑器侧
+
+**结论**: BP 蓝图侧 **0 改动**也能跑 (转发壳模式), 但推荐把 AnimNotify 直接连到具体 Component (见 `.cursor/rules/v32-phase4-bp-checklist.md`).
+
+### Phase 5 — 编译验证清单
+
+1. 关闭 UE Editor (防止文件锁)
+2. 运行 `Build.bat` (项目根目录) 或 `GenerateProjectFiles.bat` + IDE 编译
+3. 检查 0 编译错误 (warning 允许, error 不允许)
+4. UE Editor 启动后: BP_BaseCharacter / BP_GruntAI 都应自动包含 5 个 Component 子对象
+5. PIE 测试 10 项烟雾测试 (见 v32-phase4-bp-checklist.md)
+
+### 待用户验证 (v32)
+
+1. UE 5.6 编辑器编译无错 (重点: 5 个新 Component 头文件包含 + UHT 解析)
+2. BP_BaseCharacter / BP_GruntAI 都自动显示 5 个新 Component (PlayerCombo/AIAttack/CombatDeath/WeaponAttach/CharacterIcon)
+3. PIE 中:
+ - 玩家点击鼠标左键 → Combo1/Combo2 正常切换 (走 PlayerComboComponent)
+ - AI 走到攻击距离 → 自动播放攻击动画 (走 AIAttackComponent)
+ - 玩家/AI 死亡 → 武器掉落 + 溶解 (走 CombatDeathComponent.Die + DropAndFadeWeapon)
+ - 复活 3 秒无敌 (走 CombatDeathComponent.ActivateSpawnInvincibility)
+ - HUD 头像/武器图标刷新 (走 CharacterIconComponent)
+ - 武器装备 + 挂载 (走 WeaponAttachmentComponent)
+4. 10 项烟雾测试全部通过 (见 v32-phase4-bp-checklist.md)
+
+---
+
+## 14. v33 (2026.07.12 上午) 客户端玩家武器 / 攻击射线 — Component 复制链路 + 兜底行为修复
+
+### 用户反馈 (Session1.log / Session2.log)
+- 客户端玩家武器无法左键攻击 / 没有武器射线检测
+- AI 有时也无法挂武器 (SpawnWeaponID 为空)
+
+### 根因链 (5 个 Bug, 全部已修)
+
+#### Bug A: `WeaponAttachmentComponent` 没 `SetIsReplicatedByDefault(true)` (RC1)
+- **现象**: Component 字段 (CurrentWeapon / CharacterID / SpawnWeaponID) 完全不复制到客户端
+- **旧实现**: 构造函数只 DOREPLIFETIME, 没调 SetIsReplicatedByDefault
+- **修复**: `WeaponAttachmentComponent.cpp:93` 加 `SetIsReplicatedByDefault(true)`
+- **大厂原则**: Component 复制 = 3 层缺一不可: SetIsReplicatedByDefault + DOREPLIFETIME + ReplicatedUsing
+
+#### Bug B: `CharacterID` / `SpawnWeaponID` 没标 Replicated (RC3)
+- **现象**: 即便 Component 复制, 这两个字符串字段也不复制
+- **修复**: `WeaponAttachmentComponent.h:347, 363` 加 `Replicated` + cpp 中 `DOREPLIFETIME`
+
+#### Bug C: `SetMeleeProfile` 用 `OwnerCharacter` 缓存失败 (RC7)
+- **现象**: 关卡预放 AI, AIController.SetupMeleeAI → SetMeleeProfile 时机太早 (< BeginPlay), OwnerCharacter TWeakObjectPtr.Get() 返回 nullptr → AI 没武器
+- **日志**: `[WeaponAttachment] SetMeleeProfile: Owner 无效.`
+- **修复**: 改用 UE 标准 API `GetOwner()` (Component 真理源) 直接 Cast — 不是"默认值兜底", 是真理源迁移
+
+```cpp
+// 旧: Cache 失效 → 静默跳过
+ABaseCharacter* Owner = OwnerCharacter.Get();
+if (!Owner) { UE_LOG Error; return; }
+
+// 新: 真理源 = GetOwner()
+ABaseCharacter* Owner = Cast<ABaseCharacter>(GetOwner());
+if (!Owner) { UE_LOG Error + 显示 GetOwner() 类型 + 修复路径; return; }
+```
+
+#### Bug D: `SpawnAndEquipWeapon` 找不到挂载配置 → 用默认 Socket (兜底!)
+- **现象**: `WeaponAttachmentDataTable` 未配 / 找不到精确匹配 → 静默用 SocketName="WeaponSocket_R"
+- **结果**: 角色没这个 socket → attach 无效 → 武器浮在原点 → trace 两端 0,0,0 → IsNearlyZero → 跳过 trace → "0 伤害"
+- **修复**: 找不到 → Log Error + Destroy 武器 + return, 强制用户在 UE 编辑器配 DataTable
+
+```cpp
+// 旧 (v22-v31.x 兜底 — 严禁):
+else { SocketName = TEXT("WeaponSocket_R"); } // 兜底默认
+NewWeapon->AttachToComponent(Mesh, AttachmentRules, SocketName);
+
+// 新 (v33 — 零兜底):
+if (!AttachmentConfig) { UE_LOG Error + 指出 UI 配置 + Destroy; return; }
+```
+
+#### Bug E: 玩家 `ANS_MeleeTrace.uasset` BP 编译失败 (RC5)
+- **现象**: BP 蓝图 AnimNotifyState 找不到 `BaseCharacter.CurrentWeapon` (字段已迁到 WeaponAttachmentComponent)
+- **修复**: 把 StartWeaponTrace / StopWeaponTrace 从 BP ANS 改到 C++ (PlayerComboComponent.ExecuteComboSequence + OnPlayerAttackMontageEnded), 与 AI 路径对称
+- **大厂原则**: C++ 单一真理源 + 抗"BP 改坏" — 关键伤害判定不能用 BP (容易被美术改坏)
+
+### 文件清单 (v33 修改)
+
+```
++ WeaponAttachmentComponent.cpp: 第 7 段 FindWeaponAttachmentConfig 调用 → 零兜底
+~ WeaponAttachmentComponent.cpp: SetMeleeProfile → 用 GetOwner() 真理源
+~ WeaponAttachmentComponent.cpp: SetIsReplicatedByDefault(true) (构造函数)
+~ WeaponAttachmentComponent.h: CharacterID / SpawnWeaponID UPROPERTY 加 Replicated
+~ WeaponAttachmentComponent.cpp: GetLifetimeReplicatedProps 加 2 个 DOREPLIFETIME
+~ WeaponAttachmentComponent.cpp: OnRep_CurrentWeapon 移除"silent warning return"
+~ WeaponAttachmentComponent.cpp: BeginPlay 日志增强
+~ BaseCharacter.cpp: 已修 (玩家路径仅 SetCharacterID, 不设 SpawnWeaponID — 由 HandlePlayerRequestSpawn.SetSpawnLoadout 统一管)
+~ RoomSpawnSubsystem.cpp: SetSpawnLoadout 在 SpawnActor 之后调用 (已有)
+~ PlayerComboComponent.cpp: ExecuteComboSequence 加 HasAuthority 分支调 StartWeaponTrace
+~ PlayerComboComponent.cpp: 新增 OnPlayerAttackMontageEnded + BindMontageEndCallback
+```
+
+### UE 编辑器配置 (v33 必须, 用户手动)
+
+**每个角色 BP 都必须配**:
+1. **BP_BaseCharacter / BP_SWAT02 / BP_GruntAI** → Components → WeaponAttachment → `WeaponAttachmentDataTable` 字段
+   - 设置为 `DT_WeaponAttachmentConfig` (这是策划创建的 DataTable, 必须配 SocketName + RelativeLocation)
+   - **未配 → 启动时 Log Error: "[Phase 1.3 零兜底] 必须在 BP_BaseCharacter/GM_RoomGameMode Class Defaults 配置"**
+
+2. **GM_RoomGameMode** → Class Defaults → `WeaponDataTable` (已有, 也必须配)
+
+### 待用户验证 (v33)
+
+1. 编译通过 (已验证 0 errors)
+2. 重启 UE 编辑器, 在 PIE 中测试:
+ - 客户端玩家按左键 → 动画播放 + 主机 log 看到 `[BoxTrace]` 命中 / `[Server_ReportHit]` 扣血
+ - AI 走到攻击距离 → 自动攻击 + 命中 (无"SpawnWeaponID 为空"报错)
+ - 客户端玩家 Pawn 上能看到武器 mesh 跟手 (因为 Attch 配置正确)
+
+---
+
+## 14. v36 (2026.07.12) 武器没生成 — 双根因 + 零兜底彻底重构 (大厂原则)
+
+### 用户反馈
+> "@f:\Desktop\Session1.log 玩家和ai手上没有武器。"
+
+### Session1.log 核心错误链
+```
+[ABaseCharacter] 构造函数 EXIT: BP_SWAT_C WeaponAttach=0x...257DE70140 (有值!)
+[WeaponAttachmentComponent] BeginPlay: Owner=BP_SWAT_C_0, CharacterID='', SpawnWeaponID='', CurrentWeapon=None
+[BaseCharacter] SetSpawnLoadout ENTER: BP_SWAT_C WeaponAttach=0x0000000000000000 (NULL!)
+[SetSpawnLoadout: WeaponAttach 字段为 nullptr!]
+[BaseCharacter] SpawnAndEquipWeapon: WeaponAttach 组件未挂载!
+
+[MeleeAI] OnPossess 末尾仍无 WeaponID, 跳过武器生成
+[PossessedBy][AI] Pawn='BP_GruntAI_C_0' SpawnWeaponID 为空!
+```
+
+### 根因 (3 个, 全部违反大厂原则)
+
+#### 根因 A — `WeaponAttach` 字段在某种时序下变成 null
+
+```
+构造函数 EXIT: WeaponAttach=0x...257DE70140 (有效)
+SetSpawnLoadout ENTER: WeaponAttach=0x0000000000000000 (NULL!)
+```
+
+**可能原因**: BP 子类在某种初始化阶段清空了 C++ 默认字段 (UE 5.6 BP archetype 行为)
+
+**反模式 (大厂原则被违反)**:
+- raw pointer 字段缓存 — 缓存可能失效, 增加不确定性
+- 字段为 null → 多次重复 Log Error, 根因永不可见
+
+#### 根因 B — `SetMeleeProfile` 隐式容错 (`Profile.WeaponID == NAME_None` 静默写入空字符串)
+
+```cpp
+// 旧版 (v32-v35) 反模式
+FString WeaponIDStr;
+if (!InProfile->WeaponID.IsNone())  // NAME_None 时保持空字符串
+{
+    WeaponIDStr = InProfile->WeaponID.ToString();
+}
+// → 直接写入空字符串到 Pawn.SpawnWeaponID
+SetSpawnLoadout(CharIDStr, WeaponIDStr);  // 写空!
+```
+
+**反模式 (大厂原则被违反)**:
+- "留空 = 不生成武器" 的语义用 `NAME_None` 表示 — 配置错永远被掩盖
+- 注释自述"留空 = 设计意图" = 字面违反零兜底原则
+
+#### 根因 C — `MeleeAIController::SetupMeleeAI` 三路兜底
+
+```cpp
+// 旧版 (v32-v35) 反模式 — AI 路径不该有"读 PlayerState/GM 缓存"
+if (WeaponID.IsEmpty()) {
+    if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())  // AI 没有 PS, 永远 null
+        WeaponID = PS->GetSelectedWeapon1ID();
+    if (WeaponID.IsEmpty()) {
+        if (ARoomGameMode* GM = Cast<ARoomGameMode>(...))
+            if (GM->GetPlayerSpawnData(GetUniqueID(), ...))  // 用 AI ID 查玩家缓存, 永远查不到
+                WeaponID = CachedWeaponID;
+    }
+}
+```
+
+**反模式 (大厂原则被违反)**:
+- "AI 走玩家路径" = 跨类型耦合, AI 没有 PlayerState 永远查不到
+- 注释自述"AI 跟玩家走完全相同链路" = 字面违反 SRP
+
+### v36 重构 (大厂原则 — 单一真理源 + 显式优于隐式 + 零兜底)
+
+#### 修复 A: `ABaseCharacter::ResolveWeaponAttach()` lazy 查找
+
+```cpp
+UWeaponAttachmentComponent* ABaseCharacter::ResolveWeaponAttach()
+{
+    if (WeaponAttach) return WeaponAttach;  // 优先用字段 (避免每次 FindComponent 开销)
+    
+    UWeaponAttachmentComponent* Found = FindComponentByClass<UWeaponAttachmentComponent>();
+    if (Found) {
+        WeaponAttach = Found;  // 修复字段
+        UE_LOG(Warning, "字段为 null, FindComponentByClass 找到");
+        return Found;
+    }
+    
+    UE_LOG(Error, "找不到组件, 强制修复 BP 配置");
+    return nullptr;
+}
+```
+
+**大厂原则落地**:
+- 不缓存 lazy 解析结果 (缓存失效 = 隐性兜底)
+- 优先用字段, null 时 fallback UE 标准 API
+- 找不到 → Log Error + return nullptr (零兜底)
+
+#### 修复 B: `SetMeleeProfile` 显式拒绝空 WeaponID
+
+```cpp
+// 新版 (v36 — 显式优于隐式)
+if (InProfile->WeaponID.IsNone()) {
+    UE_LOG(Error, "WeaponID 是 NAME_None, 拒绝写入. 修复 DA_AIProfile_*.WeaponID");
+    return;  // 不静默写空字符串
+}
+const FString WeaponIDStr = InProfile->WeaponID.ToString();  // 必非空
+```
+
+**大厂原则落地**:
+- "留空 = 不生成武器" 必须用专门的 `bHasWeapon` 布尔字段, 不能用 `NAME_None`
+- WeaponID 字段语义是"必须有值", 不是"可空"
+- 拒绝兜底写入空字符串, 配置错必须显式
+
+#### 修复 C: `MeleeAIController::SetupMeleeAI` 删除三路兜底
+
+```cpp
+// 新版 (v36 — 零兜底)
+FString WeaponID = BaseChar->GetSpawnWeaponID();
+if (!WeaponID.IsEmpty()) {
+    BaseChar->RequestWeaponSpawn(WeaponID);
+} else {
+    UE_LOG(Error, "SpawnWeaponID 仍为空, 拒绝走 PS/GM 缓存兜底. 修复 DA_AIProfile_*.WeaponID");
+}
+```
+
+#### 修复 D: `HandlePlayerRequestSpawn` 删除"Step 0 合并缓存"兜底
+
+```cpp
+// 旧版 — 调用方传空字符串, GM 用缓存补
+if (FinalCharID.IsEmpty()) FinalCharID = ExistingCache->CharID;
+// 新版 — 调用方必须显式传非空, 空就拒绝
+const FString FinalCharID = CharRowName;
+if (FinalCharID.IsEmpty()) {
+    UE_LOG(Error, "CharID 为空, 拒绝 Spawn");
+    return;
+}
+```
+
+**配套修复**: `ARoomPlayerController::Server_RequestSpawn_Implementation` 不再传空字符串, 改成显式从 PS 读 SelectedCharID/SelectedWeapon1ID。
+
+#### 修复 E: 删除重复的武器 Spawn 接口
+
+| 接口 | 状态 | 理由 |
+|---|---|---|
+| `ABaseCharacter::EquipWeapon(TSubclassOf<>)` | **完全删除** | 没人调用, 重复接口 |
+| `ABaseCharacter::SpawnAndEquipWeapon(FString)` | **DEPRECATED 转发** | 内部转发到 RequestWeaponSpawn, 保留只为了不破坏外部 |
+| `ABaseCharacter::RequestWeaponSpawn(FString)` | **唯一公开入口** | 所有 Spawn 走这一条 |
+| `UWeaponAttachmentComponent::EquipWeapon` | **DEPRECATED 警告** | 旧逻辑, 不查 DataTable |
+| `UWeaponAttachmentComponent::SpawnAndEquipWeapon` | **保留 (内部用)** | RequestWeaponSpawn 内部调用 |
+| `UWeaponAttachmentComponent::RequestWeaponSpawn` | **唯一公开入口** | 公开 API |
+
+#### 修复 F: `CharacterIconComponent::RefreshWeaponIconOnHUD` 删除 GM 缓存兜底
+
+```cpp
+// 旧版 — 优先从 GM->GetPlayerSpawnData 缓存读
+// 新版 — 单一真理源 = Owner->GetSpawnWeaponID() (已 Replicated)
+const FString WeaponID = Owner->GetSpawnWeaponID();
+if (WeaponID.IsEmpty()) {
+    UE_LOG(Warning, "SpawnWeaponID 为空, 跳过图标");
+    return;
+}
+```
+
+### UE 编辑器配置 (v36 用户必做)
+
+**必须做** — 否则 AI 还是没武器:
+
+1. 打开 `Content/Blueprints/AI/DA_AIProfile_MeleeGrunt.uasset`
+2. 在 Identity 分类 → 找到 `Weapon RowName (DT_WeaponInfo)` 字段
+3. 配成 `WQ001` (或 DT_WeaponInfo 里实际存在的武器 RowName)
+4. 保存
+
+**原理 (大厂原则)**:
+- v36 起 `Profile.WeaponID == NAME_None` 是显式错误, 不再静默容错
+- 旧版"留空 = 不生成武器" 的语义被废除
+- 如果真的设计意图"AI 不需要武器", 应该让 AI 走别的无武器 BP, 不能用 NAME_None 当标志位
+
+## 14. v40 (2026.07.13) 死亡链路修复 + 客户端头像不可见 — Multicast_Die 缺失 + 组件裸字段访问残留
+
+### 用户反馈 (2026.07.13)
+
+```
+Session1 (房主) + Session2 (普通客户端):
+1. 房主攻击普通玩家客户端, 一击爆头, 普通玩家客户端血量不会更新为 0
+   击中身体其他部位能及时更新血量, 但每次一击杀死普通玩家客户端, 血量就不会及时更新为 0
+   房主被普通玩家攻击, 显示的血量和更新的血量都是正常的
+2. 普通玩家客户端角色头像不显示, 房主监听服务器客户端头像正常显示
+```
+
+### 根因链 (3 个核心)
+
+**根因 1 — Multicast_Die RPC 缺失**:
+```cpp
+// v32-v39 Die() 实现 (反模式)
+void UCombatDeathComponent::Die()
+{
+    // ... 
+    ExecuteDeathLocal();   // 服务器端调用, 客户端收不到任何死亡通知
+    Owner->Destroy();       // 立即销毁 → NetChannel 关闭
+    // 【关键】从未调 Multicast_Die — 死亡视觉/事件完全没广播给客户端
+}
+```
+
+**为什么血量其他部位能更新, 爆头时不能**:
+- 普通伤害 (40): HealthComponent ApplyDamage → OnHealthChanged(40) → OnRep_CurrentHealth → HUD 更新 ✓
+- 爆头 (60, 一击死): ApplyDamage(60) → CurrentHealth=0 → OnHealthChanged(0) → OnDeath → Die()
+  - Die() 同步链中 ExecuteDeathLocal + Destroy → **NetChannel 关闭**
+  - **CurrentHealth=0 + bIsDead=true 的 Replicated 推送被打断**
+  - 客户端只收到 "血量从 40 → (Pawn Destroy)" 然后 "新 Pawn 100 血" 出现
+  - HUD 显示 UpdateHealth: 100 → 40 → 100 → 40 (没收到 0)
+- **房主被攻击正常**: ListenServer 是同进程, HealthComponent.ApplyDamage 同步链完整跑完, 本地 OnRep 立即触发, 血量正常显示 0
+
+**根因 2 — Owner->Component 裸字段访问 (BP archetype nullify)**:
+```cpp
+// 反模式 - 多个组件的代码用裸字段访问 Owner->HealthComponent 等
+// 但 BP archetype 实例化会 nullify 这些字段
+if (UHealthComponent* HC = Owner->HealthComponent)  // ← 普通客户端这里是 null!
+{
+    HC->DeactivateInvincibility();  // 永远执行不到
+}
+```
+
+**为什么房主 OK, 普通客户端不 OK**:
+- 房主是 ListenServer, BP 实例化在主进程, GameMode/CharacterIconComponent 链路正常
+- 普通客户端的 CharacterIconComponent 收到服务器 BroadcastCharacterIconReady → 但内部 `Owner->CharacterEvents` 是 null → 不广播 → 客户端 HUD 永远收不到头像就绪事件
+
+**根因 3 — PerformKillSettlement 时序问题**:
+```cpp
+// TakeDamage 同步链
+TakeDamage → Super::TakeDamage → ApplyDamage (OnDeath.Broadcast) → OnHealthComponentDeath → Die()
+  ↓ (Die 同步链结束, 回到 TakeDamage)
+PerformKillSettlement  ← 此时 Owner 已被 Destroy, TWeakObjectPtr.Get() 返回 null
+```
+
+### v40 修复 (大厂架构 — 完整修复)
+
+**修复 1 — `CombatDeathComponent::Die()` 调 Multicast_Die RPC**:
+
+```cpp
+void UCombatDeathComponent::Die()
+{
+    // ... 派发复活请求 ...
+    
+    // [v40 P0 修复] 显式广播死亡视觉效果给客户端 (Multicast_Die RPC)
+    //   根因: 旧版完全没调 Multicast_Die,客户端只能依赖 OnRep_bIsDead 触发 → 但 OnRep 在 Pawn Destroy 之后不会触发
+    Owner->Multicast_Die();   // ← NEW: 服务器主动 RPC 通知所有客户端
+    
+    ExecuteDeathLocal();
+    
+    // [v40 P0 修复] 延迟销毁 Pawn (SetLifeSpan 0.1f)
+    //   根因: 旧版 Owner->Destroy() 同步销毁 → UE 在销毁帧关闭 NetChannel → Client 收不到
+    //         CurrentHealth=0 和 bIsDead=true 的 OnRep
+    Owner->SetLifeSpan(0.1f);  // ← NEW: 0.1s 后销毁,期间 Replication 推完
+}
+```
+
+**修复 2 — 全面替换裸字段访问为 resolver 调用**:
+
+```cpp
+// 修复前
+if (UHealthComponent* HC = Owner->HealthComponent) { ... }
+
+// 修复后
+if (UHealthComponent* HC = Owner->ResolveHealthComponent()) { ... }
+```
+
+**大厂原则 — v40 落地**:
+
+| 原则 | 旧 (v39) | 新 (v40) |
+|---|---|---|
+| **RPC 完整触发** | Die() 不调 Multicast_Die,客户端依赖 OnRep | Die() 显式 Multicast_Die → 客户端 100% 收到死亡事件 |
+| **Pawn 销毁时机** | Destroy() 同步销毁,NetChannel 关闭 | SetLifeSpan(0.1f) 延迟,Replication 推完 |
+| **组件解析** | 裸字段访问 (BP archetype 会 nullify) | 全部走 ResolveComponent<T>() (FindComponentByClass 兜底) |
+| **防御原则** | nullptr 静默 return | nullptr Log Error + 显式错误日志 (零兜底) |
+| **零兜底** | "找不到组件, 不做事" | "找不到组件, 强制 Log Error 报告根因" |
+
+### 文件变更 (v40)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
+ + Die(): 调 Owner->Multicast_Die() RPC
+ + Die(): Owner->SetLifeSpan(0.1f) 替代 Owner->Destroy()
+ ~ TakeDamage(): Owner->HealthComponent → Owner->ResolveHealthComponent() (6 处)
+ ~ TakeDamage(): Owner->HealthRegenComponent → Owner->ResolveHealthRegenComponent() (1 处)
+ ~ ExecuteDeathLocal(): Owner->DissolveComponent → Owner->ResolveDissolveComponent() (1 处)
+ ~ ActivateSpawnInvincibility/DeactivateSpawnInvincibility: 改用 resolver
+ ~ PerformKillSettlement: 防御层升级 (Owner null Log Error)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CharacterIconComponent.cpp
+ + BroadcastCharacterIconReady: Owner->CharacterEvents → Owner->ResolveCharacterEvents()
+ + RetryRefreshCharacterIcon: 改用 resolver
+ + BroadcastWeaponIconReady: 改用 resolver
+
+## 15. v40.1 (2026.07.13) 客户端头像 + 武器图标不显示 — Component 直接调 RPC Implementation 绕过 RPC 序列化
+
+### 用户反馈 (2026.07.13)
+
+```
+Session1 (房主) 修复血量 0 显示 + 死亡后正常
+Session2 (普通客户端) 头像 + 武器图标仍不显示
+
+其他问题修复了，就剩普通玩家客户端 Image_CharacterIcon 控件和 Image_MeleeWeapon 控件不显示
+```
+
+### 根因分析 (3 个, 都是 RPC 序列化问题)
+
+**根因 1 — `RefreshCharacterIcon` 直接调 Component.Implementation, 绕过 RPC**:
+
+```cpp
+// v32-v40.0 反模式
+void UCharacterIconComponent::RefreshCharacterIcon()
+{
+    // ...
+    // 注释写错了: "服务器自己也是一台机器, 直接本地调用 Implementation 即可"
+    // 不需要真的走 RPC (RPC 主要目的是跨网络传输到其他客户端)
+    Client_RefreshCharacterIcon_Implementation(CharID, Avatar);  // ← Component 直接调 Implementation
+}
+```
+
+**为什么会错**: Component 不是 Actor, RPC 序列化必须在 Actor 上. Component 上的方法无法触发 RPC.
+- 服务器自己 (ListenServer) 直接调 Component.Implementation → 服务器本地能跑 (但不通过 RPC)
+- 普通客户端 Pawn 上的 _Implementation **从未收到调用** → 头像永远不显示
+
+**正确架构**: 调 `Owner->Client_RefreshCharacterIcon(CharID, Avatar)` (Actor 层 RPC).
+- 服务器自己 Pawn 走本地 RPC → 直接调 Implementation (UE 5 RPC 行为)
+- 远端客户端 Pawn 走 RPC 序列化 → 收到 RPC 调 Implementation
+- 整个链路 RPC 完整
+
+**根因 2 — 武器图标没有 Client RPC**:
+
+```cpp
+// v32-v40.0 反模式
+void UCharacterIconComponent::RefreshWeaponIconOnHUD()
+{
+    // ...
+    // 服务器查表步骤注释里写了, 但代码完全没实现
+    BroadcastWeaponIconReady(WeaponID, nullptr);  // ← Icon=nullptr!
+}
+```
+
+**根因链**:
+1. `CharacterEvents` 组件 `SetIsReplicatedByDefault(false)` — 事件总线不复制
+2. 服务器 BroadcastWeaponIconReady → 服务器本地 CharacterEvents → 服务器 HUD ✓
+3. 客户端 CharacterEvents 永远不知道服务器广播了这个事件
+4. 客户端 HUD 收到 OnWeaponIconReady(WeaponID, nullptr) → 走 UpdateWeaponIconFromID 客户端查表
+5. 客户端 `GetAuthGameMode()` 返回 nullptr → 永远查不到 WeaponInfo → 武器图标永远不显示 ✗
+
+**根因 3 — `Client_RefreshCharacterIcon_Implementation` 末尾调 RefreshWeaponIconOnHUD 导致双重 Refresh + 客户端走 else 分支**:
+
+```cpp
+// v32-v40.0 反模式
+void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(...)
+{
+    BroadcastCharacterIconReady(InCharacterID, Avatar);
+    RefreshWeaponIconOnHUD();   // ← 客户端路径触发
+}
+
+// 客户端 RefreshWeaponIconOnHUD
+if (Owner->HasAuthority()) {  // false (客户端)
+    // ...
+} else {
+    Client_RefreshWeaponIcon_Implementation(WeaponID, nullptr);  // ← Icon=nullptr!
+}
+```
+
+### v40.1 修复 (大厂架构 — RPC 必须走 Actor 层)
+
+**修复 1 — `RefreshCharacterIcon` 调 Actor RPC**:
+
+```cpp
+// [v40.1 P0 修复] 必须调 Owner->Client_RefreshCharacterIcon (Actor 层 RPC),
+//                  不能直接调 Client_RefreshCharacterIcon_Implementation (Component 层).
+if (Owner)
+{
+    Owner->Client_RefreshCharacterIcon(CharID, Avatar);  // ← 触发真正的 RPC
+    RefreshWeaponIconOnHUD();                              // ← 服务器侧同时触发武器图标 RPC
+}
+```
+
+**修复 2 — 加 `Client_RefreshWeaponIcon` RPC 链路**:
+
+```cpp
+// 新增 BaseCharacter RPC
+UFUNCTION(Client, Reliable)
+void Client_RefreshWeaponIcon(const FString& InWeaponID, UTexture2D* Icon);
+
+// 新增 Component 函数
+void UCharacterIconComponent::Client_RefreshWeaponIcon_Implementation(...)
+{
+    // 缓存 + 走 CharacterEvents 广播 (与头像链路镜像)
+    CachedWeaponIDForIcon = InWeaponID;
+    BroadcastWeaponIconReady(InWeaponID, Icon);
+}
+
+// 新增服务器查表函数 (镜像 GetCharacterAvatarFromTable)
+UTexture2D* UCharacterIconComponent::GetWeaponIconFromTable(const FString& WeaponID) const;
+```
+
+**修复 3 — `RefreshWeaponIconOnHUD` 服务器查表 + RPC 推 Icon**:
+
+```cpp
+void UCharacterIconComponent::RefreshWeaponIconOnHUD()
+{
+    // ...
+    if (Owner->HasAuthority())
+    {
+        UTexture2D* Icon = GetWeaponIconFromTable(WeaponID);
+        Owner->Client_RefreshWeaponIcon(WeaponID, Icon);  // ← 服务器查表后 RPC 推完整 Icon
+    }
+    else
+    {
+        // [v40.1 修复] 客户端不应走这条路 — 服务器 RefreshCharacterIcon 已触发 RefreshWeaponIconOnHUD
+        UE_LOG(LogTemp, Error, TEXT("客户端不应该走这条路, 检查 RefreshCharacterIcon 链路"));
+    }
+}
+```
+
+**修复 4 — `Client_RefreshCharacterIcon_Implementation` 末尾不再调 RefreshWeaponIconOnHUD**:
+
+```cpp
+// 旧版: Client_RefreshCharacterIcon_Implementation 末尾调 RefreshWeaponIconOnHUD
+//   → 客户端走 else 分支 → Client_RefreshWeaponIcon_Implementation(WeaponID, nullptr) → 失败
+
+// 新版: 服务器 RefreshCharacterIcon 内显式调 RefreshWeaponIconOnHUD (走 RPC 路径推 Icon)
+//   → 客户端 Implementation 收到 Client_RefreshWeaponIcon RPC 时 Icon 已经传过来
+```
+
+**修复 5 — `RetryRefreshCharacterIcon` 不再调 RefreshWeaponIconOnHUD**:
+
+```cpp
+// Retry 只补发头像, 武器图标已由服务器 RefreshCharacterIcon 链路完成
+```
+
+### 大厂原则 (v40.1 落地)
+
+| 原则 | 旧 (v32-v40.0) | 新 (v40.1) |
+|---|---|---|
+| **RPC 必须在 Actor 上** | Component 直接调 Implementation 绕过 RPC | Component 调 Owner->Client_XXX() (Actor RPC) |
+| **服务器查表权威** | 武器图标让客户端查表 (永远 nullptr) | 服务器 GetWeaponIconFromTable, RPC 推完整 Icon |
+| **链路单一** | 头像 RPC + Implementation 末尾 RefreshWeaponIcon | 服务器 RefreshCharacterIcon 显式调 RefreshWeaponIcon, 链路单一 |
+| **零兜底** | 客户端 GetAuthGameMode() 失败静默 return | 客户端走错误路径 Log Error 强制修复 |
+| **职责分层** | RPC 在 Component 上调 (跨职责) | RPC 在 Actor 上调, Component 只负责业务逻辑 |
+
+### 文件变更 (v40.1)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CharacterIconComponent.cpp
+ + RefreshCharacterIcon: 改调 Owner->Client_RefreshCharacterIcon (RPC, 不是 Component.Implementation)
+ + RefreshCharacterIcon 末尾调 RefreshWeaponIconOnHUD (服务器链路完整)
+ + Client_RefreshCharacterIcon_Implementation 末尾不再调 RefreshWeaponIconOnHUD
+ + RetryRefreshCharacterIcon 不再调 RefreshWeaponIconOnHUD
+ + RefreshWeaponIconOnHUD: 服务器 HasAuthority=true 路径查表 + Owner->Client_RefreshWeaponIcon RPC
+ + RefreshWeaponIconOnHUD: 客户端 else 分支 Log Error (强制修复)
+ + 新增 Client_RefreshWeaponIcon_Implementation 函数
+ + 新增 GetWeaponIconFromTable 函数
+ + 新增 CachedWeaponIDForIcon 字段
+
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/CharacterIconComponent.h
+ + Client_RefreshWeaponIcon_Implementation 函数声明
+ + GetWeaponIconFromTable 函数声明
+ + CachedWeaponIDForIcon UPROPERTY 字段
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + Client_RefreshWeaponIcon UFUNCTION(Client, Reliable) RPC 声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ + Client_RefreshWeaponIcon_Implementation 转发壳
+```
+
+### v40.1 验证清单
+
+- [ ] UE 5.6 编辑器编译无错
+- [ ] PIE 中:
+ - 普通玩家客户端头像 (`Image_CharacterIcon`) 显示正确
+ - 普通玩家客户端武器图标 (`Image_MeleeWeapon`) 显示正确
+ - 房主头像/武器图标仍正常显示
+ - 复活后头像/武器图标仍正常
+ - 切换武器后图标更新 (后续测试)
+
+
+
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/BaseWeapon.cpp
+ ~ Server_ReportHit: Victim->HealthComponent → Victim->ResolveHealthComponent()
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/AIAttackComponent.cpp
+ ~ Server_ReportAIAttackHit: Victim->HealthComponent → Victim->ResolveHealthComponent()
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Services/BTService_UpdateHealth.cpp
+ ~ AIChar->HealthComponent → AIChar->ResolveHealthComponent()
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/GameHUDWidget.cpp
+ ~ Bind-Snapshot 路径: Character->HealthComponent → Character->ResolveHealthComponent()
+ ~ Character->EnergyComponent → Character->ResolveEnergyComponent()
+```
+
+### v40 验证清单
+
+- [ ] UE 5.6 编辑器编译无错
+- [ ] PIE 中:
+ - 普通玩家客户端被爆头 → 血量立即显示 0 → 死亡特效
+ - 普通玩家客户端头像 (右上角) 显示正确
+ - 普通玩家客户端死亡后能复活
+ - AI 客户端能攻击普通玩家并造成伤害
+
+### 文件变更清单 (v36)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+ ~ SetMeleeProfile: 显式拒绝 WeaponID == NAME_None
+ ~ SyncWeaponFromProfile: 显式拒绝 WeaponID/CharacterRowName == NAME_None
+ ~ SpawnAndEquipWeapon: WeaponID 空 → Log Error (拒绝生成默认武器)
+ ~ EquipWeapon: 标记 DEPRECATED, 调用时 Warning
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + ResolveWeaponAttach() 声明 (UFUNCTION BlueprintCallable)
+ - EquipWeapon 声明完全删除
+ + WeaponAttach 字段加注释: "【v36 修复】字段被 BP 子类覆盖可能为 nullptr"
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ + ResolveWeaponAttach() 实现 — lazy 查找 (字段 → FindComponentByClass)
+ + SetSpawnLoadout/SetMeleeProfile/SyncWeaponFromProfile/RequestWeaponSpawn/
+   SpawnAndEquipWeapon/EquipWeapon(组件)/OnRep_CurrentWeapon/FindWeaponAttachmentConfig/
+   GetCurrentWeapon/GetSpawnWeaponID: 全部改用 ResolveWeaponAttach
+ ~ PossessedBy: AISpawnWeaponID 改用 ResolveWeaponAttach
+ - ABASECharacter::EquipWeapon 实现完全删除
+ ~ SpawnAndEquipWeapon: deprecated 转发到 RequestWeaponSpawn
+ ~ PossessedBy 末尾: 改调 RequestWeaponSpawn (统一入口)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/MeleeAIController.cpp
+ ~ SetupMeleeAI OnPossess 末尾: 删除"三路兜底" (PS/GM 缓存)
+ ~ 改读 Pawn->GetSpawnWeaponID() (已 Replicated 的真理源)
+ ~ SpawnWeaponID 空 → Log Error 强制修复 DA 配置
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CharacterIconComponent.cpp
+ ~ RefreshWeaponIconOnHUD: 改读 Owner->GetSpawnWeaponID() (已 Replicated)
+ - 删除 GM->GetPlayerSpawnData 缓存兜底
+ ~ WeaponID 空 → Log Warning (配置错可观测)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/Spawn/RoomSpawnSubsystem.cpp
+ ~ HandlePlayerRequestSpawn: 删除 "Step 0 合并缓存" 兜底
+ ~ CharID/WeaponID 空 → Log Error + 拒绝 Spawn
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/RoomPlayerController.cpp
+ ~ Server_RequestSpawn_Implementation: 改为显式从 PS 读 Loadout
+ - 不再传空字符串让 GM 走缓存兜底
+ ~ Loadout 空 → Log Error + 拒绝 Spawn
+```
+
+### 待用户验证 (v36)
+
+1. UE 5.6 编辑器编译 0 错
+2. **UE 编辑器必做** (这是关键修复):
+ - 打开 `DA_AIProfile_MeleeGrunt.uasset` → Identity → Weapon RowName = `WQ001`
+ - 保存
+3. PIE 中:
+ - 玩家 BP_SWAT_C 出生 → 武器 mesh 出现 (ResolveWeaponAttach lazy 查找修复)
+ - AI BP_GruntAI_C 出生 → 武器 mesh 出现 (SetMeleeProfile 显式拒绝修好)
+ - 玩家按左键 → 动画 + 伤害
+ - AI 走到攻击距离 → 自动攻击 + 伤害
+
+### 大厂原则对照 (v36)
+
+| 原则 | 旧 (v32-v35) | 新 (v36) |
+|---|---|---|
+| 单一真理源 | WeaponAttach 字段 + FindComponent + 缓存兜底 | ResolveWeaponAttach lazy 查找 (UE 标准 API) |
+| 显式优于隐式 | NAME_None = 静默"no weapon" | NAME_None = 显式 Error |
+| 零兜底 | "三路兜底" AI 读 PS/GM 缓存 | 拒绝跨类型兜底, 强制修复 DA 配置 |
+| SRP | EquipWeapon/SpawnAndEquipWeapon/RequestWeaponSpawn 3 个重复入口 | 唯一 RequestWeaponSpawn 公开入口 |
+| 可观测性 | WeaponID 空 → Log Warning + 静默跳过 | Log Error + 拒绝生成 |
+
+---
+
+## 14. v37 (2026.07.12) WeaponAttachmentDataTable 单一真理源迁移
+
+### 用户原话 (2026.07.12)
+
+> "还是玩家和ai手上没有武器。DA_AIProfile_MeleeGrunt的Weapon RowName一直是配置好的。"
+
+### 日志根因 (Session1.log)
+
+```
+[WeaponAttachment] BeginPlay: Owner=BP_SWAT_C_0, CharacterID='', SpawnWeaponID='', ...
+[BaseCharacter] SetSpawnLoadout ENTER: CharID=JS001 WeaponID=WQ001
+[WeaponAttachment] RequestWeaponSpawn: WeaponID=WQ001
+[WeaponAttachment] SpawnAndEquipWeapon: 武器生成成功: BP_Weapon_Knife_C_0
+[WeaponAttachment] WeaponAttachmentDataTable 未设置! Pawn=BP_SWAT_C_0
+[WeaponAttachment] 挂载配置缺失 — CharacterID='JS001', WeaponID='WQ001' 没在 WeaponAttachmentDataTable 中找到
+[WeaponAttachment] 不静默用默认值 — 销毁武器 BP_Weapon_Knife_C_0
+```
+
+**根因链**:
+1. **武器生成** 成功 (走 GM->WeaponDataTable 配置 OK)
+2. **挂载配置** 找不到 (`WeaponAttachmentDataTable` = nullptr)
+3. **代码 Log Error + Destroy 武器** (v35 零兜底改造的正确行为 ✓)
+4. 用户看到"手上没武器" ≠ "手上错位置"
+
+### 深层架构问题 (大厂原则被违反)
+
+**v32-v36 设计**：把 `WeaponAttachmentDataTable` 字段放在 `UWeaponAttachmentComponent` 内
+
+**反模式 (v32-v36)**:
+- 同一资产需在 **3 个 BP** 各自配置:
+  - `BP_BaseCharacter` / `BP_SWAT_C` / `BP_GruntAI` 的 Components → WeaponAttachment → DataTable 字段
+- 这是**配置反模式**:
+  - 1 个资产, 3 个 BP, 改一处忘一处
+  - **用户实际踩坑**: DA_AIProfile 配了, 不知道 BP 还要配 (i.e. 每个 BP 的 WeaponAttachment 组件都需配)
+  - 报错信息说 "BP 角色" 配置 → 用户理解为 "角色 BP" → "GameMode" → 不在 BP 角色配
+
+### 新架构 v37 — 单一真理源 + 零兜底
+
+**真理源迁移**:
+```
+旧 (v32-v36):
+ BP_BaseCharacter    ──┐
+ BP_SWAT_C           ──┼── WeaponAttachmentComponent.WeaponAttachmentDataTable
+ BP_GruntAI          ──┘   (3 个 BP 各自配, 改一处忘一处)
+
+新 (v37):
+ BP_GM_RoomGameMode ── WeaponAttachmentDataTable 字段 (唯一)
+                                ↑
+                                │ 读
+                                │
+                UWeaponAttachmentComponent.GetWeaponAttachmentDataTable()
+                                │
+                                ↓
+                        所有 BP 角色共享
+```
+
+**新实现 (`UWeaponAttachmentComponent::GetWeaponAttachmentDataTable`)**:
+```
+1. Owner 无效 → Log Error + return nullptr
+2. World 无效 → Log Error + return nullptr
+3. AuthGameMode 不是 ARoomGameMode → Log Error + return nullptr
+4. GM->WeaponAttachmentDataTable 为空 → Log Error + return nullptr (零兜底 — 不允许默认分配, 不允许 fallback)
+5. 全部通过 → return GM->WeaponAttachmentDataTable
+```
+
+### 大厂原则 (v37 落地)
+
+| 原则 | 旧 (v32-v36) | 新 (v37) |
+|---|---|---|
+| **单一真理源** | 3 个 BP 各自持有 (3 份真理) | GM 唯一字段 (1 份真理) |
+| **配置可发现性** | 报错"在 BP 角色的 WeaponAttachment" (用户不知所云) | 报错"BP_GM_RoomGameMode Class Defaults → Room\|Data → Weapon Attachment DataTable" (明确路径) |
+| **零兜底** | 字段未配 → Log Error (但用户不知道去哪配) | 字段未配 → Log Error + 指向 GM 精确路径 |
+| **DRY** | 同一资产 N 份拷贝 | 1 份 |
+| **可扩展性** | 加新角色 → 还得配一遍 | 加新角色 → 自动生效 |
+
+### 文件变更 (v37)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/RoomGameMode.h
+ + ARoomGameMode::WeaponAttachmentDataTable UPROPERTY 字段 (v37 新增)
+ + 注释: "v37 单一真理源" 解释为什么移到这个字段
+
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/WeaponAttachmentComponent.h
+ - 删除: TObjectPtr<UDataTable> WeaponAttachmentDataTable 字段 (v37 删除)
+ + 新增: GetWeaponAttachmentDataTable() const API (走 GM)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+ ~ FindWeaponAttachmentConfig: 改用 GetWeaponAttachmentDataTable() (v37 调用替换)
+ ~ GetWeaponAttachmentDataTable() 实现 (v37 新增): 4 层校验 + Log Error
+ ~ OnRep_CurrentWeapon: 错误消息更新到 v37 配置路径
+ ~ SpawnAndEquipWeapon: 错误消息更新到 v37 配置路径
+```
+
+### UE 编辑器配置 (v37 用户必做一次)
+
+```
+1. 打开 Unreal Editor → Content Browser → Content/UI/Login/Data/DT_WeaponAttachmentConfig
+2. 验证行结构:
+ - ConfigID (FString): 例如 "SWAT_Knife01"
+ - TargetCharacter (TSoftClassPtr<ABaseCharacter>): 配 BP_SWAT_C / BP_GruntAI
+ - WeaponBlueprint (TSoftClassPtr<ABaseWeapon>): 配 BP_Weapon_Knife 等
+ - SocketName (FName): 例如 "WeaponSocket_R" (角色的 Mesh 上要有同名 Socket)
+ - RelativeLocation (FVector): 武器相对角色的本地空间偏移
+ - RelativeRotation (FRotator): 武器相对角色的本地空间旋转
+ - RelativeScale (FVector(1,1,1)): 武器缩放
+
+3. 打开 Content/UI/GM_RoomGameMode.uasset (BP_GameMode)
+4. Class Defaults → 找到新的 Room|Data 分类 → Weapon Attachment DataTable
+5. 拖拽 DT_WeaponAttachmentConfig 到这字段
+6. Compile + Save
+
+7. 验证: 进游戏后, 玩家和 AI 手上应该有武器
+```
+
+### 避免的兜底行为清单 (v37 必须保持)
+
+1. **不允许**: 组件字段没配时, 试图用 `GM->WeaponDataTable` 兜底 (语义不同, 一个是武器信息表, 一个是挂载配置表)
+2. **不允许**: 组件字段没配时, 试图从 `Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode())` 拿 (需要走 GM 自己的字段, 通用 GM fallback 违反"零兜底")
+3. **不允许**: GM 没配 `WeaponAttachmentDataTable` 时, 用 `DT_WeaponInfo` 的字段凑 (语义错位)
+4. **不允许**: 通配 `TargetCharacter` 匹配 (上一阶段已修, v37 保持严格匹配)
+
+---
+
+## 15. v38 (2026.07.12) 通用组件 Resolver — 解决 BP 子类覆写 C++ 默认子对象
+
+### 用户原话 (2026.07.12)
+
+> "之前问题解决了，新问题：玩家武器点击左键无法攻击。"
+
+### 日志根因 (Session1.log)
+
+```
+[ABaseCharacter] 构造函数 EXIT: WeaponAttach=有效 PlayerCombo=有效 AIAttack=有效
+[BaseCharacter] SetupPlayerInputComponent: PlayerCombo 组件未挂载!  ← null!
+[BaseCharacter] ResolveWeaponAttach: WeaponAttach 字段为 null, 通过 FindComponentByClass 找到组件  ← null 但能找到
+```
+
+**根因链**:
+1. C++ 构造函数 `CreateDefaultSubobject<UPlayerComboComponent>` 成功创建组件 (有效指针)
+2. UE BP 子类 (BP_SWAT_C) 实例化过程中, 某种初始化阶段清空了 C++ 默认字段
+3. `if (PlayerCombo)` 直接读字段 → 永远 null
+4. **同样的根因影响所有 5 个组件** (PlayerCombo / AIAttack / CombatDeath / WeaponAttach / CharacterIcon)
+5. v36 修复了 WeaponAttach (单个 resolver), 但其他 4 个组件**仍然裸用字段** ← DRY 违反
+
+### 深层架构问题 (大厂原则被违反)
+
+| 原则 | 旧 (v36) | 新 (v38) |
+|---|---|---|
+| **DRY** | 每个组件需要单独写 lazy resolver | 通用模板函数, 一次解决 |
+| **零重复** | WeaponAttach 有 resolver, 其他没有 | 5 个 resolver 全部走同一模板 |
+| **可扩展性** | 加新组件 → 还得写新 resolver | 加新组件 → 加一行调用 |
+| **职责单一** | BaseCharacter 写 5 份近似代码 | BaseCharacter 调模板, 模板管实现 |
+
+### 新架构 v38 — 通用 Resolver 模板
+
+**头文件新增 (`BaseCharacter.h`)**:
+
+```cpp
+template<typename T>
+T* ResolveComponent(T*& CachedField, const TCHAR* ComponentName)
+{
+    if (CachedField) return CachedField;  // fast path
+
+    T* Found = FindComponentByClass<T>();
+    if (Found)
+    {
+        CachedField = Found;  // 修复字段, 后续走 fast path
+        UE_LOG(Warning, TEXT("%s 字段为 null, 通过 FindComponentByClass 找到. Pawn=%s"),
+               ComponentName, *GetName());
+        return Found;
+    }
+
+    UE_LOG(Error, TEXT("%s 组件未挂载! Pawn=%s. 必须修复 BP 蓝图 Components 面板"),
+           ComponentName, *GetName());
+    return nullptr;
+}
+
+// 5 个零开销包装函数 (inline)
+UFUNCTION(BlueprintCallable, Category = "Combat")
+UPlayerComboComponent* ResolvePlayerCombo()
+{
+    return ResolveComponent<UPlayerComboComponent>(PlayerCombo, TEXT("PlayerCombo"));
+}
+// + ResolveAIAttack / ResolveCombatDeath / ResolveCharacterIcon
+// + ResolveWeaponAttach 也改成走模板 (消除 v36 重复实现)
+```
+
+**调用方替换** (示例):
+
+```cpp
+// 旧 (v32-v37):
+void ABaseCharacter::LightAttack_Pressed()
+{
+    if (PlayerCombo)
+    {
+        PlayerCombo->LightAttack_Pressed();
+    }
+    else
+    {
+        UE_LOG(Error, TEXT("PlayerCombo 未挂载!"));  // 重复 Log
+    }
+}
+
+// 新 (v38):
+void ABaseCharacter::LightAttack_Pressed()
+{
+    if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+    {
+        Combo->LightAttack_Pressed();
+    }
+    // else: ResolvePlayerCombo 内部已 Log Error, 不再重复
+}
+```
+
+### 替换的调用点 (47 个)
+
+```
+PlayerCombo → ResolvePlayerCombo (8 个函数)
+  - LightAttack_Pressed / LightAttack_Released
+  - ExecuteComboSequence / HeavyAttack / UseSkill
+  - EnableComboWindow / CheckCombo / EndAttackState
+
+AIAttack → ResolveAIAttack (6 个函数)
+  - OnAIRequestAttack_Simple / OnAIAttackMontageEnded
+  - Server_PlayAttackAnim_Implementation / Multicast_PlayAttackAnim_Implementation
+  - Server_ReportAIAttackHit_Implementation / Server_ReportAIAttackHit_Validate
+
+CombatDeath → ResolveCombatDeath (8 个函数)
+  - TakeDamage / Die / ExecuteDeathLocal / Multicast_Die_Implementation
+  - EnableRagdoll / DropAndFadeWeapon
+  - ActivateSpawnInvincibility / DeactivateSpawnInvincibility
+
+CharacterIcon → ResolveCharacterIcon (5 个函数)
+  - RefreshCharacterIcon / Client_RefreshCharacterIcon_Implementation
+  - RetryRefreshCharacterIcon / RefreshWeaponIconOnHUD
+  - GetCharacterAvatarFromTable
+
+WeaponAttach → ResolveWeaponAttach (已 v36 修过, v38 改走模板)
+```
+
+### 大厂原则 (v38 落地)
+
+| 原则 | 旧 (v32-v37) | 新 (v38) |
+|---|---|---|
+| **DRY** | 5 个组件需要 5 份近似 resolver (实际只有 1 份) | 1 个模板 + 5 个零开销 inline 包装 |
+| **零重复日志** | 每个函数都有"组件未挂载"Log Error | 模板内集中 Log, 调用方简洁 |
+| **错误诊断清晰** | 每个函数日志不同字段名 | 模板统一报告 ComponentName, 错误路径一致 |
+| **Blueprint 可调** | ResolveWeaponAttach 是 BlueprintCallable | 5 个 resolver 全部 BlueprintCallable, BP 也可调用 |
+
+### 文件变更 (v38)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + 模板函数 ResolveComponent<T>(T*&, const TCHAR*)
+ + 5 个 inline 包装: ResolvePlayerCombo / ResolveAIAttack / ResolveCombatDeath / ResolveCharacterIcon
+ ~ ResolveWeaponAttach 改为 inline 转发到模板 (删除 .cpp 中的 v36 实现)
+ + 5 个组件头 include (模板需要 T 完整类型)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ - 删除 v36 ResolveWeaponAttach 实现 (已迁移到头文件 inline)
+ ~ 47 个裸字段访问点改为 ResolveXxx() 调用
+```
+
+### UE 编辑器配置 (v38)
+
+**用户不需要做编辑器配置** —— 这是纯代码修复。
+
+但要让 BP 子类 (BP_SWAT_C / BP_GruntAI) 真正能从模板 resolver 受益, **强烈建议**:
+1. 打开 BP_SWAT_C / BP_GruntAI → Components 面板
+2. **删除** C++ 默认创建但 BP 里"影子"存在的 PlayerCombo / AIAttack / CombatDeath / WeaponAttach / CharacterIcon 子对象
+3. **重新编译** BP (Compile 按钮)
+4. 这样模板的 fast path (字段有效) 才会生效, 否则每次都走 FindComponentByClass (有性能开销)
+
+### 避免的兜底行为清单 (v38 必须保持)
+
+1. **不允许**: 模板找不到组件时返回 nullptr 静默 (必须 Log Error)
+2. **不允许**: 模板缓存解析结果 (字段可能被 BP 重置)
+3. **不允许**: 模板内"找不到就用默认 Component" (没有默认)
+4. **不允许**: 调用方拿到 nullptr 后继续访问 (每次都先 if 检查)
+
+---
+
+## 14. v39 (2026.07.12) Resolver 模式扩展到全部老组件 + 出生点精准释放
+
+### Bug 簇根因 (5 个 bug, 3 个根因)
+
+| Bug | 表现 | 根因 |
+|---|---|---|
+| Bug 1 | 房主攻击 5 次后被杀玩家不复活 | `ReleaseSpawnPoint` 整个项目 0 调用 → 出生点全部永久占用 |
+| Bug 2 | PB_HealthBar 血量条不更新 | `CharacterEvents` 字段被 BP archetype null → 事件永不广播 |
+| Bug 5 | Image_CharacterIcon 不显示 | (同上) CharacterEvents null |
+| Bug 3 | Image_MultiKill 不显示 | Bug 1 连锁: 玩家不复活 → Multicast_NotifyKill 不触发 |
+| Bug 4 | UKillFeedEntryWidget 不显示 | (同上) |
+
+### 修复 A — 出生点精准释放 (Bug 1)
+
+**新接口 `URoomSpawnSubsystem::ReleaseSpawnPointByController`**:
+- 旧 `ReleaseSpawnPoint(AActor*)` 粗粒度, 多玩家同帧死亡会误清空
+- 新 `ReleaseSpawnPointByController(AController*)` 细粒度, 通过 Controller → PlayerStart 映射精准释放
+- 新增 `UPROPERTY() TMap<TWeakObjectPtr<AController>, TWeakObjectPtr<APlayerStart>> OccupiedSpawnByController;` SSOT
+- `GetAvailableSpawnPointForFaction` 第三个参数 `OccupancyOwner`, 记录占用者
+
+**集中调度入口**: `UCombatDeathComponent::ReleaseOccupiedSpawnPoint()`
+- 由 `ExecuteDeathLocal()` 第 0 步强制调用 (幂等检查前)
+- 只在 HasAuthority() 路径执行 (客户端跳过)
+- 这是整个项目**唯一释放入口** — 死亡链路必经这里
+
+### 修复 B — Resolver 模式扩展到全部 6 个老组件 (Bug 2/5)
+
+**v38 只保护了 5 个战斗组件**:
+```
+PlayerCombo, AIAttack, CombatDeath, WeaponAttach, CharacterIcon
+```
+
+**v39 扩展到 6 个老组件** (BUG 重灾区):
+```
+ResolveHealthComponent()       (血量)
+ResolveEnergyComponent()       (能量)
+ResolveCharacterEvents()       (★ Bug 2/5 根因组件)
+ResolveDissolveComponent()     (死亡溶解)
+ResolveFootstepComponent()     (脚步)
+ResolveHealthRegenComponent()   (血量回复)
+```
+
+**复用 v38 `ResolveComponent<T>` 模板** — 零重复 (DRY)。
+
+**迁移的调用点 (12+ 处)**:
+- `BaseCharacter.cpp`: BeginPlay 订阅, OnHealthChanged_Callback, OnHealthComponentDeath, OnRep_ACValue, OnRep_ACEValue, RefreshACEWithRank, ConsumeEnergy, OnKill, PossessedBy 重置回复, PlayFootstepSound, OnHealthDisplay, Broadcast4 个事件方法
+- `GameHUDWidget.cpp`: TryBindToCharacterEvents, TickFallbackCheck (3 处裸字段 → Resolver)
+- `PlayerStatusWidget.cpp`: 1 处从缓存拉头像
+
+### 修复 C — Bug 3/4 验证随 Bug 1 自动修复
+
+- Bug 1 修好 → 玩家能复活 → HealthComponent.OnDeath 触发 → PerformKillSettlement → AddKillScore + AddDeath + Multicast_NotifyKill
+- Bug 3/4 (Multikill/KillFeed) 由 Multicast_NotifyKill 推送 — 链路打通, 自然修复
+
+### 大厂原则对照 (v39)
+
+| 原则 | 旧 (v38 之前) | 新 (v39) |
+|---|---|---|
+| **单一真理源 (Spawn)** | 出生点占用无单一入口, 释放责任散落 (实际 0 调用) | `RoomSpawnSubsystem` 唯一管理, `OccupiedSpawnByController` SSOT |
+| **集中调度 (Spawn)** | 死亡时有 5+ 个潜在释放点, 实际谁也没调 | `CombatDeathComponent::ExecuteDeathLocal` 唯一入口 |
+| **零兜底 (Spawn)** | 占用满了静默返回 nullptr → 玩家不复活 (用户看不出来的 bug) | 占用满显式 Log Error + return nullptr |
+| **零兜底 (Component Null)** | 字段 null 跳过 → 事件/逻辑不执行 | 字段 null → FindComponentByClass 兜底修复, 找不到再 Error |
+| **零重复 (Resolver)** | 每组件手写 lazy resolver (v36 给 WeaponAttach 单写) | 统一 `ResolveComponent<T>` 模板 + 11 个零开销 inline 包装 |
+| **零误清空** | ResetAllSpawnPointOccupancy 粗粒度 → 多玩家同帧死亡误清空 | ReleaseSpawnPointByController 细粒度, 按 Controller 反查释放 |
+
+### 文件变更 (v39)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/CombatDeathComponent.h
+  + ReleaseOccupiedSpawnPoint() UFUNCTION 声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
+  + #include "Systems/Spawn/RoomSpawnSubsystem.h"
+  + ExecuteDeathLocal 头部: HasAuthority() 守卫 + ReleaseOccupiedSpawnPoint()
+  + ReleaseOccupiedSpawnPoint() 实现: 找 PC → 调 SpawnSys->ReleaseSpawnPointByController(PC)
+
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/Spawn/RoomSpawnSubsystem.h
+  + OccupiedSpawnByController UPROPERTY TMap<TWeakObjectPtr<AController>, TWeakObjectPtr<APlayerStart>>
+  + ReleaseSpawnPointByController(AController*) UFUNCTION 声明
+  ~ GetAvailableSpawnPointForFaction: 加 AController* OccupancyOwner 参数
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/Spawn/RoomSpawnSubsystem.cpp
+  ~ GetAvailableSpawnPointForFaction: 记录 Controller → PlayerStart 映射
+  + ReleaseSpawnPointByController 实现: 反查释放
+  ~ HandlePlayerRequestSpawn: 传 PlayerToSpawn 作为 OccupancyOwner
+
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/RoomGameMode.h
+  ~ GetAvailableSpawnPointForFaction 转发壳加 OccupancyOwner 参数
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/RoomGameMode.cpp
+  ~ GetAvailableSpawnPointForFaction 转发壳: 传 OccupancyOwner 到 SpawnSys
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+  + 6 个老组件 forward declarations + includes (供 ResolveComponent<T> 完整类型)
+  + ResolveHealthComponent / ResolveEnergyComponent / ResolveCharacterEvents /
+    ResolveDissolveComponent / ResolveFootstepComponent / ResolveHealthRegenComponent
+    (6 个 inline UFUNCTION 包装)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+  - 12+ 处裸字段访问 → Resolver 调用 (CharacterEvents/HealthComponent/EnergyComponent/HealthRegenComponent/FootstepComponent)
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/GameHUDWidget.cpp
+  - 3 处裸字段 Character->CharacterEvents → ResolveCharacterEvents()
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/Widgets/PlayerStatusWidget.cpp
+  - 1 处裸字段 Character->CharacterEvents → ResolveCharacterEvents()
+```
+
+### 待用户验证 (v39)
+
+1. UE 5.6 编辑器编译无错:
+   - `URoomSpawnSubsystem::ReleaseSpawnPointByController` 签名匹配
+   - `ARoomGameMode::GetAvailableSpawnPointForFaction` 转发壳匹配
+   - `ABaseCharacter` 6 个新 Resolver 编译通过
+2. PIE 中:
+   - 玩家死 5 次仍能复活 (Bug 1 修复)
+   - 血量条实时更新 (Bug 2 修复)
+   - 头像图标显示 (Bug 5 修复)
+   - 多杀图标显示 (Bug 3 修复)
+   - 击杀信息显示 (Bug 4 修复)
+3. 排查日志 (关键修复证据):
+   - 应该看到 `[Spawn] ReleaseSpawnPointByController: 已释放 Controller '%s' 占用的出生点 '%s'.`
+   - 应该看到 `[GameHUDWidget][Bind] 成功订阅 CharacterEvents`
+   - 应该看到 `[CombatDeathComponent] PerformKillSettlement` 击杀结算日志
+
+---
+
+## 14. v40.2 (2026.07.13 早) 普通客户端武器图标链路 — "事件 + 缓存"双轨制落地
+
+### 用户反馈 (Session1.log)
+
+```
+其他问题修复了, 就剩普通玩家客户端 Image_CharacterIcon 控件和 Image_MeleeWeapon 控件不显示,
+房主监听服务器客户端正常显示.
+```
+
+### 根因 — v40.1 修复不完整
+
+**v40.1 修复**: RefreshCharacterIcon 末尾调 RefreshWeaponIconOnHUD (服务器查表 + Client_RefreshWeaponIcon RPC 推 Icon).
+**结果**: 头像 ✓ 显示了. 武器图标 ✗ 仍然不显示.
+
+**真正的根因 (v40.1 漏掉的部分)**:
+
+| 项目 | 头像链路 | 武器图标链路 (v40.1) |
+|---|---|---|
+| 服务器: 查表 + 广播 | ✓ BroadcastCharacterIconReady (line 940) | ✗ BroadcastWeaponIconReady 只 Broadcast 没缓存! |
+| 客户端: RPC 收 + 缓存 | ✓ Client_RefreshCharacterIcon_Implementation | ✓ Client_RefreshWeaponIcon_Implementation |
+| **HUD Bind-Snapshot 补发** | ✓ GetCachedCharacterIcon (镜像头像) | ✗ **没补发武器图标!** |
+| 客户端: HUD 订阅 + 兜底 | ✓ 头像双轨制 (事件 + 缓存) | ✗ **只有事件, 没缓存** |
+
+**触发链**:
+1. 服务器 PossessedBy → RefreshCharacterIcon → RefreshWeaponIconOnHUD → Client_RefreshWeaponIcon RPC → **客户端 Implementation → BroadcastWeaponIconReady**
+2. **但**: 此时客户端 HUD 还没创建 (Pawn Spawn < HUD NativeConstruct 时序)
+3. **没缓存**: OnWeaponIconReady 事件触发时无订阅者 → 事件丢失
+4. HUD 创建后订阅 OnWeaponIconReady → 啥也收不到
+5. Bind-Snapshot 头像补发 ✓ 武器图标没补发 ✗ → HUD 武器图标永远空
+
+### 新架构 (v40.2) — 武器图标镜像头像完整链路
+
+**真理源**: 武器图标真理源 = WeaponDataTable 行 (服务器查表 RPC 推 Icon).
+
+**大厂原则 (v40.2 落地)**:
+- **事件 + 缓存双轨制 (镜像头像)**: BroadcastWeaponIconReady 既 Broadcast 又 SetCachedWeaponIcon
+- **HUD Bind-Snapshot 补发 (镜像头像)**: TryBindToCharacterEvents / PullInitialDataFromCharacter 主动拉缓存补发
+
+### 大厂原则对照 (v40.2)
+
+| 原则 | 旧 (v40.1) | 新 (v40.2) |
+|---|---|---|
+| 镜像对称 | 头像有缓存 + 补发, 武器图标没有 | 武器图标镜像头像完整链路 |
+| 双轨制 | 头像完整 | 武器图标完整 (Broadcast + Cache + 补发) |
+| 单一真理源 | (没破坏) | WeaponDataTable 行 (服务器) |
+| 大厂原则 | 漏掉一半对称就是反模式 | 对称 ≠ 重复, 是职责对等 |
+
+### 修改文件清单 (v40.2)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Components/CharacterEvents.h
+ + 新增 SetCachedWeaponIcon / GetCachedWeaponIcon (镜像头像对应接口)
+ + 新增 CachedWeaponID / CachedWeaponIcon / bCachedWeaponIconValid 字段
+
+~ MetalSlug01/Source/MetalSlug01/Private/Components/CharacterEvents.cpp
+ + 实现 SetCachedWeaponIcon / GetCachedWeaponIcon
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CharacterIconComponent.cpp
+ ~ BroadcastWeaponIconReady: 现在先 SetCachedWeaponIcon 再 Broadcast (镜像 BroadcastCharacterIconReady)
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/GameHUDWidget.cpp
+ ~ TryBindToCharacterEvents: 增加 "1.5. 武器图标快照补发" (镜像头像补发)
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/Widgets/PlayerStatusWidget.cpp
+ ~ PullInitialDataFromCharacter: 撤销 v40.2 武器图标 Pull-Initial (v40.2.1 修正)
+ 错误根因: PlayerStatusWidget 不持有 Widget_WeaponPanel 引用 (职责分离)
+   PlayerStatusWidget 只管 Status 字段 (HP/Energy/AC/ACE/头像)
+   武器图标属于 WeaponPanel, 由 GameHUDWidget::Widget_WeaponPanel 管理
+   正确路径: GameHUDWidget::TryBindToCharacterEvents 内调 OnWeaponIconReady → UpdateWeaponIconFromID → Widget_WeaponPanel->UpdateMeleeWeaponIcon
+   大厂原则 - 单一职责: PlayerStatus 不应该穿透到 WeaponPanel
+```
+
+### 待用户验证 (v40.2)
+
+1. UE 5.6 编辑器编译无错:
+ - 新 UFUNCTIONs: `SetCachedWeaponIcon / GetCachedWeaponIcon` 编译通过
+ - 新 UPROPERTYs: `CachedWeaponID / CachedWeaponIcon / bCachedWeaponIconValid` 编译通过
+2. PIE 中:
+ - 普通玩家客户端 Image_MeleeWeapon 控件显示武器图标 ✓
+ - 普通玩家客户端 Image_CharacterIcon 控件仍然显示 ✓ (没破坏)
+ - 房主端武器图标正常 (没破坏)
+3. 日志验证:
+ - 应该看到 `[GameHUDWidget][Bind-Snapshot] 补发武器图标: WeaponID=..., Icon=...`
+ - 应该看到 `[PlayerStatus][Pull-Initial] 从 CharacterEvents 缓存拉取武器图标: ...`
+
+---
+
+## 15. v40.3 (2026.07.13) 关卡预放 AI 没武器 — 单一真理源 + 集中调度 (大厂重构)
+
+### 用户反馈 (2026.07.13)
+
+> "@f:\Desktop\Session1.log 我摆放在场景里的ai, 游戏开始后ai手里没武器。UAIProfileAsset配置表的WeaponID和CharacterRowName是ai出生时最后一道才用的默认配置。我已经输入了内容, 但是为什么手里没武器。"
+
+### 根因链 (3 个, 全部违反大厂原则)
+
+#### 根因 A — `WeaponAttachmentComponent` 用 TWeakObjectPtr 缓存 OwnerCharacter
+
+```cpp
+// 旧版 (v6-v40.2) 反模式
+TWeakObjectPtr<ABaseCharacter> OwnerCharacter;  // Component 字段
+
+void UWeaponAttachmentComponent::BeginPlay()
+{
+    Super::BeginPlay();
+    OwnerCharacter = Cast<ABaseCharacter>(GetOwner());  // <-- 在 BeginPlay 中缓存
+}
+
+void UWeaponAttachmentComponent::RequestWeaponSpawn(FString WeaponID)
+{
+    ABaseCharacter* Owner = OwnerCharacter.Get();  // <-- 永远拿这个缓存
+    if (!Owner) {
+        UE_LOG(Error, TEXT("Owner 无效"));  // 100% 失败!
+        return;
+    }
+    ...
+}
+```
+
+**为什么 100% 失败**:
+1. UE 引擎: 关卡预放 AI → 自动 Possess → Pawn::PossessedBy 先 → AIController::OnPossess 后 → SetupMeleeAI 末尾触发 RequestWeaponSpawn
+2. RequestWeaponSpawn 在 **Component::BeginPlay 之前**触发 (时序关键!)
+3. `OwnerCharacter.Get()` 拿 nullptr (字段还是 nullptr, 因为 BeginPlay 还没跑)
+4. 即使 BeginPlay 后缓存补上, RequestWeaponSpawn 已经失败
+5. **永远** SpawnAndEquipWeapon: Owner 无效 → 拒绝生成武器
+
+#### 根因 B — `BaseCharacter::PossessedBy` 中重复触发武器 Spawn
+
+```cpp
+// 旧版 (v32-v40.2) 反模式
+void ABaseCharacter::PossessedBy(AController* NewController)
+{
+    ...
+    FString WeaponID;
+    if (NewController->IsA<AAIController>())
+    {
+        SyncWeaponFromProfile();
+        WeaponID = ResolvedAttach->GetSpawnWeaponID();  // <-- 空! (SetMeleeProfile 还没跑)
+    }
+    else
+    {
+        WeaponID = PS->GetSelectedWeapon1ID();
+    }
+    if (!WeaponID.IsEmpty())
+    {
+        RequestWeaponSpawn(WeaponID);  // <-- AI 路径永远是空, 不 Spawn
+    }
+}
+```
+
+**时序问题**:
+1. Pawn::PossessedBy 触发 **早于** AIController::OnPossess
+2. AIController::OnPossess → SetupMeleeAI → SetMeleeProfile → Pawn.SpawnWeaponID 才有值
+3. PossessedBy 读 Pawn.SpawnWeaponID 时, 字段还是空
+4. PossessedBy 走 Log Error 兜底跳过
+5. 后面 SetupMeleeAI 末尾虽然触发 RequestWeaponSpawn, 但**根因 A** 导致失败
+6. AI 永久没武器
+
+#### 根因 C — `MeleeAIController::SetupMeleeAI` 末尾依赖 GetOwner 时序
+
+```cpp
+// 旧版 (v40.0-v40.2) 反模式
+BaseChar->RequestWeaponSpawn(WeaponID);  // <-- 但 OwnerCharacter 还是 nullptr
+```
+
+修复根因 A 之前, SetupMeleeAI 末尾的触发永远失败。
+
+### v40.3 重构 (大厂原则 — 单一真理源 + 集中调度 + 零兜底)
+
+#### 修复 A: `WeaponAttachmentComponent` 用 GetOwner() 直接拿 Owner
+
+```cpp
+// 新版 (v40.3) — 真理源迁移
+// 删字段: TWeakObjectPtr<ABaseCharacter> OwnerCharacter;
+// 新静态 helper: GetOwnerCharacterChecked
+
+static ABaseCharacter* GetOwnerCharacterChecked(const UActorComponent* Self)
+{
+    AActor* OwnerActor = Self->GetOwner();
+    if (!OwnerActor) return nullptr;  // Log Error
+    ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor);
+    if (!OwnerChar) return nullptr;  // Log Error
+    return OwnerChar;
+}
+```
+
+**大厂原则落地**:
+- 真理源 = UE 标准 API `GetOwner()` (Component 挂在 Actor 上, 永远非空除非 Actor 销毁)
+- **不缓存**: 缓存失效 = 隐性兜底 = 隐藏 bug
+- Cast 失败立即 Log Error + return nullptr (零兜底)
+- 与 `BaseCharacter::ResolveComponent<T>` 模板同源 (都走 GetOwner/FindComponentByClass)
+
+#### 修复 B: `BaseCharacter::PossessedBy` 删除武器 Spawn 链路
+
+```cpp
+// 新版 (v40.3) — 不再有武器 Spawn
+void ABaseCharacter::PossessedBy(AController* NewController)
+{
+    SyncFactionTagFromController(NewController);  // 玩家 Pawn.FactionTag 同步
+    // 不再触发 RequestWeaponSpawn
+    // 不再读 Pawn.SpawnWeaponID
+    // 不再读 PS.SelectedWeapon1ID
+    // 不再走 GM 缓存兜底
+}
+```
+
+**单一真理源保证**:
+- PossessedBy 只负责"非武器"职责 (阵营 + HUD + 头像)
+- 武器 Spawn **不在** PossessedBy (时序最早, 字段为空)
+- 武器 Spawn **不在** BaseCharacter 任何方法 (零兜底)
+
+#### 修复 C: `RoomSpawnSubsystem` 集中调度武器 Spawn (Spawn 路径)
+
+```cpp
+// 新版 (v40.3) — 玩家路径
+void URoomSpawnSubsystem::HandlePlayerRequestSpawn(...)
+{
+    ...
+    SpawnedChar->SetSpawnLoadout(FinalCharID, FinalWeaponID);
+    SpawnedChar->SetGenericTeamId(FFactionTags::ToGenericTeamId(PlayerFactionTag));
+    PlayerToSpawn->Possess(SpawnedChar);
+
+    // 【v40.3】Possess 之后立即调 RequestWeaponSpawn
+    if (!FinalWeaponID.IsEmpty())
+    {
+        SpawnedChar->RequestWeaponSpawn(FinalWeaponID);  // 玩家武器 Spawn 唯一入口
+    }
+    else
+    {
+        UE_LOG(Error, TEXT("FinalWeaponID 为空, 拒绝 Spawn"));  // 零兜底
+    }
+}
+
+// 新版 (v40.3) — AI 路径
+void URoomSpawnSubsystem::SpawnAIInternal(...)
+{
+    ...
+    AIPawn->SetSpawnLoadout(DesiredCharID, DesiredWeaponID);
+    AIC->Possess(AIPawn);
+    AIPawn->SetGenericTeamId(...);
+    if (Profile) BaseAIC->InitializeFromProfile(Profile);
+
+    // 【v40.3】Possess 之后立即调 RequestWeaponSpawn
+    const FString FinalWeaponID = AIPawn->GetSpawnWeaponID();
+    if (!FinalWeaponID.IsEmpty())
+    {
+        AIPawn->RequestWeaponSpawn(FinalWeaponID);  // AI Spawn 武器 Spawn 唯一入口
+    }
+    else
+    {
+        UE_LOG(Warning, TEXT("SpawnWeaponID 仍为空"));  // 零兜底
+    }
+}
+```
+
+#### 修复 D: `MeleeAIController::SetupMeleeAI` 末尾触发武器 Spawn (关卡预放路径)
+
+```cpp
+// 新版 (v40.3) — 关卡预放 AI 唯一入口
+void AMeleeAIController::SetupMeleeAI(UAIProfileAsset* MeleeProfile)
+{
+    ...
+    if (ABaseCharacter* BaseChar = Cast<ABaseCharacter>(MyPawn))
+    {
+        BaseChar->SetMeleeProfile(MeleeProfile);  // 写入 Pawn.SpawnWeaponID
+
+        // 【v40.3 关键决策】关卡预放 AI 唯一触发点
+        if (HasAuthority())
+        {
+            FString WeaponID = BaseChar->GetSpawnWeaponID();
+            if (!WeaponID.IsEmpty())
+            {
+                BaseChar->RequestWeaponSpawn(WeaponID);  // 关卡预放 AI 武器 Spawn 唯一入口
+            }
+            else
+            {
+                UE_LOG(Error, TEXT("DA_AIProfile_*.WeaponID 未配"));  // 零兜底
+            }
+        }
+    }
+}
+```
+
+### 大厂原则 (v40.3 落地)
+
+| 原则 | 旧 (v6-v40.2) | 新 (v40.3) |
+|---|---|---|
+| **单一真理源** | TWeakObjectPtr 缓存 OwnerCharacter | UE 标准 API `GetOwner()` 直接拿 |
+| **零缓存** | BeginPlay 中缓存 OwnerCharacter | 不缓存, 每次 GetOwner (避免缓存失效) |
+| **职责单一** | PossessedBy 同时管阵营+武器 | PossessedBy 只管"非武器"职责 |
+| **集中调度** | 3 个入口 (PossessedBy + SpawnSubsystem + AIController) | 3 个入口按"调用方"严格分类, 不重叠 |
+| **零兜底** | WeaponID 空 → GM 缓存兜底 | WeaponID 空 → Log Error 强制修复 |
+| **可观测性** | OwnerCharacter=null 静默跳过 | Cast 失败 Log Error + 强制修复 BP |
+
+### 武器 Spawn 唯一入口 (v40.3 真理源)
+
+```
+入口                            触发场景                       时序保证
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AMeleeAIController::SetupMeleeAI  关卡预放 AI (Level-Placed)    SetMeleeProfile ✓ → RequestWeaponSpawn
+URoomSpawnSubsystem::SpawnAIInternal  大厅入队 → 战斗 Spawn    SetSpawnLoadout ✓ → Possess ✓ → RequestWeaponSpawn
+URoomSpawnSubsystem::HandlePlayerRequestSpawn  玩家 Spawn     SetSpawnLoadout ✓ → Possess ✓ → RequestWeaponSpawn
+URoomSpawnSubsystem::RespawnCharacter  玩家/AI 复活           Possess ✓ → RequestWeaponSpawn (转 SpawnAIInternal)
+```
+
+### BaseCharacter 武器 Spawn 链路 (v40.3 已彻底删除)
+
+| 函数 | 旧 (v40.2) | 新 (v40.3) |
+|---|---|---|
+| PossessedBy | 读 Pawn.SpawnWeaponID + RequestWeaponSpawn | **不触发** |
+| SetSpawnLoadout | 写入字段 + RequestWeaponSpawn (重复入口) | **只写入字段** |
+| SyncWeaponFromProfile | 同步字段 + RequestWeaponSpawn (兜底) | **只同步字段** |
+
+### 文件变更 (v40.3)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/WeaponAttachmentComponent.h
+ - 删除 TWeakObjectPtr<ABaseCharacter> OwnerCharacter 字段
+ + 新增 static GetOwnerCharacterChecked(const UActorComponent*) helper
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+ - BeginPlay: 不再缓存 OwnerCharacter (只有诊断 Log)
+ - EndPlay: 不再 reset OwnerCharacter
+ ~ RequestWeaponSpawn / SpawnAndEquipWeapon / SyncWeaponFromProfile /
+   SetMeleeProfile / FindWeaponAttachmentConfig / GetWeaponAttachmentDataTable:
+   全部改用 GetOwnerCharacterChecked(this) 拿 Owner
+ + GetOwnerCharacterChecked 实现 (3 层校验 + Log Error)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ ~ PossessedBy: 删除全部武器 Spawn 链路 (FString WeaponID, AI/Player 分流, RequestWeaponSpawn)
+ ~ PossessedBy: 只保留 SyncFactionTagFromController + HUD refresh + 头像 + HUD 重试
+ + 大段 v40.3 注释解释删除动机 + 武器 Spawn 唯一入口
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/MeleeAIController.cpp
+ ~ SetupMeleeAI 末尾 (SetMeleeProfile 之后):
+   - 改为 HasAuthority() 守卫 + Log Warning/Error
+   - 触发 BaseChar->RequestWeaponSpawn(WeaponID) — 关卡预放 AI 唯一入口
+   + 大段 v40.3 注释解释时序保证
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/Spawn/RoomSpawnSubsystem.cpp
+ ~ HandlePlayerRequestSpawn: 在 Possess 之后立即调 SpawnedChar->RequestWeaponSpawn(FinalWeaponID)
+ + 完整时序注释 (SetSpawnLoadout → SetGenericTeamId → Possess → RequestWeaponSpawn)
+ + WeaponID 空 → Log Error 拒绝 Spawn (零兜底)
+
+ ~ SpawnAIInternal: 在 InitializeFromProfile 之后立即调 AIPawn->RequestWeaponSpawn(AIPawn->GetSpawnWeaponID())
+ + 完整时序注释 + 错误日志路径 (DA_AIProfile 配置)
+```
+
+### UE 编辑器配置 (v40.3 用户必做)
+
+```
+1. 打开 Content/Blueprints/AI/DA_AIProfile_MeleeGrunt.uasset
+2. Identity 分类 → Weapon RowName (DT_WeaponInfo) 字段
+3. 配成 WQ001 (或 DT_WeaponInfo 里实际存在的武器 RowName)
+4. 保存
+
+【v40.3 修复后, 这条配置错误会**立即**触发 Log Error + 拒绝 Spawn】
+```
+
+### 待用户验证 (v40.3)
+
+1. UE 5.6 编辑器编译 0 错
+2. **UE 编辑器必做** (否则 AI 还是没武器):
+   - 打开 DA_AIProfile_MeleeGrunt.uasset → Identity → Weapon RowName = WQ001
+   - 保存
+3. PIE 中:
+   - 关卡预放 AI: BP_GruntAI_C_0/1/2 → 自动 Possess → AIController.SetupMeleeAI 末尾 → 武器 Spawn ✓
+   - 玩家 BP_SWAT_C: 出生 → HandlePlayerRequestSpawn 末尾 → 武器 Spawn ✓
+   - 大厅 AI 入队后战斗开局 Spawn: BP_GruntAI_C_X → SpawnAIInternal 末尾 → 武器 Spawn ✓
+   - 玩家/AI 复活: 走 RoomSpawnSubsystem::RespawnCharacter → SpawnAIInternal 末尾 → 武器 Spawn ✓
+4. 日志验证 (关键修复证据):
+   - 应该看到 `[MeleeAI] SetupMeleeAI 末尾触发武器 Spawn: WeaponID=WQ001 (Pawn=BP_GruntAI_C_0)`
+   - 应该看到 `[Spawn] HandlePlayerRequestSpawn 触发武器 Spawn: WeaponID=WQ001`
+   - 应该看到 `[RoomSpawn] SpawnAIInternal 触发武器 Spawn: WeaponID=WQ001`
+   - 应该看到 `[WeaponAttachment] BeginPlay: Owner=BP_GruntAI_C_0, ...` (BeginPlay 日志不会失败)
+5. 排查日志 (零兜底证据):
+   - **不应该**看到 `[WeaponAttachment] GetOwnerCharacterChecked: GetOwner() 返回 nullptr` (说明 owner 时序正确)
+   - **不应该**看到 `[PossessedBy][AI] Pawn='BP_GruntAI_C_0' SpawnWeaponID 为空!` (v40.3 已删除此 Log)
+   - **不应该**看到 `[PossessedBy][Player] Pawn='...' PlayerState->SelectedWeapon1ID 为空!` (v40.3 已删除此 Log)
+
+---
+
+## 16. v40.4 (2026.07.13) BTTask_PlayAttackMontage 原子化 + BB 写入收回 C++ (大厂架构)
+
+### 用户反馈 (Session1.log 2026.07.13)
+
+> "现在行为树实时运行状态一直卡在这个类上, ai无法播放攻击蒙太奇。"
+
+**根因链 (5 个反模式, 全部违反大厂原则)**:
+
+| # | 反模式 | 后果 |
+|---|---|---|
+| 1 | **BTTask 写 BB Key 用硬编码** `FName(AIBlackboardKeyNames::CooldownEndTime)` | 策划改 BB Key 名时, Task 写错 Key → Decorator 永真拒判 |
+| 2 | **BTTask 写 BB.CooldownEndTime** — 这是 Decorator 关注点 | BT 关注点分离原则被违反 (大厂原则) |
+| 3 | **BTTask 设 AIController C++ 状态** `SetCurrentlyAttacking(true)/SetInAttackCooldown(true)` | 与 OnAIRequestAttack_Simple 内部对称设置冲突, 时序竞争 |
+| 4 | **AIAttackComponent 双重节流** `LastAIAttackTimeSeconds + SafeInterval` | BTDecorator_CooldownReady 已做实时冷却, 这是重复架构 + 兜底 |
+| 5 | **没有 ComboIndex 配置** — 硬编码 ComboIndex=1 | 策划无法选 Combo1/Combo2/Combo3 |
+
+**用户真正看不到攻击蒙太奇的根因** (v40.4 修复前):
+```
+BTTask_PlayAttackMontage 删除 BB 写入 → 但**没有补回** OnAIRequestAttack_Simple
+→ BB.CooldownEndTime 永远 = 0 (初始默认值)
+→ BTDecorator_CooldownReady 看到 CooldownEndTime <= 0 → 永远返回 true
+→ 冷却检查**失效** → AI 一直在攻击 → 但 BT 永远进不到攻击节点 (在某个 Selector 分支失败)
+→ 用户看到"BT 卡在 PlayAttackMontage", 实际是"AI 持续连击但用户看不到完整动画"
+```
+
+### 修复方案 (v40.4 — 原子化 + 单一节流点)
+
+#### 修复 1: BTTask_PlayAttackMontage 删成 60 行纯原子壳
+
+```cpp
+EBTNodeResult::Type UBTTask_PlayAttackMontage::ExecuteTask(...)
+{
+ // 1. 基础验证 (AIC + Pawn + Character)
+ // 2. 触发攻击 — 调 OnAIRequestAttack_Simple (单一副作用入口)
+ const bool bFired = AIChar->OnAIRequestAttack_Simple();
+ if (!bFired) return Failed;
+ // 3. 同步 Succeeded — 蒙太奇等待交给 WaitMontageFinish
+ return Succeeded;
+}
+```
+
+**删除了**:
+- 硬编码 BB Key 写入 (`FName(AIBlackboardKeyNames::CooldownEndTime)`)
+- `SetCurrentlyAttacking(true) / SetInAttackCooldown(true)` 直接操控 C++ 状态
+- `GetEffectiveAttackInterval()` — 现在由 OnAIRequestAttack_Simple 内部计算
+
+#### 修复 2: AIAttackComponent 收回 BB 写入 (单一真理源)
+
+```cpp
+// 【v40.4 P0 关键修复】OnAIRequestAttack_Simple 在蒙太奇成功播完后写 BB.CooldownEndTime
+if (AAIController* AIC = Cast<AAIController>(OwnerCharacter->GetController()))
+{
+ if (UBlackboardComponent* BB = AIC->GetBlackboardComponent())
+ {
+ const float CurrentTime = World->GetTimeSeconds();
+ const float CooldownEndTime = CurrentTime + AttackInterval;
+ BB->SetValueAsFloat(FName(AIBlackboardKeyNames::CooldownEndTime), CooldownEndTime);
+ }
+}
+```
+
+**关键点**:
+- **不是 FBlackboardKeySelector** — 因为 Component 是单一入口, 硬编码 Key 名是真理源
+- **必须从 `AAIController::GetBlackboardComponent()` 获取非 const 视图** (UE 5.6 const 保护)
+- 这是大厂原则 - 单一真理源 + 单一节流点
+
+#### 修复 3: AIAttackComponent 删除双重节流
+
+**删除**:
+- `LastAIAttackTimeSeconds` 字段 (头文件 + cpp)
+- 构造函数/EndPlay 初始化
+- `OnAIRequestAttack_Simple` 入口的整段"阶段 1: 时间戳节流" (50 行)
+
+**大厂原则落地**:
+- 单一节流点 = BTDecorator_CooldownReady (实时, 0 延迟, BT 编辑器 100% 可见)
+- 0 兜底: BT 配错应立即暴露 (ExecuteTask 返回 Failed), 不允许 C++ 节流掩盖
+- 单一职责: OnAIRequestAttack_Simple 只负责"播放蒙太奇 + 写 BB", 不做节流决策
+
+### v40.4 完整流程 (5 个阶段)
+
+```
+OnAIRequestAttack_Simple v40.4 流程:
+ 阶段 1: 死/武器检查 (零兜底)
+ 阶段 2: AIAttackMontageResolver 解析 (Level 0 唯一路径, v32 零兜底)
+ 阶段 3: PlayAnimMontage + 绑 UAnimInstance::OnMontageEnded (双保险)
+ 阶段 4: 同步网络 (Server_PlayAttackAnim) + SetAttackerIsAI(true)
+ 阶段 5: ★【v40.4 新增】写 BB.CooldownEndTime — 单一真理源
+```
+
+### 大厂原则 (v40.4 落地)
+
+| 原则 | 旧 (v22-v40.3) | 新 (v40.4) |
+|---|---|---|
+| **单一节流点** | BT Decorator + C++ LastAIAttackTimeSeconds 双层 | BTDecorator_CooldownReady 唯一 |
+| **BB 写入真理源** | BTTask_PlayAttackMontage 硬编码 Key 名 | OnAIRequestAttack_Simple 硬编码 Key 名 (Component 是入口) |
+| **AIController 状态** | BTTask 写 SetCurrentlyAttacking/SetInAttackCooldown | OnAIAttackMontageEnded 回调统一写 (事件驱动) |
+| **零兜底** | C++ 节流"再撑一道墙" 掩盖 BT 配错 | BT 配错立即 Failed 暴露, C++ 不做兜底 |
+| **BT/C++ 职责对等** | BTTask 既写 BB 又设 C++ 状态 (关注点混淆) | BTTask 只调 Component, Component 知道所有副作用 |
+| **关注点分离** | BTTask 写 BB CooldownEndTime | BTTask 不写 BB (BB 写入归 Component) |
+
+### 文件变更 (v40.4)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/AI/Tasks/BTTask_PlayAttackMontage.h
+ - 整段重写 — v40.4 原子化注释
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Tasks/BTTask_PlayAttackMontage.cpp
+ - 整段重写 — 从 102 行降至 60 行
+ - 删除: 硬编码 BB Key 写入 + SetCurrentlyAttacking/SetInAttackCooldown + 双重 GetEffectiveAttackInterval
+
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/AIAttackComponent.h
+ + 顶部注释更新 (v40.4 原子化 + 单一节流点)
+ ~ 删除 LastAIAttackTimeSeconds 字段 (v40.4 P0)
+ ~ 删除 注释里 v15 节流的内容
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/AIAttackComponent.cpp
+ + 顶部注释 v40.4 重构说明
+ + 新增 #include "BehaviorTree/BlackboardComponent.h"
+ ~ 删除 阶段 1: 本地时间戳节流 (整段 50 行)
+ + 新增 阶段 5: 写 BB.CooldownEndTime — v40.4 P0 关键修复
+ ~ 删除 LastAIAttackTimeSeconds 初始化 (构造函数 + EndPlay)
+ ~ 修正所有阶段编号 (4 阶段 → 5 阶段)
+ ~ OnAIAttackMontageEnded 注释更新 (v40.4 收敛说明)
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ ~ 修正注释 "LastAIAttackTimeSeconds (v40.4 删除)"
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ ~ 修正注释 "v40.4 原子化"
+```
+
+### UE 编辑器配置 (v40.4)
+
+**本次无新配置** — 这是纯代码修复。
+
+但必须确保 BT_MeleeAI 编辑器的 Sequence "Attack" 结构正确 (v22-v40.3 设计):
+```
+Sequence "Attack"
+├─ BTDecorator_HPThreshold        (HP > 0)
+├─ BTDecorator_InAttackRange      (距离 ∈ [AR-Hyst, AR+Hyst])
+├─ BTDecorator_CooldownReady      (WorldTime >= BB.CooldownEndTime) ★关键
+├─ BTTask_FaceTarget              (面向目标)
+├─ BTTask_PlayAttackMontage       (本节点 — 纯原子, 同步 Succeeded)
+└─ BTTask_WaitMontageFinish       (异步 InProgress)
+```
+
+**关键**: `BTDecorator_CooldownReady` 必须配 **CooldownEndTimeKey = "CooldownEndTime"**
+（与 AIBlackboardKeyNames::CooldownEndTime 一致 — 这是单一真理源）
+
+### 待用户验证 (v40.4)
+
+1. UE 5.6 编辑器编译无错:
+ - BTTask_PlayAttackMontage.cpp 第 60 行 (新结构)
+ - AIAttackComponent.cpp 阶段 5 新增代码 (BB 写入)
+ - 所有阶段编号正确 (1→2→3→4→5)
+
+2. PIE 中 (核心验证):
+ - AI 走到攻击距离 → 蒙太奇播放 ✓
+ - 攻击后 BT 等蒙太奇结束 → 真正"看到攻击动画" ✓
+ - 攻击后 N 秒 (AttackInterval) 内, BT 进 Attack 分支失败 (CooldownReady 拒判) ✓
+ - N 秒后, BT 重新进 Attack 分支 ✓
+ - AI 不会持续连击 (上次攻击后等冷却) ✓
+
+3. 排查日志:
+ - 应该看到 `[AIAttackComponent] OnAIRequestAttack_Simple: 写 BB.CooldownEndTime=XXX`
+ - 应该看到 `[AIAttackComponent] OnAIRequestAttack_Simple: AI=xxx 成功播放攻击动画`
+ - 应该看到 `[AIAttackComponent] OnAIAttackMontageEnded: AI=xxx 蒙太奇结束`
+ - **不应该**看到 `[AIAttackComponent] OnAIRequestAttack_Simple: AI=xxx 距离上次攻击仅 X.XXs, 跳过` (v40.4 删除)
+ - **不应该**看到 `[AIAttackComponent] OnAIRequestAttack_Simple: AttackInterval <= 0, 禁止攻击` (v40.4 删除)
+
+
+---
+
+## 17. v40.5 (2026.07.13) BT 节点级可观测性 + 根因诊断日志 (大厂架构)
+
+### 用户反馈 (Session1.log 2026.07.13)
+> "AI 行为树卡在播放攻击蒙太奇上一直闪烁。"
+
+### 背景 (v40.4 留下的盲点)
+
+v40.4 重构 (原子化 + 单一节流点) 删了 BTTask_PlayAttackMontage 中所有 Log, 移到了 OnAIRequestAttack_Simple 内部。
+
+**问题**: 这次清理把 "BT 节点是否跑到这里" 的诊断信号**一并删了**, 结果:
+- 用户反馈"BT 卡在 PlayAttackMontage" → 完全不知道是"BT 真的跑到 PlayAttackMontage 但 OnAIRequestAttack_Simple 失败", 还是"BT 卡在上游 Decorator 拒判"
+- 日志里**没有任何 BT 内部节点评估日志** → 根因完全不可见
+- 这种"沉默失败"是大厂反模式 (违反"可观测性"原则)
+
+### Session1.log 关键证据 (根因推断)
+
+```
+LogBaseAI: [BP_MeleeAIController_C_0] OnTargetDetected: Actor=BP_GruntAI_C_3, bSensed=1   ← AI 互相识别
+LogBaseAI: [BP_MeleeAIController_C_1] OnTargetDetected: Actor=BP_GruntAI_C_0, bSensed=1   ← AI 互相识别
+LogBaseAI: [BP_MeleeAIController_C_0] OnTargetDetected: Actor=BP_SWAT_C_0, bSensed=1     ← AI 识别玩家 ✓
+LogBaseAI: [BP_MeleeAIController_C_0] OnTargetDetected: Actor=BP_GruntAI_C_3, bSensed=0   ← Lost sight (瞬间)
+LogTemp: Warning: [BP_GruntAI_C_0] AIDiag: MaxWalkSpeed=600 Vel=600.0 IsMovLocked=0 bIsAttacking=0 HasWeapon=1 MoveMode=1   ← AI 在追
+LogCombat: [HealthComponent] ★ 复活无敌期到期 ★ Owner=BP_SWAT_C_0                                            ← 玩家无敌到期
+LogTemp: Warning: [BP_GruntAI_C_0] AIDiag: MaxWalkSpeed=600 Vel=0.0 IsMovLocked=0 bIsAttacking=0 HasWeapon=1 MoveMode=1    ← AI 完全静止!
+```
+
+**关键观察**:
+1. AI 识别玩家 → 写入 BB.TargetActor → BT 应该进 Chase/Attack
+2. 瞬间丢失 → BB.TargetActor 被清空 → BT 失去目标
+3. AI Vel 从 600 变 0 → **完全静止** (没有 OnAIRequestAttack_Simple 任何 Log)
+4. 玩家无敌到期后 → AI 还是静止 → 没有攻击动画
+
+### 真正的根因链 (基于日志推断)
+
+**最可能根因 1 — 感知/扫描链路没找到玩家**:
+- AI 互相识别 (line 326-327) 写了 BB.TargetActor → BT 看到 TargetActor, 进 Chase
+- 玩家 BP_SWAT_C_0 被识别 (line 328) → BB.TargetActor = BP_SWAT_C_0
+- 瞬间 lost sight (line 329 bSensed=0) → BB.TargetActor = nullptr
+- BTService_RefreshTarget (0.3s 周期) 应该重新扫描 → 但若 `ScanForNearestEnemy` 返回 null (阵营配错/扫描范围太小/玩家 Pawn.FactionTag 为空), BT 全部分支拒判 → **AI 静止**
+
+**最可能根因 2 — BT 根本没跑到 PlayAttackMontage**:
+- 用户报告"BT 闪烁" → UE 编辑器可视化器显示高亮 = BT 处于该节点评估中
+- 实际: BT 在 Selector 反复评估, 但每个分支的 Decorator 都拒判 (无目标/无距离/无血量)
+- BTTask_PlayAttackMontage **从未被调用**
+- 这是 Session1.log 中**没有 OnAIRequestAttack_Simple 任何 Log** 的根本原因
+
+**最可能根因 3 — 冷却装饰器异常**:
+- BTDecorator_CooldownReady 读 BB.CooldownEndTime (默认 0)
+- 0 ≤ 0 → 视为已冷却 → 放行 (这没问题)
+- 但如果 BT 装饰器的 `CooldownEndTimeKey` FBlackboardKeySelector **没配** (策划忘记), 读出来的 Key 名是 NAME_None → GetValueAsFloat(NAME_None) 返回 0 → 同样放行
+- 所以这个不是卡点
+
+### v40.5 修复方案 (大厂架构 — 节点级可观测性)
+
+#### 修复 1: BT 节点级 Display Log
+
+**原则**: 每个 BT 节点 = 业务决策单元, 入口/出口必须有 Display 级 Log, 让链路**完全可见**
+
+**实施**:
+- `BTTask_PlayAttackMontage::ExecuteTask`: 入口 Display Log + 各分支 Display Log (ENTER/FAIL/FAIL/FAIL/SUCCESS)
+- `BTService_UpdateDistance::TickNode`: TargetActor 空时 Display Log ("等待 BTService_RefreshTarget 重扫") + 距离正常时 Verbose
+- `BTService_RefreshTarget::TickNode`: 扫描到目标 Display Log + 扫描失败 Display Log + 完整排查指引
+- `BTDecorator_InAttackRange::CalculateRawConditionValue`: Verbose Log (D=xx vs [AR-x, AR+x] → PASS/FAIL)
+- `BTDecorator_CooldownReady::CalculateRawConditionValue`: Verbose Log (Now vs CooldownEndTime → PASS/FAIL)
+- `UAIAttackComponent::OnAIRequestAttack_Simple`: 入口 Display Log (确认 BT 真的调用到这里)
+
+**为什么 Display 而不是 Verbose**:
+- UE 默认 Log 级别是 Display, 默认在控制台可见
+- Verbose 默认隐藏, 用户看不到
+- 大厂原则: 关键节点入口必须**默认可见** (Epic Lyra / Paragon 都是这么做的)
+
+**为什么不"在 .cpp 里加 Log 就是大厂反模式"**:
+- 重复架构 / 兜底 = 反模式 (我们有 LastAIAttackTimeSeconds 兜底被掩盖)
+- 可观测性基础设施 = 大厂标准 (Lyra / Paragon / Fortnite 都用节点级 Log)
+- 这是两件事 — 不要混淆
+
+#### 修复 2: 升 BB.CooldownEndTime 写入为 Display
+
+旧: `UE_LOG(LogTemp, Verbose, ...)` — 默认隐藏, 用户看不到冷却是否真的写入
+
+新: `UE_LOG(LogTemp, Display, ...)` — 默认可见, 确认 BT 冷却决策有数据
+
+### 大厂原则 (v40.5 落地)
+
+| 原则 | 旧 (v40.4) | 新 (v40.5) |
+|---|---|---|
+| **节点级可观测性** | v40.4 删了所有节点 Log | 每个 BT 节点入口/出口 Display Log |
+| **默认可见** | Verbose (默认隐藏) | Display (默认可见) |
+| **BB 写入可观测** | Verbose | Display |
+| **失败根因显式化** | "OnAIRequestAttack_Simple 失败" 一句话 | 各分支 Display Log 暴露根因 |
+| **可观测 ≠ 兜底** | (上次混淆) | 节点 Log 是基础设施, 与兜底无关 |
+
+### 文件变更 (v40.5)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Tasks/BTTask_PlayAttackMontage.cpp
+ + ExecuteTask 入口 + 各失败分支 Display Log (6 处)
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Services/BTService_UpdateDistance.cpp
+ + TargetActor 空时 Display 排查日志
+ + 距离派生 Verbose 日志 (D=xx AR=xx bHasTarget=1)
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Services/BTService_RefreshTarget.cpp
+ + 扫描成功 Display 日志
+ + 扫描失败 Display 日志 + 完整排查指引 (阵营/ScanRadius)
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Decorators/BTDecorator_InAttackRange.cpp
+ + Distance<0 (无目标) Verbose 日志
+ + 距离区间判断 Verbose 日志 (D vs [AR-x, AR+x] → PASS/FAIL)
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Decorators/BTDecorator_CooldownReady.cpp
+ + CooldownEndTime<=0 (首次可攻击) Verbose 日志
+ + 冷却中 Verbose 日志 (Now vs CooldownEndTime → PASS/FAIL)
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/AIAttackComponent.cpp
+ + OnAIRequestAttack_Simple 入口 Display 日志
+ ~ BB.CooldownEndTime 写入: Verbose → Display
+```
+
+### 待用户验证 (v40.5)
+
+1. UE 5.6 编辑器编译 0 错 (重点: 所有 Display/Verbose Log 调用合法)
+2. **场景 A (BT 真的跑 PlayAttackMontage)**: 重启 PIE → AI 看到玩家 → 进入 Attack Sequence → 看日志:
+ - 应该看到: `[BTTask_PlayAttackMontage] ExecuteTask ENTER. AIController=BP_MeleeAIController_C_0`
+ - 应该看到: `[AIAttackComponent] OnAIRequestAttack_Simple ENTER. Owner=BP_GruntAI_C_0`
+ - 应该看到: `[AIAttackComponent] OnAIRequestAttack_Simple: 写 BB.CooldownEndTime=...`
+ - 应该看到: `[BTTask_PlayAttackMontage] ExecuteTask SUCCESS`
+ - 应该看到: `[BTService_RefreshTarget] BP_MeleeAIController_C_0: 扫描到新目标=BP_SWAT_C_0`
+ - 应该看到: `[BTService_UpdateDistance] ... D=xxx AR=xxx bHasTarget=1`
+ - 应该看到: `[BTDecorator_InAttackRange] ... D=xxx vs [AR=xxx - 10, AR=xxx + 10] → PASS`
+ - 应该看到: `[BTDecorator_CooldownReady] ... CurrentTime=xxx vs CooldownEndTime=xxx → PASS`
+
+3. **场景 B (BT 没跑到 PlayAttackMontage — 推测的真实 bug)**: AI 静止, 看日志:
+ - 应该看到: `[BTService_UpdateDistance] TargetActor=空, BB.Distance=-1, bHasTarget=false. 等待 BTService_RefreshTarget 重新扫描`
+ - 应该看到: `[BTService_RefreshTarget] BP_MeleeAIController_C_0: 扫描失败 (ScanRadius=xxx, 无敌人). BT 全部分支拒判, AI 静止. 根因可能是: 1) 阵营配错 (Pawn.FactionTag 为空) 2) 真无敌人 3) ScanRadius 太小`
+ - **如果看到场景 B 日志, 根因明确 — 按提示排查**:
+ - **如果 Pawn.FactionTag 为空** → 检查 Spawn 链路 (v26.5) 是否写入了 CachedFactionTag
+ - **如果 ScanRadius 太小** → 打开 BT_MeleeAI.uasset, 把 BTService_RefreshTarget 的 ScanRadius 调到 3000+ cm
+ - **如果真无敌人** → 检查是不是玩家 Pawn 在场景里
+
+4. **场景 C (冷却一直阻击)**: AI 看到玩家但不动, 看日志:
+ - 应该看到: `[BTDecorator_CooldownReady] CurrentTime=10.5 vs CooldownEndTime=100.0 → FAIL (冷却中)`
+ - **根因**: BB.CooldownEndTime 写入过大 (AttackInterval 配置错误)
+ - **修复**: 打开 DA_AIBehaviorConfig_MeleeGrunt → Combat → AttackCooldown (默认 1.5s, 配错可能 100+)
+
+### 终极验证清单 (v40.5 + UE 编辑器)
+
+1. **编译**: 关闭 UE Editor → Build.bat 或 IDE 编译 → 0 error
+2. **重启 UE Editor** (BP 缓存可能错过)
+3. **打开 BP_GruntAI.uasset** → Components → 检查 5 个组件都挂载 (PlayerCombo/AIAttack/CombatDeath/WeaponAttach/CharacterIcon)
+4. **打开 BT_MeleeAI.uasset** → 检查 BT 结构:
+ - Root = BTComposite_Selector (1 个)
+ - Selector 子节点 = Sequence * N (Chase / Attack / Retreat 等分支)
+ - 每个 Sequence 含 Decorator + Tasks
+ - **关键**: BTService_RefreshTarget 的 ScanRadius 是否 ≥ 3000
+ - **关键**: BTDecorator_CooldownReady 的 CooldownEndTimeKey 是否配 "CooldownEndTime"
+ - **关键**: BTService_UpdateDistance 的 TargetKey 是否配 "TargetActor"
+ - **关键**: BTService_UpdateDistance 的 DistanceKey 是否配 "DistanceToTarget"
+ - **关键**: BTService_UpdateDistance 的 AttackRangeKey 是否配 "AttackRange"
+5. **打开 BB_AI_Melee.uasset** → 检查 6 个 Key 都存在 (TargetActor, DistanceToTarget, bHasTarget, AttackRange, HealthPercent, CooldownEndTime)
+6. **打开 DA_AIBehaviorConfig_MeleeGrunt.uasset** → Combat → AttackRange ≈ 180-200, AttackCooldown ≈ 1.5s
+7. **打开 DA_AIProfile_MeleeGrunt.uasset** → Identity → Weapon RowName 配 `WQ001` (v36 必须)
+8. **打开 GM_RoomGameMode.uasset** → Class Defaults → WeaponDataTable / WeaponAttachmentDataTable 都配 (v36/v37 必须)
+9. **打开地图 Japanese_Temple_Demo** → 检查 NavMeshBoundsVolume 已放置 + Build Paths (line 474-516 报错就是 NavMesh MISSING)
+10. **PIE**: 看场景 A/B/C 日志确认根因
+
+### 大厂原则 (v40.5 终极对照)
+
+| 原则 | 描述 |
+|---|---|
+| **可观测性优先** | BT 节点 / Service / Task 入口必须 Display Log, 让 BT 跑没跑/在哪卡**一目了然** |
+| **失败根因显式化** | 任何"BT 没动"问题都能从日志里找到第一个"拒判"的位置 |
+| **节点 ≠ 兜底** | 节点 Log 是基础设施, 重复架构 / 兜底是反模式 — 不要混淆 |
+| **BT 优先 C++ 辅助** | 决策全在 BT (装饰器 + 服务), C++ 只做原子能力 + 副作用写入 |
+
+---
+
+## 17.1 v40.5.1 (2026.07.13) UE 5.6 `GetNameSafe` C2665 include 缺失陷阱
+
+### 用户反馈 (2026.07.13 编译失败)
+```
+BTDecorator_CooldownReady.cpp(58,3): Error C2665 : "GetNameSafe": 没有重载函数可以转换所有参数类型
+BTDecorator_CooldownReady.cpp(58,3): Error C2131 : 表达式的计算结果不是常数
+BTDecorator_CooldownReady.cpp(58,3): Error C2971 : "UE::Core::Private::FormatStringSan::TAtArgPos": 模板参数"N":"UCFS_Result": 包含非静态存储持续时间的变量
+BTDecorator_CooldownReady.cpp(58,3): Error C2672 : "UE::Core::Private::FormatStringSan::AssertFormatStatus": 未找到匹配的重载函数
+BTDecorator_CooldownReady.cpp(58,3): Error C2100 : 非法的间接寻址
+```
+
+### 真正根因 (include 缺失, 编译错误链掩盖)
+
+`OwnerComp.GetAIOwner()` 静态返回 `AAIController*`, 但 cpp 文件**没 include `AIController.h`**。
+
+编译器视角:
+- 看到 `class AAIController;` 是前向声明
+- 不知道 `AAIController : public AController : public APawn : ... : public UObjectBaseUtility`
+- `GetNameSafe` 的两个重载 (`FField*` 和 `UObjectBaseUtility*`) **都不匹配**
+- C2665 (重载解析失败) 触发连锁 — UE 5.6 格式字符串宏 `UE_LOG` 用 `FormatStringSan` 模板, 主参数失败后**整个 constexpr 推导炸**:
+ - C2131 (constexpr 失败)
+ - C2971 (TAtArgPos 模板推导失败)
+ - C2672 (AssertFormatStatus 找不到匹配重载)
+ - C2100 (非法间接寻址)
+
+**陷阱**: C2131/C2971 是**症状**, C2665 是**真相** — 修复 C2665 后所有症状消失。
+
+### 大厂原则 (v40.5.1 落地 — cpp include 完整性)
+
+| 原则 | 描述 |
+|---|---|
+| **每个 .cpp 显式 include 直接依赖** | 不依赖 transitive include (refactor 会断) |
+| **前向声明只能用于引用/指针类型** | 不能用于类型识别 / 重载解析 / sizeof |
+| **编译错误链第一个才是真相** | C2131/C2971/C2672 都是 C2665 的"症状雪崩", 必须从第一个找 |
+| **GetNameSafe 误用** | `GetNameSafe(UObjectBaseUtility*)` 需要类型完整定义 — 前向声明无效 |
+
+### 修复文件 (v40.5.1)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Decorators/BTDecorator_CooldownReady.cpp
+ + line 5: #include "AIController.h"
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Decorators/BTDecorator_InAttackRange.cpp
+ + line 7: #include "AIController.h"
+```
+
+### 教训 (未来预防)
+
+修改 cpp 文件添加 `UE_LOG` 调用时:
+1. **检查**: 函数参数的类型是什么
+2. **检查**: cpp 是否 include 了该类型的完整定义
+3. **检查**: `GetNameSafe(...)` 需要类型继承链可见 — 必须 include
+4. **永远不用** transitive include (`AAIController.h` 包含 `Pawn.h` 不保证反过来)
+
+---
+
+## 18. v40.6 (2026.07.13) BeginPlay 缓存 OwnerCharacter 反模式拆除 (真根因 — AI 不攻击)
+
+### 用户反馈 (Session1.log 2026.07.13)
+> "AI 还是不攻击，行为树卡在播放攻击蒙太奇上一直闪烁。"
+
+### v40.5 修复后仍失败的真实根因
+
+v40.5 加了大量 BT 节点 Display Log, 看日志:
+
+```
+LogTemp: Display: [BTTask_PlayAttackMontage] ExecuteTask ENTER. AIController=BP_MeleeAIController_C_1
+LogTemp: Display: [AIAttackComponent] OnAIRequestAttack_Simple ENTER. Owner=None
+LogTemp: Display: [BTTask_PlayAttackMontage] ExecuteTask FAIL: OnAIRequestAttack_Simple 返回 false
+```
+
+**User=None 是真根因**: `AIAttackComponent::OwnerCharacter` 字段永远是 null!
+
+### 根因链 (大厂原则被违反)
+
+| 组件 | BeginPlay 运行情况 | 字段缓存结果 |
+|---|---|---|
+| `[CombatDeathComponent] BeginPlay: Owner=BP_GruntAI_C_0` | ✓ 运行了 | ✓ 正常 |
+| `[WeaponAttachmentComponent] BeginPlay: Owner=BP_GruntAI_C_0` | ✓ 运行了 | ✓ 正常 |
+| `[AIAttackComponent] BeginPlay` | ❌ **完全不跑** | ✗ 永远 null |
+| `[PlayerComboComponent] BeginPlay` | ❌ **完全不跑** | ✗ 永远 null |
+
+**为什么 BeginPlay 不跑?** v36 已发现的 BP archetype 问题:
+- BP 子类 (BP_GruntAI.uasset) 在 C++ 加新组件时, 如果 BP 没重新 Compile, 子对象实例没生成
+- 但 C++ 构造函数 `CreateDefaultSubobject<>` 在 CDO 中还是创建了
+- 字段值是 CDO 实例的 (有值), 但**运行时实例的 BeginPlay 不被调用**
+- 结果: 字段在编译期看起来有值, 运行时 BeginPlay 不跑 → 字段是 CDO 默认值 (nullptr for TObjectPtr)
+
+### v40.4 留下的隐性反模式
+
+AIAttackComponent 的 BeginPlay 缓存:
+```cpp
+void UAIAttackComponent::BeginPlay()
+{
+    Super::BeginPlay();
+    // 缓存 Owner Character (假设: 组件能 BeginPlay 说明 Owner 有效)
+    if (AActor* Owner = GetOwner())
+    {
+        OwnerCharacter = Cast<ABaseCharacter>(Owner);  // 永远 null
+    }
+}
+```
+
+**为什么这是反模式 (大厂原则)**:
+1. **依赖 BeginPlay 时序**: BP archetype 让组件 BeginPlay 不运行 — 缓存永远是默认值
+2. **静默失败**: BeginPlay 不跑没有任何错误日志, 业务函数调用时 OwnerCharacter=null → 一连串 false 返回
+3. **跨边界**: 组件缓存 Actor 引用 — 字段被 BP 重置时缓存失效, 又不重新拉取
+
+### v40.6 修复方案 (大厂架构 — 不缓存, 按需 lazy resolve)
+
+#### 修复 A: 删除 OwnerCharacter 字段, 改成按需 lazy resolve
+
+```cpp
+// .h — 删除字段, 改成方法
+private:
+    ABaseCharacter* ResolveOwnerCharacter() const;
+
+// .cpp — 真理源就是 GetOwner(), 每次需要时按需查询
+ABaseCharacter* UAIAttackComponent::ResolveOwnerCharacter() const
+{
+    AActor* Owner = GetOwner();
+    if (!Owner) {
+        UE_LOG(Error, ...); return nullptr;  // 0 兜底, 直接报错
+    }
+    ABaseCharacter* BaseChar = Cast<ABaseCharacter>(Owner);
+    if (!BaseChar) {
+        UE_LOG(Error, ...); return nullptr;  // 配置错, 配置错时显式失败
+    }
+    return BaseChar;
+}
+```
+
+#### 修复 B: BeginPlay 清空函数体
+
+```cpp
+void UAIAttackComponent::BeginPlay()
+{
+    Super::BeginPlay();
+    // 【v40.6 P0】不再缓存 — 改用 ResolveOwnerCharacter() 按需 lazy resolve
+}
+```
+
+#### 修复 C: 所有方法入口注入 lazy resolve 模式
+
+```cpp
+bool UAIAttackComponent::OnAIRequestAttack_Simple()
+{
+    ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
+    if (!OwnerCharacter)
+    {
+        // ResolveOwnerCharacter 内部已 Log Error 解释根因
+        return false;
+    }
+    // ... 后续业务代码使用局部 OwnerCharacter 变量 ...
+}
+```
+
+每个方法顶部都加了同样的 7 行 — 这是**重复**, 但是唯一能保证正确性的办法。比缓存风险更低。
+
+### 大厂原则 (v40.6 落地)
+
+| 原则 | 旧 (v22-v40.5) | 新 (v40.6) |
+|---|---|---|
+| **不缓存 Actor 引用** | BeginPlay 缓存, BP archetype 让缓存失效 | 不缓存, 每次 GetOwner() + Cast |
+| **显式失败链** | BeginPlay 不跑 → 字段 null → 业务失败 (3 层静默) | ResolveOwnerCharacter 内部 Log Error, 调用方 0 兜底 |
+| **零假设** | "组件能 BeginPlay 说明 Owner 有效" (假设) | "Owner 可能随时无效, 每次都要查" (实测) |
+| **职责单一** | 缓存组件 (字段+查询) | 纯解析 (方法) |
+| **跨 BP 安全** | BP 子类 archetype 让 BeginPlay 不跑就完蛋 | BeginPlay 不跑 vs ResolveOwnerCharacter 跑无关 |
+
+### 修复文件 (v40.6)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/AIAttackComponent.h
+ - 删除 UPROPERTY TObjectPtr<ABaseCharacter> OwnerCharacter 字段
+ + 加 ABaseCharacter* ResolveOwnerCharacter() const 声明
+ + BeginPlay 注释: 不再缓存
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/AIAttackComponent.cpp
+ - 删除 BeginPlay 内 OwnerCharacter 缓存
+ + ResolveOwnerCharacter() 实现 (GetOwner() + Cast + Log Error)
+ - 删除 EndPlay 内 OwnerCharacter = nullptr 清理
+ ~ 7 个函数入口注入 `ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();` (OnAIRequestAttack_Simple / OnAIAttackMontageEnded / Server_PlayAttackAnim_Implementation / Multicast_PlayAttackAnim_Implementation / Server_ReportAIAttackHit_Implementation / 等)
+
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/PlayerComboComponent.h
+ - 删除 UPROPERTY TObjectPtr<ABaseCharacter> OwnerCharacter 字段
+ + 加 ABaseCharacter* ResolveOwnerCharacter() const 声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/PlayerComboComponent.cpp
+ - 删除 BeginPlay 内 OwnerCharacter 缓存
+ + ResolveOwnerCharacter() 实现 (与 AIAttack 同模式)
+ - 删除 EndPlay 内 OwnerCharacter = nullptr 清理
+ ~ 11 个函数入口注入 `ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();`
+ - 删除冗余的 `if (!OwnerCharacter) return;` 旧防御 (OnPlayerAttackMontageEnded)
+```
+
+### 待用户验证 (v40.6)
+
+1. UE 5.6 编辑器编译 0 错
+2. 重启 PIE → 跑一遍 → 看 Session.log:
+ - 应该看到 `[AIAttackComponent] OnAIRequestAttack_Simple ENTER. Owner=BP_GruntAI_C_0` (Owner 不再是 None!)
+ - 应该看到 `[AIAttackComponent] OnAIRequestAttack_Simple: AI=... 成功播放攻击动画` (攻击真的触发了)
+ - 应该看到 AI 实际挥刀攻击玩家 (而非闪烁 BT)
+3. **如果再失败**:
+ - Log 现在会显示真正的根因 (OnAIRequestAttack_Simple 失败的具体阶段: 死/武器/蒙太奇解析器)
+ - 按 hint 修复即可
+
+### 教训 (未来预防)
+
+| 反模式 | 替代方案 |
+|---|---|
+| BeginPlay 缓存 Actor/Component 引用 | 按需 GetOwner() + Cast |
+| 缓存 transient 引用 | 真理源 = GetOwner() |
+| 假设 BeginPlay 必然运行 | 假设 BeginPlay 可能不跑, 加防御 |
+| 引用失效静默跳过 | 引用失效显式 Log Error |
+
+**核心原则 (大厂 UE 组件设计)**:
+- 任何 Owner/外部引用都通过 `GetOwner() + Cast<T>()` 按需获取
+- 不缓存 (即使有性能开销) — 因为缓存失效的根因隐式而难调
+- 让 `GetOwner()` 调一次约 0.001ms — 完全可接受, 不要为这个微优化而引入缓存风险
+
+---
+

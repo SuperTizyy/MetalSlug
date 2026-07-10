@@ -112,9 +112,37 @@ public:
 	 * @param OutRoomName 房间名称（未设置时返回空字符串）
 	 * @param OutGameMode 游戏模式（未设置时返回空字符串）
 	 * @return 是否成功读取
+	 *
+	 * 【v54.5.1 新增】优先返回 skip-login 测试房间名（格式: 测试-{模式}-{地图}）
+	 *   根因: bSkipLoginDirectToLobby=true 时不创建 Session, SessionSettings 里没有 ROOM_NAME
+	 *   修复: skip-login 模式下 SessionManager 持有 SkipLoginRoomName/SkipLoginGameMode 字段
+	 *         GetCurrentSessionDisplayInfo 优先返回这两个字段, 找不到才读 SessionSettings
 	 */
 	UFUNCTION(BlueprintCallable, Category = "SessionManager|State")
 	bool GetCurrentSessionDisplayInfo(FString& OutRoomName, FString& OutGameMode) const;
+
+	// ==========================================
+	// 【v54.5.1 新增】skip-login 测试房间显示信息 (bSkipLoginDirectToLobby 专用)
+	// ==========================================
+	// 说明: bSkipLoginDirectToLobby=true 时 SessionManager 不创建真实 Session
+	//       房间名/模式由 GameFlowSubsystem 在 BootToLogin Step3 写入这两个字段
+	//       GetCurrentSessionDisplayInfo 优先返回这两个字段
+	//
+	// 格式: 测试-{模式}-{地图}
+	// 示例: 测试-刀战模式-Japanese_Temple_Demo / 测试-生化模式-Demonstration
+	//
+	// 职责:
+	//   - SetSkipLoginRoomDisplayInfo: GameFlowSubsystem BootToLogin 末尾调用 (唯一写入入口)
+	//   - GetCurrentSessionDisplayInfo: RoomInsidePage NativeConstruct 读取 (唯一读取入口)
+	//   - 离开 InRoom 状态时清空 (ResetSkipLoginRoomDisplayInfo)
+
+	/** 设置 skip-login 测试房间的显示信息 */
+	UFUNCTION(BlueprintCallable, Category = "SessionManager|SkipLogin")
+	void SetSkipLoginRoomDisplayInfo(const FString& InRoomName, const FString& InGameMode);
+
+	/** 清空 skip-login 测试房间显示信息 (离开 InRoom 时调用) */
+	UFUNCTION(BlueprintCallable, Category = "SessionManager|SkipLogin")
+	void ResetSkipLoginRoomDisplayInfo();
 
 	// ==========================================
 	// 【P0 大厂架构】会话状态实时更新 (Bug2 修复)
@@ -274,4 +302,11 @@ private:
 	bool bIsHost = false;
 	bool bIsInSession = false;
 	bool bIsSearching = false;
+
+	// ==========================================
+	// 【v54.5.1 新增】skip-login 测试房间显示信息 (bSkipLoginDirectToLobby 专用)
+	// ==========================================
+	// 格式: 测试-{模式}-{地图} (由 GameFlowSubsystem 在 BootToLogin 时写入)
+	FString SkipLoginRoomName;
+	FString SkipLoginGameMode;
 };

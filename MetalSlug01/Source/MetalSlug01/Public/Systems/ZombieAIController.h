@@ -27,13 +27,30 @@
 #include "ZombieAIController.generated.h"
 
 /**
- * AZombieAIController
- * 生化模式 AI 控制器 (Phase 2)
+ * 【v54 大厂架构重构 — UAIProfileAsset 删除】Re-declare the file purpose
  *
- * 复用策略:
- *   - 所有"读 Pawn / 读 BB / 调感知" 仍走 Base
- *   - 所有"按 Profile 选目标" 走 RoomGameMode::RequestTargetForAI (多态按 HuntPolicy)
- *   - 仅 override OnTargetDetected 做"母体特殊触发" + OnPossess 绑感染钩子
+ * 设计原则 (大厂架构):
+ *   - 不写任何"如果我是僵尸就..."的 if 条件 — 避免污染共用层
+ *   - 全部继承 ABaseAIController 的统一链路 (阵营协议 + 感知配置 + BT 启动)
+ *   - 仅 override 生化专属的"感染人 → 改 TeamId + 重启 BT"这一根钩子
+ *
+ * 不做的:
+ *   ✗ 不重新实现感知配置 — Base 已经从 ConfigSO.Perception 注入
+ *   ✗ 不重写 BT 启动 — Base 已经走 ConfigSO.HuntPolicy 聚合策略
+ *   ✗ 不写任何调血/调速逻辑 — 数值都在 BehaviorConfigSO 里, 策划调
+ *   ✗ 不改 GameMode::RequestTargetForAI — GameMode 通过 ConfigSO.HuntPolicy 多态即可
+ *
+ * 为什么需要单独一个 Controller 类:
+ *   1. CF 生化模式"母体"机制: 母体死亡时, 选中的人类感染者自动晋升为母体 (Phase 3)
+ *      这是僵尸"专属事件", 不在共用层实现.
+ *   2. GAS / GameplayAbility 绑订阅者: 感染技能触发 OnPawnBecomeZombie, 母体死亡广播 OnMotherFallen
+ *      这些 Delegate 不能放在共用层 (会污染刀战).
+ *   3. 工程上预留扩展点: 未来加 "群体扑击" / "感染范围伤害" 都进这一层.
+ *
+ * 【v54 大厂架构重构】UAIProfileAsset 已删除
+ *   - 旧 SetupZombieAI(UAIProfileAsset*) → 新 SetupZombieAI(UAIBehaviorConfigSO*)
+ *   - ConfigSO 直接接 AIController, 没有 Profile 中间层
+ *   - 所有 Profile 字段引用改为 ConfigSO 字段
  */
 UCLASS()
 class METALSLUG01_API AZombieAIController : public ABaseAIController
@@ -44,18 +61,22 @@ public:
 	AZombieAIController();
 
 	/**
-	 * 【Phase 2】生化控制器专属入口
-	 * GameMode 在调用 InitializeFromProfile 之前, 会判 Profile.ControllerClass 是否 = ZombieAIController
+	 * 【Phase 2 → v54 重构】生化控制器专属入口
+	 * GameMode 在调用 InitializeFromConfig 之前, 会判 ConfigSO.LevelPlacedAIControllerClass 是否 = ZombieAIController
 	 * 如果是, 调本方法注入"感染机制订阅".
 	 *
+	 * 【v54 大厂架构重构】参数从 UAIProfileAsset 改为 UAIBehaviorConfigSO
+	 *   - 旧: SetupZombieAI(UAIProfileAsset*) → 内部读 Profile.AIRole/Mother 配置
+	 *   - 新: SetupZombieAI(UAIBehaviorConfigSO*) → 直接读 ConfigSO
+	 *
 	 * 行为:
-	 *   - 订阅 Pawn 的 OnHealthZeroed 事件 (死亡时若 Profile.AIRole==Mother, 触发母体阵亡广播)
-	 *   - 不在这里跑 BT, BT 由 Base.StartBehaviorTreeFromProfile 启动
+	 *   - 订阅 Pawn 的 OnHealthZeroed 事件 (死亡时若 ConfigSO.AIRole==Mother, 触发母体阵亡广播)
+	 *   - 不在这里跑 BT, BT 由 Base.StartBehaviorTreeFromConfigInternal 启动
 	 *
 	 * 留可扩展: 后续可在这里订阅 GAS 事件链
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI|Zombie")
-	void SetupZombieAI(UAIProfileAsset* ZombieProfile);
+	void SetupZombieAI(UAIBehaviorConfigSO* ZombieConfig);
 
 	/**
 	 * 【Phase 3 预留】人类被感染回调

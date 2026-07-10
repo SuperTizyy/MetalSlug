@@ -123,6 +123,54 @@ void UCharacterEvents::SetCachedCharacterIcon(const FString& InCharID, UTexture2
 }
 
 
+// ==========================================
+// 【v40.2 P0 新增】武器图标快照 (镜像 CachedCharacterID/CachedAvatarIcon)
+// ==========================================
+
+/**
+ * UCharacterEvents::GetCachedWeaponIcon
+ *
+ * 【v40.2 P0 修复】镜像 GetCachedCharacterIcon
+ *
+ * 订阅者 (GameHUDWidget) 订阅成功后立刻拉取"最近一次广播的武器图标",
+ * 解决事件总线模式的"竞争订阅"问题:
+ *   - 服务器 RefreshCharacterIcon → RefreshWeaponIconOnHUD → RPC → Client_RefreshWeaponIcon_Implementation → BroadcastWeaponIconReady
+ *   - 如果 Broadcast 时 HUD 还没订阅, 事件丢失 → HUD 永远没武器图标
+ *   - 现在 Bind-Snapshot 也会主动调 GetCachedWeaponIcon → 模拟补发
+ *
+ * @param OutWeaponID 武器 ID (空 = 从未广播)
+ * @param OutIcon     武器图标贴图 (可能为 nullptr, 表示查表失败)
+ * @return true=有缓存 (即使 Icon 为空), false=从未广播过
+ */
+bool UCharacterEvents::GetCachedWeaponIcon(FString& OutWeaponID, UTexture2D*& OutIcon) const
+{
+	if (!bCachedWeaponIconValid)
+	{
+		OutWeaponID = TEXT("");
+		OutIcon = nullptr;
+		return false;
+	}
+
+	OutWeaponID = CachedWeaponID;
+	OutIcon = CachedWeaponIcon;
+	return true;
+}
+
+
+/**
+ * UCharacterEvents::SetCachedWeaponIcon
+ *
+ * @param InWeaponID 武器 ID
+ * @param InIcon     武器图标贴图 (允许 nullptr — 表示查表失败, 仍然写缓存)
+ */
+void UCharacterEvents::SetCachedWeaponIcon(const FString& InWeaponID, UTexture2D* InIcon)
+{
+	CachedWeaponID = InWeaponID;
+	CachedWeaponIcon = InIcon;
+	bCachedWeaponIconValid = true;
+}
+
+
 /**
  * UCharacterEvents::SetCachedACValue
  */

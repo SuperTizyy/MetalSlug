@@ -71,25 +71,33 @@ public:
 	// 武器激活接口
 	// ==========================================
 
-	/**
-	 * 开启武器刀刃伤害判定（玩家路径，由 AnimNotify 调用）
-	 *
-	 * 【P0 2026.07.07】与 AI 通道互斥
-	 *   如果当前 bIsAIWeaponActive=true,本调用被忽略(避免双扣血)
-	 *   玩家挥刀期间如果 AI 通道被外部错误开启,本调用也设 false 防止冲突
-	 *
-	 * @param bIsHeavyAttack 是否为重击（决定伤害数值和动画）
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	void StartWeaponTrace(bool bIsHeavyAttack);
+/**
+ * 开启武器刀刃伤害判定（玩家路径，由 AnimNotify 调用）
+ *
+ * 【P0 2026.07.07】与 AI 通道互斥
+ *   如果当前 bIsAIWeaponActive=true,本调用被忽略(避免双扣血)
+ *   玩家挥刀期间如果 AI 通道被外部错误开启,本调用也设 false 防止冲突
+ *
+ * 【v35 AnimNotify 化】调用方: BP AnimNotify (ANS_MeleeTrace / ANS_HeavyTrace)
+ *   - 美术在蒙太奇"挥刀中段"位置加 ANS_MeleeTrace (轻击) 或 ANS_HeavyTrace (重击)
+ *   - ANS_MeleeTrace 内: Get Current Weapon → StartWeaponTrace(false)
+ *   - ANS_HeavyTrace 内: Get Current Weapon → StartWeaponTrace(true)
+ *   - 收刀位置加 ANS_MeleeTraceEnd → Get Current Weapon → StopWeaponTrace
+ *
+ * @param bIsHeavyAttack 是否为重击（决定伤害数值和动画）
+ */
+UFUNCTION(BlueprintCallable, Category = "Combat")
+void StartWeaponTrace(bool bIsHeavyAttack);
 
-	/**
-	 * 关闭武器刀刃伤害判定（玩家路径）
-	 *
-	 * 【P0 2026.07.07】不会关闭 AI 通道,两个通道独立管理
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	void StopWeaponTrace();
+/**
+ * 关闭武器刀刃伤害判定（玩家路径）
+ *
+ * 【P0 2026.07.07】不会关闭 AI 通道,两个通道独立管理
+ *
+ * 【v35】调用方: BP AnimNotify (ANS_MeleeTraceEnd) 或蒙太奇自然结束 C++ 兜底清理
+ */
+UFUNCTION(BlueprintCallable, Category = "Combat")
+void StopWeaponTrace();
 
 	/**
 	 * 【P0 2026.07.07 大厂架构重构 — DEPRECATED】开启 AI 伤害通道

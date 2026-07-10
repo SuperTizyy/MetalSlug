@@ -17,6 +17,7 @@
 
 // 引入角色基类（用于 GetAC/GetIsDead 等）
 #include "Characters/BaseCharacter.h"
+#include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
 
 
 // ==========================================
@@ -37,49 +38,66 @@ ARoomGameState::ARoomGameState()
 
 
 // ==========================================
-// 2. 队伍查询接口
+// 2. 阵营查询接口
 // ==========================================
 
 /**
- * GetPlayersInTeam
+ * GetPlayersInFaction (2026.07.10 P0 重构: 替代 GetPlayersInTeam(ERoomTeam))
  *
- * 获取指定队伍的所有玩家 PlayerState
+ * 获取指定阵营的所有玩家 PlayerState
  * 直接利用引擎底层的 PlayerArray，永远不会出现名单不一致的问题
  *
- * @param TargetTeam 目标队伍（攻/守）
- * @return 该队伍的 PlayerState 列表
+ * @param TargetFactionTag 目标阵营 (Offense/Defense)
+ * @return 该阵营的 PlayerState 列表 (Tag 非有效阵营时返回空数组, 显式报错)
  */
-TArray<ARoomPlayerState*> ARoomGameState::GetPlayersInTeam(ERoomTeam TargetTeam) const
+TArray<ARoomPlayerState*> ARoomGameState::GetPlayersInFaction(FGameplayTag TargetFactionTag) const
 {
-	TArray<ARoomPlayerState*> TeamMembers;
+	TArray<ARoomPlayerState*> FactionMembers;
 
-	// 【架构规范】: 直接利用引擎底层的 PlayerArray，永远不会出现名单不一致的问题
+	// 【P0 2026.07.10】大厂原则: 无效阵营不静默兜底, 显式报错
+	if (!FFactionTags::IsValidFaction(TargetFactionTag))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] GetPlayersInFaction: 无效阵营 Tag='%s', 返回空数组"),
+			*TargetFactionTag.ToString());
+		return FactionMembers;
+	}
+
+	// 直接利用引擎底层的 PlayerArray, 不会有名单不一致问题
 	for (APlayerState* PS : PlayerArray)
 	{
 		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
 		{
-			if (RoomPS->CurrentTeam == TargetTeam)
+			if (RoomPS->CurrentFactionTag == TargetFactionTag)
 			{
-				TeamMembers.Add(RoomPS);
+				FactionMembers.Add(RoomPS);
 			}
 		}
 	}
 
-	return TeamMembers;
+	return FactionMembers;
 }
 
 
 /**
- * GetTeamTopACPlayer
+ * GetFactionTopACPlayer (2026.07.10 P0 重构: 替代 GetTeamTopACPlayer(ERoomTeam))
  *
- * 查询指定队伍中 AC 最高的玩家的 PlayerState
+ * 查询指定阵营中 AC 最高的玩家的 PlayerState
  * 忽略死亡或无 pawn 的玩家
  *
- * @param TargetTeam 目标队伍
+ * @param TargetFactionTag 目标阵营 (Offense/Defense)
  * @return AC 最高的 PlayerState（找不到返回 nullptr）
  */
-ARoomPlayerState* ARoomGameState::GetTeamTopACPlayer(ERoomTeam TargetTeam) const
+ARoomPlayerState* ARoomGameState::GetFactionTopACPlayer(FGameplayTag TargetFactionTag) const
 {
+	if (!FFactionTags::IsValidFaction(TargetFactionTag))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] GetFactionTopACPlayer: 无效阵营 Tag='%s'"),
+			*TargetFactionTag.ToString());
+		return nullptr;
+	}
+
 	ARoomPlayerState* TopPlayer = nullptr;
 	int32 TopAC = -1;
 
@@ -87,8 +105,8 @@ ARoomPlayerState* ARoomGameState::GetTeamTopACPlayer(ERoomTeam TargetTeam) const
 	{
 		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
 		{
-			// 队伍不匹配，跳过
-			if (RoomPS->CurrentTeam != TargetTeam)
+			// 阵营不匹配，跳过
+			if (RoomPS->CurrentFactionTag != TargetFactionTag)
 			{
 				continue;
 			}
@@ -171,6 +189,9 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ARoomGameState, DefenderTotalKills);
 	DOREPLIFETIME(ARoomGameState, AttackerWins);
 	DOREPLIFETIME(ARoomGameState, DefenderWins);
+
+	// 【v46 新增】AI 占位队列复制
+	DOREPLIFETIME(ARoomGameState, ReplicatedPendingAIQueue);
 }
 
 
@@ -249,10 +270,12 @@ void ARoomGameState::OnRep_TeamKillCount()
 /**
  * AddTeamKill
  *
- * 服务器专用: 增加指定队伍的击杀数
+ * 服务器专用: 增加指定阵营的击杀数 (2026.07.10 P0 重构 — FGameplayTag 替代 ERoomTeam)
  * 同时通过 MulticastRefreshKillCount 强制广播给所有客户端（包括 ListenServer 主机自身）
+ *
+ * @param FactionTag 目标阵营 (Offense/Defense, 其它 Tag 显式报错)
  */
-void ARoomGameState::AddTeamKill(ERoomTeam Team)
+void ARoomGameState::AddTeamKill(FGameplayTag FactionTag)
 {
 	// 仅在服务器端执行
 	if (!HasAuthority())
@@ -260,21 +283,33 @@ void ARoomGameState::AddTeamKill(ERoomTeam Team)
 		return;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] AddTeamKill 被调用！Team=%d, Before: AttackerTotalKills=%d, DefenderTotalKills=%d"),
-		(int32)Team, AttackerTotalKills, DefenderTotalKills);
+	// 【P0 2026.07.10】大厂原则: 无效阵营显式报错, 不增任何字段
+	if (!FFactionTags::IsValidFaction(FactionTag))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] AddTeamKill: 无效阵营 Tag='%s', 击杀数不变"),
+			*FactionTag.ToString());
+		return;
+	}
 
-	// 累加指定队伍的击杀数
-	if (Team == ERoomTeam::Attack)
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] AddTeamKill 被调用！FactionTag=%s, Before: AttackerTotalKills=%d, DefenderTotalKills=%d"),
+		*FactionTag.ToString(), AttackerTotalKills, DefenderTotalKills);
+
+	// 【P0 2026.07.10】单一真理源: Offense = 攻方, Defense = 守方
+	if (FactionTag == FFactionTags::Offense())
 	{
 		AttackerTotalKills++;
 	}
-	else if (Team == ERoomTeam::Defense)
+	else if (FactionTag == FFactionTags::Defense())
 	{
 		DefenderTotalKills++;
 	}
+	// 其它有效阵营理论上不存在, 但 IsValidFaction 已检查, 这里无需 else
 
-	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] AddTeamKill 执行完毕！After: AttackerTotalKills=%d, DefenderTotalKills=%d, IsNetModeServer=%d, IsNetModeRemote=%d"),
-		AttackerTotalKills, DefenderTotalKills, (int32)GetNetMode() == NM_DedicatedServer, (int32)GetNetMode() == NM_Client);
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] AddTeamKill 执行完毕！After: AttackerTotalKills=%d, DefenderTotalKills=%d"),
+		AttackerTotalKills, DefenderTotalKills);
 
 	// 【核心修复】: 强制广播给所有客户端（包括 Listen Server 主机自身）
 	// 原因: OnRep_TeamKillCount 在 Listen Server 本地不会触发，导致房主 UI 永远不更新
@@ -482,4 +517,43 @@ void ARoomGameState::OnRep_HostPlayerName()
 		&& LocalAccountName.Equals(HostPlayerName, ESearchCase::IgnoreCase);
 
 	URoomService::BroadcastHostChanged(World, bIsHostNow);
+}
+
+
+// ==========================================
+// 【v46 新增】AI 占位队列复制回调
+// ==========================================
+
+/**
+ * OnRep_ReplicatedPendingAIQueue
+ *
+ * 客户端收到 ReplicatedPendingAIQueue 同步时的回调
+ * 触发 OnPendingAIQueueChanged 广播, 让 URoomInsidePage 刷新 UI
+ */
+void ARoomGameState::OnRep_ReplicatedPendingAIQueue()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_ReplicatedPendingAIQueue: 触发 AI 队列刷新! Count=%d"),
+		ReplicatedPendingAIQueue.Num());
+
+	OnPendingAIQueueChanged.Broadcast();
+}
+
+
+/**
+ * GetPendingAICountInFaction
+ *
+ * 查询指定阵营的 AI 占位数量 (客户端 UI 用)
+ */
+int32 ARoomGameState::GetPendingAICountInFaction(FGameplayTag FactionTag) const
+{
+	if (!FFactionTags::IsValidFaction(FactionTag))
+	{
+		return 0;
+	}
+
+	return ReplicatedPendingAIQueue.FilterByPredicate([FactionTag](const FPendingAIEntry& Entry)
+	{
+		return Entry.FactionTag == FactionTag;
+	}).Num();
 }

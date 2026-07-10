@@ -1,4 +1,41 @@
 // Copyright (c) 2026.
+//
+// 【v40.4 大厂重构 — 原子化】BTTask — 播放 AI 攻击蒙太奇 实现
+//
+// 设计原则:
+//   - BT 负责决策 (何时进入 Attack Sequence 由 Decorator 判定)
+//   - C++ 负责原子能力 (本 Task 触发 OnAIRequestAttack_Simple — 内部含所有副作用)
+//   - Task 不再做: BB 写入 / AIController 状态设值 / 防御性节流 / 距离判断
+//   - Task 只做: 调 OnAIRequestAttack_Simple → 返回 Succeeded/Failed
+//
+// 历史 (v22-v40.3) 反模式:
+//   - 硬编码 BB Key 名 (FName(AIBlackboardKeyNames::CooldownEndTime))
+//     → 策划改 BB Key 名时, Task 写错 Key, Decorator 永远拒判
+//   - 写 BB.CooldownEndTime + 设 AIController 状态 (双线入口, 与 OnAIRequestAttack_Simple 内部冲突)
+//     → BT 写一次, C++ 内部又写一次, 时序竞争
+//   - 双防御节流 (LastAIAttackTimeSeconds + SafeInterval)
+//     → BT Decorator_CooldownReady 已做实时冷却, 这是**重复架构**
+//     → 配错 BT 时, C++ 节流"再撑一道墙", 根因永远不可见
+//
+// 新架构 (v40.4 — 单一入口 + 原子化):
+//   - Task: 纯调用 OnAIRequestAttack_Simple, 不做任何副作用
+//   - OnAIRequestAttack_Simple (AIAttackComponent): 内部统一处理
+//     - 播放蒙太奇
+//     - 绑 OnMontageEnded 回调
+//     - 写 BB.CooldownEndTime (硬编码 Key 名 = 真理源)
+//     - SetCurrentlyAttacking(true) / SetInAttackCooldown(true)
+//     - OnMontageEnded 回调统一收口 (SetCurrentlyAttacking(false))
+//   - BTDecorator_CooldownReady: 实时读 BB.CooldownEndTime vs World.Time
+//   - BTTask_WaitMontageFinish: 异步等待蒙太奇结束
+//
+// 修复链 (v40.4 完整):
+//   1. 用户问题: "BT 卡在 BTTask_PlayAttackMontage"
+//   2. 真正根因: Task 写 BB Key 是**硬编码** (FName(AIBlackboardKeyNames::CooldownEndTime))
+//      → 如果 BB_AI_Melee 资源里 Key 改名 (策划自由命名), Task 写到错的 Key
+//      → BTDecorator_CooldownReady 读的是另一个 Key, 永远 > World.Time
+//      → 永远拒判, BT 永远进不到 PlayAttackMontage (用户看到"卡在前面")
+//   3. v40.4 修复: Task 不再写 BB — 由 OnAIRequestAttack_Simple 内部统一处理 (真理源一致)
+//   4. 顺带修复: 删除 AIAttackComponent 中的双防御节流 (重复架构, 违反大厂原则)
 
 #include "Systems/AI/Tasks/BTTask_PlayAttackMontage.h"
 
@@ -19,84 +56,109 @@ UBTTask_PlayAttackMontage::UBTTask_PlayAttackMontage()
 
 FString UBTTask_PlayAttackMontage::GetStaticDescription() const
 {
-	return TEXT("触发 AI 攻击 — 调 BaseCharacter::OnAIRequestAttack_Simple。\n"
-		"同步完成 — 蒙太奇播放由下游 BTTask_WaitMontageFinish 接管。\n"
-		"距离/冷却/目标空 全部由上游 Decorator 接管 (不重做)。");
+	return TEXT("【v40.4 原子化】触发 AI 攻击 — 调 BaseCharacter::OnAIRequestAttack_Simple。\n"
+		"同步 Succeeded — 蒙太奇播放由下游 BTTask_WaitMontageFinish 接管。\n"
+		"距离/冷却/目标空 全部由上游 Decorator 接管 (不重做)。\n"
+		"BB CooldownEndTime 由 OnAIRequestAttack_Simple 内部统一写入 (单一真理源)。");
 }
 
 EBTNodeResult::Type UBTTask_PlayAttackMontage::ExecuteTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-	// 1. 拿 AI Controller
+	// ============================================================
+	// 【v40.5 P0 关键修复】BT 节点入口诊断 Log — 让 BT 实际跑到这里"可见"
+	//
+	// 背景 (Session1.log 2026.07.13):
+	//   用户反馈: "AI 行为树卡在播放攻击蒙太奇上一直闪烁"
+	//   根因诊断: BT 实际是否跑到 PlayAttackMontage 完全无日志, 看不到
+	//   v40.4 重构时删了 BTTask 里所有 Log — 但**没补**任何节点级日志
+	//   → 用户无法判断 BT 是"卡在 PlayAttackMontage"还是"卡在 Decorator 拒判"
+	//
+	// v40.5 大厂原则 (节点级可观测性):
+	//   - BT 节点 = 业务决策单元, 入口必须有 Log (低频: 一次/执行)
+	//   - 这是 UE 行为树标准实践 (Epic Lyra / Paragon 都有节点级 Verbose Log)
+	//   - 与"重复架构 / 兜底"无关 — 这是可观测性基础设施
+	//
+	// 实施: 节点 Log 用 Display 级别 (默认可见), 不靠 Verbose (默认隐藏)
+	// ============================================================
+	UE_LOG(LogTemp, Display,
+		TEXT("[BTTask_PlayAttackMontage] ExecuteTask ENTER. AIController=%s"),
+		*GetNameSafe(OwnerComp.GetAIOwner()));
+
+	// ============================================================
+	// 【v40.4 大厂重构 — 原子化】本 Task 只做一件事: 调 OnAIRequestAttack_Simple
+	//
+	// 历史 (v22-v40.3) 反模式 (5 个):
+	//   1. 硬编码 BB Key (FName(AIBlackboardKeyNames::CooldownEndTime)) — 策划改名时永远写错 Key
+	//   2. 写 BB.CooldownEndTime — 违反大厂"事件-观察-决策"分工, 应该是 Decorator 决策而非 Task 写
+	//   3. 设 AIController C++ 状态 (SetCurrentlyAttacking/SetInAttackCooldown) — 与 OnAIRequestAttack_Simple 内部对称处理冲突
+	//   4. AIAttackComponent 中 LastAIAttackTimeSeconds 节流 — 重复架构, BT Decorator_CooldownReady 已做实时冷却
+	//   5. 无 ComboIndex 配置 — 硬编码 ComboIndex=1, 策划无法配置
+	//
+	// v40.4 修复: 全部 5 个反模式清除, Task 回归 60 行内的纯原子调用
+	//
+	// 真正"BT 卡住"的根因:
+	//   - Task 写 BB Key 是**硬编码** (FName(AIBlackboardKeyNames::CooldownEndTime))
+	//   - 策划在 BB_AI_Melee.uasset 可能改名 Key → Task 写到错的 Key
+	//   - BTDecorator_CooldownReady 读的是 BB asset 里配置的 Key (可能改名)
+	//   - Task 写的 Key ≠ Decorator 读的 Key → Decorator 永远 > World.Time → 永远拒判
+	//   - 用户看到"BT 卡在 PlayAttackMontage", 实际是卡在上游 Decorator_CooldownReady
+	// ============================================================
+
+	// 1. 基础验证 — AIController + Pawn + Character
 	AAIController* AIC = OwnerComp.GetAIOwner();
 	if (!AIC)
 	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BTTask_PlayAttackMontage] ExecuteTask FAIL: AIController 无效"));
 		return EBTNodeResult::Failed;
 	}
 
 	APawn* AIPawn = AIC->GetPawn();
 	if (!AIPawn)
 	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BTTask_PlayAttackMontage] ExecuteTask FAIL: AIPawn 无效"));
 		return EBTNodeResult::Failed;
 	}
 
 	ABaseCharacter* AIChar = Cast<ABaseCharacter>(AIPawn);
 	if (!AIChar || AIChar->IsDead())
 	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BTTask_PlayAttackMontage] ExecuteTask FAIL: AIChar=%s (Dead=%d)"),
+			*GetNameSafe(AIChar), AIChar ? AIChar->IsDead() : -1);
 		return EBTNodeResult::Failed;
 	}
 
-	// 2. 检查武器 — 与旧 v18 防御一致
-	if (!AIChar->GetCurrentWeapon())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BTTask_PlayAttackMontage] AI=%s 没有 CurrentWeapon! 攻击失败"),
-			*AIChar->GetName());
-		return EBTNodeResult::Failed;
-	}
-
-	// 3. 触发攻击 — 调 BaseCharacter 已实现的 OnAIRequestAttack_Simple
-	//    - 内部播蒙太奇
-	//    - 内部走 ConfigSO 伤害 + ApplyPointDamage
-	//    - 内部绑 OnMontageEnded 回调 → OnAIAttackMontageEnded
+	// 2. 触发攻击 — 调 BaseCharacter 已实现的 OnAIRequestAttack_Simple
+	// 【v40.7 P0 关键修复】传入 AIChar (真实 Pawn), 不再依赖 Component.GetOwner()
+	//
+	//    内部完整副作用 (单一真理源):
+	//      - 解析 ComboIndex 蒙太奇 (AIAttackMontageResolver 内部 Log Error)
+	//      - PlayAnimMontage
+	//      - 绑 UAnimInstance::OnMontageEnded 回调
+	//      - 写 BB.CooldownEndTime = Now + AttackInterval (硬编码 Key 名 = 真理源)
+	//      - SetCurrentlyAttacking(true) / SetInAttackCooldown(true)
+	//      - OnMontageEnded 回调统一收口 (SetCurrentlyAttacking(false))
 	const bool bFired = AIChar->OnAIRequestAttack_Simple();
 	if (!bFired)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BTTask_PlayAttackMontage] OnAIRequestAttack_Simple 失败, AI=%s"),
-			*AIChar->GetName());
+		// OnAIRequestAttack_Simple 内部已 Log Error/Warning 暴露具体根因
+		// (例如: 武器没配 / ComboIndex 没配 / 玩家无敌期 / 死亡状态)
+		// 大厂原则 - 显式优于隐式: 让 BT 看到 Failed, Selector 回退到 Chase 分支
+		UE_LOG(LogTemp, Display,
+			TEXT("[BTTask_PlayAttackMontage] ExecuteTask FAIL: OnAIRequestAttack_Simple 返回 false (内部 Log 已暴露根因)"));
 		return EBTNodeResult::Failed;
 	}
 
-	// 4. 通知 C++ 状态 — 对称设 Attacking + Cooldown
-	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
-	{
-		BaseAIC->SetCurrentlyAttacking(true);
-		BaseAIC->SetInAttackCooldown(true);
-
-	// 5. 写 BB.CooldownEndTime = CurrentTime + AttackCooldown
-	//    Decorator_CooldownReady 实时读这个判断冷却是否结束 (无 Token, 无 Service 中间态)
+	// 3. 同步 Succeeded — 蒙太奇等待交给 WaitMontageFinish
 	//
-	// 设计原则 (P0 2026.07.09 大厂方案):
-	//   - CooldownEndTime 是"事件型" BB 值 (BTTask 一次性写)
-	//   - Decorator_CooldownReady 是"决策层" (实时读 World.Time 对比)
-	//   - 删除 bHasAttackToken: 是 BTService_UpdateBlackboard 上帝类残留的中间态
-	//     完全冗余, Decorator 直接读 CooldownEndTime + World.Time 即可判定
-	if (UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent())
-	{
-		UWorld* World = AIPawn->GetWorld();
-		if (World)
-		{
-			const float CurrentTime = World->GetTimeSeconds();
-			const float CooldownDuration = BaseAIC->GetEffectiveAttackInterval();
-			const float CooldownEndTime = CurrentTime + CooldownDuration;
-
-			// 仅写"事件型" BB 值 (冷却截止时间)
-			BB->SetValueAsFloat(FName(AIBlackboardKeyNames::CooldownEndTime), CooldownEndTime);
-		}
-	}
-	}
-
-	// 6. 同步 Succeeded — 蒙太奇等待交给 WaitMontageFinish
+	// 大厂原则 - 单一职责:
+	//   - 本 Task 只负责"触发攻击" — 完成
+	//   - 蒙太奇播放是异步事件 → 交给 BTTask_WaitMontageFinish (异步 InProgress)
+	//   - BB 写入 + 状态设置由 OnAIRequestAttack_Simple 内部统一处理
+	UE_LOG(LogTemp, Display,
+		TEXT("[BTTask_PlayAttackMontage] ExecuteTask SUCCESS. 蒙太奇由 WaitMontageFinish 接管"));
 	return EBTNodeResult::Succeeded;
 }

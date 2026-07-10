@@ -48,11 +48,11 @@ struct METALSLUG01_API FAIAttackMontageResult
 	UPROPERTY(BlueprintReadOnly, Category = "AI Combat")
 	int32 ResolvedIndex = INDEX_NONE;
 
-	/** 来源层级 (0 = 设计意图, 1/2/3 = 各级兜底, -1 = 完全失败) */
+	/** 来源层级 (0 = 设计意图, -1 = 显式失败/v32 零兜底) */
 	UPROPERTY(BlueprintReadOnly, Category = "AI Combat")
 	int32 FallbackLevel = -1;
 
-	/** 是否走了兜底链 (用于报警) */
+	/** 是否走了兜底链 (v32 零兜底: 永远是 false, 保留字段仅防止 BP 蓝图依赖错误) */
 	UPROPERTY(BlueprintReadOnly, Category = "AI Combat")
 	bool bFromFallback = false;
 };
@@ -60,26 +60,27 @@ struct METALSLUG01_API FAIAttackMontageResult
 
 /**
  * @class UAIAttackMontageResolver
- * @brief AI 攻击动画解析器（静态工具类）
+ * @brief AI 攻击动画解析器（静态工具类, v32 零兜底）
+ *
+ * 【v32 大厂改造】删除 Level 1/2/3 兜底链
  *
  * 业务背景 (大厂架构师视角):
- *   老设计: BTTask_MeleeAttack 直接调 Weapon->GetAttackMontage(false, 1),
- *           一旦 BP 配置错了 (LightAttackMontages 只有 1 个但请求 index=1)
- *           → 返回 nullptr → BTTask Failed → BT Selector 切回 MoveTo
- *           → AI 永远追玩家永远不到攻击动画播放 → 玩家看到"AI 跟着我但不打"
+ *   老设计: 4 层兜底链 (Level 0 设计意图 / Level 1 ComboIndex→0 / Level 2 重击代替 / Level -1 失败)
+ *           BP 配置错误被静默兼容, AI 永远"能挥刀", 玩家察觉不到配置错
  *
- *   新设计: 引入职责链兜底, 哪怕 BP 配错也能"优雅降级"
- *           - 设计意图路径优先 (调用 GetAttackMontage)
- *           - 多层兜底链, 任何一层能拿到蒙太奇就不让 AI 卡住
- *           - 报警日志清晰指引用户修复 BP
+ *   新设计 (v32 — 零兜底):
+ *           - 只有 Level 0 (设计意图) + Level -1 (Log Error 完全失败)
+ *           - 配置缺失 → Log Error + return Montage=nullptr → AI 放弃本次攻击
+ *           - 调用方 OnAIRequestAttack_Simple 已合规处理 Montage=nullptr
+ *           - BP 美术必须严格配 LightAttackMontages 数组 (Level 0 路径才会命中)
  *
  * 职责:
- *   1. 提供 ResolveLightAttackMontage: 解析 AI 轻击蒙太奇
- *   2. 提供 ResolveHeavyAttackMontage: 解析 AI 重击蒙太奇 (后续扩展)
+ *   1. 提供 ResolveLightAttackMontage: 解析 AI 轻击蒙太奇 (Level 0 唯一路径)
+ *   2. 提供 ResolveHeavyAttackMontage: 解析 AI 重击蒙太奇 (Level 0 唯一路径)
  *   3. 提供 ExplainConfigurationIssue: 生成 BP 配置修复建议
  *
  * 不负责:
- *   - 不播放蒙太奇 (那是 BaseCharacter 的事)
+ *   - 不播放蒙太奇 (那是 BaseCharacter / AIAttackComponent 的事)
  *   - 不管冷却/BT (那是 BTTask 的事)
  *   - 不持有任何状态 (纯静态工具)
  */
@@ -90,22 +91,21 @@ class METALSLUG01_API UAIAttackMontageResolver : public UObject
 
 public:
 	/**
-	 * 解析 AI 轻击蒙太奇 (核心入口)
+	 * 解析 AI 轻击蒙太奇 (Level 0 唯一路径 — v32 零兜底)
 	 *
-	 * Fallback 链 (按优先级):
+	 * 路径:
 	 *   Level 0 (设计意图): Weapon->GetAttackMontage(false, ComboIndex)
 	 *                       — 这是正常情况下应命中的路径
-	 *   Level 1 (兜底 1):   Weapon->GetAttackMontage(false, 0)
-	 *                       — 若设计意图因索引越界失败, 退回到第 0 段
-	 *   Level 2 (兜底 2):   Weapon->LightAttackMontages[0]
-	 *                       — 若 GetAttackMontage 实现 bug, 直接读数组
-	 *   Level 3 (兜底 3):   Weapon->HeavyAttackMontage
-	 *                       — 若连轻击蒙太奇都没配, 临时用重击代替 (避免 AI 完全不动)
-	 *   Level -1 (失败):    返回 Montage=nullptr, 让调用方放弃本次攻击
+	 *   Level -1 (显式失败): 找不到 → Log Error + return Montage=nullptr
+	 *
+	 * 历史 (v22-v31.x):
+	 *   - 4 层兜底链, AI 永远能挥刀 — 已删除
+	 *   - BP 配置缺失被静默兼容 (Level 1/2 降级) — 已改为 Log Error
+	 *   - 强制 BP 美术按规范配 LightAttackMontages 数组
 	 *
 	 * @param Weapon       当前 AI 装备的武器 (可为 null)
 	 * @param ComboIndex   期望的轻击段索引 (0/1/2...)
-	 * @return             解析结果 (含来源层级, 用于日志报警)
+	 * @return             解析结果 (Montage 或 nullptr)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI Combat|Montage Resolver")
 	static FAIAttackMontageResult ResolveLightAttackMontage(
@@ -113,7 +113,11 @@ public:
 		int32 ComboIndex = 0);
 
 	/**
-	 * 解析 AI 重击蒙太奇 (扩展入口, 当前用 GetAttackMontage(true, 0) 即可)
+	 * 解析 AI 重击蒙太奇 (Level 0 唯一路径 — v32 零兜底)
+	 *
+	 * 路径:
+	 *   Level 0 (设计意图): Weapon->GetAttackMontage(true, 0)
+	 *   Level -1 (显式失败): 找不到 → Log Error + return Montage=nullptr
 	 *
 	 * @param Weapon  当前 AI 装备的武器
 	 * @return        解析结果

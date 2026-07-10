@@ -10,6 +10,7 @@
 
 // 引入房间 GameState（用于 AddTeamKill 队伍击杀统计）
 #include "Systems/RoomGameState.h"
+#include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
 
 
 // ==========================================
@@ -20,15 +21,15 @@
  * ARoomPlayerState 构造函数
  *
  * 目的: 初始化默认值、开启网络同步
- * 1. 队伍 = None，准备状态 = false
+ * 1. 阵营 = Faction.Defense（默认守方，由 GameMode::PostLogin 覆盖）, 准备状态 = false
  * 2. 计分板数据归零
  * 3. PlayerState 开启网络同步
  * 4. 战备选择初始化为 "Default"
  */
 ARoomPlayerState::ARoomPlayerState()
 {
-	// 默认初始化
-	CurrentTeam = ERoomTeam::None;
+	// 【2026.07.10 P0 重构】阵营默认 Faction.Defense, GameMode 启动时根据 ModeRulesByMode 覆盖
+	CurrentFactionTag = FFactionTags::Defense();
 	bIsReady = false;
 
 	// 初始化计分板数据
@@ -62,14 +63,13 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	// ==========================================
-	// 【2026-06-29 P0 修复】注册阵营与准备状态的复制
-	// 根因: CurrentTeam 和 bIsReady 标了 ReplicatedUsing = OnRep_Team/OnRep_IsReady,
-	//       但 DOREPLIFETIME 漏注册 → 客户端永远拿不到这两个字段的值 → 
-	//       GetPlayersInTeam(Attack/Defense) 找不到任何玩家 → Box_AttackTeam/Box_DefenseTeam 始终为空
-	//       OnRep_Team/OnRep_IsReady 永远不触发 → UI 不刷新
+	// 【2026.07.10 P0 重构】阵营与准备状态同步 — 用 FGameplayTag 替代 ERoomTeam
+	// 根因: 旧版 CurrentTeam 是 ERoomTeam 枚举, 现统一用 FGameplayTag 表达阵营
 	// ==========================================
-	DOREPLIFETIME(ARoomPlayerState, CurrentTeam);
+	DOREPLIFETIME(ARoomPlayerState, CurrentFactionTag);
 	DOREPLIFETIME(ARoomPlayerState, bIsReady);
+	// 【2026.07.11 v29.6】玩家主动选阵营标志 (阻止 auto-balance 反复覆盖)
+	DOREPLIFETIME(ARoomPlayerState, bHasExplicitlyChosenTeam);
 
 	// 【核心规范】: 在这里注册变量。DOREPLIFETIME 会让引擎底层接管这些变量的网络同步
 	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
@@ -85,18 +85,52 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 
 
 // ==========================================
+// 【2026.07.11 v29.6】玩家主动切队标记
+//
+// 唯一调用方: ARoomGameMode::ChangePlayerTeam 改阵营成功后
+// 效果: bHasExplicitlyChosenTeam = true, auto-balance 永远不再覆盖玩家的选择
+//
+// 大厂原则:
+//   - 玩家意图 (PC.RequestChangeTeam) 是阵营真理 — 一旦确认, 不可被 RoomGameMode 的
+//     auto-balance 重新覆盖
+//   - 服务器修改 → 自动 Replicate 到客户端 → 客户端 OnStateChanged 自动 refresh
+// ==========================================
+void ARoomPlayerState::Server_MarkTeamExplicitlyChosen()
+{
+	// 仅服务器可调用
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerState] Server_MarkTeamExplicitlyChosen: 客户端调用, 拒绝 (HasAuthority=false)"));
+		return;
+	}
+
+	// 幂等: 已标记过则不重复
+	if (bHasExplicitlyChosenTeam)
+	{
+		return;
+	}
+
+	bHasExplicitlyChosenTeam = true;
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomPlayerState] Server_MarkTeamExplicitlyChosen: 玩家已显式选阵营 (CurrentFactionTag=%s), "
+		     "auto-balance 将永远不再覆盖此玩家的阵营"),
+		*CurrentFactionTag.ToString());
+}
+
+
+// ==========================================
 // 3. 客户端 Rep Notifies
 // ==========================================
 
 /**
- * OnRep_Team
+ * OnRep_FactionTag
  *
- * 只有客户端会在变量改变时自动执行这些 OnRep 函数
- * 队伍发生变化，通知 UI 刷新
+ * 【2026.07.10 重构】阵营 Tag 变化时的客户端回调, 替代原 OnRep_Team
+ * 通知 UI 刷新 — OnStateChanged 委托不变, UI 层无需改
  */
-void ARoomPlayerState::OnRep_Team()
+void ARoomPlayerState::OnRep_FactionTag()
 {
-	// 队伍发生变化，通知 UI 刷新
 	OnStateChanged.Broadcast();
 }
 
@@ -148,9 +182,12 @@ void ARoomPlayerState::AddKillScore()
 		{
 			if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 			{
-				UE_LOG(LogTemp, Log, TEXT("[RoomPlayerState] AddKillScore: Player=%s, CurrentTeam=%d, Before: AttackerKills=%d, DefenderKills=%d"),
-					*GetPlayerName(), (int32)CurrentTeam, RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
-				RoomGS->AddTeamKill(CurrentTeam);
+				UE_LOG(LogTemp, Log,
+					TEXT("[RoomPlayerState] AddKillScore: Player=%s, CurrentFactionTag=%s, Before: AttackerKills=%d, DefenderKills=%d"),
+					*GetPlayerName(), *CurrentFactionTag.ToString(),
+					RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
+				// 【2026.07.10 P0 重构】传递 FGameplayTag 给 GameState, 替代 ERoomTeam
+				RoomGS->AddTeamKill(CurrentFactionTag);
 				UE_LOG(LogTemp, Log, TEXT("[RoomPlayerState] AddKillScore: After: AttackerKills=%d, DefenderKills=%d"),
 					RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
 			}

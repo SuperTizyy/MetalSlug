@@ -7,6 +7,16 @@ UAIBehaviorConfigSO::UAIBehaviorConfigSO()
     // 默认值已经在 USTRUCT 字段 initializer 中
 }
 
+// ============================================
+// 【v54.3 删除】GetDefaultWeaponRowNames 函数已彻底删除
+// ============================================
+//
+// 删除原因 (用户决策 2026.07.16):
+//   - 真理源从 DefaultWeaponRowName (FName + DT_WeaponInfo 中间层) 改为 DefaultWeaponClass (TSoftClassPtr<ABaseWeapon>)
+//   - 编辑器从 Dropdown 改为资产选择器, 不再需要 GetRowNames 回调
+//   - 单一真理源: 一个字段直接决定武器 BP, 不需要查 DT 反查
+// ============================================
+
 float UAIBehaviorConfigSO::GetDifficultyScale(EAIDifficultyTier Tier) const
 {
     switch (Tier)
@@ -48,6 +58,7 @@ FAIMovementParams UAIBehaviorConfigSO::GetScaledMovement(EAIDifficultyTier Tier)
     const float Scale = GetDifficultyScale(Tier);
     FAIMovementParams Out = Movement;
     Out.WalkSpeed *= Scale;
-    Out.RunSpeed  *= Scale;
+    // WanderRadius 不缩放: 漫游半径是地图配置参数 (设计意图), 不应该被难度影响
+    // AI 在战斗外随机漫游, 难度主要影响战斗行为, 不影响漫游范围
     return Out;
 }

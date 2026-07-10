@@ -12,6 +12,9 @@
 // 引入角色基类（用于 Spawn 相关操作）
 #include "Characters/BaseCharacter.h"
 
+// 【2026.07.11 v28】Server_KickPlayer 需要 AAIController 完整类型 (Destroy/GetName), 加完整 include
+#include "AIController.h"
+
 // 引入 Enhanced Input 相关头文件
 #include "EnhancedInputComponent.h"
 
@@ -35,6 +38,12 @@
 
 // 引入房间 GameState（用于查询比赛信息）
 #include "Systems/RoomGameState.h"
+
+// 引入房间 PlayerState（用于 InitPlayerState 强制类型）
+#include "Systems/Core/RoomPlayerState.h"
+
+// 【v31.4】URoomSpawnSubsystem (复活路径真理源 + Loadout 同步)
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
 
 // 引入 GameFlowSubsystem（流程大管家）
 #include "Systems/GameFlowSubsystem.h"
@@ -614,25 +623,32 @@ void ARoomPlayerController::Client_ReceiveChatMessage_Implementation(const FStri
 // ==========================================
 
 /**
- * 验证函数: 添加 AI
+ * 验证函数: 添加 AI (大厅阶段)
+ * 【2026.07.11 v28 重构】RPC 改名 + 改签名, 走 FAISpawnRequest 通道
  */
-bool ARoomPlayerController::Server_AddAI_Validate(bool bToAttackTeam, const FString& CharacterName, int32 Count) { return true; }
+bool ARoomPlayerController::Server_QueueAIForBattleSpawn_Validate(const FAISpawnRequest& Request) { return true; }
 
 /**
- * Server_AddAI_Implementation
+ * Server_QueueAIForBattleSpawn_Implementation
  *
- * 服务器端: 处理添加 AI 请求
- * 只有房主（拥有 authority）才能添加 AI
+ * 【2026.07.11 v28 大厂架构重构】服务器端: 接收"添加 AI"请求
+ *
+ * 旧 (v24) 行为: GM->AddAIToRoom 立刻 Spawn Pawn, 大厅阶段 AI 已经站在场景里
+ * 新 (v28) 行为: GM->QueueAIForBattleSpawn 只入队, 战斗开始时统一 Spawn
+ *
+ * 大厂原则:
+ *   - 显式意图: RPC 入队 = 业务请求, 不允许"静默立刻生成"
+ *   - 零兜底: 字段非法 → GameMode::QueueAIForBattleSpawn 显式 Error + 拒绝入队
  */
-void ARoomPlayerController::Server_AddAI_Implementation(bool bToAttackTeam, const FString& CharacterName, int32 Count)
+void ARoomPlayerController::Server_QueueAIForBattleSpawn_Implementation(const FAISpawnRequest& Request)
 {
 	// 只有房主才有权限加 AI
 	if (!HasAuthority()) return;
 
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 让 GameMode 去处理具体的添加逻辑
-		GM->AddAIToRoom(bToAttackTeam, CharacterName, Count);
+		// 让 GameMode 去处理入队 (不生成 Actor)
+		GM->QueueAIForBattleSpawn(Request);
 	}
 }
 
@@ -640,66 +656,113 @@ void ARoomPlayerController::Server_AddAI_Implementation(bool bToAttackTeam, cons
  * Server_KickPlayer_Implementation
  *
  * 房主踢人 RPC
- * 区分 AI（[AI] 前缀）和真实玩家
+ * 【2026.07.11 v28 大厂架构重构】区分真人 vs AI 占位
+ *
+ * 旧 (v27) 判定: PlayerNameToKick.StartsWith(TEXT("[AI]"))
+ *   旧 AIName 是 "[AI]Grunt_1" 格式, 但新 (v28) AIName 是 "AI_GruntAI_1" 格式
+ *   → StartsWith("[AI]") 永远 false → AI 名字走"踢真人"分支, no-op
+ *
+ * 新 (v28) 判定: 走 GameMode.PendingAIQueue (元数据) 或 AIController (已生成)
+ *   - 真人: 走 PlayerController 迭代
+ *   - AI 占位 (大厅阶段): 从 PendingAIQueue 移除
+ *   - AI 已生成 (战斗阶段): 找 AIController, Destroy Controller (v24 复用, 不能简单 Destroy, 需重启)
+ *
+ * 大厂原则: 单一真理源, 判定逻辑集中此处, 不允许调用方自己判
  */
 void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& PlayerNameToKick)
 {
 	if (!HasAuthority()) return;
 
-	// 判断是否 AI（AI 名字以 [AI] 开头）
-	bool bIsAI = PlayerNameToKick.StartsWith(TEXT("[AI]"));
-
-	// 当前只实现了踢真实玩家（AI 踢人逻辑由 GameMode 内部完成）
-	if (!bIsAI)
+	// ==========================================
+	// 阶段 1: 检查是否是 AI 占位 (大厅阶段 PendingAIQueue 里有这个 DisplayName)
+	// ==========================================
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 遍历所有玩家控制器，找到目标
-		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+		if (GM->IsPendingAIByName(PlayerNameToKick))
 		{
-			ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
-			if (TargetPC && TargetPC->MyPlayerName == PlayerNameToKick)
+			// AI 占位 → 从队列移除 (不生成 Actor)
+			GM->RemovePendingAIByName(PlayerNameToKick);
+			UE_LOG(LogTemp, Log, TEXT("[KickPlayer] 移除 AI 占位 '%s' 成功"), *PlayerNameToKick);
+			return;
+		}
+	}
+
+	// ==========================================
+	// 阶段 2: 检查是否是已生成的 AI (战斗阶段, 有 AIController)
+	// ==========================================
+	bool bIsAIController = false;
+	for (FConstControllerIterator It = GetWorld()->GetControllerIterator(); It; ++It)
+	{
+		if (AAIController* AIC = Cast<AAIController>(It->Get()))
+		{
+			// AI Controller 的名字格式: AIC_AI_GruntAI_1 (SpawnAIInternal 里拼的)
+			// PlayerNameToKick 是 "AI_GruntAI_1" 格式
+			const FString AICName = AIC->GetName();
+			if (AICName.EndsWith(PlayerNameToKick))
 			{
-				// ==========================================
-				// 【2026-06-30 P0 修复】踢人前必须先清理 AccountAuthority 的 TMap 条目
-				// ----------------------------------------------------------------------
-				// 旧根因：
-				//   Server_KickPlayer 只通知了被踢客户端 Client_BeKicked() + 调 RemovePlayerFromRoom
-				//   → 但 Client_BeKicked 走 ExecuteLeaveRoom 直接跳图，没经过 AccountAuthority 清理
-				//   → AccountAuthority.OnlineAccounts 残留被踢玩家 (Username, OldSessionId)
-				//   → 被踢玩家重进时，DelayedSendPlayerInfo 生成 NEW SessionId
-				//   → HandleLoginRequest 走"情况 2: 同 Username 不同 SessionId" → 拒绝
-				//   → Client_LoginResult(bReject=true) → 弹 Overlay_LANRoomConflict
-				// 修复：在告知客户端被踢前，在房主权威表里显式调 HandleLogoutRequest
-				//       清掉对应的 (Username, SessionId) 条目，给"想重新加入"留出通道
-				// ==========================================
-				if (AccountAuthority.IsValid())
-				{
-					if (!TargetPC->MyAccountUsername.IsEmpty() && !TargetPC->MyAccountSessionId.IsEmpty())
-					{
-						AccountAuthority->HandleLogoutRequest(
-							TargetPC->MyAccountUsername,
-							TargetPC->MyAccountSessionId);
-
-						UE_LOG(LogTemp, Log,
-							TEXT("[Authority] Server_KickPlayer: 已清理 TMap 中 [%s] 的旧 SessionId (允许重进)"),
-							*TargetPC->MyAccountUsername);
-					}
-					else
-					{
-						// 【兜底】：万一被踢 PC 上 Username/SessionId 为空，走模糊匹配清理
-						AccountAuthority->HandleControllerDestroyed(TargetPC);
-					}
-				}
-
-				// 通知目标客户端被踢
-				TargetPC->Client_BeKicked();
-
-				// 【修复】: 将被踢人的 Controller 传过去，让 GameMode 移除其数据
-				if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-				{
-					GM->RemovePlayerFromRoom(TargetPC);
-				}
+				// 大厂原则 - 显式意图: 战斗阶段 AI 是真人在打, 不允许"房主踢 AI"瞬间消失
+				// (战斗进行时踢 AI 等于作弊)
+				// 但用户当前是测试期, 先支持踢, 后续可加"战斗中禁止踢 AI"规则
+				UE_LOG(LogTemp, Warning,
+					TEXT("[KickPlayer] 战斗阶段踢 AI '%s' (AIC='%s') — 立即销毁 Controller, 残留 Pawn 由 UE GC"),
+					*PlayerNameToKick, *AICName);
+				AIC->Destroy();
+				bIsAIController = true;
 				break;
 			}
+		}
+	}
+	if (bIsAIController) return;
+
+	// ==========================================
+	// 阶段 3: 真人玩家 — 走原有逻辑
+	// ==========================================
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		ARoomPlayerController* TargetPC = Cast<ARoomPlayerController>(It->Get());
+		if (TargetPC && TargetPC->MyPlayerName == PlayerNameToKick)
+		{
+			// ==========================================
+			// 【2026-06-30 P0 修复】踢人前必须先清理 AccountAuthority 的 TMap 条目
+			// ----------------------------------------------------------------------
+			// 旧根因：
+			//   Server_KickPlayer 只通知了被踢客户端 Client_BeKicked() + 调 RemovePlayerFromRoom
+			//   → 但 Client_BeKicked 走 ExecuteLeaveRoom 直接跳图，没经过 AccountAuthority 清理
+			//   → AccountAuthority.OnlineAccounts 残留被踢玩家 (Username, OldSessionId)
+			//   → 被踢玩家重进时，DelayedSendPlayerInfo 生成 NEW SessionId
+			//   → HandleLoginRequest 走"情况 2: 同 Username 不同 SessionId" → 拒绝
+			//   → Client_LoginResult(bReject=true) → 弹 Overlay_LANRoomConflict
+			// 修复：在告知客户端被踢前，在房主权威表里显式调 HandleLogoutRequest
+			//       清掉对应的 (Username, SessionId) 条目，给"想重新加入"留出通道
+			// ==========================================
+			if (AccountAuthority.IsValid())
+			{
+				if (!TargetPC->MyAccountUsername.IsEmpty() && !TargetPC->MyAccountSessionId.IsEmpty())
+				{
+					AccountAuthority->HandleLogoutRequest(
+						TargetPC->MyAccountUsername,
+						TargetPC->MyAccountSessionId);
+
+					UE_LOG(LogTemp, Log,
+						TEXT("[Authority] Server_KickPlayer: 已清理 TMap 中 [%s] 的旧 SessionId (允许重进)"),
+						*TargetPC->MyAccountUsername);
+				}
+				else
+				{
+					// 【兜底】：万一被踢 PC 上 Username/SessionId 为空，走模糊匹配清理
+					AccountAuthority->HandleControllerDestroyed(TargetPC);
+				}
+			}
+
+			// 通知目标客户端被踢
+			TargetPC->Client_BeKicked();
+
+			// 【修复】: 将被踢人的 Controller 传过去，让 GameMode 移除其数据
+			if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+			{
+				GM->RemovePlayerFromRoom(TargetPC);
+			}
+			break;
 		}
 	}
 }
@@ -727,47 +790,39 @@ void ARoomPlayerController::Server_ToggleReady_Implementation(bool bIsReady)
  *
  * 房主点击"开始游戏"时调用
  * 1. 校验所有玩家已准备
- * 2. 遍历所有玩家: 通知 Client_EnterBattleState + HandlePlayerRequestSpawn
- * 3. 启动服务器端倒计时
+ * 2. 通知所有客户端进入战斗状态 (UI 切换)
+ * 3. 启动 GameMode PerformGameStart — 倒计时结束后由 SpawnAllPlayersIntoBattle 统一处理所有 Spawn
+ *
+ * 【v48 大厂架构修复】
+ *   旧版在这里立即调 GM->HandlePlayerRequestSpawn 每个玩家，导致:
+ *     - 玩家立即 Spawn → 然后 60s 后 SpawnAllPlayersIntoBattle 又跑一遍
+ *     - AI Spawn 被 MatchStartDelay 延迟 (60s)
+ *     - 用户关闭 PIE 前 AI 永远不出现
+ *   新版: 移除即时玩家 Spawn, 全部交给 SpawnAllPlayersIntoBattle 统一处理
  */
 void ARoomPlayerController::Server_RequestStartGame_Implementation()
 {
-	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] Server_RequestStartGame called"));
+
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
 		// 1. 校验所有玩家已准备
 		if (GM->CheckAllPlayersReady())
 		{
-			// 2. 遍历所有玩家
+			// 2. 通知所有客户端切换到战斗状态 (UI 切换: 大厅UI 销毁, 战斗 HUD 显示)
 			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 			{
 				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
 				{
-					// 通知该玩家客户端切换到战斗状态
 					PC->Client_EnterBattleState();
-
-					FString TargetChar = TEXT("");
-					FString TargetWeapon = TEXT("");
-
-					// 【核心修复】: 去玩家自己的 PlayerState 里读取具有唯一真理的数据
-					if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
-					{
-						TargetChar = PS->GetSelectedCharacterID();
-						// 注意: 这里默认将主武器（武器1）传给 GameMode
-						TargetWeapon = PS->GetSelectedWeapon1ID();
-						UE_LOG(LogTemp, Warning, TEXT("[Spawn] PC='%s' sending to GM: Char='%s', Weapon='%s'"),
-							*PC->MyPlayerName, *TargetChar, *TargetWeapon);
-					}
-
-					// 让 GameMode 为该玩家生成 3D 角色和武器
-					GM->HandlePlayerRequestSpawn(PC, TargetChar, TargetWeapon);
 				}
 			}
 
-			// 【P0 架构升级 2026.07.06 17:15】调用 PerformGameStart 触发 OnBattleStarted 广播
-			// 修复: 之前 Server_RequestStartGame_Implementation 直接调 StartMatchTimer,
-			//       完全绕过了 PerformGameStart, 导致 RoomGameMode::OnBattleStarted 永远不广播
-			//       → AI 控制器订阅 OnBattleStarted 但永远收不到 → AI 永远不启动 BT → AI 完全不动
-			// PerformGameStart 内部已调 StartMatchTimer, 不会重复
+			// 3. 启动 GameMode PerformGameStart
+			//    - 立即广播 OnBattleStarted (AI BT 激活)
+			//    - 立即设 CurrentRoomState = BattleInProgress
+			//    - 倒计时 MatchStartDelay 秒后回调 SpawnAllPlayersIntoBattle
+			//      → 这里才统一处理玩家 Spawn + AI Spawn
 			GM->PerformGameStart();
 		}
 		else
@@ -808,14 +863,40 @@ void ARoomPlayerController::Client_ReceiveSystemMessage_Implementation(const FSt
  * Server_RequestSpawn_Implementation
  *
  * 玩家向服务器请求生成 3D 角色（用于测试 / 复活）
+ *
+ * 【v36 零兜底改造】不再传空字符串让 GM 走缓存兜底
+ *   旧实现: GM->HandlePlayerRequestSpawn(this, TEXT(""), TEXT(""))
+ *           → HandlePlayerRequestSpawn 内部用缓存补 (Step 0 合并)
+ *           → 这违反"零兜底"原则 (调用方传空, 让 GM 猜)
+ *   新实现: 调 Server_RequestSpawnWithLoadout(CharID, WeaponID), 让调用方显式传
+ *
+ * 大厂原则:
+ *   - 调用方必须显式传 Loadout, 不允许"故意传空"
+ *   - 复活场景: PlayerController 知道自己的 SelectedCharID/SelectedWeapon1ID
+ *   - 测试场景: UI 应该显式给默认值 (例如 JS001/WQ001)
  */
 void ARoomPlayerController::Server_RequestSpawn_Implementation()
 {
-	// 找咱们的服务器大脑 (RoomGameMode) 报到
+	// 【v36】改为显式传 Loadout
+	const FString CharID = GetPlayerState<ARoomPlayerState>()
+		? GetPlayerState<ARoomPlayerState>()->GetSelectedCharacterID()
+		: FString();
+	const FString WeaponID = GetPlayerState<ARoomPlayerState>()
+		? GetPlayerState<ARoomPlayerState>()->GetSelectedWeapon1ID()
+		: FString();
+
+	if (CharID.IsEmpty() || WeaponID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerController] Server_RequestSpawn: PlayerState.SelectedCharID/WeaponID1 为空, 拒绝 Spawn. "
+				 "【v36 零兜底】不再传空字符串让 GM 走缓存. "
+				 "【修复】UI 必须在点开始游戏前写入 SelectedCharID/SelectedWeapon1ID (RoomLifecycle 阶段)."));
+		return;
+	}
+
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		// 传两个空字符串，GameMode 就会自动识别出我们要用"测试白模"
-		GM->HandlePlayerRequestSpawn(this, TEXT(""), TEXT(""));
+		GM->HandlePlayerRequestSpawn(this, CharID, WeaponID);
 	}
 }
 
@@ -1087,6 +1168,12 @@ void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& C
 	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
 	{
 		PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+
+		// v31.4 P0: 同步到 URoomSpawnSubsystem 缓存 (复活路径的真理源)
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+		{
+			SpawnSys->SetPlayerSpawnData(GetUniqueID(), CharacterRowName, Weapon1RowName);
+		}
 	}
 }
 

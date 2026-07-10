@@ -11,12 +11,16 @@
 // 引入 UE 原生 AGameModeBase 类（基类）
 #include "GameFramework/GameModeBase.h"
 
-// 引入房间相关枚举（ERoomState/ERoomTeam/ERoomMatchMode 等）
+// 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 // 改造: 改为精确子表头
 #include "Data/Enums/RoomEnums.h"
+#include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
 
-// 【Phase 1 新增】AI 数据驱动 Profile 资产（编辑器里拖入 DA_MeleeGrunt）
-#include "Data/AI/AIProfileAsset.h"
+// 【Phase 1 新增】AI 行为类型定义 (含 FAISpawnRequest / FPendingAIEntry)
+#include "Systems/AI/AIBehaviorTypes.h"
+
+// 【v54 大厂架构】AI 行为配置 DataAsset (关卡预放 AI 走 ConfigSO.LevelPlacedAI_xxx)
+#include "Data/AI/AIBehaviorConfigSO.h"
 
 // UE 自动生成的头文件（必须放在最后一行）
 #include "RoomGameMode.generated.h"
@@ -29,24 +33,6 @@ class ABaseWeapon;        // 武器基类
 class APlayerStart;       // 玩家出生点 Actor
 class ARoomPlayerController; // 房间玩家控制器
 class AMeleeAIController;   // 近战 AI 控制器（AddAIToRoom 需要 Spawn）
-
-// ==========================================
-// 全局默认常量（数据驱动兜底）
-// ==========================================
-// 设计动机 (2026-07-03 bug fix):
-//   - 旧代码 GM 兜底硬编码 "Knife" / "Warrior", 与 DT_WeaponInfo / DT_CharacterInfo 实际 RowName 完全对不上
-//   - 导致 bSkipLoginDirectToLobby 等测试路径下角色/武器永远生成失败
-//   - 新做法: 优先从 DataTable 取第一行 (数据驱动), 全部失败时才退到全局兜底常量
-//   - 这些常量仍然作为最后兜底, 但绝不应再被作为正常路径使用
-namespace MetalSlugGameDefaults
-{
-	// 兜底角色 RowName (DT_CharacterInfo 第一行也找不到时使用)
-	static const FString FallbackCharacterRowName = TEXT("Warrior");
-
-	// 兜底武器 RowName (DT_WeaponInfo 第一行也找不到时使用)
-	// 注意: 这是绝对底线, 如果你看到它被实际命中, 说明 DT_WeaponInfo 没配置武器数据
-	static const FString FallbackWeaponRowName = TEXT("Knife01");
-}
 
 /**
  * @class ARoomGameMode
@@ -70,11 +56,69 @@ class METALSLUG01_API ARoomGameMode : public AGameModeBase
 	GENERATED_BODY()
 
 public:
+	// ==========================================
+	// 【2026.07.11 v29.5】出生点 PlayerStartTag 常量定义
+	// 【2026.07.11 v29.8 重命名】统一阵营命名, "Faction_Attack" → "Faction_Offense"
+	//
+	// 背景:
+	//   - 玩家阵营枚举用的是 Faction.Offense / Faction.Defense (FGameplayTag)
+	//   - PlayerStartTag 用的是 Faction_Attack / Faction_Defense (FName)
+	//   - 命名不一致 → 工程师 / 策划 / UI 容易混淆 (Offense vs Attack 在不同上下文含义模糊)
+	//   - v29.8 决定统一: PlayerStartTag 也用 Offense / Defense
+	//
+	// 命名映射:
+	//   - 旧 "Faction_Attack"   → 新 "Faction_Offense" (攻方)
+	//   - "Faction_Defense"     → 保持不变 (守方)
+	//
+	// 兼容性 (大厂原则 - 显式优于隐式):
+	//   - 旧 "Faction_Attack" 字符串: ScanPlayerStarts 仍接受, 但 Log Warning 提示用户改 Tag
+	//   - 这样既不丢已有配置, 又推动用户迁移到新命名
+	//
+	// 用法: 在 UE 编辑器里打开每个 PlayerStart, Details 面板 → Player Start Tag
+	//       攻方点填 "Faction_Offense", 守方点填 "Faction_Defense"
+	//       GameMode 启动时按 Tag 自动分类到 AttackSpawnPoints / DefenseSpawnPoints
+	//
+	// 为什么用常量 (而不是 #define / inline FName):
+	//   - FName 是 UE 字符串表 (Name Table) 索引, 必须池化才能 O(1) 比较
+	//   - 静态 const FName 是 UE 官方推荐做法 (单次哈希, 后续 0 开销)
+	//   - 反射层 UPROPERTY 标记让蓝图也能用
+	// ==========================================
+	static const FName TAG_Faction_Offense;
+	// 【v29.8 兼容旧 Tag】保留 "Faction_Attack" 作为已废弃别名, 接收但不推荐
+	//   - 新代码不要引用这个常量
+	//   - 只用于 ScanPlayerStarts 兼容旧版 PlayerStart 配置
+	//   - 后续 v30 计划删除 (给用户足够迁移窗口)
+	static const FName TAG_Faction_Defense;
+
 	/**
 	 * 构造函数: 在 GameMode 被加载时调用
 	 * 目的: 配置默认的玩家类、控制器类、HUD 类等
 	 */
 	ARoomGameMode(const FObjectInitializer& ObjectInitializer);
+
+	/**
+	 * @brief v31.3 数据注入入口 — GameMode → Subsystem
+	 *
+	 * 触发时机: InitGame / PostInitProperties
+	 * 用途: 把 GameMode 配置 (DT / ModeRules) 注入到 Subsystem
+	 *      让 SpawnSubsystem 成为运行时唯一真理源 (GameMode 只做编辑器面板)
+	 *
+	 * 【v54 大厂架构重构】ProfilesByMode 字段已删除
+	 *   - 关卡预放 AI 走 ConfigSO (BaseAIController.GetConfig()) — 不经过 Subsystem
+	 *   - 大厅入队 AI 走 Request — 不需要 Profile 反查
+	 *   - 只注入 ControllerClass + ModeRules
+	 */
+	void InjectSubsystemConfigs();
+
+	/**
+	 * @brief UE override: GameMode 初始化时调用 — World 已存在可调 Subsystem
+	 */
+	virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage) override;
+
+	/**
+	 * @brief UE override: 属性初始化后调用 — Editor 反射可注入 Subsystem
+	 */
+	virtual void PostInitProperties() override;
 
 	// ==========================================
 	// 玩家管理接口（由 RoomPlayerController 通过 RPC 调用）
@@ -129,75 +173,91 @@ public:
 	void BroadcastSystemMessage(const FString& Message);
 
 	/**
-	 * 【Phase 2 模式化】AI Profile 注册表 (替代原 DefaultMeleeProfile 单数引用)
+	 * 【v54 大厂架构重构 — 删除 ProfilesByMode / DefaultProfileTag】
 	 *
-	 * 数据来源: 编辑器 (BP_RoomGameMode Details 面板) 把策划拖进来的所有 AI Profile 放这里.
-	 * Key 设计:
-	 *   - 一级 Key: ERoomMatchMode (模式)
-	 *   - 二级: FAIProfileRegistry.Profiles (内含 FGameplayTag -> Profile)
-	 *   理由: UHT 不允许 TMap 内层再嵌 TMap, 用 USTRUCT 包装.
-	 *         同模式可能多类AI (普通僵尸 / 母体), 用 Tag 区分.
+	 * 历史 (v53 及之前):
+	 *   - 持有 TMap<ERoomMatchMode, FAIProfileRegistry> ProfilesByMode (二级 TMap 包装)
+	 *   - 持有 FGameplayTag DefaultProfileTag (兜底 Tag)
+	 *   - 配合 FAIProfileRegistry / UAIProfileAsset / ResolveProfileByTag 等反查链路
 	 *
-	 * 留空兜底:
-	 *   - 按 Mode → Tag 取不到时, Fallback 到 DefaultProfileTag
-	 *   - 整个 Mode 没配 Profile, Spawn 流程报警但继续 Spawn 一个裸 AI (Base).
+	 * v54 重构 (用户决策 2026.07.16):
+	 *   - UAIProfileAsset 整个类已删除 (DA_AIProfile_*.uasset 整张表废弃)
+	 *   - FAIProfileRegistry 已删除 (依赖 UAIProfileAsset)
+	 *   - 关卡预放 AI 走 ConfigSO.LevelPlacedAI_DefaultXxx (不依赖 Profile)
+	 *   - 大厅入队 AI 走 Request (UI 直接传武器/AIController, 不依赖 Profile)
+	 *   - ProfilesByMode / DefaultProfileTag 整个删除, 不再保留中间层
+	 *
+	 * 大厂原则:
+	 *   - 真理源不分裂 (一个 AI 类型只有一个 ConfigSO, 没有 Profile 中间层)
+	 *   - 删除中间层 = 删除配置反模式 + 删除反查链 = 大厂零兜底
 	 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Phase2")
-	TMap<ERoomMatchMode, FAIProfileRegistry> ProfilesByMode;
 
 	/**
-	 * 【Phase 2 模式化】默认 Profile Tag - 兜底查找时使用
-	 * 例如: AI.Profile.Default = 普通近战僵尸, 各模式不配置时退化到此.
+	 * 【v55 大厂架构重构 — 删除 DefaultControllerClass】
+	 *
+	 * 历史 (v29-v54):
+	 *   - UPROPERTY(EditDefaultsOnly, Category = "AI|Phase2") DefaultControllerClass
+	 *   - 曾作为 AIControllerClass 的 fallback (当 Request.AIControllerClass 和 ConfigSO 都为空时)
+	 *
+	 * v55 重构 (用户决策 2026.07.16):
+	 *   - DefaultControllerClass 是"错误配置模式" — GM 全局默认值, 违反"按模式配置"原则
+	 *   - 关卡预放 AI: 走 ConfigSO.LevelPlacedAIControllerClass (ConfigSO 是 AI 类型专属配置)
+	 *   - 大厅入队 AI: 走 ModeRulesByMode[Mode].AIControllerClass (FAIModeRules 是模式专属配置)
+	 *   - 两者都是"专属配置", 不需要 GM 全局默认值兜底
+	 *
+	 * 大厂原则 (零兜底):
+	 *   - 删除 GM 全局默认值兜底
+	 *   - ModeRules.AIControllerClass 为空 → Log Error + 拒绝 Spawn (强制配置)
+	 *   - ConfigSO.LevelPlacedAIControllerClass 为空 → Log Error + 拒绝 Spawn (强制配置)
+	 *   - 禁止任何 fallback
+	 *
+	 * UE 编辑器配置路径 (替代方案):
+	 *   - 大厅入队 AI: GM_RoomGameMode → ClassDefaults → ModeRulesByMode → Melee/Zombie → AIControllerClass
+	 *   - 关卡预放 AI: DA_AIBehaviorConfig_MeleeGrunt → LevelPlacedAI → LevelPlacedAIControllerClass
 	 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Phase2", meta = (Categories = "AI.Profile"))
-	FGameplayTag DefaultProfileTag;
-
-	/**
-	 * 【Phase 2 模式化】默认 AI Controller 类
-	 * 当 Profile.ControllerClass 留空时, 用此值兜底.
-	 * 默认值: ABaseAIController::StaticClass() (刀战通用).
-	 * 生化模式时, 会用 BP_RoomGameMode 默认填 AZombieAIController::StaticClass().
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Phase2")
-	TSubclassOf<class AAIController> DefaultControllerClass;
 
 	/**
 	 * 【Phase 2 模式化】模式专属规则集合 (替代老路径里的硬编码)
 	 * 设计:
-	 *   - 父类不再写死 "Faction.Player/Zombie/TotalRounds" 等
+	 *   - 父类不再写死任何阵营 Tag
 	 *   - 策划在 BP_RoomGameMode 里按 Mode 配置:
-	 *       Melee:  AttackFaction="Faction.Player",  DefenseFaction="Faction.Enemy"
-	 *       Zombie: AttackFaction="Faction.Human",   DefenseFaction="Faction.Zombie"
+	 *       Melee:  AttackFaction=Faction.Offense,  DefenseFaction=Faction.Defense
+	 *       Zombie: AttackFaction=Faction.Offense,  DefenseFaction=Faction.Defense
+	 *       (哪个 Tag 属于攻/守 = 业务决策, 不是固定规则)
 	 *   - 加新模式 (CF 当年有救世主/幽灵) → 加枚举 + ModeRules, GameMode 一行不改.
+	 *
+	 * 阵营 (Offense/Defense) 是**通用身份**, 客户端玩家和 AI 都可用:
+	 *   - Melee 模式下玩家可以是 Offense 或 Defense, AI 同样可以是 Offense 或 Defense
+	 *   - 玩家/AI 在哪个阵营, 由 GameMode::AddPlayer/AddAIByRequest 调用方决定
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "AI|Phase2")
 	TMap<ERoomMatchMode, FAIModeRules> ModeRulesByMode;
 
 	/**
-	 * 添加 AI 到房间（兼容老 API）
-	 * @deprecated 已被 AddAIByRequest 替代, 留它仅为蓝图已有调用不报错
-	 * @param bToAttackTeam true=攻方，false=守方
-	 * @param CharacterName AI 角色名（用于查找 DataTable）
-	 * @param Count 添加数量
-	 */
-	UFUNCTION(BlueprintCallable, Category = "AI", meta = (DeprecatedProperty,
-		DeprecationMessage = "Use AddAIByRequest with FAISpawnRequest instead."))
-	void AddAIToRoom(bool bToAttackTeam, const FString& CharacterName, int32 Count);
-
-	/**
-	 * 【Phase 2 推荐】按 SpawnRequest 批量添加 AI
-	 * 这是新统一入口, 同时支持刀战/生化.
+	 * 【2026.07.11 v28 大厂架构重构】大厅阶段 AI 占位入队 (替代 AddAIToRoom)
 	 *
-	 * 流程:
-	 *   1. 从 ProfilesByMode → 按 Mode + ProfileTag 查 Profile
-	 *   2. 查 CharacterDataTable 确定 Pawn Class
-	 *   3. 队内依次 Spawn (按 bUseTeamSpawnPoint 分配出生点)
-	 *   4. 用 Profile.ControllerClass (兜底 DefaultControllerClass) Spawn AI Controller
-	 *   5. Possess 后注入 Profile (感知+BT)
-	 *   6. Faction 设置走 ModeRules, 不再硬编码 "Faction.Player"
+	 * 设计意图:
+	 *   旧版 AddAIToRoom / AddAIByRequest 立刻生成 Pawn + AIController, 违反新业务规则:
+	 *     "开始游戏在阵营复活点生成 AI, 大厅阶段 UI 显示占位"
+	 *   新版:
+	 *     1. 房主 UI 点击"添加 AI [攻方 x3]" → 调本函数入队, **不生成任何 Actor**
+	 *     2. URoomStateService::GetAttackFactionSnapshots 读本类 PendingAIQueue → UI 渲染占位
+	 *     3. 开始游戏: SpawnAllPlayersIntoBattle 消费本队列 → 在阵营复活点 Spawn
+	 *     4. 战斗阶段: AI 死后复用同一 AIController (v24 不销毁), UI 已隐藏, 无影响
+	 *
+	 * 大厂原则:
+	 *   - 显式意图: Queue 入队 = "预订", Spawn 入场 = "兑现", 完全分离
+	 *   - 单一真理源: 本队列只在 GameMode, Queue/Consume 是唯一读写入口
+	 *   - 零兜底: FactionTag 必须为 Offense/Defense, 其它 Tag 显式拒绝入队
+	 *
+	 * 【v54 大厂架构重构】ProfileTag 已从 FAISpawnRequest 删除
+	 * @param Request 包含 FactionTag / CharacterInfoRowName / WeaponID / AIPawnClass / Mode / Count
+	 * @return 实际入队数量 (Count 字段值, 已通过验证后)
+	 *
+	 * @deprecated 旧版 AddAIToRoom / AddAIByRequest 已删除 — 它们违反新业务规则
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI")
-	int32 AddAIByRequest(const FAISpawnRequest& Request);
+	int32 QueueAIForBattleSpawn(const FAISpawnRequest& Request);
 
 	/**
 	 * 更新某个人的准备状态并广播
@@ -244,18 +304,16 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Game State")
 	bool bBattleStartedBroadcasted;
 
-	/**
-	 * 【P0 2026.07.10 v27】是否正在执行 SpawnAllPlayersIntoBattle
-	 *
-	 * 用途: 防止引擎的 RestartPlayer 与 SpawnAllPlayersIntoBattle 冲突
-	 * 流程:
-	 *   1. PerformGameStart -> SetTimer(SpawnAllPlayersIntoBattle)
-	 *   2. SpawnAllPlayersIntoBattle 开始时: bSpawnInProgress = true
-	 *   3. 如果引擎自动调用 RestartPlayer, RestartPlayer 检测到 bSpawnInProgress=true, 直接返回
-	 *   4. SpawnAllPlayersIntoBattle 结束时: bSpawnInProgress = false
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Game State")
-	bool bSpawnInProgress;
+	// bSpawnInProgress / FSpawnInProgressGuard 已彻底删除 (v31.5 大厂重构)
+	// 历史:
+	//   - v30 引入 RAII guard 替代裸 bool (防御函数中途 return 导致标志位残留)
+	//   - v31.1 将 bSpawnInProgress 真理源迁移到 URoomSpawnSubsystem
+	//   - v31.5 删除本类 FSpawnInProgressGuard 死代码 (cpp 中既无实现也无调用方)
+	//
+	// 大厂原则 (v31.5):
+	//   - 真理源唯一: URoomSpawnSubsystem::IsSpawnInProgress() / bSpawnInProgress
+	//   - RAII 防护归 GameMode::SpawnAllPlayersIntoBattle 局部作用域
+	//   - 严禁 RoomGameMode 再持有任何 SpawnInProgress 相关字段
 
 	// ==========================================
 	// 开发测试模式: 默认发放的角色与武器
@@ -294,6 +352,36 @@ public:
 	class UDataTable* WeaponDataTable;
 
 	/**
+	 * 【v41 大厂架构】玩家角色战斗参数配置表
+	 *
+	 * 真理源 (v41 新增):
+	 *   - 玩家角色所有战斗参数从本资产读取 (MaxHealth / MaxEnergy / RespawnDelay / SpawnInvincibility 等)
+	 *   - 消除 BaseCharacter / HealthComponent / EnergyComponent / HealthRegenComponent 内的硬编码
+	 *   - 策划在一个地方调整所有参数
+	 *
+	 * 资产类型: UPlayerConfigAsset (DataAsset)
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Config", meta = (AllowedClasses = "/Script/MetalSlug01.PlayerConfigAsset"))
+	TSoftObjectPtr<class UPlayerConfigAsset> PlayerConfigAsset;
+
+	/**
+	 * 【v37 单一真理源】武器挂载数据表 (Socket + RelativeLocation + RelativeRotation + RelativeScale)
+	 *
+	 * 真理源迁移 (v37 大厂重构):
+	 *   - 旧 (v32-v36): UWeaponAttachmentComponent 内每个 BP 都需要配这个字段
+	 *     - BP_BaseCharacter 配一次 / BP_SWAT_C 配一次 / BP_GruntAI 配一次
+	 *     - 配置反模式: 3 个 BP 持有同一资产, 改一处忘一处 (用户实际踩坑)
+	 *   - 新 (v37): 集中在 GameMode 配一次, 所有角色通过 GM 拿到
+	 *     - BP_GM_RoomGameMode → Class Defaults → Room|Data → Weapon Attachment DataTable
+	 *     - 运行时: UWeaponAttachmentComponent::GetWeaponAttachmentDataTable() 走 GM
+	 *     - 找不到 GM / GM 字段为空 → Log Error + 强制修复 (零兜底)
+	 *
+	 * 行结构: FWeaponAttachmentConfig
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Data")
+	class UDataTable* WeaponAttachmentDataTable;
+
+	/**
 	 * @brief 处理玩家的生成请求
 	 * @param PlayerToSpawn 目标玩家控制器
 	 * @param CharRowName 角色 DataTable 的行名
@@ -307,8 +395,10 @@ public:
 	 * 旧实现: 在这里写死了"按分数排序/扎堆均摊", 刀战勉强能用, 生化完全废.
 	 * 新实现:
 	 *   1. 走 GetAllAliveEnemiesFor 收集候选 + 反扎堆账本
-	 *   2. 按 RequestingAI 持有的 Profile.HuntPolicy 选评分函数 (Nearest/Random/HighestScore/Mother-Weight)
+	 *   2. 按 RequestingAI 持有的 ConfigSO.HuntPolicy 选评分函数 (Nearest/Random/HighestScore/Mother-Weight)
 	 *   3. 反扎堆均摊仍保留 (HuntPolicy.AntiHuddleWeight 控制强度)
+	 *
+	 * 【v54 大厂架构重构】Profile 已删除, 改读 ConfigSO.HuntPolicy
 	 *
 	 * @param RequestingAI 请求分配的 AI
 	 * @return 分配的敌人目标 (找不到返回 nullptr)
@@ -317,7 +407,7 @@ public:
 	class ABaseCharacter* RequestTargetForAI(class ABaseCharacter* RequestingAI);
 
 	/**
-	 * 【Phase 2 模式化】按 Profile.HuntPolicy 求一个候选的"分数"
+	 * 【Phase 2 模式化】按 ConfigSO.HuntPolicy 求一个候选的"分数"
 	 * 内部供 RequestTargetForAI 调用. 外部 BP 也可调 (调试).
 	 * 评分维度:
 	 *   - 距离 (越小越高)
@@ -333,7 +423,7 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	float ScoreCandidateForAI(class ABaseCharacter* RequestingAI,
-		class ABaseCharacter* Candidate, const FAIHuntPolicy& Policy) const;
+		const class ABaseCharacter* Candidate, const FAIHuntPolicy& Policy) const;
 
 	/**
 	 * 【Phase 2 模式化】取当前 GameMode 的模式规则
@@ -383,19 +473,22 @@ public:
 	void ReleaseTarget(ABaseCharacter* RequestingAI);
 
 	/**
-	 * 【Phase 2 模式化】查 Profile (按 Mode + Tag, 多级兜底)
-	 * 查询顺序:
-	 *   1. ProfilesByMode[Mode][Tag]
-	 *   2. ProfilesByMode[Mode][DefaultProfileTag]
-	 *   3. ProfilesByMode[ERoomMatchMode::Melee][DefaultProfileTag]   (兜底 Melee)
-	 *   4. nullptr
-	 * 同步加载 — Spawn 路径才走这, BT 启动走 Profile.LoadBehaviorConfigAsync
+	 * 【v54 大厂架构重构 — 删除 ResolveProfileExact】
+	 *
+	 * 历史 (v53 及之前):
+	 *   - ResolveProfileExact / ResolveProfileByTag 都是从 ProfilesByMode 反查 Profile 的入口
+	 *   - 它们依赖 UAIProfileAsset 类
+	 *
+	 * v54 重构 (用户决策 2026.07.16):
+	 *   - ProfilesByMode 字段已删除
+	 *   - UAIProfileAsset 已删除
+	 *   - 反查链整体删除 (v54 大厂原则: 真理源不分裂)
+	 *   - 关卡预放 AI 走 ConfigSO, 大厅入队 AI 走 Request, 不需要反查
 	 */
-	UAIProfileAsset* TryResolveProfile(ERoomMatchMode Mode, FGameplayTag ProfileTag) const;
 
 	/**
-	 * 【Phase 2 模式化】从 AI Pawn 拿它当前生效的 HuntPolicy
-	 * 内部: ABaseAIController.CurrentProfile -> HuntPolicy
+	 * 【v54 大厂架构重构】从 AI Pawn 拿它当前生效的 HuntPolicy
+	 * 内部: ABaseAIController.RuntimeConfig.GetConfig().HuntPolicy (v54 改走 ConfigSO)
 	 * @return 找不到时返回默认 (NearestDistance 兜底)
 	 */
 	FAIHuntPolicy GetEffectiveHuntPolicy(ABaseCharacter* AI) const;
@@ -414,19 +507,90 @@ public:
 private:
 	/**
 	 * AI 的唯一编号生成器，防止同名 AI 无法精准踢出
-	 * 每次 AddAIToRoom 时自增
+	 * 每次 QueueAIForBattleSpawn 时自增
 	 */
 	int32 AINextID = 1;
 
-protected:
-	/**
-	 * 记录目前哪些玩家正在被 AI 追杀（防止扎堆）
-	 * Key = 猎物 (玩家), Value = 猎人 (追他的 AI)
-	 */
-	UPROPERTY()
-	TMap<ABaseCharacter*, ABaseCharacter*> LockedTargets;
+	// ==========================================
+	// 【v50 大厂架构重构 — 删除死代码】PendingAIQueue 字段已删除
+	//
+	// 旧 (v28-v49): ARoomGameMode 持有 PendingAIQueue 字段, 走 Get/Consume/Queue 访问
+	// 新 (v50): 真理源已迁移到 URoomSpawnSubsystem::PendingAIQueue
+	//   - 所有访问器 (Get/Queue/Consume/IsPending/Remove) 都是委派壳
+	//   - RoomGameMode.h 的字段本身已无任何读写 → 删除
+	//   - 这消除一处数据源分裂 + 减少内存浪费
+	// ==========================================
+	// PendingAIQueue 字段已删除 — 真在 URoomSpawnSubsystem
 
 	/**
+	 * 【v50 大厂重构 — PendingAISequenceID 已删除】
+	 * 旧版用 GameMode 字段生成 SequenceID, 新版由 URoomSpawnSubsystem 内部管理
+	 */
+	// PendingAISequenceID 字段已删除 — 真在 URoomSpawnSubsystem
+
+	/**
+	 * 【2026.07.11 v28】内部: 把一条 PendingAI 转成 FAISpawnRequest (供 SpawnAllPlayersIntoBattle 调用 SpawnAIInternal)
+	 * 大厂原则: 转换逻辑集中一处, 避免 SpawnAIInternal 调用方各自拼凑
+	 *
+	 * 【v50】此函数仍存在但作为 GameMode 委派壳转发到 URoomSpawnSubsystem::BuildSpawnRequestFromPending
+	 */
+	FAISpawnRequest BuildSpawnRequestFromPending(const FPendingAIEntry& Entry) const;
+
+public:
+	/**
+	 * 【2026.07.11 v28】对外只读查询: 返回指定阵营的 PendingAI 列表 (供 URoomStateService 渲染 UI)
+	 * 大厂原则: 外部只读不写, 写只走 QueueAIForBattleSpawn
+	 *
+	 * @param FactionTag 阵营 (Faction.Offense / Faction.Defense), 其它值返回空数组
+	 * @return 该阵营的 PendingAI 列表 (空 FactionTag 返回空)
+	 */
+	UFUNCTION(BlueprintPure, Category = "AI|Pending")
+	TArray<FPendingAIEntry> GetPendingAIInFaction(FGameplayTag FactionTag) const;
+
+	/**
+	 * 【2026.07.11 v28】对外只读查询: 所有 PendingAI (供调试 UI / 总览)
+	 *
+	 * 【v50 重构】改为委派到 URoomSpawnSubsystem (GameMode 不再持有 PendingAIQueue 字段)
+	 */
+	UFUNCTION(BlueprintPure, Category = "AI|Pending")
+	TArray<FPendingAIEntry> GetAllPendingAI() const;
+
+	/**
+	 * 【2026.07.11 v28】内部消费: SpawnAllPlayersIntoBattle 调用, 把队列转成实际 Spawn 请求
+	 * 调用后 PendingAIQueue 被清空 (消费完即弃)
+	 *
+	 * @return 该模式的所有 SpawnRequest (按入队顺序)
+	 */
+	TArray<FAISpawnRequest> ConsumePendingAIForBattleSpawn();
+
+	/**
+	 * 【2026.07.11 v28】对外只读: 检查 DisplayName 是否在 PendingAIQueue 里
+	 * 用途: Server_KickPlayer 判断被踢名字是真人还是 AI 占位
+	 *
+	 * @param DisplayName 玩家标签上的名字 (例如 "AI_GruntAI_1")
+	 * @return true=在队列里 (AI 占位), false=不在 (真人或已 Spawn)
+	 */
+	UFUNCTION(BlueprintPure, Category = "AI|Pending")
+	bool IsPendingAIByName(const FString& DisplayName) const;
+
+	/**
+	 * 【2026.07.11 v28】对外只写: 从 PendingAIQueue 移除指定 DisplayName 的条目
+	 * 用途: Server_KickPlayer 房主踢 AI 占位 (大厅阶段, AI 还没生成)
+	 *
+	 * 大厂原则: 调用方必须先 IsPendingAIByName 检查, 避免误删
+	 *
+	 * @param DisplayName 要移除的 AI 占位名字
+	 * @return true=找到并移除, false=没找到 (调用方应先 IsPendingAIByName)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Pending")
+	bool RemovePendingAIByName(const FString& DisplayName);
+
+protected:
+	/**
+	 * 【v31 大厂重构】AI 仇恨账本已迁到 URoomTargetingSubsystem
+	 *   - LockedTargets / AIHuntingMap 已删除
+	 *   - 任何读取请走 URoomTargetingSubsystem::Get(this)
+	 *
 	 * 遍历全场，找出对这个 AI 来说所有活着的敌人
 	 * @param RequestingAI 发起查询的 AI
 	 * @return 活着的敌人列表
@@ -434,25 +598,29 @@ protected:
 	TArray<class ABaseCharacter*> GetAllAliveEnemiesFor(class ABaseCharacter* RequestingAI);
 
 	/**
-	 * 现在的账本记录的是: 哪个 AI (Key) 正在追杀哪个敌人 (Value)
-	 * 这样的好处是: 一个敌人可以被多个 AI 追，我们只要数一数 Value 出现的次数就行了
-	 */
-	UPROPERTY()
-	TMap<ABaseCharacter*, ABaseCharacter*> AIHuntingMap;
-
-	/**
-	 * 【Phase 2 模式化】私有 Spawn 内部实现
+	 * 【Phase 2 模式化】私有 Spawn 内部实现 — 单一入口
+	 *
 	 * 替代 AddAIToRoom 内联 30 行代码:
-	 *   1. 解析 Profile (Mode+Tag)
-	 *   2. 查 CharacterDataTable 拿 Pawn Class
+	 *   1. 校验 Request.AIPawnClass 非空 (UI 反查时已拿到 Class 强类型)
+	 *   2. 关卡预放 AI 时校验 Config 非空, 大厅入队 AI 时 Config 可空
 	 *   3. 分配出生点 (按 Team)
-	 *   4. Spawn AI Controller (按 Profile.ControllerClass -> 兜底 DefaultControllerClass)
+	 *   4. Spawn or Reuse AI Controller (复用模式 = AI 复活)
 	 *   5. Spawn Pawn 并 Possess
 	 *   6. 应用 FactionTag (从 FAIModeRules 里读, 不再 hardcoded)
-	 *   7. 调 InitializeFromProfile(Profile) 走统一入口
+	 *   7. 调 InitializeFromConfig(Config) 走统一入口 (关卡预放 AI)
+	 *
+	 * 【v54 大厂架构重构 — UAIProfileAsset 删除】
+	 *   - Profile 解析链路整个删除
+	 *   - Config 参数: 关卡预放 AI 必传 (从 AIC.GetConfig()), 大厅 AI 可空 (走 Request)
+	 *
+	 * 【v30 大厂架构】单一入口原则:
+	 *   - 大厅开局/战斗 Spawn: OptionalExistingController = nullptr → 新建 AIC
+	 *   - AI 复活: 传入已存在的 AIC (DeadController) → 复用, 不销毁
+	 *   - 任何新增 AI 生成路径都必须走本函数, 禁止复制实现
+	 *
 	 * @return 生成的 AI 数量 (失败可能 < Count)
 	 */
-	int32 SpawnAIInternal(const FAISpawnRequest& Request, UAIProfileAsset* Profile);
+	int32 SpawnAIInternal(const FAISpawnRequest& Request, UAIBehaviorConfigSO* Config, AAIController* OptionalExistingController = nullptr);
 
 	// ==========================================
 	// 覆盖 UE 原生生命周期函数
@@ -504,8 +672,14 @@ public:
 
 	/**
 	 * 倒计时时间（秒），可以暴露给蓝图配置
+	 *
+	 * 大厂架构 (v48):
+	 *   - 默认 3s: 给玩家和 AI 一个短暂的"准备"时间
+	 *   - 设为 0: 立即 Spawn (测试模式推荐)
+	 *   - 设负数: 被 ClampMin 钳到 0
 	 */
-	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
+	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "0.0", ClampMax = "30.0"))
 	float MatchStartDelay = 3.0f;
 
 	/**
@@ -555,11 +729,7 @@ public:
 		FString WeaponID;
 	};
 
-	/**
-	 * Key = PlayerState unique ID (GetUniqueID())，确保每个玩家独立
-	 * 作用: 在 RestartPlayer 之前缓存玩家选中的角色与武器，避免时序问题
-	 */
-	TMap<uint32, FPlayerSpawnData> PlayerSpawnDataCache;
+	// PlayerSpawnDataCache 已迁移到 URoomSpawnSubsystem (v31.1 单一真理源 — 严禁 RoomGameMode 再持有)
 
 	/**
 	 * 比赛计时器句柄
@@ -607,18 +777,25 @@ public:
 	void ScanAndCachePlayerStarts(bool bReScan = false);
 
 	/**
-	 * @brief 根据玩家所属队伍获取一个未被占用的出生点
-	 * 复活时使用：优先分配未被占用的点，如果都用过了则随机分配
-	 * @param PlayerTeam 玩家所属队伍
+	 * @brief 【2026.07.11 v30 零兜底】根据阵营 (FGameplayTag) 获取一个未被占用的出生点
+	 *
+	 * 设计:
+	 *   - 优先分配未被占用的点
+	 *   - 所有点都被占用 → Log Error + return nullptr (不静默复用)
+	 *
+	 * @param PlayerFactionTag 玩家所属阵营 (Faction.Offense / Faction.Defense)
 	 * @param bRemoveOccupied 分配后是否标记该点为已占用
+	 * @param OccupancyOwner 【v39 新增】占用者 Controller (用于死亡时精准释放)
 	 * @return 返回一个可用的出生点 Actor，如果找不到则返回 nullptr
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
-	class AActor* GetAvailableSpawnPointForTeam(ERoomTeam PlayerTeam, bool bRemoveOccupied = true);
+	class AActor* GetAvailableSpawnPointForFaction(FGameplayTag PlayerFactionTag, bool bRemoveOccupied = true, AController* OccupancyOwner = nullptr);
 
 	/**
 	 * @brief 当玩家离开（断开连接或退出房间）时，释放其占用的出生点
 	 * @param PlayerStart 要释放的出生点
+	 *
+	 * 【v39】新增更精准的 ReleaseSpawnPointByController 接口 (推荐使用)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
 	void ReleaseSpawnPoint(class AActor* PlayerStart);
@@ -638,58 +815,8 @@ public:
 	 */
 	bool GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCharID, FString& OutWeaponID) const;
 
-	// ==========================================
-	// 工具方法 (数据驱动兜底)
-	// ==========================================
-
-	/**
-	 * @brief 从 WeaponDataTable 解析一个有效的武器 RowName (数据驱动兜底)
-	 *
-	 * 设计动机 (2026-07-03 bug fix):
-	 *   - 旧代码在 FinalWeaponID 为空时硬编码 TEXT("Knife"), 但 DT_WeaponInfo 实际 RowName 是 "Knife01"/"WQ001"
-	 *   - 导致 FindRow 永远找不到, 武器永远生成失败
-	 *
-	 * 新策略 (3 级兜底):
-	 *   1. 优先 WeaponDataTable 第一行 (数据驱动)
-	 *   2. DT 为空时回退 MetalSlugGameDefaults::FallbackWeaponRowName
-	 *   3. 全部失败时返回空字符串 + 打 Error 日志 (绝不静默失败)
-	 *
-	 * @return 武器 RowName (绝不为空, 真失败时也会返回兜底常量)
-	 */
-	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
-	FString ResolveFallbackWeaponRow() const;
-
-	/**
-	 * @brief 从 CharacterDataTable 解析一个有效的角色 RowName (数据驱动兜底)
-	 *
-	 * @see ResolveFallbackWeaponRow (同款 3 级兜底策略)
-	 * @return 角色 RowName (绝不为空)
-	 */
-	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
-	FString ResolveFallbackCharacterRow() const;
-
 protected:
-	/**
-	 * 攻方（Attack）出生点列表
-	 */
-	UPROPERTY()
-	TArray<class APlayerStart*> AttackSpawnPoints;
-
-	/**
-	 * 守方（Defense）出生点列表
-	 */
-	UPROPERTY()
-	TArray<class APlayerStart*> DefenseSpawnPoints;
-
-	/**
-	 * 已占用的出生点集合（使用 Set 便于快速查找和去重）
-	 */
-	UPROPERTY()
-	TSet<class APlayerStart*> OccupiedSpawnPoints;
-
-	/**
-	 * 出生点扫描标记（防止重复扫描）
-	 */
-	UPROPERTY()
-	bool bSpawnPointsScanned = false;
+	// v31.3 SSOT: OccupiedSpawnPoints / bSpawnPointsScanned 已迁移到 URoomSpawnSubsystem
+	//   - 这两个字段在 RoomGameMode.h 是"死字段", cpp 不再读写
+	//   - 真理源唯一: URoomSpawnSubsystem 内部 protected 成员
 };

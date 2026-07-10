@@ -353,6 +353,20 @@ bool USessionManagerSubsystem::GetCurrentSessionDisplayInfo(FString& OutRoomName
 	OutRoomName.Reset();
 	OutGameMode.Reset();
 
+	// 【v54.5.1 P0 修复】优先返回 skip-login 测试房间名
+	//   根因: bSkipLoginDirectToLobby=true 时 SessionManager 不创建真实 Session,
+	//          SessionSettings 里 ROOM_NAME/GAME_MODE 都是空的
+	//          但 SkipLoginRoomName/SkipLoginGameMode 已在 BootToLogin 时写入
+	//   单一职责: GetCurrentSessionDisplayInfo 是"skip-login 专用 API + 正常 Session 共用查询" 统一入口
+	//             不需要调用方区分"是不是 skip-login", 直接在这里处理
+	if (!SkipLoginRoomName.IsEmpty())
+	{
+		OutRoomName = SkipLoginRoomName;
+		OutGameMode = SkipLoginGameMode;
+		return true;
+	}
+
+	// 正常 Session 路径
 	IOnlineSessionPtr SessionPtr = GetSessionInterface();
 	if (!SessionPtr.IsValid())
 	{
@@ -368,6 +382,21 @@ bool USessionManagerSubsystem::GetCurrentSessionDisplayInfo(FString& OutRoomName
 	Session->SessionSettings.Get(FName("ROOM_NAME"), OutRoomName);
 	Session->SessionSettings.Get(FName("GAME_MODE"), OutGameMode);
 	return true;
+}
+
+void USessionManagerSubsystem::SetSkipLoginRoomDisplayInfo(const FString& InRoomName, const FString& InGameMode)
+{
+	SkipLoginRoomName = InRoomName;
+	SkipLoginGameMode = InGameMode;
+	UE_LOG(LogTemp, Log,
+		TEXT("[SessionManager] SetSkipLoginRoomDisplayInfo: RoomName=[%s] GameMode=[%s]"),
+		*InRoomName, *InGameMode);
+}
+
+void USessionManagerSubsystem::ResetSkipLoginRoomDisplayInfo()
+{
+	SkipLoginRoomName.Reset();
+	SkipLoginGameMode.Reset();
 }
 
 TSharedPtr<FOnlineSessionSettings> USessionManagerSubsystem::BuildSessionSettings(const FRoomCreationParams& Params)

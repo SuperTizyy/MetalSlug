@@ -8,6 +8,8 @@
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomPlayerController.h"
 #include "Systems/Core/RoomPlayerState.h"
+// 【2026.07.10 P0 重构】阵营集中定义 (FGameplayTag 替代 ERoomTeam)
+#include "Data/Faction/FactionTags.h"
 
 bool UScoreboardWidget::Initialize()
 {
@@ -97,8 +99,8 @@ void UScoreboardWidget::UpdateOrCreateEntry(ARoomPlayerState* PlayerState)
 		return;
 	}
 
-	// 判断玩家队伍
-	bool bIsAttacker = (PlayerState->CurrentTeam == ERoomTeam::Attack);
+	// 【2026.07.10 P0 重构】判断玩家阵营 (FGameplayTag 替代 ERoomTeam)
+	bool bIsAttacker = (PlayerState->CurrentFactionTag == FFactionTags::Offense());
 
 	// 获取对应的VerticalBox
 	UVerticalBox* TargetBox = bIsAttacker ? VB_AttackerTeam : VB_DefenderTeam;
@@ -157,8 +159,9 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidget(ARoomPlayerState* P
 		return nullptr;
 	}
 
-	// 实时校验队伍归属，防止因服务器数据未同步导致玩家被添加到错误容器
-	bool bActualIsAttacker = (PlayerState->CurrentTeam == ERoomTeam::Attack);
+	// 实时校验阵营归属,防止因服务器数据未同步导致玩家被添加到错误容器
+	// 【2026.07.10 P0 重构】FGameplayTag 比对
+	bool bActualIsAttacker = (PlayerState->CurrentFactionTag == FFactionTags::Offense());
 	if (bActualIsAttacker != bIsAttacker)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[ScoreboardWidget] CreateEntryWidget: 玩家 %s 队伍不一致，参数=%d，实际=%d，已修正"),
@@ -290,8 +293,8 @@ void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 						Data.Kills = RoomPS->GetKills();
 						Data.Deaths = RoomPS->GetDeaths();
 						Data.Assists = RoomPS->GetAssists();
-						// 校验该玩家是否真正属于当前容器对应的队伍
-						bool bPlayerIsAttacker = (RoomPS->CurrentTeam == ERoomTeam::Attack);
+						// 【2026.07.10 P0 重构】校验该玩家是否真正属于当前容器对应的阵营
+						bool bPlayerIsAttacker = (RoomPS->CurrentFactionTag == FFactionTags::Offense());
 						Data.bBelongsToThisBox = (VerticalBox == VB_AttackerTeam) ? bPlayerIsAttacker : !bPlayerIsAttacker;
 						break;
 					}
@@ -403,7 +406,7 @@ bool UScoreboardWidget::IsCurrentPlayerAttacker() const
 		ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS);
 		if (RoomPS && RoomPS->GetPlayerName() == CurrentName)
 		{
-			return RoomPS->CurrentTeam == ERoomTeam::Attack;
+			return RoomPS->CurrentFactionTag == FFactionTags::Offense();
 		}
 	}
 

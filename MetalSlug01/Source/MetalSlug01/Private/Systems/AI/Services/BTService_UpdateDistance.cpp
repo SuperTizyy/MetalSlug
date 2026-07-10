@@ -84,6 +84,14 @@ void UBTService_UpdateDistance::TickNode(
 	{
 		BB->SetValueAsFloat(DistanceKey.SelectedKeyName, -1.f);
 		BB->SetValueAsBool(HasTargetKey.SelectedKeyName, false);
+
+		// 【v40.5 P0 诊断】TargetActor 空, BT 无目标 — 这是 AI 静止的最常见根因
+		//   (OnTargetDetected 只在感知系统 bSensed=true 时写, 丢失时清空)
+		//   BTService_RefreshTarget (0.3s) 会重新扫描, 但如果 ScanForNearestEnemy 找不到, 这里一直 -1
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[BTService_UpdateDistance] %s: TargetActor=空, BB.Distance=-1, bHasTarget=false. "
+			     "等待 BTService_RefreshTarget 重新扫描. (这是 AI 静止的最常见根因)"),
+			*AIC->GetName());
 		return;
 	}
 
@@ -104,6 +112,11 @@ void UBTService_UpdateDistance::TickNode(
 				{
 					float AR = RuntimeConfig->GetScaledCombat().AttackRange;
 					BB->SetValueAsFloat(AttackRangeKey.SelectedKeyName, AR);
+
+					// 【v40.5 P0 诊断】距离更新 — 简化版 (Verbose, 不刷屏)
+					UE_LOG(LogTemp, Verbose,
+						TEXT("[BTService_UpdateDistance] %s: Target=%s D=%.0fcm AR=%.0fcm bHasTarget=1"),
+						*AIC->GetName(), *TargetActor->GetName(), Distance, AR);
 				}
 			}
 		}

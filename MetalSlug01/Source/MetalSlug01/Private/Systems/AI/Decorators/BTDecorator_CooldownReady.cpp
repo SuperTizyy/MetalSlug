@@ -2,6 +2,7 @@
 
 #include "Systems/AI/Decorators/BTDecorator_CooldownReady.h"
 
+#include "AIController.h"
 #include "BehaviorTree/BehaviorTreeComponent.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Float.h"
@@ -55,9 +56,17 @@ bool UBTDecorator_CooldownReady::CalculateRawConditionValue(
 	// CooldownEndTime <= 0 表示"从未设置过冷却" (BB 默认值), 视为已冷却 (首次攻击可进入)
 	if (CooldownEndTime <= 0.f)
 	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[BTDecorator_CooldownReady] %s: CooldownEndTime=%.2f <= 0 → PASS (首次可攻击)"),
+			*GetNameSafe(OwnerComp.GetAIOwner()), CooldownEndTime);
 		return true;
 	}
 
 	// 当前时间 >= 冷却截止时间 → 冷却结束 → 放行
-	return CurrentTime >= CooldownEndTime;
+	const bool bReady = CurrentTime >= CooldownEndTime;
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[BTDecorator_CooldownReady] %s: CurrentTime=%.2f vs CooldownEndTime=%.2f → %s"),
+		*GetNameSafe(OwnerComp.GetAIOwner()), CurrentTime, CooldownEndTime,
+		bReady ? TEXT("PASS") : TEXT("FAIL (冷却中)"));
+	return bReady;
 }

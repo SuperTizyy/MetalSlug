@@ -58,15 +58,25 @@ void UBTService_UpdateHealth::TickNode(
 
 	// 算 HP 百分比 — 单点真理: BaseCharacter + HealthComponent
 	ABaseCharacter* AIChar = Cast<ABaseCharacter>(AIPawn);
-	if (!AIChar || !AIChar->HealthComponent)
+	if (!AIChar)
 	{
-		// 没血量组件 → 写 0 (防御)
 		BB->SetValueAsFloat(HealthPercentKey.SelectedKeyName, 0.f);
 		return;
 	}
 
-	const float Current = AIChar->HealthComponent->GetCurrent();
-	const float Max = AIChar->HealthComponent->GetMax();
+	// [v40 P0 修复] 必须用 ResolveHealthComponent() 而非裸字段
+	UHealthComponent* HC = AIChar->ResolveHealthComponent();
+	if (!HC)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BTService_UpdateHealth] AIChar=%s ResolveHealthComponent 失败. 【v40 修复】不应该出现 — BP 必挂 HealthComponent."),
+			*AIChar->GetName());
+		BB->SetValueAsFloat(HealthPercentKey.SelectedKeyName, 0.f);
+		return;
+	}
+
+	const float Current = HC->GetCurrent();
+	const float Max = HC->GetMax();
 
 	// 防御: Max <= 0 (配置错误) → 视为满血, 避免除零
 	float HPPercent = (Max > 0.f) ? (Current / Max) : 1.f;

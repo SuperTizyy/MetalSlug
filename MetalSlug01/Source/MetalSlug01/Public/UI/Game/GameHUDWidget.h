@@ -12,6 +12,7 @@
 // 引入 ERoomMatchMode 等房间枚举
 #include "Data/Enums/RoomEnums.h"
 #include "Components/CharacterEvents.h"
+#include "UI/Game/Widgets/RespawnProgressWidget.h"
 #include "GameHUDWidget.generated.h"
 
 // 前向声明所有用到的子控件
@@ -350,6 +351,10 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UEscMenuWidget* Widget_EscMenu;
 
+	/** 复活进度条（显示无敌时间进度）【2026.07.14 新增】 */
+	UPROPERTY(meta = (BindWidget))
+	URespawnProgressWidget* Widget_RespawnProgress;
+
 	/**
 	 * 击杀图标数据表引用（用于击杀信息显示）
 	 * 关联: DT_KillIconInfo
@@ -429,6 +434,17 @@ protected:
 	/** 武器图标加载完毕回调 */
 	UFUNCTION()
 	void OnWeaponIconReady(const FString& WeaponID, class UTexture2D* Icon);
+
+	// ==========================================
+	// 8. 无敌期进度条控制 (2026.07.14 重构)
+	// ==========================================
+
+	/**
+	 * 进入无敌期回调 - 显示复活进度条
+	 * @param bIsNowInvincible true=进入无敌期
+	 */
+	UFUNCTION()
+	void OnInvincibilityChanged(bool bIsNowInvincible);
 
 private:
 	/**

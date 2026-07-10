@@ -12,8 +12,9 @@
 #include "CoreMinimal.h"
 // 引入 UGameInstanceSubsystem 头文件
 #include "Subsystems/GameInstanceSubsystem.h"
-// 引入房间相关枚举（ERoomTeam/ERoomMatchMode 等）
+// 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 #include "Data/Enums/RoomEnums.h"
+#include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
 // 自动生成的反射头文件
 #include "RoomStateService.generated.h"
 
@@ -27,6 +28,10 @@ class ARoomPlayerState;
  * 设计目的:
  * - View 只读 POJO 数据，避免暴露 ARoomPlayerState 引用造成 View 误改
  * - 解耦 PlayerState 的 UPROPERTY 字段（随时可能重构）
+ *
+ * 【2026.07.11 v28】新增 bIsAI 字段 — 让 UI 区分渲染真人 vs AI 占位
+ *   - 真人 (PlayerArray): bIsAI=false
+ *   - AI 占位 (PendingAIQueue): bIsAI=true, SequenceID 用作显示顺序
  */
 USTRUCT(BlueprintType)
 struct FPlayerSnapshot
@@ -36,14 +41,34 @@ struct FPlayerSnapshot
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     FString PlayerName;
 
+    /**
+     * 【2026.07.10 P0 重构】阵营用 FGameplayTag 替代 ERoomTeam
+     * 有效值: Faction.Offense / Faction.Defense
+     */
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
-    ERoomTeam Team = ERoomTeam::None;
+    FGameplayTag FactionTag;
 
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     bool bIsReady = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     bool bIsHost = false;
+
+    /**
+     * 【2026.07.11 v28】是否 AI 占位
+     *   - true: 大厅阶段从 PendingAIQueue 来的 AI 占位
+     *   - false: 真人玩家 (来自 PlayerArray)
+     * 用途: UI 渲染时区分 (AI 显示 [AI] 前缀, 不显示准备按钮等)
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
+    bool bIsAI = false;
+
+    /**
+     * 【2026.07.11 v28】入队序号 (AI 占位专用, 真人恒为 0)
+     * 大厂原则: UI 显示顺序严格按入队顺序, 不被 ListIndex 影响
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
+    int32 SequenceID = 0;
 
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     int32 Score = 0;
@@ -158,16 +183,47 @@ public:
     // ==========================================
 
     /**
-     * @brief 获取攻方所有玩家的快照列表
+     * 【2026.07.10 P0 重构】获取攻方阵营 (Faction.Offense) 所有**真人**玩家的快照列表
+     *
+     * 【2026.07.11 v29 大厂架构修订】只返回真人 — 不再合并 AI 占位
+     * 业务规则: 真人 + AI 是两条独立数据流, UI 渲染走 KnownPlayerStates + GetPendingAIInFaction 显式合并
+     *
+     * 旧 (v28) 错误做法:
+     *   合并真人 + AI 占位 → 测试模式 (MockLogin) PlayerArray 为空 → 函数返回空 → Box 不显示
+     *
+     * 新 (v29) 做法:
+     *   只返回真人 (GS->PlayerArray.GetPlayersInFaction) — 测试模式返回空也是合法真实状态
+     *   AI 占位查询走独立 API: GM->GetPendingAIInFaction(阵营) (UI 自己合并)
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
-    TArray<FPlayerSnapshot> GetAttackTeamSnapshots() const;
+    TArray<FPlayerSnapshot> GetAttackFactionSnapshots() const;
 
     /**
-     * @brief 获取守方所有玩家的快照列表
+     * 【2026.07.10 P0 重构】获取守方阵营 (Faction.Defense) 所有**真人**玩家的快照列表
+     *
+     * 【2026.07.11 v29 大厂架构修订】只返回真人 — 不再合并 AI 占位
+     * 业务规则: 真人 + AI 是两条独立数据流, UI 渲染走 KnownPlayerStates + GetPendingAIInFaction 显式合并
+     *
+     * 旧 (v28) 错误做法:
+     *   合并真人 + AI 占位 → 测试模式 (MockLogin) PlayerArray 为空 → 函数返回空 → Box 不显示
+     *
+     * 新 (v29) 做法:
+     *   只返回真人 (GS->PlayerArray.GetPlayersInFaction) — 测试模式返回空也是合法真实状态
+     *   AI 占位查询走独立 API: GM->GetPendingAIInFaction(阵营) (UI 自己合并)
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
-    TArray<FPlayerSnapshot> GetDefenseTeamSnapshots() const;
+    TArray<FPlayerSnapshot> GetDefenseFactionSnapshots() const;
+
+    /**
+     * 【2026.07.11 v29】显式合并真人 + AI 占位的快照 (供需要"总人数"的查询方用)
+     *
+     * 大厂原则: 显式 API > 隐式参数 (可读性优先, 不会出现"忘了设 bIncludeAI" 的 bug)
+     *
+     * @param FactionTag 阵营
+     * @return 真人 + AI 占位的快照 (大厅阶段才有 AI 数据, 战斗阶段 AI 已 Spawn, 队列为空)
+     */
+    UFUNCTION(BlueprintPure, Category = "RoomStateService")
+    TArray<FPlayerSnapshot> GetFactionSnapshotsWithAI(FGameplayTag FactionTag) const;
 
     /**
      * @brief 获取本地玩家的快照（用于 UI 高亮自己的状态）
@@ -188,23 +244,24 @@ public:
     bool IsLocalPlayerHost() const;
 
     /**
-     * @brief 本地玩家当前所属队伍
+     * @brief 本地玩家当前所属阵营 (FGameplayTag)
+     * 【2026.07.10 P0 重构】替代 GetLocalPlayerTeam(ERoomTeam)
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
-    ERoomTeam GetLocalPlayerTeam() const;
+    FGameplayTag GetLocalPlayerFaction() const;
 
     // ==========================================
     // 队伍统计查询
     // ==========================================
 
     /**
-     * @brief 攻方已准备人数
+     * @brief 攻方 (Faction.Offense) 已准备人数
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
     int32 GetAttackReadyCount() const;
 
     /**
-     * @brief 守方已准备人数
+     * @brief 守方 (Faction.Defense) 已准备人数
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
     int32 GetDefenseReadyCount() const;
@@ -224,4 +281,31 @@ private:
      * @brief 内部辅助: 把一个 ARoomPlayerState 转成 FPlayerSnapshot
      */
     static FPlayerSnapshot BuildSnapshot(ARoomPlayerState* PS, bool bIsHost);
+
+    /**
+     * 【2026.07.11 v28】内部辅助: 把一个 FPendingAIEntry 转成 FPlayerSnapshot
+     * 大厂原则: 字段一一对应, 不在调用方各自拼凑
+     */
+    static FPlayerSnapshot BuildAISnapshot(const struct FPendingAIEntry& Entry);
+
+    /**
+     * 【2026.07.11 v29 大厂架构重构】内部统一查询 — 单一真理源分离
+     *
+     * 历史 (v28 错误做法):
+     *   把真人 + AI 占位合并 → UI 拿到空 (测试模式 PlayerArray 没填) → Box 不显示 (用户反馈 bug)
+     *
+     * 新 (v29) 原则:
+     *   - 单一真理源: 真人 (PlayerArray) 与 AI 占位 (PendingAIQueue) 是两条独立流
+     *   - 显式意图: bIncludeAI 参数明确"我要哪条"
+     *   - 零兜底: 默认 bIncludeAI=false (旧 API 兼容, 只真人)
+     *
+     * 设计动机:
+     *   - UI 渲染 (URoomInsidePage): 真人用 KnownPlayerStates (事件订阅流), AI 用 GM->GetPendingAIInFaction
+     *     不依赖本函数 (v29 经验: 合并函数易在测试模式下数据空)
+     *   - ScoreboardWidget / MatchReadyCheck: 只关心真人 (bIncludeAI=false)
+     *   - 需要 AI 数据: 显式调 GM->GetPendingAIInFaction(阵营), 不隐式合并
+     *
+     * @param bIncludeAI true=真人+AI, false=只真人 (UI 不该走 true)
+     */
+    TArray<FPlayerSnapshot> GetFactionSnapshotsInternal(FGameplayTag FactionTag, bool bIncludeAI) const;
 };

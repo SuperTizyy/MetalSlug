@@ -1,11 +1,13 @@
-﻿// ==========================================
-// 头文件包含说明
-// ==========================================
+﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+
 #pragma once
+
 // 包含核心最小化组件
 #include "CoreMinimal.h"
 // 包含开发者设置模块的基类
 #include "Engine/DeveloperSettings.h"
+// 引入房间模式枚举 (ERoomMatchMode)
+#include "Data/Enums/RoomEnums.h"
 // 反射头文件
 #include "MetalSlugTestSettings.generated.h"
 
@@ -63,4 +65,29 @@ public:
 	// ==========================================
 	UPROPERTY(Config, EditAnywhere, Category = "UI Flow Testing", meta = (ToolTip="开启后跳过登录, 自动以测试房主身份进入房间页 (战斗地图启动也能正确显示房主 UI)"))
 	bool bSkipLoginDirectToLobby;
+
+	// ==========================================
+	// 【v54.5.1 新增】bSkipLoginDirectToLobby=true 时自动创建的房间地图
+	// ==========================================
+	// 说明: 当 bSkipLoginDirectToLobby=true 时, 自动用本地图启动房间
+	// 默认: Japanese_Temple_Demo
+	UPROPERTY(Config, EditAnywhere, Category = "Skip Login Room Config",
+		meta = (ToolTip="bSkipLoginDirectToLobby=true 时自动进入的房间地图"))
+	FString DebugSkipBattleMapName = TEXT("Japanese_Temple_Demo");
+
+	// ==========================================
+	// 【v54.5.1 新增】bSkipLoginDirectToLobby=true 时自动创建的房间游戏模式
+	// ==========================================
+	// 说明: 当 bSkipLoginDirectToLobby=true 时, 自动设置本游戏模式
+	// Melee=刀战模式, Zombie=生化模式
+	// 注意: UPROPERTY 不支持 enum class, 用 uint8 存储, 提供访问器转换
+	UPROPERTY(Config, EditAnywhere, Category = "Skip Login Room Config",
+		meta = (ToolTip="bSkipLoginDirectToLobby=true 时自动设置的游戏模式 (0=None, 1=Melee, 2=Zombie)"))
+	uint8 DebugSkipRoomMode = static_cast<uint8>(ERoomMatchMode::Melee);
+
+	/** 获取 DebugSkipRoomMode 对应的枚举值 */
+	ERoomMatchMode GetDebugSkipRoomMode() const
+	{
+		return static_cast<ERoomMatchMode>(DebugSkipRoomMode);
+	}
 };

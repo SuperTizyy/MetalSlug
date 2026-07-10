@@ -23,6 +23,8 @@
 #include "Kismet/GameplayStatics.h"
 // 【P0 2026.07.10 大厂重构】武器溶解组件 (职责对等)
 #include "Components/WeaponDissolveComponent.h"
+// 【2026.07.11 P0 大厂架构】友军伤害守卫 (单一真理源入口)
+#include "Data/Faction/FactionTags.h"
 
 
 // ==========================================
@@ -351,15 +353,93 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
 	if (!Victim) return;
 
+	// ============================================================
+	// 【2026.07.11 P0 大厂架构】友军伤害守卫 (Friendly Fire Guard)
+	//
+	// 单一真理源: 走 FFactionTags::CanDamage 集中校验
+	//   - 同阵营 (Friendly) → 拒绝扣血 + Log Warning (用户需求: 队友之间不能有队伤)
+	//   - 任一阵营无效 → 拒绝扣血 + Log Error (强制修复 Pawn.FactionTag 同步链路)
+	//   - 异阵营 + 均有效 → 通过
+	//
+	// 设计 (大厂原则):
+	//   - 攻击者 Character: 从武器 Owner 拿 (this 是武器 Actor, Owner 才是攻击 Pawn)
+	//   - 受击者 Character: Victim (Cast 已完成)
+	//   - 不能放在 ApplyPointDamage 之后, 因为扣血一旦发生就要走 OnDeath 流程, 不可逆
+	//   - 必须放在伤害计算之前 (这里 FinalDamage 还没算), 但唯一需要的是 Pawn.FactionTag
+	//   - 命名 AttackerCharFFCheck, 避免与下方 bIsAIDriven 分支内的 AttackerChar 局部同名 (编译期红线)
+	//
+	// 【v40.9.6 P0 修复】服务器权威重算 bIsAIDriven — 真理源 = Controller 类型
+	//   旧版 bIsAIDriven 由 RPC 传入 (依赖 Owner.bIsCurrentlyAttackerAI, 残留不可信)
+	//   新版: 从 AttackerCharFFCheck->GetController() 重新判断 — AI 的 Controller 永远是 AAIController
+	// ============================================================
+	const ABaseCharacter* AttackerCharFFCheck = Cast<ABaseCharacter>(GetOwner());
+	if (!AttackerCharFFCheck)
+	{
+		// 防御性兜底 (零兜底): 武器没有 Character Owner, 这是配置错误
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseWeapon::Server_ReportHit] Weapon=%s 没有 ABaseCharacter Owner (类型=%s), 拒绝扣血 Victim=%s. "
+			     "大厂原则: 武器必须挂在 Character 上, 由 Character 驱动攻击."),
+			*GetName(),
+			GetOwner() ? *GetOwner()->GetClass()->GetName() : TEXT("<null>"),
+			*Victim->GetName());
+		return;
+	}
+
+	// 【v40.9.6 P0】服务器权威重算 — Controller 类型 (运行时不可变)
+	const AController* AttackerController = AttackerCharFFCheck->GetController();
+	const bool bIsAIDriven_Authoritative = (AttackerController != nullptr)
+		&& AttackerController->IsA(AAIController::StaticClass());
+
+	if (!FFactionTags::CanDamage(
+			AttackerCharFFCheck->GetFactionTag(),
+			Victim->GetFactionTag(),
+			TEXT("ABaseWeapon::Server_ReportHit"),
+			AttackerCharFFCheck->GetName(),
+			Victim->GetName()))
+	{
+		// CanDamage 内部已 Log Error/Warning + 指出修复路径, 这里仅静默 return
+		// 大厂原则: 不重复打日志, 让 CanDamage 单一日志源
+		return;
+	}
+
+	// ============================================================
+	// 【2026.07.11 P0 大厂架构】复活无敌期守卫 (Spawn Invincibility Guard) — 早期观察点
+	//
+	// 单一真理源:  HealthComponent->bIsInvincible 是无敌期唯一权威 (Layer 0 入口)
+	//
+	// 为什么不在这里 return:
+	//   - HealthComponent::ApplyDamage 已会在被调前拦截 (Layer 0 单一真理源)
+	//   - 这里仅做 Verbose 日志 (可观测性增强), 不重复实现拦截逻辑
+	//   - 大厂原则 - 零重复: 拦截决策唯一, 仅分散点用作可观测性
+	//
+	// 实战效果:
+	//   - 一旦 Victim 无敌期激活, 下游 ApplyPointDamage → ApplyDamage → 立即 return 0
+	//   - 这里加 Verbose 是为了让 Verbose 调试时能区分"Faction 拒绝"还是"无敌期拒绝"
+	// ============================================================
+	// [v40 P0 修复] 必须用 ResolveHealthComponent() 而非裸字段 — Victim 可能被 BP archetype nullify
+	if (UHealthComponent* VictimHC = Victim->ResolveHealthComponent())
+	{
+		if (VictimHC->IsInvincible())
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[ABaseWeapon::Server_ReportHit] Victim=%s 在无敌期, 已被 HealthComponent Layer 0 拦截, 剩余=%.2fs"),
+				*Victim->GetName(),
+				VictimHC->GetInvincibilityRemainingSeconds());
+		}
+	}
+
 	// 服务器根据部位计算伤害
 	float FinalDamage = 0.0f;
 
-	// 【P0 2026.07.07 大厂架构重构】AI 通道: 服务器权威读 ConfigSO.Damage
+	// 【v40.9.6 P0 大厂架构】AI 通道: 服务器权威读 ConfigSO.Damage
 	//
-	// 旧版: FinalDamage = Damage (依赖 RPC 传入)
-	//   → 玩家/AI 共用 trace 后 trace 端传 Damage=0, 导致 AI 永远 0 伤害
-	// 新版: 服务器**自己**从攻击者 Owner 拉 AIController → 难度缩放后的 ConfigSO.Damage
-	if (bIsAIDriven)
+	// 旧版: bIsAIDriven 由客户端读 Owner.bIsCurrentlyAttackerAI 传入 → 残留 bug
+	//   → AI 攻击蒙太奇被打断时, AIAttackComponent::OnAIAttackMontageEnded 早退出,
+	//     SetAttackerIsAI(false) 没调用, 但下一帧新 AI 攻击的 box trace 命中玩家
+	//     → IsAttackerAI() 返回残留 false → RPC 传 bIsAIDriven=false → 走玩家路径 → 60 伤害
+	// 新版: bIsAIDriven 用服务器权威值 (bIsAIDriven_Authoritative), 从 Controller 类型判定
+	//   → 真理源 = Actor 类型 (运行时不可变), 不依赖攻击状态 bool
+	if (bIsAIDriven_Authoritative)
 	{
 		// 服务器从攻击者 Owner 拉 AIController → 难度缩放后的 ConfigSO.Damage
 		if (const ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(GetOwner()))
@@ -474,8 +554,8 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 		UDamageType::StaticClass()
 	);
 
-	UE_LOG(LogTemp, Warning, TEXT("[Damage] Server_ReportHit: %s -> %s, Damage=%.1f, Bone=%s, Heavy=%d, AIChannel=%d"),
-		*GetName(), *Victim->GetName(), FinalDamage, *BoneName.ToString(), bIsHeavy, bIsAIDriven ? 1 : 0);
+	UE_LOG(LogTemp, Warning, TEXT("[Damage] Server_ReportHit: %s -> %s, Damage=%.1f, Bone=%s, Heavy=%d, AIChannel=%d (AuthReCalc from Controller)"),
+		*GetName(), *Victim->GetName(), FinalDamage, *BoneName.ToString(), bIsHeavy, bIsAIDriven_Authoritative ? 1 : 0);
 }
 
 

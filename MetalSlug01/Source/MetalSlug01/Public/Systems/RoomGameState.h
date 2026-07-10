@@ -11,9 +11,11 @@
 // 引入 UE 原生 AGameStateBase 类（基类）
 #include "GameFramework/GameStateBase.h"
 
-// 引入房间相关枚举（ERoomTeam/ERoomMatchMode 等）
+// 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 // 改造: 改为精确子表头, 不再被其他无关表污染 (原 StaticTable.h 432 行)
 #include "Data/Enums/RoomEnums.h"
+#include "Systems/AI/AIBehaviorTypes.h"  // 【v46 新增】FPendingAIEntry
+#include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
 
 // UE 自动生成的头文件
 #include "RoomGameState.generated.h"
@@ -27,6 +29,12 @@
  * @param RemainingSeconds 剩余秒数
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchTimeUpdated, int32, RemainingSeconds);
+
+/**
+ * @brief 大厅阶段 AI 占位队列变化委托（UI 订阅此事件刷新 Box_AttackTeam/Box_DefenseTeam）
+ * @param None
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPendingAIQueueChanged);
 
 /**
  * @brief 当前回合数改变委托（生化模式每回合结束后递减）
@@ -145,21 +153,27 @@ public:
 	FOnMatchModeChanged OnMatchModeChanged;
 
 	/**
-	 * 提供一个极其方便的辅助函数: 获取特定队伍的所有玩家
+	 * 提供一个极其方便的辅助函数: 获取特定阵营的所有玩家 (FGameplayTag 版)
+	 *
+	 * 【2026.07.10 P0 重构】替代 GetPlayersInTeam(ERoomTeam), 阵营用 FGameplayTag 表达
+	 *   - Tag == FFactionTags::Offense()  → 攻方所有玩家
+	 *   - Tag == FFactionTags::Defense()  → 守方所有玩家
+	 *   - 其它 Tag: 显式返回空数组 (无兜底)
+	 *
 	 * 因为数据分散在每个人自己的 PlayerState 里了，所以我们需要遍历查询
-	 * @param TargetTeam 目标队伍
-	 * @return 该队伍的所有玩家 PlayerState 列表
+	 * @param TargetFactionTag 目标阵营 (必须为 Offense/Defense 之一)
+	 * @return 该阵营的所有玩家 PlayerState 列表
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Query")
-	TArray<class ARoomPlayerState*> GetPlayersInTeam(ERoomTeam TargetTeam) const;
+	TArray<class ARoomPlayerState*> GetPlayersInFaction(FGameplayTag TargetFactionTag) const;
 
 	/**
-	 * 查询指定队伍中 AC 最高的玩家的 PlayerState（忽略死亡或无 pawn 的玩家）
-	 * @param TargetTeam 目标队伍
+	 * 查询指定阵营中 AC 最高的玩家的 PlayerState（忽略死亡或无 pawn 的玩家）
+	 * @param TargetFactionTag 目标阵营 (必须为 Offense/Defense 之一)
 	 * @return AC 最高的 PlayerState（找不到返回 nullptr）
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Query")
-	class ARoomPlayerState* GetTeamTopACPlayer(ERoomTeam TargetTeam) const;
+	class ARoomPlayerState* GetFactionTopACPlayer(FGameplayTag TargetFactionTag) const;
 
 	/**
 	 * 查询全场所有玩家中 AC 最高的玩家的 PlayerState（忽略死亡或无 pawn 的玩家）
@@ -175,6 +189,50 @@ public:
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_HostPlayerName, BlueprintReadOnly, Category = "Room|Global")
 	FString HostPlayerName;
+
+	// ==========================================
+	// 【v46 大厂架构修复】AI 占位队列复制 (客户端 UI 需要读取)
+	// ==========================================
+	//
+	// 根因:
+	//   ARoomGameMode::PendingAIQueue 不是 Replicated
+	//   → 客户端 CheckForNewPlayers 中 GM->GetAllPendingAI() 返回空
+	//   → ExpectedTotalCount 不含 AI 数量
+	//   → RefreshRoomUI 路径 B (AI 占位) 永远为空
+	//   → Box_AttackTeam/Box_DefenseTeam 不显示 AI 标签
+	//
+	// 修复:
+	//   1. ARoomGameState 新增 ReplicatedPendingAIQueue (Replicated 复制到客户端)
+	//   2. ARoomGameMode::QueueAIForBattleSpawn 成功后同步到 GameState
+	//   3. ARoomGameMode::ConsumePendingAIForBattleSpawn 成功后清空 GameState
+	//   4. URoomInsidePage::CheckForNewPlayers 改读 GameState.ReplicatedPendingAIQueue (而非 GM.PendingAIQueue)
+	//   5. 添加 OnRep_ReplicatedPendingAIQueue 回调触发 UI 刷新
+
+	/**
+	 * AI 占位队列 (Replicated)
+	 * 大厅阶段 AI 入队后复制到所有客户端, 用于 UI 渲染 Box_AttackTeam/Box_DefenseTeam
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_ReplicatedPendingAIQueue, BlueprintReadOnly, Category = "Room|AI")
+	TArray<struct FPendingAIEntry> ReplicatedPendingAIQueue;
+
+	/**
+	 * ReplicatedPendingAIQueue 复制回调 (客户端)
+	 * 触发 OnPendingAIQueueChanged 广播, 让 UI 订阅者刷新显示
+	 */
+	UFUNCTION()
+	void OnRep_ReplicatedPendingAIQueue();
+
+	/**
+	 * AI 占位队列变化事件 (客户端 UI 订阅刷新 Box)
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|AI")
+	FOnPendingAIQueueChanged OnPendingAIQueueChanged;
+
+	/**
+	 * 查询指定阵营的 AI 占位数量 (客户端 UI 用)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|AI")
+	int32 GetPendingAICountInFaction(FGameplayTag FactionTag) const;
 
 	// ==========================================
 	// 双方击杀统计
@@ -207,11 +265,15 @@ public:
 	FOnTeamKillCountUpdated OnTeamKillCountUpdated;
 
 	/**
-	 * 服务器专用: 增加指定队伍的击杀数
-	 * @param Team 要增加击杀数的队伍
+	 * 服务器专用: 增加指定阵营的击杀数
+	 *
+	 * 【2026.07.10 P0 重构】传 FGameplayTag 替代 ERoomTeam
+	 *   - Tag == FFactionTags::Offense()  → 攻方 +1
+	 *   - Tag == FFactionTags::Defense()  → 守方 +1
+	 *   - 其它 Tag: 显式报错, 不增任何字段 (无兜底)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Match")
-	void AddTeamKill(ERoomTeam Team);
+	void AddTeamKill(FGameplayTag FactionTag);
 
 	/**
 	 * 【网络架构修复】: 强制广播击杀数给所有客户端

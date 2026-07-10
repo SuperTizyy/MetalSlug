@@ -49,6 +49,16 @@
 #include "Kismet/GameplayStatics.h"
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
+#include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
+
+// 【2026.07.12 P0 大厂架构 Phase 2】5 个新 ActorComponent 头文件 (转发壳依赖)
+// 注意: 头文件本身由别的 agent 编写 (可能在 PIE 同时编译), 这里只前向声明 + 假设依赖
+// 如果某个 Component 头未到位, 注释掉对应 CreateDefaultSubobject 行即可编译
+#include "Combat/PlayerComboComponent.h"   // 玩家连击
+#include "Combat/AIAttackComponent.h"      // AI 攻击
+#include "Combat/CombatDeathComponent.h"   // 战斗死亡
+#include "Combat/WeaponAttachmentComponent.h" // 武器装备
+#include "Combat/CharacterIconComponent.h"  // 头像/武器图标
 
 // ==========================================
 // 1. 构造函数
@@ -70,6 +80,8 @@
  */
 ABaseCharacter::ABaseCharacter()
 {
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 ENTER: this=%p Class=%s"), this, *GetClass()->GetName());
+
 	PrimaryActorTick.bCanEverTick = true;
 
 	// 极其关键: 开启角色的网络同步
@@ -100,6 +112,34 @@ ABaseCharacter::ABaseCharacter()
 	CharacterEvents  = CreateDefaultSubobject<UCharacterEvents>(TEXT("CharacterEvents"));
 	HealthRegenComponent = CreateDefaultSubobject<UHealthRegenComponent>(TEXT("HealthRegenComponent"));
 
+	// 【v40.8 P0 大厂架构】复活无敌期视觉闪烁组件
+	//   - 数据/视觉分离: HealthComponent 持数据, 本组件持视觉 (MID 操作)
+	//   - 协议: 身体材质蓝图必须有 "FlickerAmount" 标量参数
+	//   - 启动时: 订阅 HealthComponent->OnInvincibilityChanged
+	//   - 激活时: 派发 OnFlickerStarted → BP 子类 Timeline 驱动
+	FlickerComponent = CreateDefaultSubobject<UInvincibilityFlickerComponent>(TEXT("FlickerComponent"));
+
+	// ==========================================
+	// 【2026.07.12 P0 大厂重构 Phase 2】5 个业务组件 (BaseCharacter 拆分)
+	// ==========================================
+	// 拆分动机: BaseCharacter.cpp 已 3957 行, 单文件维护成本爆炸.
+	//          按业务职责拆分到独立 ActorComponent, BaseCharacter 改为转发壳.
+	//
+	// 拆分说明:
+	//   PlayerCombo   ← 玩家连击状态机 (Phase 2.1)
+	//   AIAttack      ← AI 攻击子系统 (Phase 2.2)
+	//   CombatDeath   ← 战斗死亡/无敌期 (Phase 2.3)
+	//   WeaponAttach  ← 武器装备/挂载 (Phase 2.4)
+	//   CharacterIcon ← 角色头像/武器图标刷新 (Phase 2.5)
+	PlayerCombo     = CreateDefaultSubobject<UPlayerComboComponent>(TEXT("PlayerCombo"));
+	AIAttack        = CreateDefaultSubobject<UAIAttackComponent>(TEXT("AIAttack"));
+	CombatDeath     = CreateDefaultSubobject<UCombatDeathComponent>(TEXT("CombatDeath"));
+	WeaponAttach    = CreateDefaultSubobject<UWeaponAttachmentComponent>(TEXT("WeaponAttach"));
+	CharacterIcon   = CreateDefaultSubobject<UCharacterIconComponent>(TEXT("CharacterIcon"));
+
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p"),
+		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent);
+
 	// ==========================================
 	// 角色模型设置
 	// ==========================================
@@ -126,10 +166,11 @@ ABaseCharacter::ABaseCharacter()
 
 	// 注: 回复系统状态已抽离到 HealthRegenComponent, 此处不再初始化字段
 
-	// 6. 初始化连击系统状态
-	bIsHoldingLightAttack = false;
-	bIsAttacking = false;
-	CurrentWeapon = nullptr; // 初始状态手里没武器
+	// 6. 【2026.07.12 P0 重构】连击状态机字段已迁移到 PlayerComboComponent
+	//    死亡字段已迁移到 CombatDeathComponent
+	//    武器字段已迁移到 WeaponAttachmentComponent
+	//    图标字段已迁移到 CharacterIconComponent
+	//    这里不再初始化这些字段, 全部由 Component 自治
 
 	// 【核心权限】: 告诉引擎底层的导航代理，这个角色可以下蹲
 	// 如果不加这句，你按破键盘角色也不会蹲下
@@ -160,19 +201,24 @@ void ABaseCharacter::BeginPlay()
 	// 原因: 血量数据已下沉到 Component, BaseCharacter 通过事件转发来驱动 HUD 刷新
 	// 服务器: Component->ApplyDamage/Heal 内部 Broadcast
 	// 客户端: Component->OnRep_CurrentHealth 内部 Broadcast
-	if (HealthComponent)
+	// 【v39 修复】用 Resolve 函数而非裸字段访问 (BP archetype null 字段防护)
+	if (UHealthComponent* HC = ResolveHealthComponent())
 	{
-		HealthComponent->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthChanged_Callback);
+		HC->OnHealthChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthChanged_Callback);
 
 		// 【2026-07-01 新增】订阅死亡事件
 		// 服务器: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die
 		// 客户端: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal
-		HealthComponent->OnDeath.AddUniqueDynamic(this, &ABaseCharacter::OnHealthComponentDeath);
+		HC->OnDeath.AddUniqueDynamic(this, &ABaseCharacter::OnHealthComponentDeath);
+
+		// 【2026.07.14 新增】订阅无敌期变化事件
+		// 用于驱动 UI 层显示复活进度条
+		HC->OnInvincibilityChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthComponentInvincibilityChanged);
 	}
 
 	// 【2026-07-01 新增】: CharacterEvents 初始化检查
-	// 如果 CharacterEvents 未正确挂载，打一条 Error，便于调试
-	if (!CharacterEvents)
+	// 【v39 修复】用 Resolve 函数而非裸字段访问
+	if (!ResolveCharacterEvents())
 	{
 		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] CharacterEvents 组件未挂载!"));
 	}
@@ -187,16 +233,23 @@ void ABaseCharacter::BeginPlay()
  * 调用时机:
  *   - 服务器: HealthComponent::ApplyDamage / Heal 内部 Broadcast
  *   - 客户端: HealthComponent::OnRep_CurrentHealth 内部 Broadcast
+ *
+ * 【v39 修复】用 Resolve 函数而非裸字段访问 (BP archetype null 字段防护)
+ *   根因: 旧版 `if (!CharacterEvents || !HealthComponent) return;`
+ *         BP archetype 让字段 null → 不广播 → HUD 血量永远不更新 (Bug 2)
+ *   修复: 调 Resolve 函数 lazily 找到组件 (永不返回 null 除非真没挂载)
  */
 void ABaseCharacter::OnHealthChanged_Callback(float NewHealth)
 {
 	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播, 替代直接 GameHUDWidget Push
 	// 优势: UI 层自主订阅, BaseCharacter 不再依赖 GameHUDWidget
-	if (!CharacterEvents || !HealthComponent)
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	UHealthComponent* HC = ResolveHealthComponent();
+	if (!Events || !HC)
 	{
 		return;
 	}
-	CharacterEvents->OnHealthChangedDelegate.Broadcast(NewHealth, HealthComponent->GetMax());
+	Events->OnHealthChangedDelegate.Broadcast(NewHealth, HC->GetMax());
 }
 
 
@@ -216,11 +269,14 @@ void ABaseCharacter::OnHealthChanged_Callback(float NewHealth)
  */
 void ABaseCharacter::OnHealthComponentDeath()
 {
+	// 【v39 修复】用 Resolve 函数而非裸字段访问
+	UHealthComponent* HC = ResolveHealthComponent();
+
 	UE_LOG(LogTemp, Error, // 使用 Error 让日志更显眼
 		TEXT("[BaseCharacter][OnHealthComponentDeath] ★★★ 触发死亡 ★★★: Pawn=%s HasAuth=%d HealthComponent=%p"),
-		*GetName(), HasAuthority() ? 1 : 0, HealthComponent);
+		*GetName(), HasAuthority() ? 1 : 0, HC);
 
-	if (!HealthComponent)
+	if (!HC)
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[BaseCharacter][OnHealthComponentDeath] FATAL: HealthComponent is null! Cannot proceed with death."));
@@ -244,82 +300,83 @@ void ABaseCharacter::OnHealthComponentDeath()
 
 
 /**
- * ABaseCharacter::ExecuteDeathLocal
+ * ABaseCharacter::OnHealthComponentInvincibilityChanged 【2026.07.14 新增】
  *
- * 【2026-07-01 新增】本地执行死亡流程 (客户端用, 服务器也可用)
- * 与 Multicast_Die_Implementation 的区别:
- *   - 不调 StartRespawnTimer (复活只在服务器调)
- *   - 不调 ResetAC (仅服务器重置)
- *   - 其他 (武器掉落/溶解/胶囊体/动画/布娃娃) 完全一致
+ * HealthComponent 无敌期状态变化回调
+ * 职责: 订阅 HealthComponent->OnInvincibilityChanged，广播到 CharacterEvents->OnInvincibilityChanged
+ *       让 UI 层 (GameHUDWidget) 统一订阅显示复活进度条
  *
- * 幂等保证: 可能被多次调用 (服务器 Die() 走 Multicast_Die RPC 触发服务器, 客户端又通过 OnRep_bIsDead 触发)
- *   - bDeathSequenceStarted 标志保证只首次执行核心步骤
- *   - 重复调用仅 ResetAC + StartRespawnTimer
- *
- * 死亡流程时序 (t=0 死亡瞬间):
- *   - t=0: 武器立即溶解 + 角色立即溶解 + 胶囊体透明 + 禁用移动 + 死亡动画
- *   - t=0.7*DeathMontageDuration: 启动 Ragdoll
- *   - t=DissolveDuration: 角色和武器溶解完毕
- *   - t=RespawnDelaySeconds: 复活定时器到期, 销毁旧角色
- *
- * 时序约束 (大厂架构规范):
- *   RespawnDelaySeconds > DissolveDuration + DeathMontageDuration
- *   否则身体溶解到一半就被销毁, 视觉效果断裂
+ * 设计动机:
+ *   - HealthComponent->OnInvincibilityChanged 是服务器/客户端各自广播的本地事件
+ *   - 需要一个统一的 CharacterEvents 事件让 UI 层统一订阅
+ *   - 与 OnHealthChanged_Callback / OnHealthComponentDeath 模式一致
  */
-void ABaseCharacter::ExecuteDeathLocal()
+void ABaseCharacter::OnHealthComponentInvincibilityChanged(bool bIsNowInvincible)
 {
-	// 幂等检查: 死亡序列已开始则跳过核心步骤
-	if (bDeathSequenceStarted)
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
-		UE_LOG(LogTemp, Verbose,
-			TEXT("[BaseCharacter][ExecuteDeathLocal] 幂等跳过: Pawn=%s"),
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][OnHealthComponentInvincibilityChanged] CharacterEvents 未挂载! Pawn=%s"),
 			*GetName());
 		return;
 	}
-	bDeathSequenceStarted = true;
 
-	UE_LOG(LogTemp, Warning,
-		TEXT("[BaseCharacter][ExecuteDeathLocal] Pawn=%s HasAuth=%d Weapon=%s"),
-		*GetName(), HasAuthority() ? 1 : 0,
-		CurrentWeapon ? *CurrentWeapon->GetName() : TEXT("nullptr"));
+	// 广播到 CharacterEvents，让 UI 层统一订阅
+	Events->OnInvincibilityChanged.Broadcast(bIsNowInvincible);
 
-	// 1. 武器掉落
-	if (CurrentWeapon)
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter][OnHealthComponentInvincibilityChanged] ★ 无敌期变化: Pawn=%s bIsNowInvincible=%d"),
+		*GetName(), bIsNowInvincible ? 1 : 0);
+}
+
+
+/**
+ * ABaseCharacter::ExecuteDeathLocal — 转发壳 【2026.07.12 P0 重构】
+ *
+ * 真实逻辑: CombatDeathComponent::ExecuteDeathLocal
+ */
+void ABaseCharacter::ExecuteDeathLocal()
+{
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		DropAndFadeWeapon(CurrentWeapon);
-		CurrentWeapon = nullptr;
+		Death->ExecuteDeathLocal();
 	}
+}
 
-	// 2. 胶囊体透明 + 禁用移动
-	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
-	{
-		MoveComp->StopMovementImmediately();
-		MoveComp->DisableMovement();
-	}
-	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
-	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
 
-	// 3. 死亡动画 + 定时布娃娃
-	float AnimDuration = 0.1f;
-	if (DeathMontage)
-	{
-		AnimDuration = PlayAnimMontage(DeathMontage);
-	}
-	float TimeToRagdoll = AnimDuration > 0.1f ? (AnimDuration * 0.7f) : 0.1f;
-	GetWorldTimerManager().SetTimer(RagdollTimerHandle, this, &ABaseCharacter::EnableRagdoll, TimeToRagdoll, false);
+// ==========================================
+// 【2026.07.11 P0 大厂架构】复活无敌期 — 单一入口（转发壳）
+// ==========================================
+//
+// 职责: 通过 BaseCharacter 暴露公开 API, 内部委托 CombatDeathComponent
+// 调用方: RoomGameMode::RequestRespawn / SpawnAllPlayersIntoBattle 末尾
+// 真实实现位于 CombatDeathComponent, BaseCharacter 这里只做转发
+// ==========================================
 
-	// 4. 【2026-07-01 P0 修复】角色身体溶解 - 立即启动, 不再用 DissolveDelay 定时器
-	// 旧架构 bug: DissolveComponent::OnOwnerDeath 用 DissolveDelay=5s 定时器
-	//              复活定时器 3s 就触发销毁, 角色没机会溶解 → 身体"立马消失"
-	// 新架构: 死亡编排器 (ExecuteDeathLocal) 显式控制溶解时序, 立即启动
-	if (DissolveComponent)
+/**
+ * 激活复活无敌期 — 转发壳
+ * 真实逻辑: CombatDeathComponent::ActivateSpawnInvincibility
+ */
+void ABaseCharacter::ActivateSpawnInvincibility(float DurationOverride)
+{
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		DissolveComponent->StartDissolveImmediate();
+		Death->ActivateSpawnInvincibility(DurationOverride);
 	}
-	else
+	// else: ResolveCombatDeath 已 Log Error
+}
+
+
+/**
+ * 取消复活无敌期 — 转发壳
+ * 真实逻辑: CombatDeathComponent::DeactivateSpawnInvincibility
+ */
+void ABaseCharacter::DeactivateSpawnInvincibility()
+{
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter][ExecuteDeathLocal] DissolveComponent 未挂载! 角色将无法溶解"));
+		Death->DeactivateSpawnInvincibility();
 	}
 }
 
@@ -349,15 +406,14 @@ void ABaseCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		FTimerManager& TM = World->GetTimerManager();
 
-		// 清理死亡流程相关的 timer
-		// 注: WeaponDestroy 已改为服务器 SetLifeSpan, 不再使用 TimerHandle
-		// 注: DissolveTimerHandle 已迁移到 DissolveComponent, 由其自行清理
-		TM.ClearTimer(RagdollTimerHandle);
+		// 【2026.07.12 P0 重构】Timer 已迁移到 Component 自治:
+		//   - RagdollTimerHandle → CombatDeathComponent (ExecuteDeathLocal 自清理)
+		//   - CharacterIconRefreshTimerHandle → CharacterIconComponent (RetryRefresh 自清理)
+		//   - HUDRefreshTimerHandle → CharacterIconComponent (RetryRefreshHUD 自清理)
+		// UE 组件 EndPlay 时自动清理自身 Timer, 此处不需要再手动 ClearTimer
 
-		// 清理延迟重试 timer
-		// 这两个 timer 通过 this 绑定,UE 内部会自动清理,但显式清理更安全
-		TM.ClearTimer(CharacterIconRefreshTimerHandle);
-		TM.ClearTimer(HUDRefreshTimerHandle);
+		// 防御: HUDRefreshTimerHandle 仍保留在 BaseCharacter 头部? 这里用泛化 ClearTimerAll 兜底
+		//    实际已删除, 此行保留仅为编译期占位 (零运行时代价)
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -394,6 +450,7 @@ void ABaseCharacter::Tick(float DeltaTime)
 
 	// 【P0 2026.07.08 调试用】AI 移动状态诊断, 每 5s 打印一次 (仅服务器, 仅 AI)
 	// 排查 "AI 启用 BT 后闪烁但不移动" 问题
+	// 【2026.07.12 P0 重构】改读 PlayerCombo->bIsAttacking / WeaponAttach->CurrentWeapon (真理源迁移)
 	static double LastDiagnoseTime = 0.0;
 	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	if (HasAuthority() && GetController() && GetController()->IsA<AAIController>() && Now - LastDiagnoseTime > 5.0)
@@ -407,8 +464,8 @@ void ABaseCharacter::Tick(float DeltaTime)
 			Move ? Move->MaxWalkSpeed : 0.f,
 			Vel.Size(),
 			bIsMovementLocked ? 1 : 0,
-			bIsAttacking ? 1 : 0,
-			CurrentWeapon ? 1 : 0,
+			ResolvePlayerCombo() && ResolvePlayerCombo()->IsAttacking() ? 1 : 0,
+			ResolveWeaponAttach() && ResolveWeaponAttach()->GetCurrentWeapon() ? 1 : 0,
 			Move ? (int32)Move->MovementMode : -1);
 	}
 
@@ -434,14 +491,21 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 这两个字段已下沉到 HealthComponent, 复制由 Component 自治
 	// 【2026-06-15 重构】删除对 CurrentEnergy 的 DOREPLIFETIME
 	// 已下沉到 EnergyComponent, 复制由 Component 自治
-	// 同步武器指针, 让所有人都知道你拿了什么武器
-	DOREPLIFETIME(ABaseCharacter, CurrentWeapon);
+	// 【2026.07.12 P0 重构】删除对 CurrentWeapon 的 DOREPLIFETIME
+	// 已下沉到 WeaponAttachmentComponent, 复制由 Component 自治 (ReplicatedUsing = OnRep_CurrentWeapon)
 	// 同步AC/ACE值（注意: MaxAC 是配置常量，无需网络同步）
 	DOREPLIFETIME(ABaseCharacter, ACValue);
 	DOREPLIFETIME(ABaseCharacter, ACEValue);
-	// 【修复 Q3】: LastKillMethod 声明了 UPROPERTY(Replicated), 必须加入 DOREPLIFETIME
-	// 背景: Multicast_NotifyKill 在所有客户端读取 LastKillMethod, 若不复制则永远是默认值
-	DOREPLIFETIME(ABaseCharacter, LastKillMethod);
+
+	// 【v31.6 大厂重构】删除 LastKillMethod 的 DOREPLIFETIME
+	//   真理源唯一 = Weapon::LastKillMethod (Weapon 已独立复制)
+	//   Multicast_NotifyKill 改为 RPC 参数传 EKillMethod, 不再读 Character 字段
+
+	// 【2026.07.11 P0 修复】FactionTag 网络同步
+	// 根因: Pawn.FactionTag 是 UE AIPerception 的阵营敌我判定唯一数据源
+	//       如果不同步, 客户端 Pawn.FactionTag == Empty → AI 看到玩家 = Neutral (默认) →
+	//       bDetectEnemies=true 但 Neutral 被跳过 → 玩家永远不在 BT 视野 → AI 不会追玩家
+	DOREPLIFETIME(ABaseCharacter, FactionTag);
 }
 
 
@@ -487,158 +551,18 @@ void ABaseCharacter::Client_UpdateEnergyDisplay_Implementation(float Current, fl
 // ==========================================
 
 /**
- * OnRep_CurrentWeapon
+ * OnRep_CurrentWeapon — 转发壳 (UFUNCTION 在 Actor 上, 实现委托给组件)
+ * 真实逻辑: WeaponAttachmentComponent::OnRep_CurrentWeapon
  *
- * 武器指针改变时的回调(网络复制通知)
- *
- * 【Bug 3 根因分析 2026.07.10】
- *
- * 历史症状: "玩家复活后多出一把武器"
- * 根因链 (大厂排查链路):
- *   1. 服务器 PossessedBy → SpawnAndEquipWeapon → CurrentWeapon=新武器 → 复制到客户端
- *   2. 客户端 OnRep_CurrentWeapon 触发
- *   3. 客户端的 CharacterID 可能尚未从 PlayerState 复制到位(网络复制优先级)
- *   4. FindWeaponAttachmentConfig 返回 nullptr → 用默认 Socket "WeaponSocket_R"
- *   5. 挂载配置错误 → 武器视觉位置错乱, 看起来"多出一把"
- *
- * 大厂修复架构 (单一协议, 不兜底):
- *   - 只在 CharacterID 非空时才执行挂载 (防御: CharacterID 未复制到位时静默跳过)
- *   - 先脱挂旧武器 (防御: 复活场景 OldWeapon != null)
- *   - 服务器通过 PossessedBy -> SpawnAndEquipWeapon 权威挂载 (正确路径)
- *   - 客户端依赖网络复制 + 正确 CharacterID 后的挂载 (从属路径)
- *   - 日志显式化任何异常, 让美术/策划知道挂载配置缺失
- *
- * 【重要】只有 AI (非本地控制 + 非权威) 才走这个回调
- *         玩家角色: IsLocallyControlled()=true → 已在 PossessedBy 中跳过
+ * 【v36】改用 ResolveWeaponAttach lazy 查找
  */
 void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 {
-	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
-		*GetNameSafe(OldWeapon), *GetNameSafe(CurrentWeapon), IsLocallyControlled(), HasAuthority());
-
-	// 【Bug 3 修复】服务器和本地控制的角色已经在 PossessedBy 中处理了,跳过
-	if (IsLocallyControlled() || HasAuthority())
+	if (UWeaponAttachmentComponent* ResolvedAttach = ResolveWeaponAttach())
 	{
-		return;
+		ResolvedAttach->OnRep_CurrentWeapon(OldWeapon);
 	}
-
-	// 【Bug 3 修复 1】OldWeapon 脱挂 — 复活场景 OldWeapon != null
-	// 防御: 如果 OldWeapon 已失效, 跳过脱挂 (安全 no-op)
-	if (OldWeapon && IsValid(OldWeapon))
-	{
-		OldWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-		UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 脱挂旧武器: %s"), *OldWeapon->GetName());
-	}
-
-	if (!CurrentWeapon)
-	{
-		// 新武器为空, 说明服务器清空了武器, 客户端也已脱挂 (见上方), 直接返回
-		return;
-	}
-
-	// 【Bug 3 修复 2】CharacterID 未就绪时静默跳过
-	// 防御: CharacterID 通过 PlayerState 网络复制, 优先级可能低于 CurrentWeapon
-	//       如果 CharacterID 尚未到达, FindWeaponAttachmentConfig 会用错误的默认配置
-	//       直接跳过挂载, 等下一次 OnRep (CharacterID 到位后) 或让 PossessedBy 兜底
-	if (CharacterID.IsEmpty())
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponRep] 跳过挂载: CharacterID 尚未复制到位 (可能 PlayerState 未同步). "
-				 "Weapon=%s 将由 PossessedBy 或下次 OnRep 处理."),
-			*CurrentWeapon->GetName());
-		return;
-	}
-
-	// 从 WeaponDataTable 反查 WeaponID
-	ARoomGameMode* GameMode = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	FString WeaponIDToFind;
-
-	if (GameMode && GameMode->WeaponDataTable)
-	{
-		static const FString WeaponContextString(TEXT("WeaponRepLookup"));
-		for (const FName& RowName : GameMode->WeaponDataTable->GetRowNames())
-		{
-			if (FWeaponInfo* Info = GameMode->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WeaponContextString))
-			{
-				// WeaponBlueprint 是 TSoftClassPtr, 需要 LoadSynchronous 拿到 UClass* 再 IsA
-				if (!Info->WeaponBlueprint.IsNull())
-				{
-					UClass* WeaponClass = Info->WeaponBlueprint.LoadSynchronous();
-					if (WeaponClass && CurrentWeapon->IsA(WeaponClass))
-					{
-						WeaponIDToFind = RowName.ToString();
-						break;
-					}
-				}
-			}
-		}
-	}
-
-	// 【Bug 3 修复 3】WeaponID 反查失败时报警 (显式错误, 不兜底)
-	if (WeaponIDToFind.IsEmpty())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponRep] 无法反查 WeaponID: CharacterID=%s, Weapon=%s. "
-				 "请检查 WeaponDataTable 中是否存在该武器的 Blueprint 配置. "
-				 "武器将使用默认挂载 Socket (WeaponSocket_R)."),
-			*CharacterID, *CurrentWeapon->GetName());
-		// 不 return — 用默认配置继续挂载 (让武器至少能显示出来)
-		// 这是"部分失败优雅降级", 不是"兜底行为"
-	}
-
-	// 查找挂载配置
-	FWeaponAttachmentConfig* AttachmentConfig = FindWeaponAttachmentConfig(CharacterID, WeaponIDToFind);
-
-	FName SocketName = TEXT("WeaponSocket_R");
-	FVector RelativeLocation = FVector::ZeroVector;
-	FRotator RelativeRotation = FRotator::ZeroRotator;
-
-	if (AttachmentConfig)
-	{
-		SocketName = AttachmentConfig->SocketName;
-		RelativeLocation = AttachmentConfig->RelativeLocation;
-		RelativeRotation = AttachmentConfig->RelativeRotation;
-	}
-	else
-	{
-		// 【Bug 3 修复 4】挂载配置缺失时显式报警 (大厂原则: 显式错误 > 静默兼容)
-		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponRep] 挂载配置缺失: CharacterID=%s + WeaponID=%s 未找到 AttachmentConfig. "
-				 "请检查 WeaponAttachmentDataTable 中是否配置了该组合. "
-				 "使用默认 Socket=%s."),
-			*CharacterID, *WeaponIDToFind, *SocketName.ToString());
-	}
-
-	// 将武器挂载到插槽
-	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
-	CurrentWeapon->AttachToComponent(GetMesh(), AttachmentRules, SocketName);
-
-	if (!RelativeLocation.IsNearlyZero())
-	{
-		CurrentWeapon->SetActorRelativeLocation(RelativeLocation);
-	}
-	if (!RelativeRotation.IsNearlyZero())
-	{
-		CurrentWeapon->SetActorRelativeRotation(RelativeRotation);
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("[WeaponRep] 挂载完成: Socket=%s, CharID=%s, WeaponID=%s"),
-		*SocketName.ToString(), *CharacterID, *WeaponIDToFind);
-
-	// 刷新战斗 HUD 上的武器图标（远程玩家也需要在自己客户端看到）
-	if (IsLocallyControlled())
-	{
-		if (APlayerController* PC = GetController<APlayerController>())
-		{
-			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
-			{
-				if (UGameHUDWidget* GameHUD = HUD->GetGameHUDWidget())
-				{
-					GameHUD->UpdateWeaponIconFromID(WeaponIDToFind);
-				}
-			}
-		}
-	}
+	// else: ResolveWeaponAttach 已 Log Error
 }
 
 
@@ -646,15 +570,18 @@ void ABaseCharacter::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
  * OnRep_ACValue
  *
  * AC 值改变时的客户端回调
+ *
+ * 【v39 修复】用 ResolveCharacterEvents() 而非裸字段访问 (BP archetype null 字段防护)
  */
 void ABaseCharacter::OnRep_ACValue()
 {
 	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播
-	if (!CharacterEvents)
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
-	CharacterEvents->OnACValueChanged.Broadcast(ACValue);
+	Events->OnACValueChanged.Broadcast(ACValue);
 
 	// AC 变化时重新查询排名并刷新 ACE 颜色 (内部也改用事件)
 	RefreshACEWithRank();
@@ -665,18 +592,21 @@ void ABaseCharacter::OnRep_ACValue()
  * OnRep_ACEValue
  *
  * ACE 值改变时的客户端回调
+ *
+ * 【v39 修复】用 ResolveCharacterEvents() 而非裸字段访问
  */
 void ABaseCharacter::OnRep_ACEValue()
 {
 	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播
 	// OnRep_ACEValue 在所有客户端上触发, CharacterEvents 组件本身在本地,
 	// 所以这里的广播天然只在本地执行 (不需要额外的 IsLocallyControlled 守卫)
-	if (!CharacterEvents)
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
 	// 刷新 ACE 数值 (无排名, 用默认白色)
-	CharacterEvents->OnACEValueChanged.Broadcast(ACEValue);
+	Events->OnACEValueChanged.Broadcast(ACEValue);
 
 	// ACE 变化时也需要查询排名 (因为其他玩家的 ACE 变化也会影响你的排名)
 	RefreshACEWithRank();
@@ -688,231 +618,87 @@ void ABaseCharacter::OnRep_ACEValue()
 // ==========================================
 
 /**
- * RefreshCharacterIcon
- *
- * 核心修复: 本地角色直接在服务器侧走一遍 Client RPC 流程
- * 服务器先拿到 CharacterID，再通知所属客户端刷新头像
- * 这样远程玩家也能看到其他人的头像图标了
+ * RefreshCharacterIcon — 转发壳
+ * 真实逻辑: CharacterIconComponent::RefreshCharacterIcon
  */
 void ABaseCharacter::RefreshCharacterIcon()
 {
-	FString CharID;
-	if (APlayerState* PS = GetPlayerState<APlayerState>())
+	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		if (ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS))
-		{
-			CharID = RoomPS->GetSelectedCharacterID();
-		}
+		Icon->RefreshCharacterIcon();
 	}
-
-	if (CharID.IsEmpty())
-	{
-		CharID = TEXT("Warrior");
-	}
-
-	// 【2026-07-01 重构 v2】: 服务器直接查表获取头像贴图并传递给客户端
-	// 原因: GetAuthGameMode 在客户端上可能为 nullptr, 导致客户端查表失败产生白板
-	// 新架构: 服务器侧查表, 通过 RPC 传递 UTexture2D* (UE 支持 Client RPC 传 UObject*)
-	UTexture2D* Avatar = GetCharacterAvatarFromTable(CharID);
-
-	// 服务器通知所属客户端刷新头像 (Avatar 由服务器传递, 避免客户端查表失败)
-	Client_RefreshCharacterIcon(CharID, Avatar);
 }
 
 
 /**
- * Client_RefreshCharacterIcon_Implementation
- *
- * Client RPC: 在所属客户端上刷新头像
- * 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播事件
- *
- * 架构变更:
- *   - 旧: 服务器只传 CharacterID, 客户端自己查 DataTable (GetAuthGameMode 在客户端为 nullptr, 导致白板)
- *   - 新: 服务器直接传递 UTexture2D* Avatar, 客户端通过 CharacterEvents->OnCharacterIconReady 广播
- *
- * IsLocallyControlled 守卫说明:
- *   Client RPC 按 UE 语义只在所属客户端上执行,
- *   加 IsLocallyControlled() 是双保险, 防止未来 UE 语义变化或被意外 Multicast 时污染 HUD
+ * Client_RefreshCharacterIcon_Implementation — 转发壳 (UFUNCTION(Client) 在 Actor 上)
+ * 真实逻辑: CharacterIconComponent::Client_RefreshCharacterIcon_Implementation
  */
 void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar)
 {
-	// 【P0 双保险】: 必须是本机玩家才允许改本机 HUD
-	if (!IsLocallyControlled())
+	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		return;
+		Icon->Client_RefreshCharacterIcon_Implementation(InCharacterID, Avatar);
 	}
-
-	// 缓存 ID，延迟刷新时使用
-	CachedCharacterIDForIcon = InCharacterID;
-
-	// HUD 未就绪 → 延迟重试 (保留重试机制, CharacterEvents 组件本身也受 HUD 生命周期影响)
-	if (!TryResolveHUDWidget())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[Icon] HUD 未就绪, 延迟刷新, InCharacterID=%s"), *InCharacterID);
-		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
-		return;
-	}
-
-	// 通过 CharacterEvents 广播头像事件 (替代直接 GameHUDWidget Push)
-	BroadcastCharacterIconReady(InCharacterID, Avatar);
-
-	// 刷新武器图标
-	RefreshWeaponIconOnHUD();
 }
 
 
 /**
- * RetryRefreshCharacterIcon
+ * Client_RefreshWeaponIcon_Implementation — 转发壳 (UFUNCTION(Client) 在 Actor 上)
+ * 真实逻辑: CharacterIconComponent::Client_RefreshWeaponIcon_Implementation
  *
- * 延迟重试回调: 直接在客户端重新执行 HUD 刷新逻辑
- * 跳过服务器中转
- *
- * 【P0 修复 2026-06-29】: 加最大重试次数 + 防御性检查, 与 RetryRefreshHUD 保持一致
+ * 【v40.1 P0 新增】镜像 Client_RefreshCharacterIcon_Implementation
+ */
+void ABaseCharacter::Client_RefreshWeaponIcon_Implementation(const FString& InWeaponID, UTexture2D* Icon)
+{
+	if (UCharacterIconComponent* IconComp = ResolveCharacterIcon())
+	{
+		IconComp->Client_RefreshWeaponIcon_Implementation(InWeaponID, Icon);
+	}
+}
+
+
+/**
+ * RetryRefreshCharacterIcon — 转发壳
+ * 真实逻辑: CharacterIconComponent::RetryRefreshCharacterIcon
  */
 void ABaseCharacter::RetryRefreshCharacterIcon()
 {
-	// ==========================================
-	// 【P0 防御 1】: Character 或 World 已失效 → 停止重试
-	// ==========================================
-	if (!IsValid(this) || !GetWorld())
+	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		return;
+		Icon->RetryRefreshCharacterIcon();
 	}
-
-	// ==========================================
-	// 【P0 防御 2】: 2026-07-01 新增 - 仅本机玩家需要刷新 HUD
-	// 与 Client_RefreshCharacterIcon_Implementation 保持一致, 防止非本地玩家的
-	// 定时器意外跑起来污染本机 HUD
-	// ==========================================
-	if (!IsLocallyControlled())
-	{
-		return;
-	}
-
-	// ==========================================
-	// 【P0 防御 3】: 最大重试次数限制
-	// ==========================================
-	const int32 MaxRetries = 20;
-	CurrentIconRetryCount++;
-	if (CurrentIconRetryCount >= MaxRetries)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter] RetryRefreshCharacterIcon 达到最大重试次数 (%d 次), 放弃"), CurrentIconRetryCount);
-		CurrentIconRetryCount = 0;
-		GetWorld()->GetTimerManager().ClearTimer(CharacterIconRefreshTimerHandle);
-		return;
-	}
-
-	// 【2026-06-15 重构】: HUD 获取收敛到 TryResolveHUDWidget
-	if (!TryResolveHUDWidget())
-	{
-		// HUD 仍未就绪, 继续重试 (降级为 Log)
-		UE_LOG(LogTemp, Verbose, TEXT("[Icon] HUD 未就绪, 重试中... (%d/%d), CachedID=%s"),
-			CurrentIconRetryCount, MaxRetries, *CachedCharacterIDForIcon);
-		GetWorld()->GetTimerManager().SetTimer(CharacterIconRefreshTimerHandle, this, &ABaseCharacter::RetryRefreshCharacterIcon, 0.5f, false);
-		return;
-	}
-
-	// HUD 已就绪，直接刷新（使用缓存的 ID）
-	UE_LOG(LogTemp, Log, TEXT("[Icon] 延迟重试刷新角色图标和武器图标, CachedID=%s (重试 %d 次后成功)"),
-		*CachedCharacterIDForIcon, CurrentIconRetryCount);
-	CurrentIconRetryCount = 0;  // 成功 → 重置
-
-	// ==========================================
-	// 【2026-07-01 P0 修复】"事件 + 缓存"双轨制补发:
-	//   - 优先从 CharacterEvents 缓存拉取 (服务器原始 Avatar)
-	//   - 缓存为空时再尝试 GetCharacterAvatarFromTable (但客户端 GetAuthGameMode 为 nullptr, 必然失败)
-	//   - 这样: 若 BaseCharacter 之前已 Broadcast 过头像 (即便没订阅者), 我们仍能从缓存拿到
-	// ==========================================
-	UTexture2D* Avatar = nullptr;
-	FString CharIDToBroadcast = CachedCharacterIDForIcon;
-
-	if (CharacterEvents)
-	{
-		// 1. 优先: 从缓存拉 (服务器已 Broadcast 过的 Avatar)
-		FString CachedID;
-		UTexture2D* CachedAvatar = nullptr;
-		if (CharacterEvents->GetCachedCharacterIcon(CachedID, CachedAvatar))
-		{
-			Avatar = CachedAvatar;
-			CharIDToBroadcast = CachedID;
-			UE_LOG(LogTemp, Log,
-				TEXT("[Icon] RetryRefreshCharacterIcon: 从 CharacterEvents 缓存取 Avatar, CachedID=%s, Avatar=%s"),
-				*CachedID, Avatar ? *Avatar->GetName() : TEXT("nullptr"));
-		}
-		else
-		{
-			// 2. 兜底: 客户端查表 (但 GetAuthGameMode 在客户端为 nullptr, 几乎必然 nullptr)
-			Avatar = GetCharacterAvatarFromTable(CachedCharacterIDForIcon);
-			UE_LOG(LogTemp, Warning,
-				TEXT("[Icon] RetryRefreshCharacterIcon: 缓存为空, 客户端查表失败 (预期), Avatar=%s"),
-				Avatar ? *Avatar->GetName() : TEXT("nullptr"));
-		}
-	}
-
-	BroadcastCharacterIconReady(CharIDToBroadcast, Avatar);
-	RefreshWeaponIconOnHUD();
 }
 
 
 /**
- * RefreshWeaponIconOnHUD
- *
- * 刷新武器图标到 HUD
- * 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
- * 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播，替代直接 GameHUDWidget Push
+ * RefreshWeaponIconOnHUD — 转发壳
+ * 真实逻辑: CharacterIconComponent::RefreshWeaponIconOnHUD
  */
 void ABaseCharacter::RefreshWeaponIconOnHUD()
 {
-	// 优先从服务器缓存的武器 ID 读取（绕过 PlayerState 复制时序问题）
-	FString WeaponID;
-	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		FString CachedCharID;
-		FString CachedWeaponID;
-		if (GM->GetPlayerSpawnData(GetController()->GetUniqueID(), CachedCharID, CachedWeaponID))
-		{
-			WeaponID = CachedWeaponID;
-		}
-	}
-
-	if (WeaponID.IsEmpty())
-	{
-		return;
-	}
-
-	// 【2026-07-01 重构 v2】: 通过 CharacterEvents 广播武器图标事件
-	// 由 GameHUDWidget 订阅并异步加载
-	if (CharacterEvents)
-	{
-		CharacterEvents->OnWeaponIconReady.Broadcast(WeaponID, nullptr);
+		Icon->RefreshWeaponIconOnHUD();
 	}
 }
 
 
 /**
- * GetCharacterAvatarFromTable
- *
- * 从 CharacterDataTable 查指定角色 ID 的头像贴图
- * @return 头像 UTexture2D（找不到返回 nullptr）
+ * GetCharacterAvatarFromTable — 转发壳 (BlueprintPure)
+ * 真实逻辑: CharacterIconComponent::GetCharacterAvatarFromTable
  */
 UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
 {
-	if (CharID.IsEmpty()) return nullptr;
-
-	// 通过 GameMode 获取数据表
-	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	if (!GM || !GM->CharacterDataTable) return nullptr;
-
-	static const FString ContextString(TEXT("CharacterAvatarLookup"));
-	FCharacterInfo* Info = GM->CharacterDataTable->FindRow<FCharacterInfo>(FName(*CharID), ContextString);
-	if (Info && Info->AvatarIcon)
+	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		return Info->AvatarIcon;
+		return Icon->GetCharacterAvatarFromTable(CharID);
 	}
-
 	return nullptr;
 }
+
+
+/* 删除重复的 Client_RefreshCharacterIcon_Implementation — 已转发壳替代 */
 
 
 /**
@@ -922,12 +708,20 @@ UTexture2D* ABaseCharacter::GetCharacterAvatarFromTable(const FString& CharID)
  * - 全场第一: 金色
  * - 队内第一: 白色
  * - 其他: 无
+ *
+ * 【v39 修复】用 ResolveCharacterEvents() 而非裸字段访问
  */
 void ABaseCharacter::RefreshACEWithRank()
 {
 	// 【2026-07-01 重构 v2】: 改用 CharacterEvents 广播 ACE + 排名颜色事件
 	// IsLocallyControlled 守卫: ACE 排名只对本机玩家有意义
-	if (!IsLocallyControlled() || !CharacterEvents)
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
+
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
@@ -950,11 +744,13 @@ void ABaseCharacter::RefreshACEWithRank()
 		return;
 	}
 
-	// 3. 获取我的队伍
-	ERoomTeam MyTeam = MyPS->CurrentTeam;
+	// 3. 获取我的阵营 (FGameplayTag)
+	// 【2026.07.10 P0 重构】CurrentTeam (ERoomTeam) → CurrentFactionTag (FGameplayTag)
+	const FGameplayTag MyFactionTag = MyPS->CurrentFactionTag;
 
-	// 4. 查询队内 AC 最高者
-	ARoomPlayerState* TeamTop = GS->GetTeamTopACPlayer(MyTeam);
+	// 4. 查询阵营内 AC 最高者
+	// 【2026.07.10 P0 重构】GetTeamTopACPlayer(ERoomTeam) → GetFactionTopACPlayer(FGameplayTag)
+	ARoomPlayerState* TeamTop = GS->GetFactionTopACPlayer(MyFactionTag);
 
 	// 5. 查询全场 AC 最高者
 	ARoomPlayerState* OverallTop = GS->GetOverallTopACPlayer();
@@ -973,7 +769,7 @@ void ABaseCharacter::RefreshACEWithRank()
 	}
 
 	// 7. 通过 CharacterEvents 广播 ACE + 排名颜色 (替代直接 GameHUDWidget Push)
-	CharacterEvents->OnACEWithRankChanged.Broadcast(ACEValue, RankType);
+	Events->OnACEWithRankChanged.Broadcast(ACEValue, RankType);
 }
 
 
@@ -991,18 +787,21 @@ void ABaseCharacter::RefreshACEWithRank()
  */
 bool ABaseCharacter::ConsumeEnergy(float Amount)
 {
-	if (!EnergyComponent)
+	// 【v39 修复】用 ResolveEnergyComponent 而非裸字段访问
+	UEnergyComponent* EC = ResolveEnergyComponent();
+	if (!EC)
 	{
 		return false;
 	}
 
 	// 消耗能量后打断回复 (有动作表示玩家活跃)
-	const bool bSuccess = EnergyComponent->Consume(Amount);
+	// 【v39 修复】HealthRegenComponent → ResolveHealthRegenComponent
+	const bool bSuccess = EC->Consume(Amount);
 	if (bSuccess)
 	{
-		if (HealthRegenComponent)
+		if (UHealthRegenComponent* Regen = ResolveHealthRegenComponent())
 		{
-			HealthRegenComponent->NotifyDamageTaken();
+			Regen->NotifyDamageTaken();
 		}
 	}
 	return bSuccess;
@@ -1034,14 +833,15 @@ void ABaseCharacter::OnKill(ABaseCharacter* KilledCharacter)
 	if (!HasAuthority()) return;
 
 	// 击杀奖励: 增加血量和能量
-	if (EnergyComponent)
+	// 【v39 修复】用 ResolveEnergyComponent / ResolveHealthComponent 而非裸字段访问
+	if (UEnergyComponent* EC = ResolveEnergyComponent())
 	{
-		EnergyComponent->Add(EnergyRewardPerKill);
+		EC->Add(EnergyRewardPerKill);
 	}
 	// 【2026-06-15 重构】: 通过 HealthComponent 加血
-	if (HealthComponent)
+	if (UHealthComponent* HC = ResolveHealthComponent())
 	{
-		HealthComponent->Heal(HealthRewardPerKill);
+		HC->Heal(HealthRewardPerKill);
 	}
 
 	// 增加AC（AddAC 内部已 Clamp 到 MaxAC）
@@ -1128,18 +928,19 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		if (LookAction) EnhancedInputComponent->BindAction(LookAction, ETriggerEvent::Triggered, this, &ABaseCharacter::Look);
 		if (JumpAction) EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Triggered, this, &ACharacter::Jump);
 
-		// 【连斩核心绑定】: 左键按下 (Started) 和 松开 (Completed)
-		if (LightAttackAction)
+		// 【2026.07.12 P0 重构】连击输入转发给 PlayerComboComponent
+		// BaseCharacter 留作转发壳, 实际状态机逻辑在 PlayerCombo 内
+		// 【v38】改用 ResolvePlayerCombo 通用 resolver (防 BP 子类覆写)
+		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 		{
-			EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Started, this, &ABaseCharacter::LightAttack_Pressed);
-			EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Completed, this, &ABaseCharacter::LightAttack_Released);
+			Combo->SetInputActions(LightAttackAction, HeavyAttackAction, UseSkillAction);
+			Combo->BindInputActions(EnhancedInputComponent);
 		}
-
-		// 重击只需单击
-		if (HeavyAttackAction) EnhancedInputComponent->BindAction(HeavyAttackAction, ETriggerEvent::Started, this, &ABaseCharacter::HeavyAttack);
-
-		// 绑定技能释放
-		if (UseSkillAction) EnhancedInputComponent->BindAction(UseSkillAction, ETriggerEvent::Started, this, &ABaseCharacter::UseSkill);
+		else
+		{
+			// 【大厂原则 - 零兜底】PlayerCombo 必须挂载, 否则 Log Error
+			// 已在 ResolvePlayerCombo 内部 Log Error, 此处不再重复
+		}
 
 		// 绑定下蹲 (按下时触发 StartCrouch，松开时触发 StopCrouch)
 		if (CrouchAction)
@@ -1207,202 +1008,120 @@ void ABaseCharacter::Look(const FInputActionValue& Value)
 
 
 // ==========================================
-// 12. 自动连斩系统核心逻辑
+// 12. 【2026.07.12 P0 重构】自动连斩系统核心逻辑 — 全部转发到 PlayerComboComponent
 // ==========================================
+// 大厂原则 - 单一真理源:
+//   状态机字段 (bIsAttacking / bCanReceiveInput / bSaveAttack / bIsHoldingLightAttack /
+//               ComboIndex) 全部已迁移到 PlayerComboComponent
+//   BaseCharacter 上同名方法改为转发壳, 真实逻辑在 PlayerCombo 内
+//   这里只做一行委托, 不再持有副本数据
 
 /**
- * LightAttack_Pressed
- *
- * 轻击按下事件
- * 1. 死亡/暂停/无武器/下蹲禁止攻击都不能挥刀
- * 2. 记录按住状态
- * 3. 根据武器配置决定是否锁步
- * 4. 第一刀起手: 初始化状态机
- * 5. 连击区间: 记录缓存
+ * LightAttack_Pressed — 转发壳
+ * 真实逻辑: PlayerComboComponent::LightAttack_Pressed
  */
 void ABaseCharacter::LightAttack_Pressed()
 {
-	// 死人、武器未装备不能攻击
-	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
-	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
-	if (IsDead() || !CurrentWeapon) return;
-
-	// 下蹲攻击权限拦截
-	// 如果你正蹲着，并且这把武器禁止下蹲攻击，直接 return，无视玩家按键
-	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 	{
-		return;
+		Combo->LightAttack_Pressed();
 	}
-
-	bIsHoldingLightAttack = true; // 记录按住状态
-
-	// 根据当前武器的配置，决定要不要锁步
-	bIsMovementLocked = !CurrentWeapon->bCanMoveWhileLightAttack;
-
-	if (bIsMovementLocked)
-	{
-		GetCharacterMovement()->MaxWalkSpeed = 0.0f; // 物理刹车
-	}
-
-	if (!bIsAttacking)
-	{
-		// 1. 第一刀起手: 上锁，初始化状态
-		bIsAttacking = true;
-		ComboIndex = 1;
-		bSaveAttack = false;
-		bCanReceiveInput = false;
-		ExecuteComboSequence();
-	}
-	else if (bCanReceiveInput)
-	{
-		// 2. 如果正在挥刀，且【绿色输入区间】开启了
-		// 记录玩家点过鼠标了（不管点几次，只记为 true）
-		bSaveAttack = true;
-	}
+	// else: ResolvePlayerCombo 内部已 Log Error, 此处不再重复
 }
 
 
 /**
- * LightAttack_Released
- *
- * 轻击松开事件
- * 记录: 玩家松手了
+ * LightAttack_Released — 转发壳
+ * 真实逻辑: PlayerComboComponent::LightAttack_Released
  */
 void ABaseCharacter::LightAttack_Released()
 {
-	bIsHoldingLightAttack = false; // 记录: 玩家松手了
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+	{
+		Combo->LightAttack_Released();
+	}
 }
 
 
 /**
- * ExecuteComboSequence
- *
- * 连招核心执行逻辑
- * 工业级做法: 所有连招全在第 0 个蒙太奇里
- * 智能拼接要跳转的片段名字 (Combo1 或 Combo2)
+ * ExecuteComboSequence — 转发壳
+ * 真实逻辑: PlayerComboComponent::ExecuteComboSequence
  */
 void ABaseCharacter::ExecuteComboSequence()
 {
-	if (!CurrentWeapon) return;
-
-	// 工业级做法: 所有连招全在第 0 个蒙太奇里
-	UAnimMontage* ComboMontage = CurrentWeapon->GetAttackMontage(false, 0);
-	if (ComboMontage)
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 	{
-		// 智能拼接要跳转的片段名字 (Combo1 或者是 Combo2)
-		FName SectionName = (ComboIndex == 1) ? FName("Combo1") : FName("Combo2");
-
-		PlayAnimMontage(ComboMontage, 1.0f, SectionName);
-
-		// 【激活网络同步】: 告诉服务器我出的是第几刀
-		Server_PlayAttackAnim(false, ComboIndex);
+		Combo->ExecuteComboSequence();
 	}
 }
 
 
 /**
- * HeavyAttack
- *
- * 重击事件（单击）
- * 注意: 当前版本 HeavyAttack 实现被注释，仅留下权限检查
+ * HeavyAttack — 转发壳
+ * 真实逻辑: PlayerComboComponent::HeavyAttack
  */
 void ABaseCharacter::HeavyAttack()
 {
-	// 死人、武器未装备不能重击
-	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
-	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
-	if (IsDead() || !CurrentWeapon) return;
-
-	// 【新增】: 重击同样需要检查下蹲权限
-	if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 	{
-		return;
+		Combo->HeavyAttack();
 	}
-	// 注: 重击主体实现已注释（保留扩展位）
 }
 
 
 /**
- * UseSkill
- *
- * 释放技能事件
- * TODO: 技能系统具体实现
+ * UseSkill — 转发壳
+ * 真实逻辑: PlayerComboComponent::UseSkill
  */
 void ABaseCharacter::UseSkill()
 {
-	// 死亡状态不能释放技能
-	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
-	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
-	if (IsDead()) return;
-
-	// TODO: 技能系统具体实现
-	// 这里可以扩展为技能槽系统，支持多个技能
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+	{
+		Combo->UseSkill();
+	}
 }
 
 
 // ==========================================
-// 13. 动画通知 (Anim Notify) 回调接口
+// 13. 【2026.07.12 P0 重构】动画通知 (Anim Notify) 回调接口 — 全部转发到 PlayerComboComponent
 // ==========================================
 
 /**
- * EnableComboWindow
- *
- * 区间开始时触发（开启连招窗口）
- * 绿灯亮起，开始接收输入
+ * EnableComboWindow — 转发壳
+ * 真实逻辑: PlayerComboComponent::EnableComboWindow
  */
 void ABaseCharacter::EnableComboWindow()
 {
-	bCanReceiveInput = true; // 绿灯亮起，开始接收输入
-	bSaveAttack = false;     // 清空上一轮的垃圾缓存
-}
-
-
-/**
- * CheckCombo
- *
- * 区间结束时触发（检查缓存区是否有缓存攻击）
- * 终极结算: 如果有缓存的点击或玩家正死死按住左键，则跳转下一段
- */
-void ABaseCharacter::CheckCombo()
-{
-	bCanReceiveInput = false; // 绿灯熄灭，关闭窗口
-
-	// 【终极结算】: 如果有缓存的点击，或者玩家正死死按住左键
-	if (bSaveAttack || bIsHoldingLightAttack)
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 	{
-		// 【新增防逃课锁】: 连击派生前，检查当前是不是已经蹲下了
-		if (bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
-		{
-			bSaveAttack = false; // 清除缓存
-			return; // 强行中断后续连招
-		}
-
-		bSaveAttack = false; // 消耗掉这次缓存
-
-		// 核心需求: 1变2，2变1，无限循环
-		ComboIndex = (ComboIndex == 1) ? 2 : 1;
-
-		ExecuteComboSequence(); // 丝滑跳转下一刀
+		Combo->EnableComboWindow();
 	}
 }
 
 
 /**
- * EndAttackState
- *
- * 动画彻底结束时触发
- * 彻底收招，解开所有锁
+ * CheckCombo — 转发壳
+ * 真实逻辑: PlayerComboComponent::CheckCombo
+ */
+void ABaseCharacter::CheckCombo()
+{
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+	{
+		Combo->CheckCombo();
+	}
+}
+
+
+/**
+ * EndAttackState — 转发壳
+ * 真实逻辑: PlayerComboComponent::EndAttackState
  */
 void ABaseCharacter::EndAttackState()
 {
-	// 彻底收招，解开所有锁
-	bIsAttacking = false;
-	bSaveAttack = false;
-	bCanReceiveInput = false;
-	ComboIndex = 1;
-	// 收刀时，彻底解除移动锁定
-	bIsMovementLocked = false;
-	GetCharacterMovement()->MaxWalkSpeed = 600.0f; // 恢复正常速度
+	if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+	{
+		Combo->EndAttackState();
+	}
 }
 
 
@@ -1428,975 +1147,215 @@ void ABaseCharacter::EndAttackState()
  *   → 日志只能刷 "PerformAttack 失败" 一行, 排查困难
  *   → 改为 bool + 详细 UE_LOG 后, 失败原因立即一目了然
  */
-// OnAIRequestAttack_Simple — AI 专用轻攻击入口 (P0 大厂架构重构 2026.07.06)
-//
-// 【大厂架构设计思路】
-//   旧设计 (硬路径): CurrentWeapon->GetAttackMontage(false, 1)
-//                    一旦 BP 配错 → null → 攻击失败 → AI 不动
-//   新设计 (职责链): AIAttackMontageResolver::ResolveLightAttackMontage(...)
-//                    4 层兜底: 设计意图 → ComboIndex=0 → 重击代替 → 失败
-//                    任意一层能拿到蒙太奇 → AI 都能"挥刀"
-//
-// 【为什么 ComboIndex=1?】
-//   玩家轻击连击从 Combo1 开始 (Combo1/Combo2/Combo3 三段)
-//   AI 只需要"挥一刀", 不做连击, 直接用 Combo1 段 (ComboIndex=1)
-//   注: ComboIndex 是段号, 0 是预备段, 1/2/3 是 3 段连击
-//
-// 【为什么单独走 AI 通道不调 LightAttack_Pressed?】
-//   玩家路径: LightAttack_Pressed → 设 bIsMovementLocked=true, MaxWalkSpeed=0
-//             → 动画蓝图 NotifyEnd → EndAttackState → 解锁
-//   AI 风险: 如果动画蓝图 NotifyEnd 漏配 / 时序错位 → AI 永远 lock → 不动
-//   AI 通道: 不 lock 移动, 攻击期间也能跑, 真正符合 AI 行为模式
+// ==========================================
+// 14. 【2026.07.12 P0 重构 + v40.4 原子化】AI 攻击子系统 — 全部转发到 AIAttackComponent
+// ==========================================
+// 大厂原则 - 单一真理源:
+//   AI 攻击节流字段 (v40.4 删 LastAIAttackTimeSeconds / CachedAIMontage / bIsWaitingForAIMontageCallback)
+//   全部已迁移到 AIAttackComponent
+//   BaseCharacter 上同名方法改为转发壳, 真实逻辑在 AIAttack 内
+//   注意: RPC 修饰符 (Server/NetMulticast) 仍保留在 BaseCharacter 上 (UE 强制要求 RPC 在 Actor 上),
+//         Implementation 部分转发给 AIAttack
+
+/**
+ * OnAIRequestAttack_Simple — 转发壳
+ * 真实逻辑: AIAttackComponent::OnAIRequestAttack_Simple
+ */
 bool ABaseCharacter::OnAIRequestAttack_Simple()
 {
-	// ============================================================
-	// 【P0 2026.07.06 19:25 大厂架构加固】本地时间戳节流
-	//
-	// 背景: BTTask 层 (BB.CooldownEndTime + BTDecorator_CooldownReady 实时决策, P0 2026.07.09 重构后)
-	//       已做防抖, 但用户原问题"AI 持续连击"可能源于:
-	//         (a) BT 跳过 BTTask 直接调 OnAIRequestAttack_Simple (代码路径耦合)
-	//         (b) Timer 句柄失效 / OwnerComp 销毁导致 Token 永远卡在 true 时又被绕过
-	//         (c) 多个 BT 共享同一 TaskNode 实例, Timer 串扰
-	//
-	// 防御: 在 Character 自己手里再加一道墙 — 上次攻击时间戳 + AttackInterval
-	//       即使所有上层防抖都失效, 玩家也不会被连击到恶心
-	//
-	// 注意: 攻击间隔优先读 Profile.AttackInterval (策划最直观位置),
-	//       fallback 到 ConfigSO + 难度缩放 (走 AIController 统一入口),
-	//       最后兜底 1.2s
-	// ============================================================
+	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
-		float AttackInterval = 1.2f;
-
-		// 从 AI Controller 拿到最终攻击间隔
-		if (AAIController* AIC = Cast<AAIController>(GetController()))
-		{
-			if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
-			{
-				AttackInterval = BaseAIC->GetEffectiveAttackInterval();
-			}
-		}
-
-		// AttackInterval == 0 表示"完全禁用攻击" (Profile 里故意设的)
-		if (AttackInterval <= 0.0f)
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s AttackInterval=%.2f <= 0, 禁止攻击"),
-				*GetName(), AttackInterval);
-			return false;
-		}
-
-		// 检查上次攻击时间 — 防御性兜底, 防止上层节流全部失效时玩家被连击
-		const double Now = FPlatformTime::Seconds();
-		const double TimeSinceLastAttack = Now - LastAIAttackTimeSeconds;
-		const float SafeInterval = FMath::Max(AttackInterval, 0.1f); // 至少 100ms 间隔, 防意外
-
-		if (LastAIAttackTimeSeconds > 0.0 && TimeSinceLastAttack < SafeInterval)
-		{
-			UE_LOG(LogTemp, Verbose,
-				TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 距离上次攻击仅 %.2fs (< 间隔 %.2fs), 跳过"),
-				*GetName(), TimeSinceLastAttack, SafeInterval);
-			return false;
-		}
-
-		// 记录本次攻击时间戳
-		LastAIAttackTimeSeconds = Now;
+		return AI->OnAIRequestAttack_Simple(this);
 	}
-
-	// ============================================================
-	// 防御 1: 死了不能打
-	// ============================================================
-	if (IsDead())
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 已死亡, 跳过"),
-			*GetName());
-		return false;
-	}
-
-	// ============================================================
-	// 防御 2: 没武器不能打
-	// ============================================================
-	if (!CurrentWeapon)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 无 CurrentWeapon, 跳过"),
-			*GetName());
-		return false;
-	}
-
-	// ============================================================
-	// 【核心】走 Resolver 职责链 — 不再硬调 GetAttackMontage(false, 1)
-	// ============================================================
-	// 设计要点:
-	//   - ComboIndex=1 对应玩家 Combo1 段 (玩家连击序列的第 1 段)
-	//   - 如果 BP 没配 Combo1 (只有 Combo1 之前的预备段), 解析器会兜底
-	//   - 兜底链: ComboIndex=1 → ComboIndex=0 → 重击代替 → 失败
-	// ============================================================
-	const FAIAttackMontageResult ResolveResult =
-		UAIAttackMontageResolver::ResolveLightAttackMontage(CurrentWeapon, /*ComboIndex=*/1);
-
-	if (!ResolveResult.Montage)
-	{
-		// Resolver 内部已经打 Error 日志 + 修复指南, 这里只需要汇总结果
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 无可用攻击蒙太奇 (Level=%d), 放弃本次攻击"),
-			*GetName(), ResolveResult.FallbackLevel);
-		return false;
-	}
-
-	// ============================================================
-	// 【兜底成功日志】记录是否走了兜底链 (用于排查 BP 配置问题)
-	// ============================================================
-	if (ResolveResult.bFromFallback)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 走了兜底链 Level=%d (Index=%d), "
-				 "BP 配置可能有问题, 请检查 LightAttackMontages 数组"),
-			*GetName(), ResolveResult.FallbackLevel, ResolveResult.ResolvedIndex);
-	}
-
-	// ============================================================
-	// 播放蒙太奇 (AI 不需要连击, 只播第一段 Combo1)
-	// ============================================================
-	UAnimMontage* AttackMontage = ResolveResult.Montage;
-	const float MontageLen = PlayAnimMontage(AttackMontage, 1.0f, FName("Combo1"));
-	if (MontageLen <= 0.0f)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] OnAIRequestAttack_Simple: PlayAnimMontage 失败 (返回 %.2f), "
-				 "AI=%s, 武器=%s"),
-			MontageLen, *GetName(), *CurrentWeapon->GetName());
-		return false;
-	}
-
-	// ============================================================
-	// 【P0 2026.07.06 大厂架构重构】绑定 Montage 结束事件 (事件驱动 Cooldown)
-	//
-	// 旧设计问题:
-	//   - BT 用 Timer 控制 Cooldown (固定时间)
-	//   - 蒙太奇还没播完 Timer 就到时 → AI 进入下一次攻击
-	//   - 结果: Combo1 永远播不完, 攻击动作割裂
-	//
-	// 新设计 (事件驱动):
-	//   - 绑定 UAnimInstance::OnMontageEnded (multicast dynamic delegate)
-	//   - Combo1 自然播完 → 引擎回调 → OnAIAttackMontageEnded(false)
-	//   - OnAIAttackMontageEnded 通知 AIController 攻击结束 → BT 进入冷却
-	//   - 即使玩家跑远, 蒙太奇也完整播完 (用户明确要求!)
-	//
-	// 安全:
-	//   - 用 UAnimInstance::OnMontageEnded.AddDynamic (multicast), 不需要缓存本地委托
-	//   - 该 multicast 委托原生支持多次回调 (每次播放蒙太奇都会触发, 我们用 Montage 参数过滤)
-	//   - 蒙太奇指针验证避免误处理其他蒙太奇 (跨武器复用 Character 时安全)
-	// ============================================================
-	if (USkeletalMeshComponent* CharMesh = GetMesh())
-	{
-		if (UAnimInstance* AnimInst = CharMesh->GetAnimInstance())
-		{
-			// 【关键】直接绑到 UAnimInstance 的 multicast OnMontageEnded
-			// 不用 FOnMontageEnded (单播), 不用缓存 delegate, UHT 也看不到这种类型
-			// 引擎自身实现: 每次 Montage_Play 都会触发 OnMontageEnded 广播
-			// 我们的回调函数 OnAIAttackMontageEnded 必须有 UFUNCTION() 才能 AddDynamic
-			//
-			// ============================================================
-			// 【P0 2026.07.07 大厂架构修复】防 Ensure 崩溃 — RemoveDynamic + IsAlreadyBound
-			//
-			// PIE 日志 (2026.07.07-09.05) 复现:
-			//   Ensure condition failed: InvocationList[ CurFunctionIndex ] != InDelegate
-			//   in OnMontageEnded.AddDynamic → BaseCharacter.cpp:1542
-			//
-			// 原因: UE 的 TMulticastScriptDelegate::AddInternal 有 ensure:
-			//   - AddDynamic (同一对象 + 同一函数指针) 不能重复添加
-			//   - 即便先 RemoveDynamic 再 AddDynamic 也偶尔因 Inst 指针变化触发
-			//   - 我们的 OnAIRequestAttack_Simple 会被 BT 多次调用, 每次都走到这里
-			//
-			// 修复:
-			//   1. RemoveDynamic 先解绑 (幂等: 不存在时跳过, 无副作用)
-			//   2. IsAlreadyBound 检查 (双保险)
-			//   3. bIsWaitingForAIMontageCallback 标志防 OnAIAttackMontageEnded 二次处理
-			// ============================================================
-
-			// 步骤 1: 先解绑 (RemoveDynamic 是幂等的 — 不存在的 binding 静默跳过)
-			AnimInst->OnMontageEnded.RemoveDynamic(this, &ABaseCharacter::OnAIAttackMontageEnded);
-
-			// 步骤 2: 再绑定 (IsAlreadyBound 检查 — 双保险, 防止 Inst 内部状态异常)
-			if (!AnimInst->OnMontageEnded.IsAlreadyBound(this, &ABaseCharacter::OnAIAttackMontageEnded))
-			{
-				AnimInst->OnMontageEnded.AddDynamic(this, &ABaseCharacter::OnAIAttackMontageEnded);
-			}
-
-			// 缓存正在播放的攻击蒙太奇 — 用于回调时判断是不是"我触发的蒙太奇"
-			// (multicast OnMontageEnded 会对所有结束的蒙太奇广播, 必须过滤)
-			CachedAIMontage = AttackMontage;
-			bIsWaitingForAIMontageCallback = true;
-		}
-	}
-
-	// ============================================================
-	// 同步给服务器 (Multicast_PlayAttackAnim 走 GetAttackMontage 旧路径)
-	// 注: 这里不传 Montage 指针, 沿用 ComboIndex 让服务器侧也走相同 fallback
-	// ============================================================
-	Server_PlayAttackAnim(false, 1);
-
-	// ============================================================
-	// 【P0 2026.07.07 大厂架构重构 — 最终版】攻击扣血入口
-	//
-	// 用户原话: "ai的攻击扣血时机, 应该像像玩家一样用武器上的射线检测触碰扣血的,
-	//          而不是动画一开始就扣血。"
-	//
-	// 旧版问题 (2026.07.06):
-	//   OnAIRequestAttack_Simple 在动画开始**第一帧**就调 Server_ReportHit
-	//   → AI 抬手瞬间, 玩家已经掉血 → 视觉/物理不一致
-	//
-	// 新版架构 (玩家/AI 完全共用 trace 路径):
-	//   1. SetAttackerIsAI(true) — 让武器 Tick 在 trace 命中时知道这是 AI 攻击
-	//      (蒙太奇播完后在 OnAIAttackMontageEnded 复位 false)
-	//   2. CurrentWeapon->StartWeaponTrace(false) — **立即开启 trace 通道**
-	//      (玩家路径靠蒙太奇里的 AnimNotify 触发, AI 蒙太奇不一定有 AnimNotify, 必须主动开)
-	//   3. 蒙太奇播完后在 OnAIAttackMontageEnded:
-	//      - SetAttackerIsAI(false)
-	//      - CurrentWeapon->StopWeaponTrace() (对称关闭, 防残留)
-	//
-	// 命中流程:
-	//   - BaseWeapon::Tick 每帧 BoxTrace → 命中
-	//   - 调用 Server_ReportHit(bIsAIDriven=true)
-	//   - 服务器读 Owner Character 的 bIsCurrentlyAttackerAI → 走 AI 通道
-	//   - 服务器权威读 AIController->GetEffectiveAttackDamage() → ConfigSO.Damage
-	//   - ApplyPointDamage 扣血
-	//
-	// 关键: 玩家和 AI **完全共用同一套 Server_ReportHit 代码路径**
-	//       只在 bIsAIDriven 决定伤害来源, 单一职责
-	// ============================================================
-	SetAttackerIsAI(true);
-
-	// 主动开启 trace 通道 — 这是大厂关键设计:
-	//   玩家靠蒙太奇 AnimNotify, AI 蒙太奇经常复用同一蒙太奇 (如果有 AnimNotify 就更好)
-	//   但旧版项目里 AI 用的蒙太奇可能没 StartWeaponTrace AnimNotify
-	//   这里 AI 主动开启 trace: 万一 AnimNotify 也开了, 第二次只是复位 IgnoreActors (无害)
-	//   这样: 不管 AI 蒙太奇有没有 AnimNotify, trace 都开, 玩家也照常工作
-	if (HasAuthority() && CurrentWeapon)
-	{
-		CurrentWeapon->StartWeaponTrace(false);
-	}
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] OnAIRequestAttack_Simple: AI=%s 成功播放攻击动画 "
-			 "(Level=%d, Index=%d, Montage=%s, Length=%.2fs, 扣血等待 trace 命中)"),
-		*GetName(),
-		ResolveResult.FallbackLevel,
-		ResolveResult.ResolvedIndex,
-		*AttackMontage->GetName(),
-		MontageLen);
-	return true;
+	// else: ResolveAIAttack 内部已 Log Error
+	return false;
 }
 
 
-// ==========================================
-// 【P0 2026.07.06 大厂架构重构】AI 攻击蒙太奇结束回调
-// ==========================================
-
 /**
- * OnAIAttackMontageEnded — AI 攻击蒙太奇自然/被打断结束时由引擎回调
- *
- * 【核心职责】通知 AIController 攻击阶段结束, 解除 bIsCurrentlyAttacking
- *
- * 触发时机:
- *   - Combo1 段自然播完 (bInterrupted=false) → AI 进入冷却
- *   - 蒙太奇被 StopAllMontages 打断 (bInterrupted=true) → 立即解锁
- *
- * 设计: 通知 AIController 让 C++ 状态机与 BT 状态机同步
- *   - 玩家路径: 动画 BP NotifyEnd → EndAttackState (类似机制)
- *   - AI 路径:   引擎 Montage 结束 → OnAIAttackMontageEnded → AIController 解锁
- *   - 解耦: AI 不依赖动画 BP 配置 (避免 NotifyEnd 漏配导致永远 lock)
- *
- * 【签名】UAnimInstance::OnMontageEnded (Dynamic Multicast) 要求 (UAnimMontage*, bool) + UFUNCTION
- *        与 Montage_SetEndDelegate 接口完全对齐
+ * OnAIAttackMontageEnded — 转发壳 (UFUNCTION 必须在 BaseCharacter 上, UAnimInstance::OnMontageEnded 要求)
+ * 真实逻辑: AIAttackComponent::OnAIAttackMontageEnded
  */
 void ABaseCharacter::OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 {
-	// ============================================================
-	// 防御: Montage 参数验证 — 忽略不匹配的蒙太奇 (防误触发)
-	// ============================================================
-	// UAnimInstance::OnMontageEnded 是 multicast, 会对所有结束的蒙太奇广播
-	// 我们只处理自己 CachedAIMontage (本次攻击触发的) 的结束事件
-	if (Montage != CachedAIMontage)
+	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
-		return; // 不是我们这次触发的, 忽略 (例如: 玩家 AI 切换武器/受伤/死亡导致别的蒙太奇结束)
+		AI->OnAIAttackMontageEnded(Montage, bInterrupted);
 	}
-
-	if (!bIsWaitingForAIMontageCallback)
-	{
-		// 不在等回调 (防御: 收到二次回调, 第一次已处理)
-		return;
-	}
-
-	AAIController* AIC = Cast<AAIController>(GetController());
-	ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC);
-
-	if (!BaseAIC)
-	{
-		// 没 AIController (可能是玩家), 不处理 AI 状态
-		return;
-	}
-
-	// 核心: 通知 AIController 攻击阶段结束
-	//   1. C++ 层: bIsCurrentlyAttacking=false + bIsInAttackCooldown=false
-	//      - bIsCurrentlyAttacking: BT 装饰器 DistanceCheck 看到 false → 重新选 Sequence
-	//      - bIsInAttackCooldown: 退出 LockAtAttackRange 模式, BT 恢复正常决策
-	//   2. BT 层: Cooldown 机制自行处理
-	//      - 自然结束 (bInterrupted=false): Cooldown 在 BT 端计时
-	//      - 被打断 (bInterrupted=true): 立即解锁, BT 重新评估
-	// ============================================================
-	BaseAIC->SetCurrentlyAttacking(false);
-	// 【P0 2026.07.07 v10 大厂架构重构】Cooldown 在蒙太奇结束时**不**清零!
-	//
-	// 用户原话 2026.07.07 18:25 反馈:
-	//   "现在AI好像是在下一次攻击开始时才判断AttackRange设定的距离移动的"
-	//   "应该在进入攻击冷却时, 只要检测到敌人移动, 就根据AttackRange设定距离移动, 直到攻击冷却结束"
-	//
-	// 旧 v9 设计 Bug:
-	//   - 蒙太奇结束 → OnAIAttackMontageEnded → bIsInAttackCooldown=false
-	//   - 此时 Cooldown Timer 还在跑 (e.g. 还剩 0.8s)
-	//   - AI 进入 P4 状态, D<R 立即 LockStop, 玩家移动 AI 不会反应
-	//   - 只有下次 PerformAttack 重新触发 → 又进入 P1 (Cooldown) 状态 → 才重新判断距离
-	//   - 用户感知: "AI 在下一次攻击开始时才判断 AttackRange 移动"
-	//
-	// v10 修复 — 对称职责分离:
-	//   - bIsCurrentlyAttacking=false: 蒙太奇已结束, 不再播放攻击 (这里清)
-	//   - bIsInAttackCooldown: 由 BTTask::ConsumeAttackToken 的 Timer 回调负责清零
-	//     这是 P0 修复 "冷却外期间 AI 不动" 的核心 — Cooldown 状态机的生命周期
-	//     严格对齐 ConfigSO.AttackCooldown 秒数, 与 BT 决策周期完全同步
-	//
-	// 多退出路径对称:
-	//   1. 蒙太奇自然播完 → 本路径 (bIsInAttackCooldown 由 Timer 清)
-	//   2. 蒙太奇被打断 → bInterrupted=true → 立即清 (下面 else 分支)
-	//   3. AI 死亡/销毁 → EndPlay → AIController 解 Possess 自动清理
-	//   4. BT 中断 → BTTask::AbortTask → 立即清
-
-	bool bExpectCooldownEnd = !bInterrupted;
-
-	// 异常路径: 蒙太奇被打断 (玩家 AI 切换武器/受伤/死亡导致 StopAllMontages)
-	//   - Timer 不会跑完, 必须立即清 Cooldown, 否则 AI 永远卡在冷却中
-	//   - 这是"对称职责分离"的关键边界
-	if (bInterrupted)
-	{
-		BaseAIC->SetInAttackCooldown(false);
-		bExpectCooldownEnd = false; // 已立即清, Timer 再触发时是 no-op
-	}
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] OnAIAttackMontageEnded: AI=%s 蒙太奇结束 (Interrupted=%s, ExpectCooldownEnd=%s), "
-			 "SetCurrentlyAttacking=false; Cooldown %s"),
-		*GetName(),
-		bInterrupted ? TEXT("true") : TEXT("false"),
-		bExpectCooldownEnd ? TEXT("true") : TEXT("false"),
-		bInterrupted ? TEXT("已立即清 (打断分支)") : TEXT("保留, 由 Timer 自然清 (正常分支)"));
-
-	// 清理缓存 (避免下次攻击时复用旧状态)
-	bIsWaitingForAIMontageCallback = false;
-	CachedAIMontage = nullptr;
-
-	// ============================================================
-	// 【P0 2026.07.07 大厂架构重构】还原攻击者标志 + 停止 trace
-	//
-	// 这是 OnAIRequestAttack_Simple SetAttackerIsAI(true) + StartWeaponTrace() 的对称关闭
-	// 必须在蒙太奇自然结束 / 被打断 / AI 死亡时无条件关闭, 否则:
-	//   1. bIsCurrentlyAttackerAI 残留为 true
-	//      → 下次 AI 攻击 trace 命中, 服务器走 AI 通道读 ConfigSO (没坏, 但状态错乱)
-	//      → 更危险: 玩家路径的轻击 trace 命中时也走 AI 通道 (读 ConfigSO.Damage 而非 LightDamageBody)
-	//   2. bIsWeaponActive 残留为 true → trace 永远激活, 任何人接近都扣血
-	//
-	// 单一职责: 攻击者标志由攻击发起方管理, 武器 Tick 只读不写
-	// ============================================================
-	SetAttackerIsAI(false);
-
-	if (HasAuthority() && CurrentWeapon)
-	{
-		// 对称关闭 trace — AI 主动开启 trace 的对应关闭
-		// (即便 BP 蓝图 AnimNotify 也会调 StopWeaponTrace, 这里再调一次幂等无害)
-		CurrentWeapon->StopWeaponTrace();
-	}
-
-	UE_LOG(LogTemp, Verbose,
-		TEXT("[BaseCharacter] OnAIAttackMontageEnded: 已还原攻击者标志 (Player 路径) + 关闭 trace, AI=%s"),
-		*GetName());
 }
 
 
-
-
-// ==========================================================
-// 14. RPC 动画广播实现
-// ==========================================================
-// ==========================================
-
 /**
- * Server_PlayAttackAnim_Implementation
- *
- * Server RPC 实现: 客户端向服务器请求挥刀
- * 1. 服务器端也必须同步锁死速度
- * 2. 服务器收到请求后，向全频道广播
+ * Server_PlayAttackAnim_Implementation — 转发壳 (RPC 必须在 Actor 上, 但实现转发给组件)
+ * 真实逻辑: AIAttackComponent::Server_PlayAttackAnim_Implementation
  */
 void ABaseCharacter::Server_PlayAttackAnim_Implementation(bool bIsHeavy, int32 InComboIndex)
 {
-	// 服务器端也必须同步锁死速度
-	// 这样服务器和客户端的物理推演就完全一致了，再也不会发生"强行拽人"的瞬移
-	if (CurrentWeapon && !CurrentWeapon->bCanMoveWhileLightAttack)
+	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
-		bIsMovementLocked = true;
-		GetCharacterMovement()->MaxWalkSpeed = 0.0f;
+		AI->Server_PlayAttackAnim_Implementation(bIsHeavy, InComboIndex);
 	}
-
-	// 服务器收到请求后，直接向全频道广播
-	Multicast_PlayAttackAnim(bIsHeavy, InComboIndex);
 }
 
 
 /**
- * Multicast_PlayAttackAnim_Implementation
- *
- * NetMulticast 实现: 服务器向所有客户端广播
- * 发起攻击的本地玩家自己已经播过动画了，防鬼畜直接跳过
+ * Multicast_PlayAttackAnim_Implementation — 转发壳 (RPC 必须在 Actor 上)
+ * 真实逻辑: AIAttackComponent::Multicast_PlayAttackAnim_Implementation
  */
 void ABaseCharacter::Multicast_PlayAttackAnim_Implementation(bool bIsHeavy, int32 InComboIndex)
 {
-	// 发起攻击的本地玩家自己已经播过动画了，防鬼畜直接跳过
-	if (IsLocallyControlled()) return;
-
-	if (CurrentWeapon)
+	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
-		// 工业级做法: 直接拿第 0 个蒙太奇（因为所有轻击招式都在这里面）
-		UAnimMontage* MontageToPlay = CurrentWeapon->GetAttackMontage(bIsHeavy, 0);
-		if (MontageToPlay)
-		{
-			// 根据服务器传来的 InComboIndex，智能推断该播哪个片段
-			FName SectionName = (InComboIndex == 1) ? FName("Combo1") : FName("Combo2");
-
-			// 让其他玩家屏幕上的你，也精准跳到对应的连招片段
-			PlayAnimMontage(MontageToPlay, 1.0f, SectionName);
-		}
+		AI->Multicast_PlayAttackAnim_Implementation(bIsHeavy, InComboIndex);
 	}
-}
-
-
-// ==========================================
-// 【P0 大厂架构 2026.07.06】AI 攻击伤害上报 (备用通道)
-// ==========================================
-//
-// 【设计说明】当前版本 AI 攻击伤害走 BaseWeapon::Server_ReportHit 统一入口
-//            (OnAIRequestAttack_Simple 调用 CurrentWeapon->Server_ReportHit(AIDamage))
-//            本 RPC 保留为"备选实现", 如果未来有非武器 AI (例如召唤物、远程法术) 时使用
-//
-// 注意: 不要在当前 OnAIRequestAttack_Simple 流程里调它, 否则会重复扣血!
-//
-// 数据流 (历史实现, 现已弃用但保留):
-//   AIBehaviorConfigSO.Combat.Damage
-//     ↓ UAIRuntimeConfigComponent::GetScaledCombat
-//     ↓ ABaseCharacter::OnAIRequestAttack_Simple (读 CombatParam, 上报)
-//     ↓ Server_ReportAIAttackHit (本函数, 服务器权威, 备用)
-//     ↓ UGameplayStatics::ApplyPointDamage
-//     ↓ HealthComponent::ApplyDamage
-
-void ABaseCharacter::Server_ReportAIAttackHit_Implementation(AActor* HitActor, float Damage)
-{
-	// 防御 1: HitActor 必须有效
-	if (!HitActor)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s 收到空 HitActor, 忽略"),
-			*GetName());
-		return;
-	}
-
-	// 防御 2: 目标必须是 ABaseCharacter
-	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
-	if (!Victim)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s -> HitActor=%s 不是 ABaseCharacter, 忽略"),
-			*GetName(), *HitActor->GetName());
-		return;
-	}
-
-	// 防御 3: 目标已死则不扣 (避免重复扣血)
-	if (Victim->IsDead())
-	{
-		return;
-	}
-
-	// 防御 4: 自伤防御 (AI 不会打自己)
-	if (Victim == this)
-	{
-		return;
-	}
-
-	// 防御 5: 同阵营不互砍 (走 IGenericTeamAttitude Towards)
-	// 设计: 阵营协议自动判断, 这里不重复造轮子
-	//       但 Pawn 链可能没 Set 好阵营, 暂时跳过阵营检查 (下个 Phase 加)
-	const float FinalDamage = FMath::Max(Damage, 0.0f);
-
-	// 走 UGameplayStatics::ApplyPointDamage 走标准伤害事件链
-	// 注意: 用 Victim->GetActorLocation() 当 HitLocation 是简化, 实际应该用武器刀刃 Trace
-	//       现阶段 AI 攻击没有 Trace 接入, 用"AI 当前世界坐标"近似, 视觉效果无差 (伤害无距离衰减)
-	FHitResult HitInfo(Victim, Victim->GetMesh(), GetActorLocation(), -GetActorForwardVector());
-
-	UGameplayStatics::ApplyPointDamage(
-		Victim,
-		FinalDamage,
-		-GetActorForwardVector(),  // 攻击来向 (从 AI 指向玩家)
-		HitInfo,
-		GetController(),            // Instigator 是 AI 的 Controller
-		this,                       // DamageCauser 是 AI Character
-		UDamageType::StaticClass()
-	);
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] Server_ReportAIAttackHit: AI=%s -> Victim=%s, Damage=%.1f (由 ConfigSO.Damage 决定)"),
-		*GetName(), *Victim->GetName(), FinalDamage);
 }
 
 
 /**
- * Server_ReportAIAttackHit_Validate
- * 校验: HitActor 非空, Damage 在合法范围 (0~10000)
+ * Server_ReportAIAttackHit_Implementation — 转发壳 (RPC 必须在 Actor 上)
+ * 真实逻辑: AIAttackComponent::Server_ReportAIAttackHit_Implementation
+ */
+void ABaseCharacter::Server_ReportAIAttackHit_Implementation(AActor* HitActor, float Damage)
+{
+	if (UAIAttackComponent* AI = ResolveAIAttack())
+	{
+		AI->Server_ReportAIAttackHit_Implementation(HitActor, Damage);
+	}
+}
+
+
+/**
+ * Server_ReportAIAttackHit_Validate — 转发壳 (RPC Validate 必须在 Actor 上)
+ * 真实逻辑: AIAttackComponent::Server_ReportAIAttackHit_Validate
  */
 bool ABaseCharacter::Server_ReportAIAttackHit_Validate(AActor* HitActor, float Damage)
 {
-	// 1. HitActor 非空
-	if (!HitActor)
+	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
-		return true;  // HitActor 空不算作弊, 实施时拒绝即可
+		return AI->Server_ReportAIAttackHit_Validate(HitActor, Damage);
 	}
-
-	// 2. Damage 在合法范围
-	if (Damage < 0.0f || Damage > 10000.0f)
-	{
-		return false;  // 范围异常, 视为客户端作弊
-	}
-
-	return true;
+	// 找不到组件 → RPC 拒绝 (大厂原则 - 永不静默放行)
+	return false;
 }
 
 
+/* 下面是旧版实现 (Phase 2 重构前), 保留作参考, 实际不再被调用 — 已被转发壳替代 */
+
+
 // ==========================================
-// 15. 装备武器
+// 15. 【2026.07.12 P0 重构】装备武器 — 转发到 WeaponAttachmentComponent
 // ==========================================
 
 /**
- * EquipWeapon
+ /**
+ * RequestWeaponSpawn — 转发壳
+ * 真实逻辑: WeaponAttachmentComponent::RequestWeaponSpawn
  *
- * 供上帝 (GameMode) 调用的装备武器接口
- * 1. 只有服务器上帝有资格发枪
- * 2. 如果手里已经有武器了，先销毁旧的
- * 3. 在世界中凭空召唤出这把武器
- * 4. 焊接到角色的插槽上
+ * 【v36】改用 ResolveWeaponAttach lazy 查找
  */
-void ABaseCharacter::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip)
+void ABaseCharacter::RequestWeaponSpawn(TSubclassOf<ABaseWeapon> WeaponClass)
 {
-	// 只有服务器上帝有资格发枪
-	if (HasAuthority() && WeaponClassToEquip)
+	if (UWeaponAttachmentComponent* ResolvedAttach = ResolveWeaponAttach())
 	{
-		// 如果手里已经有武器了，先销毁旧的（为以后切枪做准备）
-		if (CurrentWeapon)
-		{
-			CurrentWeapon->Destroy();
-		}
-
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.Owner = this; // 武器的主人是我
-		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-
-		// 在世界中凭空召唤出这把武器
-		CurrentWeapon = GetWorld()->SpawnActor<ABaseWeapon>(WeaponClassToEquip, GetActorLocation(), GetActorRotation(), SpawnParams);
-
-		if (CurrentWeapon)
-		{
-			// 【第三人称关键】: 将武器死死地焊在第三人称全身模型 (GetMesh) 的 "WeaponSocket" 插槽上
-			CurrentWeapon->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, FName("WeaponSocket_L"));
-		}
+		ResolvedAttach->RequestWeaponSpawn(WeaponClass);
 	}
-}
-
-/**
- * ABaseCharacter::RequestWeaponSpawn
- *
- * 【P0 大厂架构 2026.07.06】武器生成请求入口（对外暴露）
- *
- * 设计: SpawnAndEquipWeapon 是 protected (仅内部逻辑使用).
- *       但关卡预放 AI 需要在 Controller 侧主动触发武器生成.
- *       所以对外暴露一个 public 包装, 让 AMeleeAIController::SetupMeleeAI 可以调用.
- *
- * 调用方: AMeleeAIController::SetupMeleeAI (OnPossess 末尾手动触发武器生成)
- *
- * 内部直接调 SpawnAndEquipWeapon, 复用完整链路 (查表/挂载/HUD).
- */
-void ABaseCharacter::RequestWeaponSpawn(FString WeaponID)
-{
-	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] RequestWeaponSpawn: WeaponID=%s, Pawn=%s"),
-		*WeaponID, *GetName());
-
-	// 直接调内部 protected 方法, 复用完整链路
-	SpawnAndEquipWeapon(WeaponID);
+	// else: ResolveWeaponAttach 已 Log Error
 }
 
 
+/* 下面是旧版 TakeDamage/Die/ExecuteDeathLocal/Multicast_Die_Implementation/EnableRagdoll/DropAndFadeWeapon
+   等死亡链路方法 (Phase 2 重构前), 保留作参考, 实际不再被调用 — 已被转发壳替代
+   新的转发壳在文件后面 — 见后续的 CombatDeathComponent 转发壳段 */
+
+
+/* 下面是旧版 TakeDamage/Die/ExecuteDeathLocal/Multicast_Die_Implementation/EnableRagdoll/DropAndFadeWeapon
+   等死亡链路方法 (Phase 2 重构前), 保留作参考, 实际不再被调用 — 已被转发壳替代
+   新的转发壳在文件后面 — 见后续的 CombatDeathComponent 转发壳段 */
+
 // ==========================================
-// 16. 受伤与死亡
+// 16. 【2026.07.12 P0 重构】受伤与死亡 — 转发到 CombatDeathComponent
 // ==========================================
+// 大厂原则 - 单一真理源:
+//   死亡链路方法 (TakeDamage / Die / ExecuteDeathLocal / Multicast_Die_Implementation /
+//                  EnableRagdoll / DropAndFadeWeapon / ActivateSpawnInvincibility /
+//                  DeactivateSpawnInvincibility)
+//   全部已迁移到 CombatDeathComponent
+//   BaseCharacter 上同名方法改为转发壳
+//   注意: Multicast_Die 仍保留 UFUNCTION(NetMulticast, Reliable) 在 BaseCharacter 上 (RPC 必须在 Actor 上),
+//         Implementation 部分转发给 CombatDeath
 
 /**
- * TakeDamage
- *
- * UE 原生函数: 处理伤害（仅服务器）
- * 1. 安全扣血
- * 2. 判定生死
- * 3. 服务器处理击杀结算（查找击杀方式、设置击杀者、通知助攻、广播计分板）
+ * TakeDamage — 转发壳 (UE 原生伤害入口)
+ * 真实逻辑: CombatDeathComponent::TakeDamage
  */
 float ABaseCharacter::TakeDamage(float DamageAmount, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, AActor* DamageCauser)
 {
-	// 1. 如果已经死了，或者客户端没有权限，直接退出
-	// 【2026-06-15 重构】: bIsDead 字段已下沉,改调 IsDead()
-	if (IsDead() || !HasAuthority()) return 0.0f;
-
-	// 先执行父类的逻辑
-	float ActualDamage = Super::TakeDamage(DamageAmount, DamageEvent, EventInstigator, DamageCauser);
-
-	// 2. 【2026-06-15 重构】安全扣血改为调 HealthComponent
-	const float ActualApplied = HealthComponent ? HealthComponent->ApplyDamage(ActualDamage) : 0.0f;
-	UE_LOG(LogTemp, Warning, TEXT("[Health] 服务器扣血完成: Damage=%.1f, NewHealth=%.1f/%.1f, Dead=%d, Auth=%d"),
-		ActualApplied, GetCurrentHealth(), GetMaxHealth(), IsDead(), HasAuthority());
-
-	// 3. 【2026-07-01 P0 新增】通知回血组件: 被打断了, 必须重新等 RegenerationDelay 才能回血
-	// 即使默认 HealthRegenRate=0, 仍调用一次以重置内部状态 (防止未来开启回血时残留计时)
-	if (HasAuthority() && HealthRegenComponent)
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		HealthRegenComponent->NotifyDamageTaken();
+		return Death->TakeDamage(DamageAmount, DamageEvent, EventInstigator, DamageCauser);
 	}
-
-	// 4. 判定生死
-	// 【2026-07-01 重构】: 死亡流程不再由 TakeDamage 主动调 Die() 触发
-	//   旧: TakeDamage → Die() → Multicast_Die  (依赖 TakeDamage 调用路径)
-	//   新: TakeDamage → HealthComponent::ApplyDamage → OnDeath.Broadcast
-	//       → BaseCharacter::OnHealthComponentDeath (BeginPlay 已订阅) → Die()
-	//   优势: 任何修改 HealthComponent 的路径都会触发, 不再依赖 TakeDamage
-	if (IsDead())
-	{
-		// 服务器处理击杀结算 (仅在这里, 不在 Die() 内, 避免事件驱动路径重复触发)
-		if (HasAuthority())
-		{
-			// 获取击杀方式（从武器获取）
-			EKillMethod KillMethod = EKillMethod::MeleeWeapon; // 默认近战
-			if (ABaseWeapon* Weapon = Cast<ABaseWeapon>(DamageCauser))
-			{
-				KillMethod = Weapon->GetLastKillMethod();
-			}
-
-			// 获取伤害发起者（击杀者）
-			AController* DamageInstigatorController = nullptr;
-			if (EventInstigator)
-			{
-				DamageInstigatorController = EventInstigator;
-			}
-
-			// 设置击杀者的击杀方式
-			if (DamageInstigatorController)
-			{
-				ABaseCharacter* KillerCharacter = Cast<ABaseCharacter>(DamageInstigatorController->GetPawn());
-				if (KillerCharacter)
-				{
-					KillerCharacter->LastKillMethod = KillMethod;
-
-					// 查找在最近5秒内攻击过受害者的所有玩家
-					GrantAssistsToEligiblePlayers(this, KillerCharacter);
-
-					// 通知所有客户端更新计分板和击杀信息
-					KillerCharacter->Multicast_NotifyKill(this, nullptr);
-				}
-				else
-				{
-					// 如果找不到击杀者角色，直接通知死亡（这种情况一般不会发生）
-					Multicast_NotifyKill(this, nullptr);
-				}
-			}
-			else
-			{
-				// 没有击杀者控制器的情况
-				Multicast_NotifyKill(this, nullptr);
-			}
-		}
-
-		// 【移除 Die()】死亡流程已由 HealthComponent::OnDeath 事件驱动:
-		//   ApplyDamage 内部 OnDeath.Broadcast → OnHealthComponentDeath → Die()
-		//   客户端通过 OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal
-	}
-
-	return ActualDamage;
+	// 找不到组件 → 0 伤害 (UE 原生接口需要 float 返回, 大厂原则 - 永不静默吞)
+	// ResolveCombatDeath 已 Log Error, 拒绝伤害也是正确行为 (伤害去哪了必须有日志)
+	return 0.0f;
 }
 
 
 /**
- * Die — 统一死亡入口 (玩家 & AI 共用)
- *
- * 【大厂架构重构 2026.07.10 - P0 关键修复 v2】
- *
- * 设计原则:
- *   - Die() 负责: 服务器校验 + 武器清理 + 派发复活请求 + 广播死亡 + 销毁 Pawn
- *   - 顺序: 先派发复活 (因为 GetController() 在 Pawn 销毁后可能返回 nullptr)
- *   - 复活逻辑完全委托给 ARoomGameMode::RequestRespawn
- *
- * 【P0 2026.07.10 v2 关键修复】
- *
- * 历史 bug (v1):
- *   Die() 先销毁 Pawn, 再调用 RequestRespawn(GetController())
- *   Pawn 销毁后, Controller.GetPawn() == nullptr, Controller 可能失效
- *   → RequestRespawn 没有被调用
- *   → AI 永远不复活
- *
- * 新实现:
- *   1. 武器清理: StopWeaponTrace + SetAttackerIsAI(false)
- *   2. 【先派发复活】在销毁 Pawn 前调用 RequestRespawn
- *   3. 广播死亡: Multicast_Die (布娃娃等视觉效果)
- *   4. 销毁 Pawn: this->Destroy()
- *
- * 调用链:
- *   HealthComponent::ApplyDamage -> TakeDamage -> Die()
- *   Die() -> RequestRespawn (先派发, 避免 Pawn 销毁后 Controller 失效)
- *        -> Multicast_Die (广播死亡)
- *        -> Destroy Pawn
+ * Die — 转发壳
+ * 真实逻辑: CombatDeathComponent::Die
  */
 void ABaseCharacter::Die()
 {
-	// 服务器权威校验
-	if (!HasAuthority()) return;
-
-	UE_LOG(LogTemp, Warning,
-		TEXT("[BaseCharacter][Die] 执行死亡流程: Pawn=%s, HasAuthority=%d"),
-		*GetName(), HasAuthority() ? 1 : 0);
-
-	// 【P0 2026.07.10 武器清理】必须在 Pawn 销毁前
-	if (CurrentWeapon)
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		SetAttackerIsAI(false);
-		CurrentWeapon->StopWeaponTrace();
+		Death->Die();
 	}
-
-	// 【P0 2026.07.10 v2 关键修复】先派发复活请求
-	// 原因: Pawn 销毁后, Controller 的 Pawn 引用失效, GetController() 可能返回 nullptr
-	//       RequestRespawn 需要从 Controller 获取 Profile, 必须在 Pawn 销毁前调用
-	// 引用方式: 先保存 Controller 指针 (Pawn 销毁后指针仍有效, 只是 GetPawn() 返回 nullptr)
-	if (AController* MyController = GetController())
-	{
-		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[BaseCharacter][Die] 派发复活请求: Controller=%s (Pawn=%s 即将销毁)"),
-				*MyController->GetName(), *GetName());
-			GM->RequestRespawn(MyController, false);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[BaseCharacter][Die] Cannot find ARoomGameMode, skipping respawn for Pawn=%s"),
-				*GetName());
-		}
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter][Die] Controller 已为空, 无法派发复活请求! Pawn=%s"),
-			*GetName());
-	}
-
-	// 【P0 2026.07.10 v3】广播死亡视觉效果给客户端
-	// ExecuteDeathLocal 处理: 武器掉落/溶解, 胶囊体透明, 死亡动画, 布娃娃
-	// 注意: 服务器端也调用, 但服务器即将销毁 Pawn, 所以实际上不会有视觉效果
-	ExecuteDeathLocal();
-
-	// 【P0 2026.07.10 v2/v3】销毁 Pawn
-	// RequestRespawn 已在上面派发, 现在销毁 Pawn 是安全的
-	// 旧武器随 Pawn 一起销毁, 不会再攻击玩家
-	UE_LOG(LogTemp, Warning,
-		TEXT("[BaseCharacter][Die] 销毁 Pawn: %s"),
-		*GetName());
-	Destroy(); // ABaseCharacter 继承自 AActor, Destroy() 是 AActor 的方法
 }
 
 
 /**
- * Multicast_Die_Implementation
- *
- * NetMulticast 实现: 死亡流程在所有机器上执行
- *
- * 【2026-07-01 架构升级】本函数已被简化为客户端兜底通道
- *   服务器流程: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() → Multicast_Die (兜底) → 服务器本地 ExecuteDeathLocal
- *   客户端流程: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal()
- *   本 RPC 同时作为:
- *     1. 服务器死亡事件传播给客户端的主通道 (即便 bIsDead Replicated 延迟, 客户端也能立刻收到)
- *     2. 服务器本地兜底 (防止服务器侧 OnHealthComponentDeath 事件未订阅时仍能进入死亡流程)
+ * ExecuteDeathLocal — 转发壳 (Phase 2 重构已新增, 此处已删除重复实现)
+ */
+/**
+ * Multicast_Die_Implementation — 转发壳 (RPC 必须在 Actor 上, 但实现转发给组件)
+ * 真实逻辑: CombatDeathComponent::Multicast_Die_Implementation
  */
 void ABaseCharacter::Multicast_Die_Implementation()
 {
-	// 服务器专属: 重置 AC/ACE
-	if (HasAuthority())
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		ResetAC();
-	}
-
-	// 执行本地死亡流程 (幂等, CurrentWeapon 已被 nullptr 后再次进入会被 if 短路)
-	ExecuteDeathLocal();
-
-	// 复活定时器仅服务器需要
-	if (HasAuthority())
-	{
-		if (AController* MyController = GetController())
-		{
-			if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(MyController))
-			{
-				PC->StartRespawnTimer(RespawnDelaySeconds);
-			}
-		}
+		Death->Multicast_Die_Implementation();
 	}
 }
 
 
 /**
- * DropAndFadeWeapon
- *
- * 【大厂 P0 2026.07.10 重构】武器死亡处理
- *
- * 历史 bug (v22 及以前):
- *   1. 服务器和客户端都调度 1 秒后 Destroy 同一把武器 (服务器先 Destroy, 客户端 timer 1 秒后 IsValid=false → 静默 no-op, 但语义混乱)
- *   2. 1 秒延迟太短, 玩家根本看不到武器掉地的物理动画
- *   3. 武器的溶解特效永远不生效, 因为 DissolveComponent::GetOwnerWeaponMesh() 在已 Detach 的 Owner 上用 FindComponentByClass 找不到
- *
- * 历史修复 (v23):
- *   调 DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh) 把武器的 MID 加到角色 DissolveComponent 数组
- *   → 责任错位 (角色的组件驱动武器的材质)
- *   → 跨边界引用 (武器 Detach 后, 角色 Component 还 hold 武器 MID, 销毁时序混乱)
- *   → 武器材质蓝图没调用 MF_Dissolve → 武器依然不溶解
- *
- * 新实现 (2026.07.10 大厂架构 — 职责对等):
- *   - 服务器: SetLifeSpan(3.0f) - 让 UE 在 3 秒后自动销毁, 单一权威
- *   - 所有机器: 立刻给武器 Mesh 启物理 + 取消 Attach + 调 Weapon->StartDissolve()
- *   - 武器自治: 武器自己持有 WeaponDissolveComponent, 管自己的溶解
- *   - 角色不再穿透调用, 零跨边界引用
- *   - 武器材质蓝图必须调用 MF_Dissolve (单一协议, 与身体完全一致)
- */
-void ABaseCharacter::DropAndFadeWeapon(ABaseWeapon* Weapon)
-{
-	if (!IsValid(Weapon))
-	{
-		return;
-	}
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] DropAndFadeWeapon: %s (Auth=%d)"),
-		*Weapon->GetName(), HasAuthority() ? 1 : 0);
-
-	// 1. 取消武器与角色的骨骼绑定
-	//    KeepWorldTransform: 武器保持在世界中的当前位置, 不会跳到原点
-	Weapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-
-	// 2. 激活武器 Mesh 物理模拟 + 碰撞, 让它掉地上
-	UMeshComponent* WeaponMesh = Weapon->FindComponentByClass<UMeshComponent>();
-	if (WeaponMesh)
-	{
-		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
-		WeaponMesh->SetCollisionResponseToAllChannels(ECR_Block);
-		WeaponMesh->SetSimulatePhysics(true);
-		WeaponMesh->WakeAllRigidBodies();
-		WeaponMesh->SetEnableGravity(true);
-	}
-
-	// 3. 【P0 2026.07.10 大厂重构】武器溶解 — 委托给武器自己
-	//    老路径: DissolveComponent->CollectWeaponDynamicMaterials(WeaponMesh)  (跨边界)
-	//    新路径: Weapon->StartDissolve()  (职责对等, 武器自治)
-	//
-	//    设计 (类比身体 DissolveComponent):
-	//      身体溶解: ABaseCharacter::DissolveComponent 驱动自己的身体 Mesh
-	//      武器溶解: ABaseWeapon::WeaponDissolveComponent 驱动自己的武器 Mesh
-	//      零跨边界: 武器 Detach 后, 它的 Component 随 Actor 继续工作
-	//
-	//    协议 (与身体一致 — 零兜底):
-	//      武器材质蓝图必须调用 MF_Dissolve 节点 (有 DissolveAmount 参数)
-	//      协议不满足时, WeaponDissolveComponent 内部 Log(Warning) 报警
-	//      C++ 不静默兜底, 不兼容老材质
-	Weapon->StartDissolve();
-
-	// 4. 【P0 修复】统一销毁授权 - 仅服务器调用 SetLifeSpan
-	//    客户端通过 Actor 的 OnDestroyed 自动同步移除, 不需要客户端各自销毁
-	//    这解决了"服务器销毁后, 客户端的 1 秒 timer 还在跑"的不一致问题
-	if (HasAuthority())
-	{
-		Weapon->SetLifeSpan(WeaponDestroyDelaySeconds);
-	}
-}
-
-/**
- * EnableRagdoll
- *
- * 启用布娃娃物理（UE 标准 5 步）
- *
- * 之前的 bug: 仅有 StopAnimMontage + SetCollisionProfileName + SetSimulatePhysics,
- *   缺了 3 个关键步骤, 物理模拟被 CharacterMovement 强制覆盖, Mesh 不会真的倒下
- *
- * UE 官方标准流程:
- *   1. 打断所有动画 (避免动画蒙太奇继续驱动骨骼, 与物理冲突)
- *   2. 禁用 CharacterMovement (MOVE_None, 让 Movement Component 不再强制控制 Mesh)
- *   3. 设置 Mesh 碰撞为 Ragdoll profile (项目设置里要预定义)
- *   4. SetAllBodiesSimulatePhysics(true) + bBlendPhysics=true (关键: 让 Mesh 的 root 与胶囊体解耦)
- *   5. WakeAllRigidBodies() (强制所有物理骨骼激活, 否则可能因 sleep 而不响应)
- *
- * @note 物理资产 PhysicsAsset 必须在 BP/资产侧配置正确, 否则骨骼没有碰撞体
- * @note 调用前必须确保胶囊体碰撞已设为 Ignore Pawn (Multicast_Die 已做)
+ * EnableRagdoll — 转发壳
+ * 真实逻辑: CombatDeathComponent::EnableRagdoll
  */
 void ABaseCharacter::EnableRagdoll()
 {
-	USkeletalMeshComponent* MeshComp = GetMesh();
-	if (!MeshComp)
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
 	{
-		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] EnableRagdoll: GetMesh() 为空, 无法启用布娃娃"));
-		return;
+		Death->EnableRagdoll();
 	}
-
-	// 1. 打断所有还在播的动画 (蒙太奇会与物理模拟冲突, 必须停掉)
-	StopAnimMontage();
-
-	// 2. 【P0 修复】禁用 CharacterMovement
-	// 原因: 角色死亡后 Movement Component 仍在每帧强制 Mesh 跟随 Capsule 移动,
-	//       这会**完全覆盖** Mesh 的物理模拟结果, 导致 Mesh 像被钉在 Capsule 上一样不倒下
-	//       这是"布娃娃不倒下"bug 的**根因**
-	if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
-	{
-		MoveComp->StopMovementImmediately();        // 立即清零所有速度
-		MoveComp->DisableMovement();                 // 禁用所有移动模式
-		MoveComp->SetComponentTickEnabled(false);    // 关闭 Movement 的 Tick, 彻底不再干预 Mesh
-	}
-
-	// 3. 碰撞 Profile 切换到 Ragdoll (项目设置里要预定义 "Ragdoll" profile)
-	MeshComp->SetCollisionProfileName(TEXT("Ragdoll"));
-
-	// 4. 【P0 修复】bBlendPhysics = true
-	// 原因: 当 bBlendPhysics 为 false 时, UE 仍然把 Mesh 视作"由动画驱动", 物理只是辅助
-	//       必须设为 true 才能让物理完全接管 Mesh 骨骼链
-	//       这是 UE Ragdoll 官方教程明确要求的**关键标志**
-	MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-	MeshComp->SetAllBodiesSimulatePhysics(true);
-	MeshComp->bBlendPhysics = true;
-
-	// 5. 【P0 修复】唤醒所有刚体
-	// 原因: 物理骨骼初始可能处于 Sleep 状态, 不会响应重力
-	//       强制唤醒确保重力立即作用于所有骨骼
-	MeshComp->WakeAllRigidBodies();
-
-	// 6. 【关键】Mesh 不再跟随 Capsule (因为 Movement 已关, 但显式声明避免边缘情况)
-	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] EnableRagdoll: 已启用布娃娃 (Mesh=%s, PhysicsAsset=%s)"),
-		*MeshComp->GetName(),
-		*GetNameSafe(MeshComp->GetPhysicsAsset()));
 }
+
+
+/**
+ * DropAndFadeWeapon — 转发壳
+ * 真实逻辑: CombatDeathComponent::DropAndFadeWeapon
+ */
+void ABaseCharacter::DropAndFadeWeapon(ABaseWeapon* Weapon)
+{
+	if (UCombatDeathComponent* Death = ResolveCombatDeath())
+	{
+		Death->DropAndFadeWeapon(Weapon);
+	}
+}
+
+
+/* 下面是已废弃的旧版 EnableRagdoll — 删除 (与上方转发壳重复, 编译会报 redefinition error) */
 
 
 // ==========================================
@@ -2479,87 +1438,42 @@ void ABaseCharacter::OnEndCrouch(float HalfHeightAdjust, float ScaledHalfHeightA
 // ==========================================
 
 /**
- * ABaseCharacter::SetMeleeProfile
+ * ABaseCharacter::SetMeleeConfig — 转发壳 【v54 P0 重构 — UAIProfileAsset 已删除】
  *
- * 【P0 大厂架构 2026.07.06】Profile 直接注入武器/角色配置
+ * 旧: SetMeleeProfile(UAIProfileAsset*) — UAIProfileAsset 整个类已删除
+ * 新: SetMeleeConfig(UAIBehaviorConfigSO*)
  *
- * 设计: SetSpawnLoadout 只做字段写入, 不承担"来源解析"职责.
- *       本方法负责从 UAIProfileAsset 解析 WeaponID/CharacterRowName,
- *       然后调用 SetSpawnLoadout 写入.
+ * 真实逻辑: WeaponAttachmentComponent::SetMeleeConfig
  *
- * 调用方: AMeleeAIController::SetupMeleeAI (关卡预放 AI 自举路径)
+ * 【v36】改用 ResolveWeaponAttach lazy 查找
  */
-void ABaseCharacter::SetMeleeProfile(UAIProfileAsset* InProfile)
+void ABaseCharacter::SetMeleeConfig(UAIBehaviorConfigSO* InConfig)
 {
-	// 存 Profile 引用, 后续 PossessedBy 可直接用
-	MeleeProfile = InProfile;
-
-	if (!InProfile)
+	if (UWeaponAttachmentComponent* ResolvedAttach = ResolveWeaponAttach())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[BaseCharacter] SetMeleeProfile: InProfile 为空, 跳过武器/角色配置"));
-		return;
+		ResolvedAttach->SetMeleeConfig(InConfig);
 	}
-
-	// 从 Profile 解析 WeaponID (FName -> FString)
-	FString WeaponIDStr;
-	if (!InProfile->WeaponID.IsNone())
-	{
-		WeaponIDStr = InProfile->WeaponID.ToString();
-	}
-
-	// 从 Profile 解析 CharacterRowName (FName -> FString)
-	FString CharIDStr;
-	if (!InProfile->CharacterRowName.IsNone())
-	{
-		CharIDStr = InProfile->CharacterRowName.ToString();
-	}
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] SetMeleeProfile: Profile=%s, DesiredCharID='%s', DesiredWeaponID='%s'"),
-		*InProfile->GetName(), *CharIDStr, *WeaponIDStr);
-
-	// 调用 SetSpawnLoadout 写入 (新实现: 无论是否为空都写入)
-	SetSpawnLoadout(CharIDStr, WeaponIDStr);
+	// else: ResolveWeaponAttach 已 Log Error
 }
 
+
 /**
- * ABaseCharacter::SyncWeaponFromProfile
+ * ABaseCharacter::SyncWeaponFromConfig — 转发壳 【v54 P0 重构】
  *
- * 【P0 大厂架构 2026.07.06】从缓存的 Profile 同步武器/角色数据
+ * 旧: SyncWeaponFromProfile() — 从已删除的 MeleeProfile 字段读
+ * 新: SyncWeaponFromConfig() — 直接接 ConfigSO, 不再依赖字段
  *
- * 调用方: PossessedBy (在读取 SpawnWeaponID 之前调用)
+ * 真实逻辑: WeaponAttachmentComponent::SyncWeaponFromConfig
  *
- * 逻辑:
- *   1. 检查 MeleeProfile 是否有效
- *   2. 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
- *   3. 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
- *   4. 诊断日志记录同步结果
+ * 【v36】改用 ResolveWeaponAttach lazy 查找
  */
-void ABaseCharacter::SyncWeaponFromProfile()
+void ABaseCharacter::SyncWeaponFromConfig()
 {
-	if (!MeleeProfile)
+	if (UWeaponAttachmentComponent* ResolvedAttach = ResolveWeaponAttach())
 	{
-		// 没有缓存的 Profile, 直接返回
-		return;
+		ResolvedAttach->SyncWeaponFromConfig();
 	}
-
-	// 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
-	if (SpawnWeaponID.IsEmpty() && !MeleeProfile->WeaponID.IsNone())
-	{
-		SpawnWeaponID = MeleeProfile->WeaponID.ToString();
-		UE_LOG(LogTemp, Log,
-			TEXT("[BaseCharacter] SyncWeaponFromProfile: 填充 SpawnWeaponID='%s' from Profile"),
-			*SpawnWeaponID);
-	}
-
-	// 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
-	if (CharacterID.IsEmpty() && !MeleeProfile->CharacterRowName.IsNone())
-	{
-		CharacterID = MeleeProfile->CharacterRowName.ToString();
-		UE_LOG(LogTemp, Log,
-			TEXT("[BaseCharacter] SyncWeaponFromProfile: 填充 CharacterID='%s' from Profile"),
-			*CharacterID);
-	}
+	// else: ResolveWeaponAttach 已 Log Error
 }
 
 /**
@@ -2575,9 +1489,10 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	// 【2026-07-01 P0 新增】重生时重置回血状态
 	// PossessedBy 在角色出生和复活时触发, 此时需要重置 LastMoveTime 和 bIsRegenerating
 	// 防止旧角色残留状态影响新角色
-	if (HealthRegenComponent)
+	// 【v39 修复】用 ResolveHealthRegenComponent 而非裸字段访问
+	if (UHealthRegenComponent* Regen = ResolveHealthRegenComponent())
 	{
-		HealthRegenComponent->ResetRegenerationState();
+		Regen->ResetRegenerationState();
 	}
 
 	// 通过 PlayerController 获取 HUD 实例并缓存
@@ -2620,77 +1535,66 @@ void ABaseCharacter::PossessedBy(AController* NewController)
 	// 仅在服务器执行
 	if (HasAuthority())
 	{
-		FString WeaponID;
-
-		// 【P0 大厂架构 2026.07.06】四路兜底 — 让 AI 也能拿到武器
+		// ============================================================
+		// 【2026.07.11 P0 修复】服务端 Pawn.FactionTag 同步
 		//
-		// Layer 0 (Profile 路径): MeleeProfile->WeaponID (关卡预放 AI)
-		// Layer 1 (AI 路径): Pawn.SpawnWeaponID 由 SpawnAIInternal 写入
-		// Layer 2 (玩家路径): PlayerState.GetSelectedWeapon1ID (原代码)
-		// Layer 3 (玩家兜底): RoomGameMode::GetPlayerSpawnData 缓存
+		// 根因: UE AIPerception 调 GetTeamAttitudeTowards → 读 Pawn.FactionTag
+		//       玩家 Pawn.FactionTag 永远空 → AI 看玩家 = Neutral (默认)
+		//       bDetectNeutrals=false → 玩家永远不在 BT 视野 → AI 不会追玩家 → "AI 不动/没目标"
 		//
-		// 大厂原则: 关键行为不能依赖单一路径
+		// 大厂原则 (零兜底):
+		//   - AI: 真理源在 AIController.CachedFactionTag (v26.5 已修复)
+		//         SetupMeleeAI/SetupZombieAI 时已写入 Pawn.FactionTag, 此处不动
+		//   - Player: 真理源在 PlayerState.CurrentFactionTag (Server 端 set, Client 端 OnRep)
+		//           此处从 PlayerState 同步 → Pawn.FactionTag (Server 单一写入点)
+		//   - 这是**单一真理源**而非"兜底": 阵营信息从 PlayerState 流向 Pawn, 不允许反向
+		// ============================================================
+		SyncFactionTagFromController(NewController);
 
-		// Layer 0: 从缓存的 Profile 同步武器/角色配置 (关卡预放 AI 专用)
-		// 调用 SyncWeaponFromProfile 会检查 MeleeProfile, 如果有效则填充空的 SpawnWeaponID
-		SyncWeaponFromProfile();
-
-		// Layer 1: AI 路径
-		if (!SpawnWeaponID.IsEmpty())
-		{
-			WeaponID = SpawnWeaponID;
-			UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using AI-profile weapon: %s, char: %s"),
-				*WeaponID, *CharacterID);
-		}
-
-		// Layer 2: 玩家路径
-		if (WeaponID.IsEmpty())
-		{
-			if (ARoomPlayerState* PS = NewController->GetPlayerState<ARoomPlayerState>())
-			{
-				// 设置当前角色ID（用于查找武器挂载配置）
-				if (CharacterID.IsEmpty())
-				{
-					CharacterID = PS->GetSelectedCharacterID();
-				}
-
-				WeaponID = PS->GetSelectedWeapon1ID();
-				UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using PlayerState weapon: %s"),
-					*WeaponID);
-			}
-		}
-
-		// Layer 3: GameMode 缓存兜底 (绕过 PS 网络复制时序问题)
-		if (WeaponID.IsEmpty())
-		{
-			if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-			{
-				FString CachedCharID;
-				FString CachedWeaponID;
-				if (GM->GetPlayerSpawnData(NewController->GetUniqueID(), CachedCharID, CachedWeaponID))
-				{
-					WeaponID = CachedWeaponID;
-					if (!CachedCharID.IsEmpty() && CharacterID.IsEmpty())
-					{
-						CharacterID = CachedCharID;
-					}
-					UE_LOG(LogTemp, Log, TEXT("[PossessedBy] Using cached weapon: %s, char: %s"),
-						*CachedWeaponID, *CachedCharID);
-				}
-			}
-		}
-
-		// 最终兜底: 没有武器就跳过 Spawn (不会崩, AI 也可能是无武器单位)
-		if (!WeaponID.IsEmpty())
-		{
-			SpawnAndEquipWeapon(WeaponID);
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[PossessedBy] 没找到武器ID, 跳过武器 Spawn. AI=%s, HasPS=%d"),
-				*GetNameSafe(this),
-				NewController->GetPlayerState<ARoomPlayerState>() ? 1 : 0);
-		}
+		// 【v32→v40.3 零兜底改造】武器 Spawn 链路彻底删除 (line 1504-1620)
+		//
+		// 历史链:
+		//   - v32-v40.2: PossessedBy 读 Pawn.SpawnWeaponID → RequestWeaponSpawn
+		//   - 同时 MeleeAIController::SetupMeleeAI 末尾也读 Pawn.SpawnWeaponID → RequestWeaponSpawn
+		//   → 2 个入口叠加, 时序问题让 AI 永远没武器 (Session1.log bug 根因)
+		//
+		// v40.3 修复: PossessedBy 只负责"非武器"职责
+		//   - SyncFactionTagFromController / HUD refresh / 头像 / HUD 重试
+		// 武器 Spawn 唯一入口:
+		//   - 关卡预放 AI: AMeleeAIController::SetupMeleeAI 末尾
+		//   - 玩家 Spawn:  URoomSpawnSubsystem::HandlePlayerRequestSpawn
+		//   - AI Spawn:    URoomSpawnSubsystem::SpawnAIInternal
+		// ============================================================
+// 【v40.3 P0 关键修复】PossessedBy 中武器 Spawn 链路已彻底删除
+//
+// 旧 (v32-v40.2) 反模式:
+//   - PossessedBy 末尾读 Pawn.SpawnWeaponID → RequestWeaponSpawn
+//   - 配合 MeleeAIController::SetupMeleeAI 末尾也读 → RequestWeaponSpawn
+//   → 2 个入口叠加, 时序问题让 AI 永远没武器 (Session1.log bug 根因)
+//
+// 新架构 (v40.3 — 单一真理源 + 集中调度):
+//   - 武器 Spawn **不在** PossessedBy (时序最早, 字段为空)
+//   - **不在** BaseCharacter 任何方法 (零兜底, 让 Spawn 路径自己负责)
+//   - 唯一入口 (按调用方分类):
+//       a) 关卡预放 AI: AMeleeAIController::SetupMeleeAI 末尾
+//          (与 SetMeleeConfig 写入字段"在同一函数内", 保证时序)
+//       b) 玩家 Spawn:   URoomSpawnSubsystem::HandlePlayerRequestSpawn
+//          (在 SpawnActor + SetSpawnLoadout + Possess 后, 调 RequestWeaponSpawn)
+//       c) AI Spawn:     URoomSpawnSubsystem::SpawnAIInternal
+//          (同上, 对 AI Pawn 调)
+//
+// 单一真理源保证:
+//   - RequestWeaponSpawn 用 GetOwnerCharacterChecked (v40.3 修复) — 不依赖 BeginPlay 时序
+//   - SpawnAndEquipWeapon 用 GetOwner() — 任何时序都拿到正确 Owner
+//   - Pawn.SetSpawnLoadout 写入字段 — Spawn 路径负责, SetMeleeProfile 负责 AI 默认路径
+//
+// PossessedBy 现在只负责"非武器"职责:
+//   - SyncFactionTagFromController (玩家 Pawn.FactionTag 同步) — 上面 line 1502
+//   - HUD refresh (RefreshHUDFromCurrentState)
+//   - 角色头像 (RefreshCharacterIcon)
+//   - HUD 重试调度
+//   **不**包含武器 Spawn — 由调用方 (SpawnSubsystem / AIController) 集中调度
+// ============================================================
 	}
 }
 
@@ -2771,243 +1675,105 @@ void ABaseCharacter::RetryRefreshHUD()
 
 
 /**
- * SpawnAndEquipWeapon
+ * 【v54.3 大厂重构 — 完全删除】SpawnAndEquipWeapon 旧版转发壳已彻底删除
  *
- * 根据 WeaponID 查表并生成+装备武器
- * 工业级规范: 指针与有效性校验贯穿全流程
+ * 旧版签名: void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
+ *
+ * 删除原因 (v54.3 中间层重构):
+ *   - 重复接口, 已统一到 RequestWeaponSpawn
+ *   - FString WeaponID 签名已彻底改为 TSubclassOf<ABaseWeapon>
+ *   - 旧 FString 版本无任何调用方, 保留只是 dead code
+ *   - 大厂原则: 单一真理源 = RequestWeaponSpawn(Class)
  */
-void ABaseCharacter::SpawnAndEquipWeapon(FString WeaponID)
+// void ABaseCharacter::SpawnAndEquipWeapon 已删除 (v54.3)
+
+
+/**
+ * FindWeaponAttachmentConfig — 转发壳
+ * 真实逻辑: WeaponAttachmentComponent::FindWeaponAttachmentConfig
+ *
+ * 【v49 大厂架构重构 — 单一真理源】
+ *   - 旧签名: (const FString& InCharacterID, const FString& InWeaponID) — 字符串匹配, 易错位
+ *   - 新签名: (TSubclassOf<ABaseCharacter>, TSubclassOf<ABaseWeapon>) — BP 强类型, 无错位
+ */
+FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(
+	TSubclassOf<ABaseCharacter> InPawnClass,
+	TSubclassOf<ABaseWeapon> InWeaponClass) const
 {
-	// 工业级规范: 指针与有效性校验
-	if (WeaponID.IsEmpty())
+	if (UWeaponAttachmentComponent* ResolvedAttach = const_cast<ABaseCharacter*>(this)->ResolveWeaponAttach())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponID 为空，直接返回"));
-		return;
+		return ResolvedAttach->FindWeaponAttachmentConfig(InPawnClass, InWeaponClass);
 	}
 
-	// 【P0 修复 2026.07.10 v2】幂等性检查 - 防止重复生成武器
-	// 根因: PossessedBy 和 SetupMeleeAI 在同一帧内都调用了 SpawnAndEquipWeapon
-	//        导致生成了两个武器,旧武器没有被销毁,飞出去成为残留物
-	// 根因链:
-	//   1. PossessedBy 先调用 SpawnAndEquipWeapon → 生成 BP_Weapon_Knife_C_4 → 挂载
-	//   2. SetupMeleeAI 再调用 SpawnAndEquipWeapon → 生成 BP_Weapon_Knife_C_5 → 覆盖 CurrentWeapon
-	//   3. C_4 没有被销毁,留在场景中 → AI 死亡时 detach + 物理模拟 → 飞出去
-	// 修复: 检查当前是否已有武器, 有则跳过
-	if (IsValid(CurrentWeapon))
-	{
-		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 已有武器 %s, 跳过生成 — WeaponID=[%s]"),
-			*CurrentWeapon->GetName(), *WeaponID);
-		return;
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 开始生成武器: WeaponID=[%s], CharacterID=[%s]"), *WeaponID, *CharacterID);
-
-	// 1. 从 GameMode 那里获取武器数据表
-	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-	if (!GM)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] GM 为空"));
-		return;
-	}
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] GM 获取成功: %s"), *GetNameSafe(GM));
-
-	if (!GM->WeaponDataTable)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponDataTable 未设置，请检查 BP_RoomGameMode 中的 WeaponDataTable 配置"));
-		return;
-	}
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponDataTable 有效"));
-
-	static const FString ContextString(TEXT("WeaponSpawnContext"));
-	FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponID), ContextString);
-
-	if (!WeaponInfo)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponInfo 未找到: %s，请检查 WeaponDataTable 中是否存在该行"), *WeaponID);
-		return;
-	}
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponInfo 查表成功: %s"), *WeaponID);
-
-	if (!WeaponInfo->WeaponBlueprint)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] WeaponBlueprint 为空，请在 WeaponDataTable 中为 %s 配置 WeaponBlueprint"), *WeaponID);
-		return;
-	}
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] WeaponBlueprint 有效: %s"), *WeaponInfo->WeaponBlueprint->GetName());
-
-	// 2. 查找武器挂载配置
-	FWeaponAttachmentConfig* AttachmentConfig = FindWeaponAttachmentConfig(CharacterID, WeaponID);
-
-	// 3. 在服务器上生成武器
-	FActorSpawnParameters SpawnParams;
-	SpawnParams.Owner = this;
-	SpawnParams.Instigator = this;
-
-	// 改造: WeaponBlueprint 改为 TSoftClassPtr (启动期不加载, 避免内存浪费)
-	// 这里运行时调用 LoadSynchronous 同步加载拿到 UClass* 再 SpawnActor
-	UClass* WeaponClass = WeaponInfo->WeaponBlueprint.LoadSynchronous();
-	if (!WeaponClass)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] 武器蓝图加载失败 (TSoftClassPtr)"));
-		return;
-	}
-
-	ABaseWeapon* NewWeapon = GetWorld()->SpawnActor<ABaseWeapon>(
-		WeaponClass,
-		GetActorLocation(),
-		GetActorRotation(),
-		SpawnParams
-	);
-
-	if (!NewWeapon)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SpawnWeapon] SpawnActor 失败"));
-		return;
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 武器生成成功: %s"), *NewWeapon->GetName());
-
-	// 4. 确定挂载参数
-	FName SocketName = TEXT("WeaponSocket_R"); // 默认右手插槽
-	FVector RelativeLocation = FVector::ZeroVector;
-	FRotator RelativeRotation = FRotator::ZeroRotator;
-	FVector RelativeScale = FVector(1.0f, 1.0f, 1.0f);
-
-	// 如果找到了挂载配置，使用配置值
-	if (AttachmentConfig)
-	{
-		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 使用挂载配置: Socket=%s, Loc=%s, Rot=%s"),
-			*AttachmentConfig->SocketName.ToString(),
-			*AttachmentConfig->RelativeLocation.ToString(),
-			*AttachmentConfig->RelativeRotation.ToString());
-		SocketName = AttachmentConfig->SocketName;
-		RelativeLocation = AttachmentConfig->RelativeLocation;
-		RelativeRotation = AttachmentConfig->RelativeRotation;
-		RelativeScale = AttachmentConfig->RelativeScale;
-	}
-	else
-	{
-		UE_LOG(LogTemp, Log, TEXT("[SpawnWeapon] 未找到挂载配置，使用默认值"));
-	}
-
-	// 5. 将武器焊接到角色的插槽上
-	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
-	NewWeapon->AttachToComponent(GetMesh(), AttachmentRules, SocketName);
-
-	// 6. 应用相对位置、旋转、缩放偏移
-	if (!RelativeLocation.IsNearlyZero())
-	{
-		NewWeapon->SetActorRelativeLocation(RelativeLocation);
-	}
-	if (!RelativeRotation.IsNearlyZero())
-	{
-		NewWeapon->SetActorRelativeRotation(RelativeRotation);
-	}
-	if (!RelativeScale.Equals(FVector(1.0f, 1.0f, 1.0f)))
-	{
-		NewWeapon->SetActorRelativeScale3D(RelativeScale);
-	}
-
-	// 7. 更新 CurrentWeapon 指针，这会触发网络同步
-	CurrentWeapon = NewWeapon;
-
-	// 8. 刷新战斗 HUD 上的武器图标（仅本地玩家）
-	if (IsLocallyControlled())
-	{
-		if (APlayerController* PC = GetController<APlayerController>())
-		{
-			if (AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD()))
-			{
-				if (UGameHUDWidget* GameHUD = HUD->GetGameHUDWidget())
-				{
-					GameHUD->UpdateWeaponIconFromID(WeaponID);
-				}
-			}
-		}
-	}
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseCharacter] FindWeaponAttachmentConfig: 找不到 WeaponAttachmentComponent."));
+	return nullptr;
 }
 
 
 /**
- * FindWeaponAttachmentConfig
+ * SetSpawnLoadout — 转发壳
+ * 真实逻辑: WeaponAttachmentComponent::SetSpawnLoadout
  *
- * 在 WeaponAttachmentDataTable 中查找挂载配置
- * 优先返回有具体 WeaponBlueprint 配置的（精确匹配）
- * 退而求其次，记录一个通配配置作为 fallback
+ * 【v36】改用 ResolveWeaponAttach lazy 查找, 字段为 null 时不再报错
  */
-FWeaponAttachmentConfig* ABaseCharacter::FindWeaponAttachmentConfig(const FString& InCharacterID, const FString& InWeaponID) const
+void ABaseCharacter::SetSpawnLoadout(const FString& InCharacterID, const FString& InWeaponID)
 {
-	static const FString ContextString(TEXT("WeaponAttachmentLookup"));
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] SetSpawnLoadout ENTER: this=%p Class=%s WeaponAttach=%p CharID=%s WeaponID=%s"),
+		this, *GetClass()->GetName(), WeaponAttach, *InCharacterID, *InWeaponID);
 
-	if (!WeaponAttachmentDataTable)
+	if (UWeaponAttachmentComponent* ResolvedAttach = ResolveWeaponAttach())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[WeaponAttachment] WeaponAttachmentDataTable 未设置!"));
-		return nullptr;
+		ResolvedAttach->SetSpawnLoadout(InCharacterID, InWeaponID);
 	}
-
-	UClass* CurrentCharacterClass = GetClass();
-
-	UE_LOG(LogTemp, Log, TEXT("[WeaponAttachment] 查找配置: CharacterID=%s, WeaponID=%s, CurrentClass=%s"), *InCharacterID, *InWeaponID, *CurrentCharacterClass->GetName());
-
-	TArray<FName> RowNames = WeaponAttachmentDataTable->GetRowNames();
-	FWeaponAttachmentConfig* FallbackMatch = nullptr;
-
-	for (const FName& RowName : RowNames)
-	{
-		FWeaponAttachmentConfig* Config = WeaponAttachmentDataTable->FindRow<FWeaponAttachmentConfig>(RowName, ContextString);
-		if (!Config) continue;
-
-		// 检查 TargetCharacter（软引用，需要 IsNull + LoadSynchronous）
-		if (!Config->TargetCharacter.IsNull())
-		{
-			UClass* TargetCharClass = Config->TargetCharacter.LoadSynchronous();
-			if (!TargetCharClass || TargetCharClass != CurrentCharacterClass) continue;
-		}
-
-		// 【关键修复】: 如果数据表中配置了具体 WeaponBlueprint（硬引用），检查是否匹配
-		// WeaponBlueprint 是 TSubclassOf，直接 == nullptr 判断
-		if (Config->WeaponBlueprint != nullptr && !InWeaponID.IsEmpty())
-		{
-			ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
-			if (GM && GM->WeaponDataTable)
-			{
-				static const FString WeaponContextString(TEXT("WeaponBlueprintLookup"));
-				FWeaponInfo* WeaponInfo = GM->WeaponDataTable->FindRow<FWeaponInfo>(FName(*InWeaponID), WeaponContextString);
-				// 改造: WeaponBlueprint 都是 TSoftClassPtr, 需 LoadSynchronous 拿到 UClass* 再 IsChildOf
-				if (WeaponInfo)
-				{
-					UClass* ConfigWeaponClass = Config->WeaponBlueprint.LoadSynchronous();
-					UClass* ActualWeaponClass = WeaponInfo->WeaponBlueprint.LoadSynchronous();
-					if (!ConfigWeaponClass || !ActualWeaponClass || !ActualWeaponClass->IsChildOf(ConfigWeaponClass))
-					{
-						continue;
-					}
-				}
-			}
-		}
-
-		UE_LOG(LogTemp, Log, TEXT("[WeaponAttachment] 找到匹配配置: RowName=%s"), *RowName.ToString());
-
-		// 优先返回有具体 WeaponBlueprint 配置的（精确匹配）
-		if (Config->WeaponBlueprint != nullptr)
-		{
-			return Config;
-		}
-
-		// 退而求其次，记录一个通配配置作为 fallback
-		if (!FallbackMatch)
-		{
-			FallbackMatch = Config;
-		}
-	}
-
-	if (!FallbackMatch)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[WeaponAttachment] 未找到匹配配置"));
-	}
-
-	return FallbackMatch;
+	// else: ResolveWeaponAttach 已 Log Error, 这里不再重复报错
 }
+
+
+/**
+ * GetSpawnWeaponID — 转发壳
+ * 真实逻辑: WeaponAttachmentComponent::GetSpawnWeaponID
+ */
+const FString& ABaseCharacter::GetSpawnWeaponID() const
+{
+	if (UWeaponAttachmentComponent* ResolvedAttach = const_cast<ABaseCharacter*>(this)->ResolveWeaponAttach())
+	{
+		return ResolvedAttach->GetSpawnWeaponID();
+	}
+
+	static const FString Empty = TEXT("");
+	return Empty;
+}
+
+
+/**
+ * GetCurrentWeapon — 转发壳
+ * 真实逻辑: WeaponAttachmentComponent::GetCurrentWeapon
+ *
+ * 【v36】改用 ResolveWeaponAttach lazy 查找 (避免字段为 null 时找不到组件)
+ */
+ABaseWeapon* ABaseCharacter::GetCurrentWeapon() const
+{
+	if (UWeaponAttachmentComponent* ResolvedAttach = const_cast<ABaseCharacter*>(this)->ResolveWeaponAttach())
+	{
+		return ResolvedAttach->GetCurrentWeapon();
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseCharacter] GetCurrentWeapon: 找不到 WeaponAttachmentComponent 组件. "
+			 "Pawn=%s. 【v36 修复】请检查 BP 蓝图 Components 面板, 确保有 WeaponAttachmentComponent 子对象. "
+			 "如果是 BP 子类, 检查 Components 面板的 'WeaponAttach' 是否被重命名或删除."),
+		*GetName());
+	return nullptr;
+}
+
+
+// ==========================================
+// 【v38 重构】ResolveWeaponAttach 已迁移到头文件 inline (走通用 ResolveComponent<T> 模板)
+// 历史 (v36) 实现已删除, 避免与模板版本重复.
+// 详见 BaseCharacter.h 中的 ResolveComponent<T> 模板.
+// ==========================================
 
 
 // ==========================================
@@ -3032,40 +1798,56 @@ ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
 /**
  * Multicast_NotifyKill_Implementation
  *
- * NetMulticast 实现: 服务器广播击杀信息给所有客户端
- * 1. 获取击杀者和被击杀者的名称
- * 2. 增加击杀者的击杀数和得分
- * 3. 向所有客户端的 HUD 广播击杀消息
- * 4. 如果击杀者是本地玩家，触发连杀图标更新
- * 5. 如果有助攻者，更新助攻者的数据
+ * NetMulticast 实现: 接收纯数据击杀消息 → 推送给所有客户端 HUD
+ *
+ * 【v31.6 大厂架构重构】从解 Actor* 改为接收字符串
+ *
+ * 历史痛点 (v22-v31.5) — Session3.log 崩溃栈:
+ *   Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000018
+ *   ABaseCharacter::Multicast_NotifyKill_Implementation() [BaseCharacter.cpp:3247]
+ *   UE_LOG: *VictimActor->GetName()  ← VictimActor 已 nullptr
+ *
+ * 根因: 服务器 TakeDamage → 触发 HealthComponent.OnDeath → Die() → Destroy()
+ *       但 Multicast_NotifyKill 在 Destroy 之前已发出, RPC 携带的 AActor* NetGUID
+ *       客户端解析时, 目标 Actor 可能已经被 bIsDead 复制触发的本地销毁标记为 Pending Kill
+ *       → 客户端拿到 nullptr → 解引用崩溃
+ *
+ * 大厂修复 (v31.6):
+ *   - RPC 签名改为 (FString KillerName, FString VictimName, EKillMethod KillMethod, bool bIsAssist)
+ *   - 服务器在 TakeDamage 时已本地读好所有数据, RPC 纯数据, 永远不可能 nullptr 崩溃
+ *   - 大厂原则: 任何 UE RPC 边界不允许传 Actor 引用 (跨 RPC 生命周期不可控)
+ *
+ * @param KillerName 击杀者姓名
+ * @param VictimName 被击杀者姓名
+ * @param KillMethod 击杀方式 (服务器已确定)
+ * @param bIsAssist  true=助攻提示 (HUD 展示图标不同)
  */
-void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AActor* AssistantActor)
+void ABaseCharacter::Multicast_NotifyKill_Implementation(const FString& KillerName, const FString& VictimName,
+                                                       EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer)
 {
-	UE_LOG(LogTemp, Log, TEXT("[BaseCharacter] Multicast_NotifyKill: Killer=%s, Victim=%s, HasAuthority=%d"),
-		*GetName(), *VictimActor->GetName(), HasAuthority());
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] Multicast_NotifyKill: Killer=%s, Victim=%s, Method=%d, IsAssist=%d, bIsKillerPlayer=%d, HasAuthority=%d"),
+		*KillerName, *VictimName, static_cast<int32>(KillMethod), bIsAssist ? 1 : 0,
+		bIsKillerPlayer ? 1 : 0, HasAuthority() ? 1 : 0);
 
-	// 获取击杀者和被击杀者的名称
-	FString KillerName = TEXT("Unknown");
-	FString VictimName = TEXT("Unknown");
+	// 大厂原则 (v31.6 零兜底): 字符串字段允许为空 (即没读到 PS 名字), 不允许静默崩溃
+	// 击杀者加分逻辑: 已在服务器 TakeDamage 流程中本地加, 不依赖 RPC 边界
 
-	// 获取击杀者名称
-	if (ARoomPlayerState* PS = GetRoomPlayerState())
+	// 【v40.9 P0 大厂架构】只有 Killer 是玩家时才推送 KillFeed 图标
+	// 业务规则: "击杀图标只用于玩家击杀其他玩家或者AI时才显示，被击杀不应该显示别人的击杀图标"
+	// - 玩家击杀玩家 → bIsKillerPlayer=true → KillFeed 显示 ✅
+	// - 玩家击杀 AI → bIsKillerPlayer=true → KillFeed 显示 ✅
+	// - AI 击杀玩家 → bIsKillerPlayer=false → KillFeed 不显示 ✅
+	// - AI 击杀 AI → bIsKillerPlayer=false → KillFeed 不显示 ✅
+
+	if (!bIsKillerPlayer)
 	{
-		KillerName = PS->GetPlayerName();
-		// 增加击杀者的击杀数和得分
-		PS->AddKillScore();
+		// AI 击杀: KillFeed 不显示，直接 return
+		// 连杀图标逻辑: 仅在当前玩家是击杀者时才更新（原有逻辑不变）
+		return;
 	}
 
-	// 获取被击杀者名称
-	if (ABaseCharacter* VictimChar = Cast<ABaseCharacter>(VictimActor))
-	{
-		if (ARoomPlayerState* VictimPS = VictimChar->GetRoomPlayerState())
-		{
-			VictimName = VictimPS->GetPlayerName();
-		}
-	}
-
-	// 向所有客户端的 HUD 广播击杀消息
+	// Killer 是玩家 — 推送 KillFeed 图标给所有客户端
 	if (UWorld* World = GetWorld())
 	{
 		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
@@ -3076,33 +1858,20 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(AActor* VictimActor, AA
 				{
 					if (UGameHUDWidget* HUDWidget = RoomPC->GetGameHUDWidget())
 					{
-						HUDWidget->AddKillFeedMessage(KillerName, VictimName, LastKillMethod);
+						// 推送击杀消息 (KillFeed) — 只有玩家击杀才显示
+						HUDWidget->AddKillFeedMessage(KillerName, VictimName, KillMethod);
 
 						// 判断是否是本地玩家（击杀者）自己的 HUD
-						// 如果击杀者是当前控制的角色，则更新自己的连杀图标
-						if (IsLocallyControlled())
+						// 如果击杀者是当前控制的角色, 则更新连杀图标 (仅非助攻)
+						if (!bIsAssist && IsLocallyControlled())
 						{
-							// 根据击杀方式判断是否是爆头
-							bool bIsHeadshot = (LastKillMethod == EKillMethod::PrimaryHeadshot ||
-								LastKillMethod == EKillMethod::SecondaryHeadshot ||
-								LastKillMethod == EKillMethod::MeleeHeadshot);
+							const bool bIsHeadshot = (KillMethod == EKillMethod::PrimaryHeadshot ||
+								KillMethod == EKillMethod::SecondaryHeadshot ||
+								KillMethod == EKillMethod::MeleeHeadshot);
 							HUDWidget->OnPlayerKill(bIsHeadshot);
 						}
 					}
 				}
-			}
-		}
-	}
-
-	// 如果有助攻者，也更新助攻者的数据
-	if (AssistantActor)
-	{
-		ABaseCharacter* AssistantChar = Cast<ABaseCharacter>(AssistantActor);
-		if (AssistantChar)
-		{
-			if (ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState())
-			{
-				AssistantPS->AddAssistScore();
 			}
 		}
 	}
@@ -3168,22 +1937,59 @@ bool ABaseCharacter::CanGrantAssist(AActor* PotentialAssistant) const
 /**
  * GrantAssistsToEligiblePlayers
  *
- * 授予符合条件的玩家助攻得分
- * 静态方法: 遍历受害者的最后攻击者记录
- * 排除击杀者本人，检查时间窗口
- * 更新助攻者的得分 + 广播助攻信息
+ * 授予符合条件的玩家助攻得分 — 单一职责 (大厂原则 v31.6)
+ *
+ * 职责:
+ *   1. 遍历 Victim.LastHitTimestamps
+ *   2. 给符合时间窗口的非 Killer 助攻者: PlayerState->AddAssistScore() + 广播助攻 RPC
+ *   3. 清理 Victim.LastHitTimestamps
+ *
+ * 不再负责 (已拆分):
+ *   - Killer.PlayerState->AddKillScore() → 由 TakeDamage 末尾统一调用
+ *   - Victim.PlayerState->AddDeath()     → 由 TakeDamage 末尾统一调用
+ *   - KillMethod 来源                     → 参数显式传入 (服务器本地读 Weapon->GetLastKillMethod())
+ *
+ * 大厂原则:
+ *   - 静态方法 (无 this 依赖), 只用 Victim / Killer 参数
+ *   - 不再做 RPC Actor* 传参, 改为纯数据 (FString + EKillMethod)
+ *   - 单一真理源: Weapon.LastKillMethod 决定 KillMethod, 不再依赖 Character.LastKillMethod
+ *
+ * @param Victim     受害者 (读取 LastHitTimestamps)
+ * @param Killer     击杀者 (排除)
+ * @param KillMethod 击杀方式 (传给 Multicast_NotifyKill 的纯数据 RPC)
+ * @param bIsKillerPlayer Killer 是否为玩家控制的角色 (决定是否显示 KillFeed 图标)
  */
-void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer)
+void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer,
+                                                  EKillMethod KillMethod, bool bIsKillerPlayer)
 {
-	if (!Victim || !Killer)
+	// 大厂零兜底: 入参校验 — 任何 null 都 Log Error + return, 不允许静默吞掉
+	if (!Victim)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] GrantAssistsToEligiblePlayers: Victim 为 null. "
+				 "调用方必须在 TakeDamage 死亡分支里调用, 传入 this."));
+		return;
+	}
+	if (!Killer)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] GrantAssistsToEligiblePlayers: Killer 为 null. "
+				 "调用方必须先校验 Killer Pawn 存在."));
 		return;
 	}
 
 	UWorld* World = Victim->GetWorld();
 	if (!World || !World->GetAuthGameMode())
 	{
+		// 非权威环境直接 return (服务器只在自己 world 加分)
 		return;
+	}
+
+	// 大厂准备 Victim 姓名 (一次性读取, 复用)
+	FString VictimName = TEXT("Unknown");
+	if (ARoomPlayerState* VictimPS = Victim->GetRoomPlayerState())
+	{
+		VictimName = VictimPS->GetPlayerName();
 	}
 
 	// 遍历受害者的最后攻击者记录
@@ -3202,32 +2008,38 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 		}
 
 		// 检查是否在时间窗口内
-		float TimeSinceHit = World->GetTimeSeconds() - HitPair.Value;
-		if (TimeSinceHit <= Victim->AssistTimeWindow)
+		const float TimeSinceHit = World->GetTimeSeconds() - HitPair.Value;
+		if (TimeSinceHit > Victim->AssistTimeWindow)
 		{
-			// 符合条件的助攻者
-			ABaseCharacter* AssistantChar = Cast<ABaseCharacter>(AttackerActor);
-			if (AssistantChar)
-			{
-				// 获取助攻者的 PlayerState
-				if (ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState())
-				{
-					AssistantPS->AddAssistScore();
-
-					// 广播助攻信息给所有客户端
-					AssistantChar->Multicast_NotifyKill(Victim, nullptr);
-				}
-			}
+			continue;
 		}
+
+		// 符合条件的助攻者
+		ABaseCharacter* AssistantChar = Cast<ABaseCharacter>(AttackerActor);
+		if (!AssistantChar)
+		{
+			continue;
+		}
+
+		ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState();
+		if (!AssistantPS)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter] 助攻者 '%s' 没有 ARoomPlayerState, 跳过加分."),
+				*AssistantChar->GetName());
+			continue;
+		}
+
+		// 服务器侧助攻加分 (单一真理源: AddAssistScore 内部 HasAuthority 守卫, 客户端不会重复)
+		AssistantPS->AddAssistScore();
+
+		// 广播助攻信息给所有客户端 — 纯数据 RPC, 不传 Actor*
+		// 【v40.9】助攻者的 KillFeed 显示由 bIsKillerPlayer 决定（主击杀者是否为玩家）
+		const FString AssistantName = AssistantPS->GetPlayerName();
+		AssistantChar->Multicast_NotifyKill(AssistantName, VictimName, KillMethod, /*bIsAssist=*/true, bIsKillerPlayer);
 	}
 
-	// 更新击杀者的死亡次数
-	if (ARoomPlayerState* VictimPS = Victim->GetRoomPlayerState())
-	{
-		VictimPS->AddDeath();
-	}
-
-	// 清理时间戳
+	// 清理时间戳 (Victim 已死, 历史不再需要)
 	Victim->LastHitTimestamps.Empty();
 }
 
@@ -3245,9 +2057,10 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
  */
 void ABaseCharacter::PlayFootstepSound(FVector Location)
 {
-	if (FootstepComponent)
+	// 【v39 修复】用 ResolveFootstepComponent 而非裸字段访问
+	if (UFootstepComponent* FC = ResolveFootstepComponent())
 	{
-		FootstepComponent->PlayFootstep(this, Location);
+		FC->PlayFootstep(this, Location);
 	}
 }
 
@@ -3333,20 +2146,20 @@ void ABaseCharacter::RefreshHUDFromCurrentState()
 		return;
 	}
 
-	// 血量
-	if (HealthComponent)
+	// 血量 - 【v39 修复】用 ResolveHealthComponent 而非裸字段访问
+	if (UHealthComponent* HC = ResolveHealthComponent())
 	{
-		const float Current = HealthComponent->GetCurrent();
-		const float Max = HealthComponent->GetMax();
+		const float Current = HC->GetCurrent();
+		const float Max = HC->GetMax();
 		GameHUDWidget->UpdateHealth(Current, Max);
 		GameHUDWidget->UpdateHealthText(FMath::CeilToInt(Current), FMath::CeilToInt(Max));
 	}
 
-	// 能量 - 【2026-06-15 重构】通过 EnergyComponent
-	if (EnergyComponent)
+	// 能量 - 【2026-06-15 重构】【v39 修复】用 ResolveEnergyComponent 而非裸字段访问
+	if (UEnergyComponent* EC = ResolveEnergyComponent())
 	{
-		const float ECurrent = EnergyComponent->GetCurrent();
-		const float EMax = EnergyComponent->GetMax();
+		const float ECurrent = EC->GetCurrent();
+		const float EMax = EC->GetMax();
 		GameHUDWidget->UpdateEnergy(ECurrent, EMax);
 		GameHUDWidget->UpdateEnergyText(FMath::CeilToInt(ECurrent), FMath::CeilToInt(EMax));
 	}
@@ -3370,15 +2183,17 @@ void ABaseCharacter::RefreshHUDFromCurrentState()
  */
 void ABaseCharacter::BroadcastCharacterIconReady(const FString& CharID, UTexture2D* Icon)
 {
-	if (!CharacterEvents)
+	// 【v39 修复】用 ResolveCharacterEvents 而非裸字段访问
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
 
 	// 【2026-07-01 P0 修复】"事件 + 缓存"双轨制
 	// 先写缓存, 再 Broadcast, 保证订阅者订阅时能从缓存拿到最新值
-	CharacterEvents->SetCachedCharacterIcon(CharID, Icon);
-	CharacterEvents->OnCharacterIconReady.Broadcast(CharID, Icon);
+	Events->SetCachedCharacterIcon(CharID, Icon);
+	Events->OnCharacterIconReady.Broadcast(CharID, Icon);
 }
 
 
@@ -3390,14 +2205,16 @@ void ABaseCharacter::BroadcastCharacterIconReady(const FString& CharID, UTexture
  */
 void ABaseCharacter::BroadcastACValueChanged(int32 NewAC)
 {
-	if (!CharacterEvents)
+	// 【v39 修复】用 ResolveCharacterEvents 而非裸字段访问
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
 
 	// 【2026-07-01 P0 修复】事件 + 缓存双轨
-	CharacterEvents->SetCachedACValue(NewAC);
-	CharacterEvents->OnACValueChanged.Broadcast(NewAC);
+	Events->SetCachedACValue(NewAC);
+	Events->OnACValueChanged.Broadcast(NewAC);
 }
 
 
@@ -3409,14 +2226,16 @@ void ABaseCharacter::BroadcastACValueChanged(int32 NewAC)
  */
 void ABaseCharacter::BroadcastACEWithRankChanged(int32 NewACE, EACERankType RankType)
 {
-	if (!CharacterEvents)
+	// 【v39 修复】用 ResolveCharacterEvents 而非裸字段访问
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
 
 	// 【2026-07-01 P0 修复】事件 + 缓存双轨
-	CharacterEvents->SetCachedACEState(NewACE, RankType);
-	CharacterEvents->OnACEWithRankChanged.Broadcast(NewACE, RankType);
+	Events->SetCachedACEState(NewACE, RankType);
+	Events->OnACEWithRankChanged.Broadcast(NewACE, RankType);
 }
 
 
@@ -3428,131 +2247,189 @@ void ABaseCharacter::BroadcastACEWithRankChanged(int32 NewACE, EACERankType Rank
  */
 void ABaseCharacter::BroadcastWeaponIconReady(const FString& WeaponID, UTexture2D* Icon)
 {
-	if (!CharacterEvents)
+	// 【v39 修复】用 ResolveCharacterEvents 而非裸字段访问
+	UCharacterEvents* Events = ResolveCharacterEvents();
+	if (!Events)
 	{
 		return;
 	}
-	CharacterEvents->OnWeaponIconReady.Broadcast(WeaponID, Icon);
+	Events->OnWeaponIconReady.Broadcast(WeaponID, Icon);
 }
 
 
 // ==========================================
-// 【Phase 1 重构】 IGenericTeamAgentInterface 实现
+// 【2026.07.10 大厂阵营重构 v1】 IGenericTeamAgentInterface 实现 (走 FFactionTags)
 //
-// 设计: GameplayTag 是单一真实源 (Single Source of Truth).
-//       uint8 GetTeamID() 是派生属性 (从 FactionTag 推 0/1),
-//       仅供旧代码兼容. 新代码全部用 GetGenericTeamId/GetTeamAttitudeTowards.
+// 单一真理源: FactionTag (FGameplayTag) — Offense/Defense 双阵营
+// 阵营协议层 (FGenericTeamId) 仅是 UE AIPerception 接口要求的"历史包袱",
+// 实现细节走内部映射, 不暴露给业务代码
+// 业务代码 (RoomGameMode/BaseAIController/UI) 统一用 FFactionTags::IsSameSide 等静态 API
 // ==========================================
 
-FGenericTeamId ABaseCharacter::ResolveGenericTeamIdFromTag(FGameplayTag InTag)
+// 【2026.07.11 P0 修复】OnRep_FactionTag — 客户端响应 Server 阵营变更
+//
+// 触发场景:
+//   - 服务器 SetGenericTeamId() / FactionTag = ... → 复制到客户端 → 客户端 OnRep 触发
+//   - 服务器 PossessedBy 从 PlayerState 同步 → 复制 → 客户端 OnRep
+//
+// 责任:
+//   1. 验证 Tag 是否有效, 无效 → Error 日志 (上层默认空是大厂禁止行为)
+//   2. UE AIPerception 的阵营表 (TArray<FPerceptionTeamID>) 内置缓存
+//      客户端阵营值变化时必须主动调 SetGenericTeamId 让引擎感知, 否则 SightSense 仍用旧值
+//   3. 广播 OnFactionTagChanged (后续 BT/UI 可订阅)
+//
+// 大厂原则: 真理源在 Pawn.FactionTag, Client 必须精确反映 Server 的当前值
+void ABaseCharacter::OnRep_FactionTag()
 {
-	// 【P0 大厂架构修复 2026.07.03】改为查表 + 严格匹配父级 Faction.X
-	// 旧版坑: 漏匹配 Faction.Enemy, AI 走 Profile.FactionTag="Faction.Enemy" → 走到末尾 return NoTeam
-	//        → Controller::SetGenericTeamId(NoTeam) 把 Pawn FactionTag 清空
-	//        → 下一帧 GetGenericTeamId() fallback 到 FGenericTeamId(0) = Player 阵营
-	//        → AIPerception 看到玩家后用阵营协议判定为 Friendly → 永远看不到
-	//
-	// 新版:
-	//   1. 用 TMap 集中维护 (添加新阵营不用动控制流)
-	//   2. 严格 MatchesTagExact, 避免 "Faction.Enemy" 误匹配 "Faction.EnemyBoss"
-	//   3. 兜底: 不认识的 FactionTag 一律返回 NoTeam(255), 不再污染为 0(Player)
-	//   4. 首次调用时懒初始化表 (避免模块启动期 GameplayTag 表未就绪)
+	const FName TagName = FactionTag.GetTagName();
 
-	static TMap<FName, FGenericTeamId> TagToTeamId;
-	static bool bTableInitialized = false;
-	if (!bTableInitialized)
+	if (!FFactionTags::IsValidFaction(FactionTag))
 	{
-		TagToTeamId.Add(TEXT("Faction.Player"),     FGenericTeamId(0));
-		TagToTeamId.Add(TEXT("Faction.Zombie"),     FGenericTeamId(1));
-		TagToTeamId.Add(TEXT("Faction.FriendlyAI"), FGenericTeamId(2));
-		TagToTeamId.Add(TEXT("Faction.Neutral"),    FGenericTeamId::NoTeam);
-		TagToTeamId.Add(TEXT("Faction.Enemy"),      FGenericTeamId(1)); // 【P0 关键】MeleeAI 走这个
-		TagToTeamId.Add(TEXT("Faction.Hostile.All"),FGenericTeamId(255));
-		bTableInitialized = true;
+		// 客户端拿到无效 Tag 也是错误 (Server 配错的客户端表现)
+		// 注意区分: Server 故意设了 Deprecated 旧 Tag (违规但合法), vs Server 没设 (None)
+		// 两者都让 bDetectNeutrals=false 的玩家永远不被 AI 看到 — 必须报错
+		if (FactionTag.IsValid())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[%s] OnRep_FactionTag: 收到非有效阵营 '%s' — Server 配错了, AI 永远不会识别此 Pawn 的敌我."
+				     " 修复: Server 端 Pawn.FactionTag 必须为 Faction.Offense 或 Faction.Defense"),
+				*GetName(), *TagName.ToString());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[%s] OnRep_FactionTag: Server 端未配 Pawn.FactionTag (空). AI 将此 Pawn 视为中立 (Neutral). "
+				     " 修复: Server 端 PossessedBy 时同步 PlayerState.CurrentFactionTag → Pawn.FactionTag"),
+				*GetName());
+		}
 	}
 
-	if (!InTag.IsValid())
-	{
-		return FGenericTeamId::NoTeam;
-	}
-
-	if (const FGenericTeamId* Found = TagToTeamId.Find(InTag.GetTagName()))
-	{
-		return *Found;
-	}
-
-	// 【P0 兜底】未识别 → NoTeam(255), 不再返回 0 (避免把 AI 误标为玩家阵营)
-	return FGenericTeamId::NoTeam;
+	// 【可选扩展点】若后续 BT/UI 需要响应阵营变化, 这里 broadcast 委托
+	// OnFactionTagChanged.Broadcast();
 }
 
 void ABaseCharacter::SetGenericTeamId(const FGenericTeamId& NewTeamID)
 {
-	// 【P0 修复 2026.07.03】反向写回 FactionTag, 跟正向 Resolve 严格对齐
-	// 旧版坑: ID=1 写 Faction.Zombie, 但 AI 配的是 Faction.Enemy, 下一帧 Resolve 会再算回 ID=1
-	//        → 反复横跳不影响功能, 但日志难追. 现在: 写 Faction.Enemy 保持命名稳定.
-	const int32 Id = NewTeamID.GetId();
-	if (Id == 0)         FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Player"));
-	else if (Id == 1)    FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Enemy")); // 跟正向表一致
-	else if (Id == 2)    FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.FriendlyAI"));
-	else if (Id == 255)  FactionTag = FGameplayTag::RequestGameplayTag(TEXT("Faction.Hostile.All"));
-	else                 FactionTag = FGameplayTag(); // NoTeam → 空 tag
+	// 【2026.07.10 v25】FGenericTeamId → FGameplayTag 统一走 FFactionTags::FromGenericTeamId
+	// (单一真理源: 所有转换都在 FFactionTags 内, ABaseCharacter 不再各自实现)
+	// 大厂原则: 非法 ID 在 FromGenericTeamId 内部已 Log Error, 此处不再重复
+	FactionTag = FFactionTags::FromGenericTeamId(NewTeamID);
 }
 
 FGenericTeamId ABaseCharacter::GetGenericTeamId() const
 {
+	// 【2026.07.10 v25】FGameplayTag → FGenericTeamId 走 FFactionTags::ToGenericTeamId
+	// 大厂原则: FactionTag 为空 → NoTeam 是 UE 协议层的合法状态, 不是兜底
 	if (FactionTag.IsValid())
 	{
-		return ResolveGenericTeamIdFromTag(FactionTag);
+		return FFactionTags::ToGenericTeamId(FactionTag);
 	}
-	// 【P0 修复 2026.07.03】无 FactionTag 时回退到 NoTeam(255), 不再默认 0(Player)
-	// 原理: AI 没配阵营时应该是 "非玩家" 的兜底, 跟 Resolve 表末尾的 NoTeam 对齐
-	//      之前默认 0 会导致: AI 没配 Profile → 跟玩家同阵营 → 不追玩家 (本次 bug 链的源头)
 	return FGenericTeamId::NoTeam;
 }
 
 ETeamAttitude::Type ABaseCharacter::GetTeamAttitudeTowards(const AActor& Other) const
 {
+	// 【2026.07.10 P0】走 FFactionTags::AttitudeBetween — 单一真理源
+	// 旧版"按 ID 奇偶判定阵营"启发式完全删除, 现在直接比 FGameplayTag
 	if (const IGenericTeamAgentInterface* OtherTeamAgent =
 		Cast<IGenericTeamAgentInterface>(&Other))
 	{
-		const FGenericTeamId OtherTeamId = OtherTeamAgent->GetGenericTeamId();
-		const FGenericTeamId MyTeamId = GetGenericTeamId();
-
-		// 同阵营 = Friendly
-		if (MyTeamId == OtherTeamId && OtherTeamId != FGenericTeamId::NoTeam)
-		{
-			return ETeamAttitude::Friendly;
-		}
-
-		// 显式 Hostile 标记 (UE 5.6 中没有 ::Hostile 静态, 用 (255) 数字)
-		const FGenericTeamId HostileId(255);
-		if (OtherTeamId == HostileId || MyTeamId == HostileId)
-		{
-			return ETeamAttitude::Hostile;
-		}
-
-		// 否则按 ID 分组: 偶数阵营互相 Friendly, 奇数阵营互相对立 (简单启发式)
-		const bool bOtherEvenTeam = (OtherTeamId.GetId() % 2) == 0;
-		const bool bMyEvenTeam     = (MyTeamId.GetId() % 2) == 0;
-		if (bOtherEvenTeam == bMyEvenTeam && MyTeamId != FGenericTeamId::NoTeam)
-		{
-			return ETeamAttitude::Friendly;
-		}
-		return ETeamAttitude::Hostile;
+		// 【2026.07.10 v25】IGenericTeamAgentInterface 不提供 GetFactionTag()
+		//   阵营 Tag 存在 Character 自己的字段里 (FactionTag), 需要从 Other 拿 Actor 再 Cast 到 ABaseCharacter
+		//   旧版 OtherTeamAgent->GetFactionTag() 编译失败, 因为 UE 接口根本没这方法
+		const ABaseCharacter* OtherChar = Cast<ABaseCharacter>(&Other);
+		const FGameplayTag OtherTag = OtherChar ? OtherChar->GetFactionTag() : FGameplayTag::EmptyTag;
+		return FFactionTags::AttitudeBetween(FactionTag, OtherTag);
 	}
 	return ETeamAttitude::Neutral;
 }
 
-uint8 ABaseCharacter::GetTeamID() const
+
+// ==========================================
+// 【2026.07.11 P0 修复】SyncFactionTagFromController
+//
+// 责任:
+//   - Server-only, 在 PossessedBy 头部调用 (复活 / 关卡预放 / 玩家加入 均触发)
+//   - AI Controller: 跳过 — AI 阵营真理源在 AIController.CachedFactionTag, 由 SetupMeleeAI 写入
+//     (若用户配置了 Pawn.FactionTag 默认值, 则尊重该值 — 这是 AI 的关卡预放约定)
+//   - Player Controller: 从 PlayerState.CurrentFactionTag 同步到 Pawn.FactionTag
+//     这才是"大厂原则 - 单一真理源":
+//       PlayerState.CurrentFactionTag (服务端权威, 已 Replicated) → Pawn.FactionTag (Pawn 本地镜像)
+//     Pawn.FactionTag 也 Replicated, 客户端 OnRep_FactionTag 同步收到 → AI 在 Client 端也能正确判定
+//
+// 大厂原则 - 零兜底:
+//   - Player Controller 没找到 PlayerState → 显式 Error, 不允许 Pawn 保持空 FactionTag
+//   - PlayerState.CurrentFactionTag 为空 → 显式 Error, 提示上层 GameMode (PostLogin) 漏初始化阵营
+//   - AI Controller 跳过同步 → 假设 SetupMeleeAI/SetupZombieAI 已写过 (关卡预放路径已 fix v26.5)
+//
+// 调用方:
+//   - ABaseCharacter::PossessedBy (Server)
+//
+// 验证:
+//   守护原则: 调用前 Pawn.FactionTag 必须是 Server 的真理 (即使没改也要走)
+//   防止 player 路径在 RoundStart 后切换阵营时不同步
+// ==========================================
+void ABaseCharacter::SyncFactionTagFromController(AController* InController)
 {
-	// 【Phase 1 重构】派生属性 — 从 FactionTag 反推 uint8, 仅旧代码用
-	switch (GetGenericTeamId().GetId())
+	// Guard 0: 防御 — 重复调用保护
+	if (!InController)
 	{
-	case 0: return 0; // Faction.Player -> 攻方
-	case 1: return 1; // Faction.Zombie -> 守方
-	case 2: return 2;
-	default: return 0;
+		return;
 	}
+
+	// ============ AI Controller 路径 — 跳过 ============
+	// AI 阵营真理源在 AIController.CachedFactionTag (v26.5 运行时真理)
+	// ABaseAIController::OnPossess + SetupMeleeAI/SetupZombieAI 都已经写过 Pawn.FactionTag (C++ 端)
+	// 关卡预放的 BP_GruntAI 由用户在 BP defaults 手动设的 Pawn.FactionTag 也保持原值
+	//
+	// 大厂原则: 不重复写, 避免"双源冲突"
+	//   若 AIC 路径有 bug, 反映在 AI 看玩家失败 — 但这是另一个问题, 不在 Player 路径修复
+	if (const ABaseAIController* AIC = Cast<ABaseAIController>(InController))
+	{
+		return;
+	}
+
+	// ============ Player Controller 路径 — 真理源同步 ============
+	ARoomPlayerState* PS = InController->GetPlayerState<ARoomPlayerState>();
+	if (!PS)
+	{
+		// 大厂原则 - 零兜底: Player Controller 应该有 PlayerState, 没有就是配置错误
+		UE_LOG(LogTemp, Error,
+			TEXT("[%s] SyncFactionTagFromController: Player Controller '%s' 没有 ARoomPlayerState! "
+			     "这会让 AI 永远看不到此玩家 (Pawn.FactionTag 保持空 → AI 视玩家为 Neutral). "
+			     "修复: 检查 ARoomGameMode::PostLogin 是否正确分配了 PlayerState"),
+			*GetName(), *InController->GetName());
+		return;
+	}
+
+	const FGameplayTag PlayerFactionTag = PS->CurrentFactionTag;
+	if (!PlayerFactionTag.IsValid())
+	{
+		// 大厂原则 - 零兜底: GameMode 启动时必须给玩家分阵营
+		UE_LOG(LogTemp, Error,
+			TEXT("[%s] SyncFactionTagFromController: PlayerState->CurrentFactionTag 为空! "
+			     "AI 视此玩家为中立 (Neutral), 永远不会追击. "
+			     "修复: 检查 ARoomGameMode::AssignPlayerFaction 或 PostLogin 是否有阵营初始化逻辑"),
+			*GetName());
+		return;
+	}
+
+	// 验证 Tag 合法性
+	if (!FFactionTags::IsValidFaction(PlayerFactionTag))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[%s] SyncFactionTagFromController: PlayerState->CurrentFactionTag='%s' 非 Faction.Offense/Defense. "
+			     "AI 永远看不到此玩家 (Pawn.FactionTag 同步失败)."),
+			*GetName(), *PlayerFactionTag.ToString());
+		return;
+	}
+
+	// 写入真理源 — DOREPLIFETIME(FactionTag) 让客户端自动 OnRep
+	FactionTag = PlayerFactionTag;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[%s] SyncFactionTagFromController: PlayerState.CurrentFactionTag='%s' → Pawn.FactionTag (Replicated)"),
+		*GetName(), *FactionTag.ToString());
 }
 
 

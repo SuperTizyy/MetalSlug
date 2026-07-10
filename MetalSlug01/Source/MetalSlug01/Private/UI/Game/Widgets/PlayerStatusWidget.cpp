@@ -57,8 +57,9 @@ void UPlayerStatusWidget::PullInitialDataFromCharacter()
 		{
 			// ==========================================
 			// 【2026-07-01 P0】从 CharacterEvents 缓存拉取头像 (主动补发)
+			// 【v39 修复】用 ResolveCharacterEvents 而非裸字段访问 (BP archetype null 字段防护)
 			// ==========================================
-			if (UCharacterEvents* Events = Character->CharacterEvents)
+			if (UCharacterEvents* Events = Character->ResolveCharacterEvents())
 			{
 				FString CachedCharID;
 				UTexture2D* CachedAvatar = nullptr;
@@ -75,6 +76,12 @@ void UPlayerStatusWidget::PullInitialDataFromCharacter()
 					UE_LOG(LogTemp, Verbose,
 						TEXT("[PlayerStatus][Pull-Initial] 无头像缓存, 等待事件推送"));
 				}
+
+				// 【v40.2 P0 修复】武器图标由 GameHUDWidget TryBindToCharacterEvents 补发 (镜像头像)
+				//   根因: PlayerStatusWidget 不持有 WeaponPanel 引用 (职责分离 — 武器图标属于 WeaponPanel)
+				//         GameHUDWidget 持有 Widget_WeaponPanel → 在 TryBindToCharacterEvents 内主动拉武器图标缓存 → 调 OnWeaponIconReady → 走 UpdateWeaponIconFromID → Widget_WeaponPanel->UpdateMeleeWeaponIcon
+				//   此处不再重复武器图标 Pull-Initial (避免 v40.2 误调 UpdateMeleeWeaponIcon 导致编译错误)
+				//   大厂原则 - 单一职责: PlayerStatus 只管 Status 字段 (HP/Energy/AC/ACE/头像), 武器图标由 HUD 整体层处理
 			}
 
 			// 拉取初始 AC 值（此时角色可能在服务端已经初始化过 AC）

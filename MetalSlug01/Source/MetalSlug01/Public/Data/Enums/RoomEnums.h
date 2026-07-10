@@ -1,7 +1,11 @@
 // ==========================================
 // 房间相关枚举
-// 作用: 拆出原 StaticTable.h 中的 ERoomState/ERoomTeam/ERoomMatchMode
+// 作用: 拆出原 StaticTable.h 中的 ERoomState/ERoomMatchMode
 // 优势: RoomGameMode/State/PC 只需要此头, 不再被其他无关表污染
+//
+// [2026.07.10 大厂阵营重构]
+//   已删除 ERoomTeam — 阵营表达统一走 FGameplayTag (见 Data/Faction/FactionTags.h)
+//   不再保留 None/Attack/Defense 三态, 因为 Offense/Defense 双阵营 + IsValidFaction 已足够表达
 // ==========================================
 #pragma once
 
@@ -22,27 +26,15 @@ enum class ERoomState : uint8
 };
 
 /**
- * @enum ERoomTeam
- * @brief 队伍类型
- * - None: 未分配
- * - Attack: 攻方
- * - Defense: 守方
- * 规范: 强类型枚举比 bool/int 更具可读性和扩展性
- */
-UENUM(BlueprintType)
-enum class ERoomTeam : uint8
-{
-	None    UMETA(DisplayName = "未分配"),
-	Attack  UMETA(DisplayName = "攻方"),
-	Defense UMETA(DisplayName = "守方")
-};
-
-/**
  * @enum ERoomMatchMode
  * @brief 房间比赛模式
  * - None: 无模式
  * - Melee: 刀战模式（30 分钟）
  * - Zombie: 生化模式（10 分钟）
+ *
+ * 阵营 Tag 由 FAIModeRules (ARoomGameMode::ModeRulesByMode) 决定:
+ *   - Melee:  AttackTeamFaction=Faction.Offense, DefenseTeamFaction=Faction.Defense
+ *   - Zombie: AttackTeamFaction=Faction.Offense (僵尸), DefenseTeamFaction=Faction.Defense (人类)
  */
 UENUM(BlueprintType)
 enum class ERoomMatchMode : uint8

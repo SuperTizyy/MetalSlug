@@ -11,8 +11,9 @@
 // 引入 UE 原生 APlayerState 类（基类）
 #include "GameFramework/PlayerState.h"
 
-// 引入房间相关枚举（ERoomTeam 等）
+// 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 #include "Data/Enums/RoomEnums.h"
+#include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
 
 // UE 自动生成的头文件
 #include "RoomPlayerState.generated.h"
@@ -108,11 +109,21 @@ public:
 	// ==========================================
 
 	/**
-	 * 当前所属队伍
-	 * ReplicatedUsing: 当服务器修改后，客户端收到新值时会自动触发 OnRep_Team
+	 * 【2026.07.10 P0 重构】玩家当前所属阵营 (FGameplayTag)
+	 *
+	 * 设计 (大厂原则 - 单一真理源):
+	 *   - 取代 ERoomTeam (None/Attack/Defense) — 全部阵营表达统一用 FGameplayTag
+	 *   - 有效值: Faction.Offense (攻方) / Faction.Defense (守方)
+	 *   - 由 ARoomGameMode::ModeRulesByMode 决定每种模式哪个 Tag 属于攻/守方
+	 *   - 初始值: Faction.Defense (玩家默认守方, 平衡设计; 模式启动后由 GameMode 重写)
+	 *
+	 * 迁移 (旧 BP 引用 ERoomTeam 字段会编译失败 → 显式更新 BP 即可):
+	 *   - ERoomTeam::None     → 空 Tag (新流程中不存在, GameMode 必须显式设)
+	 *   - ERoomTeam::Attack   → Faction.Offense
+	 *   - ERoomTeam::Defense  → Faction.Defense
 	 */
-	UPROPERTY(ReplicatedUsing = OnRep_Team, BlueprintReadOnly, Category = "Room|State")
-	ERoomTeam CurrentTeam;
+	UPROPERTY(ReplicatedUsing = OnRep_FactionTag, BlueprintReadOnly, Category = "Room|State")
+	FGameplayTag CurrentFactionTag;
 
 	/**
 	 * 玩家准备状态
@@ -120,6 +131,34 @@ public:
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_IsReady, BlueprintReadOnly, Category = "Room|State")
 	bool bIsReady;
+
+	/**
+	 * 【2026.07.11 v29.6 大厂原则】玩家是否已显式选择阵营
+	 *
+	 * 设计动机:
+	 *   - AddPlayerToRoom 内置 auto-balance 会按"哪边人少"自动分配阵营
+	 *   - 但 auto-balance 多次跑 (EnterSkipToHostMode 一次 + DelayedSendPlayerInfo 一次),
+	 *     会**反复覆盖**玩家已经在 UI 选过的阵营
+	 *   - 玩家点 Btn_JoinDefenseTeam 切队之后, 又被 auto-balance 改回 Offense → 用户感知"切队没生效"
+	 *
+	 * 大厂原则 (单一真理源 + 玩家意图不可覆盖):
+	 *   - 玩家主动切队 (ChangePlayerTeam 成功改阵营) → bHasExplicitlyChosenTeam = true, 并 Replicate
+	 *   - auto-balance 只在 bHasExplicitlyChosenTeam == false 时跑
+	 *   - 玩家从未主动切过 → 默认 Defense (PS 构造函数已设), auto-balance 可优化初值
+	 *   - 玩家主动切过 → auto-balance **不再动**, 玩家意图是真神
+	 *
+	 * 注: 不可 Reset; 跨 session 不持久化 (P0 这版先 Reload-only, 未来如需 reset 重连场景, 再加 reset API)
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|State")
+	bool bHasExplicitlyChosenTeam = false;
+
+	/**
+	 * 【2026.07.11 v29.6】服务器专用: 标记玩家已显式选择阵营
+	 *
+	 * 调用方: ARoomGameMode::ChangePlayerTeam (收到玩家主动切队请求, 改阵营成功后)
+	 * 大厂原则: 一旦玩家主动切队, auto-balance 永远不再覆盖
+	 */
+	void Server_MarkTeamExplicitlyChosen();
 
 	// ==========================================
 	// 3. 计分板数据 (Scoreboard Data)
@@ -214,10 +253,11 @@ public:
 	// ==========================================
 
 	/**
-	 * 队伍变化时的客户端回调
+	 * 【2026.07.10 重构】FactionTag 变化时的客户端回调
+	 * 替代原 OnRep_Team, OnRep 函数名变更仅为清晰区分 — UI 监听 OnStateChanged 即可
 	 */
 	UFUNCTION()
-	void OnRep_Team();
+	void OnRep_FactionTag();
 
 	/**
 	 * 准备状态变化时的客户端回调

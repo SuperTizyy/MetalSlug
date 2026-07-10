@@ -73,7 +73,7 @@ void UBaseAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	float Acceleration = Character->GetCharacterMovement()->GetCurrentAcceleration().Length();
 
 	// 动态获取当前的最高限速（下蹲时是 300，站立时是 600）
-	float CurrentMaxSpeed = Character->bIsCrouched ? Character->GetCharacterMovement()->MaxWalkSpeedCrouched : 600.0f;
+	float CurrentMaxSpeed = Character->bIsCrouched ? Character->GetCharacterMovement()->MaxWalkSpeedCrouched : 400.0f;
 
 	if (Character->bIsMovementLocked)
 	{

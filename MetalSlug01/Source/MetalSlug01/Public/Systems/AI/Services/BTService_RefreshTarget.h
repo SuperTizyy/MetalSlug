@@ -1,14 +1,18 @@
 // Copyright (c) 2026.
 //
-// 【P0 2026.07.08 BT 原子库】BTService — 目标刷新 (感知失效兜底)
+// 【2026.07.13 v40.6 反扎堆重构】BTService — 反扎堆目标申请
 //
-// 定位:
-//   - 周期检查 BB.TargetActor 是否还有效
-//   - 失效时调 AIController::ScanForNearestEnemy 重新找
-//   - 兜底: AIPerception 漏触发时 (玩家走出视野又走回来), BT 仍能恢复追踪
+// 职责:
+//   - 周期调 URoomTargetingSubsystem::RequestTargetForAI 申请锁定目标
+//   - 账本 (AIHuntingMap) 自动反扎堆: 已锁定的敌人不会被其他 AI 再锁定
+//   - 账本单一真理源: TargetingSubsystem.AIHuntingMap
 //
-// 频率: 默认 0.3s — 不需要每 0.1s, 玩家不会 0.3s 内消失又出现
-// 降 CPU: 比 AIPerception 自带 OnTargetPerceptionUpdated 更鲁棒 (扫描兜底)
+// 大厂原则:
+//   - BT 为主, C++ 为辅: 原子能力在 BT 节点里, 不用 Script 决策
+//   - 零兜底: Subsystem 不可用 / 无候选 → Log Error + Failed
+//   - 单一真理源: 账本由 TargetingSubsystem 统一管理, Service 只读不写账本
+//
+// 频率: 默认 0.3s — 跟随战场变化但不抖动 (账本稳定锁定)
 
 #pragma once
 
@@ -21,9 +25,9 @@ struct FBlackboardKeySelector;
 
 /**
  * UBTService_RefreshTarget
- * 周期性检查目标, 失效则重新扫描
+ * 周期调账本申请锁定目标 (反扎堆账本驱动)
  */
-UCLASS(Blueprintable, meta = (DisplayName = "Refresh Target (刷新目标)"))
+UCLASS(Blueprintable, meta = (DisplayName = "Refresh Target (反扎堆账本)"))
 class METALSLUG01_API UBTService_RefreshTarget : public UBTService
 {
 	GENERATED_BODY()
@@ -36,11 +40,6 @@ public:
 	/** 目标 BB Key */
 	UPROPERTY(EditAnywhere, Category = "Blackboard")
 	FBlackboardKeySelector TargetKey;
-
-	/** 扫描半径 (cm) — 超过这个距离的目标不重新选 */
-	UPROPERTY(EditAnywhere, Category = "Perception",
-		meta = (ClampMin = "100.0", ClampMax = "10000.0"))
-	float ScanRadius = 3000.f;
 
 protected:
 	virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,

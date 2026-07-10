@@ -11,6 +11,17 @@
 #include "GameFramework/PlayerController.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
+// 【2026.07.11 v28】FFactionTags::Offense / Defense (房间阵营常量)
+#include "Data/Faction/FactionTags.h"
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
+// 【v49 大厂架构】DT_CharacterInfo 反查 (CharacterName → RowName)
+#include "Data/Tables/CharacterTableRow.h"          // 【v54.2】FCharacterInfo / ConfigSoftRef
+#include "Data/AI/AIBehaviorConfigSO.h"             // 【v54.2】UAIBehaviorConfigSO
+// 【v51 大厂架构】DT_WeaponInfo 反查 (WeaponName → RowName + 反查 PawnClass)
+#include "Data/Tables/WeaponTableRow.h"
+// 【v51 大厂架构】TSubclassOf<ABaseCharacter> 完整定义 (FAISpawnRequest.AIPawnClass)
+#include "Characters/BaseCharacter.h"
+#include "Engine/DataTable.h"
 
 // ==========================================
 // 静态访问器
@@ -44,6 +55,27 @@ ARoomGameMode* URoomService::GetRoomGameMode() const
 	return Cast<ARoomGameMode>(World->GetAuthGameMode());
 }
 
+/**
+ * 【v49 大厂架构 — 单一真理源】反查 CharacterName → DT_CharacterInfo RowName
+ *
+ * 业务场景:
+ *   UI ComboBox_AICharacter 显示 "斯沃特AI" (FCharacterInfo.CharacterName)
+ *   但 SpawnAIInternal 需要 DT_CharacterInfo 的 RowName 才能查 CharacterBlueprint
+ *   → 必须反查
+ *
+ * 大厂原则 (零兜底):
+ *   - 找不到精确匹配 → Log Error + return NAME_None
+ *   - 调用方必须显式拒绝入队, 强制修复 DT 配置
+ *   - 不允许 fallback 到 "CharacterName 当 RowName" — 那是大厂反模式
+ */
+// 【v51 大厂重构 — 已删除】ResolveCharacterInfoRowName 函数已被完全删除
+//
+// 删除原因 (真理源整合):
+//   - 旧 (v49): UI 选 CharacterName → 调本函数反查 RowName → SpawnAIInternal 又反查 PawnClass
+//   - 两端反查, 反查路径不清晰
+//   - 新 (v51): RequestAddAI 一次性反查全部字段 (RowName + AIPawnClass + WeaponID)
+//   - 反查路径只有一条, 完全消除反查分散
+
 FString URoomService::GetCurrentAccountName() const
 {
 	if (UGameInstance* GI = GetGameInstance())
@@ -62,15 +94,35 @@ FString URoomService::GetCurrentAccountName() const
 
 void URoomService::RequestChangeTeam(bool bToAttackTeam)
 {
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomService] RequestChangeTeam(%s) called"),
+		bToAttackTeam ? TEXT("Attack=Offense") : TEXT("Defense"));
+
+	APlayerController* EffPC = GetEffectivePC();
+	const FString PCClassName = EffPC ? EffPC->GetClass()->GetName() : TEXT("nullptr");
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomService] RequestChangeTeam: EffectivePC=%s (Class=%s)"),
+		EffPC ? *EffPC->GetName() : TEXT("nullptr"),
+		*PCClassName);
+
+	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(EffPC))
 	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomService] RequestChangeTeam: 走 RPC 路径 Server_RequestChangeTeam"));
 		PC->Server_RequestChangeTeam(bToAttackTeam);
 		return;
 	}
 	// 独立进程模式：直接调 GameMode
+	UE_LOG(LogTemp, Warning,
+		TEXT("[RoomService] RequestChangeTeam: PC 不是 ARoomPlayerController, 走独立进程 fallback"));
 	if (ARoomGameMode* GM = GetRoomGameMode())
 	{
-		GM->ChangePlayerTeam(GetEffectivePC(), bToAttackTeam);
+		GM->ChangePlayerTeam(EffPC, bToAttackTeam);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService] RequestChangeTeam: GameMode 也拿不到, 切队失败, 玩家不会换阵营!"));
 	}
 }
 
@@ -103,16 +155,187 @@ void URoomService::RequestSendChatMessage(const FString& Message)
 	}
 }
 
-void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName, int32 Count)
+void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName, const FString& WeaponName, int32 Count)
 {
-	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))
+	if (Count <= 0)
 	{
-		PC->Server_AddAI(bToAttackTeam, CharacterName, Count);
 		return;
 	}
-	if (ARoomGameMode* GM = GetRoomGameMode())
+
+	// 【v51 大厂架构重构 — 单一真理源 + 零兜底】
+	//
+	// 真理源链路 (您设计的):
+	//   UI ComboBox_AICharacter 选 CharacterName (FCharacterInfo.CharacterName)
+	//      ↓ 反查 DT_CharacterInfo[CharacterName]
+	//   拿 RowName + CharacterBlueprint (TSoftClassPtr<ABaseCharacter>)
+	//      ↓ LoadSynchronous → AIPawnClass (BP 强类型)
+	//   一并写入 Request
+	//
+	//   UI ComboBox_AIWeapon 选 WeaponName (FWeaponInfo.WeaponName)
+	//      ↓ 反查 DT_WeaponInfo[WeaponName]
+	//   拿 WeaponID (RowName)
+	//   写入 Request.WeaponID
+	//
+	// 旧 (v49) 反模式:
+	//   - UI 传 CharacterName → 反查 RowName → SpawnAIInternal 又反查 PawnClass
+	//   - UI 传 WeaponName (字段名错叫 WeaponID) → SpawnAIInternal 反查 WeaponID
+	//   - 两端反查, 反查路径不清晰
+	//
+	// 新 (v51):
+	//   - RoomService 一次反查全做完 (RowName + PawnClass + WeaponID)
+	//   - SpawnAIInternal 不再反查 (单一真理源)
+	//   - 字段命名修正: 第二个参数实质是 WeaponName (UI 显示名)
+
+	ARoomGameMode* GM = GetRoomGameMode();
+	if (!GM)
 	{
-		GM->AddAIToRoom(bToAttackTeam, CharacterName, Count);
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] GM 为空, 拒绝入队. "
+			     "【v51 零兜底】RoomService 必须在 GameMode 存在时才能入队 AI."));
+		return;
+	}
+
+	// 1. 反查 DT_CharacterInfo → 拿 RowName + CharacterBlueprint + ConfigSoftRef (真理源完整传递)
+	//
+	// 【v54.2 大厂架构重构】
+	//   - 旧 (v54.1): 反查只拿 RowName + CharacterBlueprint, ConfigSO 走 SpawnAIInternal fallback
+	//     后果: ConfigSO 在 Possess 之后才注入, SpawnInvincibilitySeconds 等真理分散在多处
+	//   - 新 (v54.2): UI 阶段一次性拿全 (CharacterInfoRowName + AIPawnClass + ConfigSO)
+	//     好处: SpawnAIInternal 入口就拿到 Config, 所有派生计算真理源统一
+	//
+	FName CharacterInfoRowName = NAME_None;
+	TSubclassOf<ABaseCharacter> AIPawnClass = nullptr;
+	TObjectPtr<UAIBehaviorConfigSO> ResolvedConfig = nullptr;
+
+	if (CharacterName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] CharacterName 为空, 拒绝入队. "
+			     "【v51 零兜底】UI ComboBox_AICharacter 必须选角色."));
+		return;
+	}
+
+	if (!GM->CharacterDataTable)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] CharacterDataTable 未配置. "
+			     "【修复路径】GM_RoomGameMode Class Defaults → CharacterDataTable 必须配 DT_CharacterInfo."));
+		return;
+	}
+
+	static const FString Ctx(TEXT("RoomService.RequestAddAI.Character"));
+	{
+		TArray<FName> RowNames = GM->CharacterDataTable->GetRowNames();
+		for (const FName& RowName : RowNames)
+		{
+			if (FCharacterInfo* Row = GM->CharacterDataTable->FindRow<FCharacterInfo>(RowName, Ctx))
+			{
+				if (Row->CharacterName.ToString() == CharacterName)
+				{
+					CharacterInfoRowName = RowName;
+					// 【v51 关键】同步拿 PawnClass, 不让 SpawnAIInternal 二次反查
+					if (!Row->CharacterBlueprint.IsNull())
+					{
+						AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
+					}
+					// 【v54.2 关键】同步拿 ConfigSO (真理源完整传递)
+					//   - 用户决策 2026.07.16: "SpawnInvincibilitySeconds 是所有 AI 的字段"
+					//   - 必须 UI 阶段拿到 Config, SpawnAIInternal 才有真理源
+					if (!Row->ConfigSoftRef.IsNull())
+					{
+						ResolvedConfig = Row->ConfigSoftRef.LoadSynchronous();
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	if (CharacterInfoRowName.IsNone() || !AIPawnClass || !ResolvedConfig)
+	{
+		// 【v54.2 大厂原则 — 零兜底】三个字段 (RowName / AIPawnClass / ConfigSO) 任一为空都拒绝入队
+		const FString AIPawnClassName = AIPawnClass ? AIPawnClass->GetName() : FString(TEXT("<null>"));
+		const FString ConfigName = ResolvedConfig ? ResolvedConfig->GetName() : FString(TEXT("<null>"));
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] DT_CharacterInfo 行校验失败 (CharacterName='%s'). "
+			     "RowName='%s', AIPawnClass='%s', ConfigSO='%s'. "
+			     "【v54.2 零兜底】任一字段为空都拒绝入队. "
+			     "【修复路径1】DT_CharacterInfo 行 CharacterBlueprint 字段必须配 BP_*. "
+			     "【修复路径2】DT_CharacterInfo 行 ConfigSoftRef 字段必须配 DA_AIBehaviorConfig_*.uasset. "
+			     "【修复路径3】检查 UI ComboBox_AICharacter 选项源与 DT_CharacterInfo 是否一一对应."),
+			*CharacterName,
+			*CharacterInfoRowName.ToString(),
+			*AIPawnClassName,
+			*ConfigName);
+		return;
+	}
+	// 2. 反查 DT_WeaponInfo → 拿 WeaponID (RowName)
+	//    WeaponID 是字符串 (与 DT_WeaponInfo RowName 一致), 不需要 Class 强类型
+	//    Class 在武器挂载时由 WeaponAttachmentComponent 内部 DT_WeaponInfo → WeaponBlueprint 反查
+	FString WeaponID;
+	if (WeaponName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] WeaponName 为空, 拒绝入队. "
+			     "【v51 零兜底】UI ComboBox_AIWeapon 必须选武器."));
+		return;
+	}
+
+	if (!GM->WeaponDataTable)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] WeaponDataTable 未配置. "
+			     "【修复路径】GM_RoomGameMode Class Defaults → WeaponDataTable 必须配 DT_WeaponInfo."));
+		return;
+	}
+
+	static const FString WCtx(TEXT("RoomService.RequestAddAI.Weapon"));
+	{
+		TArray<FName> RowNames = GM->WeaponDataTable->GetRowNames();
+		for (const FName& RowName : RowNames)
+		{
+			if (FWeaponInfo* Row = GM->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WCtx))
+			{
+				if (Row->WeaponName.ToString() == WeaponName)
+				{
+					WeaponID = RowName.ToString();
+					break;
+				}
+			}
+		}
+	}
+
+	if (WeaponID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] DT_WeaponInfo 找不到 WeaponName='%s' 的有效行. "
+			     "【v51 零兜底】拒绝入队. "
+			     "【修复路径1】打开 DT_WeaponInfo — 添加 WeaponName='%s' 的行. "
+			     "【修复路径2】检查 UI ComboBox_AIWeapon 选项源与 DT_WeaponInfo 是否一一对应."),
+			*WeaponName, *WeaponName);
+		return;
+	}
+
+	// 3. 构造 FAISpawnRequest — 真理源完整传递 (v54.2 Config 字段已加)
+	FAISpawnRequest Request;
+	Request.Mode                 = ERoomMatchMode::Melee;
+	Request.FactionTag           = bToAttackTeam ? FFactionTags::Offense() : FFactionTags::Defense();
+	Request.CharacterInfoRowName = CharacterInfoRowName;  // UI 反查结果 (真理源)
+	Request.AIPawnClass          = AIPawnClass;            // 【v51 新增】BP 强类型, 直接 Spawn
+	Request.Config               = ResolvedConfig;         // 【v54.2 新增】ConfigSO 真理源, 通过 DT 反查拿到
+	Request.WeaponID             = WeaponID;               // UI 反查结果 (真理源, RowName)
+	Request.Count                = Count;
+	// 【v54 大厂架构重构】ProfileTag 已从 FAISpawnRequest 删除 (字段不存在)
+	Request.bUseTeamSpawnPoint   = true;
+
+	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))
+	{
+		PC->Server_QueueAIForBattleSpawn(Request);
+		return;
+	}
+	if (ARoomGameMode* GM2 = GetRoomGameMode())
+	{
+		GM2->QueueAIForBattleSpawn(Request);
 	}
 }
 
@@ -129,6 +352,12 @@ void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const F
 		if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
 		{
 			PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+
+			// v31.4 P0: 同步到 URoomSpawnSubsystem 缓存 (复活路径的真理源)
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				SpawnSys->SetPlayerSpawnData(PC->GetUniqueID(), CharacterRowName, Weapon1RowName);
+			}
 		}
 	}
 }
@@ -257,6 +486,28 @@ void URoomService::EnterSkipToHostMode()
 					UE_LOG(LogTemp, Log,
 						TEXT("[RoomService] EnterSkipToHostMode: 已同步 GameState->HostPlayerName=%s"),
 						*LocalAccountName);
+
+					// ==========================================
+					// 【2026.07.11 v29 P0 架构修复】测试模式走完整登录流程
+					// 历史: EnterSkipToHostMode 只 set HostPlayerName, 完全绕过 PostLogin
+					//   → PlayerState 没生成 → PlayerArray 空 → UI Box 不显示 widget
+					//   → AI 不识别玩家阵营 → AI 永远不攻击玩家
+					// 新: 显式调用 GM->AddPlayerToRoom(PC, LocalAccountName), 走完整登录流程
+					//   - AddPlayerToRoom 内部: SpawnPlayerState (测试模式补回) + AddUnique PlayerArray
+					//   - 智能分配攻/守方 + OnRep_FactionTag + BroadcastSystemMessage + OnPlayerJoined
+					//   - 生产模式 PostLogin 已 add, AddUnique 幂等保证不重复
+					// 大厂原则 - 单一真理源: HostPlayerName 和 PlayerArray 都由 GM 权威, 不再 RoomService 半截状态
+					// ==========================================
+					if (ARoomGameMode* GM = World->GetAuthGameMode<ARoomGameMode>())
+					{
+						GM->AddPlayerToRoom(PC, LocalAccountName);
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[RoomService] EnterSkipToHostMode: AuthGameMode 不是 ARoomGameMode (测试模式 GM 没生成?) — PlayerArray 不会 add, UI 不显示玩家"),
+							*LocalAccountName);
+					}
 				}
 			}
 		}

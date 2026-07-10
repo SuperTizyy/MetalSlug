@@ -26,6 +26,7 @@
 
 #include "CoreMinimal.h"
 #include "Data/Enums/CombatEnums.h" // EACERankType (ACE 排名颜色枚举)
+#include "Components/HealthComponent.h" // FOnInvincibilityChanged (无敌期事件)
 #include "CharacterEvents.generated.h"
 
 // 前向声明 (减少 include 依赖)
@@ -184,6 +185,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Weapon")
 	FOnWeaponIconReady OnWeaponIconReady;
 
+	/** 无敌期状态变化 【2026.07.14 新增 - 显示复活进度条用】 */
+	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Invincibility")
+	FOnInvincibilityChanged OnInvincibilityChanged;
+
 	// ==========================================
 	// 【2026-07-01 P0 新增】快照访问器 (订阅者主动拉取)
 	// ==========================================
@@ -223,6 +228,26 @@ public:
 	/** 写入 ACE + 排名快照 */
 	void SetCachedACEState(int32 InACE, EACERankType InRank);
 
+	/**
+	 * 【v40.2 P0 新增】写入武器图标快照
+	 *
+	 * 大厂原则 - "事件 + 缓存"双轨制:
+	 *   - 与头像缓存完全对称 (镜像 SetCachedCharacterIcon)
+	 *   - Bind-Snapshot 补发场景: HUD 订阅成功后, 主动拉取快照 → 调用 OnWeaponIconReady 模拟补发
+	 *   - 解决了"武器图标 RPC 比 HUD 订阅早触发 → HUD 永远丢失武器图标"问题
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
+	void SetCachedWeaponIcon(const FString& InWeaponID, UTexture2D* InIcon);
+
+	/**
+	 * 【v40.2 P0 新增】获取当前缓存的武器图标
+	 * @param OutWeaponID 武器 ID (空 = 尚无广播)
+	 * @param OutIcon     武器图标贴图 (可能为 nullptr, 表示查表失败)
+	 * @return true=有缓存, false=尚未有任何武器图标广播
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
+	bool GetCachedWeaponIcon(FString& OutWeaponID, UTexture2D*& OutIcon) const;
+
 protected:
 	// ==========================================
 	// 内部: 复制配置 (RemoteRole=Skip, 事件在本地触发)
@@ -256,4 +281,22 @@ protected:
 	/** 缓存: 是否已有任何 ACE 广播 (用于区分 "ACE=0" 与 "尚未广播") */
 	UPROPERTY()
 	bool bCachedACEValid = false;
+
+	/**
+	 * 【v40.2 P0 新增】武器图标快照缓存 (镜像 CachedCharacterID/CachedAvatarIcon)
+	 *
+	 * 大厂原则 - 单一真理源:
+	 *   - 这只是 HUD Bind-Snapshot 用的"快照", 不是武器图标的真理源
+	 *   - 真理源在 Owner->GetSpawnWeaponID() (Replicated 字段) + Owner 持有的 ABaseWeapon 实际图标资源
+	 */
+	UPROPERTY()
+	FString CachedWeaponID = FString();
+
+	/** 缓存: 最近一次武器图标广播的 武器图标贴图 (nullptr = 查表失败) */
+	UPROPERTY()
+	TObjectPtr<UTexture2D> CachedWeaponIcon = nullptr;
+
+	/** 缓存: 是否已有任何武器图标广播 (用于区分 "尚无" 与 "空字符串") */
+	UPROPERTY()
+	bool bCachedWeaponIconValid = false;
 };

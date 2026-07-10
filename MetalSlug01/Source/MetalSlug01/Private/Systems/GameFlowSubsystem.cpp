@@ -18,6 +18,15 @@
 // 引入房间业务服务（EnterSkipToHostMode 显式标房主 - 测试绕行专用 API）
 #include "Services/RoomService.h"
 
+// 引入房间 GameState (CurrentMatchMode)
+#include "Systems/RoomGameState.h"
+
+// 引入房间模式枚举 (ERoomMatchMode)
+#include "Data/Enums/RoomEnums.h"
+
+// 引入会话管理器 (SetSkipLoginRoomDisplayInfo - v54.5.1 skip-login 房间名专用)
+#include "Systems/Session/SessionManagerSubsystem.h"
+
 // 引入 UGameplayStatics 类（提供 OpenLevel 等静态函数）
 // 作用: 用于执行关卡切换、玩家查询等通用静态操作
 #include "Kismet/GameplayStatics.h"
@@ -395,73 +404,80 @@ void UGameFlowSubsystem::BootToLogin()
 				TEXT("[GameFlow][测试绕行] RoomService 不可用, 房主身份标定失败"));
 		}
 
-		// ---- Step 3: 根据当前 World 类型分发 UI ----
-		// 【大厂 P0 修复 2026.07.03】架构反思: RoomInside 由 RoomPC 接管, 不走 UIViewService
+		// ---- Step 3: bSkipLoginDirectToLobby=true 直通房间 ----
+		// 【v54.5.1 Bug 修复 + 重构】旧走 MainLobby 导致 RoomInside 不显示
+		//   旧行为: TransitToState(MainLobby) → RoomPC P0-Fallback 误拦截 → RoomInside 显示失败
+		//   新行为: 直接 TransitToState(InRoom) → RoomPC 正常处理 → RoomInside 正确显示
 		// ==========================================
-		// 旧实现 (有 Bug):
-		//   战斗地图 → OnInterrupted.Broadcast(RoomInside)
-		//   → UIViewService 静默失败 (Panel RoomInside 未配置 WidgetClass)
-		//   → RoomInsidePage 永远不被创建
-		//   → 玩家直接看到战斗 3D 场景, 没有任何 UI 覆盖
-		//
-		// 架构事实:
-		//   RoomInside 是由 RoomPlayerController::OnFlowStateChanged(InRoom) 唯一创建入口
-		//   UIViewService 显式不接管 (注释: "RoomInside 面板由 RoomPlayerController 接管创建")
-		//   → OnInterrupted 通道对 RoomInside 无效
-		//
-		// 新实现 (大厂架构 - 状态机单一入口):
-		//   战斗地图 → TransitToState(InRoom) + SetTargetRoomMapName(当前地图)
-		//   → HandleStateEntry(InRoom) 看到 TargetRoomMapName 匹配当前地图 → 不重复 OpenLevel
-		//   → OnStateChanged(InRoom) 广播 → RoomPC 接管创建 RoomInsidePage
-		//   → RoomInsidePage 看到 URoomService.bIsHost=true → 房主按钮可见
-		//
-		// L_Login 处理保持不变:
-		//   → TransitToState(MainLobby) → UIViewService 自动 ShowPanel(LANRoom)
-		// ==========================================
-		UWorld* World = GetWorld();
-		if (World)
+		// Step 3a: 设目标地图 (GameFlowSubsystem 持有 TargetRoomMapName, HandleStateEntry(InRoom) 会 OpenLevel)
+		//   注意: 清空后再 TransitToState, 让 RoomPC::OnFlowStateChanged(InRoom) 先执行 (地图比较时 TargetRoomMapName 为空,
+		//          不会误判当前地图而触发额外的 OpenLevel)
+		//   TestSettings 已在 line 379 声明, 直接复用
+		const FString BattleMapName = TestSettings->DebugSkipBattleMapName.IsEmpty()
+			? TEXT("Japanese_Temple_Demo") : TestSettings->DebugSkipBattleMapName;
+
+		// Step 3b: 设房间模式 (GameState.CurrentMatchMode)
+		ERoomMatchMode RoomMode = ERoomMatchMode::Melee;
+		if (TestSettings)
 		{
-			const FString CurMapName = World->GetMapName();
-			const bool bIsBattleMap = CurMapName.Contains(TEXT("Japanese_Temple"))
-				|| CurMapName.Contains(TEXT("Room"))
-				|| CurMapName.Contains(TEXT("Battle"))
-				|| CurMapName.Contains(TEXT("Combat"));
-
-			if (bIsBattleMap)
+			RoomMode = TestSettings->GetDebugSkipRoomMode();
+			if (RoomMode == ERoomMatchMode::None)
 			{
-				// 战斗地图: 走状态机 InRoom, 让 RoomPC 创建 RoomInsidePage
-				//   - 关键: 必须先 SetTargetRoomMapName = 当前地图名,
-				//           否则 HandleStateEntry(InRoom) 会报 "TargetRoomMapName is NONE"
-				//   - HandleStateEntry 内部已经判断 "已在目标地图则不 OpenLevel"
-				//   - CurrentState 被设为 InRoom, 触发 OnStateChanged 广播 → RoomPC 接管
-				UE_LOG(LogGameFlow, Log,
-					TEXT("[GameFlow][测试绕行] 当前在战斗地图 %s, TransitToState(InRoom) 让 RoomPC 创建 RoomInsidePage"),
-					*CurMapName);
-
-				// 用 CurrentMapName 作为 TargetRoomMapName (去除可能的 PIE 前缀 UEDPIE_0_)
-				FName CurrentMapFName = FName(*CurMapName);
-				SetTargetRoomMapName(CurrentMapFName);
-
-				// 走状态机 → RoomPC 接管
-				TransitToState(EMatchState::InRoom);
+				RoomMode = ERoomMatchMode::Melee;
+				UE_LOG(LogGameFlow, Warning,
+					TEXT("[GameFlow][测试绕行] DebugSkipRoomMode=None, 强制用 Melee"));
 			}
-			else
+		}
+		if (UWorld* World = GetWorld())
+		{
+			if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
 			{
-				// L_Login 或其他主菜单地图: 走标准 MainLobby → UIViewService 显示 LANRoomPage
+				GS->CurrentMatchMode = RoomMode;
 				UE_LOG(LogGameFlow, Log,
-					TEXT("[GameFlow][测试绕行] 当前在主菜单地图 %s, TransitToState(MainLobby)"),
-					*CurMapName);
-				TransitToState(EMatchState::MainLobby);
+					TEXT("[GameFlow][测试绕行] 已设置 CurrentMatchMode=%d"), (int32)RoomMode);
 			}
+		}
+
+		// Step 3c: 【v54.5.1 修复】先写入 skip-login 测试房间显示信息，再 TransitToState
+		//   根因: TransitToState 会同步广播 OnStateChanged(InRoom)，RoomInsidePage::NativeConstruct
+		//          在广播时就执行，此时必须读到 SkipLoginRoomName，否则显示硬编码默认值 "未命名房间"
+		//   单一职责: SessionManager 是 skip-login 房间名真理源, GameFlowSubsystem 是唯一写入入口
+		FString SkipLoginRoomName;
+		if (RoomMode == ERoomMatchMode::Melee)
+		{
+			SkipLoginRoomName = FString::Printf(TEXT("测试-刀战模式-%s"), *BattleMapName);
 		}
 		else
 		{
-			// World 不可用 (极端边缘) — 兜底走 MainLobby
-			UE_LOG(LogGameFlow, Warning,
-				TEXT("[GameFlow][测试绕行] World 不可用, 兜底 TransitToState(MainLobby)"));
-			TransitToState(EMatchState::MainLobby);
+			SkipLoginRoomName = FString::Printf(TEXT("测试-生化模式-%s"), *BattleMapName);
+		}
+		if (UGameInstance* GI = GetWorld()->GetGameInstance())
+		{
+			if (USessionManagerSubsystem* SessionMgr = GI->GetSubsystem<USessionManagerSubsystem>())
+			{
+				FString SkipLoginGameMode = (RoomMode == ERoomMatchMode::Melee)
+					? TEXT("刀战模式") : TEXT("生化模式");
+				SessionMgr->SetSkipLoginRoomDisplayInfo(SkipLoginRoomName, SkipLoginGameMode);
+			}
 		}
 
+		// Step 3d: 先清空 TargetRoomMapName, 再 TransitToState
+		//   TransitToState 会先 Broadcast(InRoom) → RoomPC::OnFlowStateChanged(InRoom)
+		//   RoomPC 看到 TargetRoomMapName=NAME_None → 地图比较失败 → 不会误 OpenLevel → 直接创建 RoomUI
+		//   然后 HandleStateEntry(InRoom) 才设置 TargetRoomMapName 并检查是否需要 OpenLevel
+		TargetRoomMapName = NAME_None;
+
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[GameFlow][测试绕行] bSkipLoginDirectToLobby=true, 地图=%s, 模式=%d, TransitToState(InRoom) (v54.5.1 修复)"),
+			*BattleMapName, (int32)RoomMode);
+
+		TransitToState(EMatchState::InRoom);
+
+		// Step 3e: HandleStateEntry(InRoom) 执行时设置 TargetRoomMapName
+		//   此时 RoomPC::OnFlowStateChanged(InRoom) 已执行完 (RoomUI 已创建)
+		//   HandleStateEntry 看到 TargetRoomMapName=NAME_None → 走 else 分支 → 不 OpenLevel
+		//   玩家留在当前地图 (Japanese_Temple_Demo), RoomUI 已显示
+		SetTargetRoomMapName(FName(*BattleMapName));
 		return;
 	}
 
@@ -627,6 +643,17 @@ void UGameFlowSubsystem::HandleStateEntry(EMatchState State)
 		// 【架构精进】战斗态和房间态在同一个地图！
 		// 不需要物理跳转。事件广播出去后，交给 RoomPlayerController / RoomGameMode
 		// 去把"房间UI"隐藏，并把"准星血条UI"挂出来
+
+		// 【v54.5.1 新增】离开 InRoom 时清空 skip-login 测试房间显示信息
+		//   单一职责: SessionManager 持有 skip-login 字段, GameFlowSubsystem 是唯一清空入口
+		//   注意: World 已在 HandleStateEntry 入口声明并校验 (line 561)
+		if (UGameInstance* GI = World->GetGameInstance())
+		{
+			if (USessionManagerSubsystem* SessionMgr = GI->GetSubsystem<USessionManagerSubsystem>())
+			{
+				SessionMgr->ResetSkipLoginRoomDisplayInfo();
+			}
+		}
 		break;
 
 	default:
@@ -978,14 +1005,19 @@ void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
 		TEXT("[GameFlow] OnWorldBeginPlay (PIE 入口 B): BootToLogin 已被入口 A 抢先执行, 延迟同步当前状态 %d (Name=%s)"),
 		(int32)CurrentState, *CurName);
 
-	// 战斗地图 → InRoom 自愈 (Joiner 容错, 与 HandlePostLoadMapWithWorld 路径 2 一致)
+	// 【v54.5 Bug 修复】战斗地图自愈逻辑收紧 — 不再误判 Login 状态
+	//   旧行为: L_Login 打开后, HandleWorldBeginPlay(L_Login) 走路径 3 → bIsBattleMapWorld 检测
+	//          → 误判 L_Login 为战斗地图 (因为 CurMapName=Japanese_Temple 还在旧 World) → 广播 InRoom → Login 页面消失
+	//   新行为: 只有 CurrentState 已在 Login 或更高 (MainLobby/InRoom) 时才考虑战斗地图自愈
+	//   场景: Joiner 加入战斗地图时, CurrentState=InRoom, 但 World 还是战斗地图 → 正常广播 InRoom
 	const FString WorldName = World->GetMapName();
 	const bool bIsBattleMapWorld =
 		WorldName.Contains(TEXT("Japanese_Temple")) ||
 		WorldName.Contains(TEXT("Room")) ||
 		WorldName.Contains(TEXT("Battle")) ||
 		WorldName.Contains(TEXT("Combat"));
-	if (bIsBattleMapWorld && CurrentState != EMatchState::InRoom)
+	// 【v54.5 关键修复】排除 Login 状态 — Login 是启动过渡态, 战斗地图自愈不应干预
+	if (bIsBattleMapWorld && CurrentState > EMatchState::Login && CurrentState != EMatchState::InRoom)
 	{
 		UE_LOG(LogGameFlow, Warning,
 			TEXT("[GameFlow] OnWorldBeginPlay: 检测到 World=%s 是战斗地图, 但 CurrentState=%d (%s), 强制修正为 InRoom (Joiner 容错)"),

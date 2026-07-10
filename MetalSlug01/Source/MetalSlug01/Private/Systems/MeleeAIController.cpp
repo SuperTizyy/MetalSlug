@@ -1,197 +1,256 @@
 ﻿// Copyright (c) 2026.
 //
-// 【Phase 2 模式化】刀战 AI 控制器
+// 【v54.4 大厂架构重构】MeleeAIController 简化 — 直接接 UAIBehaviorConfigSO
 //
-// 设计 (Phase 2 之后):
-//   - 自身不写任何"配感知"代码 (已上收 ABaseAIController)
-//   - 不写任何"选目标"代码 (走 RoomGameMode::RequestTargetForAI 多态)
-//   - 仅保留 SetupMeleeAI 作为"刀战专属入口"的钩子 (BP 兼容性 + 未来刀战专属逻辑的扩展点)
+// 【v54.4 职责明确】单一职责: 只处理「关卡预放 AI」路径的入口
+//   OnPossess → SetupMeleeAI → InitializeFromConfig → 启动 BT + 武器 + 无敌期
 //
-// 与 Phase 1 区别:
-//   - Phase 1: MeleeAIController 写死了 ConfigurePerceptionFromConfig + SightConfig 字段
-//   - Phase 2: 全部上收 Base; MeleeAIController 仅留空类壳子 (BTTask 仍可 Cast 它调 BP)
+// 大厅入队 AI (房主从 UI 添加) 不走这里:
+//   走 SpawnAIInternal → InitializeFromConfig(EffectiveConfig) (Base 直接调)
+//   大厅 AI 的 BT 来源 = GM.ModeRulesByMode[Mode].BehaviorTree (按游戏模式)
 //
-// 未来: 若刀战加"怒气爆发"等专属机制, 在这里加; 否则可以删除直接用 ABaseAIController
+// v54 之前: MeleeAIController 持 UAIProfileAsset (DefaultMeleeProfile)
+// v54 之后: 关卡预放 AI 走 SetupMeleeAI, 大厅 AI 走 SpawnAIInternal (Base 直接调)
 
-// 引入本类的头文件，包含刀战 AI 控制器的类声明
 #include "Systems/MeleeAIController.h"
 
-// 引入 AI 运行时配置组件，用于存储难度缩放后的战斗/感知参数
-#include "Systems/AI/AIRuntimeConfigComponent.h"
-// 引入 AI 行为类型定义，包含难度等级枚举等
-#include "Systems/AI/AIBehaviorTypes.h"
-// 引入 AI 行为配置静态对象，包含行为树引用和战斗/感知原始参数
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Data/AI/AIBehaviorConfigSO.h"
-// 引入 AI Profile 资产，包含阵营标签、行为配置和角色/武器信息
-#include "Data/AI/AIProfileAsset.h"
-// 引入基础角色类，用于设置角色的出生装备（武器/角色 ID）
 #include "Characters/BaseCharacter.h"
-// 【P0 修复 2026.07.06】引入 RoomPlayerState（用于武器生成兜底）
-#include "Systems/Core/RoomPlayerState.h"
-// 【P0 修复 2026.07.06】引入 RoomGameMode（用于武器生成兜底）
-#include "Systems/RoomGameMode.h"
+#include "Components/CharacterEvents.h"
+#include "Components/HealthComponent.h"
+#include "Combat/WeaponAttachmentComponent.h"
+#include "GameFramework/Pawn.h"
+#include "Logging/LogMacros.h"  // UE_LOG 宏定义 (虽然用 LogTemp, 此头文件保证宏展开)
 
-// 定义本文件的静态日志分类，所有 UE_LOG 使用此分类输出，方便在日志中过滤
-DEFINE_LOG_CATEGORY_STATIC(LogMeleeAI, Log, All);
-
-// 构造函数：初始化刀战 AI 控制器
 AMeleeAIController::AMeleeAIController()
 {
-	// 构造函数空 — 所有配置由 Profile 注入
-	// 不在构造函数中创建任何默认子对象或设置，所有配置通过 Profile 异步注入
+	// 【v54 重构】不需要 CreateDefaultSubobject RuntimeConfig — 已由 Base 处理
 }
 
-// OnPossess：当控制器接管 Pawn 时调用，用于关卡预放 AI 的自举
+// OnPossess：关卡预放 AI 自动注入默认 Config
 void AMeleeAIController::OnPossess(APawn* InPawn)
 {
-	// 【P0 2026.07.08 调试用】Warning 级别 log, 强制显示 OnPossess 入口
-	UE_LOG(LogMeleeAI, Warning, TEXT("[%s] >>> AMeleeAIController::OnPossess ENTERED (Pawn=%s, GetCurrentProfile=%s, DefaultMeleeProfile=%s)"),
-		*GetName(), *GetNameSafe(InPawn),
-		*GetNameSafe(GetCurrentProfile()),
-		*GetNameSafe(DefaultMeleeProfile));
-
-	// 【P0 大厂修复 2026.07.03 19:35】关卡预放 AI 自举
-	//
-	// 场景: BP_GruntAI 摆在地图上, 引擎自动 Possess 我们的 AIController.
-	//       没有任何外部代码会调 SetupMeleeAI.
-	//       → 当前 CurrentProfile 为空, 后续感知/BT/武器全失效.
-	//
-	// 修复: OnPossess 是 Controller 的"自举点" — 没 Profile 就用 DefaultMeleeProfile
-	//       (设计师在 BP_MeleeAIController 蓝图里拖入 DA_AIProfile_MeleeGrunt 即可)
-
-	// 调用父类 OnPossess，确保引擎基类的接管逻辑正常执行（如同步 RuntimeConfig 组件）
+	// 调用父类 OnPossess（RuntimeConfig 初始化）
 	Super::OnPossess(InPawn);
 
-	// 检查条件：当前没有 Profile（关卡预放 AI 的典型场景）且默认刀战 Profile 已配置
-	if (!GetCurrentProfile() && DefaultMeleeProfile)
+	// 【v54 重构】关卡预放 AI 路径
+	//   - 大厅 AI 路径由 SpawnAIInternal 在 Possess 之后调 InitializeFromConfig, 不需要这里
+	//   - 关卡预放 AI 没有 Spawn 调用方, 必须由 OnPossess 兜底注入 DefaultMeleeConfig
+	if (!DefaultMeleeConfig)
 	{
-		// 输出日志，记录自举注入的默认 Profile 和接管的 Pawn 名称
-		UE_LOG(LogMeleeAI, Warning, TEXT("[MeleeAI] OnPossess 自举注入 DefaultMeleeProfile=%s, Pawn=%s"),
-			*DefaultMeleeProfile->GetName(), *GetNameSafe(InPawn));
-		// 调用刀战专属设置函数，注入默认 Profile，完成 AI 初始化
-		SetupMeleeAI(DefaultMeleeProfile);
-	}
-}
-
-// SetupMeleeAI：刀战 AI 专属设置入口，配置武器/角色/阵营并启动行为树
-void AMeleeAIController::SetupMeleeAI(UAIProfileAsset* MeleeProfile)
-{
-	// 【P0 2026.07.08 调试用】Warning 级别 log
-	UE_LOG(LogMeleeAI, Warning, TEXT("[%s] >>> AMeleeAIController::SetupMeleeAI ENTERED (Profile=%s)"),
-		*GetName(), *GetNameSafe(MeleeProfile));
-
-	// 检查传入的 Profile 是否为空，为空则直接返回
-	if (!MeleeProfile)
-	{
+		// 显式报错 (大厂原则 — 零兜底)
+		UE_LOG(LogTemp, Error,
+			TEXT("[MeleeAI] OnPossess: DefaultMeleeConfig 未配置, 关卡预放 AI '%s' 无法启动 BT. "
+				 "修复: 打开 BP_MeleeAIController → Class Defaults → 拖入 DA_AIBehaviorConfig_*.uasset 到 Default Melee Config"),
+			*GetName());
 		return;
 	}
 
-	// 1. 同步加载 Config -> Apply 到 RuntimeConfig (与 Phase 1 一致)
-	// 同步加载行为配置资产（包含行为树、战斗/感知参数）
-	UAIBehaviorConfigSO* Config = MeleeProfile->LoadBehaviorConfigSync();
-	// 如果配置加载成功且运行时配置组件存在，将配置应用到组件上
-	if (Config && RuntimeConfig)
+	UE_LOG(LogTemp, Warning,
+		TEXT("[%s] >>> AMeleeAIController::OnPossess ENTERED (DefaultMeleeConfig=%s, InPawn=%s)"),
+		*GetName(), *DefaultMeleeConfig->GetName(), *GetNameSafe(InPawn));
+
+	// 调用 SetupMeleeAI 走 ConfigSO 入口
+	SetupMeleeAI(DefaultMeleeConfig);
+}
+
+// SetupMeleeAI：刀战 AI 专属设置入口（关卡预放路径 + 大厅路径都可调）
+//
+// 【v54 重构】直接接 UAIBehaviorConfigSO, 不再接 UAIProfileAsset
+//   - 关卡预放路径: OnPossess → SetupMeleeAI(DefaultMeleeConfig) → InitializeFromConfig
+//   - 大厅路径: SpawnAIInternal → InitializeFromConfig(EffectiveConfig) (不走这里)
+void AMeleeAIController::SetupMeleeAI(UAIBehaviorConfigSO* MeleeConfig)
+{
+	// 【P0 2026.07.08 调试用】Warning 级别 log
+	UE_LOG(LogTemp, Warning,
+		TEXT("[%s] >>> AMeleeAIController::SetupMeleeAI ENTERED (Config=%s)"),
+		*GetName(), *GetNameSafe(MeleeConfig));
+
+	// 零兜底 — ConfigSO 必须有效
+	if (!MeleeConfig)
 	{
-		// 将配置参数（战斗/感知）写入运行时配置组件，供后续感知/BT 使用
-		RuntimeConfig->ApplyConfig(Config);
+		UE_LOG(LogTemp, Error,
+			TEXT("[MeleeAI] SetupMeleeAI: MeleeConfig 为空, 关卡预放 AI '%s' 无法启动 BT. "
+				 "修复: 检查 BP_MeleeAIController → Default Melee Config 是否配置"),
+			*GetName());
+		return;
 	}
 
-	// 2. 设置 Faction (走 IGenericTeamAgentInterface)
-	// 如果 Profile 的阵营标签有效，解析并设置 AI 的阵营 ID
-	if (MeleeProfile->FactionTag.IsValid())
+	// 【v56 大厂架构修复】关卡预放 AI 阵营获取
+	//
+	// 设计决策 (用户 2026.07.16):
+	//   - AIBehaviorConfigSO 不允许添加 DefaultFactionTag
+	//   - 关卡预放 AI 的阵营必须从角色类 (Pawn BP) 的 FactionTag 属性获取
+	//
+	// 获取优先级:
+	//   1. CachedFactionTag (已有值, 说明 BaseAIController::OnPossess 已缓存)
+	//   2. RoomSpawnSubsystem::GetCachedLevelPlacedAIFaction (扫描缓存)
+	//   3. Pawn->GetFactionTag() (直接读取 Pawn 的 FactionTag 属性)
+	//
+	// 零兜底: 如果三者都获取不到有效阵营, 报错并拒绝继续
+	FGameplayTag EffectiveFactionTag;
+
+	if (CachedFactionTag.IsValid())
 	{
-		// 通过 ABaseCharacter 的工具函数将阵营标签转换为 GenericTeamId，并设置给 AI
-		// 阵营 ID 会同步到 Pawn 上，供感知系统判定敌我
-		SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(MeleeProfile->FactionTag));
+		// 已有缓存, 直接用
+		EffectiveFactionTag = CachedFactionTag;
+		UE_LOG(LogTemp, Log,
+			TEXT("[%s] SetupMeleeAI: 阵营来源=CachedFactionTag, FactionTag='%s'"),
+			*GetName(), *EffectiveFactionTag.ToString());
 	}
-
-	// 【P0 大厂架构重构 2026.07.06】改调 SetMeleeProfile
-	//
-	// 为什么改:
-	//   - 旧: SetupMeleeAI 调 SetSpawnLoadout(CharID, WeaponID)
-	//         但 SetSpawnLoadout 只在 !InXXXID.IsEmpty() 时写入
-	//         如果 DA_AIProfile_MeleeGrunt.WeaponID="" (默认值 NAME_None)
-	//         传入 FString() 空字符串 → 旧 SetSpawnLoadout 跳过写入
-	//         → SpawnWeaponID 永远为空 → AI 没武器
-	//
-	//   - 新: 调 SetMeleeProfile(MeleeProfile)
-	//         SetMeleeProfile 先存 MeleeProfile 引用
-	//         再解析 Profile.WeaponID / Profile.CharacterRowName (FName → FString)
-	//         最后调 SetSpawnLoadout (新实现: 无论是否为空都写入)
-	//         即使 Profile.WeaponID="" 也会被写入
-	//         PossessedBy 中的 SyncWeaponFromProfile 能从 MeleeProfile 兜底填充
-	//
-	// 调用栈:
-	//   OnPossess → SetupMeleeAI → SetMeleeProfile → SetSpawnLoadout (同步写入)
-	//   PossessedBy → SyncWeaponFromProfile → 兜底读取 MeleeProfile.WeaponID
-	//   两层保障: 同步写入 + 异步兜底
-
-	// 获取当前控制的 Pawn
-	if (APawn* MyPawn = GetPawn())
+	else
 	{
-		// 尝试将 Pawn 转换为 ABaseCharacter 类型，以便设置出生装备
-		if (ABaseCharacter* BaseChar = Cast<ABaseCharacter>(MyPawn))
+		// 尝试从 RoomSpawnSubsystem 获取 (扫描缓存)
+		UWorld* World = GetWorld();
+		if (World)
 		{
-			// 【P0 修复 2026.07.06】改调 SetMeleeProfile
-			// MeleeProfile 已在 OnPossess 开头通过 DefaultMeleeProfile 注入
-			// SetMeleeProfile 会解析 WeaponID/CharacterRowName 并写入 Pawn 字段
-			BaseChar->SetMeleeProfile(MeleeProfile);
-
-			// 【P0 修复 2026.07.06 时序问题】手动触发武器生成
-			//
-			// 问题根因:
-			//   PossessedBy 在 OnPossess 之前被引擎调用 (Possess 内部先调 Pawn->PossessedBy, 再调 Controller->OnPossess)
-			//   所以 PossessedBy 第一次运行时 SpawnWeaponID 还是空的 (还没调 SetSpawnLoadout)
-			//   即使 SetupMeleeAI 写入了 SpawnWeaponID, PossessedBy 也不会再被调用一次
-			//
-			// 修复方案:
-			//   OnPossess 末尾手动读取 Pawn.SpawnWeaponID, 如果非空则调 SpawnAndEquipWeapon
-			//   这模拟了 PossessedBy 读 SpawnWeaponID 的完整逻辑, 包括三路兜底读取
-			//
-			// 代码复制自 PossessedBy, 但直接用 SpawnWeaponID 而不再做三路读取 (因为 Profile 已写入)
-			if (HasAuthority())
+			URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(World);
+			if (SpawnSys)
 			{
-				FString WeaponID = BaseChar->GetSpawnWeaponID();
-				if (WeaponID.IsEmpty())
+				APawn* AIPawn = GetPawn();
+				if (AIPawn)
 				{
-					// 三路兜底 (与 PossessedBy 完全一致)
-					if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
+					EffectiveFactionTag = SpawnSys->GetCachedLevelPlacedAIFaction(
+						AIPawn->GetClass(), Cast<ABaseCharacter>(AIPawn));
+					if (EffectiveFactionTag.IsValid())
 					{
-						WeaponID = PS->GetSelectedWeapon1ID();
-					}
-					if (WeaponID.IsEmpty())
-					{
-						if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-						{
-							FString CachedCharID;
-							FString CachedWeaponID;
-							if (GM->GetPlayerSpawnData(GetUniqueID(), CachedCharID, CachedWeaponID))
-							{
-								WeaponID = CachedWeaponID;
-							}
-						}
+						CachedFactionTag = EffectiveFactionTag; // 回填缓存
+						UE_LOG(LogTemp, Log,
+							TEXT("[%s] SetupMeleeAI: 阵营来源=RoomSpawnSubsystem缓存, FactionTag='%s'"),
+							*GetName(), *EffectiveFactionTag.ToString());
 					}
 				}
+			}
+		}
 
-				if (!WeaponID.IsEmpty())
+		// 最后兜底: 直接读 Pawn.FactionTag
+		if (!EffectiveFactionTag.IsValid())
+		{
+			ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn());
+			if (MyPawn)
+			{
+				EffectiveFactionTag = MyPawn->GetFactionTag();
+				if (EffectiveFactionTag.IsValid())
 				{
-					UE_LOG(LogMeleeAI, Log, TEXT("[MeleeAI] OnPossess 末尾触发武器生成: WeaponID=%s"), *WeaponID);
-					// 【P0 修复 2026.07.06】SpawnAndEquipWeapon 是 protected, 通过 public RequestWeaponSpawn 调用
-					BaseChar->RequestWeaponSpawn(WeaponID);
+					CachedFactionTag = EffectiveFactionTag; // 回填缓存
+					UE_LOG(LogTemp, Log,
+						TEXT("[%s] SetupMeleeAI: 阵营来源=Pawn.FactionTag直接读取, FactionTag='%s'"),
+						*GetName(), *EffectiveFactionTag.ToString());
+				}
+			}
+		}
+
+		// 最终检查: 阵营仍然无效
+		if (!EffectiveFactionTag.IsValid())
+		{
+			// 【v56.1 大厂架构修复】不再 return, 继续初始化
+			//
+			// 根因: 旧版 SetupMeleeAI 在阵营无效时直接 return, 跳过了 InitializeFromConfig
+			//       → AI 的 BT 永远不启动 → AI 完全不动
+			// 修复: 即使阵营无效, 仍然调用 InitializeFromConfig 启动 BT
+			//       → AI 至少能移动 (虽然无法正确检测敌人)
+			//
+			// 大厂原则 (可观测性优先):
+			//   - 阵营无效 → Log Error (告诉用户配置问题)
+			//   - 但不阻止初始化 → AI 至少能部分运行
+			//   - 这是"防御型降级", 不是"兜底"
+			UE_LOG(LogTemp, Error,
+				TEXT("[MeleeAI] SetupMeleeAI: 关卡预放 AI '%s' 的阵营无法获取. "
+					 "【v56.1 修复后继续初始化】AI 将无法正确检测敌人阵营. "
+					 "修复: 确保场景中放置的 AI Pawn (例如 BP_SWAT_AI) 的 Details 面板中 "
+					 "Faction Tag 字段已配置为 Faction.Offense 或 Faction.Defense."),
+				*GetName());
+			// 不 return, 继续初始化
+		}
+	}
+
+	// 【v56】阵营获取成功, 确保 CachedFactionTag 已设置
+	if (!CachedFactionTag.IsValid())
+	{
+		CachedFactionTag = EffectiveFactionTag;
+	}
+	UE_LOG(LogTemp, Log,
+		TEXT("[%s] SetupMeleeAI: 最终阵营 CachedFactionTag='%s'"),
+		*GetName(), *CachedFactionTag.ToString());
+
+	// 1. 写入运行时真理源 (Cached AIPawnClass + Cached FactionTag)
+	APawn* MyPawn = GetPawn();
+	if (MyPawn)
+	{
+		ABaseCharacter* BaseChar = Cast<ABaseCharacter>(MyPawn);
+		if (BaseChar)
+		{
+			// 【v54 重构】真理源缓存 (运行时内存)
+			//   关卡预放 AI 没有 Profile 反查链, 但 Spawn 参数来自 ConfigSO
+			//   写入这些字段让 RequestRespawn 复用 (复活时不需要重新查 ConfigSO)
+			SetCachedAIPawnClass(BaseChar->GetClass());
+
+			// 【v54.4 大厂架构重构 — Class 强类型 + 单一真理源 + 零中间层】
+			//   旧 (v54.3 — FString 中间层):
+			//     - BaseChar->SetMeleeConfig(MeleeConfig) → 内部读 DefaultWeaponRowName → SetSpawnLoadout(FString)
+			//     - SetupMeleeAI 末尾又从 BaseChar->GetSpawnWeaponID() 读字符串 → RequestWeaponSpawn(WeaponID)
+			//     → 字符串中间层反查 DT_WeaponInfo, 2 层真理源
+			//
+			//   新 (v54.4 — Class 强类型):
+			//     - SetMeleeConfig 内部直接调 RequestWeaponSpawn(LevelPlacedWeaponClass.LoadSynchronous())
+			//     - 不写 Pawn.SpawnWeaponID 字符串字段, 不查 DT_WeaponInfo
+			//     - 单一真理源: Config.LevelPlacedWeaponClass 决定武器 BP
+			//     - SetupMeleeAI 末尾**已经不需要**再调 RequestWeaponSpawn (消除重复入口)
+			//
+			//   大厂原则:
+			//     - 武器 Spawn 入口唯一: WeaponAttachmentComponent::SetMeleeConfig 内部触发
+			//     - 时序保证: SetMeleeConfig 内 RequestWeaponSpawn 已经在 Possess 之后调用, 满足 v40.3 要求
+			//     - 零字符串中间层: 没有 FString WeaponID 流转, 直接 Class
+			BaseChar->SetMeleeConfig(MeleeConfig);
+
+			// 【v54.4 大厂重构 — ConfigSO.Class → Cache.Class (复活用)】同步 Cached WeaponClass
+			//   - 写 Class 缓存 — 让 RequestRespawn 走 Class 路径
+			//   - 真理源: Config.LevelPlacedWeaponClass (TSoftClassPtr<ABaseWeapon>)
+			//   - SetMeleeConfig 内部已 LoadSynchronous, 这里再 LoadSynchronous 一次 (软引用缓存, 开销可接受)
+			if (MeleeConfig && !MeleeConfig->LevelPlacedWeaponClass.IsNull())
+			{
+				TSubclassOf<ABaseWeapon> WeaponClass = MeleeConfig->LevelPlacedWeaponClass.LoadSynchronous();
+				if (WeaponClass)
+				{
+					SetCachedWeaponClass(WeaponClass);
 				}
 				else
 				{
-					UE_LOG(LogMeleeAI, Warning, TEXT("[MeleeAI] OnPossess 末尾仍无 WeaponID, 跳过武器生成"));
+					UE_LOG(LogTemp, Error,
+						TEXT("[MeleeAI] SetupMeleeAI: Config=%s 的 LevelPlacedWeaponClass.LoadSynchronous() 失败. "
+							 "RequestRespawn 无法复活武器. 修复: LevelPlacedWeaponClass 字段是否仍有效."),
+						*MeleeConfig->GetName());
 				}
 			}
 		}
 	}
 
-	// 4. 调 Base 入口 — 感知配置 + BT 启动 (Phase 2 之后共用层统一)
-	// 调用基类的 Profile 初始化函数，完成感知配置和行为树启动
-	// Phase 2 之后，所有感知/阵营/BT 逻辑都上收到 ABaseAIController
-	InitializeFromProfile(MeleeProfile);
+	// 2. 调用 Base 的 InitializeFromConfig 入口 (单一 Spawn 入口)
+	//   - 内部: ApplyConfig → 设阵营 → OnConfigLoaded → 启动 BT
+	//   - 与大厅 AI 路径完全对称, 都走 InitializeFromConfig
+	InitializeFromConfig(MeleeConfig);
 
-	// 输出日志，提示刀战 AI 设置完成
-	UE_LOG(LogMeleeAI, Log, TEXT("[MeleeAI] Setup 完成, Profile=%s"), *MeleeProfile->GetName());
+	// 【v54.3 完全删除】关卡预放 AI 武器 Spawn 入口已删除
+	//   - 旧: SetupMeleeAI 末尾从 BaseChar->GetSpawnWeaponID() 读字符串 → RequestWeaponSpawn(WeaponID)
+	//   - 新: WeaponAttachmentComponent::SetMeleeConfig (上面) 内部直接调 RequestWeaponSpawn(Class)
+	//   - 单一真理源: 武器 Spawn 只有 1 个入口 (Component 内, v40.3 原则)
+	//   - 与大厅路径对称: RoomSpawnSubsystem::SpawnAIInternal 在 Possess 后调 SpawnedChar->RequestWeaponSpawn(Class)
+
+	// 3. 复活无敌期激活 (走 BaseAIController 统一真理源入口 — v54.2 大厂原则)
+	//   - 真理源链: ConfigSO.SpawnInvincibilitySeconds (所有 AI 共用, 不分关卡预放/大厅入队/复活)
+	//   - 入口: this->GetSpawnInvincibilitySeconds() (BaseAIController getter, 单一访问路径)
+	//   - 与 RoomSpawnSubsystem::SpawnAIInternal 使用同一入口 (消除重复架构)
+	const float InvSeconds = GetSpawnInvincibilitySeconds();
+	if (HasAuthority() && InvSeconds > 0.f)
+	{
+		ABaseCharacter* BaseChar = Cast<ABaseCharacter>(GetPawn());
+		if (BaseChar)
+		{
+			BaseChar->ActivateSpawnInvincibility(InvSeconds);
+			UE_LOG(LogTemp, Log,
+				TEXT("[MeleeAI] SetupMeleeAI: 激活关卡预放 AI 复活无敌期 = %.2fs (Pawn=%s, 真理源=ConfigSO.SpawnInvincibilitySeconds)"),
+				InvSeconds, *BaseChar->GetName());
+		}
+	}
 }

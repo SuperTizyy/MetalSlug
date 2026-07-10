@@ -22,8 +22,7 @@
 //   现架构: BTTask_PlayAttackMontage 一次性写 BB.CooldownEndTime, BTDecorator_CooldownReady 实时算
 //   bHasAttackToken 仅作字符串常量保留, 见 AIBehaviorTypes.h 注释
 #include "Systems/AI/AIBehaviorTypes.h"
-// 引入 AI Profile 资产，包含阵营标签和行为配置资产的软引用
-#include "Data/AI/AIProfileAsset.h"
+// 【v54 重构】删除 AIProfileAsset.h include (UAIProfileAsset 已删除)
 // 引入 AI 行为配置静态对象，包含行为树引用和战斗/感知原始参数
 #include "Data/AI/AIBehaviorConfigSO.h"
 // 引入流式管理器，用于 TSoftObjectPtr::LoadSynchronous 同步加载行为树资源 【Phase 1】
@@ -52,6 +51,10 @@
 #include "Data/Enums/RoomEnums.h"
 // 引入基础角色类，用于 Cast 判断 AI Pawn / 访问 bIsMovementLocked
 #include "Characters/BaseCharacter.h"
+// 【2026.07.10 P0 重构】阵营集中定义 (FFactionTags::IsOppositeSide/AttitudeBetween)
+#include "Data/Faction/FactionTags.h"
+
+#include "Weapons/BaseWeapon.h" // 【v54.4】GetDefaultWeaponClass 返回 TSoftClassPtr<ABaseWeapon>
 // 引入 AI 运行时配置组件，TickChaseFallback/GetEffectiveAttackRange 用
 #include "Systems/AI/AIRuntimeConfigComponent.h"
 // 引入导航系统，用于检查 NavMesh 是否可用 (MoveTo 静默失败诊断)
@@ -60,6 +63,8 @@
 #include "NavMesh/RecastNavMesh.h"
 // 引入路径跟随组件，包含 EPathFollowingRequestResult 完整定义 (UE5.6 修复)
 #include "Navigation/PathFollowingComponent.h"
+// 【2026.07.13 v40.6 反扎堆账本】引入 TargetingSubsystem 头文件（感知丢失时释放账本）
+#include "Systems/Targeting/RoomTargetingSubsystem.h"
 
 // 定义本文件的静态日志分类，所有 UE_LOG 使用此分类输出，方便在日志中过滤
 DEFINE_LOG_CATEGORY_STATIC(LogBaseAI, Log, All);
@@ -107,9 +112,9 @@ void ABaseAIController::BeginPlay()
 		AIPerception->OnTargetPerceptionUpdated.AddDynamic(this, &ABaseAIController::OnTargetDetected);
 	}
 
-	// 【Phase 1 重构】 未走 Profile 入口, 但有 Pawn 时尝试 fallback
-	// 检查条件：当前有 Pawn 控制、没有加载 Profile、行为树尚未启动
-	if (GetPawn() && !CurrentProfile && !bBehaviorTreeStarted)
+	// 【v54 重构】未走 Config 入口, 但有 Pawn 时尝试 fallback
+	// 检查条件：当前有 Pawn 控制、Config 还没 Apply、行为树尚未启动
+	if (GetPawn() && (!RuntimeConfig || !RuntimeConfig->GetConfig()) && !bBehaviorTreeStarted)
 	{
 		// 走传统兼容路径：由外部 GameMode 决定 BT 启动，这里只注册黑板 Key
 		RunLegacyBehaviorTree();
@@ -230,7 +235,7 @@ AActor* ABaseAIController::ScanForNearestEnemy(ACharacter* MyCharacter, float Sc
 			}
 		}
 
-		// 【P0 终极修复 2026.07.06】阵营判定 — 走 Pawn->Controller 间接路径
+		// 【P0 终极修复 2026.07.06 + 2026.07.10 重构】阵营判定 — 走 FFactionTags
 		//
 		// 之前坑: Cast<IGenericTeamAgentInterface>(BP_Pawn) 失败
 		//   因为 BP 类 (BP_SWAT_C) 不实现 C++ 接口 (默认只有 AIController 实现)
@@ -238,36 +243,36 @@ AActor* ABaseAIController::ScanForNearestEnemy(ACharacter* MyCharacter, float Sc
 		//   根因: UE 的接口 Cast 对纯 BP 类的支持有限, 直接 Cast 不可靠
 		//
 		// 正确做法 (UE 官方推荐): Pawn->GetController() → 再 Cast AIController
-		//   AIController 实现接口, GetGenericTeamId() 返回阵营 ID
+		//   AIController 实现接口, GetFactionTag() 返回 FGameplayTag
 		//
-		// 大厂兜底: 即使阵营判定失败, 也不允许 ScanForNearestEnemy 找不到目标
-		//   任何 ACharacter 都视为潜在敌人, 后续 BT 树精确判定
+		// 大厂原则 (2026.07.10): 阵营判定统一走 FFactionTags::IsOppositeSide
+		//   不再直接比 FGenericTeamId 数字 — 让协议层"按数字分敌我"的隐式规则消失
 		ETeamAttitude::Type Attitude = ETeamAttitude::Neutral;
 		bool bIsHostile = false;
 
-		// 尝试通过 Controller 获取阵营
+		// 【2026.07.10 v25 重构】阵营获取全部走 ABaseCharacter::FactionTag 字段
+		//   旧版错误: 调 IGenericTeamAgentInterface::GetFactionTag() — 这方法在 UE 接口里不存在
+		//   新版: Cast<ABaseCharacter>(CandidatePawn) → 直接读 .FactionTag
 		if (const APawn* CandidatePawn = Cast<APawn>(Candidate))
 		{
-			if (const IGenericTeamAgentInterface* ControllerAgent =
-				Cast<IGenericTeamAgentInterface>(CandidatePawn->GetController()))
+			// 自己 (Controller) 的阵营 — 走 GetPawn()->GetFactionTag()
+			FGameplayTag MyTag = FGameplayTag::EmptyTag;
+			if (const ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn()))
 			{
-				const FGenericTeamId OtherId = ControllerAgent->GetGenericTeamId();
-				const FGenericTeamId MyId = GetGenericTeamId();
-				// 阵营不同 → 敌对 (大厂兜底: 不同阵营就是敌人)
-				if (OtherId != MyId && OtherId != FGenericTeamId::NoTeam)
-				{
-					bIsHostile = true;
-				}
-				// 显式 NoTeam (255) → 敌对 (未配阵营的 Character = 可疑目标)
-				else if (OtherId == FGenericTeamId::NoTeam)
-				{
-					bIsHostile = true;
-				}
+				MyTag = MyPawn->GetFactionTag();
 			}
-			else
+
+			// 对方阵营 — Cast<ABaseCharacter>(CandidatePawn)
+			const ABaseCharacter* CandidateChar = Cast<ABaseCharacter>(CandidatePawn);
+			const FGameplayTag OtherTag = CandidateChar ? CandidateChar->GetFactionTag() : FGameplayTag::EmptyTag;
+
+			// 【P0 2026.07.10】异阵营 → 敌对 (FFactionTags::IsOppositeSide)
+			//   - 任一无效阵营 → IsOppositeSide 返回 false → 不当敌人处理 (大厂原则)
+			//   - 双方都有效 + 异阵营 → bIsHostile = true
+			if (FFactionTags::IsValidFaction(MyTag)
+				&& FFactionTags::IsValidFaction(OtherTag)
+				&& FFactionTags::IsOppositeSide(MyTag, OtherTag))
 			{
-				// 没 AIController (普通 NPC/怪物 Character) → 视为潜在敌人
-				// 大厂兜底: PVE 关卡里这种 Character 99% 是敌人
 				bIsHostile = true;
 			}
 		}
@@ -369,6 +374,45 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 		RuntimeConfig = InPawn->FindComponentByClass<UAIRuntimeConfigComponent>();
 	}
 
+	// 【v42 2026.07.14】OnPossess 强制初始化移动速度
+	// 问题: BP 蓝图 CharacterMovement 组件的 Max Walk Speed=400 覆盖了 C++ 设的值,
+	//       导致 AI Spawn 后 MaxWalkSpeed=400 (玩家同速), 看起来"AI 变慢了"
+	// 修复: 无条件强制覆盖 BP 默认值, 优先从配置表读 WalkSpeed, 无配置才报错
+	if (ABaseCharacter* Char = Cast<ABaseCharacter>(InPawn))
+	{
+		if (UCharacterMovementComponent* Move = Char->GetCharacterMovement())
+		{
+			// 【v42】优先从 RuntimeConfig 读 (Possess 后 SetupMeleeAI 已加载)
+			// 零兜底: 配置未加载时 Log Error, 不允许静默用默认值
+			if (RuntimeConfig)
+			{
+				const float WS = RuntimeConfig->GetScaledMovement().WalkSpeed;
+				if (WS <= 0.f)
+				{
+					UE_LOG(LogBaseAI, Error,
+						TEXT("[%s] OnPossess: 配置表 WalkSpeed=%.0f <= 0, AI 不会移动! "
+							 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0 (例如 250)"),
+						*GetName(), WS);
+					Move->MaxWalkSpeed = 0.f;
+				}
+				else
+				{
+					Move->MaxWalkSpeed = WS;
+				}
+			}
+			else
+			{
+				// RuntimeConfig 为空: 关卡预放 AI 在 SetupMeleeAI 调用之前触发 OnPossess
+				// SetupMeleeAI 末尾会重新设 WalkSpeed, 这里只做防御性 0 值覆盖
+				UE_LOG(LogBaseAI, Warning,
+					TEXT("[%s] OnPossess: RuntimeConfig 为空, 速度将在 SetupMeleeAI 末尾初始化"),
+					*GetName());
+				Move->MaxWalkSpeed = 0.f;
+			}
+		}
+		Char->bIsMovementLocked = false;
+	}
+
 	// 【P0 2026.07.07 大厂架构重构】OnPossess 兜底 — 重置锁步状态
 	// 防止 AI 重新 Possess 同一个 Pawn (或关卡切换) 时, 残留的 bMovementLockedForCooldown=true
 	// 让 Pawn 永远不能动
@@ -376,6 +420,80 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 	{
 		LockMovementForCooldown(false);
 	}
+
+	// 【2026.07.11 v26.5 P0 关键修复】关卡预放路径同步 Pawn.FactionTag → CachedFactionTag
+	//
+	// 根因 (用户最新反馈 2026.07.11):
+	//   - 关卡预放的 BP_GruntAI 是用户**手动拖入场景**并**手动在细节面板配** FactionTag
+	//   - 这条路径不经过 ARoomGameMode::SpawnAIInternal, 没人写 CachedFactionTag
+	//   - SpawnAIInternal 中写入 CachedFactionTag 的代码对关卡预放 AI 不生效
+	//   - 结果: 关卡预放 AI 的 Controller 永远没有 CachedFactionTag
+	//        死亡时 RequestRespawn 拿不到阵营 → 复活链崩
+	//
+	// 大厂架构真理源 (2026.07.11 v26.5 修订):
+	//   真理源回到 **ABaseCharacter::FactionTag** (Pawn 上的 UPROPERTY, BP 可读写)
+	//   v26 把真理源放到 CachedFactionTag 的设计对**关卡预放路径**失效
+	//   v26.5 修订: Controller 在 OnPossess 时把 Pawn.FactionTag 缓存到 CachedFactionTag
+	//                既覆盖关卡预放 (Pawn 已配 FactionTag), 也覆盖 Spawn 路径 (SpawnAIInternal 已写)
+	//
+	// 大厂原则 (零兜底):
+	//   1. 关卡预放 AI 必须从 Pawn.FactionTag 缓存, 这是唯一正确的运行时阵营来源
+	//   2. SpawnAIInternal 已经写入的 CachedFactionTag 优先于 Pawn.FactionTag (运行时决策 > 默认)
+	//      因为 SpawnAIInternal 写入的是 Request.FactionTag (业务决策的最终值)
+	//   3. 两个都为空 = Pawn 没配 + Spawn 没传 = 强制修复, 不允许任何兜底
+	//
+	// 同步时机: 必须在 SetupMeleeAI / InitializeFromProfile 之前完成 (它们读 CachedFactionTag)
+	if (!CachedFactionTag.IsValid())
+	{
+		// 关卡预放路径: 读 Pawn.FactionTag 缓存
+		if (const ABaseCharacter* BC = Cast<ABaseCharacter>(InPawn))
+		{
+			if (BC->FactionTag.IsValid())
+			{
+				CachedFactionTag = BC->FactionTag;
+
+				UE_LOG(LogBaseAI, Log,
+					TEXT("[%s] OnPossess: 缓存 Pawn.FactionTag='%s' → CachedFactionTag (关卡预放路径)"),
+					*GetName(), *CachedFactionTag.ToString());
+			}
+			else
+			{
+				// 【v56 零兜底修复】Pawn.FactionTag 为空时必须报错
+				UE_LOG(LogBaseAI, Error,
+					TEXT("[%s] OnPossess: Pawn.FactionTag 为空. "
+						 "【v56 零兜底】拒绝静默跳过. "
+						 "修复: 打开场景中放置的 AI Pawn (例如 BP_SWAT_AI) → Details 面板 → Faction Tag 字段 → 配置为 Faction.Offense 或 Faction.Defense"),
+					*GetName());
+			}
+		}
+		else
+		{
+			// 【v56 零兜底修复】Pawn 不是 ABaseCharacter 时报错
+			UE_LOG(LogBaseAI, Error,
+				TEXT("[%s] OnPossess: InPawn 不是 ABaseCharacter 类型. 修复: AI Pawn 必须派生自 BP_BaseCharacter"),
+				*GetName());
+		}
+	}
+
+	// 【v40.8.4 2026.07.13 漫游支持 — 完全删除 OnPossess 写入 WanderHome】
+	//
+	// 【根因 (v40.8 - v40.8.3 三轮 bug)】
+	//   1) v40.8 锁在 if (!CachedFactionTag.IsValid()) 内 → Spawn/关卡预放路径 CachedFactionTag 已 Valid → 整个 if 跳过 → 不写
+	//   2) v40.8.1 移到 if 外 → OnPossess 阶段 GetBlackboardComponent() 返回 nullptr → 写入失败
+	//      BB 在 RunBehaviorTree(BT) 之前不实例化 (UE 5.6 硬约束)
+	//   3) v40.8.2 / v40.8.3 加 Log Error 防御 → 但写入时机错了, 任何修复都是死路
+	//
+	// 【v40.8.4 大厂架构正确修复】
+	//   写入 BB.Key 必须由 BT 启动后的 BTService 负责 (与 BTService_RefreshTarget 写入 BB.TargetActor 同一个模式)
+	//   BB Service: UBTService_InitWanderHome (新文件)
+	//   - 单次执行 (bCreateNodeInstance=true + bNotifyTick=false, TickOnce 模式)
+	//   - BT 启动后第一次 Tick 时写入 WanderHome = Pawn.Location
+	//   - 单一真理源: Pawn 出生点
+	//
+	// 大厂原则 — 时序责任分层:
+	//   OnPossess: 负责 Pawn 级状态 (阵营缓存, RuntimeConfig 实例化)
+	//   RunBehaviorTree: 负责 BT 实例化 + BB 实例化
+	//   BTService_InitWanderHome: 负责 BT 级 BB Key 初始化 (WanderHome)
 }
 
 // EndPlay：当 Actor 离开游戏世界时调用，用于清理资源
@@ -412,117 +530,124 @@ void ABaseAIController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 
 // ==========================================
-// 3. Profile 入口
+// 3. Config 入口 (v54 大厂架构重构)
 // ==========================================
-
-// InitializeFromProfile：从 AI Profile 资产初始化 AI，加载配置并启动行为树
-void ABaseAIController::InitializeFromProfile(UAIProfileAsset* InProfile)
+//
+// 【v54 大厂架构重构 — 直接接 UAIBehaviorConfigSO, 不再接 UAIProfileAsset】
+//   v54 之前: InitializeFromProfile(UAIProfileAsset*) → 内部读 Profile.BehaviorConfig → 加载 ConfigSO
+//   v54 之后: InitializeFromConfig(UAIBehaviorConfigSO*) → 直接 ApplyConfig
+//   真理源链:
+//     - 关卡预放 AI: BP_GruntAI.uasset 的 DefaultPawn 路径 → Config 由 BP 内 ConfigComp 持有
+// ========================================================================
+// 3. Config 入口 (v54.4 大厂架构重构)
+// ========================================================================
+//
+// 【v54.4 大厂架构重构 — 直接接 UAIBehaviorConfigSO, 不再接 UAIProfileAsset】
+//   v54 之前: InitializeFromProfile(UAIProfileAsset*) → 内部读 Profile.BehaviorConfig → 加载 ConfigSO
+//   v54 之后: InitializeFromConfig(UAIBehaviorConfigSO*) → 直接 ApplyConfig
+//   v54.4 之后: 加 BehaviorTreeOverride 参数
+//     → 关卡预放 AI: 传 nullptr → 读 ConfigSO.LevelPlacedBehaviorTree
+//     → 大厅 AI: 传 ModeRules.BehaviorTree → 直接用
+//
+// 设计 (大厂原则 - 单一真理源 + 职责分离):
+//   - 调用方负责传 ConfigSO (行为参数) + BehaviorTreeOverride (行为树)
+//   - 阵营优先级链: CachedFactionTag (运行时) > 都为空 = 强制修复
+//
+void ABaseAIController::InitializeFromConfig(UAIBehaviorConfigSO* InConfig, UBehaviorTree* BehaviorTreeOverride)
 {
-	// 检查传入的 Profile 是否为空
-	if (!InProfile)
+	// 【v54.4 大厂架构重构】BehaviorTreeOverride 缓存到成员变量
+	//   - 关卡预放 AI: BehaviorTreeOverride=null → StartBehaviorTreeFromConfigInternal 读 ConfigSO.LevelPlacedBehaviorTree
+	//   - 大厅 AI: BehaviorTreeOverride 非空 → StartBehaviorTreeFromConfigInternal 直接用这个
+	PendingBehaviorTreeOverride = BehaviorTreeOverride;
+
+	// 【v54 重构】检查 ConfigSO 是否为空 (零兜底, 不允许任何 fallback)
+	if (!InConfig)
 	{
-		// 输出警告日志，提示 Profile 为空
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] InitializeFromProfile(null)"), *GetName());
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[%s] InitializeFromConfig(null) — ConfigSO 缺失, AI 无法运行. "
+			     "修复: 检查 Spawn 调用方 (SpawnAIInternal / SetupMeleeAI) 是否正确传递 DA_AIBehaviorConfig_*.uasset"),
+			*GetName());
 		return;
 	}
 
-	// 保存当前 Profile，供后续逻辑使用
-	CurrentProfile = InProfile;
-	// 输出日志，记录 Profile 名称、阵营标签和行为配置资产路径
-	UE_LOG(LogBaseAI, Log, TEXT("[%s] InitializeFromProfile: Profile=%s FactionTag=%s ConfigAsset=%s"),
-		*GetName(), *InProfile->GetName(),
-		*InProfile->FactionTag.ToString(),
-		*InProfile->BehaviorConfig.ToSoftObjectPath().ToString());
+	UE_LOG(LogBaseAI, Log, TEXT("[%s] InitializeFromConfig: Config=%s, BehaviorTreeOverride=%s"),
+		*GetName(), *InConfig->GetName(), *GetNameSafe(BehaviorTreeOverride));
 
-	// 把 Profile.FactionTag 应用到阵营协议
-	// 如果 Profile 的阵营标签有效，解析并设置 AI 的阵营 ID
-	if (InProfile->FactionTag.IsValid())
-	{
-		// 通过 ABaseCharacter 的工具函数将阵营标签转换为 GenericTeamId，并设置给 AI
-		SetGenericTeamId(ABaseCharacter::ResolveGenericTeamIdFromTag(InProfile->FactionTag));
-	}
-
-	// Config 同步加载 (BT 由它异步加载)
-	// 同步加载行为配置资产（包含行为树、战斗/感知参数）
-	UAIBehaviorConfigSO* Config = InProfile->LoadBehaviorConfigSync();
-	// 输出日志，记录加载到的配置资产名称
-	UE_LOG(LogBaseAI, Log, TEXT("[%s] InitializeFromProfile: LoadBehaviorConfigSync -> %s"),
-		*GetName(), *GetNameSafe(Config));
-	// 如果运行时配置组件存在，将加载的配置应用到组件上
+	// 把 Config 应用到 RuntimeConfig 组件 (真理源写入)
 	if (RuntimeConfig)
 	{
-		RuntimeConfig->ApplyConfig(Config);
+		RuntimeConfig->ApplyConfig(InConfig);
 	}
 
-	// 如果配置加载失败，输出警告并返回
-	if (!Config)
+	// 阵营协议 (单一真理源 - CachedFactionTag)
+	if (CachedFactionTag.IsValid())
 	{
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] Profile has no Config"), *GetName());
-		return;
+		if (FFactionTags::ValidateFactionOrReportError(CachedFactionTag,
+			TEXT("ABaseAIController::InitializeFromConfig")))
+		{
+			SetGenericTeamId(FFactionTags::ToGenericTeamId(CachedFactionTag));
+		}
+	}
+	else
+	{
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[%s] InitializeFromConfig: CachedFactionTag 为空, AI 不会获得阵营. "
+			     "修复: 检查 Spawn 调用方是否在 InitializeFromConfig 之前写入 CachedFactionTag"),
+			*GetName());
 	}
 
-	// BT 异步加载完成后启动 (走 AIProfileAsset 的 FOnAIBehaviorConfigLoaded)
-	// 设计: UAIProfileAsset 负责异步加载它持有的 SoftObjectPtr<AIBehaviorConfigSO>
-	//       加载完成后 config 已 Apply 到 RuntimeConfig (base 已同步一次, 这里直接异步监听完成)
-	// 创建异步加载完成的委托，绑定到 OnProfileLoaded 函数
-	ProfileLoadedDelegate = FOnAIBehaviorConfigLoaded::CreateUObject(this, &ABaseAIController::OnProfileLoaded);
-	// 启动异步加载行为配置，加载完成后会触发 OnProfileLoaded 回调
-	InProfile->LoadBehaviorConfigAsync(ProfileLoadedDelegate);
-	// 输出日志，提示异步加载已启动
-	UE_LOG(LogBaseAI, Log, TEXT("[%s] InitializeFromProfile: LoadBehaviorConfigAsync dispatched"), *GetName());
+	OnConfigLoaded();
 }
 
-// OnProfileLoaded：行为配置异步加载完成后调用，用于启动行为树和配置感知
-void ABaseAIController::OnProfileLoaded()
+// OnConfigLoaded：Config 已 Apply 后调用, 用于启动行为树和配置感知
+void ABaseAIController::OnConfigLoaded()
 {
-	// 【P0 2026.07.08 调试用】Warning 级别 log, 强制显示 OnProfileLoaded 入口 (排查 BT 启动问题)
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> OnProfileLoaded ENTERED (CurrentProfile=%s RuntimeConfig=%s GetConfig=%s)"),
+	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> OnConfigLoaded ENTERED (RuntimeConfig=%s GetConfig=%s)"),
 		*GetName(),
-		*GetNameSafe(CurrentProfile),
 		*GetNameSafe(RuntimeConfig),
 		*GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr));
 
-	// 输出日志，记录当前 Profile、运行时配置和配置资产的状态
-	UE_LOG(LogBaseAI, Log, TEXT("[%s] OnProfileLoaded: CurrentProfile=%s RuntimeConfig=%s GetConfig=%s"),
-		*GetName(),
-		*GetNameSafe(CurrentProfile),
-		*GetNameSafe(RuntimeConfig),
-		*GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr));
-
-	// 检查 Profile、运行时配置和配置资产是否都有效
-	if (!CurrentProfile || !RuntimeConfig || !RuntimeConfig->GetConfig())
+	// 检查必要组件
+	if (!RuntimeConfig || !RuntimeConfig->GetConfig())
 	{
-		// 如果有组件缺失，输出警告并走传统兼容路径
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] OnProfileLoaded: missing components, fallback RunLegacy"), *GetName());
+		UE_LOG(LogBaseAI, Warning, TEXT("[%s] OnConfigLoaded: missing components, fallback RunLegacy"), *GetName());
 		RunLegacyBehaviorTree();
 		return;
 	}
 
-	// 【Phase 2 共用层】感知配置 — 收归 Base, 任何模式都走这里
-	// 旧: MeleeAIController::ConfigurePerceptionFromConfig 单独配
-	// 新: Base 统一从 RuntimeConfig->GetScaledPerception() 读, 自动配
-	// 配置 AI 的感知系统（视觉），从运行时配置读取缩放后的参数
+	// 【Phase 2 共用层】感知配置 — 收归 Base
 	ConfigurePerceptionFromConfig();
 
-	// 【P0 架构升级 2026.07.06 17:00】延迟 BT 启动 — 等 GameMode 广播战斗开始
-	// 解决: AI 出生后立即 RunBehaviorTree, 玩家还在大厅就追玩家 (用户原话"还没点开始游戏 AI 就开始攻击人")
+	// 【v56.1 大厂架构修复 P0】配置加载后恢复速度
 	//
-	// 策略:
-	//   1. 先检查 GameMode 是否已经 BattleInProgress (战斗已开始)
-	//      - 是 → 直接 StartBehaviorTreeFromProfile
-	//   2. 否 → 订阅 RoomGameMode::OnBattleStarted, 收到后 StartBehaviorTreeFromProfile
-	//      - 必须检查 GameMode 有效性 (PIE 早期 GameMode 可能未初始化)
-	//      - 必须检查 OnBattleStarted 是否有效 (极早期 GameMode nullptr 保护)
+	// 根因: OnPossess 时 RuntimeConfig 未加载, MaxWalkSpeed=0 (防御性)
+	//        SetupMeleeAI/InitializeFromConfig 加载配置后没有恢复速度
+	//        结果: AI 配置加载后仍然无法移动, 只有攻击后才恢复
+	//
+	// 修复: OnConfigLoaded 末尾直接设置 MaxWalkSpeed
+	//       → 不调用 LockMovementForCooldown(false) (幂等检查会拦截)
+	//       → 直接从 RuntimeConfig 读 WalkSpeed 并设置
+	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetPawn()))
+	{
+		if (UCharacterMovementComponent* Move = Char->GetCharacterMovement())
+		{
+			if (RuntimeConfig)
+			{
+				const float WS = RuntimeConfig->GetScaledMovement().WalkSpeed;
+				Move->MaxWalkSpeed = WS;
+				Char->bIsMovementLocked = false;
+				bMovementLockedForCooldown = false;
+				UE_LOG(LogBaseAI, Verbose,
+					TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f"),
+					*GetName(), WS);
+			}
+		}
+	}
+
+	// 【P0 架构升级 2026.07.06】延迟 BT 启动 — 等 GameMode 广播战斗开始
 	TryStartBehaviorTreeOrWaitForBattleStart();
 
 	// 【P0 架构升级 2026.07.03】启动期一次性全景诊断
-	// 设计: 4 件事同时检查并报告, 任何一项异常立即刷 Error/ Warning 上日志
-	//   1. Profile 完整性
-	//   2. 阵营 ID 解析 (这是上次 bug 的关键: Faction.Enemy 未识别导致 SquadTeam=0)
-	//   3. 感知配置 (Sight 半径/角度/阵营过滤)
-	//   4. NavMesh 可用性 (启动期就检查, 避免 MoveTo 静默失败)
-	// 集中输出 = 一次日志扫描能看清 AI 配置, 不必翻 4 个函数
-	// 输出 AI 启动状态的全景诊断日志，帮助快速定位问题
 	DiagnoseAndLogBootStatus();
 }
 
@@ -578,28 +703,32 @@ void ABaseAIController::ConfigurePerceptionFromConfig()
 	// ============================================================
 	// UE 5.6 的 FAISenseAffiliationFilter 只有三个 bool (没有 Teams 数组):
 	//   bDetectEnemies    — 用 GetTeamAttitudeTowards == Hostile 判定
-	//   bDetectNeutrals   — Neutral 算敌人
+	//   bDetectNeutrals   — Neutral 算敌人 (项目内无中立阵营, 永远 false)
 	//   bDetectFriendlies — Friendly 算敌人 (默认 false, 千万别开!)
 	//
 	// 修复原理:
-	//   - 关掉 bDetectNeutrals 和 bDetectFriendlies (默认 false, 显式置 false 防御)
+	//   - 关掉 bDetectFriendlies (默认 false, 显式置 false 防御)
+	//   - 硬编码 bDetectNeutrals = false (项目内没有中立阵营)
 	//   - 只保留 bDetectEnemies=true, 引擎会自动调 GetTeamAttitudeTowards 判定
 	//   - BTService_RefreshTarget 里 IsHostileTo() 是第二层兜底 (即使配错也安全)
+	//
+	// 【v54.2 大厂架构简化】
+	//   - ConfigSO 已经删除 bDetectNeutrals 字段 (项目无中立)
+	//   - 大厂原则: 字段从 Config 配置层删除, 这里硬编码 false (不暴露配置口)
 
 	// 设置是否检测敌对目标，由配置参数决定
 	SightConfig->DetectionByAffiliation.bDetectEnemies = Params.bDetectEnemies;
-	// 【P0】关闭, 不把中立当敌人 — 避免 AI 攻击中立单位
-	SightConfig->DetectionByAffiliation.bDetectNeutrals = false;   // 【P0】关闭, 不把中立当敌人
+	// 【v54.2】项目内无中立阵营 — 硬编码 false
+	SightConfig->DetectionByAffiliation.bDetectNeutrals = false;
 	// 【P0】关闭, 友军不打 — 避免 AI 攻击友军
-	SightConfig->DetectionByAffiliation.bDetectFriendlies = false; // 【P0】关闭, 友军不打
+	SightConfig->DetectionByAffiliation.bDetectFriendlies = false;
 
 	// 输出日志，记录阵营配置信息，方便调试
 	UE_LOG(LogBaseAI, Log,
-		TEXT("[%s] ConfigurePerceptionFromConfig: SquadTeam=%d, bDetectEnemies=%d, bDetectNeutrals=%d, bDetectFriendlies=%d"),
+		TEXT("[%s] ConfigurePerceptionFromConfig: SquadTeam=%d, bDetectEnemies=%d, bDetectNeutrals=false(硬编码), bDetectFriendlies=%d"),
 		*GetName(),
 		GetGenericTeamId().GetId(),
 		SightConfig->DetectionByAffiliation.bDetectEnemies ? 1 : 0,
-		SightConfig->DetectionByAffiliation.bDetectNeutrals ? 1 : 0,
 		SightConfig->DetectionByAffiliation.bDetectFriendlies ? 1 : 0);
 
 	// 将视觉感知配置应用到感知组件
@@ -643,7 +772,7 @@ void ABaseAIController::ConfigurePerceptionFromConfig()
 //
 // 【P0 架构升级 2026.07.06 17:00】解决"AI 出生立即追玩家"问题
 // 用户原话: "还没点击开始游戏我就听到 AI 在打玩家了"
-// 之前: AI 出生 → OnPossess → InitializeFromProfile → OnProfileLoaded → StartBehaviorTreeFromProfile → RunBehaviorTree
+// 之前: AI 出生 → OnPossess → InitializeFromProfile → OnProfileLoaded → StartBehaviorTreeFromConfigInternal → RunBehaviorTree
 //       BT 跑起来立即开始追大厅里的玩家 (BP_SWAT_C_0 默认 spawn)
 // 现在: 启动 BT 前先检查 GameMode 状态
 //       - BattleInProgress (战斗已开) → 立即启动
@@ -663,7 +792,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 		UE_LOG(LogBaseAI, Warning,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: GameMode 为空, 立即启动 BT (原行为)"),
 			*GetName());
-		StartBehaviorTreeFromProfile();
+		StartBehaviorTreeFromConfigInternal();
 		return;
 	}
 
@@ -675,7 +804,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 		UE_LOG(LogBaseAI, Warning,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: GameMode 不是 ARoomGameMode (%s), 立即启动 BT"),
 			*GetName(), *GMBase->GetClass()->GetName());
-		StartBehaviorTreeFromProfile();
+		StartBehaviorTreeFromConfigInternal();
 		return;
 	}
 
@@ -690,7 +819,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 		UE_LOG(LogBaseAI, Warning,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: GameMode 已 BattleInProgress, 立即启动 BT"),
 			*GetName());
-		StartBehaviorTreeFromProfile();
+		StartBehaviorTreeFromConfigInternal();
 		return;
 	}
 
@@ -717,7 +846,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 					UE_LOG(LogBaseAI, Log,
 						TEXT("[%s] OnBattleStarted 触发: GameMode 进入 BattleInProgress, 启动 BT"),
 						*Self->GetName());
-					Self->StartBehaviorTreeFromProfile();
+					Self->StartBehaviorTreeFromConfigInternal();
 				}
 			});
 
@@ -728,44 +857,83 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 	else
 	{
 		// 已经订阅过了 — 不重复订阅 (例如 OnProfileLoaded 被多次调)
-		UE_LOG(LogBaseAI, Warning,
-			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: 已订阅过 OnBattleStarted, 跳过"),
-			*GetName());
+		// 但需要检查战斗是否已开始（复活路径：Handle 存在但战斗已在进行中）
+		// 注意：直接用 GMBase（前面已获取并检查非空），避免重复声明 RoomGM
+		if (GMBase)
+		{
+			ARoomGameMode* RoomGMForCheck = Cast<ARoomGameMode>(GMBase);
+			if (RoomGMForCheck && (RoomGMForCheck->bBattleStartedBroadcasted ||
+				RoomGMForCheck->CurrentRoomState == ERoomState::BattleInProgress))
+			{
+				// 复活路径：Handle 已存在，但战斗已开始，需要立即启动 BT
+				// 旧代码缺陷：只检查 Handle 是否存在，存在就跳过，导致复活后 AI 不动
+				UE_LOG(LogBaseAI, Warning,
+					TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: Handle 已存在但战斗已开始，复活路径立即启动 BT"),
+					*GetName());
+				StartBehaviorTreeFromConfigInternal();
+			}
+			else
+			{
+				UE_LOG(LogBaseAI, Log,
+					TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: Handle 已存在且战斗未开始，继续等待"),
+					*GetName());
+			}
+		}
 	}
 }
 
-// StartBehaviorTreeFromProfile：从 Profile 启动行为树，加载行为树资源并运行
-void ABaseAIController::StartBehaviorTreeFromProfile()
+// StartBehaviorTreeFromConfigInternal：从 Profile 启动行为树，加载行为树资源并运行
+void ABaseAIController::StartBehaviorTreeFromConfigInternal()
 {
 	// 【P0 2026.07.08 调试用】Warning 级别 log, 强制显示
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> StartBehaviorTreeFromProfile ENTERED (RuntimeConfig=%s GetConfig=%s)"),
+	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> StartBehaviorTreeFromConfigInternal ENTERED (RuntimeConfig=%s GetConfig=%s)"),
 		*GetName(),
 		*GetNameSafe(RuntimeConfig),
 		*GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr));
 
 	// 输出日志，提示进入函数
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromProfile: enter"), *GetName());
+	UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromConfigInternal: enter"), *GetName());
 
 	// 检查运行时配置和配置资产是否有效
 	if (!RuntimeConfig || !RuntimeConfig->GetConfig())
 	{
 		// 如果配置无效，输出警告并返回
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromProfile: no config"), *GetName());
+		UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromConfigInternal: no config"), *GetName());
 		return;
 	}
 
-	// 同步加载行为树资源（从配置资产中的软引用加载）
-	UBehaviorTree* BT = RuntimeConfig->GetConfig()->BehaviorTree.LoadSynchronous();
-	// 输出日志，记录加载到的行为树名称
-	UE_LOG(LogBaseAI, Log, TEXT("[%s] StartBehaviorTreeFromProfile: BT=%s"),
-		*GetName(), *GetNameSafe(BT));
+	// 同步加载行为树资源
+	// 【v54.4 大厂架构重构】BT 来源分层:
+	//   1. 大厅 AI: SpawnAIInternal 传 ModeRules.BehaviorTree → PendingBehaviorTreeOverride 非空 → 直接用
+	//   2. 关卡预放 AI: PendingBehaviorTreeOverride=null → 读 ConfigSO.LevelPlacedBehaviorTree
+	UBehaviorTree* BT = nullptr;
+	if (PendingBehaviorTreeOverride.IsValid())
+	{
+		BT = PendingBehaviorTreeOverride.Get();
+		UE_LOG(LogBaseAI, Log, TEXT("[%s] StartBehaviorTreeFromConfigInternal: 优先用 BehaviorTreeOverride=%s (大厅 AI 路径)"),
+			*GetName(), *GetNameSafe(BT));
+	}
+	else
+	{
+		// 【v54.4】关卡预放 AI: 从 ConfigSO.LevelPlacedBehaviorTree 读
+		BT = RuntimeConfig->GetConfig()->LevelPlacedBehaviorTree.LoadSynchronous();
+		UE_LOG(LogBaseAI, Log, TEXT("[%s] StartBehaviorTreeFromConfigInternal: 用 ConfigSO.LevelPlacedBehaviorTree=%s (关卡预放 AI 路径)"),
+			*GetName(), *GetNameSafe(BT));
+	}
 
-	// 如果行为树加载失败
+	// 【v54.4 零兜底】BT 加载失败 → Log Error + 拒绝 RunBehaviorTree
 	if (!BT)
 	{
-		// 输出警告并走传统兼容路径
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] Config has no BehaviorTree, fallback"), *GetName());
-		RunLegacyBehaviorTree();
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[%s] StartBehaviorTreeFromConfigInternal: BehaviorTree 缺失. "
+			     "【v54.4 零兜底】拒绝 RunBehaviorTree. "
+			     "【根因】大厅 AI: GM_RoomGameMode.ModeRulesByMode[Mode].BehaviorTree 未配置. "
+			     "关卡预放 AI: DA_AIBehaviorConfig_*.LevelPlacedBehaviorTree 未配置. "
+			     "【修复路径】UE 编辑器 → GM_RoomGameMode → Class Defaults → ModeRulesByMode → "
+			     "Melee.BehaviorTree 拖入 BT_MeleeAI.uasset; "
+			     "DA_AIBehaviorConfig_MeleeGrunt → LevelPlacedAI → LevelPlacedBehaviorTree 拖入 BT_MeleeAI.uasset."),
+			*GetName());
+		// 【v54.4 零兜底】不再 fallback RunLegacyBehaviorTree, 暴露根因
 		return;
 	}
 
@@ -794,7 +962,7 @@ void ABaseAIController::StartBehaviorTreeFromConfig()
 		return;
 	}
 	// 调用从 Profile 启动行为树的函数
-	StartBehaviorTreeFromProfile();
+	StartBehaviorTreeFromConfigInternal();
 }
 
 // RunLegacyBehaviorTree：传统兼容路径，用于没有 Profile 的情况
@@ -833,13 +1001,11 @@ void ABaseAIController::DiagnoseAndLogBootStatus() const
 	// 获取 AI 控制器的名称，用于日志输出
 	const FString MyName = GetName();
 
-	// 【1】Profile 完整性
-	// 获取当前 Profile 的名称
-	const FString ProfileName = GetNameSafe(CurrentProfile);
-	// 获取当前配置资产的名称
-	const FString ConfigName  = GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr);
-	// 获取阵营标签的字符串表示
-	const FString FactionStr  = CurrentProfile ? CurrentProfile->FactionTag.ToString() : FString(TEXT("<None>"));
+	// 【1】Config 完整性 (v54: Profile 已删除, 只看 Config)
+	// 获取当前 Config 资产名称
+	const FString ConfigName = GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr);
+	// 获取阵营标签的字符串表示 (从 CachedFactionTag, 不再读 Profile)
+	const FString FactionStr = CachedFactionTag.ToString();
 
 	// 【2】阵营 ID 解析 — 关键诊断点
 	// 获取 AI 的阵营 ID
@@ -888,10 +1054,10 @@ void ABaseAIController::DiagnoseAndLogBootStatus() const
 	}
 
 	// 【统一输出格式】大厂 grep 友好: "Diagnose:" 一键定位
-	// 输出 Profile、配置、阵营标签、阵营 ID 和 Pawn 类名的诊断日志
+	// 输出 Config、阵营标签、阵营 ID 和 Pawn 类名的诊断日志
 	UE_LOG(LogBaseAI, Log,
-		TEXT("Diagnose: [%s] Profile=%s Config=%s FactionTag=%s -> TeamID=%d PawnClass=%s"),
-		*MyName, *ProfileName, *ConfigName, *FactionStr, TeamIdInt, *PawnFactionStr);
+		TEXT("Diagnose: [%s] Config=%s FactionTag=%s -> TeamID=%d PawnClass=%s"),
+		*MyName, *ConfigName, *FactionStr, TeamIdInt, *PawnFactionStr);
 
 	// 输出感知配置摘要的诊断日志
 	UE_LOG(LogBaseAI, Log,
@@ -904,11 +1070,13 @@ void ABaseAIController::DiagnoseAndLogBootStatus() const
 		*MyName, *NavMeshSummary);
 
 	// 【异常升级到 Error】 — 启动期最致命的 3 个 P0 故障点
-	// 如果阵营 ID 为 0（玩家阵营），输出错误日志，提示 AI 会把玩家当友军
+	// 如果阵营 ID 为 0（Offense 阵营），输出警告日志，提示此 AI 是攻方
+	// 注意: TeamID=0 不一定是 "AI 阵营错误" — Offense/Defense 哪个是攻方由 ModeRulesByMode 决定
+	//       这里仅作为可观测性提示, 不当作 Error
 	if (TeamIdInt == 0)
 	{
-		UE_LOG(LogBaseAI, Error,
-			TEXT("Diagnose: [%s] ⚠ TeamID=0 = Player 阵营! AI 会把玩家当友军不攻击. 请检查 Profile.FactionTag (期望 Faction.Enemy)"),
+		UE_LOG(LogBaseAI, Warning,
+			TEXT("Diagnose: [%s] TeamID=0 = Offense 阵营 (攻方). 验证: 是否与 ModeRulesByMode[Mode].AttackTeamFaction 一致"),
 			*MyName);
 	}
 	// 如果运行时配置或配置资产缺失，输出错误日志，提示 AI 无法运行
@@ -953,23 +1121,19 @@ void ABaseAIController::SetDifficultyTier(EAIDifficultyTier NewTier)
  */
 float ABaseAIController::GetEffectiveAttackInterval() const
 {
-	const UAIProfileAsset* Profile = GetCurrentProfile();
-
-	// 优先级 1: Profile 手动值 (策划明确意图, 不叠加难度缩放)
-	if (Profile && Profile->AttackInterval > 0.0f)
-	{
-		return Profile->AttackInterval;
-	}
-
-	// 优先级 2: ConfigSO + 难度缩放
+	// 【v54 大厂架构重构】直接读 ConfigSO + 难度缩放
+	//   v54 之前: Profile->AttackInterval > 0 优先, 否则读 ConfigSO
+	//   v54 之后: Profile 已删除, 只读 ConfigSO.Combat.AttackCooldown (含难度缩放)
+	//   真理源: ConfigSO.Combat.AttackCooldown (策划在 DA_AIBehaviorConfig_* 里直接配)
 	if (UAIRuntimeConfigComponent* ConfigComp = RuntimeConfig)
 	{
-		// GetScaledCombat 内部完成难度缩放 (Hard 缩 0.7x, Easy 缩 1.3x)
 		return ConfigComp->GetScaledCombat().AttackCooldown;
 	}
 
-	// 优先级 3: 兜底
-	// v13 默认 5.0s (与 ConfigSO 新默认一致, 2026.07.07 用户反馈 "AttackCooldown 默认给我改成 5 秒")
+	// 兜底 (RuntimeConfig 缺失时): 5.0s
+	UE_LOG(LogBaseAI, Warning,
+		TEXT("[%s] GetEffectiveAttackInterval: RuntimeConfig 缺失, 返回兜底 5s. 修复: 检查 RuntimeConfig 是否挂在 AIController"),
+		*GetName());
 	return 5.f;
 }
 
@@ -1004,8 +1168,8 @@ float ABaseAIController::GetEffectiveAttackDamage() const
 /**
  * 【P0 2026.07.07 大厂架构重构】AI 默认步行速度 (cm/s)
  *
- * 设计: 集中管理, 避免 TickChaseFallback / LockMovementForCooldown 各自硬编码 600
- *       (项目其它地方 Player MaxWalkSpeed 也是 600, 见 BaseCharacter.cpp line 76, 139)
+ * 设计: 集中管理, 避免 TickChaseFallback / LockMovementForCooldown 各自硬编码 400
+ *       (项目其它地方 Player MaxWalkSpeed 也是 400, 见 PlayerComboComponent.cpp, BaseAnimInstance.cpp)
  *
  * 修改此值需同时检查:
  *   - BaseCharacter.cpp line 76 / 139 (Player 的 MaxWalkSpeed)
@@ -1099,6 +1263,93 @@ float ABaseAIController::GetAttackRangeHysteresis() const
 	return 0.f; // 兜底: 没 Config 时默认 0 (锐利边界, 不卡 AI)
 }
 
+// 【v54.4 大厂架构重构】关卡预放 AI 默认武器
+//
+// 返回值是 TSoftClassPtr (语义不变: 软引用), null = 关卡预放不需要武器 (零兜底)
+//   - 关卡预放 AI: SetupMeleeAI / SpawnAIInternal 内部已校验, null 会 Log Error
+//   - 大厅 AI: 不读这个字段 (走 Request.WeaponID → ResolveWeaponClassFromID 拿 Class)
+TSoftClassPtr<ABaseWeapon> ABaseAIController::GetDefaultWeaponClass() const
+{
+    if (RuntimeConfig && RuntimeConfig->GetConfig())
+    {
+        // 【v54.4】DefaultWeaponClass → LevelPlacedWeaponClass
+        return RuntimeConfig->GetConfig()->LevelPlacedWeaponClass;
+    }
+    static bool bWarnedMissingConfigWeapon = false;
+    if (!bWarnedMissingConfigWeapon)
+    {
+        bWarnedMissingConfigWeapon = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("[BaseAIController::GetDefaultWeaponClass] AIController='%s' 的 Config 缺失. "
+                 "【v54.4 零兜底】返回 null. "
+                 "【修复】检查 InitializeFromConfig 链路."),
+            *GetNameSafe(this));
+    }
+    return nullptr;
+}
+
+// 【v54.2 大厂架构 — 真理源 + 零兜底 + 可观测性】AI 复活无敌期
+//
+// 大厂原则:
+//   - RuntimeConfig 或 Config 缺失 → Log Error (暴露根因) + 返回 0
+//   - 返回 0 不是"兜底默认值", 是"零兜底语义: 0 = 跳过激活 (用户决策)"
+//   - 调用方必须自己再校验 (Log + 走或跳), 不能依赖这个 0 当默认值
+//
+float ABaseAIController::GetSpawnInvincibilitySeconds() const
+{
+    if (RuntimeConfig && RuntimeConfig->GetConfig())
+    {
+        return RuntimeConfig->GetConfig()->SpawnInvincibilitySeconds;
+    }
+    // 【v54.2 可观测性】Config 缺失 → Log Error (首次警告, 不刷屏)
+    static bool bWarnedMissingConfig = false;
+    if (!bWarnedMissingConfig)
+    {
+        bWarnedMissingConfig = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("[BaseAIController::GetSpawnInvincibilitySeconds] AIController='%s' 的 Config 缺失. "
+                 "【v54.2 零兜底】返回 0 表示【跳过激活】, 不是默认值. "
+                 "【修复】检查 InitializeFromConfig 是否被调用, 或 SpawnAIInternal 是否漏传 Config."),
+            *GetNameSafe(this));
+    }
+    return 0.f;
+}
+
+// 【v54 大厂架构重构】直接读 ConfigSO (替代 GetCurrentProfile)
+const UAIBehaviorConfigSO* ABaseAIController::GetConfig() const
+{
+	if (RuntimeConfig)
+	{
+		return RuntimeConfig->GetConfig();
+	}
+	return nullptr;
+}
+
+// 【v54.4 大厂架构重构】关卡预放 AI 默认 AIController Class
+//
+// 返回 nullptr 不是兜底, 是"零兜底语义: 缺失 = SpawnAIInternal 拒绝 Spawn"
+//   - SpawnAIInternal 内部已校验, nullptr 会 Log Error + return
+//
+TSubclassOf<AAIController> ABaseAIController::GetDefaultAIControllerClass() const
+{
+    if (RuntimeConfig && RuntimeConfig->GetConfig())
+    {
+        // 【v54.4】DefaultAIControllerClass → LevelPlacedAIControllerClass
+        return RuntimeConfig->GetConfig()->LevelPlacedAIControllerClass;
+    }
+    static bool bWarnedMissingConfigController = false;
+    if (!bWarnedMissingConfigController)
+    {
+        bWarnedMissingConfigController = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("[BaseAIController::GetDefaultAIControllerClass] AIController='%s' 的 Config 缺失. "
+                 "【v54.4 零兜底】返回 nullptr. "
+                 "【修复】检查 InitializeFromConfig 链路."),
+            *GetNameSafe(this));
+    }
+    return nullptr;
+}
+
 
 /**
  * ComputeArrivalDecision — 【P0 2026.07.07 v14 大厂架构】纯函数距离决策 (四态)
@@ -1139,15 +1390,15 @@ float ABaseAIController::GetAttackRangeHysteresis() const
  *
  * 调用方: TickChaseFallback 唯一调用, 决策频率: 每帧
  *
- * 关于后退速度硬编码 0.7 而非可配置的工程理由 (历史 v11 决策, v14 继续保留):
- *   - 玩家 MaxWalkSpeed=600 (BaseCharacter.cpp line 76, 139)
- *   - 600*0.7=420cm/s 后退速度: 略慢于玩家冲刺 (不至于永远追不上)
- *     又快于玩家走路 (不至于被玩家轻松贴身)
- *   - 这是大厂"AI 不脱离战斗"的核心约束, 用魔法数字更稳定
- *   - 如果未来需要可调, 改回常量定义即可, 1 行修复
+ * 【v41 2026.07.14 大厂架构重构】前进/后退速度统一走配置表
+ *
+ * v41 变更: 后退速度不再是 0.7×MaxWalkSpeed, 而是 WalkSpeed×0.7 (配置表 FAIMovementParams)
+	 *   - 前进: WalkSpeed = 配置表 WalkSpeed
+ *   - 后退: ActualSpeed = WalkSpeed × 0.7 (配置表, 仍硬编码 0.7 系数)
+ *   - 0.7 系数不变: 大厂标准 (MGS/死亡搁浅/GTA5), 与玩家速度无关
  *
  * 关于后退方向的说明:
- *   返回的 ChaseScale 是**带符号**的: 正=前进, 负=后退
+	 *   返回的 WalkSpeed 是**带符号**的: 正=前进, 负=后退
  *   调用方 TickChaseFallback 会根据符号决定 AddMovementInput 的方向:
  *     - 正: AddMovementInput(ForwardDirection,  ScaleValue)     → 朝敌人移动
  *     - 负: AddMovementInput(RetreatDirection, |ScaleValue|)     → 远离敌人移动
@@ -1159,126 +1410,79 @@ float ABaseAIController::GetAttackRangeHysteresis() const
  *     - NavMesh 不会把负 Scale 误判为"减速指令"
  *     - 与 UE 官方 ACharacter::AddMovementInput 推荐用法一致 (方向明确, Scale 在 [-1, 1])
  */
+/**
+ * 【v42 2026.07.14】前进/后退速度统一走配置表 WalkSpeed
+ *
+ * 设计:
+ *   - D > AR+Hyst → 前进 (WalkSpeed = 配置表 WalkSpeed)
+ *   - D < AR-Hyst → 后退 (WalkSpeed = -配置表 WalkSpeed, 负号由调用方转方向)
+ *   - 区间内 → LockStop
+ *   - 站桩型攻击中 → LockStop
+ */
 ABaseAIController::FArrivalDecision ABaseAIController::ComputeArrivalDecision(
 	float Distance, float AttackRange,
 	bool bAttacking, bool bAllowMovementDuringAttack,
-	bool bInCooldown, float Hysteresis)
+	bool bInCooldown, float Hysteresis,
+	const FAIMovementParams& Movement)
 {
 	FArrivalDecision Out;
 	Out.Action = FArrivalDecision::EAction::Chase;
-	Out.ChaseScale = 1.0f;
+	Out.WalkSpeed = Movement.WalkSpeed;  // 【v42】前进默认用配置表 WalkSpeed
 	Out.bShouldLock = false;
 
-	// 输入防御: Hysteresis 必须非负, 防止负值导致逻辑倒置
-	// (v13: 外部唯一调用方 TickChaseFallback 传 0, 这里 double-check 防御负值输入)
+	// 输入防御: Hysteresis 必须非负
 	const float SafeHysteresis = FMath::Max(Hysteresis, 0.f);
 
 	// ================================================================
-	// [P1] 站桩型 AI 攻击中: 强制 LockStop (用户原意 — 站桩型就该站定)
-	//
-	// v11 调整: 站桩型的判定从"在攻击蒙太奇中" 改为 "在攻击蒙太奇中 且 配置为不允许移动"
-	//   - bAllowMovementDuringAttack=false: 站桩型, 攻击时锁步 (老行为保留)
-	//   - bAllowMovementDuringAttack=true : 冲锋型, 走 P3 距离维持 (统一逻辑)
-	//
-	// 注意: 这里**不**叠加 bInCooldown — v16 起 bInCooldown 不再影响移动决策
-	//       (v11/v13 行为: 蒙太奇期间无论是否冷却都站定, 蒙太奇后无论是否冷却都距离维持)
+	// [P1] 站桩型 AI 攻击中: 强制 LockStop
 	// ================================================================
 	if (bAttacking && !bAllowMovementDuringAttack)
 	{
 		Out.Action = FArrivalDecision::EAction::LockStop;
-		Out.ChaseScale = 0.f;
+		Out.WalkSpeed = 0.f;
 		Out.bShouldLock = true;
 		return Out;
 	}
 
 	// ================================================================
-	// [P2-Removed] v16 修复 — 彻底废除 v14 引入的"冷却期 LockStop" 分支
-	//
-	// v14 修复链路:
-	//   - 用户 19:50 反馈: "AI 在攻击冷却时持续原地走动, 应该原地不动"
-	//   - v14 修复: 增加 P2-New 分支 (bAttacking=false && bInCooldown=true → LockStop)
-	//   - 结果: 蒙太奇结束后 5 秒内 AI 完全静止 (ConfigSO.AttackCooldown=5s)
-	//
-	// 用户 20:11 反馈 (推翻 v14 修复):
-	//   "玩家走 ai 也不跟随, 要一会才跟随"
-	//   用户实际想要的: **冷却期 AI 应该跟随玩家走 (距离维持 AttackRange)**,
-	//   而**不是静止 5 秒**. 5 秒 LockStop 太久了.
-	//
-	// v16 修复 (大厂"以用户最终反馈为准"原则):
-	//   - 完全废除 P2-New 冷却期 LockStop 分支
-	//   - 不论 bInCooldown 是 true 还是 false, 只要 bAttacking=false 就走 P3 距离维持
-	//   - 物理直觉: AI 攻击完恢复"主动战斗意识", 立刻继续按 AttackRange 调整距离
-	//   - 这与用户 18:34 原始诉求一致:
-	//     "只要进入攻击冷却, 就实时监测敌人与 ai 距离, ai 保持 AttackRange 设定的距离,
-	//      直到攻击冷却结束"
-	//
-	// 不变量 (v16 大厂原则 — 输入决定输出):
-	//   - 蒙太奇中 (bAttacking=true):
-	//     - 站桩型 (bAllowMovementDuringAttack=false) → P1 LockStop
-	//     - 冲锋型 (bAllowMovementDuringAttack=true)  → P3 距离维持
-	//   - 非攻击期 (bAttacking=false): 统一 → P3 距离维持 (不论 bInCooldown)
-	//     - 蒙太奇刚结束: AI 立刻恢复距离维持, 玩家走近就后退, 玩家走远就追
-	//     - Cooldown 概念在移动决策上完全无影响 (只控制攻击 Token 何时就绪)
-	//
-	// 注意: bIsInAttackCooldown 成员变量仍然维护 (Timer 仍会清),
-	//       只是它不再影响 ComputeArrivalDecision. 这是"职责分离":
-	//       - 移动决策: 看 bAttacking
-	//       - 攻击权限: 看 Cooldown Timer / BB Token
+	// [P3 v16] 距离维持 (统一逻辑, 不分冷却期/完全空闲)
+	//   - D > AR+Hyst   → 前进 (WalkSpeed = 配置表 WalkSpeed)
+	//   - D < AR-Hyst   → 后退 (WalkSpeed = -配置表 WalkSpeed)
+	//   - 区间内         → LockStop
 	// ================================================================
 
-	// ================================================================
-	// [P3 v16] 距离维持 (统一逻辑, 不分冷却期 / 完全空闲)
-	//
-	// 历史:
-	//   - 旧 v10 bug: D < AR → LockStop, 玩家贴身时 AI 死站 (用户 18:11 反馈)
-	//   - v11 新: 距离维持 (用户 18:34 反馈, 但 19:50 反馈推翻了)
-	//   - v14 错误: 引入冷却期 LockStop (用户 19:50 反馈推动)
-	//   - v16 终态: 距离维持, 废除所有冷却期 LockStop (用户 20:11 反馈推动)
-	//
-	// 设计:
-	//   - D > AR+Hyst   → 全速追  (距离够远, 追到 AR 边缘)
-	//   - D < AR-Hyst   → 面向敌人后退  (距离太近, 退到 AR 边缘)
-	//   - 区间内 [AR-Hyst, AR+Hyst] → LockStop  (迟滞区间, 不切换, 防止抖动)
-	// ================================================================
-
-	// 防御: 距离为负视为不在范围内 (避免 -1 触发 Lock)
 	if (Distance < 0.f)
 	{
-		// 异常输入 → 视为已到达, 等待 BT 决策
 		Out.Action = FArrivalDecision::EAction::LockStop;
-		Out.ChaseScale = 0.f;
+		Out.WalkSpeed = 0.f;
 		Out.bShouldLock = true;
 		return Out;
 	}
 
-	// Hysteresis 区间 = 迟滞区, 视为"已到达", 锁步
-	// 不调 AddMovementInput, 让 BT 在下一帧重新评估
 	const float UpperBound = AttackRange + SafeHysteresis;
 	const float LowerBound = AttackRange - SafeHysteresis;
 
 	if (Distance > UpperBound)
 	{
-		// 距离太远 → 全速追
+		// 距离太远 → 前进
 		Out.Action = FArrivalDecision::EAction::Chase;
-		Out.ChaseScale = 1.0f;
+		Out.WalkSpeed = Movement.WalkSpeed;  // 【v42】正值 = 前进
 		Out.bShouldLock = false;
 		return Out;
 	}
 
 	if (Distance < LowerBound)
 	{
-		// 距离太近 → 面向敌人后退 (硬编码 0.7)
-		// 0.7 是大厂"略慢于玩家冲刺"的标准值, 见函数头注释
+		// 距离太近 → 后退 (负值由调用方转方向)
 		Out.Action = FArrivalDecision::EAction::Chase;
-		Out.ChaseScale = -0.7f;  // 硬编码, 见函数头注释
+		Out.WalkSpeed = -Movement.WalkSpeed;  // 【v42】负值 = 后退
 		Out.bShouldLock = false;
 		return Out;
 	}
 
-	// 在 [AR-Hyst, AR+Hyst] 迟滞区间 → LockStop
-	// 大厂 Hysteresis 核心: 不切换动作, 避免抖动
+	// 迟滞区间 → LockStop
 	Out.Action = FArrivalDecision::EAction::LockStop;
-	Out.ChaseScale = 0.f;
+	Out.WalkSpeed = 0.f;
 	Out.bShouldLock = true;
 	return Out;
 }
@@ -1392,6 +1596,9 @@ void ABaseAIController::SelfTestArrivalDecision()
 	//   ComputeArrivalDecision 调用方 TickChaseFallback 现在从 ConfigSO 读
 	//   默认 Hyst=0 时 = 单点 AR 边界 (v13 行为), Refractory Period 200ms 引擎层兜底抗抖动
 	constexpr float kDefaultHysteresis = 0.f;
+	// v42: 测试用移动参数 (WalkSpeed=250, Hyst=0)
+	constexpr float kTestWalkSpeed = 250.f;
+	const FAIMovementParams TestMoveParams{ kTestWalkSpeed, 60.f, 800.f };
 
 	struct FTestCase
 	{
@@ -1402,8 +1609,7 @@ void ABaseAIController::SelfTestArrivalDecision()
 		bool bAllowMoveDuringAttack;
 		bool bInCooldown;
 		FArrivalDecision::EAction ExpectedAction;
-		float ExpectedScaleMin;
-		float ExpectedScaleMax;
+		float ExpectedWalkSpeed;  // v42: 期望 WalkSpeed (250=前进, -250=后退, 0=停止)
 		bool ExpectedLock;
 	};
 
@@ -1414,12 +1620,12 @@ void ABaseAIController::SelfTestArrivalDecision()
 		// ============================================================
 		// [CASE 1] P4 距离够远 → Chase(1.0)
 		{ TEXT("C1_NonCombat_Far"),  300.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, 0.99f, 1.01f, false },
+		  FArrivalDecision::EAction::Chase, kTestWalkSpeed, false },
 
 		// [CASE 2] ⭐ P4 贴身 (< AR=250) → Chase(-0.7) 面向敌人后退 (用户原话)
 		// 用户原话: "敌人离 ai 小于 AttackRange, ai 面向敌人往后退"
 		{ TEXT("C2_NonCombat_Near_Retreat"), 100.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// ============================================================
 		// [v16] ⭐ 废除 v14 P2-New 冷却期 LockStop — 恢复 v11 距离维持 (用户 20:11 反馈)
@@ -1429,35 +1635,35 @@ void ABaseAIController::SelfTestArrivalDecision()
 		// ============================================================
 		// [CASE 3] ⭐ v16 — 冷却期距离够远 → Chase(1.0) (v14 这里期望 LockStop, 已修正)
 		{ TEXT("C3_Cooldown_Far_Chase"),   400.f, 250.f, false, false,  true,
-		  FArrivalDecision::EAction::Chase, 0.99f, 1.01f, false },
+		  FArrivalDecision::EAction::Chase, kTestWalkSpeed, false },
 
 		// [CASE 4] ⭐ v16 — 冷却期贴身 → Chase(-0.7) 后退 (v14 这里期望 LockStop, 已修正)
 		// 这是用户 18:34 原始诉求 + 20:11 最新反馈的核心:
 		//   "敌人离 ai 小于 AttackRange, ai 面向敌人往后退" (冷却期也适用)
 		{ TEXT("C4_Cooldown_Near_Retreat"), 100.f, 250.f, false, false,  true,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// ============================================================
 		// [P3] v11 冲锋型攻击中: 距离维持 (同 P2)
 		// ============================================================
 		// [CASE 5] P3 冲锋型攻击中 + 贴身 → Chase(-0.7) 后退
 		{ TEXT("C5_AttackingAllowMove_Near_Retreat"), 100.f, 250.f, true,  true,  false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 6] P3 冲锋型攻击中 + 远距离 → Chase(1.0)
 		{ TEXT("C6_AttackingAllowMove_Far"), 400.f, 250.f, true,  true,  false,
-		  FArrivalDecision::EAction::Chase, 0.99f, 1.01f, false },
+		  FArrivalDecision::EAction::Chase, kTestWalkSpeed, false },
 
 		// ============================================================
 		// [P1 站桩型] 任何距离 → LockStop (强制)
 		// ============================================================
 		// [CASE 7] 站桩型攻击中 + 贴身 → LockStop
 		{ TEXT("C7_AttackingLock_Near"), 100.f, 250.f, true,  false, false,
-		  FArrivalDecision::EAction::LockStop, -0.01f, 0.01f, true },
+		  FArrivalDecision::EAction::LockStop, 0.f, true },
 
 		// [CASE 8] 站桩型攻击中 + 远距离 → LockStop (强制, 任何距离)
 		{ TEXT("C8_AttackingLock_Far"), 400.f, 250.f, true,  false, false,
-		  FArrivalDecision::EAction::LockStop, -0.01f, 0.01f, true },
+		  FArrivalDecision::EAction::LockStop, 0.f, true },
 
 		// ============================================================
 		// ⭐ v18 Hyst 字段重新暴露 ConfigSO, 默认 0 = 单点 AR 边界
@@ -1470,25 +1676,25 @@ void ABaseAIController::SelfTestArrivalDecision()
 		// ============================================================
 		// [CASE 9 ⭐ v18] P4 + D=251 (刚好 > AR=250, Hyst=0) → Chase(1.0)
 		{ TEXT("C9_Boundary_AboveChase"), 251.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, 0.99f, 1.01f, false },
+		  FArrivalDecision::EAction::Chase, kTestWalkSpeed, false },
 
 		// [CASE 10 ⭐ v18] P4 + D=250 (正好 == AR, 单点) → LockStop
 		{ TEXT("C10_Boundary_ExactLock"), 250.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::LockStop, -0.01f, 0.01f, true },
+		  FArrivalDecision::EAction::LockStop, 0.f, true },
 
 		// [CASE 11 ⭐ v18] P4 + D=249 (刚好 < AR=250, Hyst=0) → Chase(-0.7) 后退
 		{ TEXT("C11_Boundary_BelowRetreat"), 249.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 12 ⭐ v18] P4 + D=245 (< AR 远离) → Chase(-0.7) 后退 (验证大于阈值仍持续后退)
 		{ TEXT("C12_FarBelow_Retreat"), 245.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 13 ⭐ v16/v18] 蒙太奇已结束 + Cooldown 未结束 + 玩家贴身 → Chase(-0.7) 后退
 		//   v16 修复: 冷却期不再走 P2-New LockStop, 恢复 v11 距离维持 (用户 20:11 反馈)
 		//   v18 验证: Hyst=0 默认时, 冷却期贴身仍正常距离维持
 		{ TEXT("C13_PostMontageCooldown_Retreat"), 100.f, 250.f, false, false, true,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 14 ⭐ v18 关键] Hyst=30 时 (用户测试用) D ∈ [220, 280] → LockStop
 		//   这是用户 20:35 反馈的 bug: "AI 卡在 200cm 不进 180cm 攻击范围"
@@ -1496,15 +1702,15 @@ void ABaseAIController::SelfTestArrivalDecision()
 		//   永远不追到 180cm 攻击区 → BTTask 不触发
 		//   验证: 默认 Hyst=0 时这个 case 也 Chase (因为 200 < 250 AR)
 		{ TEXT("C14_Hyst30_Dist200_WouldLock_In30NowChase"), 200.f, 250.f, false, true, false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 15] D=0 极端 — 重叠, 应后退 (虽然物理上不可达)
 		{ TEXT("C15_ZeroDistance_Retreat"), 0.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::Chase, -0.8f, -0.6f, false },
+		  FArrivalDecision::EAction::Chase, -kTestWalkSpeed, false },
 
 		// [CASE 16] 距离为负 (异常输入) → LockStop (防御)
 		{ TEXT("C16_NegativeDistance_Lock"), -1.f, 250.f, false, true,  false,
-		  FArrivalDecision::EAction::LockStop, -0.01f, 0.01f, true },
+		  FArrivalDecision::EAction::LockStop, 0.f, true },
 	};
 
 	int32 PassCount = 0;
@@ -1513,12 +1719,13 @@ void ABaseAIController::SelfTestArrivalDecision()
 	for (const FTestCase& T : Tests)
 	{
 		const FArrivalDecision Result = ComputeArrivalDecision(
-			T.Distance, T.AttackRange, T.bAttacking, T.bAllowMoveDuringAttack, T.bInCooldown, kDefaultHysteresis);
+			T.Distance, T.AttackRange, T.bAttacking, T.bAllowMoveDuringAttack, T.bInCooldown, kDefaultHysteresis,
+			TestMoveParams);
 
 		const bool bActionOK = (Result.Action == T.ExpectedAction);
-		const bool bScaleOK = (Result.ChaseScale >= T.ExpectedScaleMin && Result.ChaseScale <= T.ExpectedScaleMax);
+		const bool bSpeedOK = FMath::Abs(Result.WalkSpeed - T.ExpectedWalkSpeed) < 0.1f;
 		const bool bLockOK = (Result.bShouldLock == T.ExpectedLock);
-		const bool bAllOK = bActionOK && bScaleOK && bLockOK;
+		const bool bAllOK = bActionOK && bSpeedOK && bLockOK;
 
 		if (bAllOK)
 		{
@@ -1528,12 +1735,12 @@ void ABaseAIController::SelfTestArrivalDecision()
 		{
 			FailCount++;
 			UE_LOG(LogBaseAI, Error,
-				TEXT("[SelfTest] FAIL %s: Distance=%.0f Range=%.0f Attacking=%d AllowMove=%d Cooldown=%d "
-					 "→ Got Action=%d Scale=%.2f Lock=%d | Expected Action=%d Scale=[%.2f, %.2f] Lock=%d"),
+				TEXT("[SelfTest] FAIL %s: D=%.0f AR=%.0f Att=%d Allow=%d Cool=%d "
+					 "→ Got Action=%d WS=%.1f Lock=%d | Expect Action=%d WS=%.1f Lock=%d"),
 				T.Name, T.Distance, T.AttackRange,
 				T.bAttacking ? 1 : 0, T.bAllowMoveDuringAttack ? 1 : 0, T.bInCooldown ? 1 : 0,
-				(int32)Result.Action, Result.ChaseScale, Result.bShouldLock ? 1 : 0,
-				(int32)T.ExpectedAction, T.ExpectedScaleMin, T.ExpectedScaleMax, T.ExpectedLock ? 1 : 0);
+				(int32)Result.Action, Result.WalkSpeed, Result.bShouldLock ? 1 : 0,
+				(int32)T.ExpectedAction, T.ExpectedWalkSpeed, T.ExpectedLock ? 1 : 0);
 		}
 	}
 
@@ -1543,23 +1750,22 @@ void ABaseAIController::SelfTestArrivalDecision()
 	//   ⭐ v18 关键: 验证 Hyst=0 默认时, AI 一定会追到 AR (不会卡在 AR+Hyst 远处不动)
 	//              这是用户 20:35 反馈 "AI 卡在 200cm 不追" 的根因测试
 	{
-		struct FExactCase { float D; FArrivalDecision::EAction Expect; float ScaleSign; };
+		struct FExactCase { float D; FArrivalDecision::EAction Expect; float WS; };
 		const FExactCase ExactCases[] =
 		{
-			{ 200.f, FArrivalDecision::EAction::Chase,    -1.f },  // < AR → 后退 (v17 失败点: Hyst=30 时 D=200 在区间内 LockStop, 不追到 AR!)
-			{ 245.f, FArrivalDecision::EAction::Chase,    -1.f },  // < AR → 后退
-			{ 249.f, FArrivalDecision::EAction::Chase,    -1.f },  // < AR → 后退
-			{ 250.f, FArrivalDecision::EAction::LockStop,   0.f },  // == AR 单点 → 锁步
-			{ 251.f, FArrivalDecision::EAction::Chase,     1.f },  // > AR → 追
-			{ 280.f, FArrivalDecision::EAction::Chase,     1.f },  // > AR → 追
-			{ 300.f, FArrivalDecision::EAction::Chase,     1.f },  // > AR → 追
+			{ 200.f, FArrivalDecision::EAction::Chase,    -kTestWalkSpeed },
+			{ 245.f, FArrivalDecision::EAction::Chase,    -kTestWalkSpeed },
+			{ 249.f, FArrivalDecision::EAction::Chase,    -kTestWalkSpeed },
+			{ 250.f, FArrivalDecision::EAction::LockStop,   0.f },
+			{ 251.f, FArrivalDecision::EAction::Chase,      kTestWalkSpeed },
+			{ 280.f, FArrivalDecision::EAction::Chase,    kTestWalkSpeed },
+			{ 300.f, FArrivalDecision::EAction::Chase,    kTestWalkSpeed },
 		};
 		for (const FExactCase& E : ExactCases)
 		{
-			const FArrivalDecision R = ComputeArrivalDecision(E.D, 250.f, false, true, false, 0.f);
-			const bool bActionOK = (R.Action == E.Expect);
-			const bool bScaleOK = (FMath::Sign(R.ChaseScale) == E.ScaleSign);
-			if (bActionOK && bScaleOK)
+			const FArrivalDecision R = ComputeArrivalDecision(E.D, 250.f, false, true, false, 0.f, TestMoveParams);
+			const bool bOK = (R.Action == E.Expect) && (FMath::Abs(R.WalkSpeed - E.WS) < 0.1f);
+			if (bOK)
 			{
 				PassCount++;
 			}
@@ -1567,8 +1773,8 @@ void ABaseAIController::SelfTestArrivalDecision()
 			{
 				FailCount++;
 				UE_LOG(LogBaseAI, Error,
-					TEXT("[SelfTest] FAIL C17_ExactBound D=%.0f: Got Action=%d Scale=%.2f | Expected Action=%d Sign=%.0f"),
-					E.D, (int32)R.Action, R.ChaseScale, (int32)E.Expect, E.ScaleSign);
+					TEXT("[SelfTest] FAIL C17_ExactBound D=%.0f: Got Action=%d WS=%.1f | Expect Action=%d WS=%.1f"),
+					E.D, (int32)R.Action, R.WalkSpeed, (int32)E.Expect, E.WS);
 			}
 		}
 	}
@@ -1582,63 +1788,41 @@ void ABaseAIController::SelfTestArrivalDecision()
 	//   v18 修复: 默认 Hyst=0, AI 在 D=200 时 Chase(-0.7) 后退到 AR=180 内触发 BTTask
 	//   ⭐ 这个测试通过 = 用户 20:35 反馈的 bug 已修复
 	{
-		const FArrivalDecision R_Hyst0 = ComputeArrivalDecision(200.f, 180.f, false, true, false, 0.f);
-		if (R_Hyst0.Action == FArrivalDecision::EAction::Chase && FMath::Sign(R_Hyst0.ChaseScale) == -1.f)
+		const FArrivalDecision R = ComputeArrivalDecision(200.f, 180.f, false, true, false, 0.f, TestMoveParams);
+		if (R.Action == FArrivalDecision::EAction::Chase && FMath::Abs(R.WalkSpeed - (-kTestWalkSpeed)) < 0.1f)
 		{
 			PassCount++;
-			UE_LOG(LogBaseAI, Log,
-				TEXT("[SelfTest] C18_Hyst0_At200_Chase ✓ (v18 默认: AR=180 Hyst=0 D=200 → Chase 后退到攻击范围, 修复用户 20:35 'AI 卡 200cm 不追' 反馈)"));
+			UE_LOG(LogBaseAI, Log, TEXT("[SelfTest] C18 ✓ (v42: AR=180 Hyst=0 D=200 → Chase 后退)"));
 		}
 		else
 		{
 			FailCount++;
-			UE_LOG(LogBaseAI, Error,
-				TEXT("[SelfTest] FAIL C18_Hyst0_At200_Chase: Got Action=%d Scale=%.2f (Expected Chase -1)"),
-				(int32)R_Hyst0.Action, R_Hyst0.ChaseScale);
+			UE_LOG(LogBaseAI, Error, TEXT("[SelfTest] FAIL C18: Got Action=%d WS=%.1f | Expect Chase WS=%.1f"), (int32)R.Action, R.WalkSpeed, -kTestWalkSpeed);
 		}
 	}
 
-	// [CASE 19 ⭐ v18 文档化已知问题] 当 Hyst=30 时 D=200 → LockStop (符合迟滞设计, 但会触发用户场景的 bug)
-	//   这个 case 记录: 当 ConfigSO.Combat.AttackRangeHysteresis=30 时,
-	//   AI 在 D=200 (< AR+Hyst=210) 会 LockStop
-	//   这是用户 20:35 反馈 bug 的根因, 但不是 ComputeArrivalDecision 的 bug
-	//   是配置错误 (Hyst 太大, 比 AR 还大 17%)
-	//   v18 默认 Hyst=0 绕开此问题, 但保留此 case 提醒未来调试者
+	// [CASE 19] Hyst=30, D=200 → LockStop
 	{
-		const FArrivalDecision R_Hyst30 = ComputeArrivalDecision(200.f, 180.f, false, true, false, 30.f);
-		if (R_Hyst30.Action == FArrivalDecision::EAction::LockStop)
+		const FArrivalDecision R = ComputeArrivalDecision(200.f, 180.f, false, true, false, 30.f, TestMoveParams);
+		if (R.Action == FArrivalDecision::EAction::LockStop)
 		{
 			PassCount++;
-			UE_LOG(LogBaseAI, Warning,
-				TEXT("[SelfTest] C19_Hyst30_At200_LockStop ⚠ (ConfigSO.Hyst=30 时 AI 在 D=200 卡住, 不追到 AR=180. "
-					 "用户 20:35 反馈的 bug 根因. v18 默认 Hyst=0 避免此问题)"));
+			UE_LOG(LogBaseAI, Warning, TEXT("[SelfTest] C19 ⚠ (Hyst=30 设太大, 建议 Hyst < AR/2)"));
 		}
 		else
 		{
 			FailCount++;
-			UE_LOG(LogBaseAI, Error,
-				TEXT("[SelfTest] FAIL C19_Hyst30_At200_LockStop: Got Action=%d Scale=%.2f (Expected LockStop)"),
-				(int32)R_Hyst30.Action, R_Hyst30.ChaseScale);
+			UE_LOG(LogBaseAI, Error, TEXT("[SelfTest] FAIL C19: Got Action=%d | Expect LockStop"), (int32)R.Action);
 		}
 	}
 
 	if (FailCount == 0)
 	{
-		UE_LOG(LogBaseAI, Log,
-			TEXT("[SelfTest] ComputeArrivalDecision: ALL %d CASES PASSED ✓ "
-				 "(v18: Hyst 字段重新暴露到 ConfigSO [用户 20:35 反馈要求], 默认 0 = 单点 AR 边界, "
-				 "Refractory Period 200ms 在 TickChaseFallback 抗抖动 已扩展为'任何决策切换' (不仅符号反转), "
-				 "Hyst=0 默认时 AI 一定追到 AR 攻击范围 (修复用户 20:35 'AI 卡 200cm 不追' 反馈 [v17 Hyst=30 硬编码导致]), "
-				 "RetreatSpeed 字段早删, "
-				 "v15 修复 ExecuteTask 路径 PerformAttack 漏设 bInCooldown=true [用户 20:04 反馈], "
-				 "v16 废除 v14 冷却期 LockStop 恢复 v11 距离维持 [用户 20:11 反馈])"),
-			PassCount);
+		UE_LOG(LogBaseAI, Log, TEXT("[SelfTest] ComputeArrivalDecision v42: ALL %d CASES PASSED ✓ (前进/后退统一 WalkSpeed)"), PassCount);
 	}
 	else
 	{
-		UE_LOG(LogBaseAI, Error,
-			TEXT("[SelfTest] ComputeArrivalDecision: %d/%d FAILED — 距离决策状态机存在 bug, 请检查 v13 重构"),
-			FailCount, PassCount + FailCount);
+		UE_LOG(LogBaseAI, Error, TEXT("[SelfTest] ComputeArrivalDecision v42: %d/%d FAILED"), FailCount, PassCount + FailCount);
 	}
 }
 
@@ -1726,17 +1910,38 @@ void ABaseAIController::LockMovementForCooldown(bool bLock)
 	}
 	else
 	{
-		// 恢复: MaxWalkSpeed=600 + AnimInstance 走 Walk/Run
+		// 【v42 2026.07.14 大厂架构重构】恢复速度从配置表读 WalkSpeed
+		// RuntimeConfig 在 Possess 后 SetupMeleeAI 已加载, GetScaledMovement() 一定有效
+		float RestoreSpeed = 0.f; // 默认 0 (零兜底: 配置未加载时不允许 AI 乱跑)
+		if (RuntimeConfig)
+		{
+			RestoreSpeed = RuntimeConfig->GetScaledMovement().WalkSpeed;
+			if (RestoreSpeed <= 0.f)
+			{
+				UE_LOG(LogBaseAI, Error,
+					TEXT("[%s] LockMovementForCooldown: 配置表 WalkSpeed=%.0f <= 0, AI 不会移动! "
+						 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0"),
+					*GetName(), RestoreSpeed);
+				RestoreSpeed = 0.f;
+			}
+		}
+		else
+		{
+			UE_LOG(LogBaseAI, Error,
+				TEXT("[%s] LockMovementForCooldown Unlock: RuntimeConfig 为空, 无法获取 WalkSpeed! "
+					 "修复: 检查 AI Profile 的 BehaviorConfig 是否正确配置"),
+				*GetName());
+		}
 		if (UCharacterMovementComponent* Movement = MyChar->GetCharacterMovement())
 		{
-			Movement->MaxWalkSpeed = kDefaultAIWalkSpeed;
+			Movement->MaxWalkSpeed = RestoreSpeed;
 		}
 		MyChar->bIsMovementLocked = false;
 		bMovementLockedForCooldown = false;
 
 		UE_LOG(LogBaseAI, Verbose,
 			TEXT("[%s] LockMovementForCooldown: UNLOCK (MaxWalkSpeed=%.0f, bIsMovementLocked=false)"),
-			*GetName(), kDefaultAIWalkSpeed);
+			*GetName(), RestoreSpeed);
 	}
 }
 
@@ -1766,61 +1971,86 @@ AActor* ABaseAIController::GetCurrentTargetActor() const
 
 
 // ==========================================
-// 4. 【Phase 1 重构】阵营协议实现
+// 4. 【2026.07.10 重构】阵营协议实现 — 走 FFactionTags + Cast<ABaseCharacter>
 // ==========================================
-// 设计: AI 也是 IGenericTeamAgentInterface 的实现方.
-//       阵营从 Profile.FactionTag 推, 不要再造一份 uint8 TeamID.
+// 设计 (大厂原则):
+//   - Controller 仅代理 — 真正阵营信息存在 Pawn 的 FactionTag (单一真理源)
+//   - 阵营判定走 FFactionTags::AttitudeBetween, 不直接比 FGenericTeamId 数字
+//   - GetGenericTeamId 委托给 Pawn, 不在 Controller 上另存一份 ID
+//   - 阵营 Tag 从 Pawn (ABaseCharacter::FactionTag) 读, 不靠 IGenericTeamAgentInterface (UE 接口没 GetFactionTag)
 
-// SetGenericTeamId：设置 AI 的阵营 ID，同步到 Pawn 上供感知系统读取
+// SetGenericTeamId：设置 AI 的阵营 ID,代理到 Pawn
 void ABaseAIController::SetGenericTeamId(const FGenericTeamId& NewTeamID)
 {
-	// 把 TeamID 存进 Pawn (让 Pawn 暴露给 AIPerception 直接读)
-	// 获取当前控制的 Pawn
+	// 【2026.07.11 v26.5 大厂原则 - 单一真理源】
+	// 写 CachedFactionTag 必须在写 Pawn 之前 (避免 Pawn 写失败时 Controller 已设值的不一致)
+	// 通过 FFactionTags::FromGenericTeamId 反向转换, 保证 Pawn.FactionTag 和 CachedFactionTag 表达同一阵营
+	//
+	// 注意: CachedFactionTag 不是 Controller 的"派生属性", 而是 Pawn.FactionTag 的运行时段缓存
+	//        死亡时 Pawn 已销毁, 从 CachedFactionTag 拿值能保留 Spawn/OnPossess 时确认的阵营
+	//
+	// 大厂原则 - 零兜底: NewTag.IsValid() 为 false (非法 ID) 时, 不写 CachedFactionTag
+	//   因为 NoTeam 是 UE 协议层合法状态 (AI 未配置阵营时), 不是错误
+	//   若用户调用 NoTeam 进来, 不应静默覆盖已缓存的 Offense/Defense
+	const FGameplayTag NewTag = FFactionTags::FromGenericTeamId(NewTeamID);
+	if (NewTag.IsValid())
+	{
+		// 写 CachedFactionTag (Pawn 销毁也能用, 复活路径读这里)
+		// 只在 CachedFactionTag 未设时写, 避免重复调用时覆盖早期决策 (大厂原则: 单次决策)
+		if (!CachedFactionTag.IsValid())
+		{
+			CachedFactionTag = NewTag;
+		}
+	}
+
 	if (APawn* MyPawn = GetPawn())
 	{
-		// 尝试将 Pawn 转换为通用阵营代理接口
 		if (IGenericTeamAgentInterface* PawnAgent = Cast<IGenericTeamAgentInterface>(MyPawn))
 		{
-			// 将阵营 ID 设置给 Pawn，让感知系统能直接读取
 			PawnAgent->SetGenericTeamId(NewTeamID);
 		}
 	}
 }
 
-// GetGenericTeamId：获取 AI 的阵营 ID，从 Pawn 上读取
+// GetGenericTeamId：获取 AI 的阵营 ID, 委托给 Pawn (const)
 FGenericTeamId ABaseAIController::GetGenericTeamId() const
 {
-	// 获取当前控制的 Pawn（const 指针）
 	if (const APawn* MyPawn = GetPawn())
 	{
-		// 尝试将 Pawn 转换为通用阵营代理接口（const 指针）
 		if (const IGenericTeamAgentInterface* PawnAgent = Cast<IGenericTeamAgentInterface>(MyPawn))
 		{
-			// 从 Pawn 上获取阵营 ID 并返回
 			return PawnAgent->GetGenericTeamId();
 		}
 	}
-	// 如果没有 Pawn 或 Pawn 没有实现阵营接口，返回默认敌对 ID（255）
-	return FGenericTeamId(255); // AI 默认敌对, 直到外部设置
+	// 没有 Pawn 或 Pawn 不实现接口 — NoTeam (255)
+	// 大厂原则: 不在 Controller 静默默认 ID, 让上游看到 NoTeam 并显式 SetGenericTeamId
+	return FGenericTeamId::NoTeam;
 }
 
-// GetTeamAttitudeTowards：获取 AI 对另一个 Actor 的阵营态度（敌对/中立/友好）
+// GetTeamAttitudeTowards：阵营态度判定 — 走 FFactionTags::AttitudeBetween (双阵营比 FGameplayTag)
 ETeamAttitude::Type ABaseAIController::GetTeamAttitudeTowards(const AActor& Other) const
 {
-	// 尝试将目标 Actor 转换为通用阵营代理接口
-	if (const IGenericTeamAgentInterface* OtherAgent = Cast<IGenericTeamAgentInterface>(&Other))
+	// 【2026.07.10 v25 修复】IGenericTeamAgentInterface 没 GetFactionTag() 方法
+	//   阵营 Tag 存在 ABaseCharacter::FactionTag 字段, 需要从 Other 拿 Actor 再 Cast
+	const FGameplayTag OtherTag = [&Other]()
 	{
-		// 获取目标的阵营 ID
-		const FGenericTeamId OtherId = OtherAgent->GetGenericTeamId();
-		// 获取 AI 自身的阵营 ID
-		const FGenericTeamId MyId = GetGenericTeamId();
+		// 优先 Cast ABaseCharacter (项目自定义阵营字段)
+		if (const ABaseCharacter* OtherChar = Cast<ABaseCharacter>(&Other))
+		{
+			return OtherChar->GetFactionTag();
+		}
+		// 其它 Actor (非 ABaseCharacter) → 空 Tag, FFactionTags::AttitudeBetween 判 Neutral
+		return FGameplayTag::EmptyTag;
+	}();
 
-		// 标准 FGenericTeamId::GetAttitude
-		// 使用引擎原生函数计算两个阵营 ID 之间的态度，并返回
-		return FGenericTeamId::GetAttitude(MyId, OtherId);
+	// 自己 (Controller) 的阵营 — 通过 GetPawn()->GetFactionTag() 拿
+	FGameplayTag MyTag = FGameplayTag::EmptyTag;
+	if (const ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn()))
+	{
+		MyTag = MyPawn->GetFactionTag();
 	}
-	// 如果目标没有实现阵营接口，返回中立态度
-	return ETeamAttitude::Neutral;
+
+	return FFactionTags::AttitudeBetween(MyTag, OtherTag);
 }
 
 
@@ -1834,29 +2064,30 @@ ETeamAttitude::Type ABaseAIController::GetTeamAttitudeTowards(const AActor& Othe
 //
 //   目标感知分两个层次写入 BB，职责分离:
 //
-//   Layer 1 — TargetActor（任意距离均写入）:
-//     - 只要感知到敌人，无条件写入 TargetActor
-//     - 由 BTService_RefreshTarget 仲裁刷新（或本函数直接写）
-//     - 驱动 BT 的 MoveTo / Attack 节点执行
+//   Layer 1 — TargetActor（账本驱动写入）:
+//     - 感知系统不再直接写 BB.TargetActor
+//     - 由 BTService_RefreshTarget 每 0.3s 调账本 (URoomTargetingSubsystem::RequestTargetForAI) 决定锁定谁
+//     - 账本严格反扎堆: 优先 Unlocked 池, 无 unlocked → 清 BB.TargetActor
 //
-//   Layer 2 — NearbyThreat（极近距离覆盖）:
+//   Layer 2 — NearbyThreat（保留, 极近距离覆盖）:
 //     - 仅当敌人进入 AttackRange 范围时写入 (v5 已合并 OverrideBTDistance, 2026.07.07)
 //     - 优先级高于 TargetActor（极近距离遭遇优先响应）
 //     - 由本函数直接写入，BTService 在下一帧读取 NearbyThreat
 //
-//   为什么分层？
-//     - Layer 2 确保极近距离遭遇能立刻覆盖目标（不用等 Service Tick）
-//     - Layer 1 确保任意距离都能驱动行为树（即使没有 NearbyThreat）
-//     - 两者协同：Service 读 NearbyThreat 优先，本函数写 NearbyThreat 极近时才触发
+//   2026.07.13 v40.7 关键改动:
+//     - 删掉感知写 TargetActor 的逻辑（反扎堆账本失效根因）
+//     - 感知丢失时: 释放账本（保持现有逻辑）
+//     - 感知发现时: 不写 BB.TargetActor, 等待 BTService 调账本
+//     - 反应迟钝 0.3s 由 Service 周期解决, 账本稳定 + 严格反扎堆
+//
+//   为什么感知不准写 TargetActor:
+//     - 感知触发时 AI 不知道其他 AI 已经锁了什么目标
+//     - 写 BB.TargetActor = 直接覆盖账本结果 = 抢别人目标 = 扎堆
+//     - 账本是单一真理源, 只能由 BTService_RefreshTarget 写
 //
 //   感知触发时机:
 //     - bSensed=1: 敌人首次进入/持续在视野内
 //     - bSensed=0: 敌人离开视野（LastKnownLocation 留存由 BT 处理）
-//
-//   架构优势:
-//     - 不依赖 BTService 是否被添加到行为树（Service 缺失时 OnTargetDetected 兜底）
-//     - 不依赖任何额外阈值配置（直接用 AttackRange, 用户 2026.07.07 硬要求）
-//     - 与 BTService_RefreshTarget 完全兼容（两者写同一个 Key，互不冲突）
 
 // OnTargetDetected：感知回调函数，当感知组件检测到目标时触发
 void ABaseAIController::OnTargetDetected(AActor* Actor, FAIStimulus Stimulus)
@@ -1882,24 +2113,23 @@ void ABaseAIController::OnTargetDetected(AActor* Actor, FAIStimulus Stimulus)
     }
 
     // ============================================================
-    // 【P0 大厂架构重构 2026.07.06】OnTargetDetected 职责最终方案
+    // 【P0 大厂架构重构 2026.07.13 v40.7】感知系统严格反扎堆账本
     //
-    // 设计:
-    //   - 感知系统是 TargetActor 的事件驱动主源（最权威、最快）
-    //   - TickChaseFallback 是 TargetActor 的扫描兜底（不与感知系统冲突）
-    //   - UpdateNearbyThreatByDistance 每帧按距离动态更新 NearbyThreat
-    //     (OnTargetPerceptionUpdated 在持续可见时只触发 1 次, 不能依赖)
-    //   - 两者协同：感知写则信任, 感知丢失则扫描接管
+    // 旧版 (v40.6 之前): 感知到敌人即写 BB.TargetActor
+    //   问题: AI_A 和 AI_B 同时感知到 Player_X → 都写 BB.TargetActor = Player_X → 扎堆
+    //   反扎堆账本失效: 账本里 AI_A→Player_X, AI_B 也想锁 Player_X, 但 BB 已被感知覆盖
+    //   账本永远是账本, BB 永远是 BB, 两者分裂
     //
-    // 为什么 OnTargetDetected 必须写 TargetActor:
-    //   1. 感知是事件驱动, 玩家进入视野即触发, 延迟 < 1 帧
-    //   2. BTService 依赖 TargetActor 让 BT 树进入追击分支
-    //   3. TickChaseFallback 扫描周期 0.3s, 单独依赖会导致反应迟钝
+    // 新版 (v40.7): 感知系统不写 BB.TargetActor
+    //   - 账本是单一真理源, 由 BTService_RefreshTarget 每 0.3s 调账本决定
+    //   - 感知丢失时: 释放账本记录 + 清 BB.TargetActor
+    //   - 感知发现时: 仅记录日志, 等待下一次 Service Tick
+    //   - 反扎堆账本严格生效: unlocked 池空 → 清 BB.TargetActor → BT 全部分支拒判
     //
-    // 为什么 OnTargetDetected 不再写 NearbyThreat:
-    //   - 持续可见时 OnTargetPerceptionUpdated 只触发 1 次
-    //   - 玩家从远到近时, 距离变化但没有新事件, NearbyThreat 不会更新
-    //   - 改由 UpdateNearbyThreatByDistance 每帧检查距离, 解决时序问题
+    // 大厂原则:
+    //   - 单一真理源: BB.TargetActor 只能由账本 (Service 调用) 写入
+    //   - 零兜底: 感知不准写 TargetActor 防止绕过账本
+    //   - 职责单一: 感知只管"目标丢失/死亡"账本释放, 不参与目标分配
     // ============================================================
 
     // 如果没有成功感知到目标（目标丢失）
@@ -1912,7 +2142,17 @@ void ABaseAIController::OnTargetDetected(AActor* Actor, FAIStimulus Stimulus)
         {
             BB->SetValueAsObject(FName(AIBlackboardKeyNames::TargetActor), nullptr);
             // NearbyThreat 由 UpdateNearbyThreatByDistance 清空 (因为 TargetActor 失效)
-            UE_LOG(LogBaseAI, Log, TEXT("[%s] OnTargetDetected: 目标丢失, 清空 TargetActor"),
+
+            // 【2026.07.13 v40.6 反扎堆账本】感知丢失 → 释放账本记录（避免 AI 已死但账本残留）
+            if (URoomTargetingSubsystem* TargetSys = URoomTargetingSubsystem::Get(this))
+            {
+                if (const ABaseCharacter* MyPawnForRelease = Cast<ABaseCharacter>(GetPawn()))
+                {
+                    TargetSys->ReleaseTarget(const_cast<ABaseCharacter*>(MyPawnForRelease));
+                }
+            }
+
+            UE_LOG(LogBaseAI, Log, TEXT("[%s] OnTargetDetected: 目标丢失, 清空 TargetActor + 释放账本"),
                 *GetName());
         }
         return;
@@ -1924,10 +2164,16 @@ void ABaseAIController::OnTargetDetected(AActor* Actor, FAIStimulus Stimulus)
         return;
     }
 
-    // ============================================================
-    // TargetActor (事件驱动写入)
-    // 感知到目标即写入, 让 BTService 能立即响应
-    // NearbyThreat 由 UpdateNearbyThreatByDistance 每帧按距离动态更新
-    // ============================================================
-    BB->SetValueAsObject(FName(AIBlackboardKeyNames::TargetActor), Actor);
+    // 【2026.07.13 v40.7 关键修复】感知发现时不再写 BB.TargetActor
+    //
+    // 为什么: BB.TargetActor 由 BTService_RefreshTarget 通过账本 (URoomTargetingSubsystem) 仲裁决定
+    //         感知系统单独写 BB 会导致:
+    //         - 扎堆: 多个 AI 同时感知同一玩家 → 都写同一个 BB.TargetActor
+    //         - 反扎堆失效: 账本记录被 BB 直接覆盖
+    //
+    // 反应迟钝问题: 玩家进入视野 → 最多等 0.3s (Service 周期) → 账本分配目标
+    //              这是可接受的延迟, 因为反扎堆正确性 > 反应速度
+    UE_LOG(LogBaseAI, Verbose,
+        TEXT("[%s] OnTargetDetected: 发现敌人 %s, 不写 BB.TargetActor (由 BTService_RefreshTarget 仲裁)"),
+        *GetName(), *Actor->GetName());
 }

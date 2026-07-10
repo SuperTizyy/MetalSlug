@@ -26,6 +26,58 @@
 #include "Components/CharacterEvents.h"
 #include "Components/HealthRegenComponent.h"
 
+// 【2026.07.12 P0 大厂重构 Phase 2】引入新增的 5 个业务 Component
+// 拆分来源:
+//   - PlayerComboComponent   ← BaseCharacter 玩家连击状态机
+//   - AIAttackComponent       ← BaseCharacter AI 攻击子系统
+//   - CombatDeathComponent    ← BaseCharacter 战斗死亡/无敌期
+//   - WeaponAttachmentComponent ← BaseCharacter 武器装备/挂载
+//   - CharacterIconComponent  ← BaseCharacter 角色头像/武器图标刷新
+// 注: 这 5 个组件由 BaseCharacter 在构造函数中 CreateDefaultSubobject 创建,
+//     BaseCharacter 上保留同名转发壳方法, BP/外部调用方无感知
+//
+// 【2026.07.12 P0 修复】避免循环 include:
+//   旧版: BaseCharacter.h include Component.h → Component.h 不能 include BaseCharacter.h →
+//         Component 调 BaseCharacter protected 方法报 C2248 (不完整类型 friend 无效)
+//   新版: BaseCharacter.h 用前置声明, Component.h include BaseCharacter.h (完整定义)
+//
+// 大厂原则 - 友元完整定义:
+//   friend class ABaseCharacter 只在 ABaseCharacter 是完整类型时才能生效,
+//   所以 Component.h 必须看到 ABaseCharacter 的完整类定义
+class UPlayerComboComponent;
+class UAIAttackComponent;
+class UCombatDeathComponent;
+class UWeaponAttachmentComponent;
+class UCharacterIconComponent;
+// 【v39 新增】6 个老组件的前向声明 (字段声明需要)
+class UHealthComponent;
+class UEnergyComponent;
+class UCharacterEvents;
+class UDissolveComponent;
+class UFootstepComponent;
+class UHealthRegenComponent;
+class UInvincibilityFlickerComponent;  // 【v40.8 新增】无敌期视觉闪烁
+
+// 【v38 修复】模板函数 ResolveComponent<T> 调用 FindComponentByClass<T>(), 需要完整类型
+// UE 的 FindComponentByClass 是模板, 内部涉及 StaticClass(), 必须看到完整类型定义
+// 注: 这 5 个 .h 互相已经 friend, include 顺序不会形成循环
+#include "Combat/PlayerComboComponent.h"
+#include "Combat/AIAttackComponent.h"
+#include "Combat/CombatDeathComponent.h"
+#include "Combat/WeaponAttachmentComponent.h"
+#include "Combat/CharacterIconComponent.h"
+
+// 【v39 修复】新增 6 个老组件的完整 include (供 ResolveComponent<T> 模板调用 FindComponentByClass)
+//   - 老的 6 个组件 (Health/Energy/CharacterEvents/Dissolve/Footstep/HealthRegen) v38 未保护
+//   - v39 统一走 Resolve 模式, 必须看到完整类型
+#include "Components/HealthComponent.h"
+#include "Components/EnergyComponent.h"
+#include "Components/CharacterEvents.h"
+#include "Components/DissolveComponent.h"
+#include "Components/FootstepComponent.h"
+#include "Components/HealthRegenComponent.h"
+#include "Combat/InvincibilityFlickerComponent.h"  // 【v40.8 新增】
+
 // 引入 DataTable 行结构体（引擎 FindRow 模板需要）
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
@@ -41,8 +93,13 @@
 // 【Phase 1】 阵营 GameplayTag (为后续 IGenericTeamAgentInterface 升级预留)
 #include "GameplayTagContainer.h"
 
-// 【Phase 1】AI 数据驱动 Profile (前置声明, 头文件不依赖 AIProfileAsset.h 加快编译)
-class UAIProfileAsset;
+// 【v54 大厂架构重构】UAIProfileAsset 已删除, 改用 UAIBehaviorConfigSO
+class UAIBehaviorConfigSO;
+
+// 【2026.07.11 P0】 SyncFactionTagFromController 需要 Cast<ABaseAIController>
+//  前向声明避免 BaseCharacter.h 依赖 BaseAIController.h (减少编译依赖)
+class ABaseAIController;
+class ARoomPlayerState;
 
 // 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
 #include "GenericTeamAgentInterface.h"
@@ -88,6 +145,19 @@ class METALSLUG01_API ABaseCharacter : public ACharacter, public IGenericTeamAge
 {
 	GENERATED_BODY()
 
+// 【2026.07.12 P0 重构】Component 持有 BaseCharacter 上的转发壳 (TryResolveHUDWidget / Server_PlayAttackAnim 等),
+// 但 RPC/转发壳必须保留在 Actor 上 (UE 硬约束), 所以 Component 需要访问 BaseCharacter 的 protected 成员.
+//
+// 大厂原则 - 友元精确授权:
+//   - friend 写在 被访问类 (这里是 ABaseCharacter) 里, 声明 谁 (这里是 UPlayerComboComponent 等) 可以访问 protected
+//   - 比把所有方法改 public 更精确 (只对 5 个 Component 开放访问, 不对全 BP 暴露)
+//   - 反向依赖安全: BaseCharacter.h 已改为前置声明 Component (不循环 include)
+friend class UPlayerComboComponent;
+friend class UAIAttackComponent;
+friend class UCombatDeathComponent;
+friend class UWeaponAttachmentComponent;
+friend class UCharacterIconComponent;
+
 public:
 	/**
 	 * 构造函数: 在角色被加载时调用
@@ -128,18 +198,69 @@ public:
 	// ==========================================
 
 	/**
-	 * 【Phase 1 重构】
-	 * 原 uint8 TeamID 字段已废弃。
-	 * 新体系: 实现 IGenericTeamAgentInterface::GetGenericTeamId(), AIPerception 直接读取
-	 * 原 TeamID 字段保留为派生属性 (uint8 GetTeamID() 从内部 FactionTag 派生),
-	 * 仅供旧代码 (RoomGameMode/SpawnTable) 兼容用, 不再是数据源。
+	 * 【2026.07.10 P0 重构】阵营 GameplayTag — 单一真理源
+	 *
+	 * 大厂原则:
+	 *   - 全工程阵营表达只用这一个 FGameplayTag 字段
+	 *   - 有效值: Faction.Offense / Faction.Defense (由 FFactionTags 集中定义)
+	 *   - 阵营是**通用身份**: 客户端玩家和 AI 都可以是 Offense 或 Defense
+	 *     (阵营 ≠ 角色类型, 玩家/AI 由控制器决定, 与阵营正交)
+	 *   - 模式决定哪方是攻/守: 走 ARoomGameMode::ModeRulesByMode[Mode].AttackTeamFaction
+	 *   - 旧 Tag 校验: 旧 Faction.Player/Zombie/Enemy 标记 DEPRECATED,
+	 *                  FFactionTags::ValidateFactionOrReportError 检测后 Log Error
+	 *                  (大厂原则 - 零兜底, 不自动迁移)
+	 *
+	 * 删除历史 (2026.07.10):
+	 *   - uint8 TeamID 字段 (冗余)
+	 *   - uint8 GetTeamID() 派生接口 (冗余)
+	 *   - ResolveGenericTeamIdFromTag 内部查表函数 (冗余, FactionTags.cpp 替代)
+	 *   - MigrateFromLegacy 静默迁移 (大厂禁止 - 改为 ValidateFactionOrReportError)
+	 *
+	 * 数据流:
+	 *   配置层: DA_AIBehaviorConfig_XXX.FactionTag (策划在 DataAsset 配)
+	 *   运行时: ABaseCharacter::FactionTag (Controller 通过 SetGenericTeamId 写入)
+	 *   判定层: FFactionTags::AttitudeBetween (AIPerception 自动调用)
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Team",
-        meta = (Categories = "Faction"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_FactionTag,
+	         Category = "Combat|Team", meta = (Categories = "Faction"))
 	FGameplayTag FactionTag;
 
-	/** 阵营对外只读视图 — 由 Build.cs 中的 RoomGameMode/BaseAIController 兼容调用 */
-	uint8 GetTeamID() const;
+	/**
+	 * 【2026.07.11 P0 修复】FactionTag 网络同步回调
+	 *
+	 * 触发场景: 服务器修改 Pawn.FactionTag 后, 客户端 OnRep_FactionTag 收到
+	 * 为什么需要:
+	 *   - UE AIPerception 调 GetTeamAttitudeTowards → 读 Pawn.FactionTag
+	 *   - 如果没 Replicated, 客户端 Pawn 永远 FactionTag=空 → AI 看不到玩家 → 玩家永远不在 BT 视野里
+	 *   - 旧版 v25 完全没处理这个同步, 客户端看到的 FactionTag 是 UE 反射初始化的默认值 (FGameplayTag::EmptyTag)
+	 *
+	 * 大厂原则: 真理源在 Pawn.FactionTag, Client 必须看到 Server 的真相
+	 *
+	 * 调用方: 引擎自动触发
+	 */
+	UFUNCTION()
+	void OnRep_FactionTag();
+
+	/**
+	 * 【2026.07.11 P0 修复】FactionTag 从 PlayerState 同步
+	 *
+	 * Server-only (HasAuthority 检查由 PossessedBy 调用方负责)
+	 *
+	 * 角色:
+	 *   - Player Controller 路径: PlayerState.CurrentFactionTag → Pawn.FactionTag (单一真理源同步)
+	 *   - AI Controller 路径: 跳过 (AI 真理源在 AIController.CachedFactionTag)
+	 *
+	 * 大厂原则 - 零兜底: 缺 PlayerState → Error; 阵营为空 → Error
+	 * 调用方: ABaseCharacter::PossessedBy (Server)
+	 */
+	void SyncFactionTagFromController(AController* InController);
+
+	// 【P0 2026.07.10 大厂阵营重构】删除 GetTeamID()/ResolveGenericTeamIdFromTag()
+	//   理由:
+	//     1. uint8 GetTeamID() 是冗余派生 — FactionTag 已是源, 取整型 ID 无任何业务价值
+	//     2. FGenericTeamId 是 UE 历史协议, 在 FGameplayTag 阵营体系下完全冗余
+	//     3. 阵营判定统一走 FFactionTags::AttitudeBetween (大厂原则: 单一真理源)
+	//   若旧 BP/DA 引用 GetTeamID, 编译期就会暴露 → 修复迁移即可, 不要回退
 
 	/** 【Phase 1 新增】IGenericTeamAgentInterface — UE5 官方阵营协议入口 */
 	virtual void SetGenericTeamId(const FGenericTeamId& NewTeamID) override;
@@ -153,48 +274,50 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Team")
 	FGameplayTag GetFactionTag() const { return FactionTag; }
 
-	/** Faction -> FGenericTeamId 静态映射 (0=Player, 1=Zombie, 2=Friendly, 3=Neutral, 255=Hostile) */
-	static FGenericTeamId ResolveGenericTeamIdFromTag(FGameplayTag InTag);
+	// 【P0 2026.07.10】删除 ResolveGenericTeamIdFromTag — 详见上方注释
+	//   迁移: 旧调用点 ARoomGameMode::SpawnAIInternal 改用 FFactionTags::AttitudeBetween / IsSameSide
 
 	/**
-	 * 【Phase 1 新增】AI Profile 资产引用
-	 * 用途: 让编辑器里直接摆的 AI Pawn 也能拿到 Profile (无需走 RoomGameMode.AddAIToRoom)
-	 * 用法:
-	 *   1. 在 BP_GruntAI Details → Default Melee Profile 拖入 DA_MeleeGrunt
-	 *   2. BP_MeleeAIController::BeginPlay → Cast to Pawn → Get "Melee Profile" → SetupMeleeAI
+	 * 【v54 大厂架构重构 — UAIProfileAsset 已删除】MeleeProfile 字段整个删除
 	 *
-	 * 也可以走代码注入: AGameMode::AddAIToRoom 调用 AIC->SetupMeleeAI(Profile) 时无需此字段
+	 * 历史 (Phase 1 - v53):
+	 *   - 让编辑器里直接摆的 AI Pawn 也能拿到 Profile (无需走 RoomGameMode.AddAIToRoom)
+	 *   - 在 BP_GruntAI Details → Default Melee Profile 拖入 DA_MeleeGrunt
+	 *
+	 * v54 重构 (用户决策 2026.07.16):
+	 *   - UAIProfileAsset 整个类已删除, 此字段整个删除
+	 *   - ConfigSO 现在由 AMeleeAIController.DefaultMeleeConfig 持有 (单 BP 配置一次, 所有 AI 共享)
+	 *   - 关卡预放 AI: AIController::SetupMeleeAI(DefaultMeleeConfig) → SetMeleeConfig 链路
+	 *   - 大厅入队 AI: RoomGameMode::SpawnAIInternal 末尾 → AIController::InitializeFromConfig
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI")
-	TObjectPtr<UAIProfileAsset> MeleeProfile;
 
 	/**
-	 * 【P0 大厂架构 2026.07.06】Profile 直接设置武器/角色入口
+	 * 【P0 大厂架构 2026.07.06 → v54 重命名】ConfigSO 直接设置武器入口
+	 *
+	 * 旧名: SetMeleeProfile(UAIProfileAsset*) — UAIProfileAsset 已删除
+	 * 新名: SetMeleeConfig(UAIBehaviorConfigSO*) — v54 替代
 	 *
 	 * 设计: SetSpawnLoadout 空实现导致 AI 无法拿武器.
-	 *       改为: 存一份 Profile 引用, 后续 PossessedBy 直接从 Profile 读 WeaponID/CharacterID.
+	 *       现在通过 SetMeleeConfig 直接传 ConfigSO, 后续 PossessedBy 不再需要缓存字段
 	 *
-	 * 调用方: AMeleeAIController::SetupMeleeAI (关卡预放 AI 自举)
+	 * 调用方: AMeleeAIController::SetupMeleeAI 末尾 (关卡预放 AI 自举)
 	 *
-	 * 为什么不改 SetSpawnLoadout:
-	 *   - 已有代码依赖其签名, 改实现可能破坏玩家路径
-	 *   - Profile 存成员变量更直观, Debug 时一眼看清来源
+	 * 【v54 大厂架构重构】转发壳 — 实际逻辑在 WeaponAttachmentComponent::SetMeleeConfig
 	 */
-	UFUNCTION(BlueprintCallable, Category = "AI|Profile")
-	void SetMeleeProfile(UAIProfileAsset* InProfile);
+	UFUNCTION(BlueprintCallable, Category = "AI|Config")
+	void SetMeleeConfig(UAIBehaviorConfigSO* InConfig);
 
 	/**
-	 * 【P0 大厂架构 2026.07.06】从缓存的 Profile 同步武器/角色数据
+	 * 【P0 大厂架构 2026.07.06 → v54 重命名】ConfigSO 同步武器数据
 	 *
-	 * 调用方: PossessedBy (在读取 SpawnWeaponID 之前先调用本方法)
+	 * 旧名: SyncWeaponFromProfile() — 从已删除的 MeleeProfile 字段读
+	 * 新名: SyncWeaponFromConfig() — 直接接 ConfigSO, 不再依赖已删除字段
 	 *
-	 * 逻辑:
-	 *   1. 检查 MeleeProfile 是否有效
-	 *   2. 如果 SpawnWeaponID 为空, 从 Profile.WeaponID 填充
-	 *   3. 如果 CharacterID 为空, 从 Profile.CharacterRowName 填充
-	 *   4. 输出诊断日志
+	 * 调用方: 应该在 SpawnAndEquipWeapon 之前调用 (PossessedBy 中)
+	 *
+	 * 【v54 大厂架构重构】转发壳 — 实际逻辑在 WeaponAttachmentComponent::SyncWeaponFromConfig
 	 */
-	void SyncWeaponFromProfile();
+	void SyncWeaponFromConfig();
 
 protected:
 	/**
@@ -226,6 +349,8 @@ public:
 
 	/**
 	 * UE 原生函数: 处理伤害
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CombatDeathComponent::TakeDamage
 	 * @return 实际应用的伤害值
 	 */
 	virtual float TakeDamage(float DamageAmount, struct FDamageEvent const& DamageEvent, class AController* EventInstigator, AActor* DamageCauser) override;
@@ -260,6 +385,22 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Dissolve")
 	UDissolveComponent* DissolveComponent;
 
+	/**
+	 * 【v40.8 P0 大厂架构】复活无敌期视觉闪烁
+	 *
+	 * 职责:
+	 *   - 订阅 HealthComponent->OnInvincibilityChanged
+	 *   - 准备身体 Mesh 的 MID (含 FlickerAmount 参数验证)
+	 *   - 派发 OnFlickerStarted/OnFlickerStopped 到 BP 子类 (Timeline 驱动)
+	 *
+	 * 大厂原则 - 数据/视觉分离:
+	 *   - HealthComponent 只管数据 (bIsInvincible)
+	 *   - 本组件只管视觉 (MID 操作)
+	 *   - BP 子类只管动画 (Timeline)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Flicker")
+	UInvincibilityFlickerComponent* FlickerComponent;
+
 	/** 脚步音效 (地面检测 + 音效播放) */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Footstep")
 	UFootstepComponent* FootstepComponent;
@@ -272,6 +413,231 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Regen")
 	UHealthRegenComponent* HealthRegenComponent;
+
+	/**
+	 * 【2026.07.12 P0 大厂重构 Phase 2】玩家连击状态机组件 (Phase 2.1)
+	 * 职责: 玩家轻击/重击/技能/连击窗口 等状态机逻辑
+	 * 大厂原则 - 单一真理源: 状态机字段 (bIsAttacking/ComboIndex 等) 全部在本组件
+	 * BaseCharacter 上同名方法改为转发壳
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Combat")
+	UPlayerComboComponent* PlayerCombo;
+
+	/**
+	 * 【2026.07.12 P0 大厂重构 Phase 2】AI 攻击子系统组件 (Phase 2.2)
+	 * 职责: AI 专用轻击入口 + 蒙太奇生命周期 + 攻击节流 + 伤害上报
+	 * 大厂原则 - 职责分离: 与 PlayerComboComponent 完全解耦, AI 改攻击不影响玩家
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Combat")
+	UAIAttackComponent* AIAttack;
+
+	/**
+	 * 【2026.07.12 P0 大厂重构 Phase 2】战斗死亡/无敌期组件 (Phase 2.3)
+	 * 职责: TakeDamage/Die/ExecuteDeathLocal/EnableRagdoll/Multicast_Die/DropAndFadeWeapon
+	 *       + ActivateSpawnInvincibility/DeactivateSpawnInvincibility
+	 * 大厂原则 - 单一真理源: 死亡字段 bDeathSequenceStarted 在本组件
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Combat")
+	UCombatDeathComponent* CombatDeath;
+
+	/**
+	 * 【2026.07.12 P0 大厂重构 Phase 2】武器装备/挂载组件 (Phase 2.4)
+	 * 职责: OnRep_CurrentWeapon/EquipWeapon/RequestWeaponSpawn/SpawnAndEquipWeapon
+	 *       + SetSpawnLoadout/GetSpawnWeaponID/GetCurrentWeapon/FindWeaponAttachmentConfig
+	 * 大厂原则 - 单一真理源: CurrentWeapon 字段在本组件
+	 *
+	 * 【v36 修复】字段被 BP 子类覆盖可能为 nullptr, 提供 ResolveWeaponAttach() lazy 查找
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Combat")
+	UWeaponAttachmentComponent* WeaponAttach;
+
+	/**
+	 * 【v36 新增】Lazy resolve WeaponAttachmentComponent — 单一真理源 = GetComponentsByClass
+	 *
+	 * 根因 (Session1.log):
+	 *   构造函数 EXIT 时 WeaponAttach=0x...257DE70140 (有效)
+	 *   但 SetSpawnLoadout ENTER 时 WeaponAttach=0x0000000000000000 (null!)
+	 *   → BP 子类在某种初始化阶段清空了 C++ 默认字段
+	 *
+	 * 大厂原则:
+	 *   - 不要依赖 raw pointer 字段缓存 (字段可能被 BP 子类覆盖)
+	 *   - 真理源永远是 GetComponentByClass (UE 标准 API, 永远能找到)
+	 *   - 每次访问都重新 resolve, 不缓存 (缓存失效 = 隐性兜底)
+	 *   - 找不到 → Log Error + return nullptr (零兜底, 强制修复 BP 配置)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UWeaponAttachmentComponent* ResolveWeaponAttach()
+	{
+		return ResolveComponent<UWeaponAttachmentComponent>(WeaponAttach, TEXT("WeaponAttach"));
+	}
+
+	// ============================================================
+	// 【v38 大厂重构】统一组件 Resolver — 解决 BP 子类覆写 C++ 默认子对象的根因
+	// ============================================================
+	//
+	// 根因 (2026.07.12 Session1.log):
+	//   - 构造函数 EXIT 时 WeaponAttach=有效, PlayerCombo=有效
+	//   - SetupPlayerInputComponent 时 PlayerCombo=null (裸字段访问!)
+	//   - 同样的根因影响 PlayerCombo / AIAttack / CombatDeath / CharacterIcon
+	//     (WeaponAttach 已有 v36 lazy resolver, 但其他组件没有)
+	//
+	// 大厂原则 — 零重复 (DRY):
+	//   - 之前: 每个组件需要单独写 lazy resolver (v36 给 WeaponAttach 写了一份)
+	//   - v38: 统一模板 + 5 个零开销包装, 一次解决
+	//   - 真理源 = GetComponentByClass (UE 标准 API, 永远能找到)
+	//   - 优先用字段 (避免每次 FindComponent 开销)
+	//   - 找不到 → Log Error + return nullptr (零兜底)
+	// ============================================================
+
+	/**
+	 * 通用组件 Resolver 模板
+	 *   1. 优先用 CachedField (fast path)
+	 *   2. 字段为 null → FindComponentByClass<T>() (UE 标准 API)
+	 *   3. 找到 → 写回字段, 后续走 fast path
+	 *   4. 找不到 → Log Error + return nullptr (零兜底)
+	 */
+	template<typename T>
+	T* ResolveComponent(T*& CachedField, const TCHAR* ComponentName)
+	{
+		if (CachedField)
+		{
+			return CachedField;
+		}
+
+		T* Found = FindComponentByClass<T>();
+		if (Found)
+		{
+			CachedField = Found;
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter] %s 字段为 null, 通过 FindComponentByClass 找到组件. "
+					 "Pawn=%s. "
+					 "【警告】C++ 默认字段在某种初始化阶段被清空, 已修复字段. "
+					 "【修复】BP 蓝图 Components 面板的 '%s' 子对象可能未连接 (Disconnected) 或被 BP 子类重命名."),
+				ComponentName, *GetName(), ComponentName);
+			return Found;
+		}
+
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] %s 组件未挂载! Pawn=%s, Class=%s. "
+				 "【v38 零兜底】拒绝返回 nullptr 让调用方猜. "
+				 "【修复】UE 编辑器 → BP 蓝图 → Components 面板 → 添加 %s 子对象. "
+				 "C++ 构造函数 CreateDefaultSubobject 应该已自动添加, 但 BP 子类可能删除了它."),
+			ComponentName, *GetName(), *GetClass()->GetName(), ComponentName);
+		return nullptr;
+	}
+
+	/** v38 — 玩家连击状态机 (通用 resolver 入口) */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UPlayerComboComponent* ResolvePlayerCombo()
+	{
+		return ResolveComponent<UPlayerComboComponent>(PlayerCombo, TEXT("PlayerCombo"));
+	}
+
+	/** v38 — AI 攻击子系统 (通用 resolver 入口) */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UAIAttackComponent* ResolveAIAttack()
+	{
+		return ResolveComponent<UAIAttackComponent>(AIAttack, TEXT("AIAttack"));
+	}
+
+	/** v38 — 战斗死亡/无敌期 (通用 resolver 入口) */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UCombatDeathComponent* ResolveCombatDeath()
+	{
+		return ResolveComponent<UCombatDeathComponent>(CombatDeath, TEXT("CombatDeath"));
+	}
+
+	/** v38 — 角色头像/武器图标 (通用 resolver 入口) */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UCharacterIconComponent* ResolveCharacterIcon()
+	{
+		return ResolveComponent<UCharacterIconComponent>(CharacterIcon, TEXT("CharacterIcon"));
+	}
+
+	// ============================================================
+	// 【v39 大厂重构】6 个新增 Resolver — 覆盖原 6 个未受 v38 保护的字段
+	//
+	// 根因 (2026.07.12 Session2.log):
+	//   - BP 子类 archetype 在某种初始化阶段会清空 C++ 默认子对象字段
+	//   - v38 只保护了 PlayerCombo/AIAttack/CombatDeath/WeaponAttach/CharacterIcon 5 个
+	//   - 老的 6 个组件 (Health/Energy/CharacterEvents/Dissolve/Footstep/HealthRegen) 仍是裸字段
+	//   - 结果: HUD 订阅 CharacterEvents 失败, 血量/头像永远不更新
+	//
+	// 大厂原则 — 零重复 (DRY):
+	//   - 复用 v38 ResolveComponent<T> 模板, 不写新逻辑
+	//   - 6 个零开销 inline 包装, 一次调用 ResolveComponent
+	//
+	// 调用方迁移规则:
+	//   - BaseCharacter.cpp 内部: 所有裸字段访问改为 Resolve 函数
+	//   - 外部 (HUD/BP): 不直接访问字段, 走 Resolve 函数
+	// ============================================================
+
+	/** v39 — 健康组件 (血量/受伤/死亡事件) - 通用 resolver 入口 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UHealthComponent* ResolveHealthComponent()
+	{
+		return ResolveComponent<UHealthComponent>(HealthComponent, TEXT("HealthComponent"));
+	}
+
+	/** v39 — 能量组件 (消耗/回复/百分比) - 通用 resolver 入口 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UEnergyComponent* ResolveEnergyComponent()
+	{
+		return ResolveComponent<UEnergyComponent>(EnergyComponent, TEXT("EnergyComponent"));
+	}
+
+	/** v39 — 角色事件总线组件 (头像/血量/能量/AC/ACE/武器) - 通用 resolver 入口
+	 *
+	 * 【关键修复 Bug 2/5】HUD 订阅 CharacterEvents 时如果字段为 null → 永远不订阅成功
+	 *   - 修复前: `Character->CharacterEvents` 直接访问, 字段 null 时跳过订阅
+	 *   - 修复后: 调 ResolveCharacterEvents() 永远拿到有效指针 (lazily find by class)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UCharacterEvents* ResolveCharacterEvents()
+	{
+		return ResolveComponent<UCharacterEvents>(CharacterEvents, TEXT("CharacterEvents"));
+	}
+
+	/** v39 — 溶解组件 (死亡后材质渐隐) - 通用 resolver 入口 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UDissolveComponent* ResolveDissolveComponent()
+	{
+		return ResolveComponent<UDissolveComponent>(DissolveComponent, TEXT("DissolveComponent"));
+	}
+
+	/** v39 — 脚步音效组件 (地面检测 + 音效播放) - 通用 resolver 入口 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UFootstepComponent* ResolveFootstepComponent()
+	{
+		return ResolveComponent<UFootstepComponent>(FootstepComponent, TEXT("FootstepComponent"));
+	}
+
+	/** v39 — 生命回复组件 - 通用 resolver 入口 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UHealthRegenComponent* ResolveHealthRegenComponent()
+	{
+		return ResolveComponent<UHealthRegenComponent>(HealthRegenComponent, TEXT("HealthRegenComponent"));
+	}
+
+	/**
+	 * 【v40.8 新增】无敌期视觉闪烁组件 - 通用 resolver 入口
+	 *
+	 * 走与 ResolveDissolveComponent 完全相同的模板路径
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UInvincibilityFlickerComponent* ResolveFlickerComponent()
+	{
+		return ResolveComponent<UInvincibilityFlickerComponent>(FlickerComponent, TEXT("FlickerComponent"));
+	}
+
+	/**
+	 * 【2026.07.12 P0 大厂重构 Phase 2】角色头像/武器图标刷新组件 (Phase 2.5)
+	 * 职责: RefreshCharacterIcon/Client_RefreshCharacterIcon_Implementation/RetryRefreshCharacterIcon
+	 *       + RefreshWeaponIconOnHUD/GetCharacterAvatarFromTable
+	 * 大厂原则 - 单一真理源: CachedCharacterIDForIcon/CurrentIconRetryCount/CharacterIconRefreshTimerHandle 在本组件
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Combat")
+	UCharacterIconComponent* CharacterIcon;
 
 	/**
 	 * 第三人称专属的"自拍杆" (弹簧臂)
@@ -413,11 +779,18 @@ public:
 	bool CanGrantAssist(AActor* PotentialAssistant) const;
 
 	/**
-	 * 授予符合条件的玩家助攻得分
-	 * @param Victim 受害者
-	 * @param Killer 击杀者
+	 * 授予符合条件的玩家助攻得分 (服务器纯函数, 单一职责)
+	 * @param Victim         受害者 (读取 LastHitTimestamps)
+	 * @param Killer        击杀者 (排除)
+	 * @param KillMethod    击杀方式 (纯数据传给 Multicast_NotifyKill)
+	 * @param bIsKillerPlayer Killer 是否为玩家控制的角色 (决定是否显示 KillFeed 图标)
+	 *
+	 * 大厂原则 (v31.6):
+	 *   - 不再负责 AddKillScore / AddDeath (这些已在 TakeDamage 末尾集中处理)
+	 *   - KillMethod 作为参数显式传入, 不依赖 Character.LastKillMethod 字段
 	 */
-	static void GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer);
+	static void GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer,
+	                                          EKillMethod KillMethod, bool bIsKillerPlayer);
 
 	/**
 	 * 当受到伤害时，通知可能的助攻者（供武器系统调用）
@@ -477,11 +850,17 @@ protected:
 	 */
 	// 注: 原 UPROPERTY(Replicated) bool bIsDead 已下沉到 HealthComponent
 
-	/**
-	 * 记录最后的击杀方式（用于 HUD 击杀信息显示）
-	 */
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Stats")
-	EKillMethod LastKillMethod = EKillMethod::MeleeWeapon;
+	// 【v31.6 大厂重构】删除 LastKillMethod 字段 — 真理源唯一 = Weapon::LastKillMethod
+	//
+	// 历史 (v22-v31.5):
+	//   - Weapon 自己持有 LastKillMethod (写入: Server_ReportHit 根据部位设值)
+	//   - Character 也持有 LastKillMethod (写入: TakeDamage 时从 Weapon 拷贝, 用于 Multicast_NotifyKill)
+	//   - 两个字段 + DOREPLIFETIME 复制 = 重复架构
+	//
+	// 大厂原则 (v31.6):
+	//   - 真理源唯一: Weapon.LastKillMethod (被击杀方式由"哪把武器杀的"决定, 武器天然知道)
+	//   - RPC 边界纯数据化: Multicast_NotifyKill 直接传 EKillMethod, 不再读 Character 字段
+	//   - 删除 DOREPLIFETIME (line 526), 删除字段声明 (line 540)
 
 	/**
 	 * 死亡动画蒙太奇
@@ -492,6 +871,8 @@ protected:
 	/**
 	 * 死亡逻辑（服务器端）
 	 * 触发播放死亡动画 + 启动布娃娃 + 启动溶解
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CombatDeathComponent::Die()
 	 */
 	void Die();
 
@@ -504,25 +885,45 @@ protected:
 	void OnHealthComponentDeath();
 
 	/**
+	 * 【2026.07.14 新增】HealthComponent 无敌期状态变化回调
+	 * 用途: 订阅 HealthComponent->OnInvincibilityChanged，广播到 CharacterEvents->OnInvincibilityChanged
+	 *       让 UI 层 (GameHUDWidget) 统一订阅显示复活进度条
+	 *
+	 * 调用时机:
+	 *   - 服务器激活无敌: HealthComponent::ActivateInvincibility → Broadcast(true)
+	 *   - 服务器到期: HealthComponent::ExpireInvincibility_Internal → Broadcast(false)
+	 *   - 客户端激活: HealthComponent::OnRep_InvincibilityChanged → Broadcast(true)
+	 *   - 客户端到期: HealthComponent::OnRep_InvincibilityChanged → Broadcast(false)
+	 */
+	UFUNCTION()
+	void OnHealthComponentInvincibilityChanged(bool bIsNowInvincible);
+
+	/**
 	 * 【2026-07-01 新增】本地执行死亡流程
 	 * 客户端通过 HealthComponent->OnRep_bIsDead 触发, 无需 Multicast RPC
 	 * 服务器 Die() 内部也复用此方法
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CombatDeathComponent::ExecuteDeathLocal()
 	 */
 	void ExecuteDeathLocal();
 
 	/**
-	 * 【2026-07-01 新增】死亡序列幂等标志
-	 * 服务器和客户端可能通过多个路径触发死亡流程:
-	 *   - 服务器: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() → Multicast_Die (服务器自己)
-	 *   - 客户端: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal()
-	 *            + Multicast_Die RPC → ExecuteDeathLocal()
-	 * 用 bDeathSequenceStarted 保证 ExecuteDeathLocal 核心步骤只执行一次
+	 * 【2026.07.12 P0 重构】删除 bDeathSequenceStarted 字段 — 已迁移到 CombatDeathComponent
+	 *
+	 * 历史 (v22-v31.5):
+	 *   - BaseCharacter::bDeathSequenceStarted 是死亡序列幂等标志
+	 *   - 服务器/客户端可能通过多个路径触发死亡流程
+	 *
+	 * 大厂原则 (Phase 2.3 落地):
+	 *   - 真理源迁移到 CombatDeathComponent::bDeathSequenceStarted
+	 *   - BaseCharacter 不再持有副本, 完全委托给 CombatDeath
+	 *   - 字段已彻底删除 (cPP 中已无引用)
 	 */
-	UPROPERTY(Transient)
-	bool bDeathSequenceStarted = false;
 
 	/**
 	 * 启用布娃娃物理（角色真实死亡时调用）
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CombatDeathComponent::EnableRagdoll()
 	 */
 	void EnableRagdoll();
 
@@ -534,23 +935,22 @@ protected:
 	 *   - 激活武器 Mesh 物理模拟
 	 *   - 调用 DissolveComponent 收集武器材质 (修复 FindComponentByClass 找不到的 bug)
 	 *   - 仅服务器调用 Weapon->SetLifeSpan() 实现单一销毁权威
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CombatDeathComponent::DropAndFadeWeapon()
 	 */
 	void DropAndFadeWeapon(ABaseWeapon* Weapon);
 
 	/**
-	 * 布娃娃启用定时器句柄
+	 * 【2026.07.12 P0 重构】删除 RagdollTimerHandle 字段 — 已迁移到 CombatDeathComponent
 	 */
-	FTimerHandle RagdollTimerHandle;
 
 	/**
-	 * 角色图标刷新延迟重试定时器
+	 * 【2026.07.12 P0 重构】删除 CharacterIconRefreshTimerHandle 字段 — 已迁移到 CharacterIconComponent
 	 */
-	FTimerHandle CharacterIconRefreshTimerHandle;
 
 	/**
-	 * 【P0 修复 2026-06-29】角色图标重试计数器 (与 HUD 重试计数器配对, 防止日志洪水)
+	 * 【2026.07.12 P0 重构】删除 CurrentIconRetryCount 字段 — 已迁移到 CharacterIconComponent
 	 */
-	int32 CurrentIconRetryCount = 0;
 
 	/**
 	 * HUD 刷新延迟重试定时器
@@ -575,12 +975,14 @@ protected:
 	float WeaponDestroyDelaySeconds = 3.0f;
 
 	/**
-	 * 缓存角色 ID，延迟刷新时使用（避免循环触发服务器 RPC）
+	 * 【2026.07.12 P0 重构】删除 CachedCharacterIDForIcon 字段 — 已迁移到 CharacterIconComponent
 	 */
-	FString CachedCharacterIDForIcon;
 
 	/**
 	 * 网络多播死亡（让所有玩家都看到你变成布娃娃）
+	 *
+	 * 【2026.07.12 P0 重构】RPC 仍保留在 BaseCharacter 上 (RPC 必须在 Actor 上),
+	 *                      但实现转发到 CombatDeathComponent
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_Die();
@@ -596,11 +998,80 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Respawn", meta = (ClampMin = "1.0", ClampMax = "30.0"))
 	float RespawnDelaySeconds = 3.0f;
 
+	/**
+	 * 【2026.07.11 P0 大厂架构】复活无敌期（秒）
+	 *
+	 * 时序:
+	 *   - 死亡 → RespawnDelaySeconds 后生成新 Pawn (玩家路径 via PC->StartRespawnTimer)
+	 *   - AI 路径: 直接生成新 Pawn (无延迟)
+	 *   - Pawn Spawn 完毕 → PossessedBy → 立即激活无敌期 DefaultSpawnInvincibilitySeconds 秒
+	 *   - 无敌期内: HealthComponent::ApplyDamage 拦截所有伤害 (Layer 0 单一真理源)
+	 *   - 到期: Server Timer 自动清字段 → 客户端 OnRep_InvincibilityChanged 广播
+	 *
+	 * 用户决策 (2026.07.11 AskQuestion 选项 A):
+	 *   - 默认 3 秒
+	 *   - 配置 <= 0 → HealthComponent::ActivateInvincibility 静默跳过 (零兜底, 不强制默认值)
+	 *   - 玩家路径 BP BP_BaseCharacter 直接配 (此字段就是给玩家用的)
+	 *   - AI 路径在 DA_AIBehaviorConfig_XXX.SpawnInvincibilitySeconds 配 (覆盖此默认值)
+	 *
+	 * 为什么不把 RespawnDelaySeconds 和 SpawnInvincibilitySeconds 合并:
+	 *   - 语义不同: RespawnDelaySeconds 是"死后等多久重生", SpawnInvincibilitySeconds 是"重生后无敌多久"
+	 *   - 实战调参: 改 spawn invincibility 不应该影响死亡到重生的时间间隔
+	 *   - 大厂原则: 配置项语义单一, 一个值改一件事
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Combat|Respawn", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float DefaultSpawnInvincibilitySeconds = 2.0f;
+
 
 	// ==========================================
 	// 击杀奖励系统
 	// ==========================================
 public:
+	/**
+	 * 获取默认复活无敌期时长（秒）
+	 *
+	 * 大厂原则 - 封装: 外部类不直接读 protected 字段, 通过 getter 访问
+	 * DurationOverride=-1.0 时, ActivateSpawnInvincibility 用此值
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Respawn")
+	float GetDefaultSpawnInvincibilitySeconds() const { return DefaultSpawnInvincibilitySeconds; }
+
+	/**
+	 * 【v41 大厂架构】设置复活延迟秒数
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Respawn")
+	void SetRespawnDelaySeconds(float InDelay) { RespawnDelaySeconds = InDelay; }
+
+	/**
+	 * 【v41 大厂架构】设置武器销毁延迟秒数
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Death")
+	void SetWeaponDestroyDelaySeconds(float InDelay) { WeaponDestroyDelaySeconds = InDelay; }
+
+	/**
+	 * 【v41 大厂架构】设置复活无敌期秒数
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Respawn")
+	void SetDefaultSpawnInvincibilitySeconds(float InSeconds) { DefaultSpawnInvincibilitySeconds = InSeconds; }
+
+	/**
+	 * 【v41 大厂架构】设置击杀奖励血量
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Stats|KillReward")
+	void SetHealthRewardPerKill(float InReward) { HealthRewardPerKill = InReward; }
+
+	/**
+	 * 【v41 大厂架构】设置击杀奖励能量
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Stats|KillReward")
+	void SetEnergyRewardPerKill(float InReward) { EnergyRewardPerKill = InReward; }
+
+	/**
+	 * 【v41 大厂架构】设置助攻判定时间窗口
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Stats|Assist")
+	void SetAssistTimeWindow(float InWindow) { AssistTimeWindow = InWindow; }
+
 	/**
 	 * 击杀奖励接口
 	 * @param KilledCharacter 被击杀的角色
@@ -619,6 +1090,39 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats|KillReward")
 	float EnergyRewardPerKill = 25.0f;
+
+
+	// ============================================================
+	// 【2026.07.11 P0 大厂架构】复活无敌期 — public 入口 (集中调度层)
+	// ============================================================
+	//
+	// 调用方 (大厂原则 - 集中调度):
+	//   - ARoomGameMode::HandlePlayerRequestSpawn (玩家路径末尾)
+	//   - ARoomGameMode::RequestRespawn AI 分支末尾 (Possess + SetupMeleeAI 之后)
+	//   - ARoomGameMode::SpawnAIInternal (战斗开局 AI 生成末尾)
+	//
+	// 设计原则 (单一真理源 + 零兜底):
+	//   - 仅 HealthComponent 写字段, Actor 只编排行为 (跟 bIsDead 同构)
+	//   - HealthComponent 已做完整 server-only 守卫, 这里简化
+	//   - DurationOverride < 0 → 使用 DefaultSpawnInvincibilitySeconds (BP 配置)
+	//   - DefaultSpawnInvincibilitySeconds <= 0 → 用户决策 A: 静默跳过激活
+	// ============================================================
+
+	/**
+	 * 激活复活无敌期
+	 *
+	 * @param DurationOverride  < 0 (默认): 用 DefaultSpawnInvincibilitySeconds
+	 *                           > 0: 强制用这个值 (例如 AI ConfigSO 配的业务值)
+	 *                           == 0: 静默跳过激活
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Respawn")
+	void ActivateSpawnInvincibility(float DurationOverride = -1.0f);
+
+	/**
+	 * 取消复活无敌期 (死亡时强制调用, 防止 Timer 残留)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Respawn")
+	void DeactivateSpawnInvincibility();
 
 
 	// ==========================================
@@ -760,50 +1264,44 @@ protected:
 	// ==========================================
 protected:
 	/**
-	 * 角色手里当前拿着的武器
-	 * Replicated: 武器指针会通过网络复制到所有客户端
-	 * ReplicateUsing: 客户端需要用 OnRep_CurrentWeapon 同步生成武器
+	 * 【2026.07.12 P0 重构】删除 CurrentWeapon 字段 — 已迁移到 WeaponAttachmentComponent
+	 *
+	 * 历史 (v22-v31.5):
+	 *   - CurrentWeapon 是 BaseCharacter 上的 Replicated 武器指针
+	 *   - OnRep_CurrentWeapon 是网络同步回调, 客户端用这个同步生成武器
+	 *
+	 * 大厂原则 (Phase 2.4 落地):
+	 *   - 真理源迁移到 WeaponAttachmentComponent::CurrentWeapon
+	 *   - BaseCharacter 不再持有副本, 完全委托给 WeaponAttach
+	 *   - OnRep_CurrentWeapon 仍在 BaseCharacter 上声明 (UPROPERTY 必须在 Actor 上),
+	 *     但实现转发到 WeaponAttachmentComponent
+	 *   - 字段已彻底删除 (cpp 中已无引用)
 	 */
-	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Combat", meta = (ReplicateUsing = "OnRep_CurrentWeapon"))
-	class ABaseWeapon* CurrentWeapon;
 
 	/**
 	 * 武器指针改变时的回调（网络复制通知，客户端需要用这个来同步生成武器）
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION 仍保留在 BaseCharacter 上 (UPROPERTY 必须在 Actor 上),
+	 *                      实现转发到 WeaponAttachmentComponent
 	 */
 	UFUNCTION()
 	void OnRep_CurrentWeapon(class ABaseWeapon* OldWeapon);
 
 	/**
-	 * 武器挂载配置数据表
-	 * 用途: 配置不同角色+武器的挂载点、偏移等
+	 * 【2026.07.12 P0 重构】删除 WeaponAttachmentDataTable / CharacterID / SpawnWeaponID 字段
+	 *                      — 已迁移到 WeaponAttachmentComponent
+	 *
+	 * 历史 (v22-v31.5):
+	 *   - WeaponAttachmentDataTable: 武器挂载配置数据表
+	 *   - CharacterID: 当前角色 ID (用于查找挂载配置)
+	 *   - SpawnWeaponID: Spawn 时刻预定的武器 ID (AI 路径用)
+	 *
+	 * 大厂原则 (Phase 2.4 落地):
+	 *   - 真理源全部迁移到 WeaponAttachmentComponent
+	 *   - BaseCharacter 不再持有副本, 完全委托给 WeaponAttach
+	 *   - 字段已彻底删除 (cpp 中已无引用)
+	 *   - SetSpawnLoadout / GetSpawnWeaponID 仍是 BaseCharacter 转发壳
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Attachment")
-	class UDataTable* WeaponAttachmentDataTable;
-
-	/**
-	 * 当前角色 ID（用于查找挂载配置）
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Attachment")
-	FString CharacterID;
-
-	/**
-	 * 【P0 大厂架构 2026.07.03 19:35】Spawn 时刻预定的武器 ID
-	 *
-	 * 设计: AI 跟玩家走完全相同的武器 Spawn 链路 (SpawnAndEquipWeapon),
-	 *       但 AI 没有 PlayerState, 不能像玩家那样从 PS 读 SelectionWeapon1.
-	 *
-	 * 写入时机:
-	 *   - 服务器 SpawnAIInternal 后 (Possess 之前):
-	 *       AIPawn->SpawnWeaponID = Profile.WeaponID (从数据驱动配置来)
-	 *   - 已存在的玩家不变 (玩家依然从 PS 读)
-	 *
-	 * 读取时机:
-	 *   - PossessedBy 中, 优先读 SpawnWeaponID, 找不到再走 PS 路径
-	 *
-	 * 安全: 玩家流程不碰这字段, 互不干扰
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Combat|Attachment")
-	FString SpawnWeaponID;
 
 public:
 	/**
@@ -819,84 +1317,84 @@ public:
 	 *   - AMeleeAIController::SetupMeleeAI (关卡预放 AI 路径)
 	 *
 	 * 【P0 大厂架构重构 2026.07.06】:
-	 *   - 原实现: 仅在 !InXXXID.IsEmpty() 时写入, 导致 Profile.WeaponID=""
-	 *     时直接跳过, SpawnWeaponID 永远为空
+	 *   - 原实现: 仅在 !InXXXID.IsEmpty() 时写入, 导致 Profile.DefaultWeaponRowName=""
+	 *     (原 Profile.WeaponID="") 时直接跳过, SpawnWeaponID 永远为空
 	 *   - 新实现: 无论是否为空都写入, 确保外部覆盖意图被尊重
 	 *   - 大厂原则: 显式赋值优于隐式跳过, 日志清晰可追溯
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 WeaponAttachmentComponent::SetSpawnLoadout
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Attachment")
-	void SetSpawnLoadout(const FString& InCharacterID, const FString& InWeaponID)
-	{
-		UE_LOG(LogTemp, Log,
-			TEXT("[BaseCharacter] SetSpawnLoadout: InCharID='%s', InWeaponID='%s', Old CharID='%s', Old WeaponID='%s'"),
-			*InCharacterID, *InWeaponID, *CharacterID, *SpawnWeaponID);
+	void SetSpawnLoadout(const FString& InCharacterID, const FString& InWeaponID);
 
-		// 【P0 修复 2026.07.06】: 无论是否为空都写入, 不再跳过空字符串
-		// 原因: Profile.WeaponID="" 时应显式清空, 而非保留旧值
-		CharacterID = InCharacterID;
-		SpawnWeaponID = InWeaponID;
-	}
-
-	/** 只读 getter, 给 AI Controller 用 */
+	/** 只读 getter, 给 AI Controller 用
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 WeaponAttachmentComponent::GetSpawnWeaponID
+	 */
 	UFUNCTION(BlueprintPure, Category = "Combat|Attachment")
-	const FString& GetSpawnWeaponID() const { return SpawnWeaponID; }
+	const FString& GetSpawnWeaponID() const;
 
 protected:
 
 	/**
-	 * 全局攻击锁: 正在挥刀吗？
+	 * 【2026.07.12 P0 重构】删除 Combo 状态机字段 — 已迁移到 PlayerComboComponent
+	 *
+	 * 历史 (v22-v31.5):
+	 *   - bIsAttacking / bCanReceiveInput / bSaveAttack / bIsHoldingLightAttack / ComboIndex
+	 *     都是 BaseCharacter 上的状态机字段
+	 *
+	 * 大厂原则 (Phase 2.1 落地):
+	 *   - 真理源迁移到 PlayerComboComponent
+	 *   - BaseCharacter 不再持有副本, 完全委托给 PlayerCombo
+	 *   - 字段已彻底删除 (cpp 中已无引用)
 	 */
-	bool bIsAttacking;
 
 	/**
-	 * 绿灯亮起: 现在处于输入区间内吗？（连招窗口）
+	 * 【v49 大厂架构重构 — 单一真理源】根据 Class 查找挂载配置
+	 *
+	 * 转发壳 — 实际逻辑在 WeaponAttachmentComponent::FindWeaponAttachmentConfig
+	 *
+	 * @param InPawnClass   角色 BP 类 (例如 BP_GruntAI_C)
+	 * @param InWeaponClass 武器 BP 类 (例如 BP_Weapon_Knife_C)
 	 */
-	bool bCanReceiveInput;
-
-	/**
-	 * 缓存区: 玩家在这个区间内点击过鼠标吗？
-	 */
-	bool bSaveAttack;
-
-	/**
-	 * 按住状态: 玩家是一直死死按着左键没松吗？
-	 */
-	bool bIsHoldingLightAttack;
-
-	/**
-	 * 当前连招段数 (1 或 2)
-	 */
-	int32 ComboIndex;
-
-	/**
-	 * 根据角色 ID 和武器 ID 查找挂载配置
-	 */
-	struct FWeaponAttachmentConfig* FindWeaponAttachmentConfig(const FString& InCharacterID, const FString& InWeaponID) const;
+	struct FWeaponAttachmentConfig* FindWeaponAttachmentConfig(
+		TSubclassOf<ABaseCharacter> InPawnClass,
+		TSubclassOf<ABaseWeapon> InWeaponClass) const;
 
 	/**
 	 * 连招核心执行逻辑
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::ExecuteComboSequence
 	 */
 	void ExecuteComboSequence();
 
 	/**
 	 * 轻击按下事件
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::LightAttack_Pressed
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void LightAttack_Pressed();
 
 	/**
 	 * 轻击松开事件
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::LightAttack_Released
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void LightAttack_Released();
 
 	/**
 	 * 重击事件（单击）
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::HeavyAttack
 	 */
 	void HeavyAttack();
 
 	/**
 	 * 释放技能事件
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::UseSkill
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void UseSkill();
@@ -909,18 +1407,24 @@ public:
 	/**
 	 * 供动画蓝图区间 (Anim Notify State) 调用的接口
 	 * 区间开始时触发（开启连招窗口）
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::EnableComboWindow
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void EnableComboWindow();
 
 	/**
 	 * 区间结束时触发（检查缓存区是否有缓存攻击）
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::CheckCombo
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void CheckCombo();
 
 	/**
 	 * 动画彻底结束时触发
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 PlayerComboComponent::EndAttackState
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat")
 	void EndAttackState();
@@ -945,6 +1449,8 @@ public:
 	 *   - 与玩家逻辑完全解耦: 玩家改连击系统不影响 AI
 	 *   - 攻击动画播放期间 AI 仍能移动: 不会出现"原地挥刀"
 	 *   - 代码最小变更: 只加一个函数, 不改现有玩家逻辑
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 AIAttackComponent::OnAIRequestAttack_Simple
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
 	bool OnAIRequestAttack_Simple();
@@ -956,12 +1462,18 @@ public:
 protected:
 	/**
 	 * 客户端向服务器请求挥刀（带着连击序号，告诉大家播第几个动作）
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION(Server, Reliable, WithValidation) 仍保留在 BaseCharacter 上
+	 *                      (RPC 必须在 Actor 上), 实现转发到 AIAttackComponent::Server_PlayAttackAnim_Implementation
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
 
 	/**
 	 * 服务器向所有客户端广播: "大家都播放这个人的挥刀动画！"
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION(NetMulticast, Reliable) 仍保留在 BaseCharacter 上
+	 *                      (RPC 必须在 Actor 上), 实现转发到 AIAttackComponent::Multicast_PlayAttackAnim_Implementation
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_PlayAttackAnim(bool bIsHeavy, int32 InComboIndex);
@@ -984,6 +1496,9 @@ protected:
 	 *   - 武器 Server_ReportHit 接收 bIsHeavy + BoneName 后用武器字段自己算伤害
 	 *   - AI 通道要的是 ConfigSO 控制 (不是武器控制), 走武器会被 LightDamageBody 覆盖
 	 *   - 两条通道独立: 玩家按武器, AI 按 Config, 互不干扰
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION(Server, Reliable, WithValidation) 仍保留在 BaseCharacter 上
+	 *                      (RPC 必须在 Actor 上), 实现转发到 AIAttackComponent::Server_ReportAIAttackHit_Implementation
 	 *
 	 * @param HitActor  受击目标 (服务器校验: 必须是 ABaseCharacter 且未死)
 	 * @param Damage    伤害值 (服务器还会再校验范围, 防作弊)
@@ -1022,42 +1537,28 @@ public:
 	 * 【关键】必须是 UFUNCTION + 签名 (UAnimMontage*, bool)
 	 *        因为我们要绑定到 UAnimInstance::OnMontageEnded (DECLARE_DYNAMIC_MULTICAST_DELEGATE)
 	 *        该委托要求 UFUNCTION 才能 AddDynamic
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION 仍保留在 BaseCharacter 上 (UAnimInstance::OnMontageEnded 要求 UFUNCTION),
+	 *                      实现转发到 AIAttackComponent::OnAIAttackMontageEnded
 	 */
 	UFUNCTION()
 	void OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInterrupted);
 
 protected:
 	/**
-	 * 【P0 大厂架构 2026.07.06 19:25】上次 AI 攻击的时间戳 (秒, FPlatformTime::Seconds)
+	 * 【2026.07.12 P0 重构 + v40.4 原子化】删除 AI 攻击节流字段 — 已迁移到 AIAttackComponent
 	 *
-	 * 用途: OnAIRequestAttack_Simple 入口的本地节流兜底
-	 *       即使 BTTask 的 bHasAttackToken + Cooldown Timer 全部失效,
-	 *       Character 自己手里还有这道墙, 防止 AI 持续连击到玩家
+	 * 历史 (v22-v40.3):
+	 *   - LastAIAttackTimeSeconds (v40.4 删除 - 重复架构, 改 BT 决策)
+	 *   - CachedAIMontage / bIsWaitingForAIMontageCallback
+	 *     都是 BaseCharacter 上的 AI 攻击状态字段
 	 *
-	 * 设计要点:
-	 *   - 默认 0.0 = 从未攻击过 (第一次永远放行)
-	 *   - 用 C++ 成员而不是 BB Key: 不依赖 BT/BP, 跨 BT 重启保持
-	 *   - 跟 bIsCurrentlyAttacking 互补: 一个管"动作状态", 一个管"节流时间"
+	 * 大厂原则 (Phase 2.2 + v40.4 落地):
+	 *   - 真理源迁移到 AIAttackComponent
+	 *   - BaseCharacter 不再持有副本, 完全委托给 AIAttack
+	 *   - v40.4: AIAttackComponent 内也不再有 LastAIAttackTimeSeconds — 单一节流点 = BT
+	 *   - 字段已彻底删除 (cpp 中已无引用)
 	 */
-	double LastAIAttackTimeSeconds = 0.0;
-
-	/**
-	 * 上次 AI 攻击请求时播放的蒙太奇指针
-	 * 用于在 OnMontageEnded 回调时验证 Montage 是否"我们自己触发的"
-	 * (UAnimInstance::OnMontageEnded 是 multicast, 所有蒙太奇结束都会广播一次)
-	 * 由 UPROPERTY 持有, 防止 GC 回收导致野指针
-	 */
-	UPROPERTY()
-	TObjectPtr<UAnimMontage> CachedAIMontage = nullptr;
-
-	/**
-	 * 是否在等待 AI 攻击蒙太奇回调
-	 * 设计: 每次启动新攻击时设 true, 收到正确 Montage 的回调后 false
-	 *       超时机制: TickChaseFallback 通过 SetCurrentlyAttacking 5s 兜底
-	 * 用 bool 比再创建 FName 标识简单 — 单 AI 单任务
-	 */
-	UPROPERTY()
-	bool bIsWaitingForAIMontageCallback = false;
 
 
 	// ==========================================
@@ -1109,30 +1610,32 @@ public:
 
 
 	// ==========================================
-	// 供上帝 (GameMode) 调用的装备武器接口
+	// 武器装备/生成接口 (单一真理源 v36)
 	// ==========================================
 public:
 	/**
-	 * 装备武器（GameMode 调用）
-	 * @param WeaponClassToEquip 要装备的武器蓝图类
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	void EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClassToEquip);
-
-
+	 * 【v36 大厂重构】武器生成请求 — 唯一公开入口
 	/**
-	 * 【P0 大厂架构 2026.07.06】武器生成请求入口（对外暴露）
+	 * 【v54.3 大厂架构重构 — Class 强类型, 跳过 DT_WeaponInfo】武器生成请求入口
 	 *
-	 * 设计: SpawnAndEquipWeapon 是 protected (仅内部逻辑使用).
-	 *       但关卡预放 AI 需要在 Controller 侧主动触发武器生成.
-	 *       所以对外暴露一个 public 包装, 让 AMeleeAIController::SetupMeleeAI 可以调用.
+	 * 签名变更 (v54.3):
+	 *   - 旧 (v54.2): RequestWeaponSpawn(FString WeaponID) — 字符串 + DT_WeaponInfo 反查
+	 *   - 新 (v54.3): RequestWeaponSpawn(TSubclassOf<ABaseWeapon> WeaponClass) — 强类型
 	 *
-	 * 调用方: AMeleeAIController::SetupMeleeAI (OnPossess 末尾手动触发武器生成)
+	 * 用户原话 2026.07.16:
+	 *   "DefaultWeaponRowName 属性为什么不直接引用 DT_WeaponInfo 表的 WeaponBlueprint 内容啊"
 	 *
-	 * 内部直接调 SpawnAndEquipWeapon, 复用完整链路 (查表/挂载/HUD).
+	 * 调用方:
+	 *   - AMeleeAIController::SetupMeleeAI (关卡预放 AI, 读 Config.LevelPlacedWeaponClass.LoadSynchronous())
+	 *   - URoomSpawnSubsystem::SpawnAIInternal (大厅入队 AI 战斗 Spawn, 拿 Request.WeaponID 查 DT 拿 Class)
+	 *   - URoomSpawnSubsystem::HandlePlayerRequestSpawn (玩家 Spawn)
+	 *
+	 * 内部走 WeaponAttachmentComponent::RequestWeaponSpawn 复用完整链路:
+	 *   1. 查挂载配置 (DT_WeaponAttachmentConfig: PawnClass + WeaponClass → Socket/Location/Rotation)
+	 *   2. SpawnActor + AttachToComponent + Replicated
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
-	void RequestWeaponSpawn(FString WeaponID);
+	void RequestWeaponSpawn(TSubclassOf<ABaseWeapon> WeaponClass);
 
 
 	// ==========================================
@@ -1140,9 +1643,18 @@ public:
 	// ==========================================
 	/**
 	 * 获取当前装备的武器
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 WeaponAttachmentComponent::GetCurrentWeapon
+	 *
+	 * BP 调用方式 (3 选 1):
+	 *   方式 1 (推荐): 在 BP 节点图的 self 引脚上拖出 "Get Current Weapon" (此 BlueprintPure 转发壳)
+	 *   方式 2: self → Get Components By Class(WeaponAttachmentComponent) → Get Current Weapon
+	 *   方式 3: 缓存 WeaponAttach 引用 → GetCurrentWeapon 组件函数 (最高效)
+	 *
+	 * 注: BlueprintPure 让 BP 中可以直接拖成纯函数节点 (绿色), 不需要 exec 引脚
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Combat")
-	class ABaseWeapon* GetCurrentWeapon() const { return CurrentWeapon; }
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat")
+	class ABaseWeapon* GetCurrentWeapon() const;
 
 protected:
 	// ==========================================
@@ -1165,9 +1677,14 @@ protected:
 	void PossessedBy(AController* NewController);
 
 	/**
-	 * 根据 WeaponID 查表并生成+装备武器
+	 * 【v54.3 DEPRECATED — 完全删除】SpawnAndEquipWeapon 重复接口
+	 *
+	 * 历史:
+	 *   - v36: 标记 DEPRECATED, 转发到 RequestWeaponSpawn
+	 *   - v54.3: 完全删除 (重构后签名变成 Class, 旧 FString 版本无人调用, 强类型签名是单一真理源)
+	 *
+	 * 旧调用方若有残留编译错, 改为调 RequestWeaponSpawn(TSubclassOf<ABaseWeapon>)
 	 */
-	void SpawnAndEquipWeapon(FString WeaponID);
 
 	/**
 	 * 摄像机平滑过渡的速度 (越大越快，越小越像慢动作)
@@ -1244,6 +1761,8 @@ public:
 
 	/**
 	 * 根据当前 PlayerState 的 SelectedCharacterID，从 CharacterDataTable 查出头像并刷新 HUD
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CharacterIconComponent::RefreshCharacterIcon
 	 */
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void RefreshCharacterIcon();
@@ -1263,17 +1782,40 @@ protected:
 	 * 服务器调用，通知所属客户端刷新自己的头像图标
 	 * @param InCharacterID 角色 ID
 	 * @param Avatar        头像贴图（服务器查表后直接传递，解决客户端 GetAuthGameMode 为 nullptr 的问题）
+	 *
+	 * 【2026.07.12 P0 重构】UFUNCTION(Client, Reliable) 仍保留在 BaseCharacter 上 (RPC 必须在 Actor 上),
+	 *                      实现转发到 CharacterIconComponent::Client_RefreshCharacterIcon_Implementation
 	 */
 	UFUNCTION(Client, Reliable)
 	void Client_RefreshCharacterIcon(const FString& InCharacterID, class UTexture2D* Avatar);
 
 	/**
+	 * 客户端 RPC — 接收武器图标数据 (服务器查好 Icon 直接 RPC 推给客户端)
+	 *
+	 * 【v40.1 P0 新增】镜像 Client_RefreshCharacterIcon
+	 *
+	 * 服务器调 RefreshWeaponIconOnHUD → 查表 → Owner->Client_RefreshWeaponIcon(WeaponID, Icon)
+	 * 客户端收到 → 转发到 CharacterIconComponent::Client_RefreshWeaponIcon_Implementation
+	 *
+	 * 大厂原则 - RPC 必须在 Actor 上:
+	 *   - UFUNCTION(Client, Reliable) 必须在 Actor 上, 不能在 Component 上
+	 *   - 服务器本地 (ListenServer) 自动走本地 Implementation 调用, 不走 RPC 序列化
+	 *   - 远端客户端的 Pawn 走 RPC 序列化, 收到后调 Implementation
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_RefreshWeaponIcon(const FString& InWeaponID, class UTexture2D* Icon);
+
+	/**
 	 * HUD 未就绪时的延迟重试回调
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CharacterIconComponent::RetryRefreshCharacterIcon
 	 */
 	void RetryRefreshCharacterIcon();
 
 	/**
 	 * 刷新武器图标到 HUD（从 PlayerSpawnDataCache 读取 WeaponID）
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CharacterIconComponent::RefreshWeaponIconOnHUD
 	 */
 	void RefreshWeaponIconOnHUD();
 
@@ -1283,10 +1825,29 @@ protected:
 	// ==========================================
 public:
 	/**
-	 * 服务器广播击杀信息给所有客户端（用于更新计分板）
+	 * 服务器广播击杀信息给所有客户端（用于更新 HUD 击杀信息栏）
+	 *
+	 * 【v31.6 大厂架构重构】从 AActor* 引用改为纯数据
+	 *
+	 * 历史痛点 (v22 及之前):
+	 *   - 原签名 Multicast_NotifyKill(AActor* Victim, AActor* Assistant)
+	 *   - 客户端收到 RPC 时, Victim 可能已被 Destroy (Server 端 TakeDamage → Die() → Destroy 同步链路)
+	 *   - 客户端 Implementation 第 3248 行 VictimActor->GetName() 解 nullptr 崩溃
+	 *   - EXCEPTION_ACCESS_VIOLATION 0x18 (结构体内 3rd 指针成员偏移, 完全可重现)
+	 *
+	 * 大厂原则 (v31.6) — RPC 边界纯数据化:
+	 *   - RPC 参数应该是 POHOs (Plain Old Data), 序列化时不存在生命周期问题
+	 *   - 任何 Actor 引用跨 RPC 边界都需 IsValid 校验, 否则埋雷
+	 *   - 不在 RPC 边界"先传指针再解析字段", 而是"服务器本地读好后直接传字符串"
+	 *
+	 * @param KillerName  击杀者姓名 (服务器本地读 PlayerState->GetPlayerName())
+	 * @param VictimName  被击杀者姓名
+	 * @param KillMethod  击杀方式 (服务器本地读 Weapon->GetLastKillMethod())
+	 * @param bIsAssist   true=这是助攻消息, false=普通击杀
 	 */
 	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_NotifyKill(AActor* VictimActor, AActor* AssistantActor);
+	void Multicast_NotifyKill(const FString& KillerName, const FString& VictimName,
+	                          EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer);
 
 	/**
 	 * 获取击杀者 PlayerState
@@ -1303,6 +1864,8 @@ private:
 protected:
 	/**
 	 * 从 CharacterDataTable 查指定角色 ID 的头像贴图
+	 *
+	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CharacterIconComponent::GetCharacterAvatarFromTable
 	 */
 	class UTexture2D* GetCharacterAvatarFromTable(const FString& CharID);
 
