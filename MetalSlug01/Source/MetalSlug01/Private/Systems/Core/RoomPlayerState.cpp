@@ -75,6 +75,8 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME(ARoomPlayerState, SelectedCharacterID);
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID1);
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID2); // 注册新变量的网络同步
+	// 【v52 P0】第 3 把武器同步 (近战) — 必须 DOREPLIFETIME, 否则客户端永远拿不到
+	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID3);
 
 	// 注册计分板数据的网络同步
 	DOREPLIFETIME(ARoomPlayerState, RoomScore);
@@ -275,16 +277,18 @@ void ARoomPlayerState::ResetScoreboardStats()
  * 供服务端 PlayerController 调用的本地 Setter
  * 不再需要是 RPC，因为 RPC 在 Controller 里已经走过了
  * @param InCharID 角色 ID
- * @param InWeapon1ID 1 号位武器 ID
- * @param InWeapon2ID 2 号位武器 ID
+ * @param InPrimaryID   主武器 ID (Slot 1)
+ * @param InSecondaryID 副武器 ID (Slot 2)
+ * @param InMeleeID     近战武器 ID (Slot 3)
  */
-void ARoomPlayerState::SetPlayerLoadout(const FString& InCharID, const FString& InWeapon1ID, const FString& InWeapon2ID)
+void ARoomPlayerState::SetPlayerLoadout(const FString& InCharID, const FString& InPrimaryID, const FString& InSecondaryID, const FString& InMeleeID)
 {
 	// 只有服务器有权限修改带有 Replicated 的变量
 	if (HasAuthority())
 	{
 		SelectedCharacterID = InCharID;
-		SelectedWeaponID1 = InWeapon1ID;
-		SelectedWeaponID2 = InWeapon2ID;
+		SelectedWeaponID1 = InPrimaryID;
+		SelectedWeaponID2 = InSecondaryID;
+		SelectedWeaponID3 = InMeleeID;
 	}
 }

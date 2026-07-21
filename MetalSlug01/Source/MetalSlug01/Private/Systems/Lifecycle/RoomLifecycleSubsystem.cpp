@@ -45,14 +45,23 @@ bool URoomLifecycleSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float InMatchDurationSeconds,
 	FSimpleDelegate InOnSpawnAllPlayersDelegate)
 {
-	// 【v56.7 大厂架构修复】先 Spawn Pawn，再显示 HUD
+	// 【v56.7 + v56.8 大厂架构修复】先 Spawn Pawn，再显示 HUD（单一调度入口）
 	//
-	// 根因: 旧实现先调 Client_TransitToMatchState (HUD 显示), 再等 3 秒 Spawn Pawn
-	//        → 玩家看到"飞翔视角" 3 秒
+	// 根因链:
+	//   旧实现 (v22-v56.6):
+	//     Server_RequestStartGame → Client_EnterBattleState (立刻切 HUD)
+	//                          → GM->PerformGameStart (启动 N 秒倒计时)
+	//                          → N 秒后: SpawnAllPlayersIntoBattle (Spawn Pawn)
+	//     结果: 玩家在 HUD 显示后等 N 秒才看到自己的 Pawn → "飞翔视角"
 	//
-	// 修复: 把 HUD 显示移到 Spawn 完成之后
-	//        时序: 倒计时结束 → Spawn Pawn → 显示 HUD
-	//        这样玩家永远不会看到"无 Pawn 的 HUD"
+	//   v56.7 部分修复: 把 Client_TransitToMatchState + OnBattleStarted 移到 Spawn 回调
+	//     但还有一个独立的 Client_EnterBattleState 路径仍然立刻切 HUD → 修不完整
+	//
+	//   v56.8 完整修复:
+	//     - 移除 Server_RequestStartGame 中的 Client_EnterBattleState 调用
+	//     - HUD 切换、OnBattleStarted 广播、Spawn 全部归一到一个回调
+	//     - 玩家时序: 房间UI → 倒计时 → Pawn Spawn + HUD 同时显示
+	//     - 大厂原则: 单一调度入口, 同步时序, 零"提前触发"
 
 	// 1. 更新房间状态
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
@@ -67,15 +76,11 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 
 	StartMatchTimer();
 
-	// 3. 【v56.7 修复】先不显示 HUD，等 Spawn 完成后在回调里显示
-	//    客户端看到的是: 黑屏/房间UI → 3秒后 → Pawn Spawn → HUD 显示
+	// 3. 【v56.7】先不显示 HUD，等 Spawn 完成后再在回调里显示
 	//    这样玩家永远不会看到"无 Pawn 的 HUD"
 
-	// 4. 延迟生成角色
-	// 【v48 大厂架构修复】MatchStartDelay 上限保护 (默认 3s, BP 配错不会卡死用户)
-	//   根因: BP_GM_RoomGameMode.MatchStartDelay 之前被用户配成 60s → 玩家点开始后等 60s 才 Spawn
-	//   → 用户 8-10s 就关闭 PIE → 永远看不到 AI Spawn
-	//   修复: 这里钳到 [0, 5]s 区间, 超过 5s 视为配错, 自动用 3s
+	// 4. 延迟 Spawn Pawn (匹配时间由 BP 配 MatchStartDelay, 默认 3s)
+	// 【v48】上限保护: 钳到 [0, 5]s, BP 配错不会卡死
 	constexpr float kMaxAllowedStartDelay = 5.0f;
 	constexpr float kDefaultStartDelay = 3.0f;
 	if (MatchStartDelay > kMaxAllowedStartDelay)
@@ -94,14 +99,14 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 	}
 	UE_LOG(LogTemp, Log, TEXT("[RoomLifecycle] 游戏将在 %.1f 秒后开始..."), MatchStartDelay);
 
-	// 【v56.7 修复】Spawn 回调里会显示 HUD
+	// 5. 【v56.7 + v56.8】唯一回调: 先 Spawn Pawn，再显示 HUD, 最后广播 OnBattleStarted
 	GetWorld()->GetTimerManager().SetTimer(
 		MatchStartTimerHandle,
 		FTimerDelegate::CreateLambda([this]()
 		{
-			// 5. 【v56.7 修复】先 Spawn Pawn，再显示 HUD
 			UE_LOG(LogTemp, Log, TEXT("[RoomLifecycle] 倒计时结束，开始 Spawn Pawn..."));
 
+			// 5a. 触发 Pawn Spawn (玩家 + AI)
 			if (OnSpawnAllPlayersCallback.IsBound())
 			{
 				OnSpawnAllPlayersCallback.Execute();
@@ -113,7 +118,7 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 						 " GameMode 必须调用 PerformGameStart 时传入该委托."));
 			}
 
-			// 6. 【v56.7 修复】Spawn 完成后，显示 HUD
+			// 5b. 推送 HUD 切换到客户端 (【v56.8】这是 HUD 切换的唯一入口)
 			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 			{
 				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
@@ -122,7 +127,7 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 				}
 			}
 
-			// 7. 幂等广播 OnBattleStarted (AI 订阅后激活 BT)
+			// 5c. 广播 OnBattleStarted (AI BT 激活)
 			if (!bBattleStartedBroadcasted)
 			{
 				bBattleStartedBroadcasted = true;
@@ -130,7 +135,7 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 				{
 					GM->OnBattleStarted.Broadcast();
 				}
-				UE_LOG(LogTemp, Log, TEXT("[RoomLifecycle] PerformGameStart: Spawn 完成，OnBattleStarted 已广播"));
+				UE_LOG(LogTemp, Log, TEXT("[RoomLifecycle] PerformGameStart: Spawn + HUD 完成, OnBattleStarted 已广播"));
 			}
 		}),
 		MatchStartDelay,

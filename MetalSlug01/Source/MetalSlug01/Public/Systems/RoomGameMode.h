@@ -383,11 +383,13 @@ public:
 
 	/**
 	 * @brief 处理玩家的生成请求
-	 * @param PlayerToSpawn 目标玩家控制器
-	 * @param CharRowName 角色 DataTable 的行名
-	 * @param WeaponRowName 武器 DataTable 的行名
+	 * @param PlayerToSpawn           目标玩家控制器
+	 * @param CharRowName             角色 DataTable 的行名
+	 * @param WeaponPrimaryRowName    主武器 (Slot 1) DataTable 行名
+	 * @param WeaponSecondaryRowName  副武器 (Slot 2) DataTable 行名 (允许空)
+	 * @param WeaponMeleeRowName      近战武器 (Slot 3) DataTable 行名 (允许空)
 	 */
-	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponRowName);
+	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);
 
 	/**
 	 * 【Phase 2 模式化】AI 向上帝申请一个目标

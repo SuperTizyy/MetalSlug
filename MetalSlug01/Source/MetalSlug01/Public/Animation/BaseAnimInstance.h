@@ -18,6 +18,31 @@
 class ABaseCharacter;
 
 /**
+ * @brief 武器身体姿势枚举 (UE 5 大厂主流做法)
+ *
+ * 用于驱动 AnimGraph 中的 Blend Poses by Enum 节点, 实现
+ * 不同武器类别 → 不同身体姿势 (Locomotion BlendSpace) 的自动切换.
+ *
+ * 真理源 (Single Source of Truth):
+ *   - 从 ABaseWeapon::MeshType (EWeaponMeshType) 派生
+ *   - Melee → EWeaponStance::Melee (刀姿势)
+ *   - Primary/Secondary → EWeaponStance::Rifle (枪姿势)
+ *   - None / 无武器 → EWeaponStance::Unarmed (徒手姿势, 可选)
+ *
+ * 大厂原则 (UE 5 Blend Poses by Enum):
+ *   - 加新姿势只需扩展枚举 + 在 AnimGraph 多接一个 Pin
+ *   - 不改 C++ 状态机, 不改 Locomotion 状态机结构
+ *   - 平滑混合 (UE 内置 Linear Interpolation), 切换自然
+ */
+UENUM(BlueprintType)
+enum class EWeaponStance : uint8
+{
+	Unarmed    UMETA(DisplayName = "徒手 (没拿武器)"),
+	Rifle      UMETA(DisplayName = "枪械姿势 (Primary/Secondary)"),
+	Melee      UMETA(DisplayName = "近战姿势 (Melee)")
+};
+
+/**
  * @class UBaseAnimInstance
  * @brief 项目所有角色 AnimBP 的 C++ 基类
  *
@@ -125,4 +150,28 @@ protected:
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Aim")
 	float AimPitch;
+
+	// ==========================================
+	// 武器身体姿势 (v59 — AnimGraph Blend Poses by Enum 驱动)
+	// ==========================================
+
+	/**
+	 * 当前武器对应的身体姿势
+	 *
+	 * AnimGraph 里用 Blend Poses by Enum 节点, 把这个变量接进去,
+	 * UE 会自动按枚举值挑 Pin (Unarmed / Rifle / Melee) — 大厂主流做法.
+	 *
+	 * 计算逻辑 (NativeUpdateAnimation):
+	 *   - Character->GetCurrentWeapon() == nullptr → Unarmed
+	 *   - Weapon->MeshType == Melee → Melee
+	 *   - Weapon->MeshType == Primary / Secondary → Rifle
+	 *   - 其他 → Unarmed
+	 *
+	 * 网络同步:
+	 *   - BaseWeapon 本身已 Replicated (bReplicates = true)
+	 *   - MeshType 是普通 UPROPERTY (随 Actor 复制)
+	 *   - 所以客户端 AnimGraph 自动拿到正确的 stance, 无需额外同步代码
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Movement")
+	EWeaponStance CurrentWeaponStance = EWeaponStance::Unarmed;
 };

@@ -227,6 +227,44 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void HideEscMenu();
 
+	// ==========================================
+	// v60.11 大厂架构 — Crosshair 服务
+	// ==========================================
+
+	/**
+	 * GetWidget_Crosshair — 暴露 Crosshair Widget 引用 (BlueprintCallable)
+	 *
+	 * 大厂原则 — 公开 API 而非穿透 protected 字段:
+	 *   - Strategy 层 (URangedLineStrategy) 需要读 Crosshair 屏幕坐标算射线
+	 *   - 不能穿透 protected 字段, 必须提供公开 getter
+	 *
+	 * @return CrosshairWidget 指针 (永远 non-null, BindWidget 保证存在; 若 BP 没绑则编译期失败)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD|Crosshair")
+	UCrosshairWidget* GetWidget_Crosshair() const { return Widget_Crosshair; }
+
+	/**
+	 * GetCrosshairWorldRay — 把准星屏幕坐标转换成"过准星的世界射线"
+	 *
+	 * 大厂原则 — UI 层职责对等 (v60.11 新增):
+	 *   - "准星 → 世界射线" 是 UI 层的专业职责, 不应由 Strategy 算
+	 *   - Strategy 只读"射线起点 + 方向", 不关心屏幕坐标怎么转
+	 *   - 转换需要 PlayerController (Strategy 不该穿透 PC)
+	 *
+	 * 流程:
+	 *   1. 拿准星 Widget 的中心屏幕坐标 (左上角原点, 像素)
+	 *   2. 拿 PlayerController → DeprojectScreenPositionToWorld
+	 *   3. 输出 WorldOrigin (相机平面上的点) + WorldDirection (相机射线方向)
+	 *
+	 * @param OutWorldOrigin  输出: 相机平面上的过准星点 (cm)
+	 * @param OutWorldDirection 输出: 相机射线方向 (单位向量)
+	 * @return true=成功, false=配置错 (Crosshair 未渲染 / PC 为空 / Deproject 失败)
+	 *
+	 * @note 调用方必须显式校验返回值, false 时拒绝后续逻辑 (零兜底)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD|Crosshair")
+	bool GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutWorldDirection) const;
+
 	/**
 	 * 获取 ESC 菜单 Widget（供 Controller 调用）
 	 */

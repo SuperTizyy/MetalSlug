@@ -60,6 +60,9 @@
 // DataTable 行结构 (FWeaponInfo / FWeaponAttachmentConfig)
 #include "Data/Tables/WeaponTableRow.h"
 
+// 武器槽位类型 (v51 — 生化模式运行时切换)
+#include "Weapons/WeaponSlotType.h"
+
 // UE 自动生成的头文件 (必须最后, 且用裸文件名 — UE 5.6 严格模式)
 #include "WeaponAttachmentComponent.generated.h"
 
@@ -69,6 +72,18 @@ class ABaseWeapon;                                // 武器
 class APlayerController;                          // UE 原生玩家控制器
 class UDataTable;                                // 数据表
 class UAIBehaviorConfigSO;                       // AI 行为配置 (v54 替代 UAIProfileAsset)
+
+
+/**
+ * 武器槽位类型前置声明 (v52 — 生化模式运行时切换)
+ *
+ * 完整定义见: Weapons/WeaponSlotType.h
+ * 大厂原则 — 单一真理源:
+ *   - 真理源 = PlayerState.SelectedWeaponID1/2/3 (Primary / Secondary / Melee)
+ *   - 大厅 UI 已支持选 3 把武器, 运行时可切换
+ *   - AI 路径 (关卡预放 AI / 大厅入队 AI) 不强制多槽, 走兼容路径
+ */
+enum class EWeaponSlotType : uint8;
 
 
 /**
@@ -213,6 +228,118 @@ public:
 	ABaseWeapon* GetCurrentWeapon() const { return CurrentWeapon; }
 
 	/**
+	 * 【v51 大厂架构 — 生化模式】获取指定槽位的武器
+	 *
+	 * 适用场景:
+	 *   - 双武器 Spawn 后, 客户端 HUD 需要分别显示 Primary 和 Melee 图标
+	 *   - 切换槽位时, 调用方需要查目标槽位的武器是否存在
+	 *
+	 * 零兜底:
+	 *   - 槽位未生成武器 → 返回 nullptr (合法状态, 调用方按 nullptr 跳过)
+	 *
+	 * @param Slot 槽位类型 (Primary / Melee)
+	 * @return 该槽位的武器指针 (未生成则 nullptr)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat|Weapons|Slot")
+	ABaseWeapon* GetWeaponInSlot(EWeaponSlotType Slot) const;
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】检查槽位是否有武器
+	 *
+	 * 用于 Server_RequestSwitchToSlot 校验目标槽位是否有效
+	 *
+	 * @param Slot 槽位类型 (Primary / Secondary / Melee)
+	 * @return 槽位是否有武器 (非空)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat|Weapons|Slot")
+	bool HasWeaponInSlot(EWeaponSlotType Slot) const;
+
+	/**
+	 * 【v51 大厂架构 — 生化模式】获取当前激活的槽位 (服务器 + 客户端同步)
+	 *
+	 * 用于 HUD 高亮当前槽位 / 输入处理查"我正在用哪个"
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat|Weapons|Slot")
+	EWeaponSlotType GetCurrentWeaponSlot() const { return CurrentWeaponSlot; }
+
+	/**
+	 * 【v52 P0】获取槽位武器数组 (3 槽位, 只读访问)
+	 *
+	 * 调用方: BaseCharacter::Server_SwitchWeaponSlot (循环找下一个非空槽位)
+	 *
+	 * 零兜底:
+	 *   - 返回的是 TArray 内部 const 引用, 不允许修改
+	 *   - 槽位索引: Primary=0, Secondary=1, Melee=2 (与 EWeaponSlotType 严格对齐)
+	 *
+	 * 【v52 P1】无 UFUNCTION 标记: UHT 5.6 严格模式禁止 TObjectPtr 出现在 UFUNCTION
+	 *                 边界 (函数参数/返回值), 纯 C++ helper, 调用方都是 C++.
+	 */
+	const TArray<TObjectPtr<ABaseWeapon>>& GetWeaponsInSlotArray() const { return WeaponsInSlot; }
+
+	/**
+	 * 【v51 大厂架构 — 生化模式】服务器权威切槽位 (大厂原则 — 服务器权威)
+	 *
+	 * 调用方: BaseCharacter::Server_SwitchToWeaponSlot (RPC) → 本方法
+	 *
+	 * 行为:
+	 *   - 仅服务器调用 (HasAuthority 校验)
+	 *   - 隐藏当前槽位武器 (SetVisibility(false) + SetActorHiddenInGame(true))
+	 *   - 显示目标槽位武器 (SetVisibility(true) + SetActorHiddenInGame(false))
+	 *   - 更新 CurrentWeapon 指向目标武器 (向后兼容单武器 API)
+	 *   - 更新 CurrentWeaponSlot (Replicated → 客户端 OnRep 同步)
+	 *
+	 * 零兜底:
+	 *   - 目标槽位无武器 → Log Error + 拒绝切 (强制修复 Spawn 链路)
+	 *   - 调用方非服务器 → Log Error + 拒绝 (强制走 Server RPC)
+	 *
+	 * @param TargetSlot 目标槽位 (Primary / Melee)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void Server_SwitchToWeaponSlot(EWeaponSlotType TargetSlot);
+
+	/**
+	 * 【v52 P0 扩展 — 3 槽位】一次性 Spawn 3 把武器到对应槽位 (服务器权威)
+	 *
+	 * 调用方: RoomSpawnSubsystem::HandlePlayerRequestSpawn / SpawnAIInternal 末尾
+	 *
+	 * 流程:
+	 *   1. PrimaryClass   非空 → SpawnActor → 存入 WeaponsInSlot[Primary]
+	 *   2. SecondaryClass 非空 → SpawnActor → 存入 WeaponsInSlot[Secondary]
+	 *   3. MeleeClass     非空 → SpawnActor → 存入 WeaponsInSlot[Melee]
+	 *   4. 任一生成失败 → 销毁已生成的武器 + Log Error (零兜底)
+	 *   5. 服务器切到 Primary 槽位 (默认)
+	 *
+	 * 零兜底:
+	 *   - 3 个 Class 同时为空 → Log Error + return (拒绝 Spawn)
+	 *   - 至少主武器 (Primary) 必选 (玩家大厅必有)
+	 *
+	 * @param PrimaryClass   主武器 Class (大厅 SelectedWeaponID1 反查)
+	 * @param SecondaryClass 副武器 Class (大厅 SelectedWeaponID2 反查, 允许为空)
+	 * @param MeleeClass     近战武器 Class (大厅 SelectedWeaponID3 反查, 允许为空)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon> PrimaryClass, TSubclassOf<ABaseWeapon> SecondaryClass, TSubclassOf<ABaseWeapon> MeleeClass);
+
+	/**
+	 * 【v56 内部辅助】Spawn 一把武器 + 注入 Strategy
+	 *
+	 * 调用方: Server_SpawnBothWeapons 内部
+	 *
+	 * 大厂原则 (单一职责):
+	 *   - 不重复现有 SpawnAndEquipWeapon 链路 (复用挂载配置查表)
+	 *   - 仅负责"双槽位系统特有的"额外装配: Strategy 注入
+	 *
+	 * 零兜底:
+	 *   - 任何失败 → Log Error + return nullptr
+	 *   - Strategy 未注入 → 调用方拒绝继续 (Spawn 链路中断)
+	 *
+	 * @param WeaponClass 武器 BP 类
+	 * @param Slot        槽位 (Primary / Melee / Secondary) — 决定 MeshType
+	 * @return 生成的武器指针 (失败 nullptr)
+	 */
+	ABaseWeapon* SpawnAndConfigureWeaponInSlot(TSubclassOf<ABaseWeapon> WeaponClass, EWeaponSlotType Slot);
+
+	/**
 	 * 统一的武器/角色预填入口
 	 *
 	 * @param InCharacterID 角色 ID (用于查找挂载配置)
@@ -282,6 +409,24 @@ public:
 	 * @param WeaponClass 武器 BP 类 (TSoftClassPtr<ABaseWeapon>::LoadSynchronous() 或 DT_WeaponInfo 反查)
 	 */
 	void SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> WeaponClass);
+
+	/**
+	 * 【v60 大厂架构】武器火控配置初始化 — 唯一入口
+	 *
+	 * 调用方:
+	 *   - SpawnAndEquipWeapon (服务器 Spawn 末尾)
+	 *   - SpawnAndConfigureWeaponInSlot (服务器多槽位生成末尾)
+	 *
+	 * 流程:
+	 *   1. 按 WeaponClass 反查 DT_WeaponInfo (GM->WeaponDataTable)
+	 *   2. 写入 Weapon->WeaponRowName (供 Server_ReportHit 读伤害)
+	 *   3. 调 Weapon->WeaponFireComponent->InitializeFromWeaponConfig
+	 *
+	 * 零兜底:
+	 *   - 字段缺失 → Log Warning / Error (强制修复)
+	 *   - DT 找不到 → Log Error 跳过 (不静默)
+	 */
+	void InitializeWeaponFireConfigFromClass(ABaseWeapon* NewWeapon, TSubclassOf<ABaseWeapon> WeaponClass);
 
 	/**
 	 * 从 ConfigSO 同步武器数据 (v54 改名, 原 SyncWeaponFromProfile)
@@ -433,6 +578,63 @@ protected:
 	 */
 	UPROPERTY(Replicated, EditAnywhere, BlueprintReadOnly, Category = "Combat|Attachment")
 	FString SpawnWeaponID;
+
+	/**
+	 * 【v52 大厂架构 — 生化模式】3 槽位武器数组 (Replicated)
+	 *
+	 * 数据结构 (与 EWeaponSlotType 严格对齐):
+	 *   - 索引 0 = EWeaponSlotType::Primary   (主武器, 玩家大厅 SelectedWeaponID1)
+	 *   - 索引 1 = EWeaponSlotType::Secondary (副武器, 玩家大厅 SelectedWeaponID2, 允许为空)
+	 *   - 索引 2 = EWeaponSlotType::Melee     (近战武器, 玩家大厅 SelectedWeaponID3, 允许为空)
+	 *
+	 * 槽位真理源 (大厂原则):
+	 *   - 服务器 SpawnBothWeapons → 写入 WeaponsInSlot
+	 *   - 服务器 Server_SwitchToWeaponSlot → 改 CurrentWeaponSlot + 切换显示
+	 *   - 客户端 OnRep_WeaponsInSlot → 自动收到双武器引用 (UE 自动同步数组)
+	 *
+	 * 零兜底:
+	 *   - 数组空 → 玩家没武器 (走 GameMode 重新 Spawn, 不静默兜底)
+	 *   - 3 武器某槽位缺失 → 拒绝切换 (强制修复 Spawn 链路)
+	 *
+	 * 向后兼容:
+	 *   - AI 路径 (关卡预放 AI / 大厅入队 AI) 不调用 SpawnAllWeapons
+	 *   - AI 走旧 SpawnAndEquipWeapon → CurrentWeapon 字段, 与本数组不冲突
+	 *   - 3 槽位系统仅玩家路径使用 (生化模式核心需求)
+	 */
+	UPROPERTY(Replicated)
+	TArray<TObjectPtr<ABaseWeapon>> WeaponsInSlot;
+
+	/**
+	 * 【v51 大厂架构 — 生化模式】当前激活的槽位 (ReplicatedUsing)
+	 *
+	 * 默认值: EWeaponSlotType::Primary (玩家开局持有主武器)
+	 *
+	 * 同步链路:
+	 *   - 服务器 Server_SwitchToWeaponSlot 写入 → 自动 Replicate 到客户端
+	 *   - 客户端 OnRep_CurrentWeaponSlot 触发 → 更新 CurrentWeapon + 显示/隐藏
+	 *
+	 * 零兜底:
+	 *   - 服务器切到空槽位 (该槽位武器未生成) → 拒绝切 (Log Error)
+	 *   - 客户端收到 None 槽位 → 拒绝切换 (强制修复服务器状态)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_CurrentWeaponSlot, VisibleAnywhere, BlueprintReadOnly, Category = "Combat|Weapons|Slot")
+	EWeaponSlotType CurrentWeaponSlot = EWeaponSlotType::Primary;
+
+	/**
+	 * 【v51 大厂架构】OnRep_CurrentWeaponSlot — 客户端槽位同步回调
+	 *
+	 * 触发场景: 服务器 Server_SwitchToWeaponSlot → CurrentWeaponSlot 写入 → Replicate → 本回调
+	 *
+	 * 行为 (客户端):
+	 *   1. 隐藏旧槽位武器 (SetActorHiddenInGame(true))
+	 *   2. 显示新槽位武器 (SetActorHiddenInGame(false))
+	 *   3. 更新 CurrentWeapon 字段 (向后兼容单武器 API)
+	 *   4. HUD 同步 (CharacterIconComponent 读新武器 ID)
+	 *
+	 * 注意: 本回调**仅在客户端**触发 (服务器写不触发), 服务器路径直接走 Server_SwitchToWeaponSlot 内部
+	 */
+	UFUNCTION()
+	void OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot);
 
 	/**
 	 * 武器挂载配置数据表 — 【v37 单一真理源】从 GM 读取, 不在本组件持有

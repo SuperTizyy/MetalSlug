@@ -339,11 +339,11 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName
 	}
 }
 
-void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName)
+void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))
 	{
-		PC->Server_SelectLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+		PC->Server_SelectLoadout(CharacterRowName, WeaponPrimaryRowName, WeaponSecondaryRowName, WeaponMeleeRowName);
 		return;
 	}
 	// 独立进程模式：直接写 PlayerState
@@ -351,12 +351,19 @@ void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const F
 	{
 		if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
 		{
-			PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+			PS->SetPlayerLoadout(CharacterRowName, WeaponPrimaryRowName, WeaponSecondaryRowName, WeaponMeleeRowName);
 
 			// v31.4 P0: 同步到 URoomSpawnSubsystem 缓存 (复活路径的真理源)
+			// 【v52 P0】缓存 3 把武器 (主+副+近战) 用于复活时恢复 Loadout
 			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 			{
-				SpawnSys->SetPlayerSpawnData(PC->GetUniqueID(), CharacterRowName, Weapon1RowName);
+				SpawnSys->SetPlayerSpawnData(
+					PC->GetUniqueID(),
+					CharacterRowName,
+					WeaponPrimaryRowName,
+					WeaponSecondaryRowName,
+					WeaponMeleeRowName
+				);
 			}
 		}
 	}

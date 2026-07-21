@@ -9,6 +9,7 @@
 #include "Blueprint/UserWidget.h"
 #include "Components/ComboBoxString.h"
 #include "Data/Tables/CharacterTableRow.h"
+#include "Data/Enums/CombatEnums.h"  // 【v56 重构】EWeaponMeshType (武器类型过滤)
 #include "RoomInsidePage.generated.h"
 
 // 前向声明所有用到的 UI 控件
@@ -240,11 +241,38 @@ protected:
 	// ==========================================
 
 	/**
-	 * 点击此按钮，呼出更换武器的弹窗
-	 * 注意: 蓝图里这个按钮的名字严格叫 Btn_ChangeWeapon
+	 * 【v52 P0】点击此按钮, 呼出**主武器**更换弹窗
+	 *
+	 * 大厂原则 (职责对等):
+	 *   - Btn_ChangePrimaryWeapon: 改主武器 (EWeaponMeshType::Primary)
+	 *   - Btn_ChangeSecondaryWeapon: 改副武器 (EWeaponMeshType::Secondary)
+	 *   - Btn_ChangeMeleeWeapon: 改近战武器 (EWeaponMeshType::Melee)
+	 *
+	 * 蓝图里 BP_WBP_RoomInsidePage 必须有同名 Button 控件
+	 *
+	 * 注意: 旧版 "Btn_ChangeWeapon" 字段已重命名为 "Btn_ChangeMeleeWeapon" (语义: 专门换近战武器)
 	 */
 	UPROPERTY(meta = (BindWidget))
-	UButton* Btn_ChangeWeapon;
+	UButton* Btn_ChangePrimaryWeapon;
+
+	/**
+	 * 【v52 P0】点击此按钮, 呼出**副武器**更换弹窗
+	 * 蓝图里 BP_WBP_RoomInsidePage 必须有同名 Button 控件
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UButton* Btn_ChangeSecondaryWeapon;
+
+	/**
+	 * 【v52 P0】点击此按钮, 呼出**近战武器**更换弹窗
+	 * 蓝图里 BP_WBP_RoomInsidePage 必须有同名 Button 控件
+	 *
+	 * 命名说明:
+	 *   - 旧 v51 字段名: Btn_ChangeWeapon (单一武器槽)
+	 *   - 新 v52 字段名: Btn_ChangeMeleeWeapon (专门用于换近战武器)
+	 *   - 旧字段已删除 (语义不再适用)
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UButton* Btn_ChangeMeleeWeapon;
 
 	/** 更换武器覆盖面板 (整个弹窗的根节点，用于控制显示/隐藏) */
 	UPROPERTY(meta = (BindWidget))
@@ -281,10 +309,10 @@ protected:
 	TSubclassOf<UWeaponIconWidget> WeaponItemClass;
 
 	// ==========================================
-	// 7. 背包切换按钮
+	// 7. 背包切换按钮 (保留 — 每个背包包含主+副+近战 3 把武器)
 	// ==========================================
 
-	/** 背包 1 切换按钮 */
+	/** 背包 1 切换按钮 — 大厂原则: 每个背包存 3 把武器 (主/副/近战), 切换背包整套 Loadout 替换 */
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_Inventory1;
 
@@ -292,9 +320,27 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UButton* Btn_Inventory2;
 
-	/** 大厅常驻武器展示控件 */
+	/**
+	 * 【v52 P0 改造】大厅常驻武器展示 — 拆为 3 个 Image (主/副/近战)
+	 *
+	 * 旧 v51: 单个 Image_WeaponDisplay 显示"当前激活背包槽"的单把武器
+	 * 新 v52: 3 个独立 Image, 每个 Image 显示对应武器类型图标
+	 *
+	 * 大厂原则 (职责对等):
+	 *   - Image_PrimaryWeaponIcon: 主武器图标 (EWeaponMeshType::Primary)
+	 *   - Image_SecondaryWeaponIcon: 副武器图标 (EWeaponMeshType::Secondary)
+	 *   - Image_MeleeWeaponIcon: 近战武器图标 (EWeaponMeshType::Melee)
+	 *
+	 * 蓝图里 BP_WBP_RoomInsidePage 必须有同名 Image 控件 (3 个)
+	 */
 	UPROPERTY(meta = (BindWidget))
-	UImage* Image_WeaponDisplay;
+	UImage* Image_PrimaryWeaponIcon;
+
+	UPROPERTY(meta = (BindWidget))
+	UImage* Image_SecondaryWeaponIcon;
+
+	UPROPERTY(meta = (BindWidget))
+	UImage* Image_MeleeWeaponIcon;
 
 	// ==========================================
 	// 8. 背包高亮指示器
@@ -401,29 +447,87 @@ private:
 	UFUNCTION()
 	void OnHideWeaponOverlayClicked();
 
-	/** 确认更换武器按钮点击事件 */
+	/** 确认更换武器按钮点击事件 — 【v52 P0】根据 ActiveWeaponType 写入对应字段 */
 	UFUNCTION()
 	void OnConfirmWeaponChangeClicked();
 
-	/** 监听呼出弹窗的点击事件 */
+	/**
+	 * 【v52 P0 拆 3 个回调】3 个独立的"换枪按钮"回调
+	 *
+	 * 大厂原则 (职责对等):
+	 *   - OnChangePrimaryWeaponClicked: 主武器按钮 → 弹窗只列 Primary 武器
+	 *   - OnChangeSecondaryWeaponClicked: 副武器按钮 → 弹窗只列 Secondary 武器
+	 *   - OnChangeMeleeWeaponClicked: 近战武器按钮 → 弹窗只列 Melee 武器
+	 *
+	 * 旧 v51: 单个 OnChangeWeaponClicked 服务 2 个背包槽, 不区分武器类型
+	 */
 	UFUNCTION()
-	void OnChangeWeaponClicked();
+	void OnChangePrimaryWeaponClicked();
+
+	UFUNCTION()
+	void OnChangeSecondaryWeaponClicked();
+
+	UFUNCTION()
+	void OnChangeMeleeWeaponClicked();
+
+	/**
+	 * 【v52 P0】打开武器选择弹窗的私有助手 — 3 个换枪按钮共享入口
+	 *
+	 * 大厂原则 (DRY):
+	 *   - OnChangePrimaryWeaponClicked / Secondary / Melee 都调这个助手
+	 *   - 助手内部根据 WeaponType 设置 ActiveWeaponType + 加载当前选择 + 设置预览 + 弹窗
+	 *   - 避免 3 个回调里复制 5 份几乎相同的代码
+	 *
+	 * @param WeaponType 当前要更换的武器类型 (Primary / Secondary / Melee)
+	 *
+	 * 流程:
+	 *   1. 设 ActiveWeaponType = WeaponType
+	 *   2. 读 LoadedRow: Primary 走存档, Secondary/Melee 走运行时 TMap
+	 *   3. 默认回退: 找 DT_WeaponInfo 里第一个匹配 WeaponType 的 Row
+	 *   4. 设 Image_WeaponPreview
+	 *   5. Overlay_WeaponSelect->SetVisibility(Visible) + PopulateWeaponGrid(WeaponType)
+	 */
+	void OpenWeaponSelectDialog(EWeaponMeshType WeaponType);
 
 	/**
 	 * 状态机变量: 当前正在操作哪个背包 (1 或 2)
+	 * 每个背包包含主+副+近战 3 把武器
 	 */
 	int32 ActiveBackpackSlot = 1;
 
 	/**
-	 * 状态机变量: 玩家在弹窗里点选的临时武器 (还没点确认)
+	 * 【v52 P0】状态机变量: 当前弹窗正在为哪种武器类型服务
+	 *
+	 * 大厂原则 (零兜底):
+	 *   - None = 弹窗未激活
+	 *   - Primary / Secondary / Melee = 弹窗对应服务该类型
+	 *   - 玩家点 "Btn_ChangePrimaryWeapon" → ActiveWeaponType = Primary
+	 *   - 点确认 → 根据 ActiveWeaponType 写对应 PS.SelectedWeaponID{1,2,3}
 	 */
-	FName TempSelectedWeaponRow;
+	EWeaponMeshType ActiveWeaponType = EWeaponMeshType::Melee;
 
 	/**
-	 * 专门用来生成整个棋盘格的函数
-	 * 用途: 根据武器数据表动态生成武器选择网格
+	 * 【v52 P0】状态机变量: 玩家在弹窗里点选的临时武器 (按类型分桶)
+	 *
+	 * 大厂原则 (数据结构对等):
+	 *   - 旧 v51: FName TempSelectedWeaponRow (单变量, 不区分类型)
+	 *   - 新 v52: TMap<EWeaponMeshType, FName> TempSelectedWeaponsByType (3 个类型各自的临时选择)
+	 *
+	 * 业务场景:
+	 *   - 玩家点 Btn_ChangePrimaryWeapon → 弹 Primary 弹窗 → 点 Primary 武器 "WQ001"
+	 *     → TempSelectedWeaponsByType[Primary] = "WQ001"
+	 *   - 不点确认直接关弹窗 → TempSelectedWeaponsByType 暂存, 下次再开弹窗预填
+	 *   - 点确认 → 写入 PS 对应字段 + 缓存到 GetLastSelectedWeapon
 	 */
-	void PopulateWeaponGrid();
+	TMap<EWeaponMeshType, FName> TempSelectedWeaponsByType;
+
+	/**
+	 * 【v52 P0】专门用来生成整个棋盘格的函数 — 按武器类型过滤
+	 *
+	 * @param FilterType EWeaponMeshType::Primary / Secondary / Melee
+	 *                   None = 不过滤 (兼容旧路径)
+	 */
+	void PopulateWeaponGrid(EWeaponMeshType FilterType = EWeaponMeshType::None);
 
 	/** 背包 1 按钮点击回调 */
 	UFUNCTION() void OnInventory1Clicked();
@@ -436,10 +540,20 @@ private:
 	// ==========================================
 
 	/**
-	 * 更新主界面武器显示图片
-	 * @param BackpackSlot 要更新的背包槽位 (1 或 2)
+	 * 【v52 P0】更新主界面武器显示图片 — 按武器类型更新对应 Image
+	 *
+	 * 旧 v51: UpdateWeaponDisplayImage(int32 BackpackSlot) — 单个 Image, 按槽位刷新
+	 * 新 v52: UpdateWeaponDisplayImage(EWeaponMeshType WeaponType) — 3 个 Image, 按类型刷新
+	 *
+	 * 内部走 GetLastSelectedWeapon(ActiveBackpackSlot) → DT_WeaponInfo[WeaponRowName].WeaponIcon
 	 */
-	void UpdateWeaponDisplayImage(int32 BackpackSlot);
+	void UpdateWeaponDisplayImage(EWeaponMeshType WeaponType);
+
+	/**
+	 * 【v52 P0】刷新所有 3 个 Image 控件 (主+副+近战)
+	 * 用途: 切换背包 / 初始化时一次刷完 3 个图标
+	 */
+	void RefreshAllWeaponDisplayImages();
 
 	/**
 	 * 专门控制高亮框位置的小助手

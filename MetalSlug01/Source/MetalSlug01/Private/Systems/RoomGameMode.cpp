@@ -559,12 +559,14 @@ bool ARoomGameMode::CheckAllPlayersReady()
 
 /**
  * HandlePlayerRequestSpawn - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ *
+ * 【v52 P0】3 把武器一起转发 (主+副+近战)
  */
-void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponRowName)
+void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
 	if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 	{
-		SpawnSys->HandlePlayerRequestSpawn(PlayerToSpawn, CharRowName, WeaponRowName);
+		SpawnSys->HandlePlayerRequestSpawn(PlayerToSpawn, CharRowName, WeaponPrimaryRowName, WeaponSecondaryRowName, WeaponMeleeRowName);
 	}
 }
 

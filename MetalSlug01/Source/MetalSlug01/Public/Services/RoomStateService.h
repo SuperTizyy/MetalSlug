@@ -90,6 +90,19 @@ struct FPlayerSnapshot
 
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     FString SelectedWeaponID2;
+
+    /**
+     * 【v52 P0】第 3 个武器槽位 (近战武器)
+     *
+     * 大厂原则: 与 ARoomPlayerState::SelectedWeaponID3 对称,
+     * 真理源 = 大厅运行时态写入, 由 URoomStateService::BuildSnapshot 同步复制
+     *
+     * 用途:
+     *   - HUD 可查询"玩家当前槽位的近战武器"
+     *   - Scoreboard 显示"主+副+近战"全部 3 把
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
+    FString SelectedWeaponID3;
 };
 
 /**

@@ -6,8 +6,10 @@
 // 引入本类头文件
 #include "Weapons/BaseWeapon.h"
 
-// 引入静态网格组件（武器模型）
-#include "Components/StaticMeshComponent.h"
+// 引入 Mesh 组件基类 (GetMeshComponent 返回 UMeshComponent*)
+#include "Components/MeshComponent.h"
+// 引入 SkeletalMesh 组件 (ResolveMagazineSkeletalMesh 返回类型)
+#include "Components/SkeletalMeshComponent.h"
 
 // 引入角色基类（用于伤害计算, 读 bIsCurrentlyAttackerAI）
 #include "Characters/BaseCharacter.h"
@@ -23,8 +25,12 @@
 #include "Kismet/GameplayStatics.h"
 // 【P0 2026.07.10 大厂重构】武器溶解组件 (职责对等)
 #include "Components/WeaponDissolveComponent.h"
+// 【v70 P0】武器开火组件 (CreateDefaultSubobject 需要完整类型)
+#include "Components/WeaponFireComponent.h"
 // 【2026.07.11 P0 大厂架构】友军伤害守卫 (单一真理源入口)
 #include "Data/Faction/FactionTags.h"
+// v70 缺失接口: IWeaponDamageStrategy (GetDamageStrategy / SetDamageStrategy)
+#include "Weapons/WeaponDamageStrategy.h"
 
 
 // ==========================================
@@ -46,32 +52,24 @@ ABaseWeapon::ABaseWeapon()
 	// 开启网络同步，因为这把武器要挂在玩家手上让所有人看见
 	bReplicates = true;
 
-	// 初始化武器模型组件
-	WeaponMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WeaponMesh"));
-	RootComponent = WeaponMesh;
+	// 【v61.3 重构】Mesh 组件不再 CreateDefaultSubobject — 由 BP 蓝图手动添加
+	// 近战武器: StaticMeshComponent; 枪械: SkeletalMeshComponent
+	// BeginPlay 中按需查找并验证
 
-	// 【关键】: 关闭武器本身的物理碰撞
-	// 在刀战游戏中，武器模型本身是不参与物理碰撞的（否则会挡住角色的移动或摄像机）
-	// 伤害判定纯靠我们自己写的代码射线（Trace）来计算
-	WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	// WeaponFireComponent — 纯 C++ 组件 (无 BP 配置需求)
+	// 由 InitializeFromWeaponConfig 从 DT_WeaponInfo 运行时初始化，不需要手动加 BP
+	WeaponFireComponent = CreateDefaultSubobject<UWeaponFireComponent>(TEXT("WeaponFireComponent"));
 
-	// 初始化一组"默认小刀"的初始数据
+	// 初始化默认值 (BP 可覆盖)
 	LightDamageBody = 20.0f;
 	LightDamageHead = 80.0f;
 	HeavyDamage = 999.0f;
-	AttackRange = 150.0f; // 150 厘米的攻击距离
-	AttackRadius = 15.0f; // 判定球体的半径，稍微大一点防止"人体描边"
+	AttackRange = 150.0f;
+	AttackRadius = 15.0f;
 
 	PrimaryActorTick.bCanEverTick = true;
-
-	// 修改 Tick 组
-	// 强制这把武器在所有动画和物理彻底更新完毕后 (PostUpdateWork) 再执行 Tick
-	// 保证每一帧读取的 Socket 坐标是绝对精准、毫无延迟的
 	PrimaryActorTick.TickGroup = TG_PostUpdateWork;
 
-	// 【P0 2026.07.10 大厂架构重构】武器溶解组件
-	// 历史 (v23 及以前): 武器溶解由 ABaseCharacter::DissolveComponent 驱动 (跨边界)
-	// 新架构: 武器管自己 — 自己的 Mesh 自己的 DissolveComponent, 职责对等, 零跨边界
 	WeaponDissolveComponent = CreateDefaultSubobject<UWeaponDissolveComponent>(TEXT("WeaponDissolveComponent"));
 }
 
@@ -118,21 +116,26 @@ void ABaseWeapon::EndPlay(const EEndPlayReason::Type EndPlayReason)
  */
 void ABaseWeapon::StartWeaponTrace(bool bIsHeavyAttack)
 {
-	bIsWeaponActive = true;
-	bIsCurrentAttackHeavy = bIsHeavyAttack; // 记住这刀是轻是重
-	IgnoreActors.Empty(); // 每次挥刀前，清空黑名单
+	// 【v61.3 零兜底】Mesh 必须在开刃前就就位
+	UMeshComponent* Mesh = GetMeshComponent();
+	if (!Mesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseWeapon] StartWeaponTrace: Weapon=%s 没有 Mesh 组件 — 拒绝开刃. ")
+			TEXT("【v61.3 零兜底】修复: 在 BP 蓝图 Components 面板添加 StaticMeshComponent (近战) 或 SkeletalMeshComponent (枪械)."),
+			*GetName());
+		return;
+	}
 
-	// 把自己和持有武器的主人加进黑名单，防止自己砍死自己
+	bIsWeaponActive = true;
+	bIsCurrentAttackHeavy = bIsHeavyAttack;
+	IgnoreActors.Empty();
 	IgnoreActors.Add(this);
 	IgnoreActors.Add(GetOwner());
 
-	// 初始化起始位置，防止0点开刀
-	if (WeaponMesh)
-	{
-		// 开刃的瞬间，立刻记录下刀刃的初始位置
-		LastFrameStartLoc = WeaponMesh->GetSocketLocation(FName("TraceStart"));
-		LastFrameEndLoc = WeaponMesh->GetSocketLocation(FName("TraceEnd"));
-	}
+	// 开刃的瞬间，立刻记录下刀刃的初始位置
+	LastFrameStartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
+	LastFrameEndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
 }
 
 
@@ -200,9 +203,14 @@ void ABaseWeapon::Tick(float DeltaTime)
 	//   - 真正的"刀碰到了才扣血", 跟物理现实一致
 	// ============================================================
 
-	// 获取雷达探头的当前世界坐标 (假设你的武器组件叫 WeaponMesh)
-	FVector StartLoc = WeaponMesh->GetSocketLocation(FName("TraceStart"));
-	FVector EndLoc = WeaponMesh->GetSocketLocation(FName("TraceEnd"));
+	// 获取雷达探头的当前世界坐标
+	UMeshComponent* Mesh = GetMeshComponent();
+	if (!Mesh)
+	{
+		return;
+	}
+	FVector StartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
+	FVector EndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
 
 	// 如果两点重合或未找到插槽，绝对不能往下执行矩阵计算
 	if ((EndLoc - StartLoc).IsNearlyZero()) return;
@@ -223,7 +231,7 @@ void ABaseWeapon::Tick(float DeltaTime)
 
 	// 绝对不要用 MakeFromZ 猜角度，直接拿插槽最真实的物理旋转
 	// 这样检测盒的长宽高，将完美且死死地贴合你的大锤/刀身，在空中绝对不会发生自转抽搐
-	FRotator BoxRotation = WeaponMesh->GetSocketRotation(FName("TraceStart"));
+	FRotator BoxRotation = Mesh->GetSocketRotation(FName("TraceStart"));
 
 	// 碰撞检测结果
 	FHitResult HitResult;
@@ -653,4 +661,334 @@ bool ABaseWeapon::IsDissolving() const
 		return WeaponDissolveComponent->IsDissolving();
 	}
 	return false;
+}
+
+
+// ==========================================
+// v70 缺失方法补充 (保守修复 — BaseWeapon.cpp 被还原后调用的遗留方法)
+// ==========================================
+
+/**
+ * GetMeshType — 查询武器 Mesh 类型
+ *
+ * v61.2 重构: MeshType 字段由 WeaponAttachmentComponent 从 DT_WeaponInfo 写入.
+ * GetMeshType() 直接返回字段值 (单一真理源).
+ */
+EWeaponMeshType ABaseWeapon::GetMeshType() const
+{
+	return MeshType;
+}
+
+
+/**
+ * GetMeshComponent — 获取武器 Mesh 组件
+ *
+ * 【v61.3 重构】运行时按类型查找, 不依赖 C++ 字段
+ * - StaticMeshComponent (Melee)
+ * - SkeletalMeshComponent (Primary/Secondary)
+ * - 两者都找不到 → Log Error + return nullptr
+ */
+UMeshComponent* ABaseWeapon::GetMeshComponent() const
+{
+	// 【v61.3 运行时查找】按类型查找 Mesh 组件
+	// - StaticMeshComponent (Melee)
+	// - SkeletalMeshComponent (Primary/Secondary)
+	// - 两者都找不到 → Log Error + return nullptr
+	//
+	// 不做字段缓存 — 避免 TObjectPtr 类型转换问题，且 FindComponentByClass 哈希查找极快（< 0.001ms）
+	if (UStaticMeshComponent* SMC = FindComponentByClass<UStaticMeshComponent>())
+	{
+		return SMC;
+	}
+
+	if (USkeletalMeshComponent* SkMC = FindComponentByClass<USkeletalMeshComponent>())
+	{
+		return SkMC;
+	}
+
+	// 零兜底: BP 没挂 Mesh 组件
+	UE_LOG(LogTemp, Error,
+		TEXT("[ABaseWeapon] GetMeshComponent: Weapon=%s 没有 Mesh 组件! ")
+		TEXT("【v61.3 零兜底】修复: 在 BP 蓝图的 Components 面板添加 StaticMeshComponent (近战武器) 或 SkeletalMeshComponent (枪械)."),
+		*GetName());
+	return nullptr;
+}
+
+/**
+ * StopDamageTrace — 停止伤害追踪
+ *
+ * v70 保守修复: 旧版 StopDamageTrace 是 Weapon 公开方法.
+ * 新版近战武器用 MeleeSwStrategy::StopTrace, 这里 stub 给玩家/AI 路径做兼容.
+ */
+void ABaseWeapon::StopDamageTrace()
+{
+	// no-op: 近战伤害追踪由 MeleeSwStrategy 管理
+}
+
+/**
+ * Multicast_PlayFireMontage — 多播播放开火蒙太奇
+ *
+ * v70 保守修复: 旧版是 Weapon RPC, 新版 Strategy 内.
+ * 这里做 no-op stub (蒙太奇播放由 WeaponFireComponent::PerformSingleShot 内部处理).
+ */
+void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
+{
+	// 【v72 大厂架构修复】RPC 在 Weapon 上，但动画要播在角色骨骼网格体上
+	//   - 旧 (v70): no-op → 射击/换弹动画永远不播
+	//   - 新 (v72): 获取 Owner (角色) 的骨骼网格体，播放蒙太奇
+	USkeletalMeshComponent* CharMesh = nullptr;
+	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetOwner()))
+	{
+		CharMesh = Char->GetMesh();
+	}
+	if (!CharMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: Owner 不是 ABaseCharacter 或 Mesh 为空! Weapon=%s Owner=%s. 修复: 检查武器挂载链路."),
+			*GetName(),
+			GetOwner() ? *GetOwner()->GetName() : TEXT("nullptr"));
+		return;
+	}
+
+	UAnimInstance* AnimInst = CharMesh->GetAnimInstance();
+	if (!AnimInst)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: AnimInstance 为空! Weapon=%s CharMesh=%s. 修复: 检查角色 BP 的 Mesh 是否为 SkeletalMesh."),
+			*GetName(), *CharMesh->GetName());
+		return;
+	}
+
+	UAnimMontage* FireMontage = nullptr;
+	if (UWeaponFireComponent* FC = WeaponFireComponent)
+	{
+		FireMontage = FC->GetFireMontageHip();
+	}
+
+	if (!FireMontage)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: FireMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 FireMontage_Ironsights 必须配置 Anim_Fire_Rifle_Ironsights_Montage."),
+			*GetName());
+		return;
+	}
+
+	// 播放射击蒙太奇（非重叠模式）
+	AnimInst->Montage_Play(FireMontage, 1.0f, EMontagePlayReturnType::MontageLength, 0.0f, false);
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: 武器=%s 播放射击蒙太奇=%s"),
+		*GetName(), *FireMontage->GetName());
+}
+
+/**
+ * Multicast_PlayReloadMontage — 多播播放换弹蒙太奇
+ *
+ * v72 大厂架构修复: RPC 在 Weapon 上，动画要播在角色骨骼网格体上
+ */
+void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
+{
+	USkeletalMeshComponent* CharMesh = nullptr;
+	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetOwner()))
+	{
+		CharMesh = Char->GetMesh();
+	}
+	if (!CharMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: Owner 不是 ABaseCharacter 或 Mesh 为空! Weapon=%s Owner=%s."),
+			*GetName(),
+			GetOwner() ? *GetOwner()->GetName() : TEXT("nullptr"));
+		return;
+	}
+
+	UAnimInstance* AnimInst = CharMesh->GetAnimInstance();
+	if (!AnimInst)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: AnimInstance 为空! Weapon=%s."),
+			*GetName());
+		return;
+	}
+
+	UAnimMontage* ReloadMontage = nullptr;
+	if (UWeaponFireComponent* FC = WeaponFireComponent)
+	{
+		ReloadMontage = FC->GetReloadMontageHip();
+	}
+
+	if (!ReloadMontage)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: ReloadMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 ReloadMontage_Ironsights 必须配置 Anim_Reload_Rifle_Ironsights_Montage."),
+			*GetName());
+		return;
+	}
+
+	AnimInst->Montage_Play(ReloadMontage, 1.0f, EMontagePlayReturnType::MontageLength, 0.0f, false);
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: 武器=%s 播放换弹蒙太奇=%s"),
+		*GetName(), *ReloadMontage->GetName());
+}
+
+/**
+ * Server_StartFire — 服务器开始开火
+ *
+ * v70 保守修复: 旧版是 Weapon RPC, 新版 WeaponFireComponent 内.
+ * 这里 stub 做 no-op (真实实现在 WeaponFireComponent::Server_StartFire).
+ */
+void ABaseWeapon::Server_StartFire_Implementation()
+{
+	if (!WeaponFireComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Server_StartFire: WeaponFireComponent 为空! Weapon=%s. 修复: 检查 BP_Weapon_Xxx 是否删了 UWeaponFireComponent 子对象."),
+			*GetName());
+		return;
+	}
+	WeaponFireComponent->StartFire();
+}
+
+bool ABaseWeapon::Server_StartFire_Validate()
+{
+	return true;
+}
+
+/**
+ * Server_StopFire — 服务器停止开火
+ *
+ * v70 保守修复: 同上.
+ */
+void ABaseWeapon::Server_StopFire_Implementation()
+{
+	if (!WeaponFireComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Server_StopFire: WeaponFireComponent 为空! Weapon=%s. 修复: 检查 BP_Weapon_Xxx 是否删了 UWeaponFireComponent 子对象."),
+			*GetName());
+		return;
+	}
+	WeaponFireComponent->StopFire();
+}
+
+bool ABaseWeapon::Server_StopFire_Validate()
+{
+	return true;
+}
+
+/**
+ * Server_StartReload — 服务器开始换弹
+ *
+ * v70 保守修复: 同上.
+ */
+void ABaseWeapon::Server_StartReload_Implementation()
+{
+	if (!WeaponFireComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] Server_StartReload: WeaponFireComponent 为空! Weapon=%s. 修复: 检查 BP_Weapon_Xxx 是否删了 UWeaponFireComponent 子对象."),
+			*GetName());
+		return;
+	}
+	WeaponFireComponent->StartReload();
+}
+
+bool ABaseWeapon::Server_StartReload_Validate()
+{
+	return true;
+}
+
+/**
+ * ResolveMagazineSkeletalMesh — 获取弹匣 SkeletalMesh 组件
+ *
+ * v72 大厂架构修复: 旧版 (v70) 只写了 stub, 对所有武器返回 nullptr.
+ * 新版 (v72): 从武器上按名称查找 MagazineSkeletal 组件.
+ *
+ * 调用方: AnimNotify_DetachMagazine / AnimNotify_AttachMagazine
+ *
+ * 用户配置: 枪械武器 BP 中必须有一个 SkeletalMeshComponent 子对象, 组件名 = "MagazineSkeletal"
+ */
+USkeletalMeshComponent* ABaseWeapon::ResolveMagazineSkeletalMesh() const
+{
+	// 遍历所有 SkeletalMeshComponent, 找名字含 "Magazine" 的
+	TArray<USkeletalMeshComponent*> AllSkeletalMeshes;
+	GetComponents(AllSkeletalMeshes);
+	for (USkeletalMeshComponent* SkeletalMesh : AllSkeletalMeshes)
+	{
+		if (SkeletalMesh && SkeletalMesh->GetName().Contains(TEXT("Magazine")))
+		{
+			return SkeletalMesh;
+		}
+	}
+
+	// 未找到 → 零兜底: Log Error, 让用户修复 BP 配置
+	UE_LOG(LogTemp, Error,
+		TEXT("[ABaseWeapon] ResolveMagazineSkeletalMesh: 武器 '%s' 上找不到 MagazineSkeletal 组件! 修复: 在 BP_Weapon_AK47 中添加 SkeletalMeshComponent 子对象, 命名为包含 'Magazine' 的名称."),
+		*GetName());
+	return nullptr;
+}
+
+/**
+ * RestoreMagazineToWeapon — 将弹匣重新挂回武器
+ *
+ * v72 大厂架构修复: 旧版 (v70) 是 no-op, 弹匣永远留在手上.
+ * 新版 (v72): 把弹匣从角色手上挂回武器的 MagazineSocket 插槽.
+ *
+ * 调用方: AnimNotify_AttachMagazine
+ *
+ * 协议: 弹匣 Detach 时用 KeepWorld 保持世界坐标, Attach 时同样用 KeepWorld 保持世界坐标,
+ * 这样弹匣从手上回到武器时位置不变 (动画驱动换弹视觉效果).
+ */
+void ABaseWeapon::RestoreMagazineToWeapon()
+{
+	USkeletalMeshComponent* MagazineMesh = ResolveMagazineSkeletalMesh();
+	if (!MagazineMesh)
+	{
+		// ResolveMagazineSkeletalMesh 内部已 Log Error, 这里只 return
+		return;
+	}
+
+	// 获取武器的主骨骼网格体
+	USkeletalMeshComponent* WeaponMesh = Cast<USkeletalMeshComponent>(GetMeshComponent());
+	if (!WeaponMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] RestoreMagazineToWeapon: Weapon Mesh 为空! Weapon=%s"),
+			*GetName());
+		return;
+	}
+
+	// 策略 1: 武器 Skeleton 上有 MagazineSocket → 挂到插槽
+	FName TargetSocket = FName("MagazineSocket");
+	if (WeaponMesh->DoesSocketExist(TargetSocket))
+	{
+		// Detach 当前挂载 (保持世界坐标, 防止弹匣跳变)
+		FDetachmentTransformRules DetachRules(EDetachmentRule::KeepWorld, true);
+		MagazineMesh->DetachFromComponent(DetachRules);
+
+		// 挂到武器的 MagazineSocket
+		FAttachmentTransformRules AttachmentRules(EAttachmentRule::KeepWorld, true);
+		MagazineMesh->AttachToComponent(WeaponMesh, AttachmentRules, TargetSocket);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[BaseWeapon] RestoreMagazineToWeapon: 弹匣 '%s' 挂回武器 '%s' 的 MagazineSocket. FinalParent='%s' FinalSocket='%s'"),
+			*MagazineMesh->GetName(),
+			*GetName(),
+			*MagazineMesh->GetAttachParent()->GetName(),
+			*MagazineMesh->GetAttachSocketName().ToString());
+		return;
+	}
+
+	// 策略 2: 没有 MagazineSocket，MagazineSkeletal 直接作为武器 Mesh 的子组件
+	// → 挂回武器 Mesh 根节点（用户蓝图里的结构）
+	FDetachmentTransformRules DetachRules(EDetachmentRule::KeepWorld, true);
+	MagazineMesh->DetachFromComponent(DetachRules);
+
+	FAttachmentTransformRules AttachmentRules(EAttachmentRule::KeepWorld, true);
+	MagazineMesh->AttachToComponent(WeaponMesh, AttachmentRules, NAME_None);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseWeapon] RestoreMagazineToWeapon: 弹匣 '%s' 挂回武器 '%s' 根节点 (无 MagazineSocket). FinalParent='%s'"),
+		*MagazineMesh->GetName(),
+		*GetName(),
+		*MagazineMesh->GetAttachParent()->GetName());
 }

@@ -25,7 +25,8 @@
 //
 // 【大厂原则 - 单一真理源】
 //   - CharacterID 真理源 = ARoomPlayerState::SelectedCharacterID (Phase 1 已落地)
-//   - WeaponID 真理源 = ARoomPlayerState::SelectedWeaponID1
+//   - WeaponID 真理源 = ARoomPlayerState::SelectedWeaponID1 (主武器槽位, 大厅真理源)
+//     ※ v52 3 槽位扩展: 武器图标默认显示主武器槽位的武器 (HUD 显示哪个槽位的武器由外部 GameHUD 决定)
 //   - Avatar 贴图真理源 = CharacterDataTable 行 (由 GameMode 持有 DataTable 指针)
 //   - 本组件不持有 CharacterID 副本, 只缓存上一次请求的 CharacterID 用于 Retry
 //

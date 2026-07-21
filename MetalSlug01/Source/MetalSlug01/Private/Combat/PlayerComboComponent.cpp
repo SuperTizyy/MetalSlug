@@ -212,7 +212,19 @@ void UPlayerComboComponent::BindInputActions(UEnhancedInputComponent* EnhancedIn
 		return;
 	}
 
+	// ===========================================
+	// 【v60.x 大厂架构 — 武器类型分离】
+	// 同一个物理键（左键）在 UE IMC 中被同时绑定到 FireAction 和 LightAttackAction
+	// 导致按左键时两个回调都被触发
+	//
+	// 解决方案: 在 PlayerComboComponent 层根据武器类型决定是否处理 LightAttack
+	//   - 近战武器 (Melee): 处理 LightAttack
+	//   - 枪械 (Primary/Secondary): 不处理（由 OnFirePressed 处理）
+	//   - 无武器: 不处理
+	// ===========================================
+
 	// 绑定轻击: Started → LightAttack_Pressed, Completed → LightAttack_Released
+	// 武器类型检查在 LightAttack_Pressed / LightAttack_Released 内部进行
 	if (LightAttackAction)
 	{
 		EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Started,
@@ -268,17 +280,34 @@ void UPlayerComboComponent::LightAttack_Pressed()
 		return;
 	}
 
-	// 死人、武器未装备不能攻击
-	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
-	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
-	if (OwnerCharacter->IsDead() || !OwnerCharacter->GetCurrentWeapon())
+	// ============================================================
+	// 【v60.x 大厂架构 — 武器类型检查】
+	// 同一个物理键（左键）同时绑定了 FireAction 和 LightAttackAction
+	// 按左键时两个回调都被触发
+	// 修复: LightAttack 只处理近战武器 (Melee)，枪械走 OnFirePressed
+	// ============================================================
+	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		// 没武器 — 业务正常, 不报错
+		return;
+	}
+
+	// 只处理近战武器 (Melee)，枪械走 OnFirePressed
+	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Melee)
+	{
+		// 是枪械 — 不处理 LightAttack, 让 OnFirePressed 处理
+		return;
+	}
+
+	// 死人不能攻击
+	if (OwnerCharacter->IsDead())
 	{
 		return;
 	}
 
 	// 下蹲攻击权限拦截
 	// 如果你正蹲着, 并且这把武器禁止下蹲攻击, 直接 return, 无视玩家按键
-	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
 	if (OwnerCharacter->bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
 	{
 		return;
@@ -320,6 +349,8 @@ void UPlayerComboComponent::LightAttack_Pressed()
  * LightAttack_Released — 轻击松开事件
  *
  * 流程: 仅设 bIsHoldingLightAttack = false (记录松手状态, 给 CheckCombo 终极结算用)
+ *
+ * 【v60.x 大厂架构】也检查武器类型，只处理近战武器
  */
 void UPlayerComboComponent::LightAttack_Released()
 {
@@ -330,6 +361,14 @@ void UPlayerComboComponent::LightAttack_Released()
 	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
 	if (!OwnerCharacter)
 	{
+		return;
+	}
+
+	// 【v60.x 大厂架构】检查武器类型，只处理近战武器
+	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
+	if (!CurrentWeapon || CurrentWeapon->GetMeshType() != EWeaponMeshType::Melee)
+	{
+		// 没武器或不是近战武器 — 不处理
 		return;
 	}
 
@@ -594,8 +633,8 @@ void UPlayerComboComponent::ExecuteComboSequence()
 		//
 		// 新版 (v35): BP AnimNotify 控制
 		//   - 美术在 UE 编辑器打开蒙太奇 Combo1 / Combo2 段
-		//   - 在"挥刀中段"位置加 ANS_MeleeTrace (BP AnimNotify) → 触发 StartWeaponTrace
-		//   - 在"收刀"位置加 ANS_MeleeTraceEnd (BP AnimNotify) → 触发 StopWeaponTrace
+		//   - 在"挥刀中段"位置加 ANS_MeleeTrace (BP AnimNotify) → 触发 PerformDamageTrace
+		//   - 在"收刀"位置加 ANS_MeleeTraceEnd (BP AnimNotify) → 触发 StopDamageTrace
 		//   - BP AnimNotify 拿武器: WeaponAttach->GetCurrentWeapon() (蓝图纯函数节点)
 		//
 		// 大厂原则 - 职责对等:
@@ -617,7 +656,7 @@ void UPlayerComboComponent::ExecuteComboSequence()
  *
  * 流程:
  *   1. Montage 参数验证 (过滤非我触发的蒙太奇)
- *   2. 服务器主动 StopWeaponTrace (跟 AIAttackComponent 对称)
+ *   2. 服务器主动 StopDamageTrace (跟 AIAttackComponent 对称)
  *   3. 调 EndAttackState 解状态锁 + 解移动锁
  *   4. 清空 CachedPlayerMontage (防内存残留)
  *
@@ -662,12 +701,12 @@ void UPlayerComboComponent::OnPlayerAttackMontageEnded(UAnimMontage* Montage, bo
 		return;
 	}
 
-	// 步骤 1: 服务器主动 StopWeaponTrace (跟 AIAttackComponent 对称)
+	// 步骤 1: 服务器主动 StopDamageTrace (跟 AIAttackComponent 对称)
 	if (OwnerCharacter->HasAuthority())
 	{
 		if (ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon())
 		{
-			CurrentWeapon->StopWeaponTrace();
+			CurrentWeapon->StopDamageTrace();
 		}
 	}
 

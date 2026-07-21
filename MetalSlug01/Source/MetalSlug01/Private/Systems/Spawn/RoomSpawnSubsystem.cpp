@@ -13,6 +13,7 @@
 #include "Data/Tables/SpawnTableRow.h"
 #include "Data/Tables/WeaponTableRow.h"      // 【v54.3 新增】FWeaponInfo (DT_WeaponInfo 行)
 #include "Weapons/BaseWeapon.h"              // 【v54.3 新增】ABaseWeapon (ResolveWeaponClassFromID 返回类型)
+#include "Combat/WeaponAttachmentComponent.h" // 【v52 P0 新增】Server_SpawnAllWeapons 调用
 #include "Data/Config/PlayerConfigAsset.h"
 #include "Characters/BaseCharacter.h"
 #include "Components/HealthComponent.h"
@@ -840,15 +841,30 @@ bool URoomSpawnSubsystem::GetPlayerSpawnData(uint32 ControllerUniqueID, FString&
 	if (const FPlayerSpawnData* Cached = PlayerSpawnDataCache.Find(ControllerUniqueID))
 	{
 		OutCharID = Cached->CharID;
-		OutWeaponID = Cached->WeaponID;
+		// 【v52 P0】保持向后兼容: 老接口返回主武器 (Slot 1)
+		OutWeaponID = Cached->WeaponPrimaryID;
 		return true;
 	}
 	return false;
 }
 
-void URoomSpawnSubsystem::SetPlayerSpawnData(uint32 ControllerUniqueID, const FString& CharID, const FString& WeaponID)
+bool URoomSpawnSubsystem::GetPlayerSpawnDataAllWeapons(uint32 ControllerUniqueID, FString& OutCharID, FString& OutPrimaryID, FString& OutSecondaryID, FString& OutMeleeID) const
 {
-	PlayerSpawnDataCache.FindOrAdd(ControllerUniqueID) = FPlayerSpawnData{CharID, WeaponID};
+	if (const FPlayerSpawnData* Cached = PlayerSpawnDataCache.Find(ControllerUniqueID))
+	{
+		OutCharID = Cached->CharID;
+		OutPrimaryID = Cached->WeaponPrimaryID;
+		OutSecondaryID = Cached->WeaponSecondaryID;
+		OutMeleeID = Cached->WeaponMeleeID;
+		return true;
+	}
+	return false;
+}
+
+void URoomSpawnSubsystem::SetPlayerSpawnData(uint32 ControllerUniqueID, const FString& CharID, const FString& PrimaryWeaponID, const FString& SecondaryWeaponID, const FString& MeleeWeaponID)
+{
+	// 【v52 P0】3 把武器一起存, 主+副+近战
+	PlayerSpawnDataCache.FindOrAdd(ControllerUniqueID) = FPlayerSpawnData{CharID, PrimaryWeaponID, SecondaryWeaponID, MeleeWeaponID};
 }
 
 /**
@@ -1394,19 +1410,22 @@ void URoomSpawnSubsystem::SpawnAllPlayersIntoBattle()
 			if (ARoomPlayerState* PS = Cast<ARoomPlayerState>(PC->PlayerState))
 			{
 				// 【v31.2 零兜底】拒绝 fallback — 必须有 Loadout
+				// 【v52 P0】3 把武器一起读 (主+副+近战), 主武器必须非空 (Slot 1 必选), 副/近战可空
 				const FString CharID = PS->GetSelectedCharacterID();
-				const FString WeaponID = PS->GetSelectedWeapon1ID();
+				const FString PrimaryID = PS->GetSelectedWeapon1ID();
+				const FString SecondaryID = PS->GetSelectedWeapon2ID();
+				const FString MeleeID = PS->GetSelectedWeapon3ID();
 
-				if (CharID.IsEmpty() || WeaponID.IsEmpty())
+				if (CharID.IsEmpty() || PrimaryID.IsEmpty())
 				{
 					UE_LOG(LogTemp, Error,
-						TEXT("[Spawn] SpawnAllPlayersIntoBattle: 玩家 '%s' Loadout 不完整 (CharID='%s', WeaponID='%s'). "
+						TEXT("[Spawn] SpawnAllPlayersIntoBattle: 玩家 '%s' Loadout 不完整 (CharID='%s', Primary='%s'). "
 						     "【v31.2 零兜底】拒绝 Spawn."),
-						*PS->GetPlayerName(), *CharID, *WeaponID);
+						*PS->GetPlayerName(), *CharID, *PrimaryID);
 					continue;
 				}
 
-				HandlePlayerRequestSpawn(PC, CharID, WeaponID);
+				HandlePlayerRequestSpawn(PC, CharID, PrimaryID, SecondaryID, MeleeID);
 			}
 			else
 			{
@@ -1481,12 +1500,12 @@ void URoomSpawnSubsystem::SpawnAllPlayersIntoBattle()
 	bSpawnInProgress = false;
 }
 
-void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponRowName)
+void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
 	if (!PlayerToSpawn) return;
 
-	UE_LOG(LogTemp, Warning, TEXT("[Spawn] HandlePlayerRequestSpawn called. Char='%s', Weapon='%s'"),
-		*CharRowName, *WeaponRowName);
+	UE_LOG(LogTemp, Warning, TEXT("[Spawn] HandlePlayerRequestSpawn called. Char='%s', Primary='%s', Secondary='%s', Melee='%s'"),
+		*CharRowName, *WeaponPrimaryRowName, *WeaponSecondaryRowName, *WeaponMeleeRowName);
 
 	// 【v44 大厂架构修复】战斗状态守卫 — 防止战斗期间意外移动玩家 Pawn
 	// 
@@ -1541,7 +1560,11 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	//   - 空字符串 → Log Error + 拒绝 Spawn (零兜底)
 	//   - 缓存只用于跨帧/跨调用持久化 (RoomLifecycle 已写入), 不参与运行时兜底
 	const FString FinalCharID = CharRowName;
-	const FString FinalWeaponID = WeaponRowName;
+	// 【v52 P0】主武器作为当前激活武器 (Slot 1) — 玩家开局默认挂主武器
+	const FString FinalWeaponID = WeaponPrimaryRowName;
+	// 【v52 P0】副武器 + 近战武器允许为空 (玩家可能没选), 由 WeaponAttachmentComponent 3 槽位架构决定实际生成几把
+	const FString FinalSecondaryWeaponID = WeaponSecondaryRowName;
+	const FString FinalMeleeWeaponID = WeaponMeleeRowName;
 
 	// Step 1: 校验非空 (零兜底)
 	if (FinalCharID.IsEmpty() || FinalCharID == TEXT("Default"))
@@ -1554,21 +1577,23 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	if (FinalWeaponID.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] HandlePlayerRequestSpawn: WeaponID 为空 (Player=%s). 拒绝 Spawn."),
+			TEXT("[Spawn] HandlePlayerRequestSpawn: 主武器 WeaponID 为空 (Player=%s). 拒绝 Spawn."),
 			*PlayerToSpawn->GetName());
 		return;
 	}
 
-	// Step 2: 写缓存 (供复活读)
+	// Step 2: 写缓存 (供复活读) — 【v52 P0】3 把武器一起存
 	FPlayerSpawnData SpawnData;
 	SpawnData.CharID = FinalCharID;
-	SpawnData.WeaponID = FinalWeaponID;
+	SpawnData.WeaponPrimaryID = FinalWeaponID;
+	SpawnData.WeaponSecondaryID = FinalSecondaryWeaponID;
+	SpawnData.WeaponMeleeID = FinalMeleeWeaponID;
 	PlayerSpawnDataCache.Add(PlayerToSpawn->GetUniqueID(), SpawnData);
 
-	// 同步 PlayerState
+	// 同步 PlayerState — 【v52 P0】3 把武器一次写入
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SetPlayerLoadout(FinalCharID, FinalWeaponID, PS->GetSelectedWeapon2ID());
+		PS->SetPlayerLoadout(FinalCharID, FinalWeaponID, FinalSecondaryWeaponID, FinalMeleeWeaponID);
 	}
 
 	// Step 3: 查 DT_CharacterInfo
@@ -1688,33 +1713,57 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 			//   - 唯一入口: URoomSpawnSubsystem::HandlePlayerRequestSpawn (本函数)
 			//   - 时序保证: SetSpawnLoadout ✓ → SetGenericTeamId ✓ → Possess ✓ → RequestWeaponSpawn ✓
 			//   - 与 AI 路径对称: RoomSpawnSubsystem::SpawnAIInternal 同样在 Possess 后触发
+			// 【v52 P0 扩展 3 槽位】玩家路径走 Server_SpawnAllWeapons (主+副+近战 一次 Spawn)
+			//   - 旧版: 单独 Spawn 一把武器到 CurrentWeapon, 不支持多槽位
+			//   - 新版: 反查 3 把武器的 Class, 一次性传给 WeaponAttachmentComponent
+			TSubclassOf<ABaseWeapon> PrimaryClass = nullptr;
+			TSubclassOf<ABaseWeapon> SecondaryClass = nullptr;
+			TSubclassOf<ABaseWeapon> MeleeClass = nullptr;
+
 			if (!FinalWeaponID.IsEmpty())
 			{
-				TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(FinalWeaponID);
-				if (WeaponClass)
-				{
-					UE_LOG(LogTemp, Log,
-						TEXT("[Spawn] HandlePlayerRequestSpawn 触发武器 Spawn: WeaponID=%s → WeaponClass=%s (Pawn=%s, Player=%s)"),
-						*FinalWeaponID, *WeaponClass->GetName(), *SpawnedChar->GetName(), *PlayerToSpawn->GetName());
-					SpawnedChar->RequestWeaponSpawn(WeaponClass);
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 的 WeaponID='%s' 无法反查为 WeaponClass. "
-						     "【v54.3 零兜底】DT_WeaponInfo 缺失或 Row 配置错. "
-						     "修复: 1) GM_RoomGameMode.ClassDefaults.WeaponDataTable 必须配 DT_WeaponInfo; "
-						     "2) DT_WeaponInfo 里有 RowName='%s' 的行"),
-						*PlayerToSpawn->GetName(), *FinalWeaponID, *FinalWeaponID);
-				}
+				PrimaryClass = ResolveWeaponClassFromID(FinalWeaponID);
+			}
+			if (!FinalSecondaryWeaponID.IsEmpty())
+			{
+				SecondaryClass = ResolveWeaponClassFromID(FinalSecondaryWeaponID);
+			}
+			if (!FinalMeleeWeaponID.IsEmpty())
+			{
+				MeleeClass = ResolveWeaponClassFromID(FinalMeleeWeaponID);
+			}
+
+			// 零兜底 (v52): 主武器必须有, 副/近战可空
+			if (!PrimaryClass)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 的 FinalWeaponID='%s' 无法反查为 WeaponClass. "
+					     "【v52 零兜底】主武器必须有, 拒绝 Spawn. "
+					     "修复: 1) GM_RoomGameMode.ClassDefaults.WeaponDataTable 必须配 DT_WeaponInfo; "
+					     "2) DT_WeaponInfo 里有 RowName='%s' 的行"),
+					*PlayerToSpawn->GetName(), *FinalWeaponID, *FinalWeaponID);
+				return;
+			}
+
+			UE_LOG(LogTemp, Log,
+				TEXT("[Spawn] HandlePlayerRequestSpawn 触发 3 槽位 Spawn: Primary=%s Secondary=%s Melee=%s (Pawn=%s, Player=%s)"),
+				*FinalWeaponID,
+				*FinalSecondaryWeaponID,
+				*FinalMeleeWeaponID,
+				*SpawnedChar->GetName(), *PlayerToSpawn->GetName());
+
+			// 走 3 槽位 Spawn (服务器权威, 与 AI 路径对称)
+			if (UWeaponAttachmentComponent* WeaponAttachComp = SpawnedChar->FindComponentByClass<UWeaponAttachmentComponent>())
+			{
+				WeaponAttachComp->Server_SpawnAllWeapons(PrimaryClass, SecondaryClass, MeleeClass);
 			}
 			else
 			{
 				UE_LOG(LogTemp, Error,
-					TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 的 FinalWeaponID 为空. "
-					     "根因: PS.SelectedWeapon1ID 在 Lifecycle 阶段没写入, 或 PC.Server_RequestSpawn_Implementation 传空. "
-					     "【v36 零兜底】拒绝 Spawn, 不允许没有武器的玩家进战斗."),
-					*PlayerToSpawn->GetName());
+					TEXT("[Spawn] HandlePlayerRequestSpawn: Pawn '%s' 没有 UWeaponAttachmentComponent — 拒绝 Spawn. "
+					     "【v52 零兜底】必须挂载 WeaponAttachment 组件."),
+					*SpawnedChar->GetName());
+				return;
 			}
 
 			// 【v41 大厂架构】应用角色战斗参数配置
@@ -1812,9 +1861,10 @@ void URoomSpawnSubsystem::RestartPlayer(AController* NewPlayer)
 	}
 
 	// 从缓存读 Char/Weapon
+	// 【v52 P0】3 把武器一起读 (主+副+近战)
 	if (FPlayerSpawnData* Cached = PlayerSpawnDataCache.Find(NewPlayer->GetUniqueID()))
 	{
-		HandlePlayerRequestSpawn(NewPlayer, Cached->CharID, Cached->WeaponID);
+		HandlePlayerRequestSpawn(NewPlayer, Cached->CharID, Cached->WeaponPrimaryID, Cached->WeaponSecondaryID, Cached->WeaponMeleeID);
 		return;
 	}
 
@@ -1849,23 +1899,26 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 			return;
 		}
 
+		// 【v52 P0】3 把武器一起读 (主+副+近战), 完整恢复 Loadout
 		const FString CharID = Cached->CharID;
-		const FString WeaponID = Cached->WeaponID;
+		const FString PrimaryID = Cached->WeaponPrimaryID;
+		const FString SecondaryID = Cached->WeaponSecondaryID;
+		const FString MeleeID = Cached->WeaponMeleeID;
 
 		if (bImmediateRespawn)
 		{
-			HandlePlayerRequestSpawn(DeadController, CharID, WeaponID);
+			HandlePlayerRequestSpawn(DeadController, CharID, PrimaryID, SecondaryID, MeleeID);
 		}
 		else
 		{
 			TWeakObjectPtr<AController> WeakCtrl = DeadController;
 			FTimerHandle LocalHandle;
 			GetWorld()->GetTimerManager().SetTimer(LocalHandle,
-				[WeakCtrl, CharID, WeaponID, this]()
+				[WeakCtrl, CharID, PrimaryID, SecondaryID, MeleeID, this]()
 				{
 					if (AController* C = WeakCtrl.Get())
 					{
-						HandlePlayerRequestSpawn(C, CharID, WeaponID);
+						HandlePlayerRequestSpawn(C, CharID, PrimaryID, SecondaryID, MeleeID);
 					}
 				},
 				RespawnDelaySeconds, false);

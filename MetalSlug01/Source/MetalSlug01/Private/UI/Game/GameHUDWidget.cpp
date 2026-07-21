@@ -586,6 +586,89 @@ void UGameHUDWidget::HideEscMenu()
 
 
 // ==========================================
+// v60.11 大厂架构 — Crosshair 世界射线服务
+// ==========================================
+
+/**
+ * UGameHUDWidget::GetCrosshairWorldRay
+ *
+ * 大厂原则 — UI 层职责对等:
+ *   - "准星 → 世界射线" 是 UI 层的专业职责
+ *   - Strategy / Character 层只读结果, 不关心转换算法
+ *   - 这是"武器射线检测"的**单一真理源**入口
+ *
+ * 流程 (严格按顺序, 任一失败立即返回 false):
+ *   1. Widget_Crosshair 存在
+ *   2. Widget 已渲染 (CachedGeometry 有效, LocalSize > 0)
+ *   3. PlayerController 存在 (本地玩家专属)
+ *   4. DeprojectScreenPositionToWorld 成功 (返回 true)
+ *
+ * @note 调用方必须显式校验返回值, false 时拒绝射线检测 (零兜底)
+ */
+bool UGameHUDWidget::GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutWorldDirection) const
+{
+	OutWorldOrigin = FVector::ZeroVector;
+	OutWorldDirection = FVector::ZeroVector;
+
+	// (1) Widget 必须存在 — BindWidget 保证 non-null, 但运行时可能被外部清空
+	if (!Widget_Crosshair)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget::GetCrosshairWorldRay] Widget_Crosshair 为空. "
+			     "【v60.11 零兜底】修复: 在 WBP_GameHUD 蓝图 Components 面板检查 'Crosshair' 槽位是否绑了 WBP_Crosshair."));
+		return false;
+	}
+
+	// (2) Widget 必须已渲染 — 否则 GetCenterScreenPosition 返回 ZeroVector
+	const FVector2D ScreenPos = Widget_Crosshair->GetCenterScreenPosition();
+	if (ScreenPos.IsZero())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget::GetCrosshairWorldRay] 准星 Widget 未渲染或被 Collapsed. "
+			     "Widget=%s Visibility=%d. "
+			     "【v60.11 零兜底】原因排查: 1) 战斗未开始? GameHUDWidget::ShowCrosshair 没调? 2) Widget CachedGeometry 未生效 (刚 Create 还没 Tick 过)?"),
+			*Widget_Crosshair->GetName(),
+			static_cast<int32>(Widget_Crosshair->GetVisibility()));
+		return false;
+	}
+
+	// (3) PlayerController — 准星屏幕坐标 → 世界射线需要 PC
+	APlayerController* PC = GetOwningPlayer();
+	if (!PC)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget::GetCrosshairWorldRay] PlayerController 为空 (HUD 不属于本地玩家). "
+			     "【v60.11 零兜底】本函数仅本地玩家武器使用, AI/远端客户端禁止调用."));
+		return false;
+	}
+
+	// (4) Deproject 转换屏幕坐标 → 世界射线
+	FVector WorldOrigin;
+	FVector WorldDirection;
+	const bool bDeprojectOK = PC->DeprojectScreenPositionToWorld(
+		ScreenPos.X,
+		ScreenPos.Y,
+		WorldOrigin,
+		WorldDirection
+	);
+	if (!bDeprojectOK)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget::GetCrosshairWorldRay] DeprojectScreenPositionToWorld 失败. "
+			     "ScreenPos=%s Player=%s. "
+			     "【v60.11 零兜底】原因排查: 1) Viewport 未初始化? 2) ScreenPos 越界 (越界时 UE 返回 false)."),
+			*ScreenPos.ToString(),
+			*PC->GetName());
+		return false;
+	}
+
+	OutWorldOrigin = WorldOrigin;
+	OutWorldDirection = WorldDirection;
+	return true;
+}
+
+
+// ==========================================
 // 8. 结算系统
 // ==========================================
 

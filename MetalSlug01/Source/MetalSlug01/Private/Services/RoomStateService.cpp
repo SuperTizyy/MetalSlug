@@ -316,5 +316,7 @@ FPlayerSnapshot URoomStateService::BuildSnapshot(ARoomPlayerState* PS, bool bIsH
     Snap.SelectedCharacterID = PS->GetSelectedCharacterID();
     Snap.SelectedWeaponID1   = PS->GetSelectedWeapon1ID();
     Snap.SelectedWeaponID2   = PS->GetSelectedWeapon2ID();
+    // 【v52 P0】第 3 把武器 (近战), 大厅运行时态写入, 大厂原则 — 与 ARoomPlayerState 字段对称
+    Snap.SelectedWeaponID3   = PS->GetSelectedWeapon3ID();
     return Snap;
 }

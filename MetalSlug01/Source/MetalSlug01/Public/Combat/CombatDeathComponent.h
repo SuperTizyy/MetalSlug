@@ -220,6 +220,21 @@ public:
 	 */
 	void EnableRagdoll();
 
+	/**
+	 * DiagnoseMeshRenderingSetup — Mesh 渲染配置诊断 (v60.9)
+	 *
+	 * 大厂原则 — 错误尽早暴露: BeginPlay 时立即检查角色 Mesh 配置
+	 *   - 缺 Skeletal Mesh 资产 → 角色看不见
+	 *   - 缺 AnimClass → T-pose (用户最常见问题)
+	 *   - 缺 PhysicsAsset → 死亡 Ragdoll 不工作
+	 *
+	 * 每项缺失都会 Log Error 列出精确修复路径 (UE 编辑器面板名 + 资产名),
+	 * 让玩家一看日志就知道怎么修 BP, 不再瞎猜.
+	 *
+	 * 调用方: BeginPlay() 末尾 (OwnerCharacter 缓存后)
+	 */
+	void DiagnoseMeshRenderingSetup() const;
+
 	// ==========================================
 	// RPC (NetMulticast Reliable)
 	// ==========================================

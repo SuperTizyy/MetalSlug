@@ -8,8 +8,10 @@
 
 // 引入角色基类（用于获取速度、阵营等）
 #include "Characters/BaseCharacter.h"
-// 引入武器基类（用于读取 LeftHandSocket）
+// 引入武器基类（用于读取 LeftHandSocket / MeshType）
 #include "Weapons/BaseWeapon.h"
+// 引入武器枚举 (EWeaponMeshType — 用于派生 EWeaponStance)
+#include "Data/Enums/CombatEnums.h"
 // 引入角色移动组件
 #include "GameFramework/CharacterMovementComponent.h"
 
@@ -138,5 +140,30 @@ void UBaseAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	{
 		// 手里没刀，乖乖把手放下
 		LeftHandIKAlpha = 0.0f;
+	}
+
+	// ==========================================
+	// 【v59 大厂架构 — 武器身体姿势切换】
+	// 真理源: ABaseWeapon::MeshType (BP 配置驱动, 已 Replicated)
+	// AnimGraph 用 Blend Poses by Enum 节点拿这个值, 切换武器时姿势自动平滑过渡
+	// ==========================================
+	CurrentWeaponStance = EWeaponStance::Unarmed; // 默认: 没武器或 MeshType = None
+
+	if (ABaseWeapon* Weapon = Character->GetCurrentWeapon())
+	{
+		switch (Weapon->GetMeshType())
+		{
+		case EWeaponMeshType::Melee:
+			CurrentWeaponStance = EWeaponStance::Melee;   // 刀姿势
+			break;
+		case EWeaponMeshType::Primary:
+		case EWeaponMeshType::Secondary:
+			CurrentWeaponStance = EWeaponStance::Rifle;   // 枪姿势 (主武器/副武器共用一套)
+			break;
+		case EWeaponMeshType::None:
+		default:
+			CurrentWeaponStance = EWeaponStance::Unarmed; // 没配 MeshType → 兜底到徒手
+			break;
+		}
 	}
 }

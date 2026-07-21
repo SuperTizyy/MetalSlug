@@ -1,6 +1,6 @@
 // ==========================================
 // 战斗相关枚举
-// 作用: 拆出原 StaticTable.h 中的 EWeaponType/EKillMethod/EACERankType/EKillStreakType
+// 作用: 拆出原 StaticTable.h 中的 EWeaponMeshType/EKillMethod/EACERankType/EKillStreakType
 // 优势: 武器/战斗 UI 只需要此头, 与房间枚举解耦
 // ==========================================
 #pragma once
@@ -9,16 +9,24 @@
 #include "CombatEnums.generated.h"
 
 /**
- * @enum EWeaponType
- * @brief 武器类型（用于区分主武器、副武器、近战武器）
+ * @enum EWeaponMeshType
+ * @brief 武器模型类型 (v56 重构 — 同时决定战斗策略)
+ *
+ * 用户在 BP 中手动放置 StaticMeshComponent 和/或 SkeletalMeshComponent，
+ * 然后配置此枚举告诉 C++ 使用哪个组件，以及使用哪种战斗策略。
+ *
+ * v56 设计:
+ *   - MeshType 直接决定战斗策略（不需要单独的 WeaponType）
+ *   - Melee → StaticMesh + BoxTrace (近战)
+ *   - Primary/Secondary → SkeletalMesh + LineTrace (远程)
  */
 UENUM(BlueprintType)
-enum class EWeaponType : uint8
+enum class EWeaponMeshType : uint8
 {
-	None        UMETA(DisplayName = "无"),
-	Primary     UMETA(DisplayName = "主武器"),
-	Secondary   UMETA(DisplayName = "副武器"),
-	Melee       UMETA(DisplayName = "近战武器")
+	None        UMETA(DisplayName = "无（未配置）"),
+	Melee       UMETA(DisplayName = "近战武器（静态网格体）"),
+	Primary     UMETA(DisplayName = "主武器（骨骼网格体）"),
+	Secondary   UMETA(DisplayName = "副武器（骨骼网格体）")
 };
 
 /**
@@ -69,4 +77,28 @@ enum class EKillStreakType : uint8
 	ThreeKills  UMETA(DisplayName = "三杀"),
 	FourKills   UMETA(DisplayName = "四杀"),
 	FiveKills   UMETA(DisplayName = "五杀")
+};
+
+/**
+ * @enum EFireMode
+ * @brief 枪械开火模式 (v60 大厂主流 — 数据驱动)
+ *
+ * 真理源: FWeaponInfo::FireMode (DT_WeaponInfo 字段, BP 策划可调)
+ * 读取路径: WeaponFireComponent::InitializeFromWeaponConfig → 写入 CurrentFireMode
+ *
+ * 语义:
+ *   - Semi: 半自动 — 每次按下扳机打一发, 松开/连按都按"按一次打一发"算
+ *   - Auto: 全自动 — 按住扳机持续打, 射速由 FireRateRPM 决定
+ *   - Burst3: 三连发 — 每次按下打 3 发 (CSGO Glock/M4A1 模式, 留作未来扩展)
+ *
+ * 大厂原则:
+ *   - 加新模式只需扩展枚举 + 在 WeaponFireComponent 内加分支, 不改外部接口
+ *   - 模式是武器固有属性 (DT 配), 不是角色属性 — 玩家/AI 共用同一逻辑
+ */
+UENUM(BlueprintType)
+enum class EFireMode : uint8
+{
+	Semi    UMETA(DisplayName = "半自动 (按一次打一发)"),
+	Auto    UMETA(DisplayName = "全自动 (按住持续打)"),
+	Burst3  UMETA(DisplayName = "三连发 (按一次打三发)")
 };

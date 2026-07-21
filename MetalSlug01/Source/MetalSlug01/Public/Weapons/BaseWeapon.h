@@ -2,22 +2,21 @@
 
 #pragma once
 
-// ==========================================
-// 头文件包含说明
-// ==========================================
 // UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
-
-// 引入 UE 原生 AActor 类（基类）
-#include "GameFramework/Actor.h"
 
 // 引入 EKillMethod 击杀方式枚举
 #include "Data/Enums/CombatEnums.h"
 
-// UE 自动生成的头文件
-#include "BaseWeapon.generated.h"
+// IWeaponDamageStrategy 完整定义 (TScriptInterface UPROPERTY 需要完整接口类型)
+#include "Weapons/WeaponDamageStrategy.h"
 
+// 前向声明 (放在 .generated.h 之后)
 class UWeaponDissolveComponent;
+class UWeaponFireComponent;
+
+// UE 自动生成的头文件 (.generated.h 必须最后)
+#include "BaseWeapon.generated.h"
 
 /**
  * @class ABaseWeapon
@@ -255,15 +254,14 @@ protected:
 
 
 	// ==========================================
-	// 1. 武器核心组件
+	// 1. 武器核心组件 (由 BP 手动添加)
 	// ==========================================
-protected:
-	/**
-	 * 武器的静态模型（比如一把小刀、斧头、尼泊尔）
-	 * 注意: 如果需要武器有变形动画，可以换成 USkeletalMeshComponent
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
-	class UStaticMeshComponent* WeaponMesh;
+	// 
+	// 【v61.3 重构】不再声明 WeaponMesh 字段 — 由 BP Components 面板手动添加
+	// GetMeshComponent() 通过 FindComponentByClass 运行时查找,不依赖 C++ 字段
+	// 支持:
+	//   - StaticMeshComponent (近战武器)
+	//   - SkeletalMeshComponent (枪械)
 
 
 	// ==========================================
@@ -378,4 +376,194 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
 	TObjectPtr<UWeaponDissolveComponent> WeaponDissolveComponent;
+
+	// ==========================================
+	// v70 缺失方法补充 (保守修复 — BaseWeapon.cpp 被还原后调用的遗留方法)
+	// ==========================================
+
+	/**
+	 * GetMeshType — 查询武器 Mesh 类型 (EWeaponMeshType)
+	 *
+	 * 调用方: WeaponAttachmentComponent / BaseAnimInstance / BaseCharacter / MeleeSwStrategy
+	 *
+	 * v61.2 重构: MeshType 字段从 DT_WeaponInfo 写入 Weapon->MeshType.
+	 * GetMeshType() 直接返回字段值 (单一真理源).
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Config")
+	EWeaponMeshType GetMeshType() const;
+
+	/**
+	 * GetMeshComponent — 获取武器 Mesh 组件 (UMeshComponent)
+	 *
+	 * 调用方: WeaponAttachmentComponent / CombatDeathComponent / MeleeSwStrategy
+	 *
+	 * 【v61.3 重构】运行时按需查找, 不再依赖构造函数创建的固定字段
+	 * 允许 BP 手动挂载不同类型 (StaticMesh/SkeletalMesh).
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Components")
+	UMeshComponent* GetMeshComponent() const;
+
+	/**
+	 * StopDamageTrace — 停止伤害追踪 (玩家路径兼容)
+	 *
+	 * 调用方: PlayerComboComponent / AIAttackComponent / CombatDeathComponent / MeleeSwStrategy
+	 *
+	 * v70 保守修复: 旧版 StopDamageTrace 是 Weapon 公开方法.
+	 * 新版近战武器用 MeleeSwStrategy::StopTrace, 这里 stub 给玩家/AI 路径做兼容.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Combat")
+	void StopDamageTrace();
+
+	/**
+	 * Multicast_PlayFireMontage — 多播播放开火蒙太奇
+	 *
+	 * 调用方: WeaponFireComponent::MulticastPlayFireMontage
+	 *
+	 * v70 保守修复: 旧版是 Weapon RPC, 新版 Strategy 内.
+	 * 这里做 no-op stub (蒙太奇播放由 WeaponFireComponent::PerformSingleShot 内部处理).
+	 */
+	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Animation")
+	void Multicast_PlayFireMontage();
+
+	/**
+	 * Multicast_PlayReloadMontage — 多播播放换弹蒙太奇
+	 *
+	 * 调用方: WeaponFireComponent::MulticastPlayReloadMontage
+	 *
+	 * v70 保守修复: 同上.
+	 */
+	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Animation")
+	void Multicast_PlayReloadMontage();
+
+	/**
+	 * Server_StartFire — 服务器开始开火 (枪械)
+	 *
+	 * 调用方: BaseCharacter::OnFirePressed (玩家路径)
+	 *
+	 * v70 保守修复: 旧版是 Weapon RPC, 新版 WeaponFireComponent 内.
+	 * 这里 stub 做 no-op (真实实现在 WeaponFireComponent::Server_StartFire).
+	 */
+	UFUNCTION(Server, Reliable, Category = "Weapon|Combat")
+	void Server_StartFire();
+
+	/** Server_StartFire_Validate — 验证函数 */
+	bool Server_StartFire_Validate();
+
+	/**
+	 * Server_StopFire — 服务器停止开火
+	 *
+	 * 调用方: BaseCharacter::OnFireReleased
+	 */
+	UFUNCTION(Server, Reliable, Category = "Weapon|Combat")
+	void Server_StopFire();
+
+	/** Server_StopFire_Validate — 验证函数 */
+	bool Server_StopFire_Validate();
+
+	/**
+	 * Server_StartReload — 服务器开始换弹
+	 *
+	 * 调用方: BaseCharacter::OnReloadPressed
+	 */
+	UFUNCTION(Server, Reliable, Category = "Weapon|Combat")
+	void Server_StartReload();
+
+	/** Server_StartReload_Validate — 验证函数 */
+	bool Server_StartReload_Validate();
+
+	// ==========================================
+	// v70 缺失方法: 弹匣相关 (枪械 AnimNotify 调用)
+	// ==========================================
+
+	/**
+	 * ResolveMagazineSkeletalMesh — 获取弹匣 SkeletalMesh 组件
+	 *
+	 * 调用方: AnimNotify_AttachMagazine / AnimNotify_DetachMagazine
+	 *
+	 * v70 保守修复: 枪械弹匣 AnimNotify 需要此方法.
+	 * 这里返回 nullptr (近战武器没有弹匣, AnimNotify 会走 nullptr 分支).
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Magazine")
+	class USkeletalMeshComponent* ResolveMagazineSkeletalMesh() const;
+
+	/**
+	 * RestoreMagazineToWeapon — 将弹匣重新挂回武器
+	 *
+	 * 调用方: AnimNotify_AttachMagazine
+	 *
+	 * v70 保守修复: 枪械 AnimNotify 需要此方法.
+	 * 这里做 no-op stub (近战武器没有弹匣, 无需操作).
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Magazine")
+	void RestoreMagazineToWeapon();
+
+	// ==========================================
+	// v70 缺失字段补充 (被其他文件引用但 BaseWeapon 旧版没有)
+	// ==========================================
+
+	/**
+	 * MuzzleOffset — 枪口偏移量 (厘米)
+	 *
+	 * 调用方: RangedLineStrategy::PerformSingleShot
+	 *
+	 * v70 保守修复: 旧版有此字段 (默认 0.0f).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Stats")
+	float MuzzleOffset = 0.0f;
+
+	/**
+	 * WeaponRowName — 武器行名 (DT_WeaponInfo 查表用)
+	 *
+	 * 调用方: WeaponAttachmentComponent::InitializeWeaponFireConfigFromClass
+	 *
+	 * v70 保守修复: 旧版有此字段.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
+	FName WeaponRowName = NAME_None;
+
+	/**
+	 * 【v61.2 单一真理源】武器模型类型
+	 *
+	 * 真理源: DT_WeaponInfo.MeshType 由 WeaponAttachmentComponent 写入此处.
+	 * GetMeshType() 返回此字段值, 不再依赖 BP 蓝图层的 MeshType 字段.
+	 *
+	 * 默认 EWeaponMeshType::Melee (C++ 层保证有值, DT 配错时在 InitializeWeaponFireConfigFromClass 报错).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
+	EWeaponMeshType MeshType = EWeaponMeshType::Melee;
+
+	/**
+	 * WeaponFireComponent — 武器开火组件 (枪械特有)
+	 *
+	 * 调用方: WeaponAttachmentComponent::InitializeWeaponFireConfigFromClass / MeleeSwStrategy
+	 *
+	 * v70 保守修复: 旧版有此字段, 新版 Strategy 在组件内.
+	 * 这里声明以便其他文件引用.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	TObjectPtr<class UWeaponFireComponent> WeaponFireComponent;
+
+	/**
+	 * DamageStrategy — 武器伤害策略 (RangedLineStrategy / MeleeSwStrategy)
+	 *
+	 * 调用方: WeaponFireComponent::PerformSingleShot / MeleeSwStrategy
+	 *
+	 * 【v71 大厂架构修复】WeaponFireComponent::PerformSingleShot 调 Weapon->GetDamageStrategy()
+	 * 但原版 GetDamageStrategy() 返回空 TScriptInterface，导致枪械永远无法开火。
+	 * 真实存储移到这里（Weapon 是 Strategy 的 Outer，与 FireComponent 并列）。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	TScriptInterface<IWeaponDamageStrategy> DamageStrategy;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Config")
+	TScriptInterface<IWeaponDamageStrategy> GetDamageStrategy() const
+	{
+		return DamageStrategy;
+	}
+
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Config")
+	void SetDamageStrategy(TScriptInterface<IWeaponDamageStrategy> InStrategy)
+	{
+		DamageStrategy = InStrategy;
+	}
 };

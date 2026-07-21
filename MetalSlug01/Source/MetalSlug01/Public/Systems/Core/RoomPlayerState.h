@@ -81,18 +81,30 @@ public:
 	 */
 	FString GetSelectedWeapon2ID() const { return SelectedWeaponID2; }
 
+	/**
+	 * 【2026.07.18 P0】获取当前选中的 3 号位武器 ID (近战武器)
+	 *
+	 * v52 槽位扩展: 大厅 3 把武器 (主+副+近战) 对应 SelectedWeaponID1/2/3
+	 * 战斗 Spawn 时统一读出 3 把应用到玩家
+	 */
+	FString GetSelectedWeapon3ID() const { return SelectedWeaponID3; }
+
 	// ==========================================
 	// 角色/武器选择 Setter
 	// ==========================================
 
 	/**
-	 * 一次性设置角色+双武器（Controller 专用）
+	 * 一次性设置角色+3 把武器（Controller 专用）
 	 * 改为本地 Setter（去掉此处的 Server RPC，统一由 Controller 转发）
-	 * @param InCharID 角色 ID
-	 * @param InWeapon1ID 1 号位武器 ID
-	 * @param InWeapon2ID 2 号位武器 ID
+	 *
+	 * 【v52 P0 扩展】参数从 2 把改为 3 把 (主/副/近战)
+	 *
+	 * @param InCharID     角色 ID
+	 * @param InPrimaryID  主武器 ID (Slot 1)
+	 * @param InSecondaryID 副武器 ID (Slot 2)
+	 * @param InMeleeID    近战武器 ID (Slot 3)
 	 */
-	void SetPlayerLoadout(const FString& InCharID, const FString& InWeapon1ID, const FString& InWeapon2ID);
+	void SetPlayerLoadout(const FString& InCharID, const FString& InPrimaryID, const FString& InSecondaryID, const FString& InMeleeID);
 
 	// ==========================================
 	// 网络同步注册
@@ -286,16 +298,38 @@ protected:
 	FString SelectedCharacterID;
 
 	/**
-	 * 选中的 1 号位武器 ID
+	 * 【v52】选中的 1 号位武器 ID = 主武器 (Primary)
+	 * 真理源 = 大厅 UI BP1 的 SelectedWeaponID1
 	 */
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Loadout")
 	FString SelectedWeaponID1;
 
 	/**
-	 * 选中的 2 号位武器 ID
+	 * 【v52】选中的 2 号位武器 ID = 副武器 (Secondary)
+	 * 真理源 = 大厅 UI 的 TempSelectedWeaponsByType[Secondary] (运行期, 不存档)
 	 */
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Loadout")
 	FString SelectedWeaponID2;
+
+	/**
+	 * 【2026.07.18 P0】选中的 3 号位武器 ID (近战武器)
+	 *
+	 * 背景:
+	 *   旧 v23-v51: 大厅只有 2 把武器槽位 (SelectedWeaponID1/2)
+	 *   v52: 扩展为 3 槽位 (主/副/近战), 支持生化模式运行时切换
+	 *
+	 * 大厂原则 (单一真理源):
+	 *   - 3 个槽位都从大厅写入, 战斗 Spawn 时统一读出
+	 *   - RoomInsidePage 改造后, 每个背包都装 3 把武器, 玩家切背包时整个 Loadout 替换
+	 *
+	 * 零兜底 (v51 同原则):
+	 *   - 空字符串表示"未选", 拒绝用 NAME_None 当标志位
+	 *   - 大厅 UI 必须保证至少 1 把 (主或近战) 有值, 否则不允许开局
+	 *
+	 * 网络同步: Replicated (跟随 SelectedWeaponID1/2 自动同步)
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Loadout")
+	FString SelectedWeaponID3;
 
 private:
 	// ==========================================

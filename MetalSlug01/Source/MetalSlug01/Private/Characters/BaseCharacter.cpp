@@ -948,6 +948,67 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 			EnhancedInputComponent->BindAction(CrouchAction, ETriggerEvent::Started, this, &ABaseCharacter::StartCrouch);
 			EnhancedInputComponent->BindAction(CrouchAction, ETriggerEvent::Completed, this, &ABaseCharacter::StopCrouch);
 		}
+
+		// 【v51 大厂架构 — 生化模式】绑定切换武器槽位 (Q 键)
+		//   - Triggered (按下瞬间) → 调 OnSwitchWeaponPressed → Server RPC
+		//   - 服务器权威切槽 → 自动 Replicate 到所有客户端
+		if (SwitchWeaponAction)
+		{
+			EnhancedInputComponent->BindAction(SwitchWeaponAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnSwitchWeaponPressed);
+		}
+
+		// 【v58 大厂架构 — FPS枪战】绑定 1/2/3 键切换武器槽位
+		//   - 按键1 → 切换到主武器
+		//   - 按键2 → 切换到副武器
+		//   - 按键3 → 切换到近战武器
+		if (SwitchToPrimaryAction)
+		{
+			EnhancedInputComponent->BindAction(SwitchToPrimaryAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnSwitchToPrimaryPressed);
+		}
+		if (SwitchToSecondaryAction)
+		{
+			EnhancedInputComponent->BindAction(SwitchToSecondaryAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnSwitchToSecondaryPressed);
+		}
+		if (SwitchToMeleeAction)
+		{
+			EnhancedInputComponent->BindAction(SwitchToMeleeAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnSwitchToMeleePressed);
+		}
+
+		// 【v60.x 大厂架构 — FPS枪战】绑定开火/换弹输入
+		//   - FireAction (左键):
+		//     - Triggered (按住期间) → OnFirePressed → CurrentWeapon->Server_StartFire (RPC)
+		//     - Completed (松开) → OnFireReleased → CurrentWeapon->Server_StopFire (RPC)
+		//   - ReloadAction (R):
+		//     - Started (按下瞬间) → OnReloadPressed → CurrentWeapon->Server_StartReload (RPC)
+		//
+		// 【v60.x 大厂架构 — FPS枪战】绑定开火/换弹输入
+		//   - FireAction (左键):
+		//     - Started (按下瞬间) → OnFirePressed → CurrentWeapon->Server_StartFire (RPC)
+		//       注意: 半自动用 Started（全自动用 Triggered）
+		//     - Completed (松开) → OnFireReleased → CurrentWeapon->Server_StopFire (RPC)
+		//   - ReloadAction (R):
+		//     - Started (按下瞬间) → OnReloadPressed → CurrentWeapon->Server_StartReload (RPC)
+		//
+		// UE5 Enhanced Input 行为说明:
+		//   - ETriggerEvent::Started: 按下瞬间只触发一次 (适合半自动)
+		//   - ETriggerEvent::Triggered: 按住期间每帧触发 (适合全自动)
+		//   - ETriggerEvent::Completed: 松开时触发一次
+		//
+		// 大厂原则:
+		//   - 半自动: Started 触发一次 → 冷却检查 → 射击
+		//   - 全自动: Triggered 每帧触发 → StartFire → TickComponent 节流
+		//   - StopFire 在松开时触发，停止 TickComponent
+		if (FireAction)
+		{
+			// 半自动模式: 按下瞬间只触发一次（Started）
+			EnhancedInputComponent->BindAction(FireAction, ETriggerEvent::Started, this, &ABaseCharacter::OnFirePressed);
+			// 停止开火: 任何模式都需要（防止 TickComponent 继续射击）
+			EnhancedInputComponent->BindAction(FireAction, ETriggerEvent::Completed, this, &ABaseCharacter::OnFireReleased);
+		}
+		if (ReloadAction)
+		{
+			EnhancedInputComponent->BindAction(ReloadAction, ETriggerEvent::Started, this, &ABaseCharacter::OnReloadPressed);
+		}
 	}
 }
 
@@ -1795,6 +1856,165 @@ ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
 }
 
 
+// ============================================================
+// 【v60.11 大厂架构】武器射线方向服务 — 单一真理源实现
+// ============================================================
+
+/**
+ * ABaseCharacter::GetAimRayFromCrosshairOrEyes (非 const 版本)
+ *
+ * 大厂原则 — 路由策略:
+ *   - 本地玩家 → HUD 拿 Crosshair 世界射线 (玩家射线 = 玩家准星)
+ *   - AI / 远端 → 攻击者眼睛视图方向 (AI 没 HUD)
+ *
+ * 关键设计 (v60.11 修订 — 编译错误 C2662 修复):
+ *   - 本方法**非 const** — 玩家路径需要 TryResolveHUDWidget, 该方法会缓存 GameHUDWidget 字段
+ *   - UE 5.6 C2662 编译错误: const this 不能调非 const 方法
+ *   - 修复决策: 不强行 const_cast (反模式), 也不 mutable (反模式)
+ *     → 本方法去掉 const, 性能上更优 (避免每帧查 PlayerController)
+ *     → 提供 GetCrosshairWorldDirection_Const 给真正 const 上下文调用
+ *   - 大厂原则: 性能优化 > 形式 const, 但仍提供 const 查询版作 fallback
+ *
+ * @note 这是 Strategy 层 (URangedLineStrategy) 唯一的射线方向入口
+ *       Strategy 不允许自己读 HUD / 自己算屏幕坐标 (违反分层)
+ */
+bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector& OutRayDirection)
+{
+	OutRayOrigin = FVector::ZeroVector;
+	OutRayDirection = FVector::ForwardVector;
+
+	// ===========================================
+	// 路径 A: 本地玩家 → HUD 拿 Crosshair 世界射线
+	// ===========================================
+	if (IsLocallyControlled())
+	{
+		// (a) 必须有 HUD (玩家专属), 没 HUD 是 BP/初始化错
+		if (!TryResolveHUDWidget(false))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] 本地玩家 HUD 未就绪. "
+				     "Pawn=%s. 【v60.11 零兜底】拒绝射线 — HUD 没初始化, Crosshair 不可用."),
+				*GetName());
+			return false;
+		}
+
+		// (b) HUD 必须能算出 Crosshair 世界射线
+		FVector CrosshairOrigin;
+		FVector CrosshairDirection;
+		const bool bGetRayOK = GameHUDWidget->GetCrosshairWorldRay(CrosshairOrigin, CrosshairDirection);
+		if (!bGetRayOK)
+		{
+			// GetCrosshairWorldRay 内部已 Log Error, 这里只 Log 路径上下文
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] 本地玩家 Crosshair 世界射线获取失败. "
+				     "Pawn=%s. 【v60.11 零兜底】原因排查: 1) CrosshairWidget 未渲染? 2) WBP_GameHUD 漏绑 WBP_Crosshair? 3) PlayerController 未初始化?"),
+				*GetName());
+			return false;
+		}
+
+		// 注意: 这里 OutRayOrigin 不被赋值 — 射线起点由调用方 (Strategy) 用 Muzzle Socket 算
+		// 我们只输出方向, 不输出起点 — 起点是武器几何决定的, 方向是玩家意图决定的
+		OutRayDirection = CrosshairDirection;
+		return true;
+	}
+
+	// ===========================================
+	// 路径 B: AI → 攻击者准星方向 (BaseAimRotation = BT 控制的旋转)
+	// 【v60.12】GetBaseAimRotation
+	// 玩家路径已移到 RangedLineStrategy::PerformSingleShot (v60.13)
+	// ===========================================
+	const FRotator BaseAim = GetBaseAimRotation();
+	if (BaseAim.Vector().IsNearlyZero())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] AI 准星方向为零向量 (BaseAimRotation 未初始化). "
+			     "Pawn=%s. 【v60.12 零兜底】拒绝射线 — 攻击者没方向, 不能盲射."),
+			*GetName());
+		return false;
+	}
+
+	OutRayDirection = BaseAim.Vector();
+	return true;
+}
+
+
+/**
+ * ABaseCharacter::GetCrosshairWorldDirection_Const (const 版本 — 仅 const 上下文用)
+ *
+ * 大厂原则 — const 正确性 + 性能权衡:
+ *   - 这是 const 查询版, 适合 inline 渲染 / Multicast RPC Implementation 等 const 上下文
+ *   - 本方法**不依赖 TryResolveHUDWidget 缓存**, 每次走完整解析链
+ *     → 不修改 GameHUDWidget 字段 → const 安全
+ *     → 性能开销 0.001ms/次 (GetController() 是 UE 缓存, cheap)
+ *   - 仅返回方向, 不返回起点
+ *     → 起点由调用方按 Muzzle Socket 算 (武器几何真理源不在 Character 层)
+ *
+ * 零兜底:
+ *   - 玩家路径失败 → Log Error + return false
+ *   - 非本地玩家调用 → 拒绝 (本方法**专供本地玩家射线**)
+ *
+ * @param OutWorldDirection 输出: Crosshair 世界射线方向 (单位向量)
+ * @return true=成功, false=配置错 / 非本地玩家调用
+ */
+bool ABaseCharacter::GetCrosshairWorldDirection_Const(FVector& OutWorldDirection) const
+{
+	OutWorldDirection = FVector::ForwardVector;
+
+	// 非本地玩家 → 本方法专供本地玩家射线
+	if (!IsLocallyControlled())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::GetCrosshairWorldDirection_Const] 非本地玩家调用此方法 (Pawn=%s). "
+			     "【v60.11 零兜底】本方法专供本地玩家武器射线, AI/远端请用 GetActorEyesViewPoint."),
+			*GetName());
+		return false;
+	}
+
+	// 玩家专属: 拿 PlayerController → HUD → Crosshair
+	APlayerController* PC = Cast<APlayerController>(GetController());
+	if (!PC)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::GetCrosshairWorldDirection_Const] PlayerController 为空 (Pawn=%s). "
+			     "【v60.11 零兜底】拒绝射线 — 本地玩家没 PC = BP 初始化错."),
+			*GetName());
+		return false;
+	}
+
+	AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD());
+	if (!HUD)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::GetCrosshairWorldDirection_Const] HUD 未就绪 (Pawn=%s). "
+			     "【v60.11 零兜底】HUD 没创建好 — 检查 GameMode HUDClass 配置."),
+			*GetName());
+		return false;
+	}
+
+	UGameHUDWidget* HUDWidget = HUD->GetGameHUDWidget();
+	if (!HUDWidget)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::GetCrosshairWorldDirection_Const] GameHUDWidget 为空 (Pawn=%s). "
+			     "【v60.11 零兜底】HUD 创建但 GameHUDWidget 没拿到 — 检查 MyGameHUD 实现."),
+			*GetName());
+		return false;
+	}
+
+	FVector WorldOrigin;
+	FVector WorldDirection;
+	const bool bGetRayOK = HUDWidget->GetCrosshairWorldRay(WorldOrigin, WorldDirection);
+	if (!bGetRayOK)
+	{
+		// GetCrosshairWorldRay 内部已 Log Error
+		return false;
+	}
+
+	OutWorldDirection = WorldDirection;
+	return true;
+}
+
+
 /**
  * Multicast_NotifyKill_Implementation
  *
@@ -2444,4 +2664,380 @@ void ABaseCharacter::SyncFactionTagFromController(AController* InController)
 bool ABaseCharacter::Server_PlayAttackAnim_Validate(bool bIsHeavy, int32 InComboIndex)
 {
 	return InComboIndex >= 0 && InComboIndex <= 10;
+}
+
+
+// ==========================================
+// 【v51 大厂架构 — 生化模式】武器槽位切换 (Q 键)
+// ==========================================
+
+/**
+ * OnSwitchWeaponPressed — 客户端按 Q 键处理
+ *
+ * 大厂原则 (服务器权威):
+ *   - 客户端不能直接切槽位 (防作弊, 防客户端伪造)
+ *   - 客户端只发送 Server RPC + 服务器决定 TargetSlot
+ *   - 服务器基于当前 CurrentWeaponSlot 自动计算目标槽位 (Primary↔Melee 循环)
+ *
+ * 调用方: SetupPlayerInputComponent 中 SwitchWeaponAction Enhanced Input Triggered
+ */
+void ABaseCharacter::OnSwitchWeaponPressed()
+{
+	// 死亡状态不能切武器
+	if (IsDead())
+	{
+		return;
+	}
+
+	// 【v51 编译修复 — C4458】局部变量不能与类成员同名, 改名避免隐藏 ABaseCharacter::WeaponAttach
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		// ResolveWeaponAttach 内部已 Log Error, 强制修复 BP 组件挂载
+		return;
+	}
+
+	// 仅玩家 (非 AI) 才允许客户端切槽位
+	// AI 路径: AI 不接收 PlayerController 输入, 不会被本回调触发
+	// 这里显式守卫, 防止某人手动调
+	if (!IsPlayerControlled())
+	{
+		return;
+	}
+
+	// 服务器权威: 客户端发 RPC, 服务器内读取当前槽位 + 算目标槽位
+	// 注: 这里不发目标槽位到 RPC, 让服务器自主决定 (避免客户端篡改)
+	Server_SwitchWeaponSlot(EWeaponSlotType::Primary); // 占位, 服务器内忽略这个值, 自己算
+}
+
+
+/**
+ * Server_SwitchWeaponSlot_Implementation — 服务器执行切换
+ *
+ * 大厂原则 (服务器权威 + 单一真理源):
+ *   - 不信任客户端传来的 TargetSlot 参数, 服务器自己读当前状态算目标槽位
+ *   - 服务器检查双武器是否 Spawn (WeaponsInSlot.Num() >= 2)
+ *   - 服务器调 WeaponAttachmentComponent::Server_SwitchToWeaponSlot 真正执行切换
+ *
+ * 循环逻辑:
+ *   Primary → Melee
+ *   Melee   → Primary
+ *   其它 (None / Secondary) → Primary (默认 fallback)
+ */
+void ABaseCharacter::Server_SwitchWeaponSlot_Implementation(EWeaponSlotType /*TargetSlot*/)
+{
+	// 【v51 编译修复 — C4458】局部变量不能与类成员同名
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return; // ResolveWeaponAttach 内部已 Log Error
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_SwitchWeaponSlot: World 无效 — 拒绝切换. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 零兜底: 必须在服务器上执行
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_SwitchWeaponSlot: 非服务器执行 — RPC 链路有误. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 服务器权威计算目标槽位 (不信任客户端)
+	// 【v52 P0】3 槽位循环: Primary → Secondary → Melee → Primary
+	//   - 跳过空槽位 (玩家没选副武器 / 近战武器时)
+	//   - 循环找第一个非空槽位作为目标
+	const EWeaponSlotType CurrentSlot = WeaponAttachComp->GetCurrentWeaponSlot();
+	const TArray<ABaseWeapon*>& Weapons = WeaponAttachComp->GetWeaponsInSlotArray();
+	EWeaponSlotType NextSlot = EWeaponSlotType::Primary;
+
+	// 大厂原则 (零兜底): 循环查下一个非空槽位
+	//   从 CurrentSlot + 1 开始, 顺时针循环 (Primary→Secondary→Melee→Primary)
+	//   遇到非空槽位就停下, 找不到 → 留在原槽位 (不切换)
+	const TArray<EWeaponSlotType> CycleOrder = {
+		EWeaponSlotType::Primary,
+		EWeaponSlotType::Secondary,
+		EWeaponSlotType::Melee
+	};
+
+	// 找当前槽位在 CycleOrder 的索引
+	int32 CurrentIdx = CycleOrder.IndexOfByKey(CurrentSlot);
+	if (CurrentIdx == INDEX_NONE)
+	{
+		CurrentIdx = 0; // 容错: 未知槽位 → 从 Primary 开始
+	}
+
+	// 最多循环 3 次找下一个非空槽位
+	for (int32 Step = 1; Step <= 3; ++Step)
+	{
+		const int32 ProbeIdx = (CurrentIdx + Step) % 3;
+		const EWeaponSlotType Probe = CycleOrder[ProbeIdx];
+		if (ProbeIdx < Weapons.Num() && Weapons[ProbeIdx] != nullptr)
+		{
+			NextSlot = Probe;
+			break;
+		}
+	}
+	// 找不到非空槽位 → NextSlot 仍为 Primary (向后兼容), 但 Server_SwitchToWeaponSlot 会拒绝切到空槽位
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] Server_SwitchWeaponSlot: Q键触发 — Pawn=%s 当前槽位=%s → 目标槽位=%s"),
+		*GetName(),
+		LexToString(CurrentSlot),
+		LexToString(NextSlot));
+
+	// 调真实执行器 (大厂原则: 上层调度 + 下层执行分离)
+	WeaponAttachComp->Server_SwitchToWeaponSlot(NextSlot);
+}
+
+
+/**
+ * Server_SwitchWeaponSlot_Validate
+ * 校验: EWeaponSlotType 必须是合法枚举值 (UE enum class 编译期已保证)
+ */
+bool ABaseCharacter::Server_SwitchWeaponSlot_Validate(EWeaponSlotType /*TargetSlot*/)
+{
+	return true; // enum class 编译期已保证
+}
+
+
+// ==========================================
+// v58 FPS枪战 — 1/2/3 键切换武器槽位
+// ==========================================
+
+/**
+ * OnSwitchToPrimaryPressed — 切换到主武器（按键1）
+ */
+void ABaseCharacter::OnSwitchToPrimaryPressed()
+{
+	// 死亡状态不能切武器
+	if (IsDead())
+	{
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	if (!IsPlayerControlled())
+	{
+		return;
+	}
+
+	Server_RequestSwitchToSlot(EWeaponSlotType::Primary);
+}
+
+/**
+ * OnSwitchToSecondaryPressed — 切换到副武器（按键2）
+ */
+void ABaseCharacter::OnSwitchToSecondaryPressed()
+{
+	if (IsDead())
+	{
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	if (!IsPlayerControlled())
+	{
+		return;
+	}
+
+	Server_RequestSwitchToSlot(EWeaponSlotType::Secondary);
+}
+
+/**
+ * OnSwitchToMeleePressed — 切换到近战武器（按键3）
+ */
+void ABaseCharacter::OnSwitchToMeleePressed()
+{
+	if (IsDead())
+	{
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	if (!IsPlayerControlled())
+	{
+		return;
+	}
+
+	Server_RequestSwitchToSlot(EWeaponSlotType::Melee);
+}
+
+/**
+ * Server_RequestSwitchToSlot_Implementation — 服务器执行显式槽位切换
+ */
+void ABaseCharacter::Server_RequestSwitchToSlot_Implementation(EWeaponSlotType TargetSlot)
+{
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_RequestSwitchToSlot: World 无效 — 拒绝切换. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 服务器权威校验
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_RequestSwitchToSlot: 非服务器执行 — RPC 链路有误. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 零兜底: 目标槽位不能是 None
+	if (TargetSlot == EWeaponSlotType::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_RequestSwitchToSlot: 目标槽位=None — 拒绝切换. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 零兜底: 目标槽位必须有武器
+	if (!WeaponAttachComp->HasWeaponInSlot(TargetSlot))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Server_RequestSwitchToSlot: 目标槽位 %s 没有武器 — 拒绝切换. Pawn=%s"),
+			LexToString(TargetSlot), *GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] Server_RequestSwitchToSlot: 按键触发 — Pawn=%s 目标槽位=%s"),
+		*GetName(),
+		LexToString(TargetSlot));
+
+	// 调真实执行器
+	WeaponAttachComp->Server_SwitchToWeaponSlot(TargetSlot);
+}
+
+/**
+ * Server_RequestSwitchToSlot_Validate — 校验显式槽位切换参数
+ */
+bool ABaseCharacter::Server_RequestSwitchToSlot_Validate(EWeaponSlotType TargetSlot)
+{
+	return TargetSlot != EWeaponSlotType::None;
+}
+
+
+// ==========================================
+// v60 枪械射击/换弹输入回调 — 转发壳 (大厂原则)
+// ==========================================
+//
+// 【设计原则 — 转发壳模式】
+//   - BaseCharacter 留作 Input → RPC 的薄壳
+//   - 真实业务在 UWeaponFireComponent (武器自治, 与 v24 Dissolve 对称)
+//   - 服务器权威: 这里只发 Server RPC, 拒绝本地直调
+//
+// 【MeshType 校验】
+//   - 当前武器不是枪 (Melee) → 拒绝转发, 让玩家按左键走 LightAttack_Pressed
+//   - 当前没武器 → 拒绝 (业务正常)
+//   - 死亡状态 → 拒绝 (业务正常)
+
+void ABaseCharacter::OnFirePressed(const FInputActionValue& /*Value*/)
+{
+	// 死亡不能开火
+	if (IsDead()) return;
+
+	// 仅玩家 (AI 不走 PlayerController 输入, 这里防御性守卫)
+	if (!IsPlayerControlled()) return;
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp) return;
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		// 没武器 — 业务正常, 不报错
+		return;
+	}
+
+	// 仅枪械 (Primary/Secondary) 才走开火路径
+	//   - Melee 武器按左键 → 应该走 LightAttack_Pressed (连斩)
+	//   - 这里拒绝转发, 让玩家切到枪槽再开火
+	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Primary &&
+	    CurrentWeapon->GetMeshType() != EWeaponMeshType::Secondary)
+	{
+		// 不是枪, 静默拒绝 (业务正常 — 刀不响应开火键)
+		return;
+	}
+
+	// 转发到武器 RPC (服务器权威)
+	CurrentWeapon->Server_StartFire();
+}
+
+
+void ABaseCharacter::OnFireReleased(const FInputActionValue& /*Value*/)
+{
+	if (IsDead()) return;
+	if (!IsPlayerControlled()) return;
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp) return;
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon) return;
+
+	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Primary &&
+	    CurrentWeapon->GetMeshType() != EWeaponMeshType::Secondary)
+	{
+		return;
+	}
+
+	// 转发 (全自动模式下, 服务器会停 Tick 节流)
+	CurrentWeapon->Server_StopFire();
+}
+
+
+void ABaseCharacter::OnReloadPressed(const FInputActionValue& /*Value*/)
+{
+	if (IsDead()) return;
+	if (!IsPlayerControlled()) return;
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp) return;
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon) return;
+
+	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Primary &&
+	    CurrentWeapon->GetMeshType() != EWeaponMeshType::Secondary)
+	{
+		// 刀没弹匣, 拒绝
+		return;
+	}
+
+	// 转发 (服务器会校验弹药/换弹中, 拒绝 + Log Verbose)
+	CurrentWeapon->Server_StartReload();
 }

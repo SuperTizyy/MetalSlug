@@ -130,8 +130,10 @@ bool URoomInsidePage::Initialize()
 	// 绑定确认更换武器按钮点击事件
 	if (Btn_ConfirmWeaponChange){Btn_ConfirmWeaponChange->OnClicked.AddDynamic(this, &URoomInsidePage::OnConfirmWeaponChangeClicked);}
 
-	// 绑定打开武器选择弹窗按钮点击事件
-	if (Btn_ChangeWeapon){Btn_ChangeWeapon->OnClicked.AddDynamic(this, &URoomInsidePage::OnChangeWeaponClicked);}
+	// 【v52 P0 拆 3 个回调】绑定 3 个"换枪按钮" — 主/副/近战
+	if (Btn_ChangePrimaryWeapon){Btn_ChangePrimaryWeapon->OnClicked.AddDynamic(this, &URoomInsidePage::OnChangePrimaryWeaponClicked);}
+	if (Btn_ChangeSecondaryWeapon){Btn_ChangeSecondaryWeapon->OnClicked.AddDynamic(this, &URoomInsidePage::OnChangeSecondaryWeaponClicked);}
+	if (Btn_ChangeMeleeWeapon){Btn_ChangeMeleeWeapon->OnClicked.AddDynamic(this, &URoomInsidePage::OnChangeMeleeWeaponClicked);}
 
 	// 绑定背包 1 切换按钮点击事件
 	if (Btn_Inventory1) Btn_Inventory1->OnClicked.AddDynamic(this, &URoomInsidePage::OnInventory1Clicked);
@@ -302,32 +304,34 @@ void URoomInsidePage::NativeConstruct()
 				AccountSub->SaveLastSelectedCharacter(CharIDToSync);
 			}
 
-			// 初始化武器配置，确保每个背包槽位都有默认武器
+			// 初始化武器配置 — 【v52 P0】每个背包只需要保存 1 把主武器到存档
+			//   副武器 / 近战武器存在 TempSelectedWeaponsByType 中, 不持久化 (Q8=C 决策)
 			if (WeaponDataTable && AccountSub)
 			{
 				TArray<FName> WeaponRows = WeaponDataTable->GetRowNames();
 				FString DefaultWeapon = TEXT("");
 				if (WeaponRows.Num() > 0) DefaultWeapon = WeaponRows[0].ToString();
 
-				// 为两个背包槽位设置默认武器
+				// 为两个背包槽位设置默认主武器 (向后兼容旧存档结构: 2 个 BackpackSlot 各存 1 把)
 				for (int32 WSlot = 1; WSlot <= 2; WSlot++)
 				{
 					FString SavedWeapon = AccountSub->GetLastSelectedWeapon(WSlot);
 					if (SavedWeapon.IsEmpty())
 					{
-						// 如果该槽位没有保存的武器，使用默认武器
 						AccountSub->SaveLastSelectedWeapon(WSlot, DefaultWeapon);
-						UE_LOG(LogTemp, Warning, TEXT("[Room] Init weapon slot %d -> '%s'"), WSlot, *DefaultWeapon);
+						UE_LOG(LogTemp, Warning, TEXT("[Room] Init BP%d 主武器 -> '%s'"), WSlot, *DefaultWeapon);
 					}
 				}
 			}
 
 			// 向服务器同步当前的装备配置
+			// 【v52 P0】3 把武器一起发: 主武器(存档) + 副武器(运行时空) + 近战武器(运行时空)
 			if (ARoomPlayerController* PC2 = Cast<ARoomPlayerController>(GetOwningPlayer()))
 			{
 				FString W1 = AccountSub ? AccountSub->GetLastSelectedWeapon(1) : TEXT("");
 				FString W2 = AccountSub ? AccountSub->GetLastSelectedWeapon(2) : TEXT("");
-				PC2->Server_SelectLoadout(CharIDToSync, W1, W2);
+				// 【v52 P0 3 槽位】主武器 = W1 (BP1 主武器), 副/近战 默认空 (玩家可后续点击换枪按钮选)
+				PC2->Server_SelectLoadout(CharIDToSync, W1, TEXT(""), TEXT(""));
 			}
 
 			// 绑定角色选择变化事件
@@ -343,7 +347,8 @@ void URoomInsidePage::NativeConstruct()
 
 	// 默认激活背包槽位 1
 	ActiveBackpackSlot = 1;
-	UpdateWeaponDisplayImage(ActiveBackpackSlot);
+	// 【v52 P0】刷新所有 3 个武器图标 (主+副+近战)
+	RefreshAllWeaponDisplayImages();
 
 	// 更新背包高亮指示器
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
@@ -778,32 +783,52 @@ void URoomInsidePage::OnHideWeaponOverlayClicked()
 
 /**
  * OnConfirmWeaponChangeClicked
+ * 确认玩家在弹窗里点选的武器
  *
- * 确认更换武器
- * 1. 校验 TempSelectedWeaponRow
- * 2. 保存到 AccountSubsystem
- * 3. 调用 UpdateWeaponDisplayImage 刷新主界面图标
- * 4. 调用 SyncLoadoutToServer 同步服务器
- * 5. 关闭弹窗
+ * 【v52 P0 改造 — 按武器类型分发】
+ * 1. 从 TempSelectedWeaponsByType[ActiveWeaponType] 读临时选择
+ * 2. 校验非空
+ * 3. 主武器 → 写存档 (向后兼容 BackpackSlot × Primary)
+ *    副武器 / 近战武器 → 仅写运行时 TMap, 不持久化 (Q8=C)
+ * 4. 刷新对应 Image 控件
+ * 5. 调用 SyncLoadoutToServer 同步服务器 (3 把武器一起发)
+ * 6. 关闭弹窗
  */
 void URoomInsidePage::OnConfirmWeaponChangeClicked()
 {
-	if (!TempSelectedWeaponRow.IsNone())
+	const FName* SelectedRowPtr = TempSelectedWeaponsByType.Find(ActiveWeaponType);
+	if (!SelectedRowPtr || SelectedRowPtr->IsNone())
 	{
-		// 保存选择的武器到 AccountSubsystem
-		if (UGameInstance* GI = GetGameInstance())
+		UE_LOG(LogTemp, Warning, TEXT("[Room] OnConfirmWeaponChangeClicked: TempSelectedWeaponsByType[%d] 为空, 跳过"),
+			static_cast<int32>(ActiveWeaponType));
+	}
+	else
+	{
+		const FName SelectedRow = *SelectedRowPtr;
+		UGameInstance* GI = GetGameInstance();
+		UAccountService* AccountSub = GI ? UAccountService::Get(this) : nullptr;
+
+		// 【v52 P0】主武器 (Primary) 走存档路径 — 向后兼容旧 BackpackSlot × 1 武器结构
+		// 副武器 (Secondary) / 近战 (Melee) 走运行期 TMap, 不写存档 (Q8=C 决策)
+		if (ActiveWeaponType == EWeaponMeshType::Primary)
 		{
-			if (UAccountService* AccountSub = UAccountService::Get(this))
+			if (AccountSub)
 			{
-				AccountSub->SaveLastSelectedWeapon(ActiveBackpackSlot, TempSelectedWeaponRow.ToString());
+				AccountSub->SaveLastSelectedWeapon(ActiveBackpackSlot, SelectedRow.ToString());
 			}
 		}
-		// 更新主界面武器显示
-		UpdateWeaponDisplayImage(ActiveBackpackSlot);
+		// 副武器 / 近战武器: 不写存档, 仅运行时态
 
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green, FString::Printf(TEXT("背包 %d 已装备武器: %s"), ActiveBackpackSlot, *TempSelectedWeaponRow.ToString()));
+		// 刷新对应 Image 控件
+		UpdateWeaponDisplayImage(ActiveWeaponType);
 
-		// 同步装备配置到服务器
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.f, FColor::Green,
+			FString::Printf(TEXT("背包 %d 已装备%s: %s"),
+				ActiveBackpackSlot,
+				*UEnum::GetValueAsString(ActiveWeaponType),
+				*SelectedRow.ToString()));
+
+		// 同步装备配置到服务器 (3 把武器一起发)
 		SyncLoadoutToServer();
 	}
 
@@ -816,46 +841,123 @@ void URoomInsidePage::OnConfirmWeaponChangeClicked()
 
 
 /**
- * OnChangeWeaponClicked
+ * 【v52 P0 改造】打开武器选择弹窗 — 提取公共逻辑
  *
- * 打开武器选择弹窗
- * 1. 从 AccountSubsystem 读取当前背包槽位的武器
- * 2. 设置武器预览图
- * 3. 显示弹窗
- * 4. 调用 PopulateWeaponGrid 生成网格
+ * 业务流程:
+ *   1. 设置 ActiveWeaponType (调用方传参)
+ *   2. 从对应数据源读取当前选择
+ *      - Primary: AccountSubsystem.GetLastSelectedWeapon(ActiveBackpackSlot) (存档路径)
+ *      - Secondary / Melee: TempSelectedWeaponsByType[T] (运行时路径)
+ *   3. 如果没选, 用 DT_WeaponInfo 第一个 Primary 类型武器作默认 (避免空值)
+ *   4. 设置武器预览图
+ *   5. 显示弹窗 + PopulateWeaponGrid (按 ActiveWeaponType 过滤)
  */
-void URoomInsidePage::OnChangeWeaponClicked()
+void URoomInsidePage::OpenWeaponSelectDialog(EWeaponMeshType WeaponType)
 {
-	// 从 AccountSubsystem 中读取当前背包槽位的武器
-	if (UGameInstance* GI = GetGameInstance())
+	// 1. 标记当前操作类型
+	ActiveWeaponType = WeaponType;
+
+	// 2. 读当前选择
+	FName LoadedRow;
+	if (WeaponType == EWeaponMeshType::Primary)
 	{
-		if (UAccountService* AccountSub = UAccountService::Get(this))
+		// Primary 走存档
+		if (UGameInstance* GI = GetGameInstance())
 		{
-			FString SavedWeapon = AccountSub->GetLastSelectedWeapon(ActiveBackpackSlot);
-			TempSelectedWeaponRow = FName(*SavedWeapon);
+			if (UAccountService* AccountSub = UAccountService::Get(this))
+			{
+				FString SavedWeapon = AccountSub->GetLastSelectedWeapon(ActiveBackpackSlot);
+				LoadedRow = FName(*SavedWeapon);
+			}
+		}
+	}
+	else
+	{
+		// Secondary / Melee 走运行时 TMap
+		if (const FName* Found = TempSelectedWeaponsByType.Find(WeaponType))
+		{
+			LoadedRow = *Found;
 		}
 	}
 
-	// 如果没有临时选择的武器，使用第一个武器作为默认值
-	if (TempSelectedWeaponRow.IsNone() && WeaponDataTable)
+	// 3. 没选过 → 找 DT 里第一个匹配类型武器作默认 (零兜底: 弹窗不为空)
+	if (LoadedRow.IsNone() && WeaponDataTable)
 	{
 		TArray<FName> RowNames = WeaponDataTable->GetRowNames();
-		if (RowNames.Num() > 0) TempSelectedWeaponRow = RowNames[0];
-	}
-
-	// 设置武器预览图
-	if (!TempSelectedWeaponRow.IsNone() && WeaponDataTable && Image_WeaponPreview)
-	{
-		FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(TempSelectedWeaponRow, TEXT("InitPreview"));
-		if (WeaponData && WeaponData->WeaponIcon)
+		for (const FName& RowName : RowNames)
 		{
-			Image_WeaponPreview->SetBrushFromTexture(WeaponData->WeaponIcon);
+			if (const FWeaponInfo* Row = WeaponDataTable->FindRow<FWeaponInfo>(RowName, TEXT("DefaultWeaponPicker")))
+			{
+				if (Row->MeshType == WeaponType)
+				{
+					LoadedRow = RowName;
+					break;
+				}
+			}
+		}
+		// 真没有匹配类型 (策划没配) → 拿第一个凑数, 但要警告
+		if (LoadedRow.IsNone() && RowNames.Num() > 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[Room] OpenWeaponSelectDialog: DT_WeaponInfo 中没有任何 MeshType=%d 的武器, 用第 1 个凑数. "
+				"【零兜底】请在 DT_WeaponInfo 里给武器行标 MeshType 字段"),
+				static_cast<int32>(WeaponType));
+			LoadedRow = RowNames[0];
 		}
 	}
 
-	// 显示武器选择弹窗并生成武器网格
+	// 写入 TMap 临时选择
+	TempSelectedWeaponsByType.FindOrAdd(WeaponType) = LoadedRow;
+
+	// 4. 设置预览图
+	if (!LoadedRow.IsNone() && WeaponDataTable && Image_WeaponPreview)
+	{
+		if (FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(LoadedRow, TEXT("InitPreview")))
+		{
+			if (WeaponData->WeaponIcon)
+			{
+				Image_WeaponPreview->SetBrushFromTexture(WeaponData->WeaponIcon);
+			}
+		}
+	}
+
+	// 5. 显示弹窗 + 按类型过滤的武器网格
 	if (Overlay_WeaponSelect) Overlay_WeaponSelect->SetVisibility(ESlateVisibility::Visible);
-	PopulateWeaponGrid();
+	PopulateWeaponGrid(WeaponType);
+}
+
+
+/**
+ * OnChangePrimaryWeaponClicked — 主武器换枪按钮
+ *
+ * 大厂原则 (职责对等):
+ *   - 玩家点 Btn_ChangePrimaryWeapon → 调本回调
+ *   - 弹窗只列出 EWeaponMeshType::Primary 的武器 (PopulateWeaponGrid 内过滤)
+ */
+void URoomInsidePage::OnChangePrimaryWeaponClicked()
+{
+	OpenWeaponSelectDialog(EWeaponMeshType::Primary);
+}
+
+
+/**
+ * OnChangeSecondaryWeaponClicked — 副武器换枪按钮
+ *
+ * 弹窗只列 Secondary 武器
+ */
+void URoomInsidePage::OnChangeSecondaryWeaponClicked()
+{
+	OpenWeaponSelectDialog(EWeaponMeshType::Secondary);
+}
+
+
+/**
+ * OnChangeMeleeWeaponClicked — 近战武器换枪按钮 (原 OnChangeWeaponClicked 重命名)
+ *
+ * 弹窗只列 Melee 武器
+ */
+void URoomInsidePage::OnChangeMeleeWeaponClicked()
+{
+	OpenWeaponSelectDialog(EWeaponMeshType::Melee);
 }
 
 
@@ -868,14 +970,14 @@ void URoomInsidePage::OnChangeWeaponClicked()
  *
  * 切换到背包 1
  * 1. 设置 ActiveBackpackSlot = 1
- * 2. 更新武器显示
+ * 2. 刷新所有 3 个武器图标 (主+副+近战) — 【v52 P0】从单图改为多图
  * 3. 更新高亮指示器
  */
 void URoomInsidePage::OnInventory1Clicked()
 {
 	ActiveBackpackSlot = 1;
 	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至: 背包 1"));
-	UpdateWeaponDisplayImage(ActiveBackpackSlot);
+	RefreshAllWeaponDisplayImages();
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
 }
 
@@ -884,13 +986,14 @@ void URoomInsidePage::OnInventory1Clicked()
  * OnInventory2Clicked
  *
  * 切换到背包 2
+ * 【v52 P0】切背包时整个 Loadout (主+副+近战) 整套替换显示
  */
 void URoomInsidePage::OnInventory2Clicked()
 {
 	ActiveBackpackSlot = 2;
 	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Cyan, TEXT("当前切换至: 背包 2"));
 
-	UpdateWeaponDisplayImage(ActiveBackpackSlot);
+	RefreshAllWeaponDisplayImages();
 	UpdateInventoryHighlightUI(ActiveBackpackSlot);
 }
 
@@ -903,13 +1006,18 @@ void URoomInsidePage::OnInventory2Clicked()
  * PopulateWeaponGrid
  *
  * 根据 WeaponDataTable 动态生成武器选择网格
+ *
+ * 【v52 P0 改造 — 按武器类型过滤】
+ *   - FilterType = Primary / Secondary / Melee: 只列出该类型武器
+ *   - FilterType = None (默认): 列出所有武器 (向后兼容)
+ *
  * 1. 清空现有网格
- * 2. 遍历所有武器，创建 UWeaponIconWidget
+ * 2. 遍历所有武器 (按 FilterType 过滤), 创建 UWeaponIconWidget
  * 3. 调用 SetupWeaponItem 设置信息
- * 4. 设置高亮（已选中的）
+ * 4. 设置高亮 (已选中的)
  * 5. 计算网格位置并 AddChildToUniformGrid
  */
-void URoomInsidePage::PopulateWeaponGrid()
+void URoomInsidePage::PopulateWeaponGrid(EWeaponMeshType FilterType)
 {
 	if (!WeaponDataTable || !WeaponItemClass || !Grid_WeaponItems) return;
 
@@ -922,31 +1030,52 @@ void URoomInsidePage::PopulateWeaponGrid()
 	int32 MaxColumns = 4; // 每行最多 4 个武器
 	int32 CurrentIndex = 0;
 
-	// 遍历所有武器，创建对应的图标 Widget
+	// 当前选中的武器 (按类型从 TMap 读)
+	const FName CurrentSelected = TempSelectedWeaponsByType.Contains(ActiveWeaponType)
+		? TempSelectedWeaponsByType[ActiveWeaponType]
+		: NAME_None;
+
+	// 遍历所有武器, 按 FilterType 过滤
 	for (const FName& RowName : RowNames)
 	{
 		FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(RowName, ContextString);
-		if (WeaponData)
+		if (!WeaponData)
 		{
-			UWeaponIconWidget* NewItem = CreateWidget<UWeaponIconWidget>(this, WeaponItemClass);
-			if (NewItem)
-			{
-				// 设置武器信息并绑定点击事件
-				NewItem->SetupWeaponItem(RowName, *WeaponData, this);
-
-				// 检查是否为当前选中的武器，如果是则高亮显示
-				bool bIsEquippedWeapon = (RowName == TempSelectedWeaponRow);
-				NewItem->SetHighlightFrameVisibility(bIsEquippedWeapon);
-
-				// 计算网格位置
-				int32 Row = CurrentIndex / MaxColumns;
-				int32 Col = CurrentIndex % MaxColumns;
-
-				UUniformGridSlot* GridSlot = Grid_WeaponItems->AddChildToUniformGrid(NewItem, Row, Col);
-
-				CurrentIndex++;
-			}
+			continue;
 		}
+
+		// 【v52 P0】按武器类型过滤 (大厂原则 — 弹窗内只列匹配类型武器)
+		if (FilterType != EWeaponMeshType::None && WeaponData->MeshType != FilterType)
+		{
+			continue; // 类型不匹配, 跳过
+		}
+
+		UWeaponIconWidget* NewItem = CreateWidget<UWeaponIconWidget>(this, WeaponItemClass);
+		if (NewItem)
+		{
+			// 设置武器信息并绑定点击事件
+			NewItem->SetupWeaponItem(RowName, *WeaponData, this);
+
+			// 检查是否为当前选中的武器, 如果是则高亮显示
+			bool bIsEquippedWeapon = (RowName == CurrentSelected);
+			NewItem->SetHighlightFrameVisibility(bIsEquippedWeapon);
+
+			// 计算网格位置
+			int32 Row = CurrentIndex / MaxColumns;
+			int32 Col = CurrentIndex % MaxColumns;
+
+			UUniformGridSlot* GridSlot = Grid_WeaponItems->AddChildToUniformGrid(NewItem, Row, Col);
+
+			CurrentIndex++;
+		}
+	}
+
+	// 零兜底 (v52): 过滤后没有武器显示 → 提示策划
+	if (CurrentIndex == 0 && FilterType != EWeaponMeshType::None)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Room] PopulateWeaponGrid: DT_WeaponInfo 中没有 MeshType=%d 的武器, 弹窗为空. "
+			"【修复】在 DT_WeaponInfo 给武器行打 MeshType 标签"),
+			static_cast<int32>(FilterType));
 	}
 }
 
@@ -955,14 +1084,14 @@ void URoomInsidePage::PopulateWeaponGrid()
  * OnWeaponItemSelectedInGrid
  *
  * 武器网格中被选中时调用
- * 1. 更新 TempSelectedWeaponRow
+ * 1. 更新 TempSelectedWeaponsByType[ActiveWeaponType]
  * 2. 更新武器预览图
  * 3. 刷新所有武器图标的高亮状态
  */
 void URoomInsidePage::OnWeaponItemSelectedInGrid(FName WeaponRowName)
 {
-	// 更新临时选择的武器
-	TempSelectedWeaponRow = WeaponRowName;
+	// 【v52 P0】按类型写入临时选择 TMap (替代旧单变量 TempSelectedWeaponRow)
+	TempSelectedWeaponsByType.FindOrAdd(ActiveWeaponType) = WeaponRowName;
 
 	// 更新武器预览图
 	if (WeaponDataTable)
@@ -983,7 +1112,7 @@ void URoomInsidePage::OnWeaponItemSelectedInGrid(FName WeaponRowName)
 		{
 			if (UWeaponIconWidget* IconWidget = Cast<UWeaponIconWidget>(ChildWidget))
 			{
-				bool bShouldHighlight = (IconWidget->GetWeaponRowName() == TempSelectedWeaponRow);
+				bool bShouldHighlight = (IconWidget->GetWeaponRowName() == WeaponRowName);
 				IconWidget->SetHighlightFrameVisibility(bShouldHighlight);
 			}
 		}
@@ -998,45 +1127,105 @@ void URoomInsidePage::OnWeaponItemSelectedInGrid(FName WeaponRowName)
 /**
  * UpdateWeaponDisplayImage
  *
- * 根据指定背包槽位的武器配置更新显示的武器图标
- * 1. 从 AccountSubsystem 读取武器
- * 2. 从 WeaponDataTable 查找 FWeaponInfo
- * 3. 设置 Image_WeaponDisplay 的画刷
+/**
+ * UpdateWeaponDisplayImage
+ *
+ * 【v52 P0 改造】根据指定武器类型刷新对应的 Image 控件
+ *
+ * 旧 v51 签名: UpdateWeaponDisplayImage(int32 BackpackSlot)
+ *   - 单一 Image_WeaponDisplay 显示"当前背包槽的武器"
+ *   - 不区分武器类型
+ *
+ * 新 v52 签名: UpdateWeaponDisplayImage(EWeaponMeshType WeaponType)
+ *   - 3 个 Image (主/副/近战) 各管各的
+ *   - 数据源: Primary → 存档, Secondary/Melee → TempSelectedWeaponsByType
+ *
+ * @param WeaponType 主/副/近战
  */
-void URoomInsidePage::UpdateWeaponDisplayImage(int32 BackpackSlot)
+void URoomInsidePage::UpdateWeaponDisplayImage(EWeaponMeshType WeaponType)
 {
-	if (!Image_WeaponDisplay || !WeaponDataTable) return;
+	if (!WeaponDataTable) return;
 
-	FString SavedWeaponRow = TEXT("");
-
-	// 从 AccountSubsystem 中读取保存的武器
-	if (UGameInstance* GI = GetGameInstance())
+	// 选对应的 Image 控件 (大厂原则 — 职责对等)
+	UImage* TargetImage = nullptr;
+	switch (WeaponType)
 	{
-		if (UAccountService* AccountSub = UAccountService::Get(this))
+	case EWeaponMeshType::Primary:   TargetImage = Image_PrimaryWeaponIcon;   break;
+	case EWeaponMeshType::Secondary: TargetImage = Image_SecondaryWeaponIcon; break;
+	case EWeaponMeshType::Melee:     TargetImage = Image_MeleeWeaponIcon;     break;
+	default: return; // EWeaponMeshType::None — 跳过
+	}
+	if (!TargetImage) return;
+
+	// 1. 读取对应武器 ID
+	FString WeaponRowStr = TEXT("");
+	if (WeaponType == EWeaponMeshType::Primary)
+	{
+		// Primary 走存档路径 (Q5/Q8 = 向后兼容旧 BackpackSlot 索引)
+		if (UGameInstance* GI = GetGameInstance())
 		{
-			SavedWeaponRow = AccountSub->GetLastSelectedWeapon(BackpackSlot);
+			if (UAccountService* AccountSub = UAccountService::Get(this))
+			{
+				WeaponRowStr = AccountSub->GetLastSelectedWeapon(ActiveBackpackSlot);
+			}
+		}
+	}
+	else
+	{
+		// Secondary / Melee 走运行时 TMap
+		if (const FName* Found = TempSelectedWeaponsByType.Find(WeaponType))
+		{
+			WeaponRowStr = Found->ToString();
 		}
 	}
 
-	// 如果没有保存的武器，使用第一个武器作为默认值
-	if (SavedWeaponRow.IsEmpty())
+	// 2. 没选 → 找 DT 里第一个匹配类型武器作默认 (零兜底: 图标不能空)
+	if (WeaponRowStr.IsEmpty())
 	{
 		TArray<FName> RowNames = WeaponDataTable->GetRowNames();
-		if (RowNames.Num() > 0)
+		for (const FName& RowName : RowNames)
 		{
-			SavedWeaponRow = RowNames[0].ToString();
+			if (const FWeaponInfo* Row = WeaponDataTable->FindRow<FWeaponInfo>(RowName, TEXT("DefaultWeaponFallback")))
+			{
+				if (Row->MeshType == WeaponType)
+				{
+					WeaponRowStr = RowName.ToString();
+					break;
+				}
+			}
 		}
 	}
 
-	// 查找武器数据并更新显示
-	if (!SavedWeaponRow.IsEmpty())
+	// 3. 查表 + 设置 Image 画刷
+	if (!WeaponRowStr.IsEmpty())
 	{
-		FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(FName(*SavedWeaponRow), TEXT("UpdateWeaponDisplay"));
-		if (WeaponData && WeaponData->WeaponIcon)
+		if (const FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponRowStr), TEXT("UpdateWeaponDisplay")))
 		{
-			Image_WeaponDisplay->SetBrushFromTexture(WeaponData->WeaponIcon);
+			if (WeaponData->WeaponIcon)
+			{
+				TargetImage->SetBrushFromTexture(WeaponData->WeaponIcon);
+				return;
+			}
 		}
+		// 零兜底: DT 查不到 → Log Warning (策划没配武器行) — 不清空 Image, 保留上次状态
+		UE_LOG(LogTemp, Warning, TEXT("[Room] UpdateWeaponDisplayImage: DT_WeaponInfo 找不到 WeaponRow='%s' (Type=%d). "
+			"【零兜底】请检查 DT 配置"),
+			*WeaponRowStr, static_cast<int32>(WeaponType));
 	}
+}
+
+
+/**
+ * RefreshAllWeaponDisplayImages
+ *
+ * 【v52 P0】一次刷新 3 个 Image 控件 (主+副+近战)
+ * 用途: 切背包 / 初始化时调用, 避免 3 次单独调
+ */
+void URoomInsidePage::RefreshAllWeaponDisplayImages()
+{
+	UpdateWeaponDisplayImage(EWeaponMeshType::Primary);
+	UpdateWeaponDisplayImage(EWeaponMeshType::Secondary);
+	UpdateWeaponDisplayImage(EWeaponMeshType::Melee);
 }
 
 
@@ -1912,17 +2101,29 @@ void URoomInsidePage::SyncLoadoutToServer()
 			// 获取当前选择的角色 ID
 			FString CurrentCharID = (SelectedIndex != INDEX_NONE) ? CachedCharacterIDs[SelectedIndex].ToString() : TEXT("Default");
 
-			// 获取两个背包槽位的武器
-			FString CurrentWeapon1 = AccountSub->GetLastSelectedWeapon(1);
-			FString CurrentWeapon2 = AccountSub->GetLastSelectedWeapon(2);
+			// 【v52 P0】3 把武器:
+			//   - W1 (主武器): 来自存档 BP1 的 LastSelectedWeapon[1] — 向后兼容旧存档
+			//   - W2 (副武器): 来自运行时 TempSelectedWeaponsByType[Secondary]
+			//   - W3 (近战武器): 来自运行时 TempSelectedWeaponsByType[Melee]
+			FString CurrentWeapon1 = AccountSub->GetLastSelectedWeapon(1); // 主武器 (BP1 存档)
+			FString CurrentWeapon2 = TEXT("");
+			FString CurrentWeapon3 = TEXT("");
+			if (const FName* SecondaryRow = TempSelectedWeaponsByType.Find(EWeaponMeshType::Secondary))
+			{
+				CurrentWeapon2 = SecondaryRow->ToString();
+			}
+			if (const FName* MeleeRow = TempSelectedWeaponsByType.Find(EWeaponMeshType::Melee))
+			{
+				CurrentWeapon3 = MeleeRow->ToString();
+			}
 
-			// 向服务器发送装备配置（通过 RoomService 抽象）
+			// 向服务器发送装备配置 (3 把武器一起发, 通过 RoomService 抽象)
 			if (URoomService* RoomService = URoomService::Get(this))
 			{
-				RoomService->RequestSelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
+				RoomService->RequestSelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2, CurrentWeapon3);
 			}
 			// 【架构升级】原 PC->Server_SelectLoadout(...) 调用改走 RoomService
-			// PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2);
+			// PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2, CurrentWeapon3);
 		}
 	}
 }

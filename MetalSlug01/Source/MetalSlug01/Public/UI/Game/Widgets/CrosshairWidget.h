@@ -65,4 +65,24 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Crosshair")
 	void UpdateCrosshairStyle(int32 WeaponType);
+
+	// ==========================================
+	// 3. v60.11 射线服务 — 武器射线检测用
+	// ==========================================
+
+	/**
+	 * GetCenterScreenPosition — 准星中心点的**绝对屏幕坐标**
+	 *
+	 * 大厂原则 (v60.11 新增 — 单一真理源):
+	 *   - 武器射线需要"朝向准星"射出, 必须知道准星在屏幕上的绝对坐标
+	 *   - 准星可能在屏幕任意位置 (玩家自定义 / 武器不同), 不能假设 = 视口中心
+	 *   - GetCachedGeometry().LocalToAbsolute(GetLocalSize()/2) 计算当前渲染的中心点
+	 *
+	 * @return 绝对屏幕坐标 (像素, 左上角原点) — 用 PlayerController->DeprojectScreenPositionToWorld 转世界射线
+	 *
+	 * @note 必须 GetCachedGeometry().GetLocalSize() > 0 (即 widget 至少渲染过一帧)
+	 *       否则返回 ZeroVector — 调用方需自行校验
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Crosshair")
+	FVector2D GetCenterScreenPosition() const;
 };

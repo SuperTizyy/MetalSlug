@@ -158,12 +158,16 @@ public:
 
 	/**
 	 * 玩家向服务器发送选中的角色和武器（用于加载存档偏好）
-	 * @param CharacterRowName 角色 DataTable 行名
-	 * @param Weapon1RowName 武器1 DataTable 行名
-	 * @param Weapon2RowName 武器2 DataTable 行名
+	 *
+	 * 【v52 P0】槽位扩展: 从 2 把武器 (主+近战) 扩到 3 把 (主+副+近战)
+	 *
+	 * @param CharacterRowName      角色 DataTable 行名
+	 * @param WeaponPrimaryRowName  主武器 (Slot 1) DataTable 行名
+	 * @param WeaponSecondaryRowName 副武器 (Slot 2) DataTable 行名
+	 * @param WeaponMeleeRowName    近战武器 (Slot 3) DataTable 行名
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
-	void Server_SelectLoadout(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName);
+	void Server_SelectLoadout(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);
 
 	/**
 	 * 玩家请求切换队伍（攻/守）

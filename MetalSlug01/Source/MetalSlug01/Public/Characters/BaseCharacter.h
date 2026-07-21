@@ -101,6 +101,9 @@ class UAIBehaviorConfigSO;
 class ABaseAIController;
 class ARoomPlayerState;
 
+// 【v51 大厂架构 — 生化模式】武器槽位类型前置声明 (完整定义见 Weapons/WeaponSlotType.h)
+enum class EWeaponSlotType : uint8;
+
 // 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
 #include "GenericTeamAgentInterface.h"
 
@@ -690,6 +693,80 @@ protected:
 	UFUNCTION(Client, Reliable)
 	void Client_UpdateEnergyDisplay(float Current, float Max);
 
+	/**
+	 * 【v51 大厂架构 — 生化模式】服务器权威切武器槽位 (Server RPC)
+	 *
+	 * 调用方:
+	 *   - Q 键输入 → OnSwitchWeaponPressed → 本 RPC → 服务器执行
+	 *   - 自动在 Primary ↔ Melee 之间循环切换
+	 *
+	 * 大厂原则 (服务器权威 + 单一真理源):
+	 *   - 客户端不能直接切槽位 (防作弊)
+	 *   - 服务器调 WeaponAttachmentComponent::Server_SwitchToWeaponSlot
+	 *   - 切换完成后 UE 自动同步 CurrentWeaponSlot (Replicated) + OnRep 客户端
+	 *
+	 * @param TargetSlot 目标槽位 (Primary / Melee)
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_SwitchWeaponSlot(EWeaponSlotType TargetSlot);
+
+	/**
+	 * 【v51 大厂架构 — 生化模式】客户端处理 Q 键切换武器槽位
+	 *
+	 * 调用方: SetupPlayerInputComponent 绑定 SwitchWeaponAction → Enhanced Input Triggered → 本回调
+	 *
+	 * 行为:
+	 *   - 调 Server_SwitchWeaponSlot RPC (服务器权威)
+	 *   - 服务器基于当前槽位自动计算目标槽位 (Primary↔Melee 循环)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void OnSwitchWeaponPressed();
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】客户端切换到主武器（按键1）
+	 *
+	 * 调用方: SetupPlayerInputComponent 绑定 SwitchToPrimaryAction → Enhanced Input Triggered → 本回调
+	 *
+	 * 行为:
+	 *   - 调 Server_RequestSwitchToSlot RPC → 服务器切换到主槽位
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void OnSwitchToPrimaryPressed();
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】客户端切换到副武器（按键2）
+	 *
+	 * 调用方: SetupPlayerInputComponent 绑定 SwitchToSecondaryAction → Enhanced Input Triggered → 本回调
+	 *
+	 * 行为:
+	 *   - 调 Server_RequestSwitchToSlot RPC → 服务器切换到副槽位
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void OnSwitchToSecondaryPressed();
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】客户端切换到近战武器（按键3）
+	 *
+	 * 调用方: SetupPlayerInputComponent 绑定 SwitchToMeleeAction → Enhanced Input Triggered → 本回调
+	 *
+	 * 行为:
+	 *   - 调 Server_RequestSwitchToSlot RPC → 服务器切换到近战槽位
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Slot")
+	void OnSwitchToMeleePressed();
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】服务器执行显式槽位切换（1/2/3键）
+	 *
+	 * 大厂原则 (服务器权威):
+	 *   - 客户端发送目标槽位 → 服务器校验槽位是否有武器 → 执行切换
+	 *   - 服务器检查目标槽位是否有武器，无武器则拒绝切换
+	 *
+	 * @param TargetSlot 目标槽位
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_RequestSwitchToSlot(EWeaponSlotType TargetSlot);
+
 
 	// ==========================================
 	// 能量系统 (网络同步)
@@ -1239,6 +1316,58 @@ protected:
 	UInputAction* UseSkillAction;
 
 	/**
+	 * 【v51 大厂架构 — 生化模式】输入动作: 切换武器槽位 (Q 键)
+	 *
+	 * 调用方: ABaseCharacter::SetupPlayerInputComponent 绑定 Enhanced Input
+	 * 触发: Server_SwitchWeaponSlot (RPC → 服务器权威切槽)
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* SwitchWeaponAction;
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】切换到主武器（按键1）
+	 *
+	 * 调用方: ABaseCharacter::SetupPlayerInputComponent 绑定 Enhanced Input
+	 * 触发: Server_RequestSwitchToSlot RPC → 服务器切换到主槽位
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* SwitchToPrimaryAction;
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】切换到副武器（按键2）
+	 *
+	 * 调用方: ABaseCharacter::SetupPlayerInputComponent 绑定 Enhanced Input
+	 * 触发: Server_RequestSwitchToSlot RPC → 服务器切换到副槽位
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* SwitchToSecondaryAction;
+
+	/**
+	 * 【v58 大厂架构 — FPS枪战】切换到近战武器（按键3）
+	 *
+	 * 调用方: ABaseCharacter::SetupPlayerInputComponent 绑定 Enhanced Input
+	 * 触发: Server_RequestSwitchToSlot RPC → 服务器切换到近战槽位
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* SwitchToMeleeAction;
+
+	/**
+	 * 开火输入 (左键, Triggered 事件)
+	 * v60 — 玩家枪械射击
+	 * 玩家按 → Triggered → OnFirePressed (一直按住一直触发)
+	 * 玩家松 → Completed → OnFireReleased
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* FireAction;
+
+	/**
+	 * 换弹输入 (R 键, Started 事件)
+	 * v60 — 玩家换弹
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* ReloadAction;
+
+	/**
 	 * 基础输入回调: 移动
 	 */
 	void Move(const FInputActionValue& Value);
@@ -1257,6 +1386,28 @@ protected:
 	 * 下蹲回调: 停止下蹲
 	 */
 	void StopCrouch();
+
+	/**
+	 * v60 枪械射击输入回调
+	 *
+	 * - Triggered (按下+按住): 每帧触发, 路由到 CurrentWeapon->Server_StartFire
+	 *   - 半自动: Component 内部节流保护, 只打一发
+	 *   - 全自动: Component 内部 Tick 节流, 按射速持续打
+	 * - Completed (松开): 路由到 CurrentWeapon->Server_StopFire
+	 *
+	 * 大厂原则:
+	 *   - 服务器权威: 这里只发 Server RPC, 真逻辑在 WeaponFireComponent
+	 *   - MeshType 校验: 当前武器是 Melee 时拒绝转发 (刀按左键走 LightAttack_Pressed)
+	 */
+	void OnFirePressed(const FInputActionValue& Value);
+	void OnFireReleased(const FInputActionValue& Value);
+
+	/**
+	 * v60 换弹输入回调
+	 *
+	 * - Started (按下瞬间): 路由到 CurrentWeapon->Server_StartReload
+	 */
+	void OnReloadPressed(const FInputActionValue& Value);
 
 
 	// ==========================================
@@ -1854,6 +2005,42 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Scoreboard")
 	class ARoomPlayerState* GetRoomPlayerState() const;
+
+	// ============================================================
+	// 【v60.11 大厂架构】武器射线方向服务 — 单一真理源
+	// ============================================================
+
+	/**
+	 * GetAimRayFromCrosshairOrEyes — 武器射线检测的方向入口
+	 *
+	 * 大厂原则 — Camera-based 路由策略 (v60.12):
+	 *   - 本地玩家: 不走本函数 (v60.13 改为 RangedLineStrategy 直接用 PlayerCameraManager)
+	 *   - AI: 走 Controller 准星方向 (GetBaseAimRotation, BT 控制的旋转)
+	 *     → BT 的 FaceTarget 让 AIController 旋转, BaseAimRotation 反映准星方向
+	 *
+	 * 调用方:
+	 *   - AI: RangedLineStrategy (v60.12 已改用 BaseAimRotation)
+	 *   - 玩家: 不走本函数, Strategy 直接用 PlayerCameraManager
+	 *
+	 * @param OutRayOrigin     输出: 射线起点 (cm, 世界坐标) — 不输出, 由调用方决定
+	 * @param OutRayDirection  输出: 射线方向 (单位向量, 已归一化)
+	 * @return true=成功, false=获取方向失败 (Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Aim")
+	bool GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector& OutRayDirection);
+
+	/**
+	 * GetCrosshairWorldDirection_Const — 纯 const 查询 (仅供真正 const 上下文调用)
+	 *
+	 * 大厂原则 — const 正确性:
+	 *   - 当调用方处于 const 上下文 (e.g. inline 渲染函数 / 多播 RPC 实现),
+	 *     用本查询版 — 不缓存字段, 每次走完整解析链
+	 *   - 性能开销: 0.001ms/次 (PlayerController->GetHUD 链是 UE 缓存, cheap)
+	 *
+	 * @return true=成功 (OutWorldDirection 已写入), false=HUD/Crosshair 未就绪
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Aim")
+	bool GetCrosshairWorldDirection_Const(FVector& OutWorldDirection) const;
 
 private:
 	/**

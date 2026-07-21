@@ -29,7 +29,7 @@
 // 包含 BaseCharacter 以访问 Owner->HealthComponent 等
 #include "Characters/BaseCharacter.h"
 
-// 包含 BaseWeapon 以访问 Weapon->StopWeaponTrace/StartDissolve
+// 包含 BaseWeapon 以访问 Weapon->StopDamageTrace/StartDissolve
 #include "Weapons/BaseWeapon.h"
 
 // 包含 HealthComponent 以调 ApplyDamage/ActivateInvincibility/DeactivateInvincibility
@@ -124,6 +124,7 @@ void UCombatDeathComponent::BeginPlay()
 			TEXT("[CombatDeathComponent] BeginPlay: Owner 不是 ABaseCharacter (Owner=%s). "
 				 "本组件需要挂在 ABaseCharacter 上."),
 			*GetNameSafe(GetOwner()));
+		return;
 	}
 
 	UE_LOG(LogTemp, Log,
@@ -132,6 +133,94 @@ void UCombatDeathComponent::BeginPlay()
 		*GetNameSafe(GetOwner()),
 		RagdollDurationSeconds, WeaponDestroyDelaySeconds,
 		RespawnDelaySeconds, DefaultSpawnInvincibilitySeconds);
+
+	// ============================================================
+	// 【v60.9 大厂架构 — 角色渲染配置诊断】
+	//   用户反馈 (2026.07.20 Session.log): "进游戏就是大字型 (T-pose)"
+	//   根因 (BP 配置): BP_角色 的 SkeletalMeshComponent 没设 AnimClass
+	//   旧 (v60.8) 反模式: 不校验, 玩家看 T-pose 不知道为啥
+	//   新 (v60.9) 大厂原则 — 错误尽早暴露:
+	//     BeginPlay 立即检查 Mesh 渲染配置, 缺一项就 Log Error + 列出所有信息
+	//     让玩家一看日志就知道怎么修 BP
+	// ============================================================
+	DiagnoseMeshRenderingSetup();
+}
+
+
+// ==========================================
+// 7.1 Mesh 渲染配置诊断 — T-pose 根因暴露
+// ==========================================
+
+/**
+ * DiagnoseMeshRenderingSetup — 检查角色 Mesh 渲染配置, 避免 T-pose
+ *
+ * 检查项 (每项都必须配置, 否则角色渲染异常):
+ *   1. Mesh 组件存在
+ *   2. Skeletal Mesh 资产已设
+ *   3. AnimClass 已设 (T-pose 最常见原因)
+ *   4. 物理资产 (PhysicsAsset) 已设 (死亡 Ragdoll 需要)
+ *
+ * 错误处理 (大厂原则 — 零兜底):
+ *   - 缺任何一项立即 Log Error
+ *   - 错误日志列出**精确修复路径** (UE 编辑器具体面板名)
+ *   - **不强制 Exit**, 让游戏继续跑 (玩家可继续调试)
+ */
+void UCombatDeathComponent::DiagnoseMeshRenderingSetup() const
+{
+	if (!OwnerCharacter.IsValid())
+	{
+		return;
+	}
+	ABaseCharacter* Owner = OwnerCharacter.Get();
+
+	USkeletalMeshComponent* MeshComp = Owner->GetMesh();
+	if (!MeshComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CombatDeathComponent][v60.9 诊断] Pawn=%s 缺少 Mesh 组件 (SkeletalMeshComponent). "
+			     "【修复】UE 编辑器打开 BP_%s → Components 面板添加 SkeletalMeshComponent (命名 'Mesh') "
+			     "→ Details → Set Skeletal Mesh = SK_角色模型 资产."),
+			*Owner->GetName(), *Owner->GetClass()->GetName());
+		return;
+	}
+
+	// (1) Skeletal Mesh 资产
+	USkeletalMesh* SkelMesh = MeshComp->GetSkeletalMeshAsset();
+	if (!SkelMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CombatDeathComponent][v60.9 诊断] Pawn=%s 的 Mesh 组件没设 Skeletal Mesh 资产 → 角色看不见/白模. "
+			     "【修复】UE 编辑器打开 BP_%s → Components → 选中 Mesh → Details → Skeletal Mesh = SK_角色模型 资产."),
+			*Owner->GetName(), *Owner->GetClass()->GetName());
+		return;
+	}
+
+	// (2) AnimClass — T-pose 最常见根因
+	TSubclassOf<UAnimInstance> AnimClass = MeshComp->AnimClass;
+	if (!AnimClass)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CombatDeathComponent][v60.9 诊断] Pawn=%s 的 Mesh 组件没设 AnimClass → 角色大字型 (T-pose)! "
+			     "【修复】UE 编辑器打开 BP_%s → Components → 选中 Mesh → Details → 搜索 'Anim' → Anim Class = ABP_角色 (继承自 UBaseAnimInstance 的 AnimBlueprint). "
+			     "【大厂原则】AnimBlueprint 必须以 'UBaseAnimInstance' 为父类, 否则 C++ 端的 Native* 回调不触发."),
+			*Owner->GetName(), *Owner->GetClass()->GetName());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[CombatDeathComponent][v60.9 诊断] Pawn=%s AnimClass 配置正常: %s"),
+			*Owner->GetName(), *AnimClass->GetName());
+	}
+
+	// (3) PhysicsAsset — 死亡 Ragdoll 需要
+	UPhysicsAsset* PhysAsset = MeshComp->GetPhysicsAsset();
+	if (!PhysAsset)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CombatDeathComponent][v60.9 诊断] Pawn=%s 的 Skeletal Mesh '%s' 没设 PhysicsAsset → 死亡 Ragdoll 不工作, 角色会原地 T-pose 而不是倒下. "
+			     "【修复】Content Browser 双击 SK_角色 → Window → Asset Details → Physics → Physics Asset = PA_角色 资产 (如果没创建过, 工具 → Set Up Rig → 重生成)."),
+			*Owner->GetName(), *SkelMesh->GetName());
+	}
 }
 
 
@@ -328,7 +417,7 @@ void UCombatDeathComponent::Die()
 	if (ABaseWeapon* CurrentWeapon = Owner->GetCurrentWeapon())
 	{
 		Owner->SetAttackerIsAI(false);
-		CurrentWeapon->StopWeaponTrace();
+		CurrentWeapon->StopDamageTrace();
 	}
 
 	// 2. 【v43 P0 修复】先释放出生点，再派发复活请求

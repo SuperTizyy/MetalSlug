@@ -280,12 +280,19 @@ public:
 
 	/**
 	 * @brief 玩家 Spawn 主入口
-	 * @param PlayerToSpawn 目标玩家 Controller
-	 * @param CharRowName DT_CharacterInfo 行名
-	 * @param WeaponRowName DT_WeaponInfo 行名
+	 *
+	 * 【v52 P0 扩展 3 槽位】主武器 + 副武器 + 近战武器
+	 * - WeaponSecondaryRowName 留空 = 玩家没选副武器 (走主武器槽)
+	 * - WeaponMeleeRowName 留空 = 玩家没选近战武器 (走主武器槽)
+	 *
+	 * @param PlayerToSpawn           目标玩家 Controller
+	 * @param CharRowName             DT_CharacterInfo 行名
+	 * @param WeaponPrimaryRowName    DT_WeaponInfo 主武器行名 (Slot 1)
+	 * @param WeaponSecondaryRowName  DT_WeaponInfo 副武器行名 (Slot 2, 允许空)
+	 * @param WeaponMeleeRowName      DT_WeaponInfo 近战武器行名 (Slot 3, 允许空)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
-	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponRowName);
+	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);
 
 	/**
 	 * @brief 倒计时结束后触发 — 遍历 GS->PlayerArray 调 HandlePlayerRequestSpawn
@@ -332,15 +339,34 @@ public:
 	struct FPlayerSpawnData
 	{
 		FString CharID;
-		FString WeaponID;
+		/**
+		 * 【v52 P0】主武器 ID (Slot 1)
+		 * 大厂原则: 与 ARoomPlayerState::SelectedWeaponID1 对称 (真理源)
+		 */
+		FString WeaponPrimaryID;
+		/**
+		 * 【v52 P0】副武器 ID (Slot 2)
+		 */
+		FString WeaponSecondaryID;
+		/**
+		 * 【v52 P0】近战武器 ID (Slot 3)
+		 */
+		FString WeaponMeleeID;
 	};
 
 	bool GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCharID, FString& OutWeaponID) const;
 
 	/**
-	 * 写入玩家生成数据 (由 GameMode::AddPlayerToRoom 调用)
+	 * 【v52 P0 扩展 3 槽位】读取玩家 3 把武器缓存
+	 * 复活时通过这个接口一次性恢复 Loadout (主+副+近战)
 	 */
-	void SetPlayerSpawnData(uint32 ControllerUniqueID, const FString& CharID, const FString& WeaponID);
+	bool GetPlayerSpawnDataAllWeapons(uint32 ControllerUniqueID, FString& OutCharID, FString& OutPrimaryID, FString& OutSecondaryID, FString& OutMeleeID) const;
+
+	/**
+	 * 写入玩家生成数据 (由 GameMode::AddPlayerToRoom 调用)
+	 * 【v52 P0】3 把武器一起写, 主+副+近战
+	 */
+	void SetPlayerSpawnData(uint32 ControllerUniqueID, const FString& CharID, const FString& PrimaryWeaponID, const FString& SecondaryWeaponID, const FString& MeleeWeaponID);
 
 	// ==========================================
 	// AI 命名序号 (大厅入队用)

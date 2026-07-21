@@ -65,3 +65,44 @@ void UCrosshairWidget::UpdateCrosshairStyle(int32 WeaponType)
 	// 根据武器类型更新准星样式（后续扩展）
 	// 0 = 手枪, 1 = 步枪, 2 = 狙击枪, 3 = 霰弹枪等
 }
+
+
+// ==========================================
+// 4. v60.11 准星屏幕坐标
+// ==========================================
+
+/**
+ * UCrosshairWidget::GetCenterScreenPosition
+ *
+ * 大厂原则 — 武器射线检测的真理源:
+ *   - 玩家射线 = "从 Muzzle 朝准星射出"
+ *   - 准星屏幕坐标 = Widget 几何中心 (绝对屏幕坐标, 不是相对坐标)
+ *   - UE 5.6 标准做法: GetCachedGeometry().LocalToAbsolute(LocalCenter)
+ *
+ * 失败模式 (零兜底):
+ *   - Widget 未渲染 (Visibility=Collapsed 或 Size=0) → 返回 ZeroVector
+ *   - 调用方 (URangedLineStrategy) 必须显式校验 IsZero 后拒绝
+ */
+FVector2D UCrosshairWidget::GetCenterScreenPosition() const
+{
+	// (1) Widget 必须可见 — Collapsed / Hidden 时 IsConstructed=true 但 CachedGeometry 可能为空
+	if (GetVisibility() == ESlateVisibility::Collapsed
+		|| GetVisibility() == ESlateVisibility::Hidden)
+	{
+		return FVector2D::ZeroVector;
+	}
+
+	// (2) CachedGeometry 必须有效 — Widget 必须至少 Tick 过一次
+	const FGeometry& Geo = GetCachedGeometry();
+	const FVector2D LocalSize = Geo.GetLocalSize();
+	if (LocalSize.X <= 0.0f || LocalSize.Y <= 0.0f)
+	{
+		return FVector2D::ZeroVector;
+	}
+
+	// (3) 几何中心 → 绝对屏幕坐标 (左上角原点, 像素)
+	const FVector2D LocalCenter = LocalSize * 0.5f;
+	const FVector2D AbsoluteCenter = Geo.LocalToAbsolute(LocalCenter);
+
+	return AbsoluteCenter;
+}

@@ -203,10 +203,11 @@ void ARoomPlayerController::DelayedSendPlayerInfo()
 			const FAccountRecord* MyRecord = Repo->FindRecord(MyName);
 			if (MyRecord)
 			{
-				UE_LOG(LogTemp, Warning, TEXT("[Room] DelayedSendPlayerInfo: Char='%s', W1='%s', W2='%s'"),
-					*MyRecord->LastSelectedCharacter, *MyRecord->LastSelectedWeapon1, *MyRecord->LastSelectedWeapon2);
-				// 【修复 1】: 直接呼叫自身的 RPC，将初始数据推送到服务器！
-				Server_SelectLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1, MyRecord->LastSelectedWeapon2);
+			// 【修复 1】: 直接呼叫自身的 RPC，将初始数据推送到服务器！
+			// 【v52 P0 扩展 3 槽位】主武器 + 副武器 + 近战武器
+			// 【Q8 决策】存档层不持久化第 3 把武器 (避免存档迁移问题)
+			//   第 3 把武器由大厅运行期玩家手动选, 不从存档读
+			Server_SelectLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1, MyRecord->LastSelectedWeapon2, TEXT(""));
 			}
 			else
 			{
@@ -809,20 +810,23 @@ void ARoomPlayerController::Server_RequestStartGame_Implementation()
 		// 1. 校验所有玩家已准备
 		if (GM->CheckAllPlayersReady())
 		{
-			// 2. 通知所有客户端切换到战斗状态 (UI 切换: 大厅UI 销毁, 战斗 HUD 显示)
-			for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-			{
-				if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
-				{
-					PC->Client_EnterBattleState();
-				}
-			}
-
-			// 3. 启动 GameMode PerformGameStart
-			//    - 立即广播 OnBattleStarted (AI BT 激活)
-			//    - 立即设 CurrentRoomState = BattleInProgress
-			//    - 倒计时 MatchStartDelay 秒后回调 SpawnAllPlayersIntoBattle
-			//      → 这里才统一处理玩家 Spawn + AI Spawn
+			// 2. 【v56.8 大厂架构修复】启动 Lifecycle 倒计时（Spawn + HUD 一体化处理）
+			//
+			// 根因（重现——v56.7 修复不完整）:
+			//   旧实现: 先调 Client_EnterBattleState() 立即切 HUD，
+			//           再调 GM->PerformGameStart() 启动 3 秒倒计时。
+			//   结果: HUD 在玩家 Pawn Spawn 之前显示 → 玩家看到"飞翔视角"。
+			//
+			// 修复（v56.8）:
+			//   - 移除 Server_RequestStartGame 里的 Client_EnterBattleState() 调用
+			//   - HUD 切换全部下沉到 URoomLifecycleSubsystem::OnMatchStartTimerFired 回调里
+			//     （那里已经在 PerformGameStart 的倒计时回调中执行了 SpawnAllPlayersIntoBattle）
+			//   - Client_EnterBattleState 仍然保留，但**仅用于初始化倒计时兜底**（line 313-343），
+			//     实际不在这里调用（避免触发 HUD 切换）
+			//
+			// 大厂原则 — 单一调度入口:
+			//   战斗开局的所有客户端反馈 → 全部由 LifecycleSubsystem 回调统一驱动
+			//   PC.Server_RequestStartGame 唯一职责: 校验身份 + 转发到 Lifecycle
 			GM->PerformGameStart();
 		}
 		else
@@ -878,14 +882,14 @@ void ARoomPlayerController::Client_ReceiveSystemMessage_Implementation(const FSt
 void ARoomPlayerController::Server_RequestSpawn_Implementation()
 {
 	// 【v36】改为显式传 Loadout
-	const FString CharID = GetPlayerState<ARoomPlayerState>()
-		? GetPlayerState<ARoomPlayerState>()->GetSelectedCharacterID()
-		: FString();
-	const FString WeaponID = GetPlayerState<ARoomPlayerState>()
-		? GetPlayerState<ARoomPlayerState>()->GetSelectedWeapon1ID()
-		: FString();
+	// 【v52 P0】3 把武器一起读 (主+副+近战), 主武器必须非空, 副/近战可空
+	ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>();
+	const FString CharID = PS ? PS->GetSelectedCharacterID() : FString();
+	const FString PrimaryID = PS ? PS->GetSelectedWeapon1ID() : FString();
+	const FString SecondaryID = PS ? PS->GetSelectedWeapon2ID() : FString();
+	const FString MeleeID = PS ? PS->GetSelectedWeapon3ID() : FString();
 
-	if (CharID.IsEmpty() || WeaponID.IsEmpty())
+	if (CharID.IsEmpty() || PrimaryID.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[RoomPlayerController] Server_RequestSpawn: PlayerState.SelectedCharID/WeaponID1 为空, 拒绝 Spawn. "
@@ -896,7 +900,7 @@ void ARoomPlayerController::Server_RequestSpawn_Implementation()
 
 	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 	{
-		GM->HandlePlayerRequestSpawn(this, CharID, WeaponID);
+		GM->HandlePlayerRequestSpawn(this, CharID, PrimaryID, SecondaryID, MeleeID);
 	}
 }
 
@@ -1153,26 +1157,29 @@ void ARoomPlayerController::OnPlayerRespawnTimerFinished()
 /**
  * 验证函数: 选择 Loadout
  */
-bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName) { return true; }
+bool ARoomPlayerController::Server_SelectLoadout_Validate(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName) { return true; }
 
 /**
  * Server_SelectLoadout_Implementation
  *
  * 玩家把选中的角色/武器偏好发给服务器
  * 服务器写入 PlayerState 用于开局时按这个生成
+ *
+ * 【v52 P0 扩 3 槽位】主武器 + 副武器 + 近战武器, 大厅 3 个槽位一起写
  */
-void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& Weapon1RowName, const FString& Weapon2RowName)
+void ARoomPlayerController::Server_SelectLoadout_Implementation(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[Room] Server_SelectLoadout: Char='%s', W1='%s', W2='%s'"),
-		*CharacterRowName, *Weapon1RowName, *Weapon2RowName);
+	UE_LOG(LogTemp, Warning, TEXT("[Room] Server_SelectLoadout: Char='%s', Primary='%s', Secondary='%s', Melee='%s'"),
+		*CharacterRowName, *WeaponPrimaryRowName, *WeaponSecondaryRowName, *WeaponMeleeRowName);
 	if (ARoomPlayerState* PS = GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SetPlayerLoadout(CharacterRowName, Weapon1RowName, Weapon2RowName);
+		PS->SetPlayerLoadout(CharacterRowName, WeaponPrimaryRowName, WeaponSecondaryRowName, WeaponMeleeRowName);
 
 		// v31.4 P0: 同步到 URoomSpawnSubsystem 缓存 (复活路径的真理源)
+		// 【v52 P0】3 把武器一起存, 用于 Respawn 时恢复完整 Loadout
 		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 		{
-			SpawnSys->SetPlayerSpawnData(GetUniqueID(), CharacterRowName, Weapon1RowName);
+			SpawnSys->SetPlayerSpawnData(GetUniqueID(), CharacterRowName, WeaponPrimaryRowName, WeaponSecondaryRowName, WeaponMeleeRowName);
 		}
 	}
 }

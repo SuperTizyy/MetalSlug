@@ -41,7 +41,7 @@
 // 引入 AIController (UE 原生, 用于 Cast 第一层)
 #include "AIController.h"
 
-// 引入武器 (访问 CurrentWeapon->StartWeaponTrace / StopWeaponTrace)
+// 引入武器 (访问 CurrentWeapon->StartWeaponTrace / StopDamageTrace)
 #include "Weapons/BaseWeapon.h"
 
 // 引入 AI 攻击蒙太奇解析器 (职责链, v32 零兜底)
@@ -454,13 +454,13 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	//
 	// 新版 (v35): BP AnimNotify 控制
 	//   - 美术在 UE 编辑器打开 AI 蒙太奇 (跟武器共用同一个)
-	//   - 在"挥刀中段"位置加 ANS_MeleeTrace → StartWeaponTrace
-	//   - 在"收刀"位置加 ANS_MeleeTraceEnd → StopWeaponTrace
+	//   - 在"挥刀中段"位置加 ANS_MeleeTrace → PerformDamageTrace
+	//   - 在"收刀"位置加 ANS_MeleeTraceEnd → StopDamageTrace
 	//   - BP AnimNotify 拿武器: WeaponAttach->GetCurrentWeapon() (蓝图纯函数节点)
 	//
 	// 大厂原则 - 职责对等:
 	//   - 启动 trace = 美术/策划的责任 (蒙太奇节奏)
-	//   - 结束 trace = C++ 防泄漏清理 (蒙太奇自然结束时强制 StopWeaponTrace)
+	//   - 结束 trace = C++ 防泄漏清理 (蒙太奇自然结束时强制 StopDamageTrace)
 	//   - 这是"清理逻辑"不是"业务兜底" — 蒙太奇必然结束, 防 BP 通知漏触发造成 trace 永远开启
 	// ============================================================
 
@@ -596,8 +596,8 @@ void UAIAttackComponent::OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInt
 	// ============================================================
 	// 这是 OnAIRequestAttack_Simple SetAttackerIsAI(true) 的对称关闭
 	//
-	// v35 后: StartWeaponTrace 由 BP AnimNotify 触发 (玩家路径一致), C++ 不再主动开启
-	// 但这里 StopWeaponTrace 必须保留 —— 蒙太奇自然结束 = 生命周期的必然事件,
+	// v35 后: PerformDamageTrace 由 BP AnimNotify 触发 (玩家路径一致), C++ 不再主动开启
+	// 但这里 StopDamageTrace 必须保留 —— 蒙太奇自然结束 = 生命周期的必然事件,
 	// 防止 BP 通知漏触发 → bIsWeaponActive 永远残留为 true → 下次挥刀全员扣血
 	//
 	// 关闭条件: 蒙太奇自然结束 / 被打断 / AI 死亡, 否则:
@@ -611,8 +611,8 @@ void UAIAttackComponent::OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInt
 	if (OwnerCharacter->HasAuthority() && OwnerCharacter->GetCurrentWeapon())
 	{
 		// 对称关闭 trace — 这是"生命周期清理"不是"业务兜底"
-		// (即便 BP 蓝图 AnimNotify 也会调 StopWeaponTrace, 这里再调一次幂等无害)
-		OwnerCharacter->GetCurrentWeapon()->StopWeaponTrace();
+		// (即便 BP 蓝图 AnimNotify 也会调 StopDamageTrace, 这里再调一次幂等无害)
+		OwnerCharacter->GetCurrentWeapon()->StopDamageTrace();
 	}
 
 	UE_LOG(LogTemp, Verbose,
