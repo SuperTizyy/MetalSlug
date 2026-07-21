@@ -171,6 +171,33 @@ void UCharacterEvents::SetCachedWeaponIcon(const FString& InWeaponID, UTexture2D
 }
 
 
+// -----------------------------------------------------------------------------
+// 【v85.2 大厂架构新增】武器弹药快照存取
+// -----------------------------------------------------------------------------
+void UCharacterEvents::SetCachedWeaponAmmoInfo(int32 InCurrentAmmo, int32 InMagazineSize, int32 InReserveAmmo, bool bInIsMelee)
+{
+	CachedCurrentAmmo = InCurrentAmmo;
+	CachedMagazineSize = InMagazineSize;
+	CachedReserveAmmo = InReserveAmmo;
+	bCachedIsMelee = bInIsMelee;
+	bCachedWeaponAmmoValid = true;
+}
+
+bool UCharacterEvents::GetCachedWeaponAmmoInfo(int32& OutCurrentAmmo, int32& OutMagazineSize, int32& OutReserveAmmo, bool& OutbIsMelee) const
+{
+	if (!bCachedWeaponAmmoValid)
+	{
+		return false;
+	}
+
+	OutCurrentAmmo = CachedCurrentAmmo;
+	OutMagazineSize = CachedMagazineSize;
+	OutReserveAmmo = CachedReserveAmmo;
+	OutbIsMelee = bCachedIsMelee;
+	return true;
+}
+
+
 /**
  * UCharacterEvents::SetCachedACValue
  */

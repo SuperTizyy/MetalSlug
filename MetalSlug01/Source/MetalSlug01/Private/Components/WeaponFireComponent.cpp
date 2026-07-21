@@ -74,6 +74,10 @@ void UWeaponFireComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 	DOREPLIFETIME(UWeaponFireComponent, CurrentAmmo);
 	DOREPLIFETIME(UWeaponFireComponent, bIsReloading);
 	DOREPLIFETIME(UWeaponFireComponent, bIsFiring);
+
+	// v82 修复: 蒙太奇必须 Replicated (客户端 Multicast_PlayFireMontage_Implementation 靠它播放)
+	DOREPLIFETIME(UWeaponFireComponent, FireMontageHip);
+	DOREPLIFETIME(UWeaponFireComponent, ReloadMontageHip);
 }
 
 
@@ -138,7 +142,8 @@ void UWeaponFireComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	const float Now = World->GetTimeSeconds();
 	if (Now - LastFireTimeSeconds >= TimeBetweenShots)
 	{
-		PerformSingleShot();
+		// v82: 全自动节流用缓存的客户端射线 (大厂折中 — 锁定第一下的射线方向)
+		PerformSingleShot(CachedClientRayOrigin, CachedClientRayDirection);
 	}
 }
 
@@ -188,7 +193,11 @@ void UWeaponFireComponent::InitializeFromWeaponConfig(const FWeaponInfo& InWeapo
 	FireRateRPM = InWeaponConfig.FireRateRPM;
 	ReloadTimeSeconds = InWeaponConfig.ReloadTimeSeconds;
 
-	// 缓存蒙太奇 (不复制 — 蒙太奇资源客户端直接从 BP 资产加载)
+	// 缓存蒙太奇 (Replicated 自动同步到客户端 — v82 修复)
+	//   旧版 (v70-v81) 注释错误: "蒙太奇资源客户端直接从 BP 资产加载"
+	//   实际: FireMontageHip 来源于 DT_WeaponInfo, 不是 BP 子对象默认属性
+	//   → 客户端拿不到 → Multicast_PlayFireMontage 永远 "FireMontage 为空"
+	//   新版: 字段 Replicated, 服务器写入后客户端自动同步
 	FireMontageHip = InWeaponConfig.FireMontageHip;
 	ReloadMontageHip = InWeaponConfig.ReloadMontageHip;
 
@@ -212,9 +221,18 @@ void UWeaponFireComponent::InitializeFromWeaponConfig(const FWeaponInfo& InWeapo
 // 开火控制
 // ==========================================
 
-void UWeaponFireComponent::StartFire()
+void UWeaponFireComponent::StartFire(const FVector& ClientRayOrigin, const FVector& ClientRayDirection)
 {
 	ABaseWeapon* Weapon = ResolveOwnerWeapon();
+
+	// 【v85.1 诊断】入口 Log — 确认 WeaponFireComponent::StartFire 是否被调用
+	const FString WeaponName = Weapon ? *Weapon->GetName() : TEXT("(null)");
+	UE_LOG(LogTemp, Warning,
+		TEXT("[WeaponFireComponent] StartFire ENTER. Weapon=%s bIsInitialized=%d Auth=%d"),
+		*WeaponName,
+		bIsInitialized ? 1 : 0,
+		(Weapon && Weapon->HasAuthority()) ? 1 : 0);
+
 	if (!Weapon)
 	{
 		UE_LOG(LogTemp, Error,
@@ -263,7 +281,7 @@ void UWeaponFireComponent::StartFire()
 	}
 
 	// 统一射击逻辑: 所有射击都受冷却保护
-	// 
+	//
 	// 【按住连射路径】
 	//   - Triggered 每帧触发 → StartFire → bIsFiring=true → 启动 TickComponent
 	//   - TickComponent 按 FireRateRPM 节流射击
@@ -287,11 +305,33 @@ void UWeaponFireComponent::StartFire()
 	const float Now = World->GetTimeSeconds();
 	const float TimeSinceLastFire = Now - LastFireTimeSeconds;
 
+	// v82 大厂架构修复: 缓存客户端射线 (全自动连射时 TickComponent 用此缓存)
+	//   - 玩家按第一下: 客户端 HUD Crosshair 算射线 → RPC 传给服务器
+	//   - 服务器缓存到 CachedClientRayOrigin/Direction
+	//   - 全自动 Tick 触发时, 用缓存射线 (而不是服务器侧 PC->GetViewportSize — 远端玩家无效)
+	//   - 半自动: 只有一次 PerformSingleShot, 用入参射线 (就是缓存值)
+	//   - 大厂折中: 全自动射线方向锁定在开火第一下, 与 CS:GO / Valorant 一致
+	if (!ClientRayOrigin.IsNearlyZero())
+	{
+		CachedClientRayOrigin = ClientRayOrigin;
+		CachedClientRayDirection = ClientRayDirection;
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponFireComponent] StartFire: 缓存客户端射线 — Origin=%s Dir=%s (全自动 Tick 用此缓存)"),
+			*ClientRayOrigin.ToCompactString(),
+			*ClientRayDirection.ToCompactString());
+	}
+	else if (CachedClientRayOrigin.IsNearlyZero())
+	{
+		// 没客户端射线, 也没缓存 — AI 路径 (Strategy 内部 fallback BaseAimRotation)
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponFireComponent] StartFire: 无客户端射线, 走 AI fallback 路径 (Strategy 内部 BaseAimRotation)"));
+	}
+
 	// 冷却检查
 	if (TimeSinceLastFire >= TimeBetweenShots)
 	{
-		// 冷却已过，立即射击
-		PerformSingleShot();
+		// 冷却已过，立即射击 — 用缓存的客户端射线 (或入参)
+		PerformSingleShot(CachedClientRayOrigin, CachedClientRayDirection);
 
 		// 启动按住连射: 开启 TickComponent
 		if (!bIsFiring)
@@ -409,9 +449,17 @@ void UWeaponFireComponent::StartReload()
 // 内部: 实际打一发
 // ==========================================
 
-void UWeaponFireComponent::PerformSingleShot()
+void UWeaponFireComponent::PerformSingleShot(const FVector& ClientRayOrigin, const FVector& ClientRayDirection)
 {
 	ABaseWeapon* Weapon = ResolveOwnerWeapon();
+
+	// 【v85.1 诊断】PerformSingleShot 入口 Log — 确认是否执行到这里
+	UE_LOG(LogTemp, Warning,
+		TEXT("[WeaponFireComponent] PerformSingleShot ENTER. Weapon=%s CurrentAmmo=%d/%d"),
+		Weapon ? *Weapon->GetName() : TEXT("(null)"),
+		CurrentAmmo,
+		MagazineSize);
+
 	if (!Weapon)
 	{
 		return;
@@ -445,7 +493,10 @@ void UWeaponFireComponent::PerformSingleShot()
 
 	// 大厂原则 — 配置错必须显式化, 不能扣弹药继续做事 (掩盖配置错)
 	// StartTrace 返回 false = 配置错 (Mesh 失效 / Muzzle Socket 缺失 / 无 Owner)
-	const bool bExecuted = Strategy.GetInterface()->StartTrace(Weapon, /*bIsHeavy=*/false);
+	//
+	// v82: 把客户端射线参数传给 Strategy (Ranged 用, Melee 忽略)
+	const bool bExecuted = Strategy.GetInterface()->StartTrace(Weapon, /*bIsHeavy=*/false,
+		ClientRayOrigin, ClientRayDirection);
 	if (!bExecuted)
 	{
 		UE_LOG(LogTemp, Error,

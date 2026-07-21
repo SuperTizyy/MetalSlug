@@ -68,6 +68,7 @@
 // 【v54 大厂架构重构】UAIProfileAsset 已删除, 不再 include
 #include "Data/AI/AIBehaviorConfigSO.h"
 #include "Data/Config/PlayerConfigAsset.h"
+#include "Data/Config/WeaponSoundMapAsset.h"
 #include "GameFramework/PlayerController.h"
 #include "AIController.h"
 
@@ -76,6 +77,55 @@
 #include "Systems/Membership/RoomMembershipSubsystem.h"
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Systems/Targeting/RoomTargetingSubsystem.h"
+
+
+// ==========================================
+// 【v76 大厂架构 — 武器切换音效】访问器实现
+// ==========================================
+//
+// 单一真理源 (与 v37 WeaponAttachmentDataTable 模式完全对称):
+//   - GM->WeaponSoundMapAsset 字段 (TSoftObjectPtr, 编辑器配置时不立即加载)
+//   - GetWeaponSoundMapAsset() 同步加载并返回
+//   - 调用方 (WeaponAttachmentComponent) 拿到 nullptr 时拒绝播放
+//
+// 大厂原则 - 配置可发现性:
+//   - 错误日志明确指出"BP_GM_RoomGameMode → Class Defaults → Room|Audio → Weapon Sound Map Asset"
+//   - 缺资产 → 音效系统永远不工作 (UI/手感都不会暴露, 但每次切武器都 Log Error)
+//     → 强制策划/程序配置 (零兜底)
+//
+// 为什么不缓存为强指针字段?
+//   - TSoftObjectPtr 是 UE 异步加载标准模式 (Asset Registry + Streamable)
+//   - 调用方在切武器时拉一次, 失败立即 Log
+//   - 频繁路径上 (Tick/AnimNotify) 永不调用 — 仅在 Server_SwitchToWeaponSlot 触发
+//
+// @return 同步加载后的 UWeaponSoundMapAsset*, nullptr = 已 Log Error
+// ==========================================
+UWeaponSoundMapAsset* ARoomGameMode::GetWeaponSoundMapAsset() const
+{
+	if (WeaponSoundMapAsset.IsNull())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ARoomGameMode] GetWeaponSoundMapAsset: GM->WeaponSoundMapAsset 未配置. ")
+			TEXT("【v76 大厂原则 — 零兜底】必须修复: ")
+			TEXT("打开 BP_GM_RoomGameMode → Class Defaults → Room|Audio → Weapon Sound Map Asset ")
+			TEXT("→ 创建/选择 DA_WeaponSoundMap.uasset 并赋给此字段. ")
+			TEXT("未配 → 切武器时拒绝播放音效, 但会 Log Error 报告根因."));
+		return nullptr;
+	}
+
+	// 同步加载 (TSoftObjectPtr → 强指针)
+	UWeaponSoundMapAsset* Resolved = WeaponSoundMapAsset.LoadSynchronous();
+	if (!Resolved)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ARoomGameMode] GetWeaponSoundMapAsset: WeaponSoundMapAsset 资产路径无效或加载失败. ")
+			TEXT("AssetPath=%s. 【v76 零兜底】必须检查 DA_WeaponSoundMap.uasset 是否存在."),
+			*WeaponSoundMapAsset.ToString());
+		return nullptr;
+	}
+
+	return Resolved;
+}
 
 
 // ==========================================

@@ -378,6 +378,14 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	if (OwnerCharacter)
 	{
 		OwnerCharacter->SetAttackerIsAI(true);
+
+		// 【v74 大厂架构 — 蒙太奇时间轴驱动检测】
+		//   旧版 (v73) C++ 在 OnAIRequestAttack_Simple 强制调 StartDamageTrace
+		//   → 与美术在蒙太奇时间轴上拖 ANS_MeleeTraceState 标签冲突
+		//   新版 (v74) 单一真理源 = ANS_MeleeTraceState:
+		//     - 美术在蒙太奇时间轴"挥刀中段"位置拖 ANS_MeleeTraceState(Tracing) → 启 trace
+		//     - 在"收刀"位置 NotifyEnd → 关 trace
+		//   C++ 不再做硬编码启停 — 完全由蒙太奇时间轴决定 (与玩家路径对称)
 	}
 
 	// ============================================================

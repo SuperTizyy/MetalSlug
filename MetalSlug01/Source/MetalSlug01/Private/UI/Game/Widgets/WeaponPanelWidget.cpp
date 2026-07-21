@@ -16,20 +16,12 @@
 
 /**
  * UWeaponPanelWidget::Initialize
- *
- * 默认弹药文本显示 "0/0"
  */
 bool UWeaponPanelWidget::Initialize()
 {
 	if (!Super::Initialize())
 	{
 		return false;
-	}
-
-	// 初始化默认显示
-	if (Text_RemainingAmmo)
-	{
-		Text_RemainingAmmo->SetText(NSLOCTEXT("WeaponPanel", "DefaultAmmo", "0/0"));
 	}
 
 	return true;
@@ -145,62 +137,75 @@ void UWeaponPanelWidget::UpdateMeleeWeaponIcon(UTexture2D* Icon)
 
 
 // ==========================================
-// 4. 弹药
+// 4. 弹药显示
 // ==========================================
 
 /**
- * UWeaponPanelWidget::UpdateRemainingAmmo
+ * UWeaponPanelWidget::UpdateWeaponAmmoText
  *
- * 旧接口: 仅显示单一数字
- * 颜色: 0 红 / <=10 黄 / 否则 白
+ * 【v85 大厂架构新增】武器弹药数量文本显示
+ *
+ * 格式规则:
+ *   - 近战武器 (bIsMelee=true): "1/1" (固定值, 不显示备用弹药)
+ *   - 枪械 (bIsMelee=false): "弹匣弹药/备用弹药总数" 如 "30/120"
+ *
+ * 颜色逻辑:
+ *   - CurrentMag = 0: 红色 (弹药耗尽)
+ *   - CurrentMag <= 10: 黄色 (弹药过低)
+ *   - 否则: 白色 (正常)
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 本方法只负责 UI 显示逻辑
+ *   - 数据由调用方 (GameHUDWidget) 从 WeaponFireComponent 读取后传入
+ *   - 不自行查表, 不参与数据计算
  */
-void UWeaponPanelWidget::UpdateRemainingAmmo(int32 Ammo)
+void UWeaponPanelWidget::UpdateWeaponAmmoText(int32 CurrentMag, int32 MagazineSize, int32 ReserveAmmo, bool bIsMelee)
 {
-	if (Text_RemainingAmmo)
+	if (!Text_WeaponAmmo)
 	{
-		Text_RemainingAmmo->SetText(FText::AsNumber(Ammo));
-
-		// 根据弹药数量设置颜色
-		FLinearColor AmmoColor = FLinearColor::White;
-		if (Ammo == 0)
-		{
-			AmmoColor = FLinearColor::Red;
-		}
-		else if (Ammo <= 10)
-		{
-			AmmoColor = FLinearColor::Yellow;
-		}
-		Text_RemainingAmmo->SetColorAndOpacity(AmmoColor);
+		// Text_WeaponAmmo 是 BindWidgetOptional, 可能未在 BP 中绑定
+		// 此时静默 return (这是 BP 配置问题, 不是 C++ 代码问题)
+		return;
 	}
-}
 
-
-/**
- * UWeaponPanelWidget::UpdateAmmoText
- *
- * 新接口: 弹夹/总弹药格式 "X/Y"
- * 颜色: CurrentMag = 0 红 / <=10 黄 / 否则 白
- */
-void UWeaponPanelWidget::UpdateAmmoText(int32 CurrentMag, int32 TotalReserve)
-{
-	if (Text_RemainingAmmo)
+	// 根据武器类型格式化弹药文本
+	FText AmmoText;
+	if (bIsMelee)
 	{
-		Text_RemainingAmmo->SetText(FText::Format(
-			NSLOCTEXT("WeaponPanel", "AmmoFormat", "{0}/{1}"),
+		// 近战武器: 显示固定值 "1/1"
+		AmmoText = NSLOCTEXT("WeaponPanel", "MeleeAmmoFormat", "1/1");
+	}
+	else
+	{
+		// 枪械: 显示 "弹匣弹药/备用弹药总数" (如 30/120)
+		AmmoText = FText::Format(
+			NSLOCTEXT("WeaponPanel", "RangedAmmoFormat", "{0}/{2}"),
 			FText::AsNumber(CurrentMag),
-			FText::AsNumber(TotalReserve)
-		));
-
-		// 根据弹药数量设置颜色
-		FLinearColor AmmoColor = FLinearColor::White;
-		if (CurrentMag == 0)
-		{
-			AmmoColor = FLinearColor::Red;
-		}
-		else if (CurrentMag <= 10)
-		{
-			AmmoColor = FLinearColor::Yellow;
-		}
-		Text_RemainingAmmo->SetColorAndOpacity(AmmoColor);
+			FText::AsNumber(MagazineSize),
+			FText::AsNumber(ReserveAmmo)
+		);
 	}
+
+	Text_WeaponAmmo->SetText(AmmoText);
+
+	// 根据弹药数量设置颜色
+	FLinearColor AmmoColor = FLinearColor::White;
+	if (CurrentMag == 0)
+	{
+		// 弹药耗尽: 红色
+		AmmoColor = FLinearColor::Red;
+	}
+	else if (CurrentMag <= 10)
+	{
+		// 弹药过低: 黄色
+		AmmoColor = FLinearColor::Yellow;
+	}
+	// 否则保持白色 (正常)
+
+	Text_WeaponAmmo->SetColorAndOpacity(AmmoColor);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[WeaponPanelWidget] UpdateWeaponAmmoText: CurrentMag=%d, MagazineSize=%d, ReserveAmmo=%d, bIsMelee=%d, Color=%s"),
+		CurrentMag, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0,
+		CurrentMag == 0 ? TEXT("Red") : (CurrentMag <= 10 ? TEXT("Yellow") : TEXT("White")));
 }

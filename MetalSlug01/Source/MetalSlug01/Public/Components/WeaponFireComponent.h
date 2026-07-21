@@ -111,9 +111,14 @@ public:
 	 *   - 弹药空 → Log Verbose + 自动触发 StartReload (如果备用有弹药)
 	 *   - 换弹中 → Log Verbose (拒绝)
 	 *   - 未初始化 (InitializeFromWeaponConfig 没调) → Log Error + 拒绝
+	 *
+	 * v82 客户端射线参数:
+	 *   - 不传参数 = AI 路径 (Strategy 内部 fallback BaseAimRotation)
+	 *   - 玩家 RPC 调用: 传入 HUD Crosshair 算出的 Origin + Direction
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Fire")
-	void StartFire();
+	void StartFire(const FVector& ClientRayOrigin = FVector::ZeroVector,
+		const FVector& ClientRayDirection = FVector::ForwardVector);
 
 	/**
 	 * 停止开火 (服务器, 仅全自动有意义)
@@ -247,6 +252,25 @@ protected:
 	float LastFireTimeSeconds = -1000.0f;
 
 	/**
+	 * 【v82 大厂架构修复】客户端射线缓存 — 服务器 Tick 全自动连射时复用
+	 *
+	 * 用途:
+	 *   - 玩家按第一下: OnFirePressed 计算 HUD Crosshair 射线 → RPC 传到服务器
+	 *   - 服务器 StartFire 把射线存入此缓存 → 立即 PerformSingleShot 用这个射线
+	 *   - 服务器 Tick 全自动节流: PerformSingleShot() 无参数, 用此缓存射线 (不再依赖 Viewport)
+	 *
+	 * 折中 (大厂标准 — CS:GO / Valorant 都有类似机制):
+	 *   - 全自动射线方向"锁定"到开火第一下的方向
+	 *   - 玩家移动/转向时, 后续子弹射线起点不会更新 (仍按开火瞬间的位置)
+	 *   - 准星实时移动时, 全自动连射的子弹是"扇形扫射" 而不是"精确跟随" — 这是 FPS 行业标准
+	 */
+	UPROPERTY()
+	FVector CachedClientRayOrigin = FVector::ZeroVector;
+
+	UPROPERTY()
+	FVector CachedClientRayDirection = FVector(1.f, 0.f, 0.f);
+
+	/**
 	 * 换弹到期时间戳 (秒)
 	 * World->GetTimeSeconds() >= ReloadEndTimeSeconds → 完成换弹
 	 */
@@ -269,19 +293,30 @@ protected:
 	FName CachedWeaponRowName;
 
 	// ==========================================
-	// 蒙太奇缓存 (服务器写入, Multicast 给所有客户端播放)
+	// 蒙太奇缓存 (服务器写入, Replicated 给所有客户端 — v82 修复)
 	// ==========================================
 
 	/**
 	 * 腰射状态下的开火蒙太奇 (从 DT 读)
+	 *
+	 * 【v82 客户端武器可用性修复】Replicated:
+	 *   - 旧版 (v70-v81) 注释错误: "不复制, 蒙太奇资源客户端直接从 BP 资产加载"
+	 *   - 实际: DT_WeaponInfo 中的 FireMontage_Ironsights 是策划在 DataTable 配的字段,
+	 *           不是 BP 子对象的默认属性, 客户端不会自动加载
+	 *   - 客户端 Multicast_PlayFireMontage_Implementation 调 GetFireMontageHip() → nullptr
+	 *   - → Multicast_PlayFireMontage 全部 Log "FireMontage 为空"
+	 *   - → 远端玩家开火 fire 动画永远不播
+	 *
+	 *   - 新版 (v82): FireMontageHip Replicated → 服务器写入 → 客户端自动同步
+	 *   - 客户端 Multicast_PlayFireMontage_Implementation 拿到正确 FireMontage → 播放
 	 */
-	UPROPERTY()
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
 	TObjectPtr<UAnimMontage> FireMontageHip;
 
 	/**
-	 * 腰射状态下的换弹蒙太奇
+	 * 腰射状态下的换弹蒙太奇 (与 FireMontageHip 同模式 — v82 修复)
 	 */
-	UPROPERTY()
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
 	TObjectPtr<UAnimMontage> ReloadMontageHip;
 
 	// ==========================================
@@ -321,8 +356,19 @@ protected:
 	 *   4. 调 Weapon->GetDamageStrategy().StartTrace (启动 LineTrace)
 	 *   5. 触发 Multicast_PlayFireMontage (走 ABaseWeapon RPC)
 	 *   6. LastFireTimeSeconds = World->GetTimeSeconds()
+	 *
+	 * v82 大厂架构修复 — 客户端射线参数:
+	 *   - 旧 (v70-v81): PerformSingleShot 无参数, Strategy.StartTrace 内部用 PC->GetViewportSize/Deproject
+	 *     → 服务器对远端玩家 PC 调 GetViewportSize 返回 0,0 → Deproject 失败 → trace 永远失败
+	 *   - 新 (v82): PerformSingleShot 接收 ClientRayOrigin/Direction 参数, 透传到 Strategy.StartTrace
+	 *     → 客户端玩家路径用 HUD Crosshair 算出射线 → RPC 传给服务器 → 服务器用客户端射线做权威 trace
+	 *     → 兼容 AI 路径: 不传参数 = AI fallback (Strategy 内部用 BaseAimRotation)
+	 *
+	 * @param ClientRayOrigin     客户端射线起点 (默认 ZeroVector = AI/无客户端射线)
+	 * @param ClientRayDirection  客户端射线方向 (默认 ForwardVector = AI)
 	 */
-	void PerformSingleShot();
+	void PerformSingleShot(const FVector& ClientRayOrigin = FVector::ZeroVector,
+		const FVector& ClientRayDirection = FVector::ForwardVector);
 
 	/**
 	 * 实际完成换弹 (Timer 到期回调)

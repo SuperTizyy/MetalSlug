@@ -63,6 +63,8 @@
 // ==========================================
 #include "CoreMinimal.h"                          // UE 引擎核心最小化
 #include "Components/ActorComponent.h"            // UActorComponent 基类
+#include "Data/Enums/CombatEnums.h"               // EWeaponMeshType (弹药格式判断用 — v84)
+#include "Components/WeaponFireComponent.h"       // v85: 订阅 OnAmmoChanged
 
 // UE 自动生成的头文件 (必须最后, 且用裸文件名 — UE 5.6 严格模式)
 #include "CharacterIconComponent.generated.h"
@@ -269,6 +271,60 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Combat|Icon")
 	UTexture2D* GetWeaponIconFromTable(const FString& WeaponID) const;
 
+	/**
+	 * 【v84 大厂架构新增】广播武器弹药信息到 CharacterEvents
+	 *
+	 * 格式规则:
+	 *   - 近战武器 (EWeaponMeshType::Melee): "1/1" (固定值)
+	 *   - 枪械 (Primary/Secondary): "CurrentAmmo/MagazineSize + ReserveAmmo"
+	 *
+	 * 大厂原则 - 单一真理源:
+	 *   - 弹药数据从 WeaponFireComponent 读取
+	 *   - 武器类型从 Owner->GetCurrentWeapon()->GetMeshType() 读取
+	 *
+	 * 调用方:
+	 *   - 服务器 RefreshWeaponIconOnHUD (武器图标刷新时同步刷新弹药)
+	 *
+	 * @param InOwner 角色指针 (由调用方传入, 避免重复 Cast)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
+	void BroadcastWeaponAmmoInfo(class ABaseCharacter* InOwner);
+
+	/**
+	 * 【v84 大厂架构新增】服务器直接刷新武器图标 (武器切换时调用)
+	 *
+	 * 与 RefreshWeaponIconOnHUD 的区别:
+	 *   - RefreshWeaponIconOnHUD: 读取 Owner->GetSpawnWeaponID() 作为 WeaponID
+	 *   - 本方法: 直接接收 WeaponID 参数, 用于切枪时传入新武器的 WeaponID
+	 *
+	 * 大厂原则 - 单一真理源:
+	 *   - 服务器查 DT_WeaponInfo 表获取图标
+	 *   - 通过 Client_RefreshWeaponIcon RPC 推送到客户端
+	 *
+	 * @param InWeaponID 新武器的 ID (从 TargetWeapon->GetWeaponRowName() 获取)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
+	void RefreshWeaponIconOnHUDFromServer(const FString& InWeaponID);
+
+	/**
+	 * 【v85 大厂架构新增】弹药变化回调 — WeaponFireComponent::OnAmmoChanged 订阅
+	 *
+	 * 根因: 开火消耗弹药后，弹夹数量必须实时更新到 HUD
+	 * 解决方案: 订阅激活武器的 OnAmmoChanged，弹药变化时自动广播弹夹信息
+	 *
+	 * @param NewAmmo    当前弹药数量
+	 * @param MagazineSize 弹匣最大容量
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
+	void OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize);
+
+	/**
+	 * 【v85 大厂架构新增】订阅当前激活武器的弹药变化事件
+	 * 用于 BeginPlay 初始化，以及武器切换后重新订阅
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
+	void SubscribeToActiveWeaponAmmo();
+
 	// ==========================================
 	// UE 生命周期
 	// ==========================================
@@ -314,6 +370,13 @@ private:
 	FString CachedWeaponIDForIcon;
 
 	/**
+	 * 【v85 大厂架构新增】当前订阅的 WeaponFireComponent
+	 * 用于跟踪当前订阅的武器，武器切换时取消旧订阅并订阅新武器
+	 */
+	UPROPERTY(Transient)
+	TWeakObjectPtr<class UWeaponFireComponent> SubscribedWeaponFireComponent;
+
+	/**
 	 * 角色图标重试计数器 — 与 HUD 重试计数器配对, 防止日志洪水
 	 *
 	 * 大厂原则 - 零兜底:
@@ -351,16 +414,14 @@ private:
 	static constexpr int32 MaxIconRefreshRetryCount = 20;
 
 	/**
-	 * Owner Character 缓存 (避免每次访问 Owner 时 Cast)
+	 * 【v84 大厂架构】按需获取 Owner Character
 	 *
-	 * 大厂原则 - 缓存友好:
-	 *   - BeginPlay 缓存一次, 后续访问 O(1)
-	 *   - EndPlay 清空 (Owner 销毁时)
+	 * 使用 GetTypedOuter 而非 GetOwner() 来获取 Owner
+	 * GetTypedOuter 查找包含此组件的 Actor，无论它是否被标记为 Owner
 	 *
-	 * 不需要 UPROPERTY 修饰 — Owner 通过 GetOwner() 保证生命周期
+	 * @return Owner Character 指针 (失败返回 nullptr 并 Log Error)
 	 */
-	UPROPERTY(Transient)
-	TWeakObjectPtr<ABaseCharacter> OwnerCharacter;
+	ABaseCharacter* ResolveOwnerCharacter() const;
 
 	// ==========================================
 	// 内部辅助方法 (private)

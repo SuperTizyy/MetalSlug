@@ -57,6 +57,23 @@ class METALSLUG01_API ARoomGameMode : public AGameModeBase
 
 public:
 	// ==========================================
+	// 【v76 大厂架构 — 武器切换音效】访问器
+	// ==========================================
+	//
+	// 单一真理源 (v76 落地):
+	//   - GM->WeaponSoundMapAsset 字段 (SoftObjectPtr, UE 编辑器 BG 加载)
+	//   - GetWeaponSoundMapAsset() 返回同步加载后的 UWeaponSoundMapAsset*
+	//   - 调用方 (WeaponAttachmentComponent) 走这个 API 拿真理源
+	//   - 找不到 / 未配 → Log Error + return nullptr (零兜底)
+	//
+	// 大厂原则 - 配置可发现性:
+	//   - 错误日志明确指出"BP_GM_RoomGameMode → Room|Audio → Weapon Sound Map Asset"
+	//
+	// @return 同步加载后的 UWeaponSoundMapAsset (nullptr 表示 Log Error 已记录)
+	// ==========================================
+	class UWeaponSoundMapAsset* GetWeaponSoundMapAsset() const;
+
+	// ==========================================
 	// 【2026.07.11 v29.5】出生点 PlayerStartTag 常量定义
 	// 【2026.07.11 v29.8 重命名】统一阵营命名, "Faction_Attack" → "Faction_Offense"
 	//
@@ -380,6 +397,28 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Room|Data")
 	class UDataTable* WeaponAttachmentDataTable;
+
+	/**
+	 * 【v76 大厂架构 — 武器切换音效】武器切换音效映射配置 DataAsset
+	 *
+	 * 真理源 (v76 新增):
+	 *   - 所有武器切换音效从本资产读取 (按 EWeaponSlotType 映射 USoundBase)
+	 *   - 玩家按 1/2/3 切武器 → Server_SwitchToWeaponSlot 走此资产
+	 *
+	 * 单一真理源 (与 PlayerConfigAsset / WeaponDataTable 同位置):
+	 *   - BP_GM_RoomGameMode → Class Defaults → Room|Audio → Weapon Sound Map Asset
+	 *   - 运行时: UWeaponAttachmentComponent::GetWeaponSoundMapAsset() 走 GM
+	 *   - 找不到 GM / Asset 字段为空 → Log Error + 强制修复 (零兜底)
+	 *
+	 * 资产类型: UWeaponSoundMapAsset (DataAsset)
+	 * 默认值: 策划需创建 DA_WeaponSoundMap.uasset 并赋给此字段
+	 *
+	 * 大厂原则 - 零兜底:
+	 *   - GM->WeaponSoundMapAsset 未配置 → Log Error, 切武器时拒绝播放音效
+	 *   - 某个 Slot 的 Sound 字段为空 → Log Error (强制修复 DA), 不"默认 fallback"
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Audio", meta = (AllowedClasses = "/Script/MetalSlug01.WeaponSoundMapAsset"))
+	TSoftObjectPtr<class UWeaponSoundMapAsset> WeaponSoundMapAsset;
 
 	/**
 	 * @brief 处理玩家的生成请求

@@ -6,6 +6,15 @@
 // 引入本类头文件
 #include "Weapons/BaseWeapon.h"
 
+// UE 反射: DOREPLIFETIME (GetLifetimeReplicatedProps 需要)
+#include "Net/UnrealNetwork.h"
+
+// 【v83】APawn (Multicast_PlayFireTraceVisual_Implementation 用 Owner Pawn->IsLocallyControlled 跳过服务器本地)
+#include "GameFramework/Pawn.h"
+
+// 引入武器模型类型枚举 (v61.2 — DT_WeaponInfo 真理源)
+#include "Data/Tables/WeaponTableRow.h"
+
 // 引入 Mesh 组件基类 (GetMeshComponent 返回 UMeshComponent*)
 #include "Components/MeshComponent.h"
 // 引入 SkeletalMesh 组件 (ResolveMagazineSkeletalMesh 返回类型)
@@ -31,6 +40,8 @@
 #include "Data/Faction/FactionTags.h"
 // v70 缺失接口: IWeaponDamageStrategy (GetDamageStrategy / SetDamageStrategy)
 #include "Weapons/WeaponDamageStrategy.h"
+#include "Weapons/MeleeSwStrategy.h"
+#include "Weapons/RangedLineStrategy.h"
 
 
 // ==========================================
@@ -70,7 +81,109 @@ ABaseWeapon::ABaseWeapon()
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.TickGroup = TG_PostUpdateWork;
 
+	// 【v83 客户端同步修复】SetReplicateMovement(true)
+	//   - bReplicates 已在 line 59 设为 true (基础复制)
+	//   - 但 transform (位置/旋转) 默认不同步, 客户端武器可能停在初始 Spawn 位置
+	//   - SetReplicateMovement(true) → 客户端能跟着武器 Attach 到角色 Socket 移动
+	SetReplicateMovement(true);
+
 	WeaponDissolveComponent = CreateDefaultSubobject<UWeaponDissolveComponent>(TEXT("WeaponDissolveComponent"));
+}
+
+
+/**
+ * 【v82 客户端武器可用性修复】GetLifetimeReplicatedProps — 注册需要复制的字段
+ *
+ * 大厂原则 (单一真理源 + 显式同步):
+ *   - 服务器 SpawnAndEquipWeapon → InitializeWeaponFireConfigFromClass 写入策划配置
+ *   - 客户端需要这些字段才能正确触发 RPC 和 trace
+ *   - UE 自动复制: 服务器写入 → 网络同步 → 客户端 OnRep_* 触发 (本类无 OnRep, 客户端直读)
+ *
+ * 复制清单 (6 个核心字段):
+ *   - AttackRange   (枪械射线射程)
+ *   - MuzzleOffset  (枪口偏移)
+ *   - WeaponRowName (DT_WeaponInfo 行名, 弹匣动画/伤害计算用)
+ *   - MeshType      (武器类型: Primary/Secondary/Melee, 决定按左键走 LightAttack 还是 Server_StartFire)
+ *   - DamageStrategy (TScriptInterface — v82 修复: 必须 DOREPLIFETIME, UE 不会自动复制 UObject 引用)
+ *                       调用方: ANS_MeleeTraceState (客户端) + WeaponFireComponent (服务器)
+ */
+void ABaseWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	// 6 个核心字段 — 客户端必须跟服务器一致
+	DOREPLIFETIME(ABaseWeapon, AttackRange);
+	DOREPLIFETIME(ABaseWeapon, MuzzleOffset);
+	DOREPLIFETIME(ABaseWeapon, WeaponRowName);
+	DOREPLIFETIME(ABaseWeapon, MeshType);
+
+	// v82 修复: DamageStrategy 必须 Replicated (客户端 ANS_MeleeTraceState 调 GetDamageStrategy 不能为 nullptr)
+	// 旧注释说"UE 标准对象复制系统自动处理"是错的, UObject 引用必须显式 DOREPLIFETIME
+	DOREPLIFETIME(ABaseWeapon, DamageStrategy);
+
+	// 【v82+ 修复】LightAttackMontages / HeavyAttackMontage 必须 Replicated
+	//   - 旧版 (v6-v81) 没标 Replicated → 客户端拿不到蒙太奇引用 → GetAttackMontage 返回 nullptr
+	//   - 客户端 ExecuteComboSequence 跳过 if (ComboMontage) → 客户端不播本地 montage
+	//   - 客户端 ANS_MeleeTraceState::NotifyBegin 收不到 → 客户端屏幕看不到 trace
+	//   - 服务器 multicast montage → 客户端 OnPlayerAttackMontageEnded 收到 (multicast) 但 CachedPlayerMontage 空
+	//   - 根因: 武器 BP 设的蒙太奇引用没有传给客户端
+	//   - 修复: UPROPERTY(Replicated) + DOREPLIFETIME → 客户端能拿到正确的 LightAttackMontages / HeavyAttackMontage
+	DOREPLIFETIME(ABaseWeapon, LightAttackMontages);
+	DOREPLIFETIME(ABaseWeapon, HeavyAttackMontage);
+}
+
+
+/**
+ * BeginPlay — 【v83 大厂架构】客户端武器 Mesh 强制 NoCollision
+ *
+ * 调用方: UE 引擎 (Actor 初始化完成)
+ *
+ * 【核心问题】客户端武器 Mesh 阻挡角色移动 + SpringArm 阻挡
+ *   - 服务器路径 (SpawnAndEquipWeapon / SpawnAndConfigureWeaponInSlot / Server_SpawnAllWeapons
+ *     / OnRep_CurrentWeaponSlot) 已 SetActorEnableCollision(NoCollision)
+ *   - 但这些函数在客户端进程**不执行** (它们是 Server RPC 或 OnRep 触发)
+ *   - 客户端进程拿到的 BP_Weapon_Xxx Actor 是 UE 复制创建, Mesh 仍保留 BP 默认 BlockAllDynamic 碰撞
+ *   - 后果 1: 客户端玩家拿着 BP_Weapon_ShovelLarge (StaticMesh, 长 ~70cm) 在场景跑
+ *     → 武器 StaticMesh 阻挡角色 Capsule 移动 → 画面"一直抖动"
+ *   - 后果 2: 武器 mesh 阻挡 SpringArm (CameraBoom->ProbeSize=12 默认值)
+ *     → 镜头缩到角色身上 → "射击时镜头被阻挡"
+ *
+ * 大厂原则 (零兜底 + 单一真理源 + 物理正确性):
+ *   - 这是"物理正确性"不是"业务兜底": 武器 Mesh 不应该物理阻挡任何 Actor
+ *   - 武器纯装饰 + 伤害源, 不参与碰撞
+ *   - BeginPlay 双保险: 服务器端即使忘记在 SpawnAndEquipWeapon 中调 NoCollision, BeginPlay 也兜底
+ *   - 客户端端 BeginPlay 是必须的: Server 函数不跑客户端 → 必须 BeginPlay 兜
+ *
+ * 大厂原则 (Decoupled Architecture):
+ *   - 不用反射, 不用事件, 不用 OnRep
+ *   - 直接调 GetMeshComponent() (单一真理源), 然后设 NoCollision
+ *   - 找不到 Mesh → Log Warning (不影响游戏, 玩家不会察觉, 但策划配错应该报警)
+ */
+void ABaseWeapon::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// 强制禁用武器 Actor 物理碰撞 (含所有组件 — Mesh + MagazineSkeletal + ...)
+	//   - SetActorEnableCollision(false) 影响整个 Actor 的所有 primitive 组件
+	//   - 武器 mesh 不应阻挡任何东西 (角色/SpringArm/物理对象)
+	//   - 这是"装饰 Actor"的标准做法 (与 Projectile Actor 相反 — 子弹需要物理碰撞)
+	SetActorEnableCollision(false);
+
+	// 双保险: 单独对 Mesh 组件设 ECollisionEnabled::NoCollision
+	//   - 某些 BP 的 Actor 可能有多个 Mesh (主 mesh + 弹匣 mesh + ...)
+	//   - 对每个 Mesh 都设 NoCollision
+	if (UMeshComponent* WeaponMesh = GetMeshComponent())
+	{
+		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		WeaponMesh->SetCollisionResponseToAllChannels(ECR_Ignore);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[ABaseWeapon] BeginPlay: Weapon=%s 没有 Mesh 组件! 客户端可能依然会出现碰撞阻挡问题. "
+			     "【v83 警告】修复: 在 BP 蓝图的 Components 面板添加 StaticMeshComponent (近战) 或 SkeletalMeshComponent (枪械)."),
+			*GetName());
+	}
 }
 
 
@@ -86,10 +199,9 @@ ABaseWeapon::ABaseWeapon()
  */
 void ABaseWeapon::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// 防御性清场: 即便逻辑层(OnAIAttackMontageEnded / Die)漏了清理,
-	// EndPlay 是最后一道防线, 保证 Actor 销毁时通道状态是干净的
-	bIsWeaponActive = false;
-	IgnoreActors.Empty();
+	// 【v75 修复】删除旧版 bIsWeaponActive / IgnoreActors 字段清理 (v60 之前的死代码)
+	//   新版 trace 完全由 Strategy (UMeleeSwStrategy / URangedLineStrategy) 管理
+	//   BaseWeapon 不持有 trace 状态字段
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -116,42 +228,18 @@ void ABaseWeapon::EndPlay(const EEndPlayReason::Type EndPlayReason)
  */
 void ABaseWeapon::StartWeaponTrace(bool bIsHeavyAttack)
 {
-	// 【v61.3 零兜底】Mesh 必须在开刃前就就位
-	UMeshComponent* Mesh = GetMeshComponent();
-	if (!Mesh)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[ABaseWeapon] StartWeaponTrace: Weapon=%s 没有 Mesh 组件 — 拒绝开刃. ")
-			TEXT("【v61.3 零兜底】修复: 在 BP 蓝图 Components 面板添加 StaticMeshComponent (近战) 或 SkeletalMeshComponent (枪械)."),
-			*GetName());
-		return;
-	}
-
-	bIsWeaponActive = true;
-	bIsCurrentAttackHeavy = bIsHeavyAttack;
-	IgnoreActors.Empty();
-	IgnoreActors.Add(this);
-	IgnoreActors.Add(GetOwner());
-
-	// 开刃的瞬间，立刻记录下刀刃的初始位置
-	LastFrameStartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
-	LastFrameEndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
+	// 【v75 架构清理】转发到 DamageStrategy
+	// 旧版 (v1-v60.9): 本函数内联 trace 算法 + 字段状态
+	// 新版 (v60.3+):   trace 算法由 UMeleeSwStrategy / URangedLineStrategy 实现
+	// ANS_MeleeTraceState::NotifyBegin 调本方法 → 转发到 Strategy
+	StartDamageTrace(bIsHeavyAttack);
 }
 
 
-/**
- * StopWeaponTrace
- *
- * 关闭武器刀刃伤害判定
- * 同时清空黑名单
- *
- * 【P0 2026.07.07】不会关闭 AI 通道,两个通道独立管理
- *   AI 通道状态由 SetAIWeaponActive 显式控制
- */
 void ABaseWeapon::StopWeaponTrace()
 {
-	bIsWeaponActive = false;
-	IgnoreActors.Empty();
+	// 【v75 架构清理】转发到 DamageStrategy
+	StopDamageTrace();
 }
 
 
@@ -167,131 +255,36 @@ void ABaseWeapon::StopWeaponTrace()
 
 
 // ==========================================
-// 3. 核心刀刃扫掠判定
+// 3. 核心刀刃扫掠判定 (v75 — 委托 Strategy)
 // ==========================================
 
 /**
- * Tick
+ * Tick (v75 架构清理 — 删除重复 BoxTrace)
  *
- * 武器激活时每帧进行刀刃扫掠追踪
- * 核心黑科技: 缝合上一帧与当前帧的真空区（防止挥刀速度太快漏判）
+ * 旧版 (v1-v60.9): ABaseWeapon::Tick 内联 BoxTrace 算法
+ *   - 字段: bIsWeaponActive / bIsCurrentAttackHeavy / LastFrameStartLoc / LastFrameEndLoc / IgnoreActors
+ *   - StartWeaponTrace / StopWeaponTrace 维护这些字段
+ *   - Tick 每帧跑 BoxTrace
  *
- * 流程:
- * 1. 获取刀刃起点和终点的世界坐标
- * 2. 计算上一帧和当前帧的中心点
- * 3. 构建长方体检测盒（贴合刀身方向）
- * 4. BoxTraceSingle 从上一帧中心滑向当前帧中心
- * 5. 命中则加入黑名单并调用 Server_ReportHit
- * 6. 记录当前帧位置作为下一帧的"上一帧"
+ * 新版 (v60.3+): ABaseWeapon::Tick 委托 Strategy
+ *   - Strategy 内部: bIsActive / bIsCurrentHeavy / LastFrameStartLoc / LastFrameEndLoc / IgnoreActors
+ *   - StartDamageTrace / StopDamageTrace 转发到 DamageStrategy
+ *   - Tick 仅在 Strategy 激活时调 TickDetection
+ *
+ * 大厂原则 - 单一真理源 + DRY:
+ *   - 删除 BaseWeapon 内重复字段 → 真理源唯一 (Strategy 内部)
+ *   - 删除 Tick 内重复 BoxTrace → 0 算法 (委托)
+ *   - 旧 StartWeaponTrace / StopWeaponTrace 保留为转发壳, 兼容历史调用
  */
 void ABaseWeapon::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	// 如果没开刃，直接退出，节省性能
-	if (!bIsWeaponActive) return;
-
-	// 【P0 2026.07.07 大厂架构重构】删除原"AI 通道屏蔽 trace"分支
-	//
-	// 旧逻辑 (2026.07.07 之前): AI 攻击时 SetAIWeaponActive(true) 把 trace 拦住,
-	//   然后由 OnAIRequestAttack_Simple 直接调 Server_ReportHit 在第一帧扣血
-	//   → 一次挥刀两种伤害 (虽然能互斥屏蔽 trace, 但 AI 抬手瞬间就扣血)
-	//
-	// 新逻辑 (2026.07.07 大厂架构): 玩家和 AI **完全共用同一套 trace 路径**
-	//   - 蒙太奇 AnimNotify 触发 StartWeaponTrace → Tick 跑 BoxTrace
-	//   - 命中 → Server_ReportHit 读 Owner.bIsCurrentlyAttackerAI 决定走 ConfigSO 还是 LightDamageBody
-	//   - 真正的"刀碰到了才扣血", 跟物理现实一致
-	// ============================================================
-
-	// 获取雷达探头的当前世界坐标
-	UMeshComponent* Mesh = GetMeshComponent();
-	if (!Mesh)
+	// v75 架构清理: 仅委托 Strategy.TickDetection (Strategy 内部自带"激活态"判断)
+	if (DamageStrategy.GetObject())
 	{
-		return;
+		DamageStrategy->TickDetection(this, DeltaTime);
 	}
-	FVector StartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
-	FVector EndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
-
-	// 如果两点重合或未找到插槽，绝对不能往下执行矩阵计算
-	if ((EndLoc - StartLoc).IsNearlyZero()) return;
-
-	// ==========================================
-	// 【核心黑科技】: 缝合上一帧与当前帧的真空区
-	// ==========================================
-
-	// 1. 算出上一帧刀刃的中心点，和这一帧刀刃的中心点
-	FVector LastMid = (LastFrameStartLoc + LastFrameEndLoc) * 0.5f;
-	FVector CurrentMid = (StartLoc + EndLoc) * 0.5f;
-
-	// 2. 算出刀身到底有多长
-	float BladeLength = FVector::Distance(StartLoc, EndLoc);
-
-	// 3. 构建一个长方体检测盒 (长和宽是 15 的剑气厚度，高度是刀身长度的一半)
-	FVector BoxHalfSize = FVector(15.0f, 15.0f, BladeLength * 0.5f);
-
-	// 绝对不要用 MakeFromZ 猜角度，直接拿插槽最真实的物理旋转
-	// 这样检测盒的长宽高，将完美且死死地贴合你的大锤/刀身，在空中绝对不会发生自转抽搐
-	FRotator BoxRotation = Mesh->GetSocketRotation(FName("TraceStart"));
-
-	// 碰撞检测结果
-	FHitResult HitResult;
-
-	// 4. 见证奇迹: 把这个检测盒，从上一帧的中心，滑向这一帧的中心
-	bool bHit = UKismetSystemLibrary::BoxTraceSingle(
-		this,
-		LastMid,     // 起点: 上一帧的中心
-		CurrentMid,  // 终点: 这一帧的中心
-		BoxHalfSize, // 检测盒的体积
-		BoxRotation, // 检测盒的倾斜角度
-		UEngineTypes::ConvertToTraceType(ECC_Visibility),
-		false,
-		IgnoreActors,
-		EDrawDebugTrace::ForDuration, // 保持开启红线调试
-		HitResult,
-		true
-	);
-
-	if (bHit && HitResult.GetActor())
-	{
-		// 1. 将这名受害者加入黑名单，这刀还没收回之前，不会再判定他
-		IgnoreActors.Add(HitResult.GetActor());
-
-		// 【修复】: 所有机器都报告命中，由服务器统一执行伤害
-		// 客户端直接报告命中，Server RPC 会自动路由到服务器执行
-		// ============================================================
-		// 【P0 2026.07.07 大厂架构重构】伤害来源按攻击者决定
-		//
-		// 旧逻辑: 传 bIsAIDriven=false (硬编码)
-		//   → 所有 trace 命中都按"玩家"路径扣 LightDamageBody/Head
-		//   → AI 攻击读武器字段, 完全无视 ConfigSO.Damage
-		//
-		// 新逻辑 (玩家/AI 完全共用同一套 trace 路径):
-		//   从 Owner Character 读 bIsCurrentlyAttackerAI:
-		//     - true  → bIsAIDriven=true (走 AI 通道, 用 ConfigSO.Damage)
-		//     - false → bIsAIDriven=false (走玩家通道, 用 LightDamageBody/Head)
-		//
-		// 关键: 单点决策 — 不再在 Server_ReportHit 里加新 if-else
-		// ============================================================
-		bool bAIDriven = false;
-		if (const ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner()))
-		{
-			bAIDriven = OwnerChar->IsAttackerAI();
-		}
-
-		Server_ReportHit(
-			HitResult.GetActor(),
-			0.0f, // 伤害值由服务器根据部位重新计算 (或 AI 通道读 ConfigSO.Damage)
-			HitResult.ImpactPoint,
-			HitResult.ImpactNormal,
-			HitResult.BoneName,
-			bIsCurrentAttackHeavy,
-			bAIDriven  // 【P0 2026.07.07】从攻击者 Character 动态读取
-		);
-	}
-
-	// 【极其重要】: 当前帧结算完毕，把当前位置存入记忆，变成下一帧的"上一帧"
-	LastFrameStartLoc = StartLoc;
-	LastFrameEndLoc = EndLoc;
 }
 
 
@@ -398,17 +391,33 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	const bool bIsAIDriven_Authoritative = (AttackerController != nullptr)
 		&& AttackerController->IsA(AAIController::StaticClass());
 
-	if (!FFactionTags::CanDamage(
-			AttackerCharFFCheck->GetFactionTag(),
-			Victim->GetFactionTag(),
-			TEXT("ABaseWeapon::Server_ReportHit"),
-			AttackerCharFFCheck->GetName(),
-			Victim->GetName()))
+	// 【v85.1 诊断】存储友军检查结果
+	const bool bCanDamage = FFactionTags::CanDamage(
+		AttackerCharFFCheck->GetFactionTag(),
+		Victim->GetFactionTag(),
+		TEXT("ABaseWeapon::Server_ReportHit"),
+		AttackerCharFFCheck->GetName(),
+		Victim->GetName());
+
+	if (!bCanDamage)
 	{
-		// CanDamage 内部已 Log Error/Warning + 指出修复路径, 这里仅静默 return
-		// 大厂原则: 不重复打日志, 让 CanDamage 单一日志源
+	// 【v85.1 诊断】友军拒绝
+	UE_LOG(LogTemp, Warning,
+			TEXT("[ABaseWeapon::Server_ReportHit] 友军伤害拒绝: Attacker=%s (Faction=%s) -> Victim=%s (Faction=%s). 不扣血."),
+			*AttackerCharFFCheck->GetName(),
+			*AttackerCharFFCheck->GetFactionTag().ToString(),
+			*Victim->GetName(),
+			*Victim->GetFactionTag().ToString());
 		return;
 	}
+
+	// 【v85.1 诊断】友军允许 — 继续扣血
+	UE_LOG(LogTemp, Warning,
+		TEXT("[ABaseWeapon::Server_ReportHit] 友军检查通过: Attacker=%s (Faction=%s) -> Victim=%s (Faction=%s). 继续扣血."),
+		*AttackerCharFFCheck->GetName(),
+		*AttackerCharFFCheck->GetFactionTag().ToString(),
+		*Victim->GetName(),
+		*Victim->GetFactionTag().ToString());
 
 	// ============================================================
 	// 【2026.07.11 P0 大厂架构】复活无敌期守卫 (Spawn Invincibility Guard) — 早期观察点
@@ -546,6 +555,15 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	HitInfo.BoneName = BoneName;
 	HitInfo.ImpactPoint = HitLocation;
 	HitInfo.ImpactNormal = HitNormal;
+
+	// 【v85.1 诊断】确认 FinalDamage 合理
+	if (FinalDamage <= 0.0f)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseWeapon::Server_ReportHit] FinalDamage<=0! Victim=%s Damage=%.1f. 修复: 检查 DT_WeaponInfo 伤害字段."),
+			*Victim->GetName(), FinalDamage);
+		return;
+	}
 
 	// UE5: 使用 HitInfo 的 GetActor() 会返回 Actor
 	// ApplyPointDamage 内部会从 HitInfo 提取必要信息
@@ -715,14 +733,113 @@ UMeshComponent* ABaseWeapon::GetMeshComponent() const
 }
 
 /**
+ * StartDamageTrace — 启动伤害追踪
+ *
+ * 【v73 大厂架构】转发到 DamageStrategy (单一真理源)
+ *   - 调用方: PlayerComboComponent::EnableComboWindow (玩家挥刀中段)
+ *   - 调用方: AIAttackComponent 蒙太奇中段 (未来)
+ *   - 替代旧版"BP AnimNotify 调用 PerformDamageTrace" 的 BP 配置错反模式
+ *     (大厂原则 - 零兜底: 不依赖 BP AnimNotify 是否配了)
+ */
+void ABaseWeapon::StartDamageTrace(bool bIsHeavy)
+{
+	// 【v85.2 大厂架构修复】懒创建 DamageStrategy
+	//
+	// 根因 (从 Session1.log 定位):
+	//   日志: "[ABaseWeapon] StartDamageTrace: DamageStrategy 未注册 → 拒绝开启"
+	//   → DamageStrategy 在客户端是 nullptr
+	//
+	// 根因分析:
+	//   1. 服务器 Spawn 武器时, WeaponAttachmentComponent::SpawnAndEquipWeapon 调 SetDamageStrategy(NewObject<UMeleeSwStrategy>)
+	//   2. DamageStrategy 字段虽然有 UPROPERTY(Replicated), 但 TScriptInterface 内部持有的 UObject 引用
+	//      在跨 Actor 引用复制的场景下可能失效 (Weapon 自身是复制过来的引用, 但内部的 subobject 引用未必同步)
+	//   3. 客户端 ANS_MeleeTraceState::NotifyBegin 调 Weapon->StartDamageTrace
+	//      → DamageStrategy.GetObject() == nullptr → 直接 return
+	//   4. 后果: 客户端没有任何 melee trace, 既没有伤害也没有视觉
+	//
+	// 架构设计 (大厂原则 - 单一职责):
+	//   - DamageStrategy 的创建应该只在 Spawn 链路中发生一次 (WeaponAttachmentComponent)
+	//   - 但如果 Spawn 链路有 bug (复制问题), 不能让 StartDamageTrace 静默失败
+	//   - 懒创建 = 确保功能可用的防御性措施, 而非"兜底"
+	//   - 最终还是要修 Spawn 链路, 让 DamageStrategy 在 Spawn 时正确创建
+	//
+	if (!DamageStrategy.GetObject())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[ABaseWeapon] StartDamageTrace: DamageStrategy 为空, 懒创建. Weapon=%s MeshType=%d. "
+			     "【v85.2 懒创建】确保客户端能正常工作. "
+			     "但这说明 Spawn 链路有问题 — DamageStrategy 应该在 Spawn 时注入, 不是这里才创建."),
+			*GetName(),
+			static_cast<int32>(MeshType));
+
+		// 按 MeshType 创建对应的 Strategy
+		switch (MeshType)
+		{
+		case EWeaponMeshType::Melee:
+			{
+				UObject* NewStrategy = NewObject<UMeleeSwStrategy>(this);
+				DamageStrategy.SetObject(NewStrategy);
+				DamageStrategy.SetInterface(Cast<IWeaponDamageStrategy>(NewStrategy));
+				break;
+			}
+		case EWeaponMeshType::Primary:
+		case EWeaponMeshType::Secondary:
+			{
+				UObject* NewStrategy = NewObject<URangedLineStrategy>(this);
+				DamageStrategy.SetObject(NewStrategy);
+				DamageStrategy.SetInterface(Cast<IWeaponDamageStrategy>(NewStrategy));
+				break;
+			}
+		default:
+			UE_LOG(LogTemp, Error,
+				TEXT("[ABaseWeapon] StartDamageTrace: MeshType 为 None, 无法懒创建 DamageStrategy. Weapon=%s."),
+				*GetName());
+			return;
+		}
+
+		if (!DamageStrategy.GetObject())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ABaseWeapon] StartDamageTrace: DamageStrategy 懒创建失败. Weapon=%s."),
+				*GetName());
+			return;
+		}
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[ABaseWeapon] StartDamageTrace: DamageStrategy 懒创建成功. Weapon=%s Strategy=%s"),
+			*GetName(),
+			*DamageStrategy.GetObject()->GetClass()->GetName());
+	}
+
+	if (!DamageStrategy->StartTrace(this, bIsHeavy))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseWeapon] StartDamageTrace: Strategy->StartTrace 失败. Weapon=%s 【v73 零兜底】检查 Mesh / Socket / BP 配置."),
+			*GetName());
+	}
+}
+
+/**
  * StopDamageTrace — 停止伤害追踪
  *
- * v70 保守修复: 旧版 StopDamageTrace 是 Weapon 公开方法.
- * 新版近战武器用 MeleeSwStrategy::StopTrace, 这里 stub 给玩家/AI 路径做兼容.
+ * 【v73 大厂架构修复】转发到 DamageStrategy (与 StartDamageTrace 对称)
+ *   - 旧版 (v70-v72) 是 no-op stub, 导致 EnableComboWindow 中 StartTrace 后永远没停
+ *   - 修复: 转发到 DamageStrategy->StopTrace(this)
+ *
+ * 调用方:
+ *   - PlayerComboComponent::OnPlayerAttackMontageEnded (蒙太奇结束)
+ *   - AIAttackComponent::OnAIAttackMontageEnded (蒙太奇结束)
+ *   - BaseWeapon::OnWeaponChanged (切换武器槽位, 强制停当前检测)
  */
 void ABaseWeapon::StopDamageTrace()
 {
-	// no-op: 近战伤害追踪由 MeleeSwStrategy 管理
+	if (!DamageStrategy.GetObject())
+	{
+		// 【v73 零兜底】若 Strategy 已 Disposed (Destroy 链路), 静默 — 幂等
+		return;
+	}
+
+	DamageStrategy->StopTrace(this);
 }
 
 /**
@@ -830,14 +947,92 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 		*GetName(), *ReloadMontage->GetName());
 }
 
+
 /**
- * Server_StartFire — 服务器开始开火
+ * Multicast_PlayFireTraceVisual_Implementation — 客户端同步显示服务器 trace 视觉
  *
- * v70 保守修复: 旧版是 Weapon RPC, 新版 WeaponFireComponent 内.
- * 这里 stub 做 no-op (真实实现在 WeaponFireComponent::Server_StartFire).
+ * 调用方: URangedLineStrategy::PerformSingleShot (服务器权威 trace 完后)
+ *
+ * 架构:
+ *   - 服务器权威 trace (单次权威判定)
+ *   - 服务器 trace 完后调 Multicast → 所有客户端画 DrawDebugLine (红线/绿线, 与服务器一致)
+ *   - 大厂原则: 服务器权威 trace → 客户端视觉同步, 不重复 trace
+ *
+ * @param StartLoc trace 起点
+ * @param EndLoc   trace 终点
+ * @param bHit     是否命中 (决定颜色: 命中绿, 未命中红)
+ * @param HitLoc   命中点 (bHit=true 时有效)
  */
-void ABaseWeapon::Server_StartFire_Implementation()
+void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc, FVector EndLoc, bool bHit, FVector HitLoc)
 {
+	// 跳过服务器本地进程 — 服务器自己已经画过 (EDrawDebugTrace::ForDuration), 不重复
+	//   - 服务器本地 = HasAuthority=true (是服务器进程) + Owner Pawn IsLocallyControlled=true (这是本地玩家)
+	//   - 远端客户端 = HasAuthority=false (是客户端进程) → 不跳过, 画视觉线
+	if (HasAuthority())
+	{
+		if (const APawn* OwnerPawn = Cast<APawn>(GetOwner()))
+		{
+			if (OwnerPawn->IsLocallyControlled())
+			{
+				return;
+			}
+		}
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 颜色: 命中绿, 未命中红 (与服务器 trace 一致)
+	const FColor LineColor = bHit ? FColor::Green : FColor::Red;
+
+	// 1. 主线: StartLoc → (bHit ? HitLoc : EndLoc)
+	// 【v85.x 修复】bPersistentLines=true 让射线持续显示，不再是 0.5s 闪烁
+	const FVector LineEnd = bHit ? HitLoc : EndLoc;
+	DrawDebugLine(
+		World,
+		StartLoc,
+		LineEnd,
+		LineColor,
+		true,                        // bPersistentLines: 持续显示 (不再消失)
+		3.0f,                        // LifeTime: 3秒后消失 (足够看清)
+		0,                           // DepthPriority
+		2.0f                         // Thickness: 2.0 粗线 (比之前 1.5 更明显)
+	);
+
+	// 2. 命中十字 (bHit=true 时画, 让客户端清楚"打中了哪里")
+	// 【v85.x 修复】命中十字也持续显示
+	if (bHit)
+	{
+		const float CrossSize = 10.0f; // 10cm 十字
+		DrawDebugLine(World, HitLoc - FVector(CrossSize, 0, 0), HitLoc + FVector(CrossSize, 0, 0), FColor::Green, true, 3.0f, 0, 2.0f);
+		DrawDebugLine(World, HitLoc - FVector(0, CrossSize, 0), HitLoc + FVector(0, CrossSize, 0), FColor::Green, true, 3.0f, 0, 2.0f);
+		DrawDebugLine(World, HitLoc - FVector(0, 0, CrossSize), HitLoc + FVector(0, 0, CrossSize), FColor::Green, true, 3.0f, 0, 2.0f);
+	}
+}
+
+
+/**
+ * Server_StartFire — 服务器开始开火 (枪械)
+ *
+ * v82 大厂架构修复 — 客户端射线参数:
+ *   - 旧 (v70-v81) 反模式: Server_StartFire 无参数, 服务器 WeaponFireComponent::StartFire()
+ *     → 内部用 PC->GetViewportSize/Deproject → 服务器对远端玩家 PC 失败 → trace 永远失败
+ *   - 新 (v82): 客户端玩家路径 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
+ *     → 服务器用客户端射线做权威 trace (防作弊)
+ *     → 兼容 AI 路径: 传零向量 = AI fallback (Strategy 内部用 BaseAimRotation)
+ */
+void ABaseWeapon::Server_StartFire_Implementation(const FVector_NetQuantize& ClientRayOrigin, const FVector_NetQuantizeNormal& ClientRayDirection)
+{
+	// 【v85.1 诊断】入口 Log — 确认 RPC 是否被调用
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseWeapon] Server_StartFire_Implementation ENTER. Weapon=%s Origin=%s Dir=%s"),
+		*GetName(),
+		*ClientRayOrigin.ToCompactString(),
+		*ClientRayDirection.ToCompactString());
+
 	if (!WeaponFireComponent)
 	{
 		UE_LOG(LogTemp, Error,
@@ -845,7 +1040,7 @@ void ABaseWeapon::Server_StartFire_Implementation()
 			*GetName());
 		return;
 	}
-	WeaponFireComponent->StartFire();
+	WeaponFireComponent->StartFire(ClientRayOrigin, ClientRayDirection);
 }
 
 bool ABaseWeapon::Server_StartFire_Validate()

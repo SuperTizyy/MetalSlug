@@ -43,6 +43,51 @@
 
 class ABaseWeapon;
 
+/**
+ * EWeaponTraceState — 武器检测状态标签 (v74 大厂架构统一)
+ *
+ * 【设计动机 — 用户需求 2026.07.22】
+ *   美术想在 UE 编辑器蒙太奇里"拖时间轴"打检测状态标签 (Idle/Tracing/Hit),
+ *   让动画驱动检测生命周期. 旧版依赖 BP ANS_MeleeTrace 一刀切调用 StartTrace/StopTrace,
+ *   策划/美术无法按"挥刀中段/收刀"分段控制.
+ *
+ * 【v74 统一状态标签 — 大厂原则】
+ *   - 单一真理源: ANS_MeleeTraceState (UAnimNotifyState 子类) 在蒙太奇时间轴上设置标签
+ *   - C++ 端: AnimNotifyState::NotifyBegin/NotifyEnd 把标签写入 Strategy 内部字段
+ *   - 各 Strategy (Melee/Ranged) 读统一字段, 不再有散落的 bIsActive
+ *
+ * 状态机 (蒙太奇时间轴驱动):
+ *   Idle (蒙太奇起播) → AnimNotifyState::NotifyBegin(Tracing) → 检测中
+ *   Tracing → AnimNotifyState::NotifyEnd(Idle) → 检测关闭
+ *   Hit 是 TickDetection 命中时设置, 立即回 Tracing
+ */
+UENUM(BlueprintType)
+enum class EWeaponTraceState : uint8
+{
+	/** 未激活 — 默认状态 */
+	Idle UMETA(DisplayName = "Idle"),
+	/** 检测中 — AnimNotifyState::NotifyBegin 设置, NotifyEnd 清除 */
+	Tracing UMETA(DisplayName = "Tracing"),
+	/** 本帧命中 — TickDetection 命中时设置, 立即回 Tracing */
+	Hit UMETA(DisplayName = "Hit")
+};
+
+/**
+ * 武器检测状态变化委托 (v74)
+ *
+ * @param State      新状态
+ * @param HitActor   命中目标 (State=Hit 时有效, 其他为空)
+ * @param HitLoc     命中世界坐标 (State=Hit 时有效)
+ * @param HitBone    命中骨骼名 (State=Hit 时有效, Headshot 判定关键)
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
+	FOnWeaponTraceStateChanged,
+	EWeaponTraceState, State,
+	AActor*, HitActor,
+	FVector, HitLoc,
+	FName, HitBone
+);
+
 UINTERFACE(MinimalAPI, BlueprintType, meta = (CannotImplementInterfaceInBlueprint))
 class UWeaponDamageStrategy : public UInterface
 {
@@ -82,12 +127,25 @@ public:
 	 *   - Melee (近战): 初始化跨帧状态 + 启动 TickDetection 做 BoxTrace 缝合
 	 *     * 调用方需要后续 StopTrace 关闭 (否则 Tick 会一直做事)
 	 *
+	 * 【v82 大厂架构修复 — 客户端射线参数】:
+	 *   - 旧 (v70-v81) 反模式: Ranged 内部用 PC->GetViewportSize + DeprojectScreenPositionToWorld
+	 *     → 服务器进程对远端玩家 PC 调用 GetViewportSize 返回 0,0 → Deproject 失败 → return false
+	 *     → 远端玩家在服务器上 trace 永远失败 → 玩家开火"无射线" (用户报告)
+	 *   - 新 (v82): 客户端玩家路径在 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
+	 *     → 服务器用客户端传来的射线做权威 trace (防作弊: 限制射线长度/方向)
+	 *   - AI 路径: 传零向量 → Strategy 内部 fallback 用 BaseAimRotation (BT 控制的旋转)
+	 *   - 兼容旧调用: 不传参数 = AI 路径, 向前兼容
+	 *
 	 * @param Weapon     武器 Actor 指针 (实现可读 MeshType / Mesh / Owner)
 	 * @param bIsHeavy   是否重击 (近战区分轻击/重击伤害, 枪械区分半自动/全自动)
+	 * @param ClientRayOrigin     客户端射线起点 (FVector::ZeroVector = AI 路径, Strategy 内部 fallback)
+	 * @param ClientRayDirection  客户端射线方向 (FVector::ForwardVector = AI 路径)
 	 *
 	 * @return 是否成功启动 (false = 配置错/状态错, 调用方应停止后续逻辑)
 	 */
-	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy) = 0;
+	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
+		const FVector& ClientRayOrigin = FVector::ZeroVector,
+		const FVector& ClientRayDirection = FVector::ForwardVector) = 0;
 
 	/**
 	 * 停止伤害检测
@@ -123,4 +181,26 @@ public:
 	 * 调用方: ABaseWeapon::Tick 决策是否委托 TickDetection (消除 BaseWeapon::bIsWeaponActive 重复)
 	 */
 	virtual bool IsActive() const = 0;
+
+	/**
+	 * 获取当前检测状态标签 (v74 — 蒙太奇时间轴驱动)
+	 *
+	 * 真理源: ANS_MeleeTraceState 写入 / TickDetection 命中时设 Hit
+	 *
+	 * 调用方: HUD / 音效 / 命中反馈 / 调试可视化
+	 *
+	 * 大厂原则: 替代 IsActive() bool 字段 — 状态标签包含 Idle/Tracing/Hit 三态
+	 *           订阅方拿到语义明确的状态, 不再二值猜"是否在 trace"
+	 */
+	virtual EWeaponTraceState GetTraceState() const = 0;
+
+	/**
+	 * 获取状态变化广播委托 (v74 — 事件驱动替代轮询)
+	 *
+	 * 调用方: HUD / 音效 / 命中反馈 Subscribe 订阅
+	 *
+	 * 大厂原则: 替代"每帧 Tick 查 IsActive()" 反模式
+	 *           委托由各 Strategy 实现持有, 暴露 const 引用防止外部重绑
+	 */
+	virtual FOnWeaponTraceStateChanged& OnTraceStateChanged() = 0;
 };

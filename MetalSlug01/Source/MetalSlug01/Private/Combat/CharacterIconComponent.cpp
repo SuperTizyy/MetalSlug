@@ -37,6 +37,9 @@
 // 引入 PlayerState (查 CharacterID/WeaponID 真理源)
 #include "Systems/Core/RoomPlayerState.h"
 
+// 引入 ActorIterator (用于遍历 World 中的 Character)
+#include "EngineUtils.h"
+
 // 引入 GameMode (查 CharacterDataTable/WeaponDataTable)
 #include "Systems/RoomGameMode.h"
 
@@ -49,6 +52,9 @@
 
 // 引入贴图指针类型
 #include "Engine/Texture2D.h"
+
+// 引入 WeaponFireComponent (弹药数据真理源 — v84 大厂架构新增)
+#include "Components/WeaponFireComponent.h"
 
 // 引入 TimerManager (SetTimer / ClearTimer 用于重试机制)
 #include "TimerManager.h"
@@ -89,25 +95,140 @@ UCharacterIconComponent::UCharacterIconComponent()
 // ==========================================
 
 /**
+ * UCharacterIconComponent::ResolveOwnerCharacter
+ *
+ * 【v84 大厂架构】使用 GetTypedOuter 获取 Owner Character
+ *
+ * 使用 GetTypedOuter 而非 GetOwner() 来获取 Owner:
+ *   - GetTypedOuter 查找包含此组件的 Actor，无论它是否被正确标记为 Owner
+ *   - 比 GetOwner() 更可靠，避免 CDO 问题
+ *
+ * @return Owner Character 指针 (失败返回 nullptr 并 Log Error)
+ */
+ABaseCharacter* UCharacterIconComponent::ResolveOwnerCharacter() const
+{
+	// 【v84 最终修复】使用 TActorIterator 遍历 World 获取有效的 Owner
+	// 
+	// 根因分析:
+	//   - BeginPlay 中 GetOwner()=BP_SWAT_C_0 (正确)
+	//   - 但 ResolvePlayerState 中 GetOwner()=Default__BaseCharacter (CDO)
+	//   - 这意味着 this 指针指向的是 CDO 上的组件实例
+	//
+	// 解决方案:
+	//   - 不依赖 this 的 Owner 关系
+	//   - 使用 TActorIterator 遍历 World，找到拥有这个组件的 ABaseCharacter
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] ResolveOwnerCharacter: GetWorld() 返回 nullptr."));
+		return nullptr;
+	}
+
+	// 遍历所有 ABaseCharacter，找到持有这个组件实例的
+	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	{
+		ABaseCharacter* Char = *It;
+		if (!Char || !Char->IsValidLowLevel())
+		{
+			continue;
+		}
+
+		// 检查这个 Character 是否拥有这个组件（使用地址比较）
+		UCharacterIconComponent* Found = Char->FindComponentByClass<UCharacterIconComponent>();
+		if (Found == this)
+		{
+			return Char;
+		}
+	}
+
+	// 【最终兜底】尝试从 GetOwner() 获取，并验证不是 CDO
+	AActor* OwnerActor = GetOwner();
+	if (OwnerActor)
+	{
+		// 检查是否为 CDO (Class Default Object)
+		const bool bIsCDO = OwnerActor->GetName().Contains(TEXT("Default__"));
+		if (!bIsCDO)
+		{
+			return Cast<ABaseCharacter>(OwnerActor);
+		}
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[CharacterIconComponent] ResolveOwnerCharacter: 无法找到有效的 Owner Character. "
+			 "this=%p, GetOwner()=%s. "
+			 "【根因】组件实例附加到了错误的 Actor (可能是 CDO). "
+			 "【修复】检查 BP_SWAT_C Components 面板，确保 CharacterIcon 组件没有被 BP 实例化覆盖."),
+		(void*)this,
+		OwnerActor ? *OwnerActor->GetName() : TEXT("<null>"));
+	return nullptr;
+}
+
+/**
  * UCharacterIconComponent::BeginPlay
  *
- * 缓存 Owner Character 引用, 避免后续每次 GetOwner() + Cast 的开销
- *
- * 大厂原则:
- *   - Owner 必须存在 (UE 反射保证: 组件能 BeginPlay 说明 Owner 有效)
- *   - 缓存失败 → Log Warning (不中断流程, 由后续访问点的 nullptr 守卫兜底)
+ * 简单记录 BeginPlay 执行
  */
 void UCharacterIconComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 缓存 Owner 引用 — 后续访问 O(1), 避免 GetOwner() + Cast 开销
-	OwnerCharacter = Cast<ABaseCharacter>(GetOwner());
-	if (!OwnerCharacter.IsValid())
+	// 简单记录 BeginPlay 执行
+	UE_LOG(LogTemp, Log,
+		TEXT("[CharacterIconComponent] BeginPlay: Owner=%s"),
+		GetOwner() ? *GetOwner()->GetName() : TEXT("<null>"));
+
+	// 【v85 大厂架构新增】订阅激活武器的弹药变化事件
+	// 根因: 开火消耗弹药后，弹夹数量必须实时更新到 HUD
+	// 解决方案: CharacterIconComponent 订阅 WeaponFireComponent::OnAmmoChanged，
+	//           弹药变化时自动广播弹夹信息到 HUD
+	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();
+	if (!OwnerChar)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[CharacterIconComponent] BeginPlay: Owner 不是 ABaseCharacter, 后续访问会失败. "
-				 "Owner=%s"), GetOwner() ? *GetOwner()->GetName() : TEXT("<null>"));
+		return;
+	}
+
+	// 订阅当前武器的弹药变化
+	SubscribeToActiveWeaponAmmo();
+
+	// 【v85.1 大厂架构新增】订阅后立即广播一次弹夹信息
+	// 根因: 出生时弹夹文本为空，需要切枪才能显示
+	// 解决方案: 订阅完成后立即调用 BroadcastWeaponAmmoInfo，触发 HUD 刷新
+	BroadcastWeaponAmmoInfo(OwnerChar);
+}
+
+
+// -----------------------------------------------------------------------------
+// 【v85 大厂架构新增】订阅当前激活武器的弹药变化事件
+// 用于 BeginPlay 初始化，以及武器切换后重新订阅
+// -----------------------------------------------------------------------------
+void UCharacterIconComponent::SubscribeToActiveWeaponAmmo()
+{
+	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();
+	if (!OwnerChar)
+	{
+		return;
+	}
+
+	// 1. 取消旧武器的订阅
+	if (SubscribedWeaponFireComponent.IsValid())
+	{
+		SubscribedWeaponFireComponent->OnAmmoChanged.RemoveDynamic(this, &UCharacterIconComponent::OnWeaponAmmoChanged);
+		SubscribedWeaponFireComponent.Reset();
+	}
+
+	// 2. 订阅新武器
+	ABaseWeapon* ActiveWeapon = OwnerChar->GetCurrentWeapon();
+	if (ActiveWeapon)
+	{
+		if (UWeaponFireComponent* FireComp = ActiveWeapon->FindComponentByClass<UWeaponFireComponent>())
+		{
+			FireComp->OnAmmoChanged.AddDynamic(this, &UCharacterIconComponent::OnWeaponAmmoChanged);
+			SubscribedWeaponFireComponent = FireComp;
+			UE_LOG(LogTemp, Log,
+				TEXT("[CharacterIconComponent] SubscribeToActiveWeaponAmmo: 订阅 %s 的 OnAmmoChanged"),
+				*ActiveWeapon->GetName());
+		}
 	}
 }
 
@@ -124,16 +245,22 @@ void UCharacterIconComponent::BeginPlay()
  */
 void UCharacterIconComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// 【v85 大厂架构新增】取消武器弹药变化订阅
+	if (SubscribedWeaponFireComponent.IsValid())
+	{
+		SubscribedWeaponFireComponent->OnAmmoChanged.RemoveDynamic(this, &UCharacterIconComponent::OnWeaponAmmoChanged);
+		SubscribedWeaponFireComponent.Reset();
+	}
+
 	if (UWorld* World = GetWorld())
 	{
 		// 显式清理重试 Timer — 防残留
 		World->GetTimerManager().ClearTimer(CharacterIconRefreshTimerHandle);
 	}
 
-	// 清空缓存 — 防 EndPlay 后回调意外触发
+	// 清理组件持有的资源
 	CachedCharacterIDForIcon.Empty();
 	CurrentIconRetryCount = 0;
-	OwnerCharacter.Reset();
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -169,9 +296,9 @@ void UCharacterIconComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void UCharacterIconComponent::RefreshCharacterIcon()
 {
 	// ============================================================
-	// 前置检查: Owner 必须有效
+	// 前置检查: Owner 必须有效 【v84 使用 ResolveOwnerCharacter】
 	// ============================================================
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -266,9 +393,9 @@ void UCharacterIconComponent::RefreshCharacterIcon()
 void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar)
 {
 	// ============================================================
-	// 前置检查: Owner 必须有效
+	// 前置检查: Owner 必须有效 【v84 使用 ResolveOwnerCharacter】
 	// ============================================================
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -358,9 +485,9 @@ void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const F
 void UCharacterIconComponent::RetryRefreshCharacterIcon()
 {
 	// ============================================================
-	// 【P0 防御 1】: Character 或 World 已失效 → 停止重试
+	// 【P0 防御 1】: Character 或 World 已失效 → 停止重试 【v84 使用 ResolveOwnerCharacter】
 	// ============================================================
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	UWorld* World = GetWorld();
 	if (!Owner || !IsValid(Owner) || !World)
 	{
@@ -495,9 +622,9 @@ void UCharacterIconComponent::RetryRefreshCharacterIcon()
 void UCharacterIconComponent::RefreshWeaponIconOnHUD()
 {
 	// ============================================================
-	// 前置检查: Owner 必须有效
+	// 前置检查: Owner 必须有效 【v84 使用 ResolveOwnerCharacter】
 	// ============================================================
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -538,6 +665,16 @@ void UCharacterIconComponent::RefreshWeaponIconOnHUD()
 		UTexture2D* Icon = GetWeaponIconFromTable(WeaponID);
 		// Icon 可能为 nullptr (DataTable 配错), Implementation 内部会 Log Error 报告根因
 		Owner->Client_RefreshWeaponIcon(WeaponID, Icon);
+
+		// ============================================================
+		// 【v84 大厂架构新增】同时广播武器弹药信息 (与图标同步)
+		//   大厂原则 - 单一真理源:
+		//     - 弹药真理源 = WeaponFireComponent.CurrentAmmo / MagazineSize / ReserveAmmo
+		//     - CharacterIconComponent 读取并封装为文本, 通过 CharacterEvents 推送给 HUD
+		//   调用方:
+		//     - 服务器 RefreshWeaponIconOnHUD (武器图标刷新时同步刷新弹药)
+		// ============================================================
+		BroadcastWeaponAmmoInfo(Owner);
 	}
 	else
 	{
@@ -644,7 +781,7 @@ UTexture2D* UCharacterIconComponent::GetCharacterAvatarFromTable(const FString& 
  */
 UDataTable* UCharacterIconComponent::ResolveCharacterDataTable() const
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -694,7 +831,7 @@ UDataTable* UCharacterIconComponent::ResolveCharacterDataTable() const
  */
 UDataTable* UCharacterIconComponent::ResolveWeaponDataTable() const
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -807,7 +944,7 @@ UTexture2D* UCharacterIconComponent::GetWeaponIconFromTable(const FString& Weapo
  */
 void UCharacterIconComponent::Client_RefreshWeaponIcon_Implementation(const FString& InWeaponID, UTexture2D* Icon)
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -850,7 +987,7 @@ void UCharacterIconComponent::Client_RefreshWeaponIcon_Implementation(const FStr
  */
 ARoomPlayerState* UCharacterIconComponent::ResolvePlayerState() const
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		UE_LOG(LogTemp, Error,
@@ -901,7 +1038,7 @@ ARoomPlayerState* UCharacterIconComponent::ResolvePlayerState() const
  */
 void UCharacterIconComponent::BroadcastCharacterIconReady(const FString& CharID, UTexture2D* Icon)
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		return;
@@ -937,7 +1074,7 @@ void UCharacterIconComponent::BroadcastCharacterIconReady(const FString& CharID,
  */
 void UCharacterIconComponent::BroadcastWeaponIconReady(const FString& WeaponID, UTexture2D* Icon)
 {
-	ABaseCharacter* Owner = OwnerCharacter.Get();
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
 	if (!Owner)
 	{
 		return;
@@ -958,4 +1095,158 @@ void UCharacterIconComponent::BroadcastWeaponIconReady(const FString& WeaponID, 
 	//   修复: 先写缓存, 再 Broadcast, 保证 Bind-Snapshot 能补发
 	Events->SetCachedWeaponIcon(WeaponID, Icon);
 	Events->OnWeaponIconReady.Broadcast(WeaponID, Icon);
+}
+
+
+/**
+ * BroadcastWeaponAmmoInfo — 广播武器弹药信息到 CharacterEvents
+ *
+ * 【v84 大厂架构新增】武器面板 TextBlock 显示弹药数量
+ *
+ * 格式规则:
+ *   - 近战武器 (EWeaponMeshType::Melee): "1/1" (固定值, 弹药无意义)
+ *   - 枪械 (Primary/Secondary): "CurrentAmmo/MagazineSize + ReserveAmmo"
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 弹药数据从 WeaponFireComponent 读取 (CurrentAmmo / MagazineSize / ReserveAmmo)
+ *   - 武器类型从 Owner->GetCurrentWeapon()->GetMeshType() 读取
+ *   - 本函数只负责读取数据 + 广播, 不参与计算
+ *
+ * @param InOwner 角色指针 (由调用方传入, 避免重复 Cast)
+ */
+void UCharacterIconComponent::BroadcastWeaponAmmoInfo(ABaseCharacter* InOwner)
+{
+	if (!InOwner)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: InOwner 为空."));
+		return;
+	}
+
+	// 通过 ResolveCharacterEvents 获取事件总线
+	UCharacterEvents* Events = InOwner->ResolveCharacterEvents();
+	if (!Events)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: ResolveCharacterEvents 失败. "
+				 "InOwner='%s'. 检查 CharacterEvents 组件是否挂载."),
+			*InOwner->GetName());
+		return;
+	}
+
+	// 从当前武器获取弹药数据
+	ABaseWeapon* CurrentWeapon = InOwner->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		// 无武器: 广播近战默认值 1/1 (大厂原则 - 防御型设计)
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 当前无武器 (InOwner='%s'). "
+				 "广播近战默认值 1/1."),
+			*InOwner->GetName());
+		// 【v85.2 大厂架构新增】写入缓存
+		Events->SetCachedWeaponAmmoInfo(1, 1, 0, true);
+		Events->OnWeaponAmmoInfoReady.Broadcast(1, 1, 0);
+		return;
+	}
+
+	// 获取武器类型 (决定弹药显示格式)
+	const EWeaponMeshType MeshType = CurrentWeapon->GetMeshType();
+
+	if (MeshType == EWeaponMeshType::Melee)
+	{
+		// 近战武器: 显示固定值 "1/1"
+		// 【v85.2 大厂架构新增】写入缓存
+		Events->SetCachedWeaponAmmoInfo(1, 1, 0, true);
+		Events->OnWeaponAmmoInfoReady.Broadcast(1, 1, 0);
+		UE_LOG(LogTemp, Log,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 近战武器, 广播 1/1. InOwner='%s', Weapon='%s'"),
+			*InOwner->GetName(), *CurrentWeapon->GetName());
+	}
+	else
+	{
+		// 枪械: 从 WeaponFireComponent 读取弹药数据 (字段直接访问)
+		if (UWeaponFireComponent* FireComp = CurrentWeapon->WeaponFireComponent)
+		{
+			const int32 CurrentAmmo = FireComp->GetCurrentAmmo();
+			const int32 MagazineSize = FireComp->GetMagazineSize();
+			const int32 ReserveAmmo = FireComp->GetReserveAmmo();
+
+			// 【v85.2 大厂架构新增】写入缓存
+			Events->SetCachedWeaponAmmoInfo(CurrentAmmo, MagazineSize, ReserveAmmo, false);
+			Events->OnWeaponAmmoInfoReady.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+			UE_LOG(LogTemp, Log,
+				TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 枪械, 广播 %d/%d. "
+					 "InOwner='%s', Weapon='%s'"),
+				CurrentAmmo, MagazineSize,
+				*InOwner->GetName(), *CurrentWeapon->GetName());
+		}
+		else
+		{
+			// WeaponFireComponent 不存在 (近战武器没有此组件)
+			// 理论上不会走到这里 (因为 MeshType == Melee 时已处理)
+			// 但做防御型设计: 广播默认值
+			UE_LOG(LogTemp, Warning,
+				TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 枪械 '%s' 没有 WeaponFireComponent. "
+					 "InOwner='%s'. 广播默认值 30/120."),
+				*CurrentWeapon->GetName(), *InOwner->GetName());
+			// 【v85.2 大厂架构新增】写入缓存
+			Events->SetCachedWeaponAmmoInfo(30, 30, 120, false);
+			Events->OnWeaponAmmoInfoReady.Broadcast(30, 30, 120);
+		}
+	}
+}
+
+
+// -----------------------------------------------------------------------------
+// 【v84 大厂架构新增】服务器直接刷新武器图标 (武器切换时调用)
+// -----------------------------------------------------------------------------
+void UCharacterIconComponent::RefreshWeaponIconOnHUDFromServer(const FString& InWeaponID)
+{
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
+	if (!Owner)
+	{
+		return;
+	}
+
+	// 【v85 大厂架构新增】武器切换时重新订阅新武器的弹药变化
+	// 根因: 切枪后必须订阅新武器的 OnAmmoChanged，否则弹夹数量不更新
+	SubscribeToActiveWeaponAmmo();
+
+	// 服务器查表获取武器图标
+	UTexture2D* WeaponIcon = GetWeaponIconFromTable(InWeaponID);
+	if (!WeaponIcon)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] RefreshWeaponIconOnHUDFromServer: 武器 '%s' 查不到图标. "
+				 "InOwner='%s'. 跳过武器图标刷新."),
+			*InWeaponID,
+			*Owner->GetName());
+		return;
+	}
+
+	// 缓存 WeaponID
+	CachedWeaponIDForIcon = InWeaponID;
+
+	// 服务器查表获取图标, 通过 RPC 推送到客户端
+	if (Owner->HasAuthority())
+	{
+		Owner->Client_RefreshWeaponIcon(InWeaponID, WeaponIcon);
+	}
+}
+
+
+// -----------------------------------------------------------------------------
+// 【v85 大厂架构新增】弹药变化回调 — WeaponFireComponent::OnAmmoChanged 订阅
+// -----------------------------------------------------------------------------
+void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize)
+{
+	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();
+	if (!OwnerChar)
+	{
+		return;
+	}
+
+	// 直接调用 BroadcastWeaponAmmoInfo，传入当前武器
+	// BroadcastWeaponAmmoInfo 会读取当前激活武器并广播弹夹信息
+	BroadcastWeaponAmmoInfo(OwnerChar);
 }

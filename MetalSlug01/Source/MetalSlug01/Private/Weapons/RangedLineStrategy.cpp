@@ -47,6 +47,7 @@
 URangedLineStrategy::URangedLineStrategy()
 {
 	bIsCurrentHeavy = false;
+	TraceState = EWeaponTraceState::Idle;
 }
 
 
@@ -54,7 +55,9 @@ URangedLineStrategy::URangedLineStrategy()
 // 1. StartTrace — v60.3 立即执行一发射线
 // ===========================================
 
-bool URangedLineStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
+bool URangedLineStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
+	const FVector& ClientRayOrigin,
+	const FVector& ClientRayDirection)
 {
 	if (!Weapon)
 	{
@@ -68,13 +71,15 @@ bool URangedLineStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
 	bIsCurrentHeavy = bIsHeavy;
 
 	UE_LOG(LogTemp, Log,
-		TEXT("[URangedLineStrategy::StartTrace] 立即执行枪械射线 — Weapon=%s Type=%d Heavy=%d"),
+		TEXT("[URangedLineStrategy::StartTrace] 立即执行枪械射线 — Weapon=%s Type=%d Heavy=%d ClientRayOrigin=%s Dir=%s"),
 		*Weapon->GetName(),
 		static_cast<int32>(Weapon->GetMeshType()),
-		bIsHeavy ? 1 : 0);
+		bIsHeavy ? 1 : 0,
+		*ClientRayOrigin.ToCompactString(),
+		*ClientRayDirection.ToCompactString());
 
 	// 立即打一发 (不再延后)
-	const bool bExecuted = PerformSingleShot(Weapon);
+	const bool bExecuted = PerformSingleShot(Weapon, ClientRayOrigin, ClientRayDirection);
 	return bExecuted;
 }
 
@@ -88,6 +93,8 @@ void URangedLineStrategy::StopTrace(ABaseWeapon* Weapon)
 	// v60.3 大厂原则: Ranged 无激活态，StopTrace 仅清理 TWeakObjectPtr
 	ActiveWeapon.Reset();
 	bIsCurrentHeavy = false;
+	// v74 — Ranged 立即 Idle (StartTrace 单帧 Tracing 不留持久状态)
+	TraceState = EWeaponTraceState::Idle;
 
 	UE_LOG(LogTemp, Verbose,
 		TEXT("[URangedLineStrategy::StopTrace] 清理 Ranged 状态 — Weapon=%s (Ranged 无激活态)"),
@@ -110,7 +117,9 @@ void URangedLineStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 // 子弹从枪口射出，方向对准星 (所见即所射)
 // ===========================================
 
-bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon)
+bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
+	const FVector& ClientRayOrigin,
+	const FVector& ClientRayDirection)
 {
 	if (!Weapon)
 	{
@@ -143,108 +152,193 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon)
 	}
 
 	// ===========================================
-	// 步骤 3: 获取相机位置和方向 (v60.16 核心)
+	// 步骤 3 (v82 大厂架构修复): 决定射线来源和方向
+	//
+	// 【v85.4 大厂架构修复】玩家路径正确计算射线起点
+	//
+	// 根因 (从 Session1.log 定位):
+	//   用户报告: "主武器射线检测没有算 TargetArmLength，之前好的，被改坏了"
+	//
+	// 问题分析:
+	//   客户端用 DeprojectScreenPositionToWorld 从屏幕中心算出射线起点
+	//   - Deproject 返回的 WorldOrigin = 相机位置 = Pawn位置 + CameraBoom偏移
+	//   - 这个偏移已经包含了 TargetArmLength
+	//   - 所以服务器不应该再添加 TargetArmLength
+	//
+	// 修复方案:
+	//   玩家路径: 直接用客户端传来的射线起点（所见即所射）
+	//   AI 路径: 服务器用自己的相机数据 (需要加 TargetArmLength)
 	// ===========================================
-	APlayerCameraManager* CameraMgr = PC->PlayerCameraManager;
-	if (!CameraMgr)
+	FVector RayDirection;
+	FVector RayOrigin;
+
+	if (!ClientRayOrigin.IsNearlyZero())
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s PlayerCameraManager 为空 — 拒绝射线."),
-			*Weapon->GetName());
-		return false;
-	}
+		// 玩家路径: 射线起点 = 相机位置 + 相机前方 × (枪长度 + 弹簧臂长度)
+		//   - ClientRayOrigin = 相机位置 (来自 HUD Deproject)
+		//   - ClientRayDirection = 相机前方 (来自 HUD Deproject)
+		// ============================================================
+		// 步骤 3a: 获取相机位置和弹簧臂长度
+		// ============================================================
+		const FVector CameraLocation = ClientRayOrigin;
+		const FVector CameraForward = ClientRayDirection.GetSafeNormal();
 
-	const FVector CameraLocation = CameraMgr->GetCameraLocation();
+		if (CameraForward.IsNearlyZero())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 相机前方为零 — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
 
-	// 获取相机旋转，计算相机朝向方向
-	const FRotator CameraRotation = CameraMgr->GetCameraRotation();
-	const FVector CameraForward = CameraRotation.Vector(); // 单位向量，指向相机朝向
+		// ============================================================
+		// 步骤 3b: 获取弹簧臂长度 (TargetArmLength) — 【v85.x 零兜底】必须获取真实值
+		// ============================================================
+		ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
+		if (!CharacterOwner)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 ACharacter — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
 
-	if (CameraForward.IsNearlyZero())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 相机朝向为零 — 拒绝射线."),
-			*Weapon->GetName());
-		return false;
-	}
+		USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(
+			CharacterOwner->GetComponentByClass(USpringArmComponent::StaticClass()));
+		if (!CameraBoom)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 找不到 CameraBoom (SpringArmComponent) — 拒绝射线. 修复: 检查角色 BP 的 CameraBoom 是否正确挂载."),
+				*Weapon->GetName());
+			return false;
+		}
 
-	// ===========================================
-	// 步骤 4: 获取 TargetArmLength (相机到角色中心的距离)
-	// ===========================================
-	ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
-	if (!CharacterOwner)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 ACharacter — 拒绝射线."),
-			*Weapon->GetName());
-		return false;
-	}
+		const float TargetArmLength = CameraBoom->TargetArmLength;
 
-	// 获取角色的 CameraBoom (SpringArmComponent)
-	// CameraBoom 是角色 Mesh 的子组件，连接到 RootComponent
-	USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(
-		CharacterOwner->GetComponentByClass(USpringArmComponent::StaticClass()));
+		// ============================================================
+		// 步骤 3c: 计算射线起点 = 相机位置 + 相机前方 × (枪长度 + 弹簧臂长度)
+		// ============================================================
+		const float MuzzleOffset = Weapon->MuzzleOffset;
+		const float TotalOffset = TargetArmLength + MuzzleOffset;
+		RayOrigin = CameraLocation + CameraForward * TotalOffset;
+		RayDirection = CameraForward;
 
-	float TargetArmLength = 300.0f; // 默认值
-
-	if (CameraBoom)
-	{
-		TargetArmLength = CameraBoom->TargetArmLength;
+		UE_LOG(LogTemp, Log,
+			TEXT("[URangedLineStrategy::PerformSingleShot] 玩家路径 — Weapon=%s CameraLoc=%s TAL=%.1f MuzzleOffset=%.1f TotalOffset=%.1f RayOrigin=%s RayDir=%s"),
+			*Weapon->GetName(),
+			*CameraLocation.ToCompactString(),
+			TargetArmLength,
+			MuzzleOffset,
+			TotalOffset,
+			*RayOrigin.ToCompactString(),
+			*RayDirection.ToCompactString());
 	}
 	else
 	{
-		// CameraBoom 不存在时，用默认值
-		UE_LOG(LogTemp, Warning,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 找不到 CameraBoom，用默认值 TAL=300cm."),
-			*Weapon->GetName());
+		// AI 路径 / 兼容旧调用: 服务器侧自己算射线
+		//   - 如果是 AI 控制的 Pawn: 用 BaseAimRotation (BT 控制的旋转)
+		//   - 如果是 ListenServer 本地玩家: 用本地 PC->Deproject
+		// ===========================================
+		// 步骤 3a: 获取相机位置和方向 (v60.16 核心)
+		// ===========================================
+		APlayerCameraManager* CameraMgr = PC->PlayerCameraManager;
+		if (!CameraMgr)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s PlayerCameraManager 为空 — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
+
+		const FVector CameraLocation = CameraMgr->GetCameraLocation();
+
+		// 获取相机旋转，计算相机朝向方向
+		const FRotator CameraRotation = CameraMgr->GetCameraRotation();
+		const FVector CameraForward = CameraRotation.Vector(); // 单位向量，指向相机朝向
+
+		if (CameraForward.IsNearlyZero())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 相机朝向为零 — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
+
+		// ===========================================
+		// 步骤 3b: 获取 TargetArmLength (相机到角色中心的距离)
+		// ===========================================
+		ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
+		if (!CharacterOwner)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 ACharacter — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
+
+		// 获取角色的 CameraBoom (SpringArmComponent)
+		USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(
+			CharacterOwner->GetComponentByClass(USpringArmComponent::StaticClass()));
+
+		float TargetArmLength = 300.0f; // 默认值
+		if (CameraBoom)
+		{
+			TargetArmLength = CameraBoom->TargetArmLength;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 找不到 CameraBoom，用默认值 TAL=300cm."),
+				*Weapon->GetName());
+		}
+
+		// ===========================================
+		// 步骤 3c: 计算枪口偏移后的射线起点 (v60.16 核心公式)
+		// ===========================================
+		const float MuzzleOffset = Weapon->MuzzleOffset;
+		const float TotalOffset = TargetArmLength + MuzzleOffset;
+		RayOrigin = CameraLocation + CameraForward * TotalOffset;
+
+		// ===========================================
+		// 步骤 3d: 获取射击方向 (准星屏幕坐标 → 世界射线)
+		// ===========================================
+		int32 ViewportSizeX, ViewportSizeY;
+		PC->GetViewportSize(ViewportSizeX, ViewportSizeY);
+
+		const FVector2D CrosshairScreenPos = FVector2D(
+			ViewportSizeX * 0.5f,
+			ViewportSizeY * 0.5f
+		);
+
+		FVector WorldOrigin;
+		WorldOrigin = FVector::ZeroVector;
+		FVector WorldDirection;
+		const bool bDeprojectOK = PC->DeprojectScreenPositionToWorld(
+			CrosshairScreenPos.X,
+			CrosshairScreenPos.Y,
+			WorldOrigin,
+			WorldDirection
+		);
+
+		if (!bDeprojectOK || WorldDirection.IsNearlyZero())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s DeprojectScreenPositionToWorld 失败 — 拒绝射线."),
+				*Weapon->GetName());
+			return false;
+		}
+
+		RayDirection = WorldDirection;
 	}
 
 	// ===========================================
-	// 步骤 5: 计算枪口偏移后的射线起点 (v60.16 核心公式)
-	// ===========================================
-	// 第三人称视角布局: 枪口 → 角色 → 相机 (从前往后)
-	// CameraForward 指向相机方向（从枪口指向相机的方向）
-	// 枪口在相机前方（目标方向），所以射线起点 = 相机位置 + CameraForward × (TAL + MuzzleOffset)
-	const float MuzzleOffset = Weapon->MuzzleOffset;
-	const float TotalOffset = TargetArmLength + MuzzleOffset;
-	const FVector RayOrigin = CameraLocation + CameraForward * TotalOffset;
-
-	// ===========================================
-	// 步骤 6: 获取射击方向 (准星屏幕坐标 → 世界射线)
-	// ===========================================
-	int32 ViewportSizeX, ViewportSizeY;
-	PC->GetViewportSize(ViewportSizeX, ViewportSizeY);
-
-	const FVector2D CrosshairScreenPos = FVector2D(
-		ViewportSizeX * 0.5f,
-		ViewportSizeY * 0.5f
-	);
-
-	FVector WorldOrigin;
-	FVector WorldDirection;
-	const bool bDeprojectOK = PC->DeprojectScreenPositionToWorld(
-		CrosshairScreenPos.X,
-		CrosshairScreenPos.Y,
-		WorldOrigin,
-		WorldDirection
-	);
-
-	if (!bDeprojectOK || WorldDirection.IsNearlyZero())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s DeprojectScreenPositionToWorld 失败 — 拒绝射线."),
-			*Weapon->GetName());
-		return false;
-	}
-
-	// ===========================================
-	// 步骤 7: 计算射线终点
+	// 步骤 4: 计算射线终点 (玩家/AI 路径统一)
 	// ===========================================
 	const float Range = Weapon->AttackRange;
-	const FVector EndLoc = RayOrigin + WorldDirection * Range;
+	const FVector EndLoc = RayOrigin + RayDirection * Range;
 
 	// ===========================================
-	// 步骤 8: 命中过滤 (自己 + Owner)
+	// 步骤 5: 命中过滤 (自己 + Owner)
 	// ===========================================
 	TArray<AActor*> IgnoreActors;
 	IgnoreActors.Add(Weapon);
@@ -254,13 +348,13 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon)
 	}
 
 	// ===========================================
-	// 步骤 9: 执行 LineTraceSingle 射线检测
+	// 步骤 6: 执行 LineTraceSingle 射线检测
 	// ===========================================
 	FHitResult HitResult;
 	const bool bHit = UKismetSystemLibrary::LineTraceSingle(
 		Weapon,
-		RayOrigin,     // 起点: 枪口位置 (相机 - 偏移)
-		EndLoc,        // 终点: 枪口 + 方向 * 射程
+		RayOrigin,     // 起点: 玩家=客户端射线起点 / AI=相机+枪口偏移
+		EndLoc,        // 终点: 起点 + 方向 * 射程
 		UEngineTypes::ConvertToTraceType(ECC_Visibility),
 		false,
 		IgnoreActors,
@@ -269,11 +363,11 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon)
 		true,
 		FLinearColor::Red,       // TraceColor: 未命中
 		FLinearColor::Green,     // TraceHitColor: 命中
-		IWeaponDamageStrategy::kDebugTraceLifeTimeSeconds
+		IWeaponDamageStrategy::kDebugTraceLifeTimeSeconds  // 5分钟持久显示
 	);
 
 	// ===========================================
-	// 步骤 10: 命中处理
+	// 步骤 7: 命中处理
 	// ===========================================
 	if (bHit && HitResult.GetActor())
 	{
@@ -296,23 +390,34 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon)
 		);
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] ★命中★ — Weapon=%s Target=%s Bone=%s Origin=%s End=%s (TAL=%.0f+MO=%.0f=%.0fcm)"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] ★命中★ — Weapon=%s Target=%s Bone=%s Origin=%s End=%s (Range=%.1fcm)"),
 			*Weapon->GetName(),
 			*HitResult.GetActor()->GetName(),
 			*HitResult.BoneName.ToString(),
 			*RayOrigin.ToCompactString(),
 			*EndLoc.ToCompactString(),
-			TargetArmLength, MuzzleOffset, TotalOffset);
+			Range);
 	}
 	else
 	{
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] 未命中 — Weapon=%s Origin=%s Dir=%s Range=%.1fcm (TAL=%.0f+MO=%.0f=%.0fcm)"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] 未命中 — Weapon=%s Origin=%s Dir=%s Range=%.1fcm"),
 			*Weapon->GetName(),
 			*RayOrigin.ToCompactString(),
-			*WorldDirection.ToCompactString(),
-			Range,
-			TargetArmLength, MuzzleOffset, TotalOffset);
+			*RayDirection.ToCompactString(),
+			Range);
+	}
+
+	// ============================================================
+	// 【v83 大厂架构 — 客户端屏幕可见】服务器 trace 完后 Multicast 给所有客户端画线
+	//   - 服务器本地 (ListenServer 自己的玩家) 跳过 — 服务器进程已经用 EDrawDebugTrace::ForDuration 画过
+	//   - 远端客户端收到 RPC 后, 客户端进程画一条完全一致的线
+	//   - 大厂原则: 服务器权威 trace → 客户端视觉同步, 不重复 trace
+	// ============================================================
+	if (Weapon->HasAuthority())
+	{
+		const FVector HitLocation = bHit ? HitResult.ImpactPoint : EndLoc;
+		Weapon->Multicast_PlayFireTraceVisual(RayOrigin, EndLoc, bHit, HitLocation);
 	}
 
 	return true;

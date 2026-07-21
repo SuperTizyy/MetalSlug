@@ -29,10 +29,15 @@
 #include "Characters/BaseCharacter.h"
 
 
+// 【v75 单一真理源】Socket 名称常量定义 — 与 .h 声明一一对应
+const FName UMeleeSwStrategy::SocketName_TraceStart = FName(TEXT("TraceStart"));
+const FName UMeleeSwStrategy::SocketName_TraceEnd   = FName(TEXT("TraceEnd"));
+
+
 UMeleeSwStrategy::UMeleeSwStrategy()
 {
 	// 默认状态
-	bIsActive = false;
+	TraceState = EWeaponTraceState::Idle;
 	bIsCurrentHeavy = false;
 }
 
@@ -41,8 +46,11 @@ UMeleeSwStrategy::UMeleeSwStrategy()
 // 1. StartTrace — 启动检测
 // ==========================================
 
-bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
+bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
+	const FVector& /*ClientRayOrigin*/,
+	const FVector& /*ClientRayDirection*/)
 {
+	// v82 客户端射线参数 — Melee 不使用, 走 Socket 路径
 	if (!Weapon)
 	{
 		UE_LOG(LogTemp, Error,
@@ -60,8 +68,32 @@ bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
 		return false;
 	}
 
-	// 记录激活态
-	bIsActive = true;
+	// 【v75 P0 修复】零兜底: 校验 Socket 真实存在 — 美术没配立即报错
+	//   根因: 旧版 StartTrace 不校验 Socket, GetSocketLocation 返回组件原点 fallback
+	//   → LastFrameStartLoc == LastFrameEndLoc (都是组件原点) → TickDetection 跳过
+	//   → 用户看不到任何 trace, 也不知道为什么 (兜底反模式)
+	//   真理源: SocketName_TraceStart / SocketName_TraceEnd (头文件静态成员常量)
+	if (!Mesh->DoesSocketExist(SocketName_TraceStart))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UMeleeSwStrategy::StartTrace] Weapon=%s Mesh 没有 Socket 'TraceStart' — 拒绝启动检测. ")
+			TEXT("【v75 零兜底】修复: 打开武器 Mesh 资产 (BP_Weapon_ShovelLarge.uasset → Components → StaticMeshComponent) ")
+			TEXT("→ 在 Details 面板 'Sockets' 分组 → Add Socket → 命名 'TraceStart' → 拖到刀刃起点."),
+			*Weapon->GetName());
+		return false;
+	}
+	if (!Mesh->DoesSocketExist(SocketName_TraceEnd))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UMeleeSwStrategy::StartTrace] Weapon=%s Mesh 没有 Socket 'TraceEnd' — 拒绝启动检测. ")
+			TEXT("【v75 零兜底】修复: 同上, 在武器 Mesh 上加 Socket 'TraceEnd', 拖到刀刃终点."),
+			*Weapon->GetName());
+		return false;
+	}
+
+	// 记录激活态 (v74 — 状态标签 + 广播)
+	const EWeaponTraceState OldState = TraceState;
+	TraceState = EWeaponTraceState::Tracing;
 	bIsCurrentHeavy = bIsHeavy;
 	ActiveWeapon = Weapon;
 	IgnoreActors.Empty();
@@ -73,9 +105,15 @@ bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
 		IgnoreActors.Add(Owner);
 	}
 
-	// 初始化起始位置 (防 0 点开刀)
-	LastFrameStartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
-	LastFrameEndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
+	// 初始化起始位置 (用同一静态常量, 避免魔法字符串散落)
+	LastFrameStartLoc = Mesh->GetSocketLocation(SocketName_TraceStart);
+	LastFrameEndLoc = Mesh->GetSocketLocation(SocketName_TraceEnd);
+
+	// v74 广播: Idle → Tracing
+	if (OldState != TraceState)
+	{
+		TraceStateChanged.Broadcast(TraceState, nullptr, FVector::ZeroVector, NAME_None);
+	}
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[UMeleeSwStrategy::StartTrace] 启动近战检测 — Weapon=%s Heavy=%d 起点=%s 终点=%s"),
@@ -94,16 +132,23 @@ bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy)
 
 void UMeleeSwStrategy::StopTrace(ABaseWeapon* Weapon)
 {
-	if (!bIsActive)
+	if (TraceState == EWeaponTraceState::Idle)
 	{
 		// 幂等: 已经停止, no-op
 		return;
 	}
 
-	bIsActive = false;
+	const EWeaponTraceState OldState = TraceState;
+	TraceState = EWeaponTraceState::Idle;
 	IgnoreActors.Empty();
 	ActiveWeapon.Reset();
 	bIsCurrentHeavy = false;
+
+	// v74 广播: Tracing → Idle
+	if (OldState != TraceState)
+	{
+		TraceStateChanged.Broadcast(TraceState, nullptr, FVector::ZeroVector, NAME_None);
+	}
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[UMeleeSwStrategy::StopTrace] 停止近战检测 — Weapon=%s"),
@@ -118,7 +163,7 @@ void UMeleeSwStrategy::StopTrace(ABaseWeapon* Weapon)
 void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 {
 	// 未激活 → 跳过 (大厂原则 - 不浪费 CPU)
-	if (!bIsActive)
+	if (TraceState == EWeaponTraceState::Idle)
 	{
 		return;
 	}
@@ -127,7 +172,8 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[UMeleeSwStrategy::TickDetection] Weapon 已失效 — 强制停止检测."));
-		bIsActive = false;
+		TraceState = EWeaponTraceState::Idle;
+		TraceStateChanged.Broadcast(TraceState, nullptr, FVector::ZeroVector, NAME_None);
 		return;
 	}
 
@@ -137,18 +183,34 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		UE_LOG(LogTemp, Error,
 			TEXT("[UMeleeSwStrategy::TickDetection] Weapon=%s 没有 Mesh 组件 — 强制停止检测."),
 			*Weapon->GetName());
-		bIsActive = false;
+		TraceState = EWeaponTraceState::Idle;
+		TraceStateChanged.Broadcast(TraceState, nullptr, FVector::ZeroVector, NAME_None);
 		return;
 	}
 
 	// 读取当前帧的刀刃世界坐标
-	const FVector StartLoc = Mesh->GetSocketLocation(FName("TraceStart"));
-	const FVector EndLoc = Mesh->GetSocketLocation(FName("TraceEnd"));
+	//   真理源: SocketName_TraceStart / SocketName_TraceEnd (头文件静态成员常量)
+	const FVector StartLoc = Mesh->GetSocketLocation(SocketName_TraceStart);
+	const FVector EndLoc = Mesh->GetSocketLocation(SocketName_TraceEnd);
 
-	// 零兜底: 两点重合或 Socket 不存在 → 跳过 (防 NaN/零矩阵)
-	if ((EndLoc - StartLoc).IsNearlyZero())
+	// 【v75 零兜底】Socket 位置不能为零向量 — StartTrace 已校验 Socket 存在, 但位置可能仍在原点 (美术配错)
+	//   旧版 (v60-v74): IsNearlyZero 静默跳过 → 用户看不到 trace 也不知道为什么 (兜底反模式)
+	//   新版 (v75): 起点终点任一为零向量 → Log Error + 强制 StopTrace + 关闭状态标签
+	const bool bStartInvalid = StartLoc.IsNearlyZero();
+	const bool bEndInvalid = EndLoc.IsNearlyZero();
+	if (bStartInvalid || bEndInvalid)
 	{
-		// 不报错 (允许开始帧 LastFrame 全零), 但跳过本帧检测
+		UE_LOG(LogTemp, Error,
+			TEXT("[UMeleeSwStrategy::TickDetection] Weapon=%s Socket 位置为零向量 (Start=%s, End=%s) — 强制停止检测. ")
+			TEXT("【v75 零兜底】Socket 已存在但位置是原点, 说明美术在 Mesh 编辑器拖 Socket 时没真正放上去. ")
+			TEXT("修复: 打开武器 Mesh 资产 → Sockets 面板 → 拖动 TraceStart/TraceEnd 到刀刃两端 → 保存."),
+			*Weapon->GetName(),
+			*StartLoc.ToCompactString(),
+			*EndLoc.ToCompactString());
+
+		TraceState = EWeaponTraceState::Idle;
+		TraceStateChanged.Broadcast(TraceState, nullptr, FVector::ZeroVector, NAME_None);
+		ActiveWeapon.Reset();
 		return;
 	}
 
@@ -164,7 +226,7 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	const FVector BoxHalfSize = FVector(15.0f, 15.0f, BladeLength * 0.5f);
 
 	// 绝对不用 MakeFromZ 猜角度, 直接拿 Socket 最真实物理旋转
-	const FRotator BoxRotation = Mesh->GetSocketRotation(FName("TraceStart"));
+	const FRotator BoxRotation = Mesh->GetSocketRotation(SocketName_TraceStart);
 
 	// 过滤 IgnoreActors 中的失效引用 (TWeakObjectPtr 可能在武器切换后失效)
 	TArray<AActor*> ValidIgnoreActors;
@@ -207,6 +269,14 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		{
 			bAIDriven = OwnerChar->IsAttackerAI();
 		}
+
+		// v74 广播: Tracing → Hit (Hit 是一帧瞬态, 下帧自动回 Tracing)
+		// HUD/音效/命中反馈订阅 OnTraceStateChanged 即可拿到完整命中信息
+		TraceStateChanged.Broadcast(
+			EWeaponTraceState::Hit,
+			HitResult.GetActor(),
+			HitResult.ImpactPoint,
+			HitResult.BoneName);
 
 		// 调 Server RPC 报告命中 (RPC 自动路由到服务器)
 		Weapon->Server_ReportHit(

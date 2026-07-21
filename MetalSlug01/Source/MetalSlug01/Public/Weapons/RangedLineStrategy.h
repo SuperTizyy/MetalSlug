@@ -65,22 +65,29 @@ public:
 	// IWeaponDamageStrategy 实现
 	// ===========================================
 
-	/**
-	 * 启动一次伤害检测 — v60.3 立即执行一发射线
-	 *
-	 * 调用方: WeaponFireComponent::PerformSingleShot / ABaseWeapon::PerformDamageTrace
-	 *
-	 * 流程 (v60.16 相机起点 + 枪口偏移):
-	 *   1. 获取相机位置 + 方向
-	 *   2. 获取 TargetArmLength (相机到角色中心)
-	 *   3. 计算射线起点 = 相机位置 - 相机方向 × (TargetArmLength + MuzzleOffset)
-	 *   4. 准星屏幕坐标 → Deproject → 世界方向
-	 *   5. 终点 = 起点 + 方向 × AttackRange
-	 *   6. LineTraceSingle → 命中调 Server_ReportHit
-	 *
-	 * @return true=成功执行射线, false=配置错/状态错
-	 */
-	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy) override;
+/**
+ * 启动一次伤害检测 — v60.3 立即执行一发射线
+ *
+ * 调用方: WeaponFireComponent::PerformSingleShot / ABaseWeapon::PerformDamageTrace
+ *
+ * 流程 (v82 修复 — 客户端射线参数):
+ *   1. 入参校验 (Weapon 非空)
+ *   2. 缓存状态 (ActiveWeapon + bIsCurrentHeavy)
+ *   3. 调 PerformSingleShot(ClientRayOrigin, ClientRayDirection) — 传入客户端射线参数
+ *
+ * v82 大厂架构修复:
+ *   - 旧 (v70-v81) 反模式: PerformSingleShot 内部用 PC->GetViewportSize + DeprojectScreenPositionToWorld
+ *     → 服务器进程对远端玩家 PC 调用 GetViewportSize 返回 0,0 → Deproject 失败 → return false
+ *     → 远端玩家在服务器上 trace 永远失败 (用户报告 "玩家客户端攻击没射线检测")
+ *   - 新 (v82): ClientRayOrigin/Direction 由客户端在 OnFirePressed 用 HUD Crosshair 算出 → RPC 传给服务器
+ *     → 服务器用客户端射线做权威 trace (玩家射线 = 玩家准星)
+ *     → 兼容 AI 路径: ClientRayOrigin = ZeroVector → AI fallback 用 BaseAimRotation
+ *
+ * @return true=成功执行射线, false=配置错/状态错
+ */
+virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
+	const FVector& ClientRayOrigin = FVector::ZeroVector,
+	const FVector& ClientRayDirection = FVector::ForwardVector) override;
 
 	/**
 	 * 停止检测 — v60.3 对 Ranged 是 no-op
@@ -94,22 +101,37 @@ public:
 
 	/**
 	 * 查询激活态 — v60.3 Ranged 永远返回 false
+	 *
+	 * v74 注: Ranged 也支持状态标签 (单帧 Tracing 后回 Idle), 但 IsActive 仅 Tracing 中为 true
 	 */
-	virtual bool IsActive() const override { return false; }
+	virtual bool IsActive() const override { return TraceState != EWeaponTraceState::Idle; }
+
+	/**
+	 * 获取当前检测状态标签 (v74 — Ranged 单帧 Tracing)
+	 */
+	virtual EWeaponTraceState GetTraceState() const override { return TraceState; }
+
+	/**
+	 * 获取状态变化广播委托 (v74)
+	 */
+	virtual FOnWeaponTraceStateChanged& OnTraceStateChanged() override { return TraceStateChanged; }
 
 protected:
 	/**
 	 * 单次射线检测 (内部使用, StartTrace 内部调用)
 	 *
-	 * 流程 (v60.16 相机起点 + 枪口偏移):
-	 *   1. 相机位置 - 相机方向 × (TargetArmLength + MuzzleOffset) = 枪口位置
-	 *   2. 准星屏幕中心 → Deproject → 世界方向
-	 *   3. 终点 = 枪口位置 + 方向 × AttackRange
-	 *   4. LineTraceSingle → 命中调 Server_ReportHit
+	 * v82 大厂架构修复 — 客户端射线参数:
+	 *   - 旧: PerformSingleShot(Weapon) 内部用 PC->GetViewportSize + Deproject
+	 *     → 服务器进程失败
+	 *   - 新: PerformSingleShot(Weapon, ClientRayOrigin, ClientRayDirection)
+	 *     → 客户端传射线, 服务器做权威 trace
+	 *     → ClientRayOrigin = ZeroVector 时, AI fallback 用 BaseAimRotation
 	 *
 	 * @return true=成功执行, false=配置错
 	 */
-	bool PerformSingleShot(ABaseWeapon* Weapon);
+	bool PerformSingleShot(ABaseWeapon* Weapon,
+		const FVector& ClientRayOrigin = FVector::ZeroVector,
+		const FVector& ClientRayDirection = FVector::ForwardVector);
 
 	/**
 	 * 当前激活的 Weapon (保留以便后续 DropOff/后坐力扩展)
@@ -121,4 +143,15 @@ protected:
 	 * 当前是否重击 (枪械暂未用)
 	 */
 	bool bIsCurrentHeavy = false;
+
+	/**
+	 * 当前检测状态标签 (v74)
+	 */
+	EWeaponTraceState TraceState = EWeaponTraceState::Idle;
+
+	/**
+	 * 状态变化广播委托 (v74)
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Trace")
+	FOnWeaponTraceStateChanged TraceStateChanged;
 };

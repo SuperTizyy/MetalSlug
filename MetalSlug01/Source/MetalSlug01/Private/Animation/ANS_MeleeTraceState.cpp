@@ -1,0 +1,215 @@
+// ==========================================
+// ANS_MeleeTraceState 实现 (v74 大厂架构)
+//
+// 【大厂原则 — 责任链】
+//   ANS_MeleeTraceState (本类)
+//     → Weapon->StartDamageTrace(bIsHeavy)
+//       → MeleeSwStrategy::StartTrace (内部激活 + 广播)
+//         → Tick 检测 BoxTrace 缝合 → 命中广播
+//
+//   美术在蒙太奇时间轴上控制"何时开始/结束"
+//   C++ 在 Strategy 内部处理"命中判定 + 伤害结算"
+//   订阅方通过 OnTraceStateChanged 委托拿事件 (HUD/音效/命中反馈)
+//
+// 【零兜底】
+//   - Mesh 无效 → Log Error + 拒绝启动
+//   - 没找到武器 → Log Error + 拒绝启动
+//   - 武器不是近战 (MeshType != Melee) → Log Error + 拒绝启动
+// ==========================================
+
+#include "Animation/ANS_MeleeTraceState.h"
+
+#include "Characters/BaseCharacter.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/MeshComponent.h"  // v82+ UMeshComponent 完整定义 (CurrentWeapon->GetMeshComponent 返回类型)
+#include "Weapons/BaseWeapon.h"
+#include "Weapons/WeaponDamageStrategy.h"
+
+
+UANS_MeleeTraceState::UANS_MeleeTraceState()
+{
+#if WITH_EDITORONLY_DATA
+	// 蒙太奇编辑器默认区间长度 (美术可拖动调整)
+	NotifyColor = FColor(220, 80, 40); // 醒目橙色 — 与 Footstep 区分
+#endif
+}
+
+
+// ==========================================================
+// 1. NotifyBegin — 进入区间
+// ==========================================================
+
+void UANS_MeleeTraceState::NotifyBegin(
+	USkeletalMeshComponent* MeshComp,
+	UAnimSequenceBase* Animation,
+	float TotalDuration,
+	const FAnimNotifyEventReference& EventReference)
+{
+	Super::NotifyBegin(MeshComp, Animation, TotalDuration, EventReference);
+
+	// 零兜底: Mesh 无效 → 拒绝
+	if (!MeshComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: MeshComp 为空 — 拒绝启动 trace."));
+		return;
+	}
+
+	// 取 Owner (角色 Pawn)
+	AActor* OwnerActor = MeshComp->GetOwner();
+	if (!OwnerActor)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: MeshComp 没有 Owner — 拒绝启动 trace."));
+		return;
+	}
+
+	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor);
+	if (!OwnerChar)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: Owner=%s 不是 ABaseCharacter — 拒绝启动 trace. "
+			     "【v74 零兜底】只支持挂在角色 Mesh 上的蒙太奇."),
+			*OwnerActor->GetName());
+		return;
+	}
+
+	// 取当前武器
+	ABaseWeapon* CurrentWeapon = OwnerChar->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: Owner=%s 没有当前武器 — 拒绝启动 trace. "
+			     "【v74 零兜底】检查 SpawnWeaponID 是否配置."),
+			*OwnerChar->GetName());
+		return;
+	}
+
+	// 零兜底: 只处理近战武器 (其他类型由对应 ANS 处理)
+	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Melee)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: Weapon=%s MeshType=%d 不是 Melee — 拒绝启动 trace. "
+			     "【v74 零兜底】枪械用 ANS_RangedFire, 不要挂这个标签."),
+			*CurrentWeapon->GetName(),
+			static_cast<int32>(CurrentWeapon->GetMeshType()));
+		return;
+	}
+
+	// ============================================================
+	// 【v85.3 大厂架构重构】所有进程都调 StartDamageTrace
+	//
+	// 旧版 (v74-v85.2) 反模式:
+	//   NotifyBegin 只让服务器调 StartDamageTrace → 客户端只能画静态 Box (不执行 trace)
+	//   → 客户端看不到同步的 trace 视觉效果 (命中时的绿色 Box)
+	//
+	// 新版 (v85.3):
+	//   所有进程 (服务器+客户端) 都调 StartDamageTrace
+	//   MeleeSwStrategy::TickDetection 在所有进程都执行
+	//   Server_ReportHit 的 HasAuthority() 守卫是防重复扣血的唯一机制
+	//
+	// 调用链 (大厂原则 - 责任链):
+	//   1. 动画播放到 ANS 区间开始 → NotifyBegin → StartDamageTrace
+	//   2. MeleeSwStrategy::TickDetection 跨帧执行 BoxTrace (两端都跑)
+	//   3. 命中 → Server_ReportHit RPC → 服务器 ApplyDamage (HasAuthority 守卫)
+	//   4. 动画结束/ANS 区间结束 → NotifyEnd → StopDamageTrace
+	//
+	// 大厂原则 - 零兜底:
+	//   - 不区分服务器/客户端进程: 两端都执行相同的 trace 逻辑
+	//   - 伤害计算只在服务器: Server_ReportHit 的 HasAuthority() 守卫保证
+	// ============================================================
+
+	// 根据 EnterState 决策 (美术可能配 Idle 做"主动关闭")
+	switch (EnterState)
+	{
+	case EWeaponTraceState::Tracing:
+		CurrentWeapon->StartDamageTrace(bIsHeavy);
+		break;
+
+	case EWeaponTraceState::Idle:
+		CurrentWeapon->StopDamageTrace();
+		break;
+
+	case EWeaponTraceState::Hit:
+		// Hit 是 TickDetection 命中时瞬态, 不能由 AnimNotifyState 设置
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: EnterState=Hit 不合法 — 拒绝. "
+			     "【v74 零兜底】Hit 由 MeleeSwStrategy 命中时自动设置, 不允许美术手动配置."));
+		break;
+
+	default:
+		UE_LOG(LogTemp, Error,
+			TEXT("[ANS_MeleeTraceState] NotifyBegin: 未知 EnterState=%d — 拒绝."),
+			static_cast<int32>(EnterState));
+		break;
+	}
+}
+
+
+// ==========================================================
+// 2. NotifyEnd — 离开区间
+// ==========================================================
+
+void UANS_MeleeTraceState::NotifyEnd(
+	USkeletalMeshComponent* MeshComp,
+	UAnimSequenceBase* Animation,
+	const FAnimNotifyEventReference& EventReference)
+{
+	Super::NotifyEnd(MeshComp, Animation, EventReference);
+
+	// 零兜底: Mesh 无效 → 静默 (蒙太奇自然结束, 不能刷错)
+	if (!MeshComp)
+	{
+		return;
+	}
+
+	AActor* OwnerActor = MeshComp->GetOwner();
+	if (!OwnerActor)
+	{
+		return;
+	}
+
+	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor);
+	if (!OwnerChar)
+	{
+		return;
+	}
+
+	ABaseWeapon* CurrentWeapon = OwnerChar->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		// 蒙太奇结束时武器可能已切换/销毁 — 静默 (StopDamageTrace 幂等)
+		return;
+	}
+
+	// ============================================================
+	// 【v85.3 大厂架构重构】所有进程都调 StopDamageTrace
+	//
+	// 旧版 (v74-v85.2) 反模式:
+	//   NotifyEnd 只让服务器调 StopDamageTrace → 客户端永远不关 trace
+	//   → 客户端 trace 永远开着 (射线跟着角色走)
+	//
+	// 新版 (v85.3):
+	//   所有进程都调 StopDamageTrace
+	//   MeleeSwStrategy::TraceState = Idle → TickDetection 不再执行
+	//   → 客户端 trace 立即关闭
+	// ============================================================
+	CurrentWeapon->StopDamageTrace();
+}
+
+
+// ==========================================================
+// 3. GetNotifyName — 蒙太奇编辑器显示
+// ==========================================================
+
+FString UANS_MeleeTraceState::GetNotifyName_Implementation() const
+{
+	// 编辑器时间轴上显示 "Melee Trace (Tracing)" / "Melee Trace (Idle)"
+	const FString StateName = StaticEnum<EWeaponTraceState>()
+		? StaticEnum<EWeaponTraceState>()->GetDisplayNameTextByValue(static_cast<int64>(EnterState)).ToString()
+		: TEXT("Unknown");
+
+	return FString::Printf(TEXT("Melee Trace (%s%s)"),
+		*StateName,
+		bIsHeavy ? TEXT(" Heavy") : TEXT(""));
+}

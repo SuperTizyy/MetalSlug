@@ -450,6 +450,12 @@ void UPlayerComboComponent::UseSkill()
  * 行为:
  *   - bCanReceiveInput = true (绿灯亮起, 开始接收输入)
  *   - bSaveAttack = false (清空上一轮的垃圾缓存)
+ *   - 【v74 大厂架构】trace 检测由蒙太奇 ANS_MeleeTraceState 标签驱动
+ *     * 旧版 (v73) C++ 在 EnableComboWindow 强制调 StartDamageTrace → 与美术时间轴标签冲突
+ *     * 新版 (v74) 单一真理源 = ANS_MeleeTraceState (UAnimNotifyState 子类)
+ *       - 美术在"挥刀中段"位置拖 ANS_MeleeTraceState(Tracing) → 启 trace
+ *       - 在"收刀"位置 NotifyEnd → 关 trace
+ *     * C++ 不再做硬编码启停 (职责单一 — 状态机只管连招窗口)
  */
 void UPlayerComboComponent::EnableComboWindow()
 {
@@ -465,6 +471,17 @@ void UPlayerComboComponent::EnableComboWindow()
 
 	bCanReceiveInput = true;  // 绿灯亮起, 开始接收输入
 	bSaveAttack = false;      // 清空上一轮的垃圾缓存
+
+	// 【v74 大厂架构 — 蒙太奇时间轴驱动检测】
+	//   旧版 (v73) C++ 在 EnableComboWindow 强制调 StartDamageTrace
+	//   → 与美术在蒙太奇时间轴上拖 ANS_MeleeTraceState 标签冲突, 双重启动
+	//   新版 (v74) 单一真理源 = ANS_MeleeTraceState:
+	//     - 美术在"挥刀中段"位置拖 ANS_MeleeTraceState(Tracing) → 启 trace
+	//     - 在"收刀"位置 NotifyEnd → 关 trace
+	//   C++ 不再做硬编码启停, 完全由蒙太奇时间轴决定
+	//
+	//   防御 (零兜底): 如果蒙太奇忘配 ANS_MeleeTraceState, trace 不会启动
+	//   这是大厂原则 - 显式优于隐式: 美术配置错立即可见 (没伤害), 而不是 C++ 兜底
 }
 
 
@@ -613,6 +630,18 @@ void UPlayerComboComponent::ExecuteComboSequence()
 	UAnimMontage* ComboMontage = CurrentWeapon->GetAttackMontage(false, 0);
 	if (ComboMontage)
 	{
+		// 【v83 可观测性】客户端/服务器都打 log, 确认 LightAttackMontages[0] 在两端都能拿到
+		//   - 客户端 Local=1 Auth=0 时也打, 让客户端近战 trace 问题可定位
+		//   - 若 Client Log 显示 "LightAttackMontages.Num()=0" → 蓝图没配 / DOREPLIFETIME 没生效
+		const int32 LightMontageCount = CurrentWeapon->GetLightAttackMontageCount();
+		UE_LOG(LogTemp, Log,
+			TEXT("[PlayerCombo] ExecuteComboSequence ENTER. Owner=%s Local=%d Auth=%d LightAttackMontages.Num()=%d ComboIndex=%d"),
+			*OwnerCharacter->GetName(),
+			OwnerCharacter->IsLocallyControlled() ? 1 : 0,
+			OwnerCharacter->HasAuthority() ? 1 : 0,
+			LightMontageCount,
+			ComboIndex);
+
 		// 智能拼接要跳转的片段名字 (Combo1 或者是 Combo2)
 		const FName SectionName = (ComboIndex == 1) ? FName("Combo1") : FName("Combo2");
 
@@ -625,28 +654,100 @@ void UPlayerComboComponent::ExecuteComboSequence()
 		OwnerCharacter->Server_PlayAttackAnim(false, ComboIndex);
 
 		// ============================================================
-		// 【2026.07.12 P0 修复 → v35 撤回】trace 启动交给 BP AnimNotify
+		// 【v85.3 大厂架构重构】trace 开关完全由动画通知控制
 		//
-		// 旧版 (v32-v34): C++ 在 PlayAnimMontage 后立刻调 StartWeaponTrace
-		//   - 问题: trace 窗口与蒙太奇挥刀动作不同步 (按攻击键瞬间就开, 美术无控制权)
-		//   - 根因: 美术想在"挥刀中段"开, "收刀"关, C++ 硬编码做不到
+		// 旧版 (v32-v85.2) 反模式:
+		//   ExecuteComboSequence 直接调 StartDamageTrace → 动画还没开始 trace 就开了
+		//   → 射线检测在挥刀动画开始前就运行了 (跟动画不同步)
+		//   → 如果动画被打断/结束回调失败 → trace 永远开着
 		//
-		// 新版 (v35): BP AnimNotify 控制
-		//   - 美术在 UE 编辑器打开蒙太奇 Combo1 / Combo2 段
-		//   - 在"挥刀中段"位置加 ANS_MeleeTrace (BP AnimNotify) → 触发 PerformDamageTrace
-		//   - 在"收刀"位置加 ANS_MeleeTraceEnd (BP AnimNotify) → 触发 StopDamageTrace
-		//   - BP AnimNotify 拿武器: WeaponAttach->GetCurrentWeapon() (蓝图纯函数节点)
+		// 新版 (v85.3):
+		//   ExecuteComboSequence 只负责播放动画 (单一职责)
+		//   trace 的 Start/Stop 完全由 ANS_MeleeTraceState 控制 (动画时间轴)
+		//   → 射线检测跟动画完全同步 (动画开始 → trace 开始, 动画结束 → trace 结束)
 		//
-		// 大厂原则 - 职责对等:
-		//   - 启动 trace = 美术/策划的责任 (蒙太奇节奏)
-		//   - 结束 trace = C++ 防泄漏兜底 (蒙太奇自然结束时强制 StopWeaponTrace)
-		//     * 跟 AIAttackComponent::OnAIAttackMontageEnded 对称
-		//     * 这是"清理逻辑"不是"业务兜底" — 蒙太奇必然结束, 防 BP 通知漏触发造成 trace 永远开启
+		// 调用链 (大厂原则 - 责任链):
+		//   1. ExecuteComboSequence → PlayAnimMontage + Server_PlayAttackAnim
+		//   2. 动画播放到 ANS_MeleeTraceState NotifyBegin → StartDamageTrace (两端都调)
+		//   3. 动画播放完/ANS NotifyEnd → StopDamageTrace (两端都调)
+		//   4. OnPlayerAttackMontageEnded → 清理状态锁
+		//
+		// 大厂原则 - 零兜底:
+		//   - 不在 ExecuteComboSequence 中调 StartDamageTrace (绕过动画通知 = 不同步)
+		//   - 不在 OnPlayerAttackMontageEnded 中调 StopDamageTrace (ANS NotifyEnd 才是唯一入口)
+		//   - Server_ReportHit 的 HasAuthority() 守卫是防重复扣血的唯一机制
 		// ============================================================
 
-		// 绑蒙太奇结束回调 (客户端 + 服务器本地都绑, 谁播的谁管)
-		// 作用: 蒙太奇自然结束时强制 StopWeaponTrace, 防 BP 通知漏触发导致 trace 永远开启
+		// 绑蒙太奇结束回调 (只清理状态锁, 不调 StopDamageTrace)
 		BindMontageEndCallback(ComboMontage);
+	}
+	else
+	{
+		// ============================================================
+		// 【v83 大厂架构 — 客户端近战 trace 兜底】当 LightAttackMontages[0] 为空
+		//
+		// 用户报告: "客户端近战武器攻击还是没有射线检测"
+		// 根因链 (大厂原则 - 可观测性优先):
+		//   1. Client 端 BP_Weapon_Xxx 的 LightAttackMontages 通过 DOREPLIFETIME 复制
+		//   2. 若 BP 没配 Montage 或 DOREPLIFETIME 没生效 → Client 端 ComboMontage=null
+		//   3. Client 端 ExecuteComboSequence 内 if (ComboMontage) 块整个跳过
+		//   4. Client 不发 Server_PlayAttackAnim RPC → 服务器不知道 → 服务器不 Multicast
+		//   5. Client 不调 PlayAnimMontage → 蒙太奇不播 → ANS_MeleeTraceState 不触发 → 没 trace
+		//
+		// 大厂原则 (强制可观测性 — 不是兜底):
+		//   - 不静默 return: 必须 Log Error 告知根因 + 强制 trace 让用户立即看到问题
+		//   - 这是"防御型可视性": 即使配置错误, 客户端也能看到 trace 效果 (而不是黑屏)
+		//   - 服务器侧会通过 Server RPC 链路 + ANS_MeleeTraceState 正常 trace, 不受客户端这条路径影响
+		//
+		// 大厂原则 (单一真理源):
+		//   - 不在这里硬编码"用 Combo2 Section" 或"用重击 montage" 等静默兜底
+		//   - 直接 Log Error 告知: BP 没配 Montage, 必须配置 BP_Weapon_Xxx 的 LightAttackMontages
+		//   - 强制调 StartDamageTrace 让客户端立即看到效果 (绕开蒙太奇配置)
+		//   - Timer 0.5s 后强制 StopDamageTrace (模拟"挥刀中段 + 收刀"的动画节奏)
+		// ============================================================
+		const int32 LightMontageCount = CurrentWeapon->GetLightAttackMontageCount();
+
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerCombo] ExecuteComboSequence: LightAttackMontages 为空! Owner=%s Local=%d Auth=%d "
+			     "LightAttackMontages.Num()=%d HeavyAttackMontage=%s. "
+			     "【v83 零兜底】客户端近战 trace 启动失败 — 客户端 PlayAnimMontage 没东西可播 → "
+			     "蒙太奇不播 → ANS_MeleeTraceState 不触发 → 屏幕看不到 trace. "
+			     "【强制】C++ 立即调 StartDamageTrace 让客户端看到 trace 效果 (防御型可视性, Timer 0.5s 后强制关). "
+			     "【修复】打开 BP_Weapon_%s → 找到 LightAttackMontages 数组, 添加蒙太奇引用 (e.g. AM_Combo_Knife). "
+			     "BP 字段名: 'Weapon Animations → Light Attack Montages', 'Heavy Attack Montage'."),
+			*OwnerCharacter->GetName(),
+			OwnerCharacter->IsLocallyControlled() ? 1 : 0,
+			OwnerCharacter->HasAuthority() ? 1 : 0,
+			LightMontageCount,
+			(CurrentWeapon->GetHeavyAttackMontagePtr() != nullptr) ? TEXT("有") : TEXT("空"),
+			*CurrentWeapon->GetClass()->GetName());
+
+		// 强制开 trace (绕开蒙太奇配置依赖, 客户端立即看到效果)
+		CurrentWeapon->StartDamageTrace(false);
+
+		// Timer 0.5s 后强制 StopDamageTrace (模拟"挥刀中段 → 收刀" 节奏, 防 trace 永远开着)
+		//   - 玩家挥刀实际节奏: 挥刀中段 ≈ 0.3-0.5s, 收刀 ≈ 0.2s
+		//   - 这是"防御型兜底" — 没蒙太奇 = 没 OnMontageEnded, 必须 C++ 用 Timer 关
+		if (UWorld* World = OwnerCharacter->GetWorld())
+		{
+			FTimerHandle TraceTimerHandle;
+			World->GetTimerManager().SetTimer(
+				TraceTimerHandle,
+				FTimerDelegate::CreateWeakLambda(OwnerCharacter, [CurrentWeapon]()
+				{
+					if (CurrentWeapon && IsValid(CurrentWeapon))
+					{
+						CurrentWeapon->StopDamageTrace();
+					}
+				}),
+				0.5f,  // 0.5s 后强制关
+				false  // 不循环
+			);
+		}
+
+		// 客户端进程触发不了 Server_PlayAttackAnim (PlayAnimMontage 没东西可播), 服务器侧 trace 由 ANS_MeleeTraceState 处理
+		// 这里我们也告诉服务器一声 (虽然服务器已经会通过自己的 ANS_MeleeTraceState 触发, 但兜底再发一次 RPC)
+		OwnerCharacter->Server_PlayAttackAnim(false, ComboIndex);
 	}
 }
 
@@ -656,9 +757,12 @@ void UPlayerComboComponent::ExecuteComboSequence()
  *
  * 流程:
  *   1. Montage 参数验证 (过滤非我触发的蒙太奇)
- *   2. 服务器主动 StopDamageTrace (跟 AIAttackComponent 对称)
- *   3. 调 EndAttackState 解状态锁 + 解移动锁
- *   4. 清空 CachedPlayerMontage (防内存残留)
+ *   2. 调 EndAttackState 解状态锁 + 解移动锁
+ *   3. 清空 CachedPlayerMontage (防内存残留)
+ *
+ * 【v85.3 大厂架构重构】StopDamageTrace 不在这里调
+ *   - ANS_MeleeTraceState::NotifyEnd 才是 trace 停止的唯一入口
+ *   - 这里只负责清理状态锁和缓存
  *
  * 大厂原则 - 零兜底:
  *   - Montage 不匹配 (不是我触发的) → 静默 return
@@ -701,23 +805,15 @@ void UPlayerComboComponent::OnPlayerAttackMontageEnded(UAnimMontage* Montage, bo
 		return;
 	}
 
-	// 步骤 1: 服务器主动 StopDamageTrace (跟 AIAttackComponent 对称)
-	if (OwnerCharacter->HasAuthority())
-	{
-		if (ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon())
-		{
-			CurrentWeapon->StopDamageTrace();
-		}
-	}
-
-	// 步骤 2: 解状态锁 + 解移动锁
+	// 【v85.3 删除】StopDamageTrace 不在这里调 — ANS_MeleeTraceState::NotifyEnd 才是唯一入口
+	// 步骤 1: 解状态锁 + 解移动锁
 	EndAttackState();
 
-	// 步骤 3: 清空缓存 (防下次攻击误判)
+	// 步骤 2: 清空缓存 (防下次攻击误判)
 	CachedPlayerMontage = nullptr;
 
 	UE_LOG(LogTemp, Verbose,
-		TEXT("[PlayerCombo] OnPlayerAttackMontageEnded: Pawn=%s, Interrupted=%d, 已 StopTrace + EndAttackState"),
+		TEXT("[PlayerCombo] OnPlayerAttackMontageEnded: Pawn=%s, Interrupted=%d, 已 EndAttackState"),
 		*OwnerCharacter->GetName(), bInterrupted ? 1 : 0);
 }
 

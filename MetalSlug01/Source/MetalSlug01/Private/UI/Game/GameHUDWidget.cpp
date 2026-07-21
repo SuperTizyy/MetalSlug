@@ -598,10 +598,16 @@ void UGameHUDWidget::HideEscMenu()
  *   - 这是"武器射线检测"的**单一真理源**入口
  *
  * 流程 (严格按顺序, 任一失败立即返回 false):
- *   1. Widget_Crosshair 存在
- *   2. Widget 已渲染 (CachedGeometry 有效, LocalSize > 0)
- *   3. PlayerController 存在 (本地玩家专属)
- *   4. DeprojectScreenPositionToWorld 成功 (返回 true)
+ *   1. PlayerController 存在 (本地玩家专属)
+ *   2. ViewportSize 获取成功 (>= 1x1)
+ *   3. DeprojectScreenPositionToWorld 成功 (返回 true)
+ *
+ * 【v82+ 重大重构】不再依赖 Widget_Crosshair 的几何位置
+ *   旧版 (v60-v81) 反模式: Widget_Crosshair->GetCenterScreenPosition() 拿 widget 几何中心
+ *   - 根因: widget 的 Alignment / Padding 决定位置, 玩家放置不准确 → 射线方向 Z 偏 (-0.3 朝地)
+ *   - 真实 Bug: 用户报告 "射线总是朝地打" — widget 中心坐标 ≠ 屏幕中心
+ *   - 新版 (v82+): 用 ViewportSize / 2.0 = 真正的屏幕中心 (玩家设计的"准星")
+ *   - Widget_Crosshair 只是装饰, 不参与几何计算 (单一真理源 = 屏幕中心)
  *
  * @note 调用方必须显式校验返回值, false 时拒绝射线检测 (零兜底)
  */
@@ -610,39 +616,38 @@ bool UGameHUDWidget::GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutW
 	OutWorldOrigin = FVector::ZeroVector;
 	OutWorldDirection = FVector::ZeroVector;
 
-	// (1) Widget 必须存在 — BindWidget 保证 non-null, 但运行时可能被外部清空
-	if (!Widget_Crosshair)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget::GetCrosshairWorldRay] Widget_Crosshair 为空. "
-			     "【v60.11 零兜底】修复: 在 WBP_GameHUD 蓝图 Components 面板检查 'Crosshair' 槽位是否绑了 WBP_Crosshair."));
-		return false;
-	}
-
-	// (2) Widget 必须已渲染 — 否则 GetCenterScreenPosition 返回 ZeroVector
-	const FVector2D ScreenPos = Widget_Crosshair->GetCenterScreenPosition();
-	if (ScreenPos.IsZero())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget::GetCrosshairWorldRay] 准星 Widget 未渲染或被 Collapsed. "
-			     "Widget=%s Visibility=%d. "
-			     "【v60.11 零兜底】原因排查: 1) 战斗未开始? GameHUDWidget::ShowCrosshair 没调? 2) Widget CachedGeometry 未生效 (刚 Create 还没 Tick 过)?"),
-			*Widget_Crosshair->GetName(),
-			static_cast<int32>(Widget_Crosshair->GetVisibility()));
-		return false;
-	}
-
-	// (3) PlayerController — 准星屏幕坐标 → 世界射线需要 PC
+	// (1) PlayerController — 准星屏幕坐标 → 世界射线需要 PC
 	APlayerController* PC = GetOwningPlayer();
 	if (!PC)
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[GameHUDWidget::GetCrosshairWorldRay] PlayerController 为空 (HUD 不属于本地玩家). "
-			     "【v60.11 零兜底】本函数仅本地玩家武器使用, AI/远端客户端禁止调用."));
+			     "【v82+ 零兜底】本函数仅本地玩家武器使用, AI/远端客户端禁止调用."));
 		return false;
 	}
 
-	// (4) Deproject 转换屏幕坐标 → 世界射线
+	// (2) ViewportSize — 用屏幕中心 (ViewportSize / 2) 作为准星屏幕坐标
+	//   旧版 (v60-v81): 用 Widget_Crosshair->GetCenterScreenPosition()
+	//   - widget 几何位置 ≠ 玩家视觉准星中心 → Z 分量偏移 (-0.3 朝地)
+	//   - 大厂原则: 真理源 = 玩家屏幕中心, 不是 widget 几何中心
+	int32 ViewportSizeX = 0;
+	int32 ViewportSizeY = 0;
+	PC->GetViewportSize(ViewportSizeX, ViewportSizeY);
+	if (ViewportSizeX <= 0 || ViewportSizeY <= 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget::GetCrosshairWorldRay] ViewportSize 无效. SizeX=%d SizeY=%d. "
+			     "【v82+ 零兜底】原因排查: 1) Viewport 未初始化? 2) 关卡切换中? 3) 玩家无本地窗口?"),
+			ViewportSizeX, ViewportSizeY);
+		return false;
+	}
+
+	const FVector2D ScreenPos = FVector2D(
+		ViewportSizeX * 0.5f,
+		ViewportSizeY * 0.5f
+	);
+
+	// (3) Deproject 转换屏幕坐标 → 世界射线
 	FVector WorldOrigin;
 	FVector WorldDirection;
 	const bool bDeprojectOK = PC->DeprojectScreenPositionToWorld(
@@ -656,7 +661,7 @@ bool UGameHUDWidget::GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutW
 		UE_LOG(LogTemp, Error,
 			TEXT("[GameHUDWidget::GetCrosshairWorldRay] DeprojectScreenPositionToWorld 失败. "
 			     "ScreenPos=%s Player=%s. "
-			     "【v60.11 零兜底】原因排查: 1) Viewport 未初始化? 2) ScreenPos 越界 (越界时 UE 返回 false)."),
+			     "【v82+ 零兜底】原因排查: 1) Viewport 未初始化? 2) ScreenPos 越界 (越界时 UE 返回 false)."),
 			*ScreenPos.ToString(),
 			*PC->GetName());
 		return false;
@@ -882,6 +887,7 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 		Events->OnACEValueChanged.AddDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
 		Events->OnACEWithRankChanged.AddDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
 		Events->OnWeaponIconReady.AddDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+		Events->OnWeaponAmmoInfoReady.AddDynamic(this, &UGameHUDWidget::OnWeaponAmmoInfoReady);
 
 		// 【2026.07.14 新增】订阅无敌期状态变化 - 控制复活进度条显示/隐藏
 		Events->OnInvincibilityChanged.AddDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
@@ -932,6 +938,45 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			{
 				UE_LOG(LogTemp, Verbose,
 					TEXT("[GameHUDWidget][Bind-Snapshot] 无武器图标缓存, 等待 CharacterEvents::OnWeaponIconReady 事件"));
+			}
+		}
+
+		// 【v85.2 大厂架构新增】弹药快照补发 (HUD 绑定成功后立即显示弹夹数)
+		// 根因: CharacterIconComponent::BeginPlay 执行时武器 WeaponFireComponent 可能未初始化
+		//       → BroadcastWeaponAmmoInfo 读到空弹药 → HUD 显示为空
+		//       → 用户需要切枪才能看到弹夹数
+		// 解决方案: HUD 订阅成功后，从 CharacterEvents::OnWeaponAmmoInfoReady 缓存快照直接补发到 UI
+		{
+			// 检查缓存的弹药数据
+			int32 CachedCurrentAmmo = -1;
+			int32 CachedMagazineSize = -1;
+			int32 CachedReserveAmmo = -1;
+			bool bCachedIsMelee = false;
+			if (Events->GetCachedWeaponAmmoInfo(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee))
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
+					CachedCurrentAmmo, CachedMagazineSize, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee ? 1 : 0);
+				OnWeaponAmmoInfoReady(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo);
+			}
+			else
+			{
+				// 如果 CharacterEvents 没有缓存，直接从武器组件读取
+				if (ABaseWeapon* CurrentWeapon = Character->GetCurrentWeapon())
+				{
+					if (UWeaponFireComponent* FireComp = CurrentWeapon->FindComponentByClass<UWeaponFireComponent>())
+					{
+						const int32 CurrentAmmo = FireComp->GetCurrentAmmo();
+						const int32 MagazineSize = FireComp->GetMagazineSize();
+						const int32 ReserveAmmo = FireComp->GetReserveAmmo();
+						const bool bIsMelee = (CurrentWeapon->GetMeshType() == EWeaponMeshType::Melee);
+
+						UE_LOG(LogTemp, Log,
+							TEXT("[GameHUDWidget][Bind-Snapshot] 从武器组件补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
+							CurrentAmmo, MagazineSize, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
+						OnWeaponAmmoInfoReady(CurrentAmmo, MagazineSize, ReserveAmmo);
+					}
+				}
 			}
 		}
 
@@ -1061,6 +1106,7 @@ void UGameHUDWidget::UnbindFromCharacterEvents()
 		CachedCharacterEvents->OnACEValueChanged.RemoveDynamic(this,     &UGameHUDWidget::OnACEValueChanged);
 		CachedCharacterEvents->OnACEWithRankChanged.RemoveDynamic(this,  &UGameHUDWidget::OnACEWithRankChanged);
 		CachedCharacterEvents->OnWeaponIconReady.RemoveDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
+		CachedCharacterEvents->OnWeaponAmmoInfoReady.RemoveDynamic(this, &UGameHUDWidget::OnWeaponAmmoInfoReady);
 		CachedCharacterEvents->OnInvincibilityChanged.RemoveDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
 
 		CachedCharacterEvents = nullptr;
@@ -1187,6 +1233,45 @@ void UGameHUDWidget::OnWeaponIconReady(const FString& WeaponID, class UTexture2D
 
 	// Icon 为空: 通过 WeaponID 从 DataTable 加载
 	UpdateWeaponIconFromID(WeaponID);
+}
+
+
+/**
+ * UGameHUDWidget::OnWeaponAmmoInfoReady
+ *
+ * 【v84 大厂架构新增】武器弹药数量加载完毕回调
+ *
+ * 触发时机:
+ *   - 服务器 CharacterIconComponent::BroadcastWeaponAmmoInfo
+ *   - 在武器图标刷新时同步广播 (RefreshWeaponIconOnHUD 末尾)
+ *
+ * 格式规则:
+ *   - 近战武器 (MeshType=Melee): "1/1"
+ *   - 枪械: "CurrentMag/MagazineSize + ReserveAmmo"
+ *
+ * @param CurrentMag   当前弹匣弹药
+ * @param MagazineSize 弹匣容量
+ * @param ReserveAmmo  备用弹药总数
+ */
+void UGameHUDWidget::OnWeaponAmmoInfoReady(int32 CurrentMag, int32 MagazineSize, int32 ReserveAmmo)
+{
+	if (!Widget_WeaponPanel)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnWeaponAmmoInfoReady: Widget_WeaponPanel 未绑定! "
+				 "请检查 WBP_GameHUDWidget 蓝图中是否正确拖入了 WeaponPanel 子控件"));
+		return;
+	}
+
+	// 根据武器类型判断是否为近战武器
+	// 弹药信息中 ReserveAmmo=0 且 MagazineSize=1 的是近战武器标志
+	const bool bIsMelee = (MagazineSize == 1 && ReserveAmmo == 0);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] OnWeaponAmmoInfoReady: CurrentMag=%d, MagazineSize=%d, ReserveAmmo=%d, bIsMelee=%d"),
+		CurrentMag, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
+
+	Widget_WeaponPanel->UpdateWeaponAmmoText(CurrentMag, MagazineSize, ReserveAmmo, bIsMelee);
 }
 
 

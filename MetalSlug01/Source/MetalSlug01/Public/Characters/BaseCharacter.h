@@ -102,7 +102,14 @@ class ABaseAIController;
 class ARoomPlayerState;
 
 // 【v51 大厂架构 — 生化模式】武器槽位类型前置声明 (完整定义见 Weapons/WeaponSlotType.h)
-enum class EWeaponSlotType : uint8;
+// enum class EWeaponSlotType : uint8;
+// 【v76 大厂架构 — 武器切换音效】UFUNCTION 参数需要完整 enum 定义, UHT 反射要求
+//   旧版用前向声明, 但 UFUNCTION(NetMulticast) 反射枚举参数需要完整定义
+//   → 改为直接 include (v76 已验证)
+#include "Weapons/WeaponSlotType.h"
+
+// 【v76 大厂架构 — 武器切换音效】USoundBase 前向声明 (Multicast RPC 签名需要)
+// class USoundBase;
 
 // 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
 #include "GenericTeamAgentInterface.h"
@@ -1063,6 +1070,31 @@ protected:
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_Die();
+
+	/**
+	 * 【v76 大厂架构】Multicast RPC — 播放"拿起武器"音效到所有客户端
+	 *
+	 * 触发场景:
+	 *   - 服务器 Server_SwitchToWeaponSlot → UWeaponAttachmentComponent::PlayEquipSoundForSlot
+	 *   - PlayEquipSoundForSlot 拿到 Sound 数据 → 调本 RPC
+	 *   - 所有客户端 (包括服务器自己的 ListenClient 实例) 收到 RPC → PlaySoundAtLocation
+	 *
+	 * 大厂原则 — RPC 纯数据化:
+	 *   - 参数是 USoundBase* / float — 不传 Actor / Component 引用 (UE 网络边界序列化要求)
+	 *   - 调用方负责查出 Sound 数据后再传, RPC 内部不查 (避免分布式 RPC 里反查 GM)
+	 *
+	 * 大厂原则 — UE 5.6 NetMulticast 行为:
+	 *   - 服务器自己调用时, NetMulticast **会** 在服务器本地执行 Implementation
+	 *   - 远端客户端收到时也执行 Implementation
+	 *   - 服务器 Local 实例播本地音效 (如果它有可视窗口)
+	 *   - Dedicated Server 上服务器实例没声音 (合理 — 服务器不渲染)
+	 *
+	 * @param InSound       要播放的 SoundBase (SoundCue / SoundWave / MetaSoundSource)
+	 * @param VolumeMul     音量倍数 (DataAsset.VolumeMultiplier)
+	 * @param PitchMul      音高倍数 (DataAsset.PitchMultiplier)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlayEquipSoundForSlot(EWeaponSlotType NewSlot, USoundBase* InSound, float VolumeMul, float PitchMul);
 
 	/**
 	 * 复活延迟时间（秒），死亡时传递给 PlayerController 启动定时器

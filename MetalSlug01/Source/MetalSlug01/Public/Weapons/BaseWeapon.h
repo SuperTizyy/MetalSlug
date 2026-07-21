@@ -58,6 +58,18 @@ public:
 	virtual void Tick(float DeltaTime) override;
 
 	/**
+	 * 【v81 客户端武器可用性修复】网络复制字段注册
+	 *
+	 * 旧 (v80-): bReplicates=true 但 GetLifetimeReplicatedProps 不存在
+	 *   → Actor 本身复制 (引用同步), 但 UPROPERTY 字段不复制
+	 *   → 客户端的 Weapon.AttackRange / MeshType / WeaponRowName / MuzzleOffset 永远是 BP 默认值
+	 *   → OnFirePressed 静默 return / RangedLineStrategy 射程错误 / Server_ReportHit 伤害计算异常
+	 *
+	 * 新 (v81): 注册 5 个核心字段 → UE 自动复制 → 客户端的武器数据跟服务器一致
+	 */
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	/**
 	 * 【P0 2026.07.07 大厂架构】销毁兜底 — EndPlay 时清理通道状态
 	 * 防止:
 	 *   - 武器销毁时 AI 通道残留为 true, 影响其他复用 Character 的人
@@ -183,33 +195,16 @@ void StopWeaponTrace();
 	bool bCanAttackWhileCrouched = true;
 
 protected:
-	/**
-	 * 内部标记: 武器当前是否激活（具有杀伤力）
-	 */
-	bool bIsWeaponActive = false;
-
-	/**
-	 * 内部标记: 当前这刀是轻击还是重击
-	 */
-	bool bIsCurrentAttackHeavy = false;
+	// 【v75 架构清理】删除旧版 trace 状态字段
+	//   - bIsWeaponActive / bIsCurrentAttackHeavy / IgnoreActors / LastFrameStartLoc / LastFrameEndLoc
+	//   - 全部由 DamageStrategy (UMeleeSwStrategy / URangedLineStrategy) 内部持有
+	//   - 真理源唯一 — 不再 BaseWeapon / Strategy 双状态
 
 	// 【P0 2026.07.07 大厂架构重构 — 已删除】 bIsAIWeaponActive 字段
 	//
 	// 历史: 旧版 AI 通道与 trace 互斥机制的标志, Tick 用它跳过 trace
 	// 当前: 玩家/AI 共用同一 trace 路径, 不再需要互斥
 	// 替代: 由 ABaseCharacter::bIsCurrentlyAttackerAI 替代 (基于攻击者状态而非武器状态)
-
-	/**
-	 * 记录这一刀已经砍中过的人，防止一刀对同一个人造成多次伤害
-	 */
-	UPROPERTY()
-	TArray<AActor*> IgnoreActors;
-
-	/**
-	 * 记录上一帧刀刃的起点和终点（用于刀刃扫掠追踪）
-	 */
-	FVector LastFrameStartLoc;
-	FVector LastFrameEndLoc;
 
 public:
 	/**
@@ -288,8 +283,14 @@ public:
 
 	/**
 	 * 攻击判定距离（例如尼泊尔比小刀长）
+	 *
+	 * 【v81 客户端武器可用性修复】Replicated:
+	 *   旧 (v80-): 仅服务器 SpawnAndEquipWeapon → InitializeWeaponFireConfigFromClass 写入
+	 *   → 客户端的 Weapon.AttackRange 永远是 BP 默认值 (150.0f)
+	 *   → 客户端 URangedLineStrategy::PerformSingleShot 用错误射程 → 看不到伤害
+	 *   新: 服务器写入 → UE 自动复制 → 客户端可用正确的策划配置射程
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Weapon Stats")
+	UPROPERTY(Replicated, EditDefaultsOnly, BlueprintReadWrite, Category = "Weapon Stats")
 	float AttackRange;
 
 	/**
@@ -307,13 +308,13 @@ protected:
 	 * 【核心升级】: 轻击连斩动画数组！
 	 * 你可以往里面塞 左划、右划、下劈 3个不同的动画
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon Animations")
+	UPROPERTY(Replicated, EditDefaultsOnly, BlueprintReadWrite, Category = "Weapon Animations")
 	TArray<class UAnimMontage*> LightAttackMontages;
 
 	/**
 	 * 重击通常只有一个动画
 	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon Animations")
+	UPROPERTY(Replicated, EditDefaultsOnly, BlueprintReadWrite, Category = "Weapon Animations")
 	class UAnimMontage* HeavyAttackMontage;
 
 
@@ -328,6 +329,37 @@ public:
 	 * @return 对应的 AnimMontage
 	 */
 	UAnimMontage* GetAttackMontage(bool bIsHeavy, int32 ComboIndex = 0) const;
+
+
+	// ==========================================
+	// 【v83.1 大厂架构】Montage 数量 / 重击查询 getter (公开)
+	//
+	// 背景: v83 PlayerComboComponent 直接访问 protected LightAttackMontages.Num()
+	//   → 编译错 C2248 无法访问 protected 成员
+	//
+	// 大厂原则 (封装 + 公开 API):
+	//   - protected 字段不能被外部直接读, 必须通过 getter
+	//   - getter 是单一真理源 (PlayerComboComponent 不需要知道内部是 TArray 还是 TMap)
+	//   - inline 零开销
+	//   - const 方法, 纯查询
+	//
+	// 调用方: PlayerComboComponent::ExecuteComboSequence (v83.1 可观测性 log)
+	// ==========================================
+	/**
+	 * 返回轻击蒙太奇数量 (供客户端可观测性 log + 强制 trace 兜底判定)
+	 */
+	FORCEINLINE int32 GetLightAttackMontageCount() const
+	{
+		return LightAttackMontages.Num();
+	}
+
+	/**
+	 * 返回重击蒙太奇指针 (供客户端可观测性 log 报告)
+	 */
+	FORCEINLINE UAnimMontage* GetHeavyAttackMontagePtr() const
+	{
+		return HeavyAttackMontage;
+	}
 
 
 	// ==========================================
@@ -404,12 +436,50 @@ public:
 	UMeshComponent* GetMeshComponent() const;
 
 	/**
+	 * BeginPlay — UE 生命周期 (大厂架构 v83+ 客户端武器可用性)
+	 *
+	 * 调用方: UE 引擎 (Actor 初始化完成后)
+	 *
+	 * 【核心职责】强制禁用武器 Mesh 的物理碰撞
+	 *   - 服务器: 调用 SpawnAndEquipWeapon / Server_SpawnAllWeapons / OnRep_CurrentWeaponSlot 时已设 NoCollision
+	 *   - 客户端: 客户端进程不执行这些 Server 函数 → 武器 Mesh 仍保留 BP 默认 BlockAllDynamic 碰撞
+	 *     → 当玩家拿着近战武器 (StaticMesh 70cm 长) 在场景里跑, 武器 Mesh 阻挡自身角色 Capsule 移动
+	 *     → 客户端画面"一直抖动" + SpringArm (ProbeSize=12) 被武器 Mesh 阻挡 → 镜头缩到角色身上
+	 *
+	 * 大厂原则 (零兜底 + 单一真理源):
+	 *   - 服务器端 BeginPlay 设 NoCollision 是双保险 (与 SpawnAndEquipWeapon 等路径对称)
+	 *   - 客户端端 BeginPlay 设 NoCollision 是必须的 (Server 函数不跑客户端)
+	 *   - 这是"物理正确性" 不是"业务兜底": 武器 mesh 不应该阻挡任何其他 actor (武器只负责装饰和伤害)
+	 *
+	 * 大厂原则 (Decoupled Architecture):
+	 *   - 不用反射 / 不用事件
+	 *   - 直接调 GetMeshComponent() (单一真理源), 设 NoCollision
+	 *   - 找不到 Mesh → Log Warning (不影响游戏, 因为玩家拿着的武器一定有 Mesh)
+	 */
+	virtual void BeginPlay() override;
+
+	/**
+	 * StartDamageTrace — 启动伤害追踪 (v73 大厂架构)
+	 *
+	 * 调用方:
+	 *   - PlayerComboComponent::EnableComboWindow (玩家挥刀中段开启 trace)
+	 *   - AIAttackComponent (AI 攻击蒙太奇中段开启 trace)
+	 *
+	 * 替代旧版"依赖 BP AnimNotify 调用 PerformDamageTrace" 的反模式:
+	 *   - 旧版 BP 配错 / 美术忘配 → 玩家/AI 永远没有伤害检测 (用户看不到错, 只看到"打不出伤害")
+	 *   - v73: C++ 在状态机确定的时机 (挥刀中段) 强制调用, 不依赖 BP 配置
+	 *
+	 * @param bIsHeavy  是否重击 (近战区分轻击/重击伤害)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Combat")
+	void StartDamageTrace(bool bIsHeavy);
+
+	/**
 	 * StopDamageTrace — 停止伤害追踪 (玩家路径兼容)
 	 *
 	 * 调用方: PlayerComboComponent / AIAttackComponent / CombatDeathComponent / MeleeSwStrategy
 	 *
-	 * v70 保守修复: 旧版 StopDamageTrace 是 Weapon 公开方法.
-	 * 新版近战武器用 MeleeSwStrategy::StopTrace, 这里 stub 给玩家/AI 路径做兼容.
+	 * 【v73 大厂架构修复】真正转发到 DamageStrategy, 不再是 no-op stub
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Combat")
 	void StopDamageTrace();
@@ -436,15 +506,44 @@ public:
 	void Multicast_PlayReloadMontage();
 
 	/**
+	 * Multicast_PlayFireTraceVisual — 客户端同步显示服务器 trace 视觉
+	 *
+	 * 调用方: URangedLineStrategy::PerformSingleShot (服务器权威 trace 完后)
+	 *
+	 * 架构:
+	 *   - 服务器权威 trace (单次权威判定)
+	 *   - 服务器 trace 完后调 Multicast → 所有客户端画 DrawDebugLine (红线/绿线, 与服务器一致)
+	 *   - 大厂原则: 服务器权威 trace → 客户端视觉同步, 不重复 trace
+	 *
+	 * @param StartLoc trace 起点
+	 * @param EndLoc   trace 终点
+	 * @param bHit     是否命中 (决定颜色: 命中绿, 未命中红)
+	 * @param HitLoc   命中点 (bHit=true 时有效)
+	 */
+	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Debug")
+	void Multicast_PlayFireTraceVisual(FVector StartLoc, FVector EndLoc, bool bHit, FVector HitLoc);
+
+	/**
 	 * Server_StartFire — 服务器开始开火 (枪械)
 	 *
 	 * 调用方: BaseCharacter::OnFirePressed (玩家路径)
 	 *
 	 * v70 保守修复: 旧版是 Weapon RPC, 新版 WeaponFireComponent 内.
 	 * 这里 stub 做 no-op (真实实现在 WeaponFireComponent::Server_StartFire).
+	 *
+	 * v82 大厂架构修复 — 客户端射线参数:
+	 *   - 客户端玩家在 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
+	 *   - 服务器 WeaponFireComponent::StartFire 缓存射线, 全自动 Tick 复用
+	 *   - AI 路径 (BT): 传零向量 = Strategy 内部 fallback BaseAimRotation
+	 *
+	 * @param ClientRayOrigin     客户端射线起点 (ZeroVector = AI 路径)
+	 * @param ClientRayDirection  客户端射线方向 (ForwardVector = AI 路径)
 	 */
 	UFUNCTION(Server, Reliable, Category = "Weapon|Combat")
-	void Server_StartFire();
+	void Server_StartFire(const FVector_NetQuantize& ClientRayOrigin, const FVector_NetQuantizeNormal& ClientRayDirection);
+
+	/** Server_StartFire_Implementation — 服务器接收射线参数后透传到 WeaponFireComponent */
+	void Server_StartFire_Implementation(const FVector_NetQuantize& ClientRayOrigin, const FVector_NetQuantizeNormal& ClientRayDirection);
 
 	/** Server_StartFire_Validate — 验证函数 */
 	bool Server_StartFire_Validate();
@@ -507,8 +606,12 @@ public:
 	 * 调用方: RangedLineStrategy::PerformSingleShot
 	 *
 	 * v70 保守修复: 旧版有此字段 (默认 0.0f).
+	 *
+	 * 【v81 客户端武器可用性修复】Replicated:
+	 *   客户端 RangedLineStrategy::PerformSingleShot 必须读这个值
+	 *   → 客户端 MuzzleOffset=0 → 射线起点偏到角色中心 → 客户端射偏
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Stats")
+	UPROPERTY(Replicated, EditAnywhere, BlueprintReadWrite, Category = "Weapon Stats")
 	float MuzzleOffset = 0.0f;
 
 	/**
@@ -517,8 +620,13 @@ public:
 	 * 调用方: WeaponAttachmentComponent::InitializeWeaponFireConfigFromClass
 	 *
 	 * v70 保守修复: 旧版有此字段.
+	 *
+	 * 【v81 客户端武器可用性修复】Replicated:
+	 *   客户端的 WeaponRowName 必须跟服务器一致 (RangedLineStrategy::PerformSingleShot 不直接读这个字段,
+	 *   但 AnimNotify_AttachMagazine / AnimNotify_DetachMagazine / Server_ReportHit 等多处读)
+	 *   → 客户端为空 → 武器名解析失败
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
+	UPROPERTY(Replicated, EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
 	FName WeaponRowName = NAME_None;
 
 	/**
@@ -528,8 +636,13 @@ public:
 	 * GetMeshType() 返回此字段值, 不再依赖 BP 蓝图层的 MeshType 字段.
 	 *
 	 * 默认 EWeaponMeshType::Melee (C++ 层保证有值, DT 配错时在 InitializeWeaponFireConfigFromClass 报错).
+	 *
+	 * 【v81 客户端武器可用性修复】Replicated:
+	 *   客户端的 MeshType 必须跟服务器一致 (OnFirePressed → GetCurrentWeapon() → GetMeshType()
+	 *   决定走 LightAttack_Pressed 还是 Server_StartFire)
+	 *   → 客户端 MeshType=None (BP 默认值) → 客户端无法分类武器类型 → 按左键没反应
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
+	UPROPERTY(Replicated, EditAnywhere, BlueprintReadWrite, Category = "Weapon Config")
 	EWeaponMeshType MeshType = EWeaponMeshType::Melee;
 
 	/**
@@ -546,13 +659,22 @@ public:
 	/**
 	 * DamageStrategy — 武器伤害策略 (RangedLineStrategy / MeleeSwStrategy)
 	 *
-	 * 调用方: WeaponFireComponent::PerformSingleShot / MeleeSwStrategy
+	 * 调用方: WeaponFireComponent::PerformSingleShot (服务器) / ANS_MeleeTraceState (客户端)
 	 *
 	 * 【v71 大厂架构修复】WeaponFireComponent::PerformSingleShot 调 Weapon->GetDamageStrategy()
 	 * 但原版 GetDamageStrategy() 返回空 TScriptInterface，导致枪械永远无法开火。
 	 * 真实存储移到这里（Weapon 是 Strategy 的 Outer，与 FireComponent 并列）。
+	 *
+	 * 【v82 客户端武器可用性修复】Replicated:
+	 *   - 旧版 (v70-v81) 注释错误: "DamageStrategy (TScriptInterface — UE 不直接复制,
+	 *            但持有 UObject 引用, 由 UE 的 Object 复制系统处理)"
+	 *   - 实际: TScriptInterface<UObject*> 也需要 UPROPERTY(Replicated) + DOREPLIFETIME
+	 *           UE 不会"自动"复制 UObject 引用, 必须显式标记
+	 *   - 客户端 ANS_MeleeTraceState::NotifyBegin 调 Weapon->StartDamageTrace → GetDamageStrategy() → nullptr
+	 *   - → 客户端近战 trace 完全跑不起来 (服务器跑 Ranged 没事, 因为 HasAuthority 守卫)
+	 *   - 新版 (v82): DamageStrategy Replicated → 服务器写入 → 客户端自动同步
 	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Components")
 	TScriptInterface<IWeaponDamageStrategy> DamageStrategy;
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Config")

@@ -87,12 +87,91 @@ enum class EWeaponSlotType : uint8;
 
 
 /**
+ * 【v78 大厂架构 — 简化版】武器状态结构体
+ *
+ * 大厂原则 - 单一复制链:
+ *   旧问题 (v51-v77):
+ *     - CurrentWeapon 和 CurrentWeaponSlot 是两个独立 UPROPERTY(Replicated)
+ *     - CurrentWeaponSlot 用 DOREPLIFETIME(Replicated) 没有 OnRep → 客户端永远是默认值 Primary
+ *     - 导致武器切换时 CurrentWeaponSlot 不更新 → 所有武器切命令都失败
+ *   新方案 (v78):
+ *     - 合并 ActiveWeapon + ActiveSlot 为 FWeaponState struct，通过 DOREPLIFETIME 普通复制
+ *     - CurrentWeaponSlot 保留 ReplicatedUsing = OnRep_CurrentWeaponSlot 触发客户端回调
+ *     - OnRep_CurrentWeaponSlot 读取 WeaponState 作为真理源
+ *
+ * 大厂原则 - 向后兼容:
+ *   - CurrentWeapon / CurrentWeaponSlot 字段保留（作为缓存视图）
+ *   - WeaponState 是真 Truth Source，OnRep_CurrentWeaponSlot 读取 WeaponState 并回写字段
+ *   - Server_SwitchToWeaponSlot 写入 WeaponState + CurrentWeaponSlot
+ */
+USTRUCT(BlueprintType)
+struct FWeaponState
+{
+	GENERATED_BODY()
+
+	// 当前激活武器指针（nullptr = 空槽位）
+	UPROPERTY(BlueprintReadOnly)
+	TObjectPtr<ABaseWeapon> ActiveWeapon = nullptr;
+
+	// 当前激活槽位类型
+	UPROPERTY(BlueprintReadOnly)
+	EWeaponSlotType ActiveSlot = EWeaponSlotType::Primary;
+};
+
+
+/**
+ * 【v81 大厂架构 — 客户端武器姿态修复】武器挂载运行时数据
+ *
+ * 根因 (v77-v80):
+ *   - 服务器 SpawnAndEquipWeapon 调 AttachToComponent + SetActorRelativeLocation/Rotation/Scale
+ *   - UE Actor 复制会同步 Attach 关系 (RootComponent 挂在哪), 但**不会**同步 RelativeLocation/Rotation
+ *   - 客户端的武器 Actor 已经"挂"在角色 Mesh 上 (Socket 位置 = 默认姿态), 但没有策划配置的偏移
+ *   - IsWeaponAttachedToSocket 返回 true → OnRep_CurrentWeapon 跳过补偏移 → 客户端姿态错
+ *
+ * 修复 (v81 大厂架构):
+ *   - 真理源 = 服务器写入 Replicated RuntimeData 字段
+ *   - OnRep_CurrentWeaponSlot / OnRep_CurrentWeapon 读取 RuntimeData 强制应用偏移
+ *   - 删除 "IsWeaponAttachedToSocket 跳过" 反模式 (兜底行为)
+ *   - 零兜底: 客户端必须严格应用服务器配置的偏移, 不允许"已经挂上就跳过"
+ *
+ * 复制策略:
+ *   - 作为 Component 的 UPROPERTY(Replicated) 字段
+ *   - 服务器 Server_SpawnAllWeapons / SpawnAndEquipWeapon 写入
+ *   - 客户端 OnRep_* 触发时读取并应用
+ */
+USTRUCT(BlueprintType)
+struct FWeaponAttachmentRuntime
+{
+	GENERATED_BODY()
+
+	// 武器挂载的 Socket 名 (策划在 DT_WeaponAttachmentConfig 配置)
+	UPROPERTY(BlueprintReadOnly)
+	FName SocketName = NAME_None;
+
+	// 武器相对角色的本地空间位置 (厘米)
+	UPROPERTY(BlueprintReadOnly)
+	FVector RelativeLocation = FVector::ZeroVector;
+
+	// 武器相对角色的本地空间旋转
+	UPROPERTY(BlueprintReadOnly)
+	FRotator RelativeRotation = FRotator::ZeroRotator;
+
+	// 武器相对角色的本地空间缩放
+	UPROPERTY(BlueprintReadOnly)
+	FVector RelativeScale3D = FVector(1.0f, 1.0f, 1.0f);
+
+	// 服务器是否已完成应用 (用于客户端 OnRep 守卫 — 只有 true 才是合法配置)
+	UPROPERTY(BlueprintReadOnly)
+	bool bIsValid = false;
+};
+
+/**
  * @class UWeaponAttachmentComponent
  * @brief 武器网络复制 + 挂载子系统 — BaseCharacter 的"武器持有层"
  *
  * 设计模式: ActorComponent 自治子系统
  *   - Owner 暴露: 通过 Owner->MeleeProfile / Owner->GetMesh() 访问
- *   - 网络复制: CurrentWeapon 通过 Replicated + OnRep_CurrentWeapon
+ *   - 网络复制: FWeaponState 通过 DOREPLIFETIME; CurrentWeaponSlot 通过 ReplicatedUsing = OnRep_CurrentWeaponSlot
  *   - 服务器权威: 所有生成/销毁走服务器
  *
  * 使用方法:
@@ -484,6 +563,29 @@ public:
 	 */
 	class UDataTable* GetWeaponAttachmentDataTable() const;
 
+	/**
+	 * 【v76 大厂架构】播放"拿起武器"音效 (按 EWeaponSlotType 查表)
+	 *
+	 * 单入口播放点 (服务器/客户端共一个调用点, 不在 BP ANS 散落):
+	 *   - Server_SwitchToWeaponSlot 末尾 (服务器权威广播后)
+	 *   - OnRep_CurrentWeaponSlot 末尾 (客户端 OnRep 触发, 仅 Auth 路径外补播)
+	 *
+	 * 大厂原则 - 单一真理源 (与 GetWeaponAttachmentDataTable 完全对称):
+	 *   - 本函数通过 GM->GetWeaponSoundMapAsset() 查 DA_WeaponSoundMap
+	 *   - 不在 BP 蓝图 / 组件字段 / 单个武器字段上重复配置
+	 *
+	 * 大厂原则 - 零兜底:
+	 *   - GM 未配 → 已 Log Error (前面 accessor), 本函数不再重复
+	 *   - Slot.Entry.Sound 为空 → Log Error + 拒绝播放 (强制修复 DA)
+	 *
+	 * 网络策略:
+	 *   - 服务器播本地 + Multicast_RPC 让所有客户端也听到 (RPC 由 Server_SwitchToWeaponSlot 末尾发)
+	 *   - OnRep 触发只补"远端玩家外其他人" 的客户端, 不重复自己 (通过 bIsLocallyControlled 守卫)
+	 *
+	 * @param NewSlot 切换到的目标槽位 (Primary / Secondary / Melee)
+	 */
+	void PlayEquipSoundForSlot(EWeaponSlotType NewSlot);
+
 protected:
 	// ==========================================
 	// UE 生命周期
@@ -527,8 +629,38 @@ protected:
 	static ABaseCharacter* GetOwnerCharacterChecked(const UActorComponent* Self);
 
 	// ==========================================
-	// 字段 (单一真理源)
+	// 内部辅助函数 (private)
 	// ==========================================
+
+	/**
+	 * 【v77 大厂架构】检查武器是否已挂载到 Socket
+	 *
+	 * 原理: UE AttachToComponent 后, Actor 的 RootComponent 会记录挂载的 Socket 名
+	 * 如果 GetAttachSocketName() != NAME_None, 说明已挂载
+	 *
+	 * @param Weapon  待检查武器
+	 * @param Owner   持有者角色
+	 * @return true = 已挂载 (跳过重复 Attach), false = 未挂载 (需要补挂)
+	 */
+	bool IsWeaponAttachedToSocket(ABaseWeapon* Weapon, ABaseCharacter* Owner) const;
+
+	/**
+	 * 【v78 大厂架构】数组索引 → 槽位类型
+	 *
+	 * 映射: 0→Primary, 1→Secondary, 2→Melee, 其他→None
+	 * 在 RefreshWeaponVisibilityForSlotChange 中用于遍历 WeaponsInSlot
+	 */
+	FORCEINLINE static EWeaponSlotType ArrayIndexToSlotType(int32 Index)
+	{
+		switch (Index)
+		{
+		case 0: return EWeaponSlotType::Primary;
+		case 1: return EWeaponSlotType::Secondary;
+		case 2: return EWeaponSlotType::Melee;
+		default: return EWeaponSlotType::None;
+		}
+	}
+
 protected:
 	/**
 	 * 当前装备的武器指针 (Replicated)
@@ -605,33 +737,89 @@ protected:
 	TArray<TObjectPtr<ABaseWeapon>> WeaponsInSlot;
 
 	/**
+	 * 【v78 大厂架构 — 简化版】武器状态真理源
+	 *
+	 * 替代旧 CurrentWeapon + CurrentWeaponSlot 两个独立 UPROPERTY(Replicated)
+	 *
+	 * 复制策略:
+	 *   - CurrentWeaponSlot 通过 ReplicatedUsing = OnRep_CurrentWeaponSlot 触发客户端回调
+	 *   - WeaponState 通过普通 DOREPLIFETIME 复制（同步 ActiveWeapon + ActiveSlot）
+	 *   - OnRep_CurrentWeaponSlot 读取 WeaponState 并执行所有显示逻辑
+	 *
+	 * 向后兼容: 旧字段保留，OnRep_CurrentWeaponSlot 同步后回写
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Weapons|State")
+	FWeaponState WeaponState;
+
+	/**
 	 * 【v51 大厂架构 — 生化模式】当前激活的槽位 (ReplicatedUsing)
 	 *
 	 * 默认值: EWeaponSlotType::Primary (玩家开局持有主武器)
 	 *
 	 * 同步链路:
-	 *   - 服务器 Server_SwitchToWeaponSlot 写入 → 自动 Replicate 到客户端
-	 *   - 客户端 OnRep_CurrentWeaponSlot 触发 → 更新 CurrentWeapon + 显示/隐藏
+	 *   - 服务器 Server_SwitchToWeaponSlot 写入 WeaponState + CurrentWeaponSlot
+	 *   - CurrentWeaponSlot 通过 ReplicatedUsing → 客户端 OnRep_CurrentWeaponSlot 触发
+	 *   - OnRep_CurrentWeaponSlot 读取 WeaponState.ActiveWeapon + ActiveSlot 并显示/隐藏
 	 *
 	 * 零兜底:
-	 *   - 服务器切到空槽位 (该槽位武器未生成) → 拒绝切 (Log Error)
+	 *   - 服务器切到空槽位 → 拒绝切 (Log Error)
 	 *   - 客户端收到 None 槽位 → 拒绝切换 (强制修复服务器状态)
+	 *
+	 * 【v78 简化】CurrentWeaponSlot 是 OnRep 触发器，真理源在 WeaponState
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentWeaponSlot, VisibleAnywhere, BlueprintReadOnly, Category = "Combat|Weapons|Slot")
 	EWeaponSlotType CurrentWeaponSlot = EWeaponSlotType::Primary;
 
 	/**
+	 * 【v81 大厂架构 — 客户端武器姿态修复】武器挂载运行时数据
+	 *
+	 * 复制策略:
+	 *   - Replicated 字段 (普通复制, 无 OnRep — OnRep 通过 CurrentWeapon / CurrentWeaponSlot 触发)
+	 *   - 服务器 SpawnAndEquipWeapon 末尾写入 SocketName + RelativeLocation/Rotation/Scale
+	 *   - 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读取 RuntimeData 强制应用偏移
+	 *
+	 * 为什么不用 OnRep:
+	 *   - OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 已经在用, 偏移应用放在它们里面
+	 *   - 一个 OnRep 函数, 用 RuntimeData 作为真理源
+	 *
+	 * 真理源 vs 缓存:
+	 *   - RuntimeData[Slot] 是真理源 (服务器写入, 客户端读)
+	 *   - 不需要每个武器独立存偏移, 因为当前激活的槽位只有一个
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Weapons|Attachment")
+	FWeaponAttachmentRuntime ActiveSlotAttachment;
+
+	/**
+	 * 【v78 大厂架构】RefreshWeaponVisibilityForSlotChange — 槽位切换刷新可见性
+	 *
+	 * 职责: 根据新激活的槽位，隐藏旧槽位武器、显示新槽位武器
+	 */
+	void RefreshWeaponVisibilityForSlotChange(EWeaponSlotType NewActiveSlot);
+
+	/**
+	 * 【v81 大厂架构 — 客户端武器姿态修复】应用挂载运行时数据到武器 Actor
+	 *
+	 * 职责: 把 ActiveSlotAttachment 字段 (SocketName + RelativeLocation/Rotation/Scale)
+	 *       实际应用到武器 Actor 上 (Attach + SetActorRelative*).
+	 *
+	 * 调用方 (3 个, 都是 OnRep 入口):
+	 *   - OnRep_CurrentWeapon 末尾 (远端玩家新武器复制过来时)
+	 *   - OnRep_CurrentWeaponSlot 末尾 (远端玩家槽位切换时)
+	 *   - 服务器 SpawnAndEquipWeapon 末尾 (服务器权威应用)
+	 *
+	 * 大厂原则 - 零兜底:
+	 *   - Weapon 为空 → Log Error + return (强制修复 Spawn 链路)
+	 *   - RuntimeData.bIsValid=false → Log Error + return (服务器没写入偏移, 强制修复服务器逻辑)
+	 *   - 不允许"已挂载就跳过" (v77 反模式已删除)
+	 *
+	 * @param Weapon 要应用偏移的武器 Actor (通常 = CurrentWeapon)
+	 */
+	void ApplyAttachmentRuntime(ABaseWeapon* Weapon);
+
+	/**
 	 * 【v51 大厂架构】OnRep_CurrentWeaponSlot — 客户端槽位同步回调
 	 *
-	 * 触发场景: 服务器 Server_SwitchToWeaponSlot → CurrentWeaponSlot 写入 → Replicate → 本回调
-	 *
-	 * 行为 (客户端):
-	 *   1. 隐藏旧槽位武器 (SetActorHiddenInGame(true))
-	 *   2. 显示新槽位武器 (SetActorHiddenInGame(false))
-	 *   3. 更新 CurrentWeapon 字段 (向后兼容单武器 API)
-	 *   4. HUD 同步 (CharacterIconComponent 读新武器 ID)
-	 *
-	 * 注意: 本回调**仅在客户端**触发 (服务器写不触发), 服务器路径直接走 Server_SwitchToWeaponSlot 内部
+	 * 【v78 简化】真理源移至 WeaponState，OnRep 读取 WeaponState.ActiveSlot + ActiveWeapon
 	 */
 	UFUNCTION()
 	void OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot);

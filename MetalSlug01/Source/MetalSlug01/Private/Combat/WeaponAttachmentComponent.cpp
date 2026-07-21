@@ -40,12 +40,16 @@
 #include "Weapons/RangedLineStrategy.h"
 #include "Components/WeaponFireComponent.h"  // v60 — 武器开火组件
 #include "Data/Tables/WeaponTableRow.h"     // v60 — DT_WeaponInfo 真理源
+#include "Data/Config/WeaponSoundMapAsset.h" // v76 — 武器切换音效配置真理源
 
 // 包含 RoomGameMode 以访问 WeaponDataTable (运行时武器配置)
 #include "Systems/RoomGameMode.h"
 
 // 包含 AMyGameHUD 以访问 HUD 刷新
 #include "UI/MyGameHUD.h"
+
+// 【v84 大厂架构新增】武器切换时刷新武器图标和弹夹数量
+#include "Combat/CharacterIconComponent.h"
 
 // 包含 GameHUDWidget 以访问 UpdateWeaponIconFromID
 #include "UI/Game/GameHUDWidget.h"
@@ -65,6 +69,10 @@
 
 // UE 反射: LogCategory
 #include "Logging/LogMacros.h"
+
+// 【v76 大厂架构】武器切换音效 (UE 反射 + 标准播放 API)
+#include "Sound/SoundBase.h"
+#include "Kismet/GameplayStatics.h"
 
 
 // ==========================================
@@ -95,6 +103,13 @@ static FORCEINLINE int32 SlotTypeToArrayIndex(EWeaponSlotType Slot)
 	default: return INDEX_NONE; // None 或其他 → 无效
 	}
 }
+
+// 【v78 大厂架构】反向映射: 数组索引 → 槽位类型
+// 映射表:
+//   0 → Primary
+//   1 → Secondary
+//   2 → Melee
+// 其他 → None
 
 // ==========================================
 // 1. 构造函数
@@ -135,6 +150,43 @@ UWeaponAttachmentComponent::UWeaponAttachmentComponent()
 
 
 // ==========================================
+// 1. 静态工具函数
+// ==========================================
+
+// 【v77 大厂架构】检查武器是否已挂载到 Socket
+//   原理: UE AttachToComponent 后, Actor 的 RootComponent 会记录挂载的 Socket 名
+//   如果 GetAttachSocketName() != NAME_None, 说明已挂载
+//   返回: true = 已挂载 (跳过重复 Attach), false = 未挂载 (需要补挂)
+bool UWeaponAttachmentComponent::IsWeaponAttachedToSocket(ABaseWeapon* Weapon, ABaseCharacter* Owner) const
+{
+	if (!Weapon || !Owner || !Owner->GetMesh())
+	{
+		return false;
+	}
+
+	USceneComponent* RootComp = Weapon->GetRootComponent();
+	if (!RootComp)
+	{
+		return false;
+	}
+
+	FName AttachedSocket = RootComp->GetAttachSocketName();
+	if (AttachedSocket == NAME_None)
+	{
+		return false;
+	}
+
+	// 进一步验证: 武器确实挂在角色的 Mesh 上 (防止挂错对象)
+	USceneComponent* AttachmentParent = RootComp->GetAttachParent();
+	if (AttachmentParent != Owner->GetMesh())
+	{
+		return false;
+	}
+
+	return true;
+}
+
+// ==========================================
 // 2. UE 生命周期
 // ==========================================
 
@@ -152,7 +204,12 @@ void UWeaponAttachmentComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProp
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	// CurrentWeapon: ReplicatedUsing = OnRep_CurrentWeapon
+	// 【v78 大厂架构 — 单一复制链】WeaponState struct 一次性复制所有字段
+	// 替代旧 CurrentWeapon + CurrentWeaponSlot 两个独立 UPROPERTY(Replicated)
+	// UE 保证 struct 内所有字段在同一帧复制到所有客户端
+	DOREPLIFETIME(UWeaponAttachmentComponent, WeaponState);
+
+	// CurrentWeapon: ReplicatedUsing = OnRep_CurrentWeapon (保留向后兼容)
 	// 服务器写 → 客户端 OnRep_CurrentWeapon 自动触发
 	DOREPLIFETIME(UWeaponAttachmentComponent, CurrentWeapon);
 
@@ -163,9 +220,15 @@ void UWeaponAttachmentComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProp
 
 	// 【v51 大厂架构 — 生化模式】双槽位同步
 	//   WeaponsInSlot: 服务器 SpawnBothWeapons 后, 客户端自动收到双武器指针数组
-	//   CurrentWeaponSlot: ReplicatedUsing → 客户端 OnRep 触发显示/隐藏切换
+	//   CurrentWeaponSlot: 【v78 废弃】真理源移至 WeaponState，保留作为缓存视图
 	DOREPLIFETIME(UWeaponAttachmentComponent, WeaponsInSlot);
 	DOREPLIFETIME(UWeaponAttachmentComponent, CurrentWeaponSlot);
+
+	// 【v81 大厂架构 — 客户端武器姿态修复】
+	//   旧: 服务器调 SetActorRelativeLocation 但 UE 不复制 RelativeLocation 字段
+	//   新: 服务器写入 ActiveSlotAttachment (FWeaponAttachmentRuntime) → UE 自动复制
+	//       → 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读取并强制应用偏移
+	DOREPLIFETIME(UWeaponAttachmentComponent, ActiveSlotAttachment);
 }
 
 
@@ -248,27 +311,34 @@ void UWeaponAttachmentComponent::EndPlay(const EEndPlayReason::Type EndPlayReaso
 }
 
 
-// ==========================================
-// 3. OnRep_CurrentWeapon — 客户端武器挂载回调
-// ==========================================
-
-/**
- * OnRep_CurrentWeapon — 武器指针改变时的网络复制回调
- *
- * 【Phase 1.2 修复 — 零兜底】反查 WeaponID 失败 → Log Error + return
- * 【Phase 1.3 修复 — 零兜底】FindWeaponAttachmentConfig 找不到精确 → Log Error + return nullptr
- *
- * 触发场景:
- *   - 服务器 PossessedBy → SpawnAndEquipWeapon → CurrentWeapon=新武器 → 复制到客户端
- *   - 客户端 OnRep_CurrentWeapon 触发 → 走反查 + 挂载逻辑
- *
- * 大厂修复架构:
- *   - 服务器和本地控制的角色已在 PossessedBy 中处理 → 跳过
- *   - 先脱挂旧武器 (复活场景 OldWeapon != null)
- *   - CharacterID 未就绪时静默跳过 (网络复制优先级)
- *   - 反查 WeaponID 失败 → Log Error + return (Phase 1.2)
- *   - 拒绝通配 fallback (Phase 1.3)
- */
+// ==============================================================================
+// ==============================================================================
+// 【v81 大厂架构修复】OnRep_CurrentWeapon — 客户端强制补 Attach + 应用偏移
+//
+// 旧 (v77-v80) 反模式:
+//
+//   Bug 1/2/4: OnRep_CurrentWeapon 对"已挂载武器"重复 Destroy() + Attach()
+//              流程: 服务器 Attach → CurrentWeapon 复制 → 客户端 OnRep
+//                    → AttachToComponent(已挂载的武器) → 时序错误 → 偏移未应用
+//                    → 如果找不到 AttachmentConfig → Destroy() → 武器消失
+//   Bug 3:     CharacterID 复制晚于 CurrentWeapon → 跳过整个逻辑 → 武器无偏移
+//   Bug 5 (v81 新): UE Actor 复制会自动同步 Attach 关系, 但不会同步 RelativeLocation/Rotation
+//              → 客户端武器 Actor 已挂在角色 Mesh 上 (Socket 位置) 但没有策划偏移
+//              → IsWeaponAttachedToSocket 返回 true → 跳过补偏移 → 客户端姿态错
+//
+// 新架构 (v81 — 单一真理源 + 显式同步):
+//
+//   1. 服务器 SpawnAndEquipWeapon → Attach + SetActorRelativeLocation/Rotation/Scale + 写入 ActiveSlotAttachment (Replicated)
+//   2. 客户端 OnRep_CurrentWeapon 触发 → 走 ApplyAttachmentRuntime(CurrentWeapon)
+//      → 强制 Attach 到角色 Mesh + 应用 ActiveSlotAttachment 配置的偏移
+//      → 不论武器之前是否已挂载, 都应用服务器配置的偏移
+//   3. 不再调用 Destroy() / 不再做"已挂载就跳过"分支
+//
+// 大厂原则:
+//   - 单一真理源: 服务器 ActiveSlotAttachment 是偏移唯一权威
+//   - 零兜底: 服务器未写入偏移 → bIsValid=false → 客户端 Log Error 强制修复
+//   - 不依赖 UE 隐式行为: 显式同步偏移, 不依赖"Attach 自动同步"
+// ==============================================================================
 void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 {
 	ABaseCharacter* Owner = GetOwnerCharacterChecked(this);
@@ -277,131 +347,155 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		return;
 	}
 
+	const bool bIsLocallyControlled = Owner->IsLocallyControlled();
+	const bool bIsAuthority = Owner->HasAuthority();
+
 	UE_LOG(LogTemp, Log,
 		TEXT("[WeaponAttachment] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
 		*GetNameSafe(OldWeapon), *GetNameSafe(CurrentWeapon),
-		Owner->IsLocallyControlled(), Owner->HasAuthority());
+		bIsLocallyControlled, bIsAuthority);
 
-	// 服务器和本地控制的角色已经在 PossessedBy 中处理了, 跳过
-	if (Owner->IsLocallyControlled() || Owner->HasAuthority())
-	{
-		return;
-	}
-
-	// 旧武器脱挂 (防御: 复活场景 OldWeapon != null)
-	if (OldWeapon && IsValid(OldWeapon))
+	// 旧武器脱挂 (防御: 复活 / 换装场景)
+	if (OldWeapon && IsValid(OldWeapon) && OldWeapon != CurrentWeapon)
 	{
 		OldWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 		UE_LOG(LogTemp, Log,
-			TEXT("[WeaponAttachment] 脱挂旧武器: %s"), *OldWeapon->GetName());
+			TEXT("[WeaponAttachment] OnRep_CurrentWeapon: 脱挂旧武器=%s"),
+			*OldWeapon->GetName());
 	}
 
+	// 新武器为空, 服务器清空了武器 — 脱挂已结束 (OldWeapon 已处理)
 	if (!CurrentWeapon)
 	{
-		// 新武器为空, 服务器清空了武器, 客户端也已脱挂
 		return;
 	}
 
-	// CharacterID 未就绪时静默跳过
-	// 防御: CharacterID 通过 PlayerState 网络复制, 优先级可能低于 CurrentWeapon
-	// 【2026.07.12 P0 修复】CharacterID/SpawnWeaponID 已 Replicated (跟 CurrentWeapon 同包同步)
-	//                       这段防御已不需要 — 如果出现 CharacterID 空, 那是服务器未写, 不是网络时序问题
-	if (CharacterID.IsEmpty())
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponAttachment] OnRep_CurrentWeapon: CharacterID 为空, 服务器 PossessedBy/SpawnAIInternal 没写 SetSpawnLoadout. "
-				 "Weapon=%s 不会挂载. 【大厂原则】零兜底, 强制修复 Spawn 链路."),
-			*CurrentWeapon->GetName());
-		return;
-	}
-
-	// 【v54.3 大厂重构 — Class 强类型真理源】删除整个 FString 反查块
-	//
-	// 旧 (v54.2 — 反查字符串): OnRep_CurrentWeapon 收到新 CurrentWeapon → 反查 WeaponDataTable 把 Weapon BP 翻译为 WeaponID 字符串 → 用字符串再去 FindWeaponAttachmentConfig
-	//   - 2 层翻译 (BP → RowName → 配置), 字符串拼错永远不可见
-	//   - 大部分工作冗余: 已经有 CurrentWeapon (强类型), 还要反查字符串有什么用?
-	//
-	// 新 (v54.3 — Class 强类型): 直接用 CurrentWeapon->GetClass() 强类型查 FindWeaponAttachmentConfig
-	//   - 真理源: CurrentWeapon (Class) — UE 标准 API 拿到的, 永远最权威
-	//   - 不需要回查 DT_WeaponInfo, 不需要任何字符串中转
-	TSubclassOf<ABaseCharacter> OwnerClass = Owner->GetClass();
-	TSubclassOf<ABaseWeapon> WeaponClass = CurrentWeapon ? CurrentWeapon->GetClass() : nullptr;
-	FWeaponAttachmentConfig* AttachmentConfig = FindWeaponAttachmentConfig(OwnerClass, WeaponClass);
-
-	// ============================================================
-	// 【v35 零兜底改造】挂载配置缺失 → Log Error + Destroy 武器 + return
-	//
-	// 旧版 (v32-v34) 反模式:
-	//   - SocketName/RelativeLocation/RelativeRotation 用兜底默认值 (TEXT("WeaponSocket_R") / ZeroVector / ZeroRotator)
-	//   - AttachToComponent 用默认 Socket → 角色没这个 socket → attach 无效
-	//   - SetActorRelativeLocation/Rotation 用 ZeroVector → 武器位置错乱 (挂在原点, 玩家看不到武器)
-	//   - 注释自辩"使用默认 Socket" = 字面违反零兜底原则
-	//
-	// 大厂原则 (v35 零兜底):
-	//   - 挂载配置缺失 = 配置错, 必须显式化
-	//   - Log Error + Destroy 武器 + return, 强制用户在 UE 编辑器配 WeaponAttachmentDataTable
-	//   - 玩家看到"武器没显示" > "武器位置错乱" (后者让 BP 配置错被永远掩盖)
-	// ============================================================
-	if (!AttachmentConfig)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponAttachment] OnRep_CurrentWeapon: 挂载配置缺失! "
-				 "OwnerClass=%s, WeaponClass=%s, Weapon=%s. "
-				 "【v35 零兜底】不静默使用默认 Socket — Destroy 武器 %s. "
-				 "【强制修复 — v37 单一真理源】挂载配置不在 BP 角色里 (v37 已删), "
-				 "而是集中在 UE 编辑器 → BP_GM_RoomGameMode → Class Defaults → "
-				 "Room|Data → Weapon Attachment DataTable 配 DT_WeaponAttachmentConfig. "
-				 "DataTable 必须包含 (TargetCharacter + WeaponBlueprint) 精确匹配行."),
-			*Owner->GetClass()->GetName(),
-			CurrentWeapon ? *CurrentWeapon->GetClass()->GetName() : TEXT("nullptr"),
-			CurrentWeapon ? *CurrentWeapon->GetName() : TEXT("nullptr"),
-			CurrentWeapon ? *CurrentWeapon->GetName() : TEXT("nullptr"));
-		if (CurrentWeapon)
-		{
-			CurrentWeapon->Destroy();
-		}
-		return;
-	}
-
-	// 从配置读取挂载参数 (唯一真理源, 不允许默认值)
-	const FName SocketName = AttachmentConfig->SocketName;
-	const FVector RelativeLocation = AttachmentConfig->RelativeLocation;
-	const FRotator RelativeRotation = AttachmentConfig->RelativeRotation;
-
-	// 将武器挂载到插槽
-	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
-	CurrentWeapon->AttachToComponent(Owner->GetMesh(), AttachmentRules, SocketName);
-
-	// 【v35 零兜底】总是调 setter, 不 IsNearlyZero 判断 (旧版"如果为零就跳过"也是兜底)
-	CurrentWeapon->SetActorRelativeLocation(RelativeLocation);
-	CurrentWeapon->SetActorRelativeRotation(RelativeRotation);
-
-	// 【v57 大厂架构诊断日志】显示实际应用的变换
-	UE_LOG(LogTemp, Log,
-		TEXT("[WeaponAttachment] 挂载完成: Socket=%s, OwnerClass=%s, WeaponClass=%s, "
-			 "AppliedLoc=%s, AppliedRot=%s, SocketLoc=%s, WeaponWorldLoc=%s"),
-		*SocketName.ToString(),
-		*Owner->GetClass()->GetName(),
-		CurrentWeapon ? *CurrentWeapon->GetClass()->GetName() : TEXT("nullptr"),
-		*RelativeLocation.ToString(),
-		*RelativeRotation.ToString(),
-		*Owner->GetMesh()->GetSocketLocation(SocketName).ToString(),
-		*CurrentWeapon->GetActorLocation().ToString());
-
-	// ==========================================
-	// 【v40.2 P0 注释】武器图标刷新不在此处触发
-	//   根因: 旧版只挂武器, 不调 RefreshWeaponIconOnHUD
-	//         → 客户端武器图标永远不显示
-	//   修复点: 不在 OnRep 末尾触发 (服务器已在 PossessedBy 内通过 RefreshCharacterIcon 链路 → RefreshWeaponIconOnHUD 触发 Client_RefreshWeaponIcon RPC)
-	//         客户端实现通过 "事件 + 缓存双轨制" (v40.2 新增 CharacterEvents::SetCachedWeaponIcon / GetCachedWeaponIcon) 保证 HUD 订阅时能补发
-	//   大厂原则 - 单一真理源: 武器图标真理源 = WeaponDataTable 行 (服务器查表 RPC 推 Icon)
-	// ==========================================
+	// 【v81 修复】删除 IsWeaponAttachedToSocket 跳过分支 — 不论是否已挂载, 都强制应用偏移
+	//   单一真理源: ActiveSlotAttachment 字段 (服务器写入, Replicated)
+	//   客户端必须严格应用服务器配置的偏移, 不能依赖"已挂载就跳过" 的隐式行为
+	ApplyAttachmentRuntime(CurrentWeapon);
 }
 
 
-// ==========================================
+// ==============================================================================
+// 【v81 大厂架构】ApplyAttachmentRuntime — 应用挂载运行时数据到武器 Actor
+//
+// 真理源 = ActiveSlotAttachment (服务器写入 Replicated)
+// 调用方 (3 个, 都是 OnRep 入口):
+//   - OnRep_CurrentWeapon 末尾 (远端玩家新武器复制过来时)
+//   - OnRep_CurrentWeaponSlot 末尾 (远端玩家槽位切换时)
+//   - Server_SwitchToWeaponSlot / SpawnAndEquipWeapon 已主动应用, 但这里做幂等保护
+//
+// 大厂原则 - 零兜底:
+//   - Weapon 为空 → Log Error + return (强制修复 Spawn 链路)
+//   - bIsValid=false → Log Error + return (服务器没写入偏移, 强制修复服务器逻辑)
+//   - 不允许"已挂载就跳过" (v77 反模式已删除, 客户端必须强制应用偏移)
+// ==============================================================================
+void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
+{
+	if (!Weapon)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] ApplyAttachmentRuntime: Weapon 为空 — 拒绝应用. "
+			     "【v81 零兜底】OnRep 必须在拿到有效 CurrentWeapon 后再调用本函数."));
+		return;
+	}
+
+	if (!ActiveSlotAttachment.bIsValid)
+	{
+		// 服务器还没写入偏移 → 拒绝应用
+		//   这通常意味着 Spawn 时未写入, 或 Server_SwitchToWeaponSlot 找不到配置
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] ApplyAttachmentRuntime: ActiveSlotAttachment.bIsValid=false — 服务器未写入挂载偏移. "
+			     "Weapon=%s. 【v81 零兜底】客户端无法应用偏移, 请检查服务器 SpawnAndEquipWeapon/Server_SwitchToWeaponSlot 写入逻辑. "
+			     "【排查路径】1) 确认服务器 SpawnAndEquipWeapon 末尾写入了 ActiveSlotAttachment; "
+			     "2) 确认 DT_WeaponAttachmentConfig 有 PawnClass=%s + WeaponClass=%s 的精确匹配行."),
+			*Weapon->GetName(),
+			*GetOwner()->GetClass()->GetName(),
+			*Weapon->GetClass()->GetName());
+		return;
+	}
+
+	ABaseCharacter* Owner = GetOwnerCharacterChecked(this);
+	if (!Owner || !Owner->GetMesh())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] ApplyAttachmentRuntime: Owner 或 Mesh 为空 — 拒绝 Attach. Weapon=%s"),
+			*Weapon->GetName());
+		return;
+	}
+
+	const FName SocketName = ActiveSlotAttachment.SocketName;
+	const FVector RelativeLocation = ActiveSlotAttachment.RelativeLocation;
+	const FRotator RelativeRotation = ActiveSlotAttachment.RelativeRotation;
+	const FVector RelativeScale = ActiveSlotAttachment.RelativeScale3D;
+
+	// Step 1: Attach (使用 SnapToTargetNotIncludingScale, 与服务器一致)
+	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
+	Weapon->AttachToComponent(Owner->GetMesh(), AttachmentRules, SocketName);
+
+	// Step 2: 强制应用相对偏移 (v57 零兜底修复 — 不允许 IsNearlyZero 跳过)
+	Weapon->SetActorRelativeLocation(RelativeLocation);
+	Weapon->SetActorRelativeRotation(RelativeRotation);
+	Weapon->SetActorRelativeScale3D(RelativeScale);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[WeaponAttachment] ApplyAttachmentRuntime: 应用成功 — Weapon=%s Socket=%s Loc=%s Rot=%s Scale=%s"),
+		*Weapon->GetName(),
+		*SocketName.ToString(),
+		*RelativeLocation.ToString(),
+		*RelativeRotation.ToString(),
+		*RelativeScale.ToString());
+}
+
+
+// ==============================================================================
+// 【v78 大厂架构】RefreshWeaponVisibilityForSlotChange — 槽位切换刷新可见性
+//
+// 职责: 根据新激活的槽位，隐藏旧槽位武器、显示新槽位武器
+//        替代 OnRep_CurrentWeaponSlot 的可见性逻辑，集中在一处
+//
+// 大厂原则 - 单一职责:
+//   - 不做其他事情（不更新字段、不播音效、不广播 CharacterEvents）
+//   - 只负责可见性
+// ==============================================================================
+void UWeaponAttachmentComponent::RefreshWeaponVisibilityForSlotChange(EWeaponSlotType NewActiveSlot)
+{
+	ABaseCharacter* Owner = GetOwnerCharacterChecked(this);
+	if (!Owner)
+	{
+		return;
+	}
+
+	// 遍历所有槽位，设置可见性
+	for (int32 Idx = 0; Idx < WeaponsInSlot.Num(); ++Idx)
+	{
+		if (!WeaponsInSlot.IsValidIndex(Idx) || !WeaponsInSlot[Idx])
+		{
+			continue;
+		}
+
+		ABaseWeapon* W = WeaponsInSlot[Idx];
+		EWeaponSlotType SlotOfThisWeapon = ArrayIndexToSlotType(Idx);
+		const bool bShouldShow = (SlotOfThisWeapon == NewActiveSlot);
+
+		W->SetActorHiddenInGame(!bShouldShow);
+
+		// 【v77 大厂原则 - 零幽灵碰撞】武器始终无碰撞
+		W->SetActorEnableCollision(ECollisionEnabled::NoCollision);
+
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponAttachment] RefreshWeaponVisibility: Pawn=%s Slot=%s Show=%d"),
+			*Owner->GetName(),
+			LexToString(SlotOfThisWeapon),
+			bShouldShow ? 1 : 0);
+	}
+}
+
+
+// ==============================================================================
 // 4. EquipWeapon — 服务器换枪
-// ==========================================
+// ==============================================================================
 
 /**
  * EquipWeapon — 服务器装备武器 (简化接口, deprecated)
@@ -656,6 +750,22 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 		*RelativeLocation.ToString(),
 		*RelativeRotation.ToString());
 
+	// 4. 武器碰撞必须关闭【v72 大厂架构 P0 修复】
+	//   根因: 武器 BP 默认 CollisionProfile=BlockAll, Attach 到角色手部后与角色胶囊体重叠
+	//   → 物理引擎把角色往反方向推 → "按什么都往后"
+	//   修复: Spawn 后立即 SetCollisionEnabled(NoCollision), SwitchToWeaponSlot 时同样处理
+	if (UMeshComponent* WeaponMesh = NewWeapon->GetMeshComponent())
+	{
+		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+	else
+	{
+		// GetMeshComponent 内部已有 Log Error, 这里只记录
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] SpawnAndEquipWeapon: GetMeshComponent 返回 null, 无法关闭碰撞. Weapon=%s"),
+			*NewWeapon->GetName());
+	}
+
 	// 5. 将武器焊接到角色的插槽上
 	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
 	NewWeapon->AttachToComponent(Owner->GetMesh(), AttachmentRules, SocketName);
@@ -745,6 +855,21 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 	//     - 跟武器生成路径完全独立 (大厂原则: 职责对等, 不交叉)
 	//
 	// 因此这里不再调 HUD.UpdateWeaponIconFromID, 否则会形成两条独立链路, 违背 v40.1 "职责单一"
+
+	// 9. 【v81 大厂架构 — 客户端武器姿态修复】写入挂载运行时数据
+	//    服务器写入 → UE 复制 → 客户端 OnRep_CurrentWeapon/OnRep_CurrentWeaponSlot 读取并应用偏移
+	//    客户端不再依赖"服务器 Attach + 客户端被 UE 自动同步 Attach 关系" 的隐式行为
+	ActiveSlotAttachment.SocketName = SocketName;
+	ActiveSlotAttachment.RelativeLocation = RelativeLocation;
+	ActiveSlotAttachment.RelativeRotation = RelativeRotation;
+	ActiveSlotAttachment.RelativeScale3D = RelativeScale;
+	ActiveSlotAttachment.bIsValid = true; // 标记服务器已应用 → 客户端可以信任
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[WeaponAttachment] SpawnAndEquipWeapon: 写入 ActiveSlotAttachment (Replicated) — Socket=%s Loc=%s Rot=%s — 客户端将自动应用"),
+		*SocketName.ToString(),
+		*RelativeLocation.ToString(),
+		*RelativeRotation.ToString());
 }
 
 
@@ -1251,6 +1376,14 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	const EWeaponSlotType OldSlot = CurrentWeaponSlot;
 	ABaseWeapon* OldWeapon = GetWeaponInSlot(OldSlot);
 
+	// 【v78 大厂架构 — 单一复制链】先更新 WeaponState（真理源）
+	//   UE 保证 WeaponState 内所有字段（ActiveWeapon + ActiveSlot）同步复制到客户端
+	//   替代旧版分别写 CurrentWeapon + CurrentWeaponSlot（独立复制导致时序不一致）
+	FWeaponState NewState;
+	NewState.ActiveWeapon = TargetWeapon;
+	NewState.ActiveSlot = TargetSlot;
+	WeaponState = NewState;
+
 	// 1. 隐藏旧槽位武器 (保留 Spawn, 仅不可见 — 防切换 GC 抖动)
 	if (OldWeapon && OldWeapon != TargetWeapon)
 	{
@@ -1281,13 +1414,20 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	else
 	{
 		TargetWeapon->SetActorHiddenInGame(false);
-		TargetWeapon->SetActorEnableCollision(true);
+		// 【v72 大厂架构 P0 修复】武器绝对不能启用碰撞！
+		//   旧版: SetActorEnableCollision(true) → 武器与角色胶囊体重叠 → 物理引擎推角色
+		//   → 用户看到"切到近战武器后 WASD 全部后退"
+		//   修复: 武器始终 NoCollision, 由游戏逻辑自己控制命中检测
+		if (UMeshComponent* WeaponMesh = TargetWeapon->GetMeshComponent())
+		{
+			WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		}
 	}
 
 	// 3. 更新 CurrentWeapon (向后兼容单武器 API — 所有调用 GetCurrentWeapon() 的代码无需改)
 	CurrentWeapon = TargetWeapon;
 
-	// 4. 更新 CurrentWeaponSlot (Replicated → 客户端 OnRep)
+	// 4. 更新 CurrentWeaponSlot (向后兼容 — 真理源在 WeaponState)
 	CurrentWeaponSlot = TargetSlot;
 
 	// 【v58 防御性日志】切到 MeshType=None 的武器 — 警告用户 BP 配置错误
@@ -1314,6 +1454,45 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 		*TargetWeapon->GetName(),
 		static_cast<int32>(TargetWeapon->GetMeshType()));
 
+	// 【v76 大厂架构】播放"拿起武器"音效 (服务器权威触发, 客户端通过 Multicast 听到)
+	//   单一入口: 任何"拿起武器"事件都走这一条 — 与 Server_SwitchToWeaponSlot 是同一时刻
+	//   大厂原则 - 零兜底:
+	//     - GM/Asset 未配 → Log Error (在 GetWeaponSoundMapAsset / DA 内部), 本函数静默忽略
+	//     - Slot.Entry.Sound 为空 → Log Error + 拒绝播放
+	PlayEquipSoundForSlot(TargetSlot);
+
+	// 【v81 大厂架构 — 客户端武器姿态修复】写入新槽位的挂载运行时数据
+	//   切换到 TargetSlot 时, 必须用目标武器的挂载配置刷新 ActiveSlotAttachment
+	//   → 客户端 OnRep_CurrentWeaponSlot 触发 → 读取并应用新槽位的偏移
+	{
+		FWeaponAttachmentConfig* TargetSlotConfig = FindWeaponAttachmentConfig(
+			Owner->GetClass(), TargetWeapon->GetClass());
+		if (TargetSlotConfig)
+		{
+			ActiveSlotAttachment.SocketName = TargetSlotConfig->SocketName;
+			ActiveSlotAttachment.RelativeLocation = TargetSlotConfig->RelativeLocation;
+			ActiveSlotAttachment.RelativeRotation = TargetSlotConfig->RelativeRotation;
+			ActiveSlotAttachment.RelativeScale3D = TargetSlotConfig->RelativeScale;
+			ActiveSlotAttachment.bIsValid = true;
+
+			UE_LOG(LogTemp, Log,
+				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: 刷新 ActiveSlotAttachment — Slot=%s Socket=%s"),
+				LexToString(TargetSlot),
+				*TargetSlotConfig->SocketName.ToString());
+		}
+		else
+		{
+			// 零兜底: 找不到配置 → 不写 ActiveSlotAttachment (bIsValid 保持 false)
+			//   客户端 OnRep 会检测到 bIsValid=false → Log Error + 强制修复
+			UE_LOG(LogTemp, Error,
+				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: TargetSlot=%s 的挂载配置缺失 — ActiveSlotAttachment.bIsValid 保持 false. "
+				     "PawnClass=%s WeaponClass=%s. 【v81 零兜底】客户端将看到 Log Error, 请修复 DT_WeaponAttachmentConfig."),
+				LexToString(TargetSlot),
+				*Owner->GetClass()->GetName(),
+				*TargetWeapon->GetClass()->GetName());
+		}
+	}
+
 	// 【v58 大厂架构诊断】切换后检查武器是否真的可见
 	//   排查 "切过去了但看不到" 的根因: Hidden / 位置 / Attach 失败
 	//   GetMeshComponent 是 BaseWeapon public wrapper (GetActiveMesh 是 protected)
@@ -1336,61 +1515,210 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 		*AttachedSocket.ToString(),
 		ActiveMesh ? *ActiveMesh->GetName() : TEXT("<null>"),
 		*WeaponWorldLoc.ToCompactString());
+
+	// 【v84 大厂架构修复】武器切换完成后必须广播弹夹信息
+	// 根因: 切枪后 HUD 应显示新武器的弹夹数量 (近战=1/1, 枪械=实际弹药)
+	// 解决方案: Server_SwitchToWeaponSlot 完成后立即广播弹夹数量
+	if (UCharacterIconComponent* IconComp = Owner->FindComponentByClass<UCharacterIconComponent>())
+	{
+		// 1. 先刷新武器图标 (服务器查表, RPC 推 Icon)
+		FString NewWeaponID = TargetWeapon->WeaponRowName.ToString();
+		IconComp->RefreshWeaponIconOnHUDFromServer(NewWeaponID);
+
+		// 2. 再刷新弹夹数量
+		IconComp->BroadcastWeaponAmmoInfo(Owner);
+	}
 }
 
 
 // -----------------------------------------------------------------------------
-// 3. OnRep_CurrentWeaponSlot — 客户端槽位同步回调
+// 【v78 大厂架构】OnRep_CurrentWeaponSlot — 客户端槽位同步回调
 // -----------------------------------------------------------------------------
+//
+// 【v78 大厂架构 — 单一真理源】
+//   CurrentWeaponSlot 通过 ReplicatedUsing 触发本回调
+//   WeaponState 通过 DOREPLIFETIME 普通复制（同步 ActiveWeapon + ActiveSlot）
+//
+//   本 OnRep 读取 WeaponState 作为真理源，执行所有显示逻辑
+//   如果 WeaponState.ActiveSlot != CurrentWeaponSlot，说明复制顺序不一致，用 WeaponState
+//
 void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot)
 {
 	ABaseCharacter* Owner = GetOwnerCharacterChecked(this);
 	if (!Owner)
 	{
-		return; // 客户端无 Owner (极少见, 跳过)
+		return;
 	}
 
-	// 1. 隐藏旧槽位
+	// 【v78 零兜底】WeaponState 是真理源，必须有效
+	if (WeaponState.ActiveSlot == EWeaponSlotType::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: WeaponState.ActiveSlot=None — 非法状态! Pawn=%s. ")
+			TEXT("【v78 大厂原则】拒绝执行切换，强制修复服务器 SwitchToWeaponSlot 链路."),
+			*Owner->GetName());
+		return;
+	}
+
+	// 【v78 大厂架构 — 单一真理源】
+	//   CurrentWeaponSlot 可能和 WeaponState.ActiveSlot 不一致（复制顺序问题）
+	//   使用 WeaponState.ActiveSlot 作为真理源
+	const EWeaponSlotType TrueSlot = WeaponState.ActiveSlot;
+
+	// 防御性检查：如果 CurrentWeaponSlot（触发源）和 WeaponState.ActiveSlot（真理源）不一致
+	if (TrueSlot != CurrentWeaponSlot)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: WeaponState.ActiveSlot(%s) != CurrentWeaponSlot(%s) — 复制顺序不一致! ")
+			TEXT("使用 WeaponState.ActiveSlot 作为真理源. Pawn=%s"),
+			LexToString(TrueSlot),
+			LexToString(CurrentWeaponSlot),
+			*Owner->GetName());
+	}
+
+	// 隐藏旧槽位武器
 	if (ABaseWeapon* OldWeapon = GetWeaponInSlot(OldSlot))
 	{
 		OldWeapon->SetActorHiddenInGame(true);
-		OldWeapon->SetActorEnableCollision(false);
+		OldWeapon->SetActorEnableCollision(ECollisionEnabled::NoCollision);
 	}
 
-	// 2. 显示新槽位
-	if (ABaseWeapon* NewWeapon = GetWeaponInSlot(CurrentWeaponSlot))
+	// 显示新槽位武器 — 优先使用 WeaponState.ActiveWeapon（真理源）
+	if (ABaseWeapon* NewWeapon = WeaponState.ActiveWeapon)
 	{
 		NewWeapon->SetActorHiddenInGame(false);
 
-		// 【v58.1 大厂架构 P0】同上 — 没有 ActiveMesh 不启 collision, 杜绝幽灵碰撞墙
-		if (NewWeapon->GetMeshComponent())
+		if (UMeshComponent* WeaponMesh = NewWeapon->GetMeshComponent())
 		{
-			NewWeapon->SetActorEnableCollision(true);
+			WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		}
 		else
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: 客户端武器无 ActiveMesh — 拒绝启用 collision. "
-				     "Weapon=%s Pawn=%s. 【v58.1 大厂原则 — 零幽灵碰撞】检查 BP 配置."),
+				TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: 客户端武器无 ActiveMesh. Weapon=%s Pawn=%s."),
 				*NewWeapon->GetName(), *Owner->GetName());
 		}
 
-		// 更新 CurrentWeapon (向后兼容)
+		// 更新向后兼容字段
 		CurrentWeapon = NewWeapon;
 	}
 	else
 	{
-		// 客户端同步到非法状态 (服务器有但客户端没收到武器指针) → 强制 Log 报告
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: 客户端切到槽位 %s 但无武器 — 服务器未同步正确. Pawn=%s"),
-			LexToString(CurrentWeaponSlot), *Owner->GetName());
+			TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: WeaponState.ActiveWeapon=null. Pawn=%s Slot=%s"),
+			*Owner->GetName(), LexToString(TrueSlot));
 	}
 
+	// 更新向后兼容字段
+	CurrentWeaponSlot = TrueSlot;
+
+	// 【v81 大厂架构 — 客户端武器姿态修复】槽位切换后必须应用新槽位的挂载偏移
+	//   服务器 Server_SwitchToWeaponSlot 末尾已写入 ActiveSlotAttachment (新槽位)
+	//   客户端 OnRep 触发 → 应用服务器配置的新槽位偏移
+	ApplyAttachmentRuntime(WeaponState.ActiveWeapon);
+
 	UE_LOG(LogTemp, Log,
-		TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: 客户端同步槽位 — Pawn=%s 旧=%s 新=%s"),
+		TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: Pawn=%s 旧=%s 新=%s ActiveWeapon=%s"),
 		*Owner->GetName(),
 		LexToString(OldSlot),
-		LexToString(CurrentWeaponSlot));
+		LexToString(TrueSlot),
+		*GetNameSafe(WeaponState.ActiveWeapon));
+}
+
+// ==========================================
+// 【v76 大厂架构 — 武器切换音效】PlayEquipSoundForSlot 单入口实现
+// ==========================================
+//
+// 单一入口 (零重复):
+//   - 唯一调用方: Server_SwitchToWeaponSlot 末尾 (服务器权威)
+//   - 客户端播放由 Multicast RPC 负责 — 不在本函数内重复 (防双发)
+//   - 不用 OnRep_CurrentWeaponSlot 路径 (服务器切换自己 / 已本地控制的 Client 触发的是 Server 路径,
+//     远端 Client 触发的是 OnRep,但远端 Client 的"拿起音效"通过 Server → Multicast 在 OnRep 之前到)
+//
+// 大厂原则 - 单一真理源 (与 v37 WeaponAttachmentDataTable 完全对称):
+//   - 数据流: Server_SwitchToWeaponSlot → GetAuthGameMode → GetWeaponSoundMapAsset → FindSoundForSlot → Multicast_RPC
+//   - 不在 BP 蓝图 / 武器字段 / Component 内重复配置
+//
+// 大厂原则 - 零兜底:
+//   - GM 未配 → GetWeaponSoundMapAsset 已 Log Error, 本函数直接返回
+//   - Slot.Entry.Sound 为空 → Log Error (强制修复 DA_WeaponSoundMap.uasset)
+//
+// 大厂原则 - 可观测性:
+//   - 成功播放 → Display Log (玩家和测试都能看到)
+//   - 失败 (任何一层) → Error Log (运维发现)
+//
+// 大厂原则 - 网络策略:
+//   - 服务器播本地 (Multicast RPC 内部对服务器自己也会广播一次)
+//   - 所有客户端收 Multicast → 播放
+//   - 不让远端 Client 自己 OnRep 时再播一次 (避免双发)
+// ==========================================
+void UWeaponAttachmentComponent::PlayEquipSoundForSlot(EWeaponSlotType NewSlot)
+{
+	// 1. 不在客户端触发 (Multicast RPC 由服务器权威发出)
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return; // 客户端路径: Multicast RPC 自己会触发播放
+	}
+
+	// 2. 真理源: GM 单点访问
+	ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode());
+	if (!GM)
+	{
+		// 极少见: 测试模式可能没 GM (但 Server_SwitchToWeaponSlot 通常在战斗中触发)
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] PlayEquipSoundForSlot: GetAuthGameMode 不是 ARoomGameMode (类型=%s) — 拒绝播放. "
+			     "【v76 大厂原则 — 零兜底】检查地图 GameMode Override."),
+			*GetNameSafe(GetWorld()->GetAuthGameMode()));
+		return;
+	}
+
+	UWeaponSoundMapAsset* SoundMapAsset = GM->GetWeaponSoundMapAsset();
+	if (!SoundMapAsset)
+	{
+		// GetWeaponSoundMapAsset 内部已 Log Error, 本函数不重复
+		return;
+	}
+
+	const FWeaponSlotSoundEntry* Entry = SoundMapAsset->FindSoundForSlot(NewSlot);
+	if (!Entry)
+	{
+		// FindSoundForSlot 内部已 Log Error
+		return;
+	}
+
+	// 3. 零兜底: Entry 内 Sound 字段为空 → 强制修复 DA
+	if (!Entry->Sound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] PlayEquipSoundForSlot: Slot=%s 的 Sound 字段为空. "
+			     "【v76 大厂原则 — 零兜底】打开 DA_WeaponSoundMap.uasset → Slots 分类 → %s → Sound 字段必须配 SoundCue / SoundWave / MetaSoundSource. "
+			     "未配 → 拒绝播放, 强制修复 DA."),
+			LexToString(NewSlot),
+			LexToString(NewSlot));
+		return;
+	}
+
+	// 4. Multicast RPC — 服务器权威广播, 所有客户端听
+	//   RPC 必须在 Actor 上 (UE 5.6 硬约束), 转交给 Owner Actor 调
+	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+	if (!OwnerChar)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] PlayEquipSoundForSlot: Owner 不是 ABaseCharacter (类型=%s) — 无法发 Multicast RPC. "
+			     "【v76 零兜底】检查组件挂载点."),
+			*GetNameSafe(GetOwner()));
+		return;
+	}
+
+	OwnerChar->Multicast_PlayEquipSoundForSlot(NewSlot, Entry->Sound, Entry->VolumeMultiplier, Entry->PitchMultiplier);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] PlayEquipSoundForSlot: Pawn=%s 切到 Slot=%s 发 Multicast RPC — Sound=%s Vol=%.2f Pitch=%.2f"),
+		*GetOwner()->GetName(),
+		LexToString(NewSlot),
+		*Entry->Sound->GetName(),
+		Entry->VolumeMultiplier,
+		Entry->PitchMultiplier);
 }
 
 
@@ -1523,35 +1851,43 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 	}
 	else
 	{
+		// 【v78 大厂架构 — 单一复制链】写入 WeaponState（真理源）
+		FWeaponState NewState;
+		NewState.ActiveWeapon = SelectedDefault;
+		NewState.ActiveSlot = SelectedSlot;
+		WeaponState = NewState;
+
+		// 向后兼容字段
 		CurrentWeapon = SelectedDefault;
 		CurrentWeaponSlot = SelectedSlot;
 	}
 
-	// 隐藏/显示各槽位武器 (零幽灵碰撞)
+	// ============================================================
+	// 【v77 P0 修复】所有槽位武器碰撞必须始终为 NoCollision
+	//
+	// 旧 (v60.x) 反模式:
+	//   - bShouldShow=true 时错误设 SetActorEnableCollision(true)
+	//   - 武器有碰撞体 → 与玩家身体碰撞 → 武器把玩家推开 → "玩家被武器弹飞"
+	//   - 日志: BP_Weapon_ShovelLarge_C_0 堵在角色前面 → 玩家被弹飞
+	//
+	// 大厂原则 - 零幽灵碰撞:
+	//   - 武器是角色的延伸, 不能有物理碰撞 (只有关卡设计用的物理武器才有碰撞)
+	//   - Server_SwitchToWeaponSlot 已修复 (v72), 这里漏了
+	// ============================================================
 	if (ABaseWeapon* W = WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Primary)])
 	{
-		const bool bShouldShow = (CurrentWeaponSlot == EWeaponSlotType::Primary);
-		W->SetActorHiddenInGame(!bShouldShow);
-		if (bShouldShow && W->GetMeshComponent())
-		{
-			W->SetActorEnableCollision(true);
-		}
-		else
-		{
-			W->SetActorEnableCollision(false);
-		}
+		W->SetActorHiddenInGame(CurrentWeaponSlot != EWeaponSlotType::Primary);
+		W->SetActorEnableCollision(ECollisionEnabled::NoCollision);
 	}
 	if (ABaseWeapon* W = WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Secondary)])
 	{
-		const bool bShouldShow = (CurrentWeaponSlot == EWeaponSlotType::Secondary);
-		W->SetActorHiddenInGame(!bShouldShow);
-		W->SetActorEnableCollision(bShouldShow && W->GetMeshComponent() != nullptr);
+		W->SetActorHiddenInGame(CurrentWeaponSlot != EWeaponSlotType::Secondary);
+		W->SetActorEnableCollision(ECollisionEnabled::NoCollision);
 	}
 	if (ABaseWeapon* W = WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Melee)])
 	{
-		const bool bShouldShow = (CurrentWeaponSlot == EWeaponSlotType::Melee);
-		W->SetActorHiddenInGame(!bShouldShow);
-		W->SetActorEnableCollision(bShouldShow && W->GetMeshComponent() != nullptr);
+		W->SetActorHiddenInGame(CurrentWeaponSlot != EWeaponSlotType::Melee);
+		W->SetActorEnableCollision(ECollisionEnabled::NoCollision);
 	}
 
 	UE_LOG(LogTemp, Log,
@@ -1563,6 +1899,15 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 		WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Primary)] ? TEXT("OK") : TEXT("FAIL"),
 		WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Secondary)] ? TEXT("OK") : TEXT("FAIL/Empty"),
 		WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Melee)] ? TEXT("OK") : TEXT("FAIL/Empty"));
+
+	// 【v84 大厂架构修复】武器 Spawn 完成后必须广播弹夹信息
+	// 根因: 弹夹数量在武器 Spawn 之前广播 (BroadcastWeaponAmmoInfo 早于 Server_SpawnAllWeapons)
+	//        导致 HUD 显示的是"无武器默认值 1/1"而非实际弹药数量
+	// 解决方案: Server_SpawnAllWeapons 完成后立即广播弹夹数量
+	if (UCharacterIconComponent* IconComp = Owner->FindComponentByClass<UCharacterIconComponent>())
+	{
+		IconComp->BroadcastWeaponAmmoInfo(Owner);
+	}
 }
 
 
@@ -1764,6 +2109,14 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 		SocketName
 	);
 
+	// 【v72 大厂架构 P0 修复】武器 Spawn 后立即关闭碰撞 (与 SpawnAndEquipWeapon 路径对称)
+	//   根因: 武器 BP 默认 CollisionProfile=BlockAll, Attach 到角色手部后与角色胶囊体重叠
+	//   → 物理引擎把角色往反方向推 → "按什么都往后"
+	if (UMeshComponent* WeaponMesh = NewWeapon->GetMeshComponent())
+	{
+		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+
 	// 【v58 大厂架构诊断日志】验证 Attach 是否真的成功
 	//   UE AttachToComponent 即便 Socket 不存在也返回 true (静默成功, 但实际 attach 到 root)
 	//   必须 GetAttachSocketName 二次校验
@@ -1853,6 +2206,30 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 		static_cast<int32>(ConfigMeshType),
 		Strategy && Strategy.GetObject() ? *Strategy.GetObject()->GetClass()->GetName() : TEXT("<none>"),
 		LexToString(Slot));
+
+	// 【v81 大厂架构 — 客户端武器姿态修复】写入挂载运行时数据
+	//   服务器 SpawnAndConfigureWeaponInSlot 是"槽位专用" Spawn 入口 (v52+)
+	//   仅当 Spawn 的是当前激活槽位时, 写入 ActiveSlotAttachment
+	//   (否则 — 比如生成副武器时 ActiveSlot 还是 Primary — 会被 Primary 的 OnRep 错误覆盖)
+	if (Slot == CurrentWeaponSlot)
+	{
+		ActiveSlotAttachment.SocketName = AttachmentConfig->SocketName;
+		ActiveSlotAttachment.RelativeLocation = AttachmentConfig->RelativeLocation;
+		ActiveSlotAttachment.RelativeRotation = AttachmentConfig->RelativeRotation;
+		ActiveSlotAttachment.RelativeScale3D = AttachmentConfig->RelativeScale;
+		ActiveSlotAttachment.bIsValid = true;
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[WeaponAttachment] SpawnAndConfigureWeaponInSlot: 写入 ActiveSlotAttachment (当前激活槽位=%s) — Socket=%s"),
+			LexToString(Slot),
+			*AttachmentConfig->SocketName.ToString());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponAttachment] SpawnAndConfigureWeaponInSlot: Slot=%s 不是当前激活槽位 (=%s), 不写 ActiveSlotAttachment."),
+			LexToString(Slot), LexToString(CurrentWeaponSlot));
+	}
 
 	return NewWeapon;
 }
@@ -1998,7 +2375,10 @@ void UWeaponAttachmentComponent::InitializeWeaponFireConfigFromClass(ABaseWeapon
 
 	// 6. 【v60.14 新增】写入武器射程 (策划配置, 非硬编码)
 	//    - 射线终点 = StartLoc + Direction * Weapon->AttackRange
-	//    - 零兜底: AttackRange ≤ 0 → Log Error 拒绝初始化
+	//    - 零兜底:
+	//      (a) AttackRange <= 0 → Log Error + 拒绝写入 (否则射线终点 = StartLoc, 永远打不到东西)
+	//      (b) AttackRange > 20000cm (200米) → Log Error 提示 (设计异常, AK47 不可能 600 米)
+	//          仍写入 (允许运行, 但开发者必须改 DT — 上一版本没这校验, 用户 AK47 配 60000cm 直接打 40km 远)
 	if (FoundWeaponInfo->AttackRange <= 0.0f)
 	{
 		UE_LOG(LogTemp, Error,
@@ -2008,6 +2388,19 @@ void UWeaponAttachmentComponent::InitializeWeaponFireConfigFromClass(ABaseWeapon
 	else
 	{
 		NewWeapon->AttackRange = FoundWeaponInfo->AttackRange;
+
+		// 【v82+ 防御】AttackRange 上限校验 — 设计异常, 必须告知开发者
+		//   真根因: 之前没这校验, BQ001.AK47 在 DT 里配成 60000cm → 射线 End 在 40km 外
+		//   → 打到地图底面 Landscape_0 (Y=-40180 距离地图原点 40km) → 用户看到"射线乱飞"
+		constexpr float kMaxReasonableAttackRangeCm = 20000.0f; // 200 米, 大厂武器射程上限
+		if (FoundWeaponInfo->AttackRange > kMaxReasonableAttackRangeCm)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[WeaponAttachment] InitializeWeaponFireConfigFromClass: WeaponRow=%s AttackRange=%.0fcm 超过 200 米上限 (=%fcm). "
+				     "【v82+ 零兜底】强烈建议修改 DT_WeaponInfo 中该行的 AttackRange (典型值: AK47=3000cm, 狙击枪=15000cm). "
+				     "代码已写入该值, 但射线会打到地图边缘, 表现是'射线乱飞/超长'."),
+				*FoundRowName.ToString(), FoundWeaponInfo->AttackRange, kMaxReasonableAttackRangeCm);
+		}
 	}
 
 	// 7. 【v60.16 新增】写入枪口偏移 (策划配置, 非硬编码)

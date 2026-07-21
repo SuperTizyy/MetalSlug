@@ -473,6 +473,10 @@ protected:
 	UFUNCTION()
 	void OnWeaponIconReady(const FString& WeaponID, class UTexture2D* Icon);
 
+	/** 武器弹药数量加载完毕回调 【v84 大厂架构新增】 */
+	UFUNCTION()
+	void OnWeaponAmmoInfoReady(int32 CurrentMag, int32 MagazineSize, int32 ReserveAmmo);
+
 	// ==========================================
 	// 8. 无敌期进度条控制 (2026.07.14 重构)
 	// ==========================================

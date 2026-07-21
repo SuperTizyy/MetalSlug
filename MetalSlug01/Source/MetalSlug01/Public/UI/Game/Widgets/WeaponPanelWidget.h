@@ -20,12 +20,11 @@ class UTextBlock;
  *
  * 职责说明:
  * - 显示主武器、副武器、近战武器的图标
- * - 显示剩余弹药（"弹夹/总弹药"格式）
- * - 弹药数过低时颜色变化（白/黄/红）
+ * - 显示武器弹药数量
  *
  * 架构理念:
  * 1. 主/副/近战: 各自独立的 Image 控件（图标 + 底座两层）
- * 2. 弹药: 单一 Text_RemainingAmmo
+ * 2. 弹药: Text_WeaponAmmo 显示弹药数量 (近战=1/1, 枪械=当前弹药/弹匣+备用弹药)
  * 3. 近战图标特殊处理: 使用动态材质 M_WeaponIconRotate 旋转 90 度
  * 4. 防御性: 每个 Update* 都做空指针检查
  */
@@ -59,18 +58,24 @@ public:
 	void UpdateMeleeWeaponIcon(UTexture2D* Icon);
 
 	/**
-	 * 更新剩余弹药（单一数字）
-	 * @deprecated 建议使用 UpdateAmmoText
+	 * 【v84 大厂架构新增】更新武器弹药数量文本
+	 *
+	 * 格式规则:
+	 *   - 近战武器 (bIsMelee=true): "1/1" (固定值)
+	 *   - 枪械 (bIsMelee=false): "弹匣弹药/弹匣容量 + 备用弹药" 如 "30/30 +120"
+	 *
+	 * 颜色逻辑:
+	 *   - CurrentMag = 0: 红色 (弹药耗尽)
+	 *   - CurrentMag <= 10: 黄色 (弹药过低)
+	 *   - 否则: 白色 (正常)
+	 *
+	 * @param CurrentMag   当前弹匣弹药
+	 * @param MagazineSize 弹匣容量
+	 * @param ReserveAmmo  备用弹药总数
+	 * @param bIsMelee    是否为近战武器 (近战武器只显示 1/1)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "WeaponPanel")
-	void UpdateRemainingAmmo(int32 Ammo);
-
-	/**
-	 * 更新弹药文本（支持弹夹/总弹药格式，如 "30/120"）
-	 * 颜色: 0 红 / <=10 黄 / 否则 白
-	 */
-	UFUNCTION(BlueprintCallable, Category = "WeaponPanel")
-	void UpdateAmmoText(int32 CurrentMag, int32 TotalReserve);
+	void UpdateWeaponAmmoText(int32 CurrentMag, int32 MagazineSize, int32 ReserveAmmo, bool bIsMelee);
 
 protected:
 	// ==========================================
@@ -78,7 +83,7 @@ protected:
 	// ==========================================
 
 	/**
-	 * 初始化: Text_RemainingAmmo 默认 "0/0"
+	 * 初始化
 	 */
 	virtual bool Initialize() override;
 
@@ -111,7 +116,7 @@ private:
 	UPROPERTY(meta = (BindWidget))
 	UImage* Image_MeleeWeaponBase;
 
-	/** 弹药显示文本 "X/Y" */
-	UPROPERTY(meta = (BindWidget))
-	UTextBlock* Text_RemainingAmmo;
+	/** 武器弹药数量文本 【v84 大厂架构新增】 */
+	UPROPERTY(meta = (BindWidgetOptional))
+	UTextBlock* Text_WeaponAmmo;
 };

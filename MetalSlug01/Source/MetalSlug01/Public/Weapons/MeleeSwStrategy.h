@@ -73,9 +73,15 @@ public:
 	 * 【协议】
 	 *   Weapon 必须有 Mesh (UMeshComponent), Mesh 上有 TraceStart / TraceEnd 两个 Socket
 	 *
+	 * 【v82 客户端射线参数 — Melee 不使用】
+	 *   - Melee trace 起点/终点来自 Mesh Socket, 不需要客户端射线
+	 *   - 保留参数接口一致性 (默认 ZeroVector = 不使用客户端射线)
+	 *
 	 * @return true=成功启动, false=配置错/状态错
 	 */
-	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy) override;
+	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
+		const FVector& ClientRayOrigin = FVector::ZeroVector,
+		const FVector& ClientRayDirection = FVector::ForwardVector) override;
 
 	/**
 	 * 停止近战检测 — 清 IgnoreActors, 重置 LastFrame 缓存, bIsActive=false
@@ -100,12 +106,22 @@ public:
 	/**
 	 * 查询激活态 (v60.3 新增 — 单一真理源)
 	 *
-	 * 真理源: bIsActive 字段
+	 * 真理源: TraceState 字段 (v74 — 替代 bIsActive bool)
 	 * 调用方: ABaseWeapon::Tick 决策是否委托 TickDetection
 	 *
 	 * 大厂原则: 替代 BaseWeapon::bIsWeaponActive 重复字段, BaseWeapon::Tick 通过 IsActive() 查询
 	 */
-	virtual bool IsActive() const override { return bIsActive; }
+	virtual bool IsActive() const override { return TraceState != EWeaponTraceState::Idle; }
+
+	/**
+	 * 获取当前检测状态标签 (v74)
+	 */
+	virtual EWeaponTraceState GetTraceState() const override { return TraceState; }
+
+	/**
+	 * 获取状态变化广播委托 (v74)
+	 */
+	virtual FOnWeaponTraceStateChanged& OnTraceStateChanged() override { return TraceStateChanged; }
 
 protected:
 	/**
@@ -133,12 +149,26 @@ protected:
 	FVector LastFrameEndLoc = FVector::ZeroVector;
 
 	/**
-	 * 当前激活态 (v60.3 — 唯一真理源, BaseWeapon::Tick 通过 IsActive() 查)
+	 * 当前检测状态标签 (v74 — 替代 bIsActive bool)
 	 *
-	 * 写入: StartTrace 设 true, StopTrace 设 false
-	 * 读取: IsActive() 接口, TickDetection 内部防御
+	 * 真理源: ANS_MeleeTraceState::NotifyBegin 写入 Tracing, NotifyEnd 写回 Idle
+	 *         TickDetection 命中时设 Hit 后立即回 Tracing
+	 *
+	 * 大厂原则 - 单一真理源:
+	 *   - 蒙太奇时间轴驱动 = 美术可控 (按挥刀节奏)
+	 *   - 不再有"start/stop 时机 C++ 说了算"
+	 *   - Strategy 内部状态字段, 调用方通过 GetTraceState() / OnTraceStateChanged() 读
 	 */
-	bool bIsActive = false;
+	EWeaponTraceState TraceState = EWeaponTraceState::Idle;
+
+	/**
+	 * 状态变化广播委托 (v74 — 事件驱动)
+	 *
+	 * 订阅方: HUD / 音效 / 命中反馈
+	 * 触发: StartTrace/StopTrace/TickDetection 命中时广播
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Trace")
+	FOnWeaponTraceStateChanged TraceStateChanged;
 
 	/**
 	 * 当前激活的 Weapon 指针 (回调 Server_ReportHit 时用)
@@ -155,4 +185,15 @@ protected:
 	 * 当前是重击还是轻击 (TickDetection 命中后传给 Server_ReportHit)
 	 */
 	bool bIsCurrentHeavy = false;
+
+	// ==========================================
+	// 【v75 单一真理源】Socket 名称常量声明
+	// ==========================================
+	// 武器 Mesh 必须有以下 Socket (美术在 Mesh 编辑器加):
+	//   - TraceStart: 刀刃起点
+	//   - TraceEnd:   刀刃终点
+	// 大厂原则 - DRY: 唯一真理源在头文件声明 + cpp 定义, StartTrace / TickDetection 共享同一常量
+	//   (UCLASS 内不能用 `= FName(...)` 初始化静态成员, UE 反射系统限制, 必须 cpp 内定义)
+	static const FName SocketName_TraceStart;
+	static const FName SocketName_TraceEnd;
 };

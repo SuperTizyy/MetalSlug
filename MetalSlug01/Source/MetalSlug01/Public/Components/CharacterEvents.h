@@ -101,6 +101,27 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnACEWithRankChanged, int32, NewAC
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponIconReady, const FString&, WeaponID, UTexture2D*, Icon);
 
+// ----------------------------------------
+// 8. 武器弹药信息事件 【v84 大厂架构新增】
+// ----------------------------------------
+/**
+ * 武器弹药信息就绪 — 用于武器面板 TextBlock 显示弹药数量
+ *
+ * 格式规则:
+ *   - 近战武器 (EWeaponMeshType::Melee): "1/1" (固定值, 弹药无意义)
+ *   - 枪械 (Primary/Secondary): "弹匣弹药/弹匣容量 + 备用弹药"
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 真理源在 WeaponFireComponent.GetCurrentAmmo() / GetMagazineSize() / GetReserveAmmo()
+ *   - CharacterIconComponent 读取并封装为文本, 通过本事件推送给 HUD
+ *   - WeaponPanelWidget 只负责 UI 显示, 不参与数据计算
+ *
+ * @param CurrentMag   当前弹匣弹药
+ * @param MagazineSize 弹匣容量
+ * @param ReserveAmmo  备用弹药总数
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnWeaponAmmoInfoReady, int32, CurrentMag, int32, MagazineSize, int32, ReserveAmmo);
+
 
 // ==========================================
 // UCharacterEvents - 角色状态事件总线
@@ -189,6 +210,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Invincibility")
 	FOnInvincibilityChanged OnInvincibilityChanged;
 
+	/** 武器弹药信息就绪 【v84 大厂架构新增 - 武器面板 TextBlock 显示弹药】 */
+	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Weapon")
+	FOnWeaponAmmoInfoReady OnWeaponAmmoInfoReady;
+
 	// ==========================================
 	// 【2026-07-01 P0 新增】快照访问器 (订阅者主动拉取)
 	// ==========================================
@@ -248,6 +273,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
 	bool GetCachedWeaponIcon(FString& OutWeaponID, UTexture2D*& OutIcon) const;
 
+	/**
+	 * 【v85.2 大厂架构新增】写入武器弹药快照
+	 *
+	 * 大厂原则 - "事件 + 缓存"双轨制:
+	 *   - 与武器图标缓存完全对称
+	 *   - Bind-Snapshot 补发场景: HUD 订阅成功后, 主动拉取弹药快照
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
+	void SetCachedWeaponAmmoInfo(int32 InCurrentAmmo, int32 InMagazineSize, int32 InReserveAmmo, bool bInIsMelee);
+
+	/**
+	 * 【v85.2 大厂架构新增】获取当前缓存的武器弹药信息
+	 * @return true=有缓存, false=尚未有任何弹药广播
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
+	bool GetCachedWeaponAmmoInfo(int32& OutCurrentAmmo, int32& OutMagazineSize, int32& OutReserveAmmo, bool& OutbIsMelee) const;
+
 protected:
 	// ==========================================
 	// 内部: 复制配置 (RemoteRole=Skip, 事件在本地触发)
@@ -299,4 +341,24 @@ protected:
 	/** 缓存: 是否已有任何武器图标广播 (用于区分 "尚无" 与 "空字符串") */
 	UPROPERTY()
 	bool bCachedWeaponIconValid = false;
+
+	/** 缓存: 最近一次武器弹药广播 - 当前弹匣弹药数 */
+	UPROPERTY()
+	int32 CachedCurrentAmmo = -1;
+
+	/** 缓存: 最近一次武器弹药广播 - 弹匣容量 */
+	UPROPERTY()
+	int32 CachedMagazineSize = -1;
+
+	/** 缓存: 最近一次武器弹药广播 - 备用弹药数 */
+	UPROPERTY()
+	int32 CachedReserveAmmo = -1;
+
+	/** 缓存: 最近一次武器弹药广播 - 是否为近战武器 */
+	UPROPERTY()
+	bool bCachedIsMelee = false;
+
+	/** 缓存: 是否已有任何武器弹药广播 */
+	UPROPERTY()
+	bool bCachedWeaponAmmoValid = false;
 };

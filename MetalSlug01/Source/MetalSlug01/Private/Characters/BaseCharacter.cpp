@@ -8,6 +8,9 @@
 
 #include "GenericTeamAgentInterface.h"
 
+// 引入 DrawDebug 函数 (v82+ 客户端预测线)
+#include "DrawDebugHelpers.h"
+
 // 引入摄像机组件
 #include "Camera/CameraComponent.h"
 
@@ -47,6 +50,8 @@
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomPlayerController.h"
 #include "Kismet/GameplayStatics.h"
+#include "Sound/SoundBase.h"           // v76 — 武器切换音效 (USoundBase 完整定义)
+#include "Weapons/WeaponSlotType.h"    // v76 — EWeaponSlotType (LexToString)
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
@@ -95,6 +100,8 @@ ABaseCharacter::ABaseCharacter()
 	CameraBoom->SetupAttachment(RootComponent);
 	CameraBoom->TargetArmLength = 300.0f; // 摄像机距离角色的距离（可以随时在蓝图里调）
 	CameraBoom->bUsePawnControlRotation = true; // 弹簧臂跟随鼠标转动
+
+	// 【v85.x 删除相机阻尼】让鼠标控制更跟手，零延迟
 
 	// 2. 创建跟随摄像机
 	FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
@@ -1000,8 +1007,10 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		//   - StopFire 在松开时触发，停止 TickComponent
 		if (FireAction)
 		{
-			// 半自动模式: 按下瞬间只触发一次（Started）
-			EnhancedInputComponent->BindAction(FireAction, ETriggerEvent::Started, this, &ABaseCharacter::OnFirePressed);
+		// 全自动扫射模式: 按住期间每帧触发（Triggered）
+		//   - Triggered 每帧调用 OnFirePressed
+		//   - WeaponFireComponent::StartFire 内部有冷却检查，冷却中启动 TickComponent 等待
+		EnhancedInputComponent->BindAction(FireAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnFirePressed);
 			// 停止开火: 任何模式都需要（防止 TickComponent 继续射击）
 			EnhancedInputComponent->BindAction(FireAction, ETriggerEvent::Completed, this, &ABaseCharacter::OnFireReleased);
 		}
@@ -1387,6 +1396,79 @@ void ABaseCharacter::Multicast_Die_Implementation()
 	{
 		Death->Multicast_Die_Implementation();
 	}
+}
+
+
+/**
+ * Multicast_PlayEquipSoundForSlot_Implementation — 播放拿起武器音效
+ *
+ * 【v76 大厂架构】RPC 真身实现 (UE 5.6 NetMulticast, 服务器 + 所有客户端都触发)
+ *
+ * 为什么不在 Component 而在 Actor:
+ *   - UE 5.6 RPC 必须声明在 Actor 上 (Component RPC 受限, 不可靠)
+ *   - Multicast_PlayEquipSoundForSlot 声明在 BaseCharacter, 实现也在这里
+ *   - 大厂原则: RPC Implementation 自包含, 不再转发 Component (单一职责)
+ *   - 与 Multicast_Die 不同 (后者转发 Component) 是因为 Die 业务复杂,
+ *     PlayEquip 是单行调用 UGameplayStatics, 转不转发无所谓
+ *
+ * 大厂原则 - 零兜底:
+ *   - InSound 字段为空 → Log Error + 拒绝播放 (强制修复 DA)
+ *   - World 无效 → Log Error + 拒绝播放
+ *   - Owner 坐标失效 → 用 ZeroVector fallback (视觉位置影响小,声音是非定向)
+ *
+ * 大厂原则 - 网络:
+ *   - 服务器本地调用 → 服务器 Implementation 触发 (PlaySoundAtLocation)
+ *   - 远端客户端收到 → Implementation 触发 (PlaySoundAtLocation)
+ *   - 服务器 Local 实例 (ListenServer 客户端) 同样触发 (UE NetMulticast 行为)
+ *   - Dedicated Server 上服务器实例也触发 (但服务器没声卡 → 无声播放是引擎忽略)
+ *
+ * @param NewSlot 槽位 (Primary / Secondary / Melee — 用于日志)
+ * @param InSound 音效资产 (从 GM->DA_WeaponSoundMap 查出, RPC 边界序列化纯指针)
+ * @param VolumeMul 音量倍数 (从 DataAsset.VolumeMultiplier)
+ * @param PitchMul 音高倍数 (从 DataAsset.PitchMultiplier)
+ */
+void ABaseCharacter::Multicast_PlayEquipSoundForSlot_Implementation(EWeaponSlotType NewSlot, USoundBase* InSound, float VolumeMul, float PitchMul)
+{
+	// 零兜底: Sound 字段为空 → 强制修复 DA (服务端已查,这里防御二次)
+	if (!InSound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseCharacter::Multicast_PlayEquipSoundForSlot] InSound 为空 — 拒绝播放. Slot=%s. ")
+			TEXT("【v76 大厂原则 — 零兜底】服务器查 DA 时 Sound 字段为空, 强制修复 DA_WeaponSoundMap.uasset."),
+			LexToString(NewSlot));
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseCharacter::Multicast_PlayEquipSoundForSlot] World 无效 — 拒绝播放. Slot=%s."),
+			LexToString(NewSlot));
+		return;
+	}
+
+	// 优先级: Owner 位置 (玩家) > ZeroVector (兜底)
+	const FVector PlayLocation = GetActorLocation();
+
+	// UE 5 标准 API: PlaySoundAtLocation (无 Multiplayer 行为, 任何调用方都本地播放)
+	UGameplayStatics::PlaySoundAtLocation(
+		this,
+		InSound,
+		PlayLocation,
+		VolumeMul,
+		PitchMul
+	);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[ABaseCharacter::Multicast_PlayEquipSoundForSlot] Pawn=%s Slot=%s 播放 Equip 音效 — Sound=%s Loc=%s Vol=%.2f Pitch=%.2f World=%s"),
+		*GetName(),
+		LexToString(NewSlot),
+		*InSound->GetName(),
+		*PlayLocation.ToCompactString(),
+		VolumeMul,
+		PitchMul,
+		*World->GetName());
 }
 
 
@@ -1912,8 +1994,12 @@ bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector
 			return false;
 		}
 
-		// 注意: 这里 OutRayOrigin 不被赋值 — 射线起点由调用方 (Strategy) 用 Muzzle Socket 算
-		// 我们只输出方向, 不输出起点 — 起点是武器几何决定的, 方向是玩家意图决定的
+		// v82 大厂架构修复: 输出 Origin + Direction (玩家准星世界射线 = 准星屏幕中心 Deproject 起点)
+		//   - 旧 (v60.11) 反模式: 只输出 Direction, Origin 让 Strategy 用 Muzzle Socket 算
+		//   - 新 (v82): 输出完整的 Origin + Direction → RPC 传给服务器 → 服务器直接 trace
+		//   - 服务器不再需要 Muzzle Socket 计算, 不再需要 Character/Weapon 几何信息
+		//   - 这是"客户端射线, 服务器权威 trace"的大厂标准 (CS:GO / Apex / Valorant)
+		OutRayOrigin = CrosshairOrigin;
 		OutRayDirection = CrosshairDirection;
 		return true;
 	}
@@ -2967,34 +3053,130 @@ bool ABaseCharacter::Server_RequestSwitchToSlot_Validate(EWeaponSlotType TargetS
 
 void ABaseCharacter::OnFirePressed(const FInputActionValue& /*Value*/)
 {
+	// 【v82 诊断增强】入口 Display Log — 用户能确认按左键是否触发此函数
+	//   旧版 (v70-v81) 只有错误情况 Log, 按下时静默, 难诊断"按了左键没反应"
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::OnFirePressed] ENTER. Pawn=%s Local=%d Auth=%d"),
+		*GetName(),
+		IsLocallyControlled() ? 1 : 0,
+		HasAuthority() ? 1 : 0);
+
 	// 死亡不能开火
-	if (IsDead()) return;
+	if (IsDead())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 已死亡, 拒绝开火."),
+			*GetName());
+		return;
+	}
 
 	// 仅玩家 (AI 不走 PlayerController 输入, 这里防御性守卫)
-	if (!IsPlayerControlled()) return;
+	if (!IsPlayerControlled())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 非玩家控制, 拒绝开火 (AI 应走 OnAIRequestAttack_Simple)."),
+			*GetName());
+		return;
+	}
 
 	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
-	if (!WeaponAttachComp) return;
+	if (!WeaponAttachComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 找不到 WeaponAttachmentComponent."),
+			*GetName());
+		return;
+	}
 
 	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
 	if (!CurrentWeapon)
 	{
 		// 没武器 — 业务正常, 不报错
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 没武器, 拒绝开火."),
+			*GetName());
 		return;
 	}
 
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::OnFirePressed] Pawn=%s CurrentWeapon=%s MeshType=%d (0=None 1=Melee 2=Primary 3=Secondary). 决策路径..."),
+		*GetName(),
+		*CurrentWeapon->GetName(),
+		static_cast<int32>(CurrentWeapon->GetMeshType()));
+
 	// 仅枪械 (Primary/Secondary) 才走开火路径
-	//   - Melee 武器按左键 → 应该走 LightAttack_Pressed (连斩)
-	//   - 这里拒绝转发, 让玩家切到枪槽再开火
+	//   - Melee 武器按左键 → 调 PlayerComboComponent->LightAttack_Pressed (连斩)
+	if (CurrentWeapon->GetMeshType() == EWeaponMeshType::Melee)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s MeshType=Melee → 走 LightAttack_Pressed (连斩)."),
+			*GetName());
+		// 走近战连击路径
+		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+		{
+			Combo->LightAttack_Pressed();
+		}
+		// else: ResolvePlayerCombo 内部已 Log Error
+		return;
+	}
+
+	// Primary / Secondary 走枪械开火路径
 	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Primary &&
 	    CurrentWeapon->GetMeshType() != EWeaponMeshType::Secondary)
 	{
-		// 不是枪, 静默拒绝 (业务正常 — 刀不响应开火键)
+		// 不是枪也不是刀, 静默拒绝 (业务正常)
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s MeshType=%d 既不是枪也不是刀, 拒绝开火. 【v82 修复】检查 DT_WeaponInfo.BQ001.MeshType 是否配 Primary."),
+			*GetName(),
+			static_cast<int32>(CurrentWeapon->GetMeshType()));
 		return;
 	}
 
-	// 转发到武器 RPC (服务器权威)
-	CurrentWeapon->Server_StartFire();
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::OnFirePressed] Pawn=%s MeshType=Primary/Secondary → 计算客户端射线 + 调 Server_StartFire() (RPC 转发到服务器)."),
+		*GetName());
+
+	// v82 大厂架构修复: 客户端计算 HUD Crosshair 射线 → RPC 传给服务器做权威 trace
+	//   - 旧 (v70-v81) 反模式: 不传射线参数, 服务器 WeaponFireComponent 内部用 PC->GetViewportSize
+	//     → 服务器对远端玩家 PC 调 GetViewportSize 返回 0,0 → Deproject 失败 → trace 永远失败
+	//   - 新 (v82): 客户端玩家路径在 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
+	//   - 玩家射线 = 玩家准星: 服务器用客户端射线做权威 trace (所见即所射, 防作弊)
+	FVector ClientRayOrigin = FVector::ZeroVector;
+	FVector ClientRayDirection = FVector::ForwardVector;
+
+	// 调 BaseCharacter::GetAimRayFromCrosshairOrEyes 拿方向 (路径 A 本地玩家 → HUD Crosshair)
+	const bool bGotRay = GetAimRayFromCrosshairOrEyes(ClientRayOrigin, ClientRayDirection);
+	if (!bGotRay)
+	{
+		// HUD 未就绪 / Crosshair 不可用 — 零兜底: 拒绝开火 + Log Error (不允许"没射线也开火")
+		//   旧版会静默继续, 服务器再 fail — 双重静默 = 用户根本看不到错误
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 获取客户端射线失败 (HUD 未就绪 / Crosshair 不可用). 拒绝开火, 强制修复 HUD 配置. "
+			     "【v82 修复】检查 WBP_GameHUD 是否绑定了 WBP_Crosshair 子控件."),
+			*GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 客户端射线: Origin=%s Direction=%s → 调 Server_StartFire."),
+		*GetName(),
+		*ClientRayOrigin.ToCompactString(),
+		*ClientRayDirection.ToCompactString());
+
+	// ============================================================
+	// 【v85.1 大厂架构 — 主武器射线视觉】
+	//
+	// 完整流程:
+	//   OnFirePressed → Server_StartFire RPC (携带客户端射线参数)
+	//     → URangedLineStrategy::PerformSingleShot (服务器权威 trace)
+	//       → 服务器本地: EDrawDebugTrace::ForDuration (红/绿线, 5分钟持久)
+	//       → Multicast_PlayFireTraceVisual → 所有客户端画红/绿线 (0.5s 短留)
+	//
+	// 颜色规则:
+	//   - 命中 (Hit) = 绿色
+	//   - 未命中 (Miss) = 红色
+	// ============================================================
+	CurrentWeapon->Server_StartFire(FVector_NetQuantize(ClientRayOrigin), FVector_NetQuantizeNormal(ClientRayDirection));
 }
 
 
@@ -3009,6 +3191,17 @@ void ABaseCharacter::OnFireReleased(const FInputActionValue& /*Value*/)
 	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
 	if (!CurrentWeapon) return;
 
+	// 近战武器: 转发到 PlayerComboComponent->LightAttack_Released
+	if (CurrentWeapon->GetMeshType() == EWeaponMeshType::Melee)
+	{
+		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+		{
+			Combo->LightAttack_Released();
+		}
+		return;
+	}
+
+	// 枪械路径
 	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Primary &&
 	    CurrentWeapon->GetMeshType() != EWeaponMeshType::Secondary)
 	{
