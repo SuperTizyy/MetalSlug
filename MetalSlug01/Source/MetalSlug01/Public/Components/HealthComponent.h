@@ -140,7 +140,13 @@ public:
 	 *   - >  0 : 还在无敌期 (精确剩余秒数)
 	 *   - <= 0 : 未激活 或 已到期
 	 *
-	 * 用途: HUD 显示倒计时数字
+	 * 用途: HUD 显示倒计时数字 + 进度条
+	 *
+	 * 【v40.9 大厂架构 — 真理源是派生字段, 不是衍生 bool】
+	 *   - 用 GameState->GetServerWorldTimeSeconds() 计算 (服务器权威时钟, 自动补偿网络延迟)
+	 *   - 派生于 InvincibilityExpiresAtWorldTime (Replicated 字段), 不依赖 bIsInvincible
+	 *   - 即使 bIsInvincible 还没同步过来 (OnRep 时序竞争), 只要 ExpiresAt > Now → 还在无敌期
+	 *   - 避免 UE bool 字段复制的边缘 case (初始值不同步 / true→false 间隔 < Bind 时间)
 	 */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Health|Invincibility")
 	float GetInvincibilityRemainingSeconds() const;

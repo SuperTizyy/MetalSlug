@@ -523,4 +523,14 @@ private:
 	 *   - 未订阅且有 Pawn → 重置重试并重新尝试
 	 */
 	void TickFallbackCheck(float DeltaTime);
+
+	/**
+	 * 【v40.8 P0 新增】无敌期轮询兜底: 每 0.1s 一次
+	 *   - 主动从 HealthComponent 拉 GetInvincibilityRemainingSeconds()
+	 *   - 与 Widget_RespawnProgress 显示状态对比, 缺则补 Show/Hide
+	 *   - 解决 OnRep 初始值不触发 / 事件丢失 的边缘 case
+	 *   - 大厂原则: HUD 不能依赖单一事件流, 必须有兜底机制
+	 */
+	float InvincibilityWatchdogTimer = 0.0f;
+	void TickInvincibilityWatchdog(float DeltaTime);
 };

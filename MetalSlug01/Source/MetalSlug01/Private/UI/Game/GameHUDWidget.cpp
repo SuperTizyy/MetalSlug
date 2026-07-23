@@ -21,9 +21,11 @@
 #include "UI/Game/Widgets/ScoreboardWidget.h"
 #include "UI/Game/Widgets/CrosshairWidget.h"
 #include "UI/Game/Widgets/EscMenuWidget.h"
+#include "UI/Game/Widgets/RespawnProgressWidget.h"
 #include "Components/Border.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
+#include "Components/HealthComponent.h"
 
 
 // ==========================================
@@ -201,6 +203,17 @@ void UGameHUDWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
 	TickFallbackCheck(InDeltaTime);
+
+	// 【v40.8 大厂架构 P0】无敌期轮询兜底
+	//   根因: OnInvincibilityChanged 事件可能因为以下原因丢失:
+	//     - 客户端刚 Spawn 时, bIsInvincible 的"初始值" 同步可能不触发 OnRep
+	//     - 客户端收到 true → 立刻收到 false, 中间间隔小于 HUD Bind 时间,事件被错过
+	//     - 任何边缘 race 都会让 HUD 永远错过 Show()
+	//   修复: HUD NativeTick 每 0.1s 主动从 HealthComponent 拉 GetInvincibilityRemainingSeconds()
+	//        与 Widget_RespawnProgress->bIsShowing 状态对比, 缺则补 Show/ Hide
+	//   镜像对称 (v40.8): HUD 同时订阅事件 + 主动拉数据, 兜底"事件丢失"
+	//   零重复: 不影响 OnInvincibilityChanged 事件流, 仅作兜底
+	TickInvincibilityWatchdog(InDeltaTime);
 }
 
 
@@ -250,6 +263,98 @@ void UGameHUDWidget::TickFallbackCheck(float DeltaTime)
 
 		CharacterEventsRetryCount = 0;
 		TryBindToCharacterEvents();
+	}
+}
+
+
+/**
+ * UGameHUDWidget::TickInvincibilityWatchdog
+ *
+ * 【v40.8 P0 大厂架构】无敌期轮询兜底 (HUD 不依赖单一事件流)
+ *
+ * 设计动机:
+ *   UE 网络复制 bIsInvincible 字段的 OnRep 行为有以下边缘 case:
+ *     1. 客户端刚 Spawn 时, bIsInvincible 初始值可能不触发 OnRep (业界共识)
+ *     2. 客户端收到 true → 立即收到 false (间隔 < 客户端 Bind 时间), 事件错过
+ *     3. 任何 race condition 都可能让 HUD 永远错过 Show()
+ *
+ *   这导致玩家复活时, 复活进度条/无敌闪烁等 HUD 效果不显示 (用户报告)
+ *
+ * 大厂原则 (事件 + 拉取 双轨制):
+ *   - 事件流: OnInvincibilityChanged (HandleInvincibilityChanged) 实时触发
+ *   - 拉取流: 本函数每 0.1s 主动从 HealthComponent 拉 GetInvincibilityRemainingSeconds()
+ *   - 两者互补, 拉取流兜底事件流丢失
+ *
+ * 性能:
+ *   - 0.1s 间隔 = 10Hz, 完全不影响性能 (单字段 Get 几乎 0 开销)
+ *   - 只在 GetInvincibilityRemainingSeconds() > 0 时调用 Show(), 否则 Hide()
+ *   - RespawnProgressWidget->bIsShowing 状态做去重, 同状态重复调不浪费
+ *
+ * 零兜底原则:
+ *   - 不用 bool 字段 (IsInvincible) 判断, 用绝对时间字段 (InvincibilityExpiresAtWorldTime)
+ *     派生剩余秒数, 避免 OnRep 初始值不触发的 UE 固有限制
+ *   - 不写死默认 Duration, 一切从 HealthComponent::GetInvincibilityDuration() 派生
+ */
+void UGameHUDWidget::TickInvincibilityWatchdog(float DeltaTime)
+{
+	// 0.1s 节流 (10Hz) — 完全不影响性能
+	InvincibilityWatchdogTimer += DeltaTime;
+	if (InvincibilityWatchdogTimer < 0.1f)
+	{
+		return;
+	}
+	InvincibilityWatchdogTimer = 0.0f;
+
+	// 必须有 RespawnProgress Widget
+	if (!Widget_RespawnProgress)
+	{
+		return;
+	}
+
+	APlayerController* PC = GetOwningPlayer();
+	if (!PC)
+	{
+		return;
+	}
+
+	ABaseCharacter* Character = Cast<ABaseCharacter>(PC->GetPawn());
+	if (!Character)
+	{
+		return;
+	}
+
+	UHealthComponent* HC = Character->ResolveHealthComponent();
+	if (!HC)
+	{
+		return;
+	}
+
+	// 真理源: 派生剩余秒数 (不依赖 bool 字段,避免 OnRep 初始值不触发问题)
+	const float Remaining = HC->GetInvincibilityRemainingSeconds();
+
+	if (Remaining > 0.0f)
+	{
+		// 应该显示 (但可能事件错过了 → Show() 内部用 bIsShowing 去重, 重复调无副作用)
+		if (!Widget_RespawnProgress->IsShowingProgress())
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[GameHUDWidget][Watchdog][v40.8] 检测到仍在无敌期, 但 Widget 未显示 → 强制 Show. "
+					 "Pawn=%s, Remaining=%.2fs"),
+				*Character->GetName(), Remaining);
+			Widget_RespawnProgress->Show();
+		}
+	}
+	else
+	{
+		// 不在无敌期, 应隐藏 (但事件可能错过)
+		if (Widget_RespawnProgress->IsShowingProgress())
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[GameHUDWidget][Watchdog][v40.8] 无敌期已结束, 但 Widget 仍显示 → 强制 Hide. "
+					 "Pawn=%s"),
+				*Character->GetName());
+			Widget_RespawnProgress->Hide();
+		}
 	}
 }
 
@@ -990,18 +1095,34 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			}
 		}
 
-		// 【v40.7 新增】无敌期状态快照补发
-		// 根因: 玩家复活时 ActivateSpawnInvincibility 先于 HUD 订阅触发
-		// → OnInvincibilityChanged(true) 事件丢失 → Show() 从未被调用 → 进度条不显示
-		// 修复: HUD 订阅成功后主动检查当前 invincibility 状态，如已激活则立即 Show
+		// 【v40.9 增强 v40.8】无敌期状态快照补发
+		// 根因 (v40.7): 玩家复活时 ActivateSpawnInvincibility 先于 HUD 订阅触发
+		//   → OnInvincibilityChanged(true) 事件丢失 → Show() 从未被调用 → 进度条不显示
+		// 修复 (v40.7): HUD 订阅成功后主动检查当前 invincibility 状态，如已激活则立即 Show
+		//
+		// 二次根因 (v40.8): 旧版用 `HC->IsInvincible()` (bool 字段)
+		//   - UE 网络复制: bIsInvincible 字段的"初始值" 在某些时序下不会触发 OnRep
+		//     → 客户端字段可能停留在 false 即使无敌期还未结束
+		//   - 或: 客户端先收到 true → OnRep true → Bind 之前就收到 false → 字段 false
+		//     → Bind 时 HC->IsInvincible() == false → 漏补发
+		// 二次修复 (v40.8): 改用 `GetInvincibilityRemainingSeconds() > 0` 判定
+		//   - InvincibilityExpiresAtWorldTime 是 Replicated 绝对时间
+		//   - 客户端读 World->GetTimeSeconds() 算剩余 → 即使 OnRep 初始值丢失,也能从 expires-at 字段反推
+		//   - 这才是无敌期状态的"真理源" (大厂原则: 派生字段 > 衍生 bool 字段)
+		//
+		// 三次增强 (v40.9): GetInvincibilityRemainingSeconds 内部已用 GameState 时间 (服务器权威 + 自动网络延迟补偿)
+		//   - 这是 Bind-Snapshot 兜底链路的最后一环
+		//   - 即使 Replicated 字段有微小时序差异,剩余秒数仍准确
 		{
 			if (UHealthComponent* HC = Character->ResolveHealthComponent())
 			{
-				if (HC->IsInvincible() && Widget_RespawnProgress)
+				const float Remaining = HC->GetInvincibilityRemainingSeconds();
+				if (Remaining > 0.0f && Widget_RespawnProgress)
 				{
 					UE_LOG(LogTemp, Log,
-						TEXT("[GameHUDWidget][Bind-Snapshot] 检测到当前处于无敌期，强制显示复活进度条. Pawn=%s"),
-						*Character->GetName());
+						TEXT("[GameHUDWidget][Bind-Snapshot][v40.8] 仍在无敌期, 强制显示复活进度条. "
+							 "Pawn=%s, Remaining=%.2fs"),
+						*Character->GetName(), Remaining);
 					Widget_RespawnProgress->Show();
 				}
 			}

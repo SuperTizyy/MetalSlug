@@ -236,6 +236,31 @@ public:
 	void Client_RefreshWeaponIcon_Implementation(const FString& InWeaponID, UTexture2D* Icon);
 
 	/**
+	 * 【v85.3 P0 新增】客户端接收武器弹药数据 (镜像 Client_RefreshWeaponIcon_Implementation)
+	 *
+	 * 服务器调 Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
+	 *   ↓ RPC
+	 * 客户端收到 → 缓存 SetCachedWeaponAmmoInfo + 调 CharacterEvents 广播 (HUD 订阅)
+	 *
+	 * 大厂原则 - RPC 必须在 Actor 上 (UE 硬约束):
+	 *   - UFUNCTION(Client, Reliable) 在 BaseCharacter::Client_RefreshWeaponAmmo 上
+	 *   - BaseCharacter 转发壳直接调本方法
+	 *   - 服务器本地 (ListenServer) 自动走本地 Implementation 调用
+	 *   - 远端客户端的 Pawn 走 RPC 序列化, 收到后调 Implementation
+	 *
+	 * 大厂原则 - 镜像对称:
+	 *   - 武器图标 (v40.1): 服务器查表 → RPC 推 Icon
+	 *   - 武器弹药 (v85.3): 服务器读 FireComp → RPC 推 CurrentAmmo/MagazineSize/ReserveAmmo
+	 *   - 客户端不"自己读武器组件再广播" (因为 CurrentWeapon 还没复制过来时读到默认值 1/1, HUD 显示错误)
+	 *
+	 * 大厂原则 - 零兜底:
+	 *   - MagazineSize <= 0 → Log Error (RT 配错)
+	 *   - bIsLocallyControlled=false → 不缓存 (其他玩家的弹药不影响本机 HUD)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
+	void Client_RefreshWeaponAmmo_Implementation(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo);
+
+	/**
 	 * 从 CharacterDataTable 查指定角色 ID 的头像贴图 (BlueprintPure)
 	 *
 	 * 【2026.07.12 P0 重构】从 BaseCharacter 抽离

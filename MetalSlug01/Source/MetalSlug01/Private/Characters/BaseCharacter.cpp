@@ -666,6 +666,21 @@ void ABaseCharacter::Client_RefreshWeaponIcon_Implementation(const FString& InWe
 
 
 /**
+ * Client_RefreshWeaponAmmo_Implementation — 转发壳 (UFUNCTION(Client) 在 Actor 上)
+ * 真实逻辑: CharacterIconComponent::Client_RefreshWeaponAmmo_Implementation
+ *
+ * 【v85.3 P0 新增】镜像 Client_RefreshWeaponIcon_Implementation
+ */
+void ABaseCharacter::Client_RefreshWeaponAmmo_Implementation(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo)
+{
+	if (UCharacterIconComponent* IconComp = ResolveCharacterIcon())
+	{
+		IconComp->Client_RefreshWeaponAmmo_Implementation(CurrentAmmo, MagazineSize, ReserveAmmo);
+	}
+}
+
+
+/**
  * RetryRefreshCharacterIcon — 转发壳
  * 真实逻辑: CharacterIconComponent::RetryRefreshCharacterIcon
  */

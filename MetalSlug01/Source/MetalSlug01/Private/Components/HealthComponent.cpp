@@ -11,6 +11,12 @@
 #include "Engine/World.h"
 #include "TimerManager.h"
 
+// 【v40.9 新增】GetServerWorldTimeSeconds 需要 GameStateBase 完整定义
+//   - AGameStateBase::GetServerWorldTimeSeconds() 是 UE 内置 API
+//   - 客户端通过内置 RPC 自动补偿网络延迟
+//   - 不依赖前置 transitive include (避免 refactor 编译失败)
+#include "GameFramework/GameStateBase.h"
+
 UHealthComponent::UHealthComponent()
 {
 	// 【2026-06-15 新增】: 启用复制 (修复前未开启,服务器修改客户端看不到)
@@ -268,6 +274,11 @@ void UHealthComponent::DeactivateInvincibility()
 
 	bIsInvincible = false;
 	InvincibilityExpiresAtWorldTime = 0.0f;
+	// 【v40.9 修复 — 镜像对称 v40.7】同步清 TotalDuration
+	//   根因: 旧版 DeactivateInvincibility 没清 InvincibilityTotalDuration, 只有 Expire 才清
+	//         → 显式 Deactivate 后, 字段残留 → 下次 Activate 之前的 GetInvincibilityDuration() 返回旧值
+	//   镜像对称: Deactivate 与 Expire 行为应完全一致 (都是 "无敌结束"), 字段清除必须对称
+	InvincibilityTotalDuration = 0.0f;
 
 	UE_LOG(LogCombat, Log,
 		TEXT("[HealthComponent] ★ 复活无敌期取消 ★ Owner=%s"),
@@ -305,17 +316,57 @@ void UHealthComponent::ExpireInvincibility_Internal()
 
 float UHealthComponent::GetInvincibilityRemainingSeconds() const
 {
-	if (!bIsInvincible)
+	// 【v40.9 大厂架构 — 真理源迁移】
+	//   旧版 (v40.8) 根因:
+	//     - 第一行用 bIsInvincible 字段短路 (if (!bIsInvincible) return 0.0f)
+	//     - UE 网络复制: bool 字段在某些时序下不可靠 (OnRep 初始值不触发, true→false 间隔 < HUD Bind 时间)
+	//     - HUD Bind 时如果 bIsInvincible 已变 false (服务器到期已 OnRep), 返回 0 → Show 不触发
+	//     - 即使 Bind 之前没到期, 客户端 OnInvincibilityChanged(true) 触发 Show 之后, OnInvincibilityChanged(false) 紧接着触发 Hide → 闪一下又消失
+	//   Session1.log 实证:
+	//     - Line 00253.451 [Bind-Snapshot] Remaining=23.58s (因为 bIsInvincible=true 时 OnRep 时序竞争)
+	//     - Line 00255.324 [OnInvincibilityChanged(false)] Hide 触发, 整个无敌期显示不完整
+	//   修复 (v40.9):
+	//     - **真理源: 派生字段 (InvincibilityExpiresAtWorldTime) 而不是衍生 bool (bIsInvincible)**
+	//     - 大厂原则: 派生字段 > 衍生 bool (派生字段在所有时序下都准确)
+	//     - ExpiresAt 字段 Replicated (普通 Replicated), 客户端读到时如果 ExpiresAt > Now → 还在无敌期
+	//     - 用 GameState->GetServerWorldTimeSeconds() 而非 World->GetTimeSeconds():
+	//       * 服务器时间 = 权威时钟, 客户端通过 UE 内置 RPC 自动补偿网络延迟
+	//       * 避免客户端加载晚于服务器导致的 Remaining 计算偏差
+	//       * 与 RoomGameState::GetMatchRemainingSeconds() 模式对称 (大厂原则)
+	//   零兜底:
+	//     - ExpiresAt=0 (Deactivate/Expire 后) → ExpiresAt - Now 是负数 → Max 钳到 0 → 返回 0
+	//     - 不需要 bool 字段守卫, 派生逻辑自然处理
+	//   性能: GetServerWorldTimeSeconds 是 UE 内置 API, 单次调用约 1μs, 10Hz Tick 完全无压力
+
+	if (const UWorld* World = GetWorld())
 	{
-		return 0.0f;
+		double NowD = 0.0;
+		if (const AGameStateBase* GS = World->GetGameState())
+		{
+			// 大厂原则: 服务器权威时钟 + 自动网络延迟补偿
+			// 【UE 5.6 API 变更】GetServerWorldTimeSeconds() 返回 double (UE 5.6 内部服务器时间改为 double 精度)
+			//   旧版 UE 4.x / 5.0 返回 float, 5.6 已切换为 double — 必须用 double 接收
+			NowD = GS->GetServerWorldTimeSeconds();
+		}
+		else
+		{
+			// GameState 不在 (过渡期, 极少见) → fallback 到本地 World time
+			// 这是显式降级, 不是兜底 — GameState 必然存在 (UE GameMode 强制)
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[HealthComponent] GetInvincibilityRemainingSeconds: GameState=null, fallback 到 World->GetTimeSeconds. "
+					 "Owner=%s"),
+				*GetNameSafe(GetOwner()));
+			NowD = World->GetTimeSeconds();
+		}
+		// 显式 double → float (避免 UE 5.6 double 精度丢失)
+		const float Now = static_cast<float>(NowD);
+		const float Remaining = FMath::Max(0.0f, InvincibilityExpiresAtWorldTime - Now);
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[HealthComponent] GetInvincibilityRemainingSeconds: Owner=%s, ExpiresAt=%.2f, Now=%.2f, Remaining=%.2fs"),
+			*GetNameSafe(GetOwner()), InvincibilityExpiresAtWorldTime, Now, Remaining);
+		return Remaining;
 	}
-	const UWorld* World = GetWorld();
-	if (!World)
-	{
-		return 0.0f;
-	}
-	const float Now = World->GetTimeSeconds();
-	return FMath::Max(0.0f, InvincibilityExpiresAtWorldTime - Now);
+	return 0.0f;
 }
 
 float UHealthComponent::GetInvincibilityDuration() const

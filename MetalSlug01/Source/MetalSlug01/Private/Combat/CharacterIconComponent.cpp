@@ -191,10 +191,25 @@ void UCharacterIconComponent::BeginPlay()
 	// 订阅当前武器的弹药变化
 	SubscribeToActiveWeaponAmmo();
 
-	// 【v85.1 大厂架构新增】订阅后立即广播一次弹夹信息
-	// 根因: 出生时弹夹文本为空，需要切枪才能显示
-	// 解决方案: 订阅完成后立即调用 BroadcastWeaponAmmoInfo，触发 HUD 刷新
-	BroadcastWeaponAmmoInfo(OwnerChar);
+	// 【v85.3 大厂架构重构】服务器/客户端分流
+	//   服务器 BeginPlay 时 CurrentWeapon 已存在 (Server_SpawnAllWeapons 先于 BeginPlay),
+	//   服务器立即 BroadcastWeaponAmmoInfo → 触发 RPC 推弹药数据 + 本地缓存/Broadcast
+	//   客户端 BeginPlay 时 CurrentWeapon 还是 None (OnRep_CurrentWeapon 还没触发),
+	//   客户端不能直接调 BroadcastWeaponAmmoInfo (SERVER ONLY — HasAuthority 检查会拦截),
+	//   客户端弹药数据来源 = OnRep_CurrentWeapon 末尾的 SubscribeToActiveWeaponAmmo
+	//                    + 服务器 SpawnAllWeapons RPC 推送的 Client_RefreshWeaponAmmo
+	if (OwnerChar->HasAuthority())
+	{
+		BroadcastWeaponAmmoInfo(OwnerChar);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[CharacterIconComponent] BeginPlay: 客户端路径, 不调 BroadcastWeaponAmmoInfo. "
+				 "Owner='%s'. 弹药来源 = Server RPC (Server_SpawnAllWeapons/SwitchToWeaponSlot 末尾) + "
+				 "OnRep_CurrentWeapon 重新订阅 + OnWeaponAmmoChanged (开火实时)."),
+			*OwnerChar->GetName());
+	}
 }
 
 
@@ -978,6 +993,94 @@ void UCharacterIconComponent::Client_RefreshWeaponIcon_Implementation(const FStr
 
 
 /**
+ * Client_RefreshWeaponAmmo_Implementation — 客户端接收武器弹药数据
+ *
+ * 【v85.3 P0 新增】镜像 Client_RefreshWeaponIcon_Implementation
+ *
+ * 服务器调用链 (v85.3 大厂架构):
+ *   Server_SpawnAllWeapons (末尾)
+ *     → Owner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
+ *   Server_SwitchToWeaponSlot (末尾)
+ *     → Owner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
+ *
+ * 客户端收到 → 缓存 + 调 CharacterEvents 广播 (HUD 订阅)
+ *
+ * 【根本修复】为什么需要这个 RPC:
+ *   旧版 (v85): 客户端 CharacterIconComponent::BeginPlay 时
+ *     - CurrentWeapon 还是 None (OnRep_CurrentWeapon 还没触发)
+ *     - BroadcastWeaponAmmoInfo → 走"无武器"分支 → 缓存 "1/1, bIsMelee=true"
+ *     - HUD Bind-Snapshot 读到 → 显示 1/1 (用户报错的现象)
+ *
+ *   新版 (v85.3): 服务器主动 RPC 推弹药数据给客户端
+ *     - Client_RefreshWeaponAmmo 收到 CurrentAmmo/MagazineSize/ReserveAmmo
+ *     - 缓存 SetCachedWeaponAmmoInfo + 广播 OnWeaponAmmoInfoReady
+ *     - HUD 立刻显示 "30/120" 而不是 "1/1"
+ *
+ * 大厂原则 - 与 v40.1 武器图标 RPC 镜像对称:
+ *   - 武器图标真理源 = DT_WeaponInfo 行 (服务器查表) → Client_RefreshWeaponIcon RPC
+ *   - 武器弹药真理源 = WeaponFireComponent 字段 (服务器读) → Client_RefreshWeaponAmmo RPC
+ *
+ * 大厂原则 - 零兜底:
+ *   - bIsLocallyControlled=false → 不处理 (其他玩家的弹药不影响本机 HUD)
+ *   - Owner/Events 为空 → Log Error + return
+ *
+ * @param CurrentAmmo   服务器读 FireComp->GetCurrentAmmo()
+ * @param MagazineSize  服务器读 FireComp->GetMagazineSize()
+ * @param ReserveAmmo   服务器读 FireComp->GetReserveAmmo()
+ */
+void UCharacterIconComponent::Client_RefreshWeaponAmmo_Implementation(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo)
+{
+	ABaseCharacter* Owner = ResolveOwnerCharacter();
+	if (!Owner)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] Client_RefreshWeaponAmmo_Implementation: Owner Character 已失效."));
+		return;
+	}
+
+	// 【P0 双保险】: 必须是本机玩家才允许改本机 HUD (与其他玩家的弹药隔离)
+	if (!Owner->IsLocallyControlled())
+	{
+		return;
+	}
+
+	// 零兜底验证 — 服务器送来的弹药数据合理性检查
+	if (MagazineSize <= 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] Client_RefreshWeaponAmmo_Implementation: MagazineSize <= 0 — 服务器数据异常. "
+				 "CurrentAmmo=%d, MagazineSize=%d, ReserveAmmo=%d, Owner='%s'. "
+				 "【排查】服务器 WeaponFireComponent::InitializeFromWeaponConfig 配错了 DT_WeaponInfo.MagazineSize 字段."),
+			CurrentAmmo, MagazineSize, ReserveAmmo,
+			*Owner->GetName());
+		// 仍然广播 — 让 HUD 显示异常数据而非空白 (大厂原则: 显式优于隐式)
+	}
+
+	UCharacterEvents* Events = Owner->ResolveCharacterEvents();
+	if (!Events)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] Client_RefreshWeaponAmmo_Implementation: ResolveCharacterEvents 失败. "
+				 "Owner='%s'. 检查 CharacterEvents 组件是否挂载."),
+			*Owner->GetName());
+		return;
+	}
+
+	// 大厂原则 - 双轨制 (镜像 v40.2 武器图标缓存):
+	//   1. 先写缓存 (Snapshot Caching — 用于后续 HUD Bind 时拉快照)
+	//   2. 再 Broadcast (事件总线 — 让已订阅的 HUD 实时刷新)
+	Events->SetCachedWeaponAmmoInfo(CurrentAmmo, MagazineSize, ReserveAmmo, /* bIsMelee */ false);
+	Events->OnWeaponAmmoInfoReady.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[CharacterIconComponent] Client_RefreshWeaponAmmo_Implementation: 收到弹药数据 %d/%d+%d. "
+			 "Owner='%s'"),
+		CurrentAmmo, MagazineSize, ReserveAmmo,
+		*Owner->GetName());
+}
+
+
+/**
  * ResolvePlayerState — 通过 Owner Character 路径查找 ARoomPlayerState
  *
  * 大厂原则 - 零兜底:
@@ -1099,18 +1202,34 @@ void UCharacterIconComponent::BroadcastWeaponIconReady(const FString& WeaponID, 
 
 
 /**
- * BroadcastWeaponAmmoInfo — 广播武器弹药信息到 CharacterEvents
+ * BroadcastWeaponAmmoInfo — 【v85.3 拆分】服务器本地专用 (镜像 RefreshWeaponIconOnHUD)
  *
- * 【v84 大厂架构新增】武器面板 TextBlock 显示弹药数量
+ * 服务器调用链 (v85.3 大厂架构重构后):
+ *   Server_SpawnAllWeapons (末尾)
+ *     → BroadcastWeaponAmmoInfo (本地服务器读取弹药 + Owner->Client_RefreshWeaponAmmo RPC)
+ *   Server_SwitchToWeaponSlot (末尾)
+ *     → BroadcastWeaponAmmoInfo (本地服务器读取弹药 + Owner->Client_RefreshWeaponAmmo RPC)
+ *   RefreshCharacterIcon 链路 → RefreshWeaponIconOnHUD (末尾追加) → BroadcastWeaponAmmoInfo
  *
- * 格式规则:
- *   - 近战武器 (EWeaponMeshType::Melee): "1/1" (固定值, 弹药无意义)
- *   - 枪械 (Primary/Secondary): "CurrentAmmo/MagazineSize + ReserveAmmo"
+ * 【v85.3 镜像对称原则 — 与 RefreshWeaponIconOnHUD 完全对称】
+ *   旧版 (v85): BroadcastWeaponAmmoInfo 直接读 FireComp + 本地 Broadcast
+ *     → 客户端调它时 (因为 CurrentWeapon 还没复制过来), 走"无武器"分支, 缓存"1/1, bIsMelee=true"
+ *     → HUD 显示错误弹药数据 (用户报错的现象)
  *
- * 大厂原则 - 单一真理源:
- *   - 弹药数据从 WeaponFireComponent 读取 (CurrentAmmo / MagazineSize / ReserveAmmo)
- *   - 武器类型从 Owner->GetCurrentWeapon()->GetMeshType() 读取
- *   - 本函数只负责读取数据 + 广播, 不参与计算
+ *   新版 (v85.3): BroadcastWeaponAmmoInfo 仅服务器调用:
+ *     → 服务器本地读 FireComp (数据必然有效, 因为服务器 Spawn 时序保证)
+ *     → 写 Owner->Client_RefreshWeaponAmmo RPC 推弹药数据给客户端
+ *     → 客户端收到 → 缓存 + OnWeaponAmmoInfoReady.Broadcast (HUD 更新)
+ *     → 服务器本地也 Broadcast (因为 ListenServer = 同进程, 服务器自己也要更新 HUD)
+ *
+ * 大厂原则 - 镜像对称 v40.1/v40.2:
+ *   武器图标: RefreshWeaponIconOnHUD (服务器) → Owner->Client_RefreshWeaponIcon RPC → 客户端缓存+广播
+ *   武器弹药: BroadcastWeaponAmmoInfo (服务器) → Owner->Client_RefreshWeaponAmmo RPC → 客户端缓存+广播
+ *
+ * 大厂原则 - 客户端隔离:
+ *   - 本函数现在是 SERVER ONLY, 调用前检查 HasAuthority()
+ *   - 客户端不允许直接读 FireComp + Broadcast (因为 CurrentWeapon 还没复制过来)
+ *   - 客户端弹药来源只有两条: 1) Client_RefreshWeaponAmmo RPC 推送 2) OnWeaponAmmoChanged (开火后实时)
  *
  * @param InOwner 角色指针 (由调用方传入, 避免重复 Cast)
  */
@@ -1123,77 +1242,100 @@ void UCharacterIconComponent::BroadcastWeaponAmmoInfo(ABaseCharacter* InOwner)
 		return;
 	}
 
-	// 通过 ResolveCharacterEvents 获取事件总线
-	UCharacterEvents* Events = InOwner->ResolveCharacterEvents();
-	if (!Events)
+	// 【v85.3 大厂原则 - 服务端授权检查】
+	//   本函数现在仅服务器调用, 因为:
+	//   1. 服务器读 FireComp 数据必然正确 (CurrentWeapon 一定存在)
+	//   2. 客户端调它会读到默认值 1/1 (CurrentWeapon 还没复制过来)
+	//   3. 必须通过 Owner->Client_RefreshWeaponAmmo RPC 路径推送数据
+	if (!InOwner->HasAuthority())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: ResolveCharacterEvents 失败. "
-				 "InOwner='%s'. 检查 CharacterEvents 组件是否挂载."),
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 客户端不应该走这条路. "
+				 "InOwner='%s'. "
+				 "【v85.3 修复】客户端弹药来源必须是 Client_RefreshWeaponAmmo RPC 或 OnWeaponAmmoChanged, "
+				 "不允许直接调用 BroadcastWeaponAmmoInfo."),
 			*InOwner->GetName());
 		return;
 	}
 
-	// 从当前武器获取弹药数据
+	// 采集弹药数据 (服务端权威)
+	int32 CurrentAmmo = 0;
+	int32 MagazineSize = 0;
+	int32 ReserveAmmo = 0;
+	bool bIsMelee = false;
+
 	ABaseWeapon* CurrentWeapon = InOwner->GetCurrentWeapon();
 	if (!CurrentWeapon)
 	{
-		// 无武器: 广播近战默认值 1/1 (大厂原则 - 防御型设计)
-		UE_LOG(LogTemp, Warning,
-			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 当前无武器 (InOwner='%s'). "
-				 "广播近战默认值 1/1."),
+		// 服务器理论上一定有 CurrentWeapon (Spawn 时序保证)
+		// 客户端如果走这里, 就走 [v85.3] 上面 HasAuthority 检查被拦截
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 服务器无 CurrentWeapon (InOwner='%s'). "
+				 "【大厂原则】零兜底 — 服务器 Spawn 时序保证一定有武器, 此分支意味着逻辑错误, "
+				 "请检查 Server_SpawnAllWeapons → RequestWeaponSpawn 调用链."),
 			*InOwner->GetName());
-		// 【v85.2 大厂架构新增】写入缓存
-		Events->SetCachedWeaponAmmoInfo(1, 1, 0, true);
-		Events->OnWeaponAmmoInfoReady.Broadcast(1, 1, 0);
 		return;
 	}
 
-	// 获取武器类型 (决定弹药显示格式)
 	const EWeaponMeshType MeshType = CurrentWeapon->GetMeshType();
 
 	if (MeshType == EWeaponMeshType::Melee)
 	{
-		// 近战武器: 显示固定值 "1/1"
-		// 【v85.2 大厂架构新增】写入缓存
-		Events->SetCachedWeaponAmmoInfo(1, 1, 0, true);
-		Events->OnWeaponAmmoInfoReady.Broadcast(1, 1, 0);
-		UE_LOG(LogTemp, Log,
-			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 近战武器, 广播 1/1. InOwner='%s', Weapon='%s'"),
-			*InOwner->GetName(), *CurrentWeapon->GetName());
+		// 近战武器: 固定 1/1 (弹药无意义)
+		bIsMelee = true;
+		CurrentAmmo = 1;
+		MagazineSize = 1;
+		ReserveAmmo = 0;
 	}
 	else
 	{
-		// 枪械: 从 WeaponFireComponent 读取弹药数据 (字段直接访问)
+		// 枪械: 从 WeaponFireComponent 读取 (字段直接访问)
 		if (UWeaponFireComponent* FireComp = CurrentWeapon->WeaponFireComponent)
 		{
-			const int32 CurrentAmmo = FireComp->GetCurrentAmmo();
-			const int32 MagazineSize = FireComp->GetMagazineSize();
-			const int32 ReserveAmmo = FireComp->GetReserveAmmo();
-
-			// 【v85.2 大厂架构新增】写入缓存
-			Events->SetCachedWeaponAmmoInfo(CurrentAmmo, MagazineSize, ReserveAmmo, false);
-			Events->OnWeaponAmmoInfoReady.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
-			UE_LOG(LogTemp, Log,
-				TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 枪械, 广播 %d/%d. "
-					 "InOwner='%s', Weapon='%s'"),
-				CurrentAmmo, MagazineSize,
-				*InOwner->GetName(), *CurrentWeapon->GetName());
+			CurrentAmmo = FireComp->GetCurrentAmmo();
+			MagazineSize = FireComp->GetMagazineSize();
+			ReserveAmmo = FireComp->GetReserveAmmo();
 		}
 		else
 		{
-			// WeaponFireComponent 不存在 (近战武器没有此组件)
-			// 理论上不会走到这里 (因为 MeshType == Melee 时已处理)
-			// 但做防御型设计: 广播默认值
-			UE_LOG(LogTemp, Warning,
+			// 零兜底 — 服务器枪械一定有 WeaponFireComponent
+			UE_LOG(LogTemp, Error,
 				TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 枪械 '%s' 没有 WeaponFireComponent. "
-					 "InOwner='%s'. 广播默认值 30/120."),
+					 "InOwner='%s'. "
+					 "【大厂原则】零兜底 — DT_WeaponInfo.MeshType 配错 (Melee 配到枪械) 或 WeaponFireComponent 未挂载."),
 				*CurrentWeapon->GetName(), *InOwner->GetName());
-			// 【v85.2 大厂架构新增】写入缓存
-			Events->SetCachedWeaponAmmoInfo(30, 30, 120, false);
-			Events->OnWeaponAmmoInfoReady.Broadcast(30, 30, 120);
+			return;
 		}
 	}
+
+	// 【v85.3 P0 镜像对称 v40.1】服务器本地也广播 (ListenServer = 同进程, 服务器自己也要更新 HUD)
+	//   大厂原则 - 显式优于隐式:
+	//     服务器本地调 Client_RefreshWeaponAmmo_Implementation → 缓存 + Broadcast
+	//     ListenServer 直接走本地 RPC (UE RPC 行为), 不走网络序列化
+	UCharacterEvents* Events = InOwner->ResolveCharacterEvents();
+	if (Events)
+	{
+		// 服务器本地路径: 直接写缓存 + 广播 (镜像 Client_RefreshWeaponAmmo_Implementation)
+		Events->SetCachedWeaponAmmoInfo(CurrentAmmo, MagazineSize, ReserveAmmo, bIsMelee);
+		Events->OnWeaponAmmoInfoReady.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+	}
+
+	// 【v85.3 P0 核心修复】RPC 推弹药数据给所有客户端 (镜像 Owner->Client_RefreshWeaponIcon)
+	if (bIsMelee)
+	{
+		// 近战武器也推 RPC — 保证所有客户端缓存一致 (HUD Bind-Snapshot 时不会显示 "1/1, bIsMelee=true" 默认值)
+		InOwner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo);
+	}
+	else
+	{
+		InOwner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo);
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 服务器广播弹药 %d/%d+%d, bIsMelee=%d. "
+			 "InOwner='%s', Weapon='%s'"),
+		CurrentAmmo, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0,
+		*InOwner->GetName(), *CurrentWeapon->GetName());
 }
 
 
@@ -1237,6 +1379,7 @@ void UCharacterIconComponent::RefreshWeaponIconOnHUDFromServer(const FString& In
 
 // -----------------------------------------------------------------------------
 // 【v85 大厂架构新增】弹药变化回调 — WeaponFireComponent::OnAmmoChanged 订阅
+// 【v85.3 大厂重构】直接用 NewAmmo/MagazineSize, 不再调 BroadcastWeaponAmmoInfo (SERVER ONLY)
 // -----------------------------------------------------------------------------
 void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize)
 {
@@ -1246,7 +1389,39 @@ void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineS
 		return;
 	}
 
-	// 直接调用 BroadcastWeaponAmmoInfo，传入当前武器
-	// BroadcastWeaponAmmoInfo 会读取当前激活武器并广播弹夹信息
-	BroadcastWeaponAmmoInfo(OwnerChar);
+	UCharacterEvents* Events = OwnerChar->ResolveCharacterEvents();
+	if (!Events)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: ResolveCharacterEvents 失败. "
+				 "Owner='%s'. 检查 CharacterEvents 组件是否挂载."),
+			*OwnerChar->GetName());
+		return;
+	}
+
+	// 零兜底 — 服务器/客户端都走这条路, 不走 BroadcastWeaponAmmoInfo (那是 SERVER ONLY 的 RPC 推入口)
+	//   ReserveAmmo 这里不知道 (OnAmmoChanged 只传 CurrentAmmo/MagazineSize),
+	//   保留缓存的 ReserveAmmo, 不重置
+	//   如果缓存从未写入 (bCachedWeaponAmmoValid=false), 退化用 0 (不允许 -1 显示在 HUD 上)
+	int32 OldReserveAmmo = 0;
+	bool bOldIsMelee = false;
+	int32 OldCurrentAmmo = 0;
+	int32 OldMagazineSize = 0;
+	const bool bHasValidCache = Events->GetCachedWeaponAmmoInfo(OldCurrentAmmo, OldMagazineSize, OldReserveAmmo, bOldIsMelee);
+	if (!bHasValidCache)
+	{
+		// 缓存从未初始化 — ReserveAmmo 用 0 而非 -1 (避免 HUD 显示 -1)
+		OldReserveAmmo = 0;
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: CharacterEvents 缓存无效, ReserveAmmo 退化到 0. "
+				 "正常情况: Server RPC 先推 Client_RefreshWeaponAmmo 写入缓存, 再触发本回调."));
+	}
+	Events->SetCachedWeaponAmmoInfo(NewAmmo, MagazineSize, OldReserveAmmo, /* bIsMelee */ false);
+	Events->OnWeaponAmmoInfoReady.Broadcast(NewAmmo, MagazineSize, OldReserveAmmo);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: %d/%d, ReserveAmmo=%d. "
+			 "Owner='%s'"),
+		NewAmmo, MagazineSize, OldReserveAmmo,
+		*OwnerChar->GetName());
 }

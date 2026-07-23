@@ -1989,6 +1989,28 @@ protected:
 	void Client_RefreshWeaponIcon(const FString& InWeaponID, class UTexture2D* Icon);
 
 	/**
+	 * 客户端 RPC — 接收武器弹药数据 (服务器查好 CurrentAmmo/MagazineSize/ReserveAmmo 直接 RPC 推给客户端)
+	 *
+	 * 【v85.3 P0 新增】镜像 Client_RefreshWeaponIcon
+	 *
+	 * 服务器调 (Server_SpawnAllWeapons / Server_SwitchToWeaponSlot 末尾)
+	 *   → Owner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
+	 * 客户端收到 → 转发到 CharacterIconComponent::Client_RefreshWeaponAmmo_Implementation
+	 *
+	 * 大厂原则 - RPC 必须在 Actor 上:
+	 *   - UFUNCTION(Client, Reliable) 必须在 Actor 上, 不能在 Component 上
+	 *   - 服务器本地 (ListenServer) 自动走本地 Implementation 调用, 不走 RPC 序列化
+	 *   - 远端客户端的 Pawn 走 RPC 序列化, 收到后调 Implementation
+	 *
+	 * 镜像对称原则 (v40.1/v40.2 已落地, v85.3 弹药链路必须同样走 RPC):
+	 *   - 武器图标真理源 = 服务器查 DT_WeaponInfo, RPC 推 Icon
+	 *   - 武器弹药真理源 = 服务器读 WeaponFireComponent.CurrentAmmo/MagazineSize/ReserveAmmo, RPC 推数据
+	 *   - 客户端不"自己读武器组件再广播" (因为 CurrentWeapon 还没复制过来时, 读到默认值 1/1, HUD 显示错误)
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_RefreshWeaponAmmo(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo);
+
+	/**
 	 * HUD 未就绪时的延迟重试回调
 	 *
 	 * 【2026.07.12 P0 重构】转发壳 — 实际逻辑在 CharacterIconComponent::RetryRefreshCharacterIcon

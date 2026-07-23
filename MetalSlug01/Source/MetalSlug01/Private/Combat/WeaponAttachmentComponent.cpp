@@ -374,6 +374,26 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 	//   单一真理源: ActiveSlotAttachment 字段 (服务器写入, Replicated)
 	//   客户端必须严格应用服务器配置的偏移, 不能依赖"已挂载就跳过" 的隐式行为
 	ApplyAttachmentRuntime(CurrentWeapon);
+
+	// 【v85.3 大厂架构 P0 修复】客户端武器到位时, 必须重新订阅新武器的 OnAmmoChanged
+	//   根因链 (v85.3 真根因):
+	//     1. CharacterIconComponent::BeginPlay (客户端) 时, CurrentWeapon 还没复制过来 (OnRep_CurrentWeapon 还没触发)
+	//     2. SubscribeToActiveWeaponAmmo → GetCurrentWeapon() = None → 订阅失败 (FireComp 也没)
+	//     3. 现在 OnRep_CurrentWeapon 触发了, 武器到位, 但订阅还没建立
+	//     4. 开火时, OnRep_CurrentAmmo → OnAmmoChanged.Broadcast → 无订阅者 → HUD 不更新
+	//   修复: OnRep_CurrentWeapon (客户端) 触发时, 重新订阅新武器的 FireComp.OnAmmoChanged
+	//   大厂原则 - 镜像对称 v40.2:
+	//     武器图标: Client_RefreshWeaponIcon RPC → 缓存 + 广播 (服务器主动推)
+	//     武器弹药: Client_RefreshWeaponAmmo RPC → 缓存 + 广播 (服务器主动推)
+	//     + 本步订阅: 客户端后续开火实时弹药 (OnRep_CurrentAmmo → OnWeaponAmmoChanged → Broadcast)
+	//   客户端弹药数据来源 = 三条路径:
+	//     1. Client_RefreshWeaponAmmo RPC (服务器 SpawnAllWeapons/SwitchToWeaponSlot 末尾触发)
+	//     2. OnWeaponAmmoChanged (开火后实时, 由 OnRep_CurrentAmmo 触发)
+	//     3. HUD Bind-Snapshot 拉 CharacterEvents 缓存 (HUD 创建时补发)
+	if (UCharacterIconComponent* IconComp = Owner->ResolveCharacterIcon())
+	{
+		IconComp->SubscribeToActiveWeaponAmmo();
+	}
 }
 
 
@@ -1331,6 +1351,19 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 		return;
 	}
 
+	// 【v40.8 P0 新增】入口 Log — 节点级可观测性 (大厂原则)
+	//   根因: 旧版 Server_SwitchToWeaponSlot 没有入口 Log, 一旦发生"非预期的切槽位",
+	//         (例如 BP 蓝图 BeginPlay 误调 SwitchToWeaponSlot), 完全没有排查线索
+	//   修复: 在函数开头记录调用方, 让"谁调了"立即可见
+	//   - TargetSlot: 目标槽位
+	//   - 当前 CurrentWeaponSlot: 调用前状态 (用于对比)
+	//   - Owner Pawn 名: 用于过滤具体角色
+	UE_LOG(LogTemp, Log,
+		TEXT("[WeaponAttachment][v40.8] Server_SwitchToWeaponSlot ENTER. "
+		     "Pawn=%s TargetSlot=%s 当前 CurrentWeaponSlot=%s. "
+		     "(若此调用非预期, 检查 BP 蓝图 BeginPlay / PossessedBy / InputAction 是否误触发了切槽位)"),
+		*Owner->GetName(), LexToString(TargetSlot), LexToString(CurrentWeaponSlot));
+
 	// 零兜底: 仅服务器可切 (RPC 路由进来后已保证服务器执行, 但显式校验防客户端误调)
 	if (!Owner->HasAuthority())
 	{
@@ -1860,6 +1893,17 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 		// 向后兼容字段
 		CurrentWeapon = SelectedDefault;
 		CurrentWeaponSlot = SelectedSlot;
+
+		// 【v40.8 P0 节点级可观测性】记录默认槽位选择 — 让"为什么当前槽是 Melee" 一目了然
+		//   根因: 旧版没有这个 Log, 当 BP 端 BeginPlay / PossessedBy 误调了 SwitchToWeaponSlot,
+		//         完全无法知道"是不是 Spawn 流程之后立即被切了"
+		//   修复: 显式记录 Spawn 完成后的默认槽位, 配合 Server_SwitchToWeaponSlot 入口 Log (v40.8),
+		//         用户可以一目了然看到"切槽位发生在 Spawn 之前 / 之后"
+		UE_LOG(LogTemp, Log,
+			TEXT("[WeaponAttachment][v40.8] Server_SpawnAllWeapons: 写入默认槽位. "
+			     "Pawn=%s DefaultSlot=%s DefaultWeapon=%s. "
+			     "(若此 Pawn 随后立即切到其他槽位, 检查 BP 蓝图 BeginPlay / PossessedBy 是否误调 SwitchToWeaponSlot)"),
+			*Owner->GetName(), LexToString(SelectedSlot), *SelectedDefault->GetName());
 	}
 
 	// ============================================================

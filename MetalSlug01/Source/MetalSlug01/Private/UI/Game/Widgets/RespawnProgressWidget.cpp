@@ -53,6 +53,7 @@ void URespawnProgressWidget::NativeTick(const FGeometry& MyGeometry, float InDel
 		{
 			PB_InvincibilityProgress->SetPercent(1.0f);
 		}
+		// 【v40.9 修复】同 UpdateProgress 改用 FString::Printf 替代 FText::Format (ICU 不支持 :.2f)
 		if (Text_Countdown)
 		{
 			Text_Countdown->SetText(FText::FromString(TEXT("100.00%")));
@@ -229,12 +230,21 @@ void URespawnProgressWidget::UpdateProgress(float RemainingSeconds, float TotalD
 	}
 
 	// 更新倒计时文字 - 显示百分比格式 "X.XX%"
+	//
+	// 【v40.9 大厂架构 — 修复 FText::Format 格式错误】
+	//   根因 (Session1.log 实证): 旧版用 FText::Format("{0:.2f}%", Percentage)
+	//     - FText::Format 是基于 ICU 库, **不支持 printf 风格的 `:.2f`**
+	//     - 每次 SetText 都触发: "LogTextFormatter: Failed to parse argument '0:.2f' as a number"
+	//     - fallback 值是 "0", 所以倒计时百分比文字**永远是 "0%"** — 不实时更新
+	//     - 用户报告 "复活进度条没有实时更新" 的真正根因
+	//   修复 (v40.9): 用 FString::Printf (C++ 标准 printf) 格式化, 包成 FText
+	//     - FString::Printf(TEXT("%.2f%%"), Percentage) → "12.34%"
+	//     - FText::FromString(...) → FText (UMG 控件接受)
+	//   零重复: 不影响进度条数值 (Progress = Remaining / Total), 只修字符串格式
 	if (Text_Countdown)
 	{
-		FText PercentageText = FText::Format(
-			NSLOCTEXT("RespawnProgress", "PercentageFormat", "{0:.2f}%"),
-			Percentage);
-		Text_Countdown->SetText(PercentageText);
+		const FString PercentText = FString::Printf(TEXT("%.2f%%"), Percentage);
+		Text_Countdown->SetText(FText::FromString(PercentText));
 	}
 
 	UE_LOG(LogTemp, Verbose,
