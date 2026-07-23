@@ -64,6 +64,7 @@ void UANS_MeleeTraceState::NotifyBegin(
 		return;
 	}
 
+	// 零兜底 — Owner 不是 ABaseCharacter
 	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor);
 	if (!OwnerChar)
 	{
@@ -71,6 +72,39 @@ void UANS_MeleeTraceState::NotifyBegin(
 			TEXT("[ANS_MeleeTraceState] NotifyBegin: Owner=%s 不是 ABaseCharacter — 拒绝启动 trace. "
 			     "【v74 零兜底】只支持挂在角色 Mesh 上的蒙太奇."),
 			*OwnerActor->GetName());
+		return;
+	}
+
+	// ============================================================
+	// 【v93.2 大厂架构 — 母体复用】bIsMother=true 早返回分支
+	//   - 母体没有武器 → 不能走 CurrentWeapon 路径 (下面会因 CurrentWeapon=nullptr 被零兜底拒绝)
+	//   - 必须在取武器检查之前分支, 否则母体永远走不到这里
+	//   - 母体路径: 走 Owner->StartMotherTrace(bIsHeavy) (零武器依赖)
+	// ============================================================
+	if (OwnerChar->bIsMother)
+	{
+		switch (EnterState)
+		{
+		case EWeaponTraceState::Tracing:
+			OwnerChar->StartMotherTrace(bIsHeavy);
+			break;
+
+		case EWeaponTraceState::Idle:
+			OwnerChar->StopMotherTrace();
+			break;
+
+		case EWeaponTraceState::Hit:
+			UE_LOG(LogTemp, Error,
+				TEXT("[ANS_MeleeTraceState] NotifyBegin: 母体 EnterState=Hit 不合法 — 拒绝. "
+				     "【v93.2 零兜底】Hit 由 MeleeSwStrategy 命中时自动设置."));
+			break;
+
+		default:
+			UE_LOG(LogTemp, Error,
+				TEXT("[ANS_MeleeTraceState] NotifyBegin: 母体未知 EnterState=%d — 拒绝."),
+				static_cast<int32>(EnterState));
+			break;
+		}
 		return;
 	}
 
@@ -172,6 +206,17 @@ void UANS_MeleeTraceState::NotifyEnd(
 	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor);
 	if (!OwnerChar)
 	{
+		return;
+	}
+
+	// ============================================================
+	// 【v93.2 大厂架构 — 母体复用】bIsMother=true 时关闭母体 trace
+	//   - 与 NotifyBegin 对称: 母体无武器 → 走 Owner->StopMotherTrace
+	//   - 不论 EnterState 配置是 Tracing/Idle, NotifyEnd 都关闭 (蒙太奇自然结束语义)
+	// ============================================================
+	if (OwnerChar->bIsMother)
+	{
+		OwnerChar->StopMotherTrace();
 		return;
 	}
 

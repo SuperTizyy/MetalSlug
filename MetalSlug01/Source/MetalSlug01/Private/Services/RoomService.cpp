@@ -318,7 +318,38 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName
 
 	// 3. 构造 FAISpawnRequest — 真理源完整传递 (v54.2 Config 字段已加)
 	FAISpawnRequest Request;
-	Request.Mode                 = ERoomMatchMode::Melee;
+	// 【v93 大厂 P0 修复】Request.Mode 改为读 GameState->CurrentMatchMode (单一真理源)
+	//   旧 (硬编码 Melee): 生化模式房间入队的 AI 走 Melee 链路 → 阵营 / 模式不匹配
+	//   新 (读 GS): GS->CurrentMatchMode 由 ARoomGameMode::InitGame 从 URL ?Mode= 解析写入 → 房间模式真理源
+	//   零兜底: GS 为 null 或 CurrentMatchMode == None → Log Error + 拒绝入队 (不允许默认分配)
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+		{
+			if (GS->CurrentMatchMode == ERoomMatchMode::None)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomService::RequestAddAI] GS->CurrentMatchMode == ERoomMatchMode::None, 拒绝入队 AI. "
+					     "【修复】检查 ARoomGameMode::InitGame 是否正确解析 URL ?Mode= 参数. "
+					     "【业务根因】LANRoomPage::OnCreateSessionComplete 必须先调 FlowSub->SetTargetRoomMode()."));
+				return;
+			}
+			Request.Mode = GS->CurrentMatchMode;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomService::RequestAddAI] World->GetGameState<ARoomGameState>() 返回 null, 拒绝入队. "
+				     "【修复】检查 World Settings → Default GameMode."));
+			return;
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService::RequestAddAI] World 为 null, 拒绝入队. RoomService 必须在 World 就绪时才能入队 AI."));
+		return;
+	}
 	Request.FactionTag           = bToAttackTeam ? FFactionTags::Offense() : FFactionTags::Defense();
 	Request.CharacterInfoRowName = CharacterInfoRowName;  // UI 反查结果 (真理源)
 	Request.AIPawnClass          = AIPawnClass;            // 【v51 新增】BP 强类型, 直接 Spawn

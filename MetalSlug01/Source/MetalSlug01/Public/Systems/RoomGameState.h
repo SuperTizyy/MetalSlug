@@ -43,6 +43,34 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPendingAIQueueChanged);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnCurrentRoundUpdated, int32, CurrentRound);
 
 /**
+ * 【v92 大厂架构重构】总局数改变委托 (替换 ZombieTotalRounds, 单一真理源)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 服务器在 InitGame 阶段通过 RoomGameMode 注入 TotalRounds
+ *   - GameState.TotalRounds Replicated, 客户端 UI 订阅显示
+ *   - UI 显示格式: "总局数：xx"
+ *
+ * 为什么从 ZombieTotalRounds 改到 TotalRounds:
+ *   - 旧版 ZombieTotalRounds 与 TotalRounds 是 2 个字段并存 (重复架构)
+ *   - 新版 TotalRounds 统一切换模式时复用 (生化模式用, 刀战模式隐藏)
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTotalRoundsUpdated, int32, TotalRounds);
+
+/**
+ * 【v92 大厂架构新增】生化模式母体变异倒计时改变委托
+ *
+ * 单一真理源 — 客户端 UI 订阅此事件:
+ *   - 服务器写入 MotherMutationStartTime/Duration → 自动 Replicated
+ *   - OnRep_MotherMutationState 触发 OnMotherMutationChanged.Broadcast(StartTime, Duration)
+ *   - Widget 收到事件后用 GetServerWorldTimeSeconds() 计算剩余秒数
+ *
+ * 大厂原则:
+ *   - 不传剩余秒数（避免每秒广播一次倒计时数字 — 大带宽浪费）
+ *   - 客户端本地基于权威时间戳计算（与 MatchEndTime 同模式）
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMotherMutationChanged, float, StartTime, float, Duration);
+
+/**
  * @brief 模式切换委托（UI 据此隐藏/显示 Text_RemainingRounds）
  * @param NewMode 新模式
  */
@@ -105,10 +133,33 @@ public:
 
 	/**
 	 * 当前房间的游戏模式（刀战/生化）
-	 * Replicated: 服务器设置后自动同步到所有客户端
+	 * ReplicatedUsing: 服务器写入后自动同步到所有客户端, OnRep_CurrentMatchMode 自动 Broadcast OnMatchModeChanged
+	 *
+	 * 【v93 大厂架构修复】OnRep 委托:
+	 *   - 旧版 (v53-v92): 只有 Replicated, 无 OnRep, 客户端 UI 订阅 OnMatchModeChanged 永远收不到
+	 *   - 旧根因: GameFlowSubsystem.cpp:435 只 GS->CurrentMatchMode = RoomMode (没调 Broadcast)
+	 *   - 修复: ReplicatedUsing = OnRep_CurrentMatchMode → OnRep 自动 Broadcast (UE 标准机制)
+	 *   - 服务器写入走 SetCurrentMatchMode 公开 API, 内部手动 Broadcast (镜像 SetTotalRounds)
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 不允许: 直接赋值 GS->CurrentMatchMode = NewMode (绕过 OnRep)
+	 *   - 必须: 调 GS->SetCurrentMatchMode(NewMode) 单一入口
 	 */
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Match")
+	UPROPERTY(ReplicatedUsing = OnRep_CurrentMatchMode, BlueprintReadOnly, Category = "Room|Match")
 	ERoomMatchMode CurrentMatchMode = ERoomMatchMode::Melee;
+
+	/**
+	 * 【v93 新增】客户端接到房间模式同步时的回调
+	 *
+	 * 用途: 触发 OnMatchModeChanged 委托, UI 立即响应 (切换 Melee/Zombie 容器显隐)
+	 *
+	 * 大厂原则 — 镜像 OnRep_TotalRounds:
+	 *   - OnRep_TotalRounds: 服务器写入 → 客户端 OnRep → Broadcast OnTotalRoundsUpdated
+	 *   - OnRep_CurrentMatchMode: 服务器写入 → 客户端 OnRep → Broadcast OnMatchModeChanged
+	 *   - 两条路径完全对称 (UE 引擎 OnRep 机制保证跨网络同步触发)
+	 */
+	UFUNCTION()
+	void OnRep_CurrentMatchMode();
 
 	/**
 	 * 【架构重构】: 只同步比赛结束的绝对时间戳，避免每秒网络通信的极大开销
@@ -129,6 +180,11 @@ public:
 	/**
 	 * 剩余局数（生化模式: 剩余回合数，刀战模式: 隐藏此字段）
 	 * ReplicatedUsing: 同步时会自动调用 OnRep_CurrentRound
+	 *
+	 * 大厂原则 — 内部计数 vs UI 显示:
+	 *   - CurrentRound 仅作 Subsystem 内部计数器使用 (StartNextZombieRound: CurrentRound--)
+	 *   - UI 显示用 TotalRounds (Replicated 单一真理源), 不显示"倒数过程"
+	 *   - 避免: UI 显示与内部计数耦合, 客户端不应该看到 "5/5 → 4/5" 这种倒数动画
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentRound, BlueprintReadOnly, Category = "Room|Match")
 	int32 CurrentRound = 0;
@@ -145,6 +201,187 @@ public:
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "Room|Match")
 	FOnCurrentRoundUpdated OnCurrentRoundUpdated;
+
+	/**
+	 * 【v92 大厂架构重构】总局数 (替换 ZombieTotalRounds)
+	 *
+	 * 大厂原则 — 单一真理源 (大厂架构必修):
+	 *   - 策划在 GameMode Class Defaults.TotalRounds 配置 (1~20 钳制)
+	 *   - 服务器 InitGame 阶段调用 SetTotalRounds 写入 (单一入口)
+	 *   - 引擎自动 Replicate 到所有客户端
+	 *   - UI 显示格式: "总局数：xx" (由 UMatchInfoWidget::UpdateTotalRounds 渲染)
+	 *
+	 * 为什么不用 ZombieTotalRounds (已删除):
+	 *   - 旧版 ZombieTotalRounds 与 TotalRounds 是 2 个字段并存 (重复架构)
+	 *   - 旧版 ZombieTotalRounds 仅在 Subsystem 内部使用, UI 看不见 (无效数据)
+	 *   - 新版 TotalRounds 唯一字段, Subsystem 与 UI 都从 GameState 读
+	 *
+	 * 调用方:
+	 *   - ARoomGameMode::InjectSubsystemConfigs → SetTotalRounds (写入字段)
+	 *   - URoomLifecycleSubsystem::HandleZombieRoundEnd / StartNextZombieRound (内部读, 用于日志)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_TotalRounds, BlueprintReadOnly, Category = "Room|Match")
+	int32 TotalRounds = 5;
+
+	/**
+	 * 客户端接到总局数同步时的回调
+	 * 用途: 触发 OnTotalRoundsUpdated 委托, UI 立即更新显示
+	 */
+	UFUNCTION()
+	void OnRep_TotalRounds();
+
+	/**
+	 * UI 监听的委托 (总局数变化时触发)
+	 * 大厂原则 — 单一入口: GameState.TotalRounds 变化时, UI 立即刷新显示
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Match")
+	FOnTotalRoundsUpdated OnTotalRoundsUpdated;
+
+	/**
+	 * 【服务器专用】设置总局数 (GameMode 在 InitGame 时调用)
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 不允许"TotalRounds <= 0 时静默设默认值" (强制修复 GameMode 配置)
+	 *   - 不允许"TotalRounds < 1 时静默 Clamp 到 5" (GameMode 字段已 Clamp, 不会传非法值)
+	 *
+	 * @param InTotalRounds 总回合数 (必须 >= 1, 由 GameMode 钳制)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match")
+	void SetTotalRounds(int32 InTotalRounds);
+
+	// ==========================================
+	// 【v92 大厂架构新增】生化模式母体变异倒计时
+	// ==========================================
+	//
+	// 设计动机:
+	//   生化模式每局开局时, 玩家/AI 都是人类, 互相无敌, 8 秒倒计时结束才会"变异"
+	//   服务器端通过这两个字段同步倒计时状态, 客户端 UI 用本地时间计算秒数
+	//
+	// 大厂原则 — 与 MatchEndTime 镜像:
+	//   - 服务器只同步"开始时间戳 + 持续秒数", 不每秒广播倒计时数字
+	//   - 客户端用 GetServerWorldTimeSeconds() 计算, 自动补偿网络延迟
+	//   - 单一真理源: 数据在 GameState, Widget 只是镜像
+	//
+	// 调度入口:
+	//   - URoomLifecycleSubsystem::StartMotherMutationCountdown() (服务器)
+	//   - URoomLifecycleSubsystem::ResetMotherMutationCountdown() (服务器)
+
+	/**
+	 * 母体变异开始时间戳 (服务器权威世界时间)
+	 * Replicated: 服务器写入后自动同步到所有客户端
+	 * 客户端用 GetServerWorldTimeSeconds() 计算剩余秒数
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_MotherMutationState, BlueprintReadOnly, Category = "Room|Match|Mother")
+	float MotherMutationStartTime = 0.0f;
+
+	/**
+	 * 母体变异倒计时总秒数 (业务可配, 默认 8s)
+	 * Replicated: 服务器写入后自动同步到所有客户端
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_MotherMutationState, BlueprintReadOnly, Category = "Room|Match|Mother")
+	float MotherMutationDuration = 0.0f;
+
+	// ==========================================
+	// 【v93.1 大厂架构新增】母体变异触发状态 — 防止 SetTimer 重复触发
+	// ==========================================
+	//
+	// 大厂原则 — 分布式防重入:
+	//   - 母体变异倒计时结束后, 客户端/服务器都会收到"倒计时 = 0"
+	//   - 但只有服务器应触发"选母体 + 变异"业务 (这是权威业务)
+	//   - 防止: 同一局 LifecycleSubsystem 重复调 StartMotherMutationCountdown → SetTimer 残留
+	//          → HandleCountdownExpired 被重复触发 → 同一局多次变异
+	//   - 真理源: 服务器 MarkMotherMutationFired() → Replicate → 客户端读到 true
+	//   - 分布式防御层 2 (URoomMotherMutationSubsystem 内 bMotherMutationFired_Local 是层 1)
+	//
+	// 业务约束:
+	//   - 一次比赛只允许触发一次母体变异 (生化模式每局只有 1 个母体)
+	//   - Reset 入口: HandleZombieRoundEnd (新回合) / 模式切换
+	//   - 不在 OnRep 处理, 因为只是状态字段 (客户端不需要做额外业务)
+
+	/**
+	 * 母体变异是否已触发 — 防重入标志 (Replicated)
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Match|Mother")
+	bool MotherMutationHasFired = false;
+
+	/**
+	 * 母体变异已触发次数 — 业务统计字段 (Replicated)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 服务器 URoomMotherMutationSubsystem::MutateCharacterToMother 成功时 ++
+	 *   - 客户端通过 GetMotherMutationCount() 查询
+	 *   - 业务用途: UI 显示 / 比赛结算
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Match|Mother")
+	int32 MotherMutationCount = 0;
+
+	/**
+	 * 服务器专用: 标记母体变异已触发 + 次数 +1
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 服务器写入 Replicated 字段 → 自动同步到客户端
+	 *   - 强制调用方是服务器 (HasAuthority), 客户端调用 = 错误
+	 *   - 不允许: 外部代码直接 GS->MotherMutationHasFired = true (绕过 +1 统计)
+	 *
+	 * 调用方:
+	 *   - URoomMotherMutationSubsystem::HandleCountdownExpired 末尾
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Mother")
+	void MarkMotherMutationFired();
+
+	/**
+	 * 服务器专用: 重置母体变异触发标志 (新回合 / 模式切换)
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 服务器写入 Replicated 字段 → 自动同步到客户端
+	 *   - 调用方: URoomLifecycleSubsystem::StartMotherMutationCountdown (新局开始时清零)
+	 *           + HandleZombieRoundEnd (本局结束)
+	 *
+	 * 注意: 不清 MotherMutationCount (业务统计字段, 应保留历史)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Mother")
+	void ResetMotherMutationHasFired();
+
+	/**
+	 * 母体变异倒计时同步回调 (客户端)
+	 * 触发 OnMotherMutationChanged 委托
+	 */
+	UFUNCTION()
+	void OnRep_MotherMutationState();
+
+	/**
+	 * UI 监听的委托: 母体变异倒计时启动/重置时触发
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Match|Mother")
+	FOnMotherMutationChanged OnMotherMutationChanged;
+
+	/**
+	 * 提供一个接口供 UI 查询母体变异剩余时间（秒）
+	 * 客户端调用时自动补偿网络延迟
+	 *
+	 * 大厂原则 — 镜像 GetMatchRemainingSeconds():
+	 *   - 如果服务器未启动倒计时, 返回 0
+	 *   - 如果倒计时已结束, 返回 0 (不允许负数)
+	 *
+	 * @return 剩余秒数（最小为 0, 未启动时返回 0）
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Match|Mother")
+	int32 GetMotherMutationRemainingSeconds() const;
+
+	/**
+	 * 【服务器专用】启动母体变异倒计时
+	 * @param Duration 倒计时总秒数
+	 * 服务器写入 MotherMutationStartTime/Duration, Replicate 推送到客户端
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Mother")
+	void StartMotherMutationCountdown(float Duration);
+
+	/**
+	 * 【服务器专用】重置母体变异倒计时 (关闭)
+	 * 服务器写入 StartTime/Duration = 0, 客户端 GetMotherMutationRemainingSeconds() 自动返回 0
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Mother")
+	void ResetMotherMutationCountdown();
 
 	/**
 	 * UI 监听的委托: 模式切换时 UI 需隐藏/显示 Text_RemainingRounds
@@ -181,6 +418,24 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Query")
 	class ARoomPlayerState* GetOverallTopACPlayer() const;
+
+	/**
+	 * 【v93 新增】服务器专用: 设置当前房间模式
+	 *
+	 * 大厂原则 — 显式优于隐式 (零兜底):
+	 *   - 不允许: 外部代码直接 GS->CurrentMatchMode = NewMode (绕过 OnRep)
+	 *   - 必须: 走 SetCurrentMatchMode 公开 API
+	 *   - 原因: ReplicatedUsing = OnRep_CurrentMatchMode, 直接赋值不会触发 Broadcast
+	 *   - 服务器写入字段后立即手动 Broadcast (镜像 SetTotalRounds)
+	 *
+	 * 调用方:
+	 *   - UGameFlowSubsystem::EnterSkipToHostMode (测试模式写入)
+	 *   - 其它未来入口 (例如大厅创房时根据房间类型写入)
+	 *
+	 * @param NewMode 新模式 (None/Unknown 拒绝写入 — 强制修复调用方)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match")
+	void SetCurrentMatchMode(ERoomMatchMode NewMode);
 
 	/**
 	 * 记录当前房间的房主名称，全服同步！

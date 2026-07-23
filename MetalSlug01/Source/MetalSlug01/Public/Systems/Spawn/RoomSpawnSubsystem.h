@@ -294,11 +294,67 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
 	void HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);
 
+	// ==========================================
+	// 【v89 大厂架构新增】母体 Pawn 重建 — 业务层唯一入口
+	// ==========================================
+	//
+	// 大厂原则 — 业务分层 (MR → v89 落地):
+	//   - RoomMotherMutationSubsystem 旧实现: 占位代码直接设 bIsMother=true + 跳过 Pawn 重建
+	//   - 新实现: 由本函数销毁旧 Pawn + 用 BP_MuTi 蓝图类 Spawn 新 Pawn + 重新 Possess
+	//   - 母体变异是 Pawn 类变更, 业务语义上仍然属于"Spawn 调度", 走 SpawnSubsystem 单一入口
+	//   - 避免散布"我自己 Destroy + Spawn" — 违反 SRP / 集中调度
+	//
+	// 调用方:
+	//   - URoomMotherMutationSubsystem::MutateCharacterToMother (生化模式变异)
+
 	/**
-	 * @brief 倒计时结束后触发 — 遍历 GS->PlayerArray 调 HandlePlayerRequestSpawn
+	 * @brief 母体变异 — 销毁旧人类 Pawn + Spawn BP_MuTi 蓝图类新 Pawn + 重新 Possess
+	 *
+	 * 大厂原则:
+	 *   - 母体 RowName 强类型输入 (不允许空字符串, 零兜底)
+	 *   - 母体可能无武器 (MotherCharRowName 配 BP_MuTi 蓝图类), 武器 SetSpawnLoadout 允许空
+	 *   - 释放原 Pawn 占用出生点 (复用 ReleaseSpawnPointByController)
+	 *   - 重新分配新出生点 (复用 GetAvailableSpawnPointForFaction)
+	 *   - Controller->Possess 同步触发 Pawn.FactionTag 复制 (v27 链路, 阵营不变)
+	 *
+	 * @param Controller         目标 Controller (玩家或 AI)
+	 * @param MotherCharRowName  DT_CharacterInfo 中 BP_MuTi 对应的 RowName (非空)
+	 * @return 是否成功 (失败 = Controller/RowName/出生点/Spawn 任意环节失败)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	bool MutatePawnToMother(AController* Controller, const FString& MotherCharRowName);
+
+/**
+ * @brief 倒计时结束后触发 — 遍历 GS->PlayerArray 调 HandlePlayerRequestSpawn
+ */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
 	void SpawnAllPlayersIntoBattle();
+
+	// ==========================================
+	// 【v93.1 大厂架构新增】业务层角色账本查询
+	// ==========================================
+	//
+	// 大厂原则 — 业务查询 vs GetAllActorsOfClass:
+	//   - 旧: MotherMutationSubsystem 直接 GetAllActorsOfClass<ABaseCharacter> — 散查
+	//   - 新: 走本函数单一入口 — 业务层账本唯一真理源
+	//   - 不维护 SpawnedAICharacters 字段 (会引入账本同步问题)
+	//   - 本函数内部 GetAllActorsOfClass (一次性扫描, N<=20, 选母体每局 N 次, 性能可接受)
+	//
+	// 调用方:
+	//   - URoomMotherMutationSubsystem::GetEligibleHumanTargets (选母体)
+	//   - 未来扩展: UI 渲染对局内角色, 比赛结算等
+
+	/**
+	 * @brief 获取对局内所有 ABaseCharacter 派生角色 (玩家 Pawn + AI Pawn)
+	 *
+	 * 大厂原则 — 单一入口:
+	 *   - 业务方应走本函数, 不直接 GetAllActorsOfClass
+	 *   - 本函数是未来账本缓存的预留接口 (若性能不够, 可内部加 TArray<TWeakObjectPtr<ABaseCharacter>>)
+	 *
+	 * @return 对局内所有 ABaseCharacter 指针数组 (含已死角色, 调用方需 IsDead 过滤)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Spawn")
+	TArray<ABaseCharacter*> GetAllBattleCharacters() const;
 
 	/**
 	 * @brief 引擎 override: Spawn 前询问 Pawn Class

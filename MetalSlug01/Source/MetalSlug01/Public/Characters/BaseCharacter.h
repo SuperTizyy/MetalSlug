@@ -26,6 +26,12 @@
 #include "Components/CharacterEvents.h"
 #include "Components/HealthRegenComponent.h"
 
+// 【v93 大厂架构新增】UAnimMontage 完整类型 (MotherAttackMontage UPROPERTY 字段必须)
+#include "Animation/AnimMontage.h"
+
+// 【v93.2 大厂架构新增】UMeleeSwStrategy 完整类型 (MotherTraceStrategy UPROPERTY 字段必须)
+class UMeleeSwStrategy;
+
 // 【2026.07.12 P0 大厂重构 Phase 2】引入新增的 5 个业务 Component
 // 拆分来源:
 //   - PlayerComboComponent   ← BaseCharacter 玩家连击状态机
@@ -167,6 +173,9 @@ friend class UAIAttackComponent;
 friend class UCombatDeathComponent;
 friend class UWeaponAttachmentComponent;
 friend class UCharacterIconComponent;
+// 【v93.2 大厂架构新增】母体 trace 命中 RPC 转发 — MeleeSwStrategy::TickDetection 命中时
+//   调 OwnerChar->Server_ReportMotherAttackHit (protected RPC). 与 5 个业务 Component friend 对称.
+friend class UMeleeSwStrategy;
 
 public:
 	/**
@@ -285,6 +294,118 @@ public:
 	FGameplayTag GetFactionTag() const { return FactionTag; }
 
 	// 【P0 2026.07.10】删除 ResolveGenericTeamIdFromTag — 详见上方注释
+
+	// ==========================================
+	// 【v93.1 大厂架构新增】母体变异状态 — 生化模式独有
+	// ==========================================
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 真理源 = 服务器 URoomMotherMutationSubsystem::MutateCharacterToMother 写入
+	//   - 客户端 OnRep_bIsMother 收到 → Broadcast 让 BT / UI 知道该角色已变异为母体
+	//   - 镜像 v27 FactionTag: 没有 Replicated = 客户端永远是默认值 → 业务失效
+	//
+	// 大厂原则 — 双向标记 (互斥语义):
+	//   - bIsMother = true  时, bIsHuman = false (强制一致, MutateCharacterToMother 写入时同步)
+	//   - bIsHuman  便于 BP 蓝图分支 (策划可读)
+	//   - 默认值: bIsHuman = true, bIsMother = false (出生时是正常人类)
+	//
+	// 业务层使用:
+	//   - BT Decorator (母体不攻击人类 / 不需要识别玩家)
+	//   - HUD (玩家知道自己已变异)
+	//   - UI Scoreboard (母体显示特殊图标)
+	//
+	// 跨模式安全:
+	//   - 刀战模式: bIsMother 永远是 false, 这两字段对刀战模式 0 影响
+	//   - 生化模式: 服务器变异时写入, 客户端 OnRep 触发
+
+	/**
+	 * 是否为生化母体 — 母体变异后由服务器写入 true, 客户端 OnRep 收到
+	 * @note 仅在 ERoomMatchMode::Zombie 模式下才有意义
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_bIsMother, BlueprintReadOnly, Category = "Combat|Mother")
+	bool bIsMother = false;
+
+	/**
+	 * 是否为人类 — 镜像字段, 母体变异时由服务器同步设为 false
+	 * @note 互斥于 bIsMother (MutateCharacterToMother 写入时双字段同步)
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Mother")
+	bool bIsHuman = true;
+
+	/**
+	 * bIsMother 复制回调 (客户端) — 触发 OnMotherStatusChanged 广播
+	 * 大厂原则 — UE 5.6 OnRep: 必须用 UFUNCTION() 标记, 引擎自动调用
+	 */
+	UFUNCTION()
+	void OnRep_bIsMother();
+
+	/**
+	 * 【v93 大厂架构新增】母体左键攻击蒙太奇 — 真理源 (母体无武器也能攻击)
+	 *
+	 * 业务背景:
+	 *   生化模式母体变异后, 玩家按左键应播放母体专属攻击动画 (无武器)
+	 *   - 由 BP_MuTi.uasset 在 ClassDefaults → Combat|Mother → Mother Attack Montage 配
+	 *   - 必填, 零兜底 (未配 → PlayerComboComponent::LightAttack_Pressed 拒绝攻击 + Log Error)
+	 *   - 仅 bIsMother=true 时使用, 刀战模式零影响 (bIsMother 永远是 false)
+	 *
+	 * 镜像对称:
+	 *   - 玩家武器轻击: BaseWeapon::LightAttackMontages[ComboIndex] (武器驱动)
+	 *   - 玩家母体轻击: ABaseCharacter::MotherAttackMontage        (角色驱动, 单一蒙太奇无连击)
+	 *
+	 * 大厂原则 — 不重复架构:
+	 *   - 复用现有 Multicast_PlayAttackAnim RPC (单一真理源), 不新增 RPC
+	 *   - 客户端 Implementation 根据 bIsMother 选不同 Montage 来源 (武器 vs 母体字段)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Combat|Mother")
+	TObjectPtr<UAnimMontage> MotherAttackMontage = nullptr;
+
+	/**
+	 * 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】母体攻击 Strategy 实例
+	 *
+	 * 设计动机:
+	 *   - 母体没有武器 → 不能复用 BaseWeapon::DamageStrategy
+	 *   - 母体有自己的 BoxTrace 算法 → 不能用 BP 蓝图 Tick (性能/抗抖动)
+	 *   - 复用 MeleeSwStrategy 算法 (零重复架构)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 所有母体 Pawn 共享同一份 Strategy 实例? 不! 每个 Pawn 一份
+	 *   - Strategy 内部有 IgnoreActors / LastFrameStartLoc 等跨帧状态, 不能共享
+	 *   - 这是"per-instance state" 不是 "shared singleton"
+	 *
+	 * 零兜底:
+	 *   - Strategy null → StartMotherTrace 拒绝 + Log Error (强制修复)
+	 *   - 构造函数创建, BeginPlay 不再缓存 (v40.6 大厂原则 — 不缓存 Actor 引用)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat|Mother")
+	TObjectPtr<UMeleeSwStrategy> MotherTraceStrategy = nullptr;
+
+	/**
+	 * 母体变异事件广播 (客户端被动接收)
+	 * - 服务器调 Target->Multicast_PlayMutationFX 通知所有客户端
+	 * - 客户端 Implementation 触发本委托
+	 * - HUD / 蓝图可订阅播变身动画 + 粒子 + 音效
+	 */
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMotherStatusChanged, const FString&, TargetName);
+
+	UPROPERTY(BlueprintAssignable, Category = "Combat|Mother")
+	FOnMotherStatusChanged OnMotherStatusChanged;
+
+	/**
+	 * 【v93.1 大厂架构】Multicast RPC — 播放"母体变异"视觉特效到所有客户端
+	 *
+	 * 大厂原则 — RPC 边界纯数据化 (v31.6):
+	 *   - 参数是 FString (TargetName), 不传 Actor* (UE 网络边界序列化要求)
+	 *   - 业务方: URoomMotherMutationSubsystem::MutateCharacterToMother 服务器触发
+	 *
+	 * 大厂原则 — UE 5.6 NetMulticast 行为:
+	 *   - 服务器自己调用时, NetMulticast **会** 在服务器本地执行 Implementation
+	 *   - 远端客户端收到时也执行 Implementation
+	 *   - 服务器自己可能也播一次 (ListenServer 模式)
+	 *
+	 * @param TargetName 被变异角色的名称 (服务器本地读 Target->GetName())
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlayMutationFX(const FString& TargetName);
 	//   迁移: 旧调用点 ARoomGameMode::SpawnAIInternal 改用 FFactionTags::AttitudeBetween / IsSameSide
 
 	/**
@@ -1691,6 +1812,35 @@ protected:
 
 
 	// ==========================================
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】母体攻击命中上报
+	// ==========================================
+	// 背景: 生化模式母体复用 ANS_MeleeTraceState (大厂复用原则), 但母体无武器
+	//       → 命中 RPC 不能走 Weapon->Server_ReportHit (Weapon 必非空)
+	//       → 母体必须有自己的 Server RPC, 但 RPC 必须声明在 Actor 上 (UE 5.6 硬约束)
+	//
+	// 复用动机 (用户需求 2026.07.25):
+	//   - 复用 UANS_MeleeTraceState 类 (美术不学新标签)
+	//   - 复用 MeleeSwStrategy::TickDetection BoxTrace 缝合算法 (零重复)
+	//   - 母体路径: Mesh 来自 Owner (BP_MuTi), Socket 名 _Mother 后缀
+	//   - 命中 RPC: 走 Server_ReportMotherAttackHit (本函数)
+	//
+	// 实现 (大厂原则 — 转发壳模式):
+	//   - UFUNCTION(Server, Reliable, WithValidation) 必须在 BaseCharacter (Actor)
+	//   - _Implementation 转发到 PlayerComboComponent 或 AIAttackComponent (账本归属)
+	//   - 玩家母体 → PlayerComboComponent::Server_ReportMotherAttackHit_Implementation
+	//   - AI 母体   → AIAttackComponent::Server_ReportMotherAttackHit_Implementation
+	//   - 内部统一调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用)
+	//
+	// 大厂原则 — 不重复架构:
+	//   - 防御层 (IsDead / 自伤 / 友军 / 无敌期) 与 Server_ReportAIAttackHit 同构
+	//   - 仅"命中后行为"不同: AIAttack 走 ApplyDamage, MotherAttack 走 MutateCharacterToMother
+	//
+	// @param HitActor  受击目标 (服务器校验: 必须是 ABaseCharacter 且 bIsHuman=true 且未死)
+	UFUNCTION(Server, Reliable, WithValidation)
+	void Server_ReportMotherAttackHit(AActor* HitActor);
+
+
+	// ==========================================
 	// 【P0 2026.07.06 大厂架构重构】AI 攻击蒙太奇事件驱动
 	// ==========================================
 public:
@@ -1838,6 +1988,59 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat")
 	class ABaseWeapon* GetCurrentWeapon() const;
+
+	/**
+	 * 【v93 大厂架构】获取母体攻击蒙太奇 (Pawn 真理源, 母体左键攻击使用)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 直接读 this->MotherAttackMontage 字段 (蓝图配置)
+	 *   - 不从 WeaponAttachment 派生 (母体无武器, 武器驱动路径不适用)
+	 *   - 不走 Get/Resolve component 路径 (字段在 Actor 上, 不在 Component)
+	 *
+	 * 调用方:
+	 *   - UPlayerComboComponent::LightAttack_Pressed (母体分支)
+	 *   - UAIAttackComponent::Multicast_PlayAttackAnim_Implementation (母体分支)
+	 *
+	 * 返回值语义:
+	 *   - 非 nullptr: BP_MuTi 已配 MotherAttackMontage
+	 *   - nullptr:    BP_MuTi 未配 → PlayerComboComponent 会拒绝攻击 + Log Error (零兜底)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Combat|Mother")
+	UAnimMontage* GetMotherAttackMontage() const;
+
+	/**
+	 * 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】启动母体攻击 trace
+	 *
+	 * 复用动机 (用户需求 2026.07.25):
+	 *   - 复用 ANS_MeleeTraceState 类 (美术不学新标签)
+	 *   - 复用 MeleeSwStrategy::TickDetection BoxTrace 缝合算法 (零重复)
+	 *   - 母体没有武器 → 不能走 Weapon->StartDamageTrace
+	 *   - 母体路径: Mesh = GetMesh(), Socket = TraceStart_Mother / TraceEnd_Mother
+	 *   - 命中: 调 Server_ReportMotherAttackHit (走变母体逻辑)
+	 *
+	 * 职责:
+	 *   - 创建/持有独立的 MeleeSwStrategy 实例 (Strategy 模式 — 不在 BP_MuTi 持字段)
+	 *   - Tick 时调 Strategy.TickDetection (Strategy 内部驱动 BoxTrace)
+	 *
+	 * 调用方:
+	 *   - UANS_MeleeTraceState::NotifyBegin (EnterState=Tracing + bIsMother=true 分支)
+	 *
+	 * @param bIsHeavy 是否重击 (策划/美术在蒙太奇时间轴上配 ANS 的 bIsHeavy 字段)
+	 * @return true=成功启动, false=配置错/状态错
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Mother")
+	bool StartMotherTrace(bool bIsHeavy);
+
+	/**
+	 * 【v93.2 大厂架构】停止母体攻击 trace (与 StartMotherTrace 对称)
+	 *
+	 * 幂等: 多次调用 no-op
+	 *
+	 * 调用方:
+	 *   - UANS_MeleeTraceState::NotifyEnd (bIsMother=true 分支)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Mother")
+	void StopMotherTrace();
 
 protected:
 	// ==========================================

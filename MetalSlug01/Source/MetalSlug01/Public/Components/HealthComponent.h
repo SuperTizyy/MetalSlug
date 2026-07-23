@@ -223,7 +223,31 @@ protected:
 	/** Timer 到期回调: 清除无敌状态 (服务器 only) */
 	void ExpireInvincibility_Internal();
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health")
+	/**
+	 * 【v93.4 大厂架构修复】最大血量 — 必须 Replicated 才能客户端正确同步
+	 *
+	 * 业务规则 (用户 2026.07.25 明确):
+	 *   - 母体变异时, HealthComponent->InitializeHealth(200) 写 MaxHealth=200
+	 *   - 客户端 HUD 读 GetMax() 必须返回 200, 否则血条进度算错 (CurrentHealth/MaxHealth)
+	 *
+	 * 旧 (v93.3 之前) 反模式:
+	 *   - UPROPERTY 没标 Replicated → MaxHealth 是服务器本地字段, 客户端永远是默认值 100
+	 *   - 母体变异时服务器 MaxHealth=200, CurrentHealth=200, 但客户端 MaxHealth=100
+	 *   - HUD 显示: CurrentHealth=200 / MaxHealth=100 (看似满血,但客户端读到 100, 进度条算错)
+	 *   - 客户端 OnRep_CurrentHealth 只触发 OnHealthChanged(CurrentHealth), 没传 MaxHealth
+	 *
+	 * 新 (v93.4) 单一真理源:
+	 *   - MaxHealth Replicated → 客户端自动收到 200
+	 *   - InitializeHealth 末尾 broadcast OnHealthChanged(MaxHealth) → 服务器同步通知 HUD
+	 *   - 客户端 OnRep_CurrentHealth 同步 broadcast OnHealthChanged(CurrentHealth)
+	 *   - HUD 在收到广播后调用 GetMax() → 正确读到 200
+	 *
+	 * 不破坏现有逻辑 (大厂原则 — 零副作用):
+	 *   - 加 Replicated 不会影响 ApplyDamage / Heal 等任何现有路径
+	 *   - 默认 100 保持不变, 所有非母体路径都是 100
+	 *   - 仅母体变异时显式改 200
+	 */
+	UPROPERTY(Replicated, EditDefaultsOnly, BlueprintReadOnly, Category = "Health")
 	float MaxHealth = 100.0f;
 
 	/**

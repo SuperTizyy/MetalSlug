@@ -1269,6 +1269,33 @@ void ULANRoomPage::OnCreateSessionComplete(FName SessionName, bool bWasSuccessfu
 				//   HandleStateEntry(InRoom) 看到 bIsHostListenServer=true 会加 ?listen
 				FlowSub->SetIsHostListenServer(true);
 
+				// 【v93 大厂 P0 修复】缓存目标房间模式 (HandleStateEntry(InRoom) 会读这个值, 写入 URL ?Mode=)
+				//   单一真理源: PendingGameMode 字符串 ("刀战模式" / "生化模式") → URoomMatchModeUtils 解析 → ERoomMatchMode
+				//   零兜底: 解析失败返回 None → Log Error + 拒绝写入 TargetRoomMode (后续 InitGame 会拒绝写入 GS)
+				const ERoomMatchMode ParsedMode = URoomMatchModeUtils::ParseMatchModeFromGameModeString(PendingGameMode);
+				if (ParsedMode == ERoomMatchMode::None)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[LANRoomPage] OnCreateSessionComplete: PendingGameMode='%s' 解析为 ERoomMatchMode::None. "
+						     "拒绝创房! "
+						     "【修复】检查 LANRoomPage::OnConfirmCreateRoomClicked 是否正确设置了 PendingGameMode (应来自 ComboBox_GameMode 选中项)."),
+						*PendingGameMode);
+					// 失败: 重置 UI 状态
+					bIsHost = false;
+					bIsTraveling = false;
+					if (Text_CreateRoomHint)
+					{
+						Text_CreateRoomHint->SetText(FText::FromString(TEXT("游戏模式解析失败, 请重试")));
+						Text_CreateRoomHint->SetVisibility(ESlateVisibility::Visible);
+					}
+					ReEnableCreateRoomButton();
+					return;
+				}
+				FlowSub->SetTargetRoomMode(ParsedMode);
+				UE_LOG(LogTemp, Log,
+					TEXT("[LANRoomPage] OnCreateSessionComplete: PendingGameMode='%s' → TargetRoomMode=%d (1=Melee / 2=Zombie)"),
+					*PendingGameMode, (int32)ParsedMode);
+
 				// 2. 【大厂 P0 修复 2026.07.03】跨地图意图登记 (关键! Client 端必备)
 				//    场景: Host 创房后 ServerTravel 把 Client 拉到战斗地图
 				//          Client 进图时 CurrentState 还是 MainLobby (3)

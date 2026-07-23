@@ -138,13 +138,70 @@ public:
 	bool HandleZombieRoundEnd();
 
 	// ==========================================
+	// 【v92 大厂架构新增】生化模式母体变异倒计时调度
+	// ==========================================
+	//
+	// 业务规则:
+	//   生化模式每局开局, 玩家/AI 都是人类, 互相无敌
+	//   8 秒倒计时结束才会"变异"为母体 (Phase 3 母体死亡广播)
+	//
+	// 大厂原则 — 集中调度:
+	//   - 启动入口: PerformGameStart (首局) + StartNextZombieRound (后续局)
+	//   - 重置入口: HandleZombieRoundEnd (本局结束) + ResetMotherMutationCountdown (兜底)
+	//   - GameState 是数据源, Subsystem 是调度者, 不持有状态
+	//
+	// 反射友好 (UE 5.6 UHT):
+	//   - 不暴露 FSimpleDelegate 给 UHT, 用普通 C++ 方法
+
+	/**
+	 * @brief 启动母体变异倒计时 (服务器内部调用)
+	 *
+	 * 大厂原则 — 镜像 MatchEndTime 写入流程:
+	 *   - 调用 GameState->StartMotherMutationCountdown(Duration)
+	 *   - GameState 写入 Replicated 字段, 客户端 OnRep 自动触发
+	 *   - Widget 收到 OnMotherMutationChanged 后显示倒计时
+	 *
+	 * @param Duration 倒计时总秒数 (必须 > 0, 由 GameMode.MotherMutationDurationSeconds 注入)
+	 */
+	void StartMotherMutationCountdown();
+
+	/**
+	 * @brief 重置母体变异倒计时 (服务器内部调用, 关闭倒计时)
+	 * 调用时机: 本局结束 / 切换模式 / GameMode 兜底重置
+	 */
+	void ResetMotherMutationCountdown();
+
+	// ==========================================
 	// 配置入口 (由 GameMode 在构造/初始化时注入)
 	// ==========================================
 
 	/**
-	 * @brief 注入生化模式总回合数 (来自 GameMode.ZombieTotalRounds)
+	 * @brief 注入总局数 (来自 GameMode.TotalRounds)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - GameMode.TotalRounds → GameState.TotalRounds (Replicated) → UI 订阅
+	 *   - Subsystem 内部不再持有 ZombieTotalRounds 副本 (消除重复架构)
+	 *   - Subsystem 在 HandleZombieRoundEnd / StartNextZombieRound 内部读 GameState.TotalRounds
 	 */
-	void SetZombieTotalRounds(int32 InRounds) { ZombieTotalRounds = InRounds; }
+	void SetTotalRounds(int32 InRounds);
+
+	/**
+	 * @brief 注入生化模式每局时长 (来自 GameMode.ZombieMatchDurationSeconds)
+	 *
+	 * 大厂原则 — 对称设计:
+	 *   - MeleeMatchDurationSeconds 走 PerformGameStart 直接传 (GameMode → Subsystem)
+	 *   - ZombieMatchDurationSeconds 走 SetZombieMatchDuration 注入 (GameMode → Subsystem)
+	 *   - 两条路径都是 GameMode → Subsystem 单向注入
+	 *
+	 * @param InSeconds 生化模式每局时长 (秒, 必须 >= 30)
+	 */
+	void SetZombieMatchDuration(int32 InSeconds) { ZombieMatchDurationSeconds = InSeconds; }
+
+	/**
+	 * @brief 注入母体变异倒计时秒数 (来自 GameMode.MotherMutationDurationSeconds)
+	 * @param InSeconds 倒计时秒数 (必须 > 0, <= 0 时按零兜底: 静默跳过启动)
+	 */
+	void SetMotherMutationDuration(float InSeconds) { MotherMutationDurationSeconds = InSeconds; }
 
 	// ==========================================
 	// 查询接口
@@ -163,10 +220,25 @@ protected:
 	 */
 	FTimerHandle MatchStartTimerHandle;
 
-	/**
-	 * 比赛计时器句柄 (1Hz tick, 检查时间是否耗尽)
-	 */
+/**
+ * 比赛计时器句柄 (1Hz tick, 检查时间是否耗尽)
+ */
 	FTimerHandle MatchTimerHandle;
+
+	/**
+	 * 【v93.1 大厂架构新增】母体变异倒计时到期定时器句柄
+	 *
+	 * 大厂原则 — 镜像 MatchTimerHandle:
+	 *   - StartMotherMutationCountdown 末尾 SetTimer(Duration) → 到期调 MotherMutationSubsystem::HandleCountdownExpired
+	 *   - ResetMotherMutationCountdown 内部 ClearTimer 防残留
+	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的 (避免 SetTimer 累加)
+	 *
+	 * 防重入机制:
+	 *   - 本地层 1: URoomMotherMutationSubsystem::bMotherMutationFired_Local
+	 *   - 分布式层 2: ARoomGameState::MotherMutationHasFired (Replicated)
+	 *   - 客户端层 3: LifecycleSubsystem 不在客户端运行 (服务器权威)
+	 */
+	FTimerHandle MotherMutationTimerHandle;
 
 	/**
 	 * 是否已经广播过 OnBattleStarted (幂等保护)
@@ -174,9 +246,23 @@ protected:
 	bool bBattleStartedBroadcasted = false;
 
 	/**
-	 * 生化模式总回合数 (由 GameMode 注入)
+	 * 【v92 大厂架构重构】生化模式每局时长 (由 GameMode 注入, 默认 120s)
+	 *
+	 * 替代旧的 ZombieTotalRounds (重复字段已删除):
+	 *   - 旧版: ZombieTotalRounds (回合数, Subsystem 内部用) + TotalRounds (UI 用) — 重复
+	 *   - 新版: ZombieMatchDurationSeconds (时长) + TotalRounds (UI 总局数) — 各司其职
+	 *
+	 * StartMatchTimer (Zombie 分支) 用此值 + Now 写入 GameState.MatchEndTime
+	 * StartNextZombieRound 内部读 GameState.MatchEndTime 重置
 	 */
-	int32 ZombieTotalRounds = 5;
+	int32 ZombieMatchDurationSeconds = 120;
+
+	/**
+	 * 母体变异倒计时秒数 (由 GameMode 注入, 默认 8s)
+	 * 大厂原则 — 业务可配: GameMode 暴露字段给策划调整
+	 * <= 0 表示禁用 (匹配逻辑里不启动倒计时)
+	 */
+	float MotherMutationDurationSeconds = 8.0f;
 
 	/**
 	 * 开局延迟秒数 (由 GameMode 注入, 启动 PerformGameStart 时写入)

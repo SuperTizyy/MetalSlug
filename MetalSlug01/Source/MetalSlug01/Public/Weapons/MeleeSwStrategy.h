@@ -63,6 +63,22 @@ public:
 	// IWeaponDamageStrategy 实现
 	// ==========================================
 
+	// ==========================================================
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】接口签名扩展
+	//
+	// 复用动机:
+	//   - 母体无武器, 不能复用 BaseWeapon::StartDamageTrace
+	//   - 但 BoxTrace 缝合算法 + IgnoreActors 防一刀多伤 = Melee 通用算法, 应该复用
+	//   - 不重写 Strategy 类 — 加 bUseOwnerMesh 标志, 让 Strategy 走 Owner Mesh 路径
+	//   - Socket 名改 TraceStart_Mother / TraceEnd_Mother (母体 Mesh 上, 武器 Mesh 上仍用 TraceStart/TraceEnd)
+	//   - 命中 RPC 改 Owner->Server_ReportMotherAttackHit 而不是 Weapon->Server_ReportHit
+	//
+	// 大厂原则 — 不重复架构:
+	//   - 复用现有 BoxTrace 缝合算法 (零改动)
+	//   - 复用现有 IgnoreActors / LastFrame 缓存 (零改动)
+	//   - 复用现有 TraceState 状态机 (零改动)
+	//   - 只在 StartTrace/TickDetection 加分支 (单一路径)
+	// ==========================================================
 	/**
 	 * 启动近战检测 (v60.3 — 立即记录激活态, 不立即执行)
 	 *
@@ -77,11 +93,38 @@ public:
 	 *   - Melee trace 起点/终点来自 Mesh Socket, 不需要客户端射线
 	 *   - 保留参数接口一致性 (默认 ZeroVector = 不使用客户端射线)
 	 *
+	 * 【v93.2 母体复用】
+	 *   - bUseOwnerMesh=false (默认): Weapon Mesh 路径 (刀战玩家/AI)
+	 *   - bUseOwnerMesh=true: Weapon->GetOwner() Mesh 路径 (生化母体)
+	 *   - bUseOwnerMesh=true 时, Socket 名用 SocketName_MotherTraceStart / SocketName_MotherTraceEnd
+	 *
 	 * @return true=成功启动, false=配置错/状态错
 	 */
 	virtual bool StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
 		const FVector& ClientRayOrigin = FVector::ZeroVector,
 		const FVector& ClientRayDirection = FVector::ForwardVector) override;
+
+	/**
+	 * 【v93.2 母体复用 — 简化入口】启动母体 trace (供 ANS_MeleeTraceState bIsMother 分支直接调)
+	 *
+	 * 与 StartTrace(Weapon, bIsHeavy) 的区别:
+	 *   - 内部固定 bUseOwnerMesh=true
+	 *   - 内部固定 Socket 名 = SocketName_MotherTraceStart / SocketName_MotherTraceEnd
+	 *   - 调用方只需传 Owner Character + bIsHeavy
+	 *
+	 * 调用方:
+	 *   - UANS_MeleeTraceState::NotifyBegin (bIsMother 分支)
+	 *
+	 * @return true=成功启动, false=配置错/状态错
+	 */
+	bool StartMotherTrace(class ABaseCharacter* OwnerChar, bool bIsHeavy);
+
+	/**
+	 * 【v93.2 母体复用 — 简化入口】停止母体 trace
+	 *
+	 * 幂等: 多次调用 no-op
+	 */
+	void StopMotherTrace(class ABaseCharacter* OwnerChar);
 
 	/**
 	 * 停止近战检测 — 清 IgnoreActors, 重置 LastFrame 缓存, bIsActive=false
@@ -100,6 +143,11 @@ public:
 	 *   4. BoxTraceSingle 从 LastMid → CurrentMid (缝合)
 	 *   5. 命中 → 加 IgnoreActors + 调 Weapon->Server_ReportHit
 	 *   6. 更新 LastFrame 缓存
+	 *
+	 * 【v93.2 母体复用】
+	 *   - bUseOwnerMesh=false: Mesh 来源 = Weapon->GetMeshComponent(), RPC = Weapon->Server_ReportHit
+	 *   - bUseOwnerMesh=true:  Mesh 来源 = Owner->GetMesh(),          RPC = Owner->Server_ReportMotherAttackHit
+	 *   - 大厂原则: 算法零重复, 路径决策用 if 分支
 	 */
 	virtual void TickDetection(ABaseWeapon* Weapon, float DeltaTime) override;
 
@@ -196,4 +244,34 @@ protected:
 	//   (UCLASS 内不能用 `= FName(...)` 初始化静态成员, UE 反射系统限制, 必须 cpp 内定义)
 	static const FName SocketName_TraceStart;
 	static const FName SocketName_TraceEnd;
+
+	// ==================================
+	// 【v93.2 母体复用】母体 Socket 名称常量
+	// ==================================
+	// 母体 Pawn Mesh 必须有以下 Socket (美术在 BP_MuTi Mesh 编辑器加):
+	//   - TraceStart_Mother: 母体爪击起点
+	//   - TraceEnd_Mother:   母体爪击终点
+	// 大厂原则 - DRY: 与武器 Socket 名并列, 单一真理源在头文件声明
+	static const FName SocketName_MotherTraceStart;
+	static const FName SocketName_MotherTraceEnd;
+
+	// ==================================
+	// 【v93.2 母体复用】bUseOwnerMesh 路径标志
+	// ==================================
+	// false (默认): StartTrace 走 Weapon Mesh (刀战路径, 武器 Socket 名)
+	// true:         StartTrace 走 Owner Mesh (生化母体路径, 母体 Socket 名)
+	// 大厂原则 - 路径明确: 一个 Strategy 实例同时支持两条路径, 通过 bUseOwnerMesh 决策
+	bool bUseOwnerMesh = false;
+
+	// ==================================
+	// 【v93.2 母体复用】Active Owner (母体路径专用)
+	// ==================================
+	// 母体路径下, ActiveWeapon 是 nullptr, 命中 RPC 走 Owner->Server_ReportMotherAttackHit
+	// 刀战路径下, ActiveOwner 是 nullptr, 命中 RPC 走 Weapon->Server_ReportHit
+	// 大厂原则 - 单一真理源: 谁拥有当前 trace, 谁负责报命中
+	TWeakObjectPtr<class ABaseCharacter> ActiveOwner;
+
+	// 【v93.2 母体复用】bAIDriven 缓存 (TickDetection 读)
+	// 母体路径下, 玩家/AI 判定从 ActiveOwner 读 bIsCurrentlyAttackerAI
+	bool bIsMotherAIDriven = false;
 };

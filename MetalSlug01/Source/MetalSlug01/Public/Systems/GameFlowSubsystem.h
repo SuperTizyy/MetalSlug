@@ -15,6 +15,9 @@
 // 引入共享枚举定义（EMatchState, EUIPanel），打破 GameFlowSubsystem <-> UIViewService 循环依赖
 #include "Enums/CoreEnums.h"
 
+// 引入 ERoomMatchMode 枚举(MatchMode 跨地图持久字段的类型)
+#include "Data/Enums/RoomEnums.h"
+
 // 引入 SessionManager 头文件（GameInstance 级 Subsystem），订阅 OnSessionTerminated 事件
 // 大厂架构: GameFlow 是 Session 生命周期 + 地图流转的统一调度, SessionManager 只负责 Session 单一职责
 #include "Systems/Session/SessionManagerSubsystem.h"
@@ -176,6 +179,37 @@ public:
 	void SetIsHostListenServer(bool bInIsHost) { bIsHostListenServer = bInIsHost; }
 
 	// ==========================================
+	// 【大厂 P0 修复 v3 2026.07.13】目标房间模式 (MatchMode) 持久化
+	// ==========================================
+
+	/**
+	 * @brief 【大厂标准 - 单一真理源】设置即将进入的房间的比赛模式
+	 *
+	 * 使用场景:
+	 *   - Host 创房成功 → SetTargetRoomMode(Melee/Zombie) + TransitToState(InRoom)
+	 *     → HandleStateEntry(InRoom) 内部 OpenLevel 时把 TargetRoomMode 写入 GameState->CurrentMatchMode
+	 *   - Client 通过 SessionSettings GAME_MODE 字符串解析后, 在 OnRep 触发前由 RPC 注入
+	 *
+	 * 设计动机 (历史 bug):
+	 *   - 旧版只在 UMetalSlugTestSettings::DebugSkipRoomMode (测试模式) 写入 GameState
+	 *   - 真实创房 (LANRoomPage) 完全没设置 → GameState 永远默认 → UI 显示错乱
+	 *
+	 * 大厂原则 (Single Source of Truth):
+	 *   - "目标模式" 的唯一来源 = GameFlowSubsystem (跨地图持久)
+	 *   - 任何业务方 (LANRoomPage / 测试模式 / 玩家邀请) 都走 SetTargetRoomMode
+	 *   - HandleStateEntry(InRoom) 负责把字段值写入 GameState
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|GameFlow")
+	void SetTargetRoomMode(ERoomMatchMode Mode) { TargetRoomMode = Mode; }
+
+	/**
+	 * @brief 获取当前缓存的目标房间模式
+	 * @return TargetRoomMode 已缓存的模式（未设置时为 ERoomMatchMode::None）
+	 */
+	UFUNCTION(BlueprintPure, Category = "MetalSlug|GameFlow")
+	ERoomMatchMode GetTargetRoomMode() const { return TargetRoomMode; }
+
+	// ==========================================
 	// 【P0 架构升级】跨地图"下一步状态"意图机制
 	// ==========================================
 
@@ -268,6 +302,15 @@ private:
 	 */
 	UPROPERTY(Transient)
 	bool bIsHostListenServer = false;
+
+	/**
+	 * 【大厂 P0 修复 v3 2026.07.13】目标房间比赛模式 (跨地图持久)
+	 *   - 默认 ERoomMatchMode::None (未配置)
+	 *   - 由 SetTargetRoomMode 写入, HandleStateEntry(InRoom) 消费后写入 GameState
+	 *   - 跨地图持久 (Transient), 不会因切图丢失
+	 */
+	UPROPERTY(Transient)
+	ERoomMatchMode TargetRoomMode = ERoomMatchMode::None;
 
 	// ==========================================
 	// 【P0 架构升级】跨地图"下一步状态"意图持久化字段

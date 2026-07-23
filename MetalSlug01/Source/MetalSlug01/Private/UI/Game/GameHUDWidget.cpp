@@ -389,11 +389,12 @@ void UGameHUDWidget::OnChatMessageReadyFromWidget(const FString& PlayerName, con
  *
  * 尝试绑定到 GameState
  * 1. 模式切换 -> OnMatchModeChangedForHUD
- * 2. 当前回合数 -> UpdateRemainingRoundsText
+ * 2. 总局数同步 -> UpdateTotalRoundsText (【v92】替换 UpdateRemainingRoundsText, 单一真理源)
  * 3. 队伍击杀数 -> UpdateTeamKillCountsText
  * 4. 进入结算 -> OnEnterSettlement
  * 5. 显示最终胜负 -> OnShowFinalSettlement
- * 6. 立即同步一次
+ * 6. 母体变异倒计时 -> OnMotherMutationChanged
+ * 7. 立即同步一次
  * 失败: 0.5 秒重试，最多 5 次
  */
 void UGameHUDWidget::TryBindToGameState()
@@ -405,8 +406,10 @@ void UGameHUDWidget::TryBindToGameState()
 			// 绑定事件: 当 GameState 的模式切换时，UI 决定各控件的显示/隐藏
 			RoomGS->OnMatchModeChanged.AddDynamic(this, &UGameHUDWidget::OnMatchModeChangedForHUD);
 
-			// 绑定事件: 当 GameState 的当前回合数变化时（生化模式），刷新 Text_RemainingRounds
-			RoomGS->OnCurrentRoundUpdated.AddDynamic(this, &UGameHUDWidget::UpdateRemainingRoundsText);
+			// 【v92 大厂架构重构】绑定事件: GameState.TotalRounds 同步时刷新 Text_RemainingRounds
+			//   - 替换旧的 OnCurrentRoundUpdated 订阅 (CurrentRound 是内部计数, UI 不订阅)
+			//   - 大厂原则: UI 订阅真理源 (TotalRounds), 不订阅内部计数 (CurrentRound)
+			RoomGS->OnTotalRoundsUpdated.AddDynamic(this, &UGameHUDWidget::UpdateTotalRoundsText);
 
 			// 绑定事件: 当 GameState 的队伍击杀统计变化时，刷新 MatchInfoWidget 上的 Text_AttackerCount / Text_DefenderCount
 			RoomGS->OnTeamKillCountUpdated.AddDynamic(this, &UGameHUDWidget::UpdateTeamKillCountsText);
@@ -417,11 +420,20 @@ void UGameHUDWidget::TryBindToGameState()
 			// 绑定事件: 显示最终胜负（延迟 3 秒后触发）
 			RoomGS->OnShowFinalSettlement.AddDynamic(this, &UGameHUDWidget::OnShowFinalSettlement);
 
-			// 初始化时先刷一次（剩余回合数）
-			UpdateRemainingRoundsText(RoomGS->CurrentRound);
+			// 【v92 大厂架构新增】绑定事件: 母体变异倒计时同步 (生化模式每局开局 8s 倒计时)
+			// 单一真理源: GameState.OnRep_MotherMutationState 触发该委托
+			RoomGS->OnMotherMutationChanged.AddDynamic(this, &UGameHUDWidget::OnMotherMutationChanged);
+
+			// 【v92 大厂架构重构】初始化时先刷一次 (总局数, 直接读 GameState.TotalRounds)
+			UpdateTotalRoundsText(RoomGS->TotalRounds);
 
 			// 初始化时同步当前已存在的队伍击杀数据
 			UpdateTeamKillCountsText(RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
+
+			// 【v92 大厂架构新增】初始化时同步当前母体变异倒计时状态
+			// 大厂原则 — 镜像 Bind-Snapshot 补发: 防止 HUD 订阅晚于服务器 Broadcast 事件
+			// 例如: 服务器已开始倒计时 → HUD 创建 → 直接读 GameState 当前字段 → 立即显示
+			OnMotherMutationChanged(RoomGS->MotherMutationStartTime, RoomGS->MotherMutationDuration);
 
 			UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] 成功绑定 GameState，AttackerKills=%d, DefenderKills=%d"),
 				RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
@@ -503,14 +515,24 @@ void UGameHUDWidget::OnPlayerKill(bool bIsHeadshot)
 	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] OnPlayerKill: bIsHeadshot=%d"), bIsHeadshot);
 }
 
-/** 更新剩余局数文本 */
-void UGameHUDWidget::UpdateRemainingRoundsText(int32 RemainingRounds)
+/**
+ * 【v92 大厂架构重构】更新总局数文本 (替换 UpdateRemainingRoundsText)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 数据源: GameState.TotalRounds (Replicated)
+ *   - 接收 GameState.OnTotalRoundsUpdated 回调 (替换旧的 OnCurrentRoundUpdated 订阅)
+ *   - 静态显示 "总局数：xx", 不倒数
+ */
+void UGameHUDWidget::UpdateTotalRoundsText(int32 TotalRounds)
 {
-	RemainingRounds = FMath::Max(0, RemainingRounds);
-
 	if (Widget_MatchInfo)
 	{
-		Widget_MatchInfo->UpdateRemainingRounds(RemainingRounds);
+		Widget_MatchInfo->UpdateTotalRounds(TotalRounds);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] UpdateTotalRoundsText: Widget_MatchInfo 为空, 无法刷新总局数!"));
 	}
 }
 
@@ -536,6 +558,37 @@ void UGameHUDWidget::OnMatchModeChangedForHUD(ERoomMatchMode NewMode)
 	{
 		Widget_MatchInfo->SetVisibilityByMode(NewMode);
 	}
+}
+
+
+/**
+ * 【v92 大厂架构新增】母体变异倒计时同步回调 (转发壳)
+ *
+ * 单一真理源 — 由 GameState.OnRep_MotherMutationState 触发 OnMotherMutationChanged
+ * 职责: 把事件转发给 Widget_MatchInfo, 由 Widget 内部决定显示/隐藏 + NativeTick 刷新数字
+ *
+ * 大厂原则 — 镜像 OnMatchModeChangedForHUD:
+ *   - GameHUDWidget 不持有倒计时逻辑, 只做事件路由
+ *   - Widget_MatchInfo 是唯一显示组件
+ *
+ * 大厂原则 — 零兜底:
+ *   - Widget_MatchInfo 为空 → Log Error + return (强制修复 BP)
+ */
+void UGameHUDWidget::OnMotherMutationChanged(float StartTime, float Duration)
+{
+	if (!Widget_MatchInfo)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnMotherMutationChanged: Widget_MatchInfo 为空, 无法转发母体变异倒计时!"
+			     " 【修复】检查 WBP_GameHUDWidget 是否绑定了 Widget_MatchInfo (UMatchInfoWidget)."));
+		return;
+	}
+
+	Widget_MatchInfo->UpdateMotherMutationCountdown(StartTime, Duration);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] OnMotherMutationChanged: 转发母体变异倒计时到 MatchInfoWidget. StartTime=%.2f, Duration=%.2f"),
+		StartTime, Duration);
 }
 
 /** 更新 AC 值 */

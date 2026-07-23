@@ -77,6 +77,8 @@
 #include "Systems/Membership/RoomMembershipSubsystem.h"
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Systems/Targeting/RoomTargetingSubsystem.h"
+// 【v93.1 大厂架构新增】第五个 Subsystem — 母体变异业务权威
+#include "Systems/Mother/RoomMotherMutationSubsystem.h"
 
 
 // ==========================================
@@ -178,11 +180,94 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 /**
  * InitGame - UE override, World 已就绪后第一次调用
  *   - 这是把 GameMode 配置注入 Subsystem 的最早安全时机
+ *
+ *   注意: InitGame 时 GameState **尚未创建** (GameState 在 InitGameState 中创建)
+ *         所以写入 GS->CurrentMatchMode 的逻辑在 InitGameState 中 (见下方 override)
  */
 void ARoomGameMode::InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage)
 {
 	Super::InitGame(MapName, Options, ErrorMessage);
 	InjectSubsystemConfigs();
+}
+
+/**
+ * InitGameState - UE override, GameState 已创建后调用
+ *
+ *   【v93 大厂架构修复】URL ?Mode=数字 → GS->SetCurrentMatchMode
+ *   关键时序: InitGameState 时, GameState 已被 AGameModeBase 创建, 是新房间地图的 GS (不是 L_Login 的旧 GS)
+ *   解析 URL Options 中的 ?Mode= 参数, 写入 GS CurrentMatchMode
+ *   - Melee = 1, Zombie = 2
+ *   - None 或缺省 → Log Error + 拒绝写入 (零兜底)
+ *   - 写入后立即 Broadcast OnMatchModeChanged (镜像 SetTotalRounds 模式)
+ *
+ * 大厂原则 (Single Source of Truth):
+ *   - URL Options 里的 Mode 字段 (由 GameFlowSubsystem::HandleStateEntry InRoom 写入) 是房间模式真理源
+ *   - GS->CurrentMatchMode 是运行时决策层真理源
+ *   - InitGameState 是这两个真理源之间的唯一桥梁
+ *
+ * 测试模式路径:
+ *   - BootToLogin skip-login 分支不调 OpenLevel, GameState 已存在, 直接 GS->SetCurrentMatchMode (旧路径)
+ *   - 正式路径: 通过 URL ?Mode= 跨地图传递, InitGameState 解析
+ *   - 两条路径都最终通过 SetCurrentMatchMode 公开 API 写入 (单一真理源)
+ */
+void ARoomGameMode::InitGameState()
+{
+	Super::InitGameState();
+
+	// 【v93 大厂架构】解析 URL Options 中的 ?Mode= 参数, 写入 GameState->CurrentMatchMode
+	//   单一真理源: URL Options 里的 Mode 字段 (由 GameFlowSubsystem::HandleStateEntry InRoom 写入)
+	//   没有兜底: 缺省 / 非法 / None → Log Error + 拒绝写入
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] InitGameState: World 为 null, 跳过 URL ?Mode= 解析."));
+		return;
+	}
+	ARoomGameState* GS = World->GetGameState<ARoomGameState>();
+	if (!GS)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] InitGameState: GameState 不是 ARoomGameState (或为 null). "
+			     "GS->SetCurrentMatchMode 无法调用. "
+			     "【修复】检查 World Settings → GameMode Override / Default GameMode."));
+		return;
+	}
+
+	// 解析 URL Options (注意: UE 标准接口是 OptionsString 字段, 不是 GetGameModeURLOptions)
+	//   来源: AGameModeBase 在 InitGame(MapName, Options, ...) 中接收 URL Options 并保存到 OptionsString
+	//   InitGameState 在 InitGame 之后被引擎自动调用, 此时 OptionsString 已有值
+	const FString& Options = OptionsString;
+	const FString ModeStr = UGameplayStatics::ParseOption(Options, TEXT("Mode"));
+	if (ModeStr.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] InitGameState: URL Options 缺少 'Mode' 参数 (Options='%s'). "
+			     "GS->SetCurrentMatchMode 拒绝写入 None. "
+			     "【修复】GameFlowSubsystem::HandleStateEntry InRoom 必须在 OpenLevel 时附加 ?Mode=数字. "
+			     "【业务根因】LANRoomPage::OnConfirmCreateRoomClicked 必须先调 FlowSub->SetTargetRoomMode(ERoomMatchMode)."),
+			*Options);
+		return;
+	}
+	const int32 ModeInt = FCString::Atoi(*ModeStr);
+	const ERoomMatchMode ParsedMode = static_cast<ERoomMatchMode>(ModeInt);
+
+	// 显式校验 (拒绝 None / 非法值, 大厂原则零兜底)
+	if (ParsedMode == ERoomMatchMode::None || ModeInt < 1 || ModeInt > 2)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] InitGameState: URL 'Mode=%s' (整数=%d) 不是合法 ERoomMatchMode. "
+			     "合法值: 1=Melee (刀战模式), 2=Zombie (生化模式). "
+			     "拒绝写入 GS->SetCurrentMatchMode."),
+			*ModeStr, ModeInt);
+		return;
+	}
+
+	// 单一真理源写入 (镜像 Skip-Login 路径)
+	GS->SetCurrentMatchMode(ParsedMode);
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameMode] InitGameState: URL ?Mode=%s → GS->SetCurrentMatchMode(%s) 成功."),
+		*ModeStr, ParsedMode == ERoomMatchMode::Melee ? TEXT("Melee") : TEXT("Zombie"));
 }
 
 /**
@@ -222,7 +307,10 @@ void ARoomGameMode::PostInitProperties()
  */
 void ARoomGameMode::InjectSubsystemConfigs()
 {
+	// 【v93.1 重构】变量提升到函数顶部, 让下面 4 个 Subsystem 注入块共享 (避免作用域 bug)
 	URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this);
+	URoomLifecycleSubsystem* LifeSys = URoomLifecycleSubsystem::Get(this);
+
 	if (!SpawnSys)
 	{
 		UE_LOG(LogTemp, Warning,
@@ -264,6 +352,60 @@ void ARoomGameMode::InjectSubsystemConfigs()
 		*GetNameSafe(WeaponDataTable),
 		ModeRulesByMode.Num(),
 		RespawnDelaySeconds);
+
+	// 4. 【v92 大厂架构新增】注入母体变异倒计时秒数到 LifecycleSubsystem
+	// 单一真理源: GameMode.MotherMutationDurationSeconds → Subsystem.MotherMutationDurationSeconds
+	// 流向: GameMode → Subsystem (单向, 只在 InitGame 时一次性注入)
+	//
+	// 【v92 大厂架构重构】注入 TotalRounds 到 LifecycleSubsystem (转发到 GameState):
+	//   - GameMode.TotalRounds (策划配置) → Subsystem.SetTotalRounds → GameState.TotalRounds (Replicated)
+	//   - UI 显示用 GameState.TotalRounds, 单一真理源
+	//   - 取代旧的 ZombieTotalRounds (已删除)
+	//
+	// 【v92 大厂架构重构】注入 ZombieMatchDurationSeconds:
+	//   - GameMode.ZombieMatchDurationSeconds (策划配置) → Subsystem.ZombieMatchDurationSeconds
+	//   - StartMatchTimer (Zombie 分支) 用此值写入 GameState.MatchEndTime
+	//   - 与 MeleeMatchDurationSeconds 对称 (两模式各自配置每局时长)
+	if (LifeSys)
+	{
+		LifeSys->SetMotherMutationDuration(MotherMutationDurationSeconds);
+		LifeSys->SetTotalRounds(TotalRounds);
+		LifeSys->SetZombieMatchDuration(ZombieMatchDurationSeconds);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameMode] 注入 LifecycleSubsystem: MotherMutationDuration=%.2fs, TotalRounds=%d, ZombieMatchDuration=%ds"),
+			MotherMutationDurationSeconds, TotalRounds, ZombieMatchDurationSeconds);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] InjectSubsystemConfigs: URoomLifecycleSubsystem 不可用 (World 未就绪), 跳过 LifecycleSubsystem 注入"));
+	}
+
+	// 【v93.1 大厂架构新增】注入 MotherMutationSubsystem — 母体变异业务权威调度
+	// 大厂原则 — 对称设计: 与上述 4 个 Subsystem 注入流程一致
+	//   - GameMode 找到 Subsystem (URoomMotherMutationSubsystem::Get(this))
+	//   - 调 InitializeSubsystem() 注入依赖 (GameMode / Lifecycle / Spawn)
+	//   - 大厂原则 — 显式依赖注入, 不允许 lazy 解析 (避免时序 bug)
+	//
+	// 为什么独立注入:
+	//   - MotherMutationSubsystem 业务有 3 个依赖 (GameMode / Lifecycle / Spawn)
+	//   - Lifecycle 和 Spawn 已经在上面获取过, 这里直接复用
+	//   - 即使 Lifecycle / Spawn 为空, 也要 InitializeSubsystem 注入 (MotherMutationSubsystem 内部已防御)
+	if (URoomMotherMutationSubsystem* MutationSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		// 复用上面已经获取的 SpawnSys / LifeSys (可能为 nullptr, MotherMutationSubsystem 内部 Log Error + 容忍)
+		MutationSys->InitializeSubsystem(this, LifeSys, SpawnSys);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameMode] 注入 MotherMutationSubsystem: 依赖注入完成 (GameMode=%s Lifecycle=%s Spawn=%s)"),
+			*GetNameSafe(this), *GetNameSafe(LifeSys), *GetNameSafe(SpawnSys));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] InjectSubsystemConfigs: URoomMotherMutationSubsystem 不可用 (World 未就绪), 跳过 MotherMutationSubsystem 注入"));
+	}
 }
 
 

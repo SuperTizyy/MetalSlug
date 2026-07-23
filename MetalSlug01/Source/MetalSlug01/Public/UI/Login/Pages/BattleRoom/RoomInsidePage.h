@@ -10,6 +10,7 @@
 #include "Components/ComboBoxString.h"
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Enums/CombatEnums.h"  // 【v56 重构】EWeaponMeshType (武器类型过滤)
+#include "Data/Enums/RoomEnums.h"    // 【v93 新增】ERoomMatchMode (游戏模式)
 #include "RoomInsidePage.generated.h"
 
 // 前向声明所有用到的 UI 控件
@@ -24,6 +25,9 @@ class UUniformGridPanel;
 class UOverlay;
 class UWeaponIconWidget;
 class UDataTable;
+class UCanvasPanel;  // 【v93 新增】刀战/生化模式容器
+class UWrapBox;      // 【v93 新增】生化模式专用横向自动换行玩家标签容器
+class UPanelWidget;  // 【v93 修复】CreatePlayerLabelInBox 入参基类 (兼容 VerticalBox + WrapBox)
 
 
 /**
@@ -163,6 +167,17 @@ protected:
 	UFUNCTION()
 	void OnRoomServicePlayerLeft(const FString& PlayerName);
 
+	// ==========================================================
+	// 【v93 新增】游戏模式变化响应
+	// ==========================================================
+
+	/**
+	 * 【v93 大厂架构】游戏模式切换回调（GameState.OnMatchModeChanged 触发）
+	 * @param NewMode 新模式（Melee/Zombie）
+	 */
+	UFUNCTION()
+	void OnGameStateMatchModeChanged(ERoomMatchMode NewMode);
+
 	// ==========================================
 	// 3. 攻守方玩家列表相关控件
 	// ==========================================
@@ -172,6 +187,59 @@ protected:
 
 	/** 守方列表容器: 用于显示所有加入守方的玩家条目 */
 	UPROPERTY(meta = (BindWidget)) TObjectPtr<UVerticalBox> Box_DefenseTeam;
+
+	// ==========================================================
+	// 【v93 新增】刀战/生化模式分离容器（按模式显示/隐藏）
+	// ==========================================================
+
+	/**
+	 * 【v93 大厂架构】刀战模式 CanvasPanel 容器
+	 *
+	 * 大厂原则 — 职责对等 + 互斥显示:
+	 *   - Canvas_MeleeContainer: 刀战模式专用, 内含 Box_AttackTeam/Box_DefenseTeam/武器槽/AI 面板等
+	 *   - Canvas_ZombieContainer: 生化模式专用, 内含 WrapBox_ZombiePlayers
+	 *   - 两个 Canvas 互斥显示: 单一模式, 单一可见 Canvas
+	 *
+	 * 蓝图要求:
+	 *   - BP_WBP_RoomInsidePage 内必须新建一个名为 Canvas_MeleeContainer 的 CanvasPanel 控件
+	 *   - 把现有 Box_AttackTeam/Box_DefenseTeam + 武器槽 + AI 面板等"刀战专属 UI"全部移入 Canvas_MeleeContainer
+	 *
+	 * 模式切换:
+	 *   - 由 ApplyVisibilityByMode(ERoomMatchMode) 统一控制 Visible/Collapsed
+	 *   - Melee → Visible / Zombie → Collapsed
+	 */
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UCanvasPanel> Canvas_MeleeContainer;
+
+	/**
+	 * 【v93 大厂架构】生化模式 CanvasPanel 容器
+	 *
+	 * 大厂原则 — 互斥显示 + WrapBox 取代 VerticalBox:
+	 *   - 生化模式玩家数量多 (8~10 个), 用 VerticalBox 纵向堆叠会超出屏幕
+	 *   - WrapBox 横向自动换行, 适配生化模式多人场景
+	 *
+	 * 蓝图要求:
+	 *   - BP_WBP_RoomInsidePage 内必须新建一个名为 Canvas_ZombieContainer 的 CanvasPanel 控件
+	 *   - 把 WrapBox_ZombiePlayers 移入 Canvas_ZombieContainer
+	 *
+	 * 模式切换:
+	 *   - Melee → Collapsed / Zombie → Visible
+	 */
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UCanvasPanel> Canvas_ZombieContainer;
+
+	/**
+	 * 【v93 大厂架构】WrapBox 容器（生化模式专用）
+	 *
+	 * 大厂原则 — 职责对等 + 数据流对称:
+	 *   - 刀战模式: Box_AttackTeam/Box_DefenseTeam (VerticalBox) 按阵营分桶
+	 *   - 生化模式: WrapBox_ZombiePlayers (WrapBox) 单容器横向自动换行, 不分阵营
+	 *   - RefreshRoomUI 根据 MatchMode 决定渲染到哪个容器
+	 *
+	 * 蓝图要求:
+	 *   - BP_WBP_RoomInsidePage 内必须新建一个名为 WrapBox_ZombiePlayers 的 WrapBox 控件
+	 *   - 放在 Canvas_ZombieContainer 内
+	 *   - 刀战模式不可见 (Canvas_ZombieContainer 整体 Collapsed)
+	 */
+	UPROPERTY(meta = (BindWidget)) TObjectPtr<UWrapBox> WrapBox_ZombiePlayers;
 
 	/** 加入攻方按钮 */
 	UPROPERTY(meta = (BindWidget)) TObjectPtr<UButton> Btn_JoinAttackTeam;
@@ -656,8 +724,35 @@ private:
 	 * @param LocalAccountName 本机账号名 (兜底本地房主判定)
 	 * @param bLabelReady 该 label 准备状态 (AI 永远 false) — 与类成员 bIsReady 区分
 	 */
+	/**
+	 * 【2026.07.11 v29 大厂架构重构 + v93 修复】内部辅助: 在指定容器里创建 UPlayerLabelWidget
+	 *
+	 * 设计动机:
+	 *   旧 (v28) 错误做法: RefreshRoomUI 内联 70 行 widget 创建/属性设置逻辑, 真人 + AI 各一份
+	 *     → 重复代码, 改一处忘一处, 易出 bug
+	 *   新 (v29): 抽出 CreatePlayerLabelInBox, 真人 + AI 共用, 单点真理
+	 *
+	 * 【v93 修复】参数类型从 UVerticalBox* 改为 UPanelWidget*:
+	 *   - 旧版硬编码 UVerticalBox*, 无法接受 UWrapBox* (生化模式 WrapBox 容器)
+	 *   - 编译错误 C2664: "无法将 TObjectPtr<UWrapBox> 转换为 UVerticalBox*"
+	 *   - UVerticalBox 和 UWrapBox 都是 UPanelWidget 子类, 用基类更符合大厂原则 (类型对等)
+	 *   - 内部用 UPanelWidget::AddChild(UWidget*) 基类 API, 无需区分 VerticalBox/WrapBox
+	 *
+	 * 大厂原则:
+	 *   - 单一入口: widget 创建 + 属性设置逻辑只在此一处
+	 *   - 显式参数: bIsAI 显式传 (不再依赖 PName.StartsWith("[AI]") 字符串约定)
+	 *   - 零兜底: TargetBox 为空或 PlayerLabel 创建失败 → Log Error + 不渲染 (显式问题)
+	 *
+	 * @param TargetBox 目标容器 (刀战 Box_AttackTeam/Box_DefenseTeam / 生化 WrapBox_ZombiePlayers)
+	 * @param PName 玩家/AI 名字
+	 * @param bIsAI 是否 AI 占位
+	 * @param CurrentHostName 服务器权威房主名
+	 * @param bAmILocalHost 本机是否房主 (从 NetMode 权威判断得来)
+	 * @param LocalAccountName 本机账号名 (兜底本地房主判定)
+	 * @param bLabelReady 该 label 准备状态 (AI 永远 false) — 与类成员 bIsReady 区分
+	 */
 	void CreatePlayerLabelInBox(
-		UVerticalBox* TargetBox,
+		UPanelWidget* TargetBox,
 		const FString& PName,
 		bool bIsAI,
 		const FString& CurrentHostName,
@@ -675,6 +770,29 @@ private:
 	 *   - RefreshRoomUI 末尾 (房主身份可能在订阅期间变化)
 	 */
 	void UpdateHostVisibility();
+
+	// ==========================================================
+	// 【v93 新增】按模式控制 Canvas 显示/隐藏
+	// ==========================================================
+
+	/**
+	 * 【v93 大厂架构】根据游戏模式, 控制 Canvas_MeleeContainer / Canvas_ZombieContainer 的 Visible/Collapsed
+	 *
+	 * 大厂原则 — 单一入口 + 互斥显示:
+	 *   - Melee 模式: Canvas_MeleeContainer=Visible / Canvas_ZombieContainer=Collapsed / WrapBox_ZombiePlayers=Collapsed
+	 *   - Zombie 模式: Canvas_MeleeContainer=Collapsed / Canvas_ZombieContainer=Visible / WrapBox_ZombiePlayers=Visible
+	 *   - None/其他: 全部 Collapsed + Log Error (零兜底, 强制修复 GameMode)
+	 *
+	 * 触发点:
+	 *   - NativeConstruct (widget 首次创建时)
+	 *   - OnGameStateMatchModeChanged (服务器同步房间模式变化时)
+	 *   - RefreshRoomUI 末尾 (作为兜底, 防止模式切换后 Canvas 状态不一致)
+	 *
+	 * 内部行为:
+	 *   - 清空模式不匹配的 Box (避免残留旧模式的 widget)
+	 *   - 触发 RefreshRoomUI 重新渲染当前模式的玩家标签
+	 */
+	void ApplyVisibilityByMode(ERoomMatchMode Mode);
 
 	/**
 	 * 【Bug1 P0 修复】兜底函数: 遍历本机玩家 VBox, 把对应本地账号的 PlayerLabel 强制标为房主

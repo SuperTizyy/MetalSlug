@@ -185,6 +185,10 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ARoomGameState, MatchEndTime);
 	DOREPLIFETIME(ARoomGameState, HostPlayerName);
 	DOREPLIFETIME(ARoomGameState, CurrentRound);
+
+	// 【v92 大厂架构重构】TotalRounds Replicated (替换 ZombieTotalRounds)
+	DOREPLIFETIME(ARoomGameState, TotalRounds);
+
 	DOREPLIFETIME(ARoomGameState, AttackerTotalKills);
 	DOREPLIFETIME(ARoomGameState, DefenderTotalKills);
 	DOREPLIFETIME(ARoomGameState, AttackerWins);
@@ -192,6 +196,15 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 
 	// 【v46 新增】AI 占位队列复制
 	DOREPLIFETIME(ARoomGameState, ReplicatedPendingAIQueue);
+
+	// 【v92 新增】母体变异倒计时复制
+	DOREPLIFETIME(ARoomGameState, MotherMutationStartTime);
+	DOREPLIFETIME(ARoomGameState, MotherMutationDuration);
+
+	// 【v93.1 新增】母体变异触发标志 + 次数复制 (防重入层 2 + 业务统计)
+	// 大厂原则 — 镜像 v27 FactionTag: 没有 DOREPLIFETIME = 客户端永远是默认值 → 防重入失效
+	DOREPLIFETIME(ARoomGameState, MotherMutationHasFired);
+	DOREPLIFETIME(ARoomGameState, MotherMutationCount);
 }
 
 
@@ -208,6 +221,345 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 void ARoomGameState::OnRep_CurrentRound()
 {
 	OnCurrentRoundUpdated.Broadcast(CurrentRound);
+}
+
+
+// ==========================================
+// 【v92 大厂架构重构】总局数同步 (替换 ZombieTotalRounds)
+// ==========================================
+
+/**
+ * OnRep_TotalRounds
+ *
+ * 客户端接到 TotalRounds 同步时的回调
+ * 触发 OnTotalRoundsUpdated 委托, UI 立即刷新 "总局数：xx" 显示
+ *
+ * 大厂原则 — 与 OnRep_CurrentRound 对称:
+ *   - CurrentRound: 内部计数器, UI 不订阅, 由 LifecycleSubsystem 内部用
+ *   - TotalRounds: UI 真理源, UI 订阅 OnTotalRoundsUpdated
+ *   - 两个字段职责完全分离 (内部 vs UI)
+ */
+void ARoomGameState::OnRep_TotalRounds()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_TotalRounds: 总局数同步! TotalRounds=%d"),
+		TotalRounds);
+
+	OnTotalRoundsUpdated.Broadcast(TotalRounds);
+}
+
+
+/**
+ * SetTotalRounds (服务器专用)
+ *
+ * 大厂原则 — 显式优于隐式 (零兜底):
+ *   - InTotalRounds < 1 → Log Error + return (强制修复 GameMode 配置)
+ *   - 服务器不写"非权威默认值" (如 5), 让 Bug 立即暴露
+ *   - 服务器写入字段后立即手动 Broadcast (自身 OnRep 不触发)
+ */
+void ARoomGameState::SetTotalRounds(int32 InTotalRounds)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetTotalRounds: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	if (InTotalRounds < 1)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetTotalRounds: InTotalRounds=%d < 1, 拒绝写入. "
+			     "【修复】检查 GameMode.TotalRounds 字段配置 (ClampMin=1)."),
+			InTotalRounds);
+		return;
+	}
+
+	TotalRounds = InTotalRounds;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 OnRep_HostPlayerName)
+	OnTotalRoundsUpdated.Broadcast(TotalRounds);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] SetTotalRounds: 总局数已设置! TotalRounds=%d"),
+		TotalRounds);
+}
+
+
+// ==========================================
+// 【v93 大厂架构新增】房间模式同步 (修复 OnRep 永远不 Broadcast 的 Bug)
+// ==========================================
+//
+// 根因:
+//   - GameState.CurrentMatchMode 在 v53 是 Replicated, 但没有 OnRep_CurrentMatchMode
+//   - GameFlowSubsystem.cpp:435 直接 GS->CurrentMatchMode = RoomMode (绕开 OnRep 路径)
+//   - OnMatchModeChanged 委托存在但永远不 Broadcast
+//   - UI 订阅者 (URoomInsidePage) 永远收不到"模式变了"通知
+//
+// 修复 (v93 大厂架构):
+//   - ReplicatedUsing = OnRep_CurrentMatchMode → 客户端 OnRep 自动 Broadcast
+//   - 服务器写入走 SetCurrentMatchMode 公开 API → 服务器手动 Broadcast (镜像 SetTotalRounds)
+//   - GameFlowSubsystem 改用 GS->SetCurrentMatchMode(RoomMode) (单一入口, 显式优于隐式)
+// ==========================================
+
+/**
+ * OnRep_CurrentMatchMode
+ *
+ * 客户端接到 CurrentMatchMode 同步时的回调
+ * 触发 OnMatchModeChanged 委托, UI 立即响应 (URoomInsidePage 切换 Melee/Zombie 容器显隐)
+ *
+ * 大厂原则 — 与 OnRep_TotalRounds 对称:
+ *   - OnRep_TotalRounds: 服务器写入 → 客户端 OnRep → Broadcast OnTotalRoundsUpdated
+ *   - OnRep_CurrentMatchMode: 服务器写入 → 客户端 OnRep → Broadcast OnMatchModeChanged
+ *   - 两条路径完全对称 (UE 引擎 OnRep 机制保证跨网络同步触发)
+ */
+void ARoomGameState::OnRep_CurrentMatchMode()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_CurrentMatchMode: 房间模式同步! CurrentMatchMode=%d"),
+		static_cast<int32>(CurrentMatchMode));
+
+	OnMatchModeChanged.Broadcast(CurrentMatchMode);
+}
+
+
+/**
+ * SetCurrentMatchMode (服务器专用)
+ *
+ * 大厂原则 — 显式优于隐式 (零兜底):
+ *   - 不允许: 外部代码直接 GS->CurrentMatchMode = NewMode (绕过 OnRep 路径, 不触发 Broadcast)
+ *   - 必须: 走 SetCurrentMatchMode 公开 API (镜像 SetTotalRounds 模式)
+ *   - NewMode == None → Log Error + 拒绝写入 (强制修复调用方)
+ *   - 服务器写入字段后立即手动 Broadcast (自身 OnRep 不触发)
+ *
+ * 调用方:
+ *   - UGameFlowSubsystem::EnterSkipToHostMode (测试模式写入 RoomMode)
+ *
+ * @param NewMode 新模式 (必须为 Melee 或 Zombie, 不允许 None)
+ */
+void ARoomGameState::SetCurrentMatchMode(ERoomMatchMode NewMode)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetCurrentMatchMode: 客户端调用非法, HasAuthority=false. "
+			     "【修复】SetCurrentMatchMode 必须由服务器调用 (例如 GameFlowSubsystem)."));
+		return;
+	}
+
+	if (NewMode == ERoomMatchMode::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetCurrentMatchMode: NewMode=None 拒绝写入. "
+			     "【修复】调用方必须传入合法模式 (Melee/Zombie). "
+			     "【背景】None 表示未配置模式, 不允许写入 GameState."));
+		return;
+	}
+
+	CurrentMatchMode = NewMode;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 OnRep_TotalRounds)
+	OnMatchModeChanged.Broadcast(CurrentMatchMode);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] SetCurrentMatchMode: 房间模式已设置! CurrentMatchMode=%d"),
+		static_cast<int32>(CurrentMatchMode));
+}
+
+
+// ==========================================
+// 【v92 大厂架构新增】生化模式母体变异倒计时
+// ==========================================
+
+/**
+ * OnRep_MotherMutationState
+ *
+ * 客户端接到 MotherMutationStartTime/Duration 同步时的回调
+ * 触发 OnMotherMutationChanged 委托, Widget 收到事件后用 GetServerWorldTimeSeconds() 计算剩余秒数
+ *
+ * 大厂原则 — 镜像 OnRep_CurrentRound:
+ *   - 不在 OnRep 内强制刷 UI (零兜底, 业务方自行决定)
+ *   - 只负责 Broadcast, UI 自己用 DirtyFlag + NativeTick 渲染
+ */
+void ARoomGameState::OnRep_MotherMutationState()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_MotherMutationState: 母体变异倒计时同步! StartTime=%.2f, Duration=%.2f"),
+		MotherMutationStartTime, MotherMutationDuration);
+
+	OnMotherMutationChanged.Broadcast(MotherMutationStartTime, MotherMutationDuration);
+}
+
+
+/**
+ * GetMotherMutationRemainingSeconds
+ *
+ * 计算母体变异倒计时剩余秒数
+ * 使用 GetServerWorldTimeSeconds() 自适应网络延迟
+ *
+ * 大厂原则 — 镜像 GetMatchRemainingSeconds:
+ *   - 服务器未启动倒计时 (Duration <= 0) → 返回 0
+ *   - 倒计时已结束 → 返回 0 (不允许负数)
+ *
+ * @return 剩余秒数（最小为 0）
+ */
+int32 ARoomGameState::GetMotherMutationRemainingSeconds() const
+{
+	// 服务器未启动倒计时, 返回 0
+	if (MotherMutationDuration <= 0.0f || MotherMutationStartTime <= 0.0f)
+	{
+		return 0;
+	}
+
+	// 使用内置的获取服务器预估世界时间的方法, 自动消除客户端与服务器端的时间差
+	const float CurrentServerTime = GetServerWorldTimeSeconds();
+
+	// 计算倒计时结束时间戳 + 剩余秒数 (钳制到 0 以上)
+	const float EndTime = MotherMutationStartTime + MotherMutationDuration;
+	const int32 RemainingSeconds = FMath::Max(0, FMath::RoundToInt(EndTime - CurrentServerTime));
+	return RemainingSeconds;
+}
+
+
+/**
+ * StartMotherMutationCountdown (服务器专用)
+ *
+ * 启动母体变异倒计时
+ * 写入 MotherMutationStartTime/Duration, 引擎自动 Replicate 到所有客户端
+ * OnRep_MotherMutationState 会在客户端触发 OnMotherMutationChanged 广播
+ *
+ * 大厂原则 — 零兜底:
+ *   - Duration <= 0 → Log Error + return (强制业务方传有效值)
+ *   - 服务器只写权威字段, 客户端本地计算剩余秒数
+ *
+ * @param Duration 倒计时总秒数 (必须 > 0)
+ */
+void ARoomGameState::StartMotherMutationCountdown(float Duration)
+{
+	// 仅在服务器端执行
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] StartMotherMutationCountdown: 客户端调用非法, HasAuthority=false. 仅服务器可启动倒计时."));
+		return;
+	}
+
+	// 大厂原则 — 零兜底: Duration 必须 > 0
+	if (Duration <= 0.0f)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] StartMotherMutationCountdown: Duration=%.2f 必须 > 0, 拒绝启动. "
+			     "【修复】检查 LifecycleSubsystem 注入的 MotherMutationDurationSeconds 配置."),
+			Duration);
+		return;
+	}
+
+	// 写入 Replicated 字段 (引擎自动复制)
+	MotherMutationStartTime = GetServerWorldTimeSeconds();
+	MotherMutationDuration = Duration;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 OnRep_HostPlayerName 等其他字段)
+	OnMotherMutationChanged.Broadcast(MotherMutationStartTime, MotherMutationDuration);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] StartMotherMutationCountdown: 母体变异倒计时已启动! StartTime=%.2f, Duration=%.2fs"),
+		MotherMutationStartTime, MotherMutationDuration);
+}
+
+
+/**
+ * ResetMotherMutationCountdown (服务器专用)
+ *
+ * 重置母体变异倒计时 (关闭倒计时)
+ * 写入 StartTime/Duration = 0, 客户端 GetMotherMutationRemainingSeconds() 自动返回 0
+ *
+ * 用途: 倒计时到期后, 服务器主动关闭, 客户端 Widget 收到事件后隐藏 TextBlock
+ */
+void ARoomGameState::ResetMotherMutationCountdown()
+{
+	// 仅在服务器端执行
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	MotherMutationStartTime = 0.0f;
+	MotherMutationDuration = 0.0f;
+
+	// 服务器自身不会触发 OnRep, 手动广播
+	OnMotherMutationChanged.Broadcast(0.0f, 0.0f);
+
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] ResetMotherMutationCountdown: 母体变异倒计时已重置."));
+}
+
+
+// ==========================================
+// 【v93.1 大厂架构新增】母体变异触发标志 — 防重入
+// ==========================================
+
+/**
+ * MarkMotherMutationFired — 服务器专用
+ *
+ * 大厂原则 — 显式优于隐式:
+ *   - 仅服务器可调用 (HasAuthority 校验)
+ *   - 写入 Replicated 字段 → 自动同步到客户端
+ *   - 业务约束: 一局比赛只能调用一次 (URoomMotherMutationSubsystem 内已防重入, 这里再加一道防御)
+ *
+ * 调用方:
+ *   - URoomMotherMutationSubsystem::HandleCountdownExpired (倒计时到期, 已选好母体)
+ */
+void ARoomGameState::MarkMotherMutationFired()
+{
+	// 大厂原则 — 服务器权威校验
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] MarkMotherMutationFired: 客户端调用非法, HasAuthority=false. 仅服务器可标记."));
+		return;
+	}
+
+	if (MotherMutationHasFired)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameState] MarkMotherMutationFired: MotherMutationHasFired 已为 true, 重复调用. "
+			     "【根因】URoomMotherMutationSubsystem 防重入失效, 检查 bMotherMutationFired_Local 字段."));
+		return;
+	}
+
+	MotherMutationHasFired = true;
+	MotherMutationCount++;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomGameState] MarkMotherMutationFired: 已标记母体变异触发 (Count=%d)"),
+		MotherMutationCount);
+}
+
+
+/**
+ * ResetMotherMutationHasFired — 服务器专用 (新回合 / 模式切换)
+ *
+ * 大厂原则 — 显式优于隐式:
+ *   - 仅服务器可调用 (HasAuthority 校验)
+ *   - MotherMutationCount 不清 (业务统计字段, 应保留历史)
+ *
+ * 调用方:
+ *   - URoomLifecycleSubsystem::StartMotherMutationCountdown (新局开始)
+ *   - URoomLifecycleSubsystem::HandleZombieRoundEnd (本局结束)
+ */
+void ARoomGameState::ResetMotherMutationHasFired()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] ResetMotherMutationHasFired: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	MotherMutationHasFired = false;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] ResetMotherMutationHasFired: 防重入标志已重置 (MotherMutationCount=%d 保留)"),
+		MotherMutationCount);
 }
 
 

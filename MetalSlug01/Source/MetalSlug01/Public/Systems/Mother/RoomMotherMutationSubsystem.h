@@ -1,0 +1,184 @@
+// Copyright (c) 2026. All Rights Reserved.
+// URoomMotherMutationSubsystem — 生化模式母体变异业务权威调度
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Subsystems/WorldSubsystem.h"
+#include "UObject/ObjectPtr.h"
+#include "GameplayTagContainer.h"
+#include "RoomMotherMutationSubsystem.generated.h"
+
+class ABaseCharacter;
+class ARoomGameMode;
+class ARoomGameState;
+class URoomLifecycleSubsystem;
+class URoomSpawnSubsystem;
+
+/**
+ * 【大厂架构 — 单一职责】母体变异业务子系统
+ *
+ * 职责边界:
+ *   - 本 Subsystem 唯一负责: 倒计时到期 → 选母体 → 触发变异
+ *   - 不负责: 倒计时显示 (URoomLifecycleSubsystem + ARoomGameState 已就绪)
+ *   - 不负责: Pawn 生成/销毁 (URoomSpawnSubsystem 唯一真理源)
+ *   - 不负责: 阵营系统 (FFactionTags 单一真理源)
+ *
+ * 大厂原则 — 零兜底:
+ *   - GameMode 找不到 → Log Error + 中断
+ *   - 选母体清单为空 → Log Error + 不选
+ *   - BP_MuTi 蓝图类加载失败 → Log Error + 不变异 (防止"半截变异")
+ *
+ * 大厂原则 — RPC 边界:
+ *   - 服务器: 本 Subsystem 在 GameMode 中执行 HasAuthority 校验后, 通过 Multicast_PlayMutationFX 广播
+ *   - 客户端: 只被动接收 (MutatedTargetName 用来 UI 显示, 母体本人不显示自己)
+ *
+ * 调用链 (服务器权威):
+ *   URoomLifecycleSubsystem::StartMotherMutationCountdown
+ *     └─ SetTimer 到期 → URoomMotherMutationSubsystem::HandleCountdownExpired (Server)
+ *         ├─ 1. 校验重入 (MotherMutationHasFired)
+ *         ├─ 2. 收集活着的"人类"角色 (GetEligibleHumanTargets)
+ *         ├─ 3. 随机选 1 个 (SelectRandomTarget)
+ *         ├─ 4. 调 ARoomGameState::MarkMotherMutationFired (Replicated 标记, 防重复触发)
+ *         └─ 5. 调 MutateCharacterToMother(Selected) (核心业务)
+ *             ├─ 服务器: 销毁旧 Pawn + 用 BP_MuTi 蓝图类 Spawn 新 Pawn (走 SpawnSubsystem)
+ *             ├─ 服务器: 写 Selected->Multicast_PlayMutationFX(TargetName, NewClassPath)
+ *             └─ 客户端: 收到 RPC → 播母体变异特效 + UI 提示
+ */
+UCLASS()
+class METALSLUG01_API URoomMotherMutationSubsystem : public UWorldSubsystem
+{
+	GENERATED_BODY()
+
+public:
+	/**
+	 * 【大厂原则 — 标准子系统钩子】只在 Game World 实例化, 不在 Editor/Preview 实例化
+	 * 大厂原则: 子系统若不写 ShouldCreateSubsystem, 在编辑器世界也会创建 → 浪费内存
+	 */
+	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
+
+	/**
+	 * 【标准 Subsystem Get 接口 — 镜像其他 Room Subsystem 风格 (v31.5 教训)】
+	 *
+	 * 大厂原则 — UE 子系统访问标准模式:
+	 *   - WorldContextObject → GetWorld() → World->GetSubsystem<URoomMotherMutationSubsystem>()
+	 *   - 调用方使用 `URoomMotherMutationSubsystem::Get(this)` 一行拿到
+	 *
+	 * 为什么不放 UPROPERTY 字段:
+	 *   - UE WorldSubsystem 是由 World 自动管理的, 不需要引用计数
+	 *   - World 卸载时 Subsystem 自动销毁 (UE 引擎保证)
+	 *
+	 * @param WorldContextObject UE 标准 Context Object (this / World / GameInstance 等)
+	 * @return 找到的 Subsystem, nullptr=World 未就绪 或 Game World 不是 Subsystem 管理范围
+	 */
+	static URoomMotherMutationSubsystem* Get(const UObject* WorldContextObject);
+
+	/**
+	 * 【依赖注入 — 镜像 v31.5 风格】服务器初始化时由 ARoomGameMode::InjectSubsystemConfigs 调用
+	 * 大厂原则 — 显式依赖: 不允许 lazy 解析 (URoomSpawnSubsystem 等都可能晚于本子系统初始化)
+	 *
+	 * @param InGameMode  GameMode 引用 (业务调用与权威校验的入口)
+	 * @param InLifecycle 倒计时权威 (本子系统从它接收"倒计时到期"事件)
+	 * @param InSpawn     Pawn 生成权威 (MutateCharacterToMother 通过它重建母体 Pawn)
+	 */
+	void InitializeSubsystem(ARoomGameMode* InGameMode,
+	                         URoomLifecycleSubsystem* InLifecycle,
+	                         URoomSpawnSubsystem* InSpawn);
+
+	/**
+	 * 【服务器权威入口 — 倒计时到期回调】
+	 *
+	 * 大厂原则 — RPC 时序保证:
+	 *   - 本函数由 URoomLifecycleSubsystem::SetTimer 在 Duration 到期时调用 (Server only)
+	 *   - 客户端不调本函数 — 客户端倒计时走 GameState OnRep + UI 自渲染
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 调用前必须校验 HasAuthority (由 LifecycleSubsystem 调用方负责, 本函数内仍 defensive 检查)
+	 *   - 选母体失败/重复触发 → Log Error + 提前返回, 不允许"沉默失败"
+	 */
+	void HandleCountdownExpired();
+
+	/**
+	 * 【业务核心 — 母体变异】把一个角色变成 BP_MuTi 母体
+	 *
+	 * 大厂原则 — 单一入口:
+	 *   - 本函数是"对局内任何角色变母体"的唯一入口
+	 *   - 触发场景: HandleCountdownExpired 倒计时到期; 后续可能扩展 (感染 / 触发器等)
+	 *
+	 * @param Target  被选中的目标角色 (必须是有效且活着的 Pawn)
+	 * @return true=变异成功, false=变异失败 (Log Error 已记录)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Mother")
+	bool MutateCharacterToMother(ABaseCharacter* Target);
+
+	/**
+	 * 【业务查询 — 已变母体清单】对局内所有母体 (用于 UI / 胜负判定)
+	 * 大厂原则 — 镜像 v39: 母体账本是"业务层唯一真理源", 不依赖 GetAllActorsOfClass 散查
+	 *
+	 * 注意: 不用 UFUNCTION 标记 — 返回 const TArray<TWeakObjectPtr<...>>& 不被 UHT 支持
+	 *       (BlueprintPure 反射不允许 const T& 返回值), 走 C++ 直接调
+	 *
+	 * @return 弱引用数组 (避免持有悬空指针)
+	 */
+	const TArray<TWeakObjectPtr<ABaseCharacter>>& GetMotherCharacters() const { return MotherCharacters; }
+
+	/**
+	 * 【业务查询 — 母体变异计数】对局内已触发母体变异的总次数 (Replicated)
+	 * 大厂原则 — SSOT: ARoomGameState::MotherMutationCount 是唯一真理源, 本函数转发
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Mother")
+	int32 GetMotherMutationCount() const;
+
+protected:
+	/** GameMode 引用 (业务调用与权威校验的入口) */
+	UPROPERTY(Transient)
+	TObjectPtr<ARoomGameMode> GameMode;
+
+	/** 倒计时权威 — 用于反向查询当前倒计时状态 */
+	UPROPERTY(Transient)
+	TObjectPtr<URoomLifecycleSubsystem> Lifecycle;
+
+	/** Pawn 生成权威 — 用于重建母体 Pawn */
+	UPROPERTY(Transient)
+	TObjectPtr<URoomSpawnSubsystem> Spawn;
+
+	/** 母体账本 — 业务层唯一真理源 (与 v39 SpawnedAICharacters 同思路) */
+	UPROPERTY(Transient)
+	TArray<TWeakObjectPtr<ABaseCharacter>> MotherCharacters;
+
+	/**
+	 * 【重入守卫 — 服务器本地】本子系统内"已触发变异" 标记
+	 *
+	 * 大厂原则 — 多层防御:
+	 *   - 防御层 1 (本字段): 单进程内防止 HandleCountdownExpired 被重复调
+	 *   - 防御层 2 (ARoomGameState::MotherMutationHasFired): 跨进程/客户端防重入
+	 *
+	 * 注意: 真正的分布式真理源是 GameState.MotherMutationHasFired (Replicated)
+	 *       本字段只是性能优化 + 防御性 guard
+	 */
+	bool bMotherMutationFired_Local = false;
+
+	/**
+	 * 【业务核心 — 选母体清单】收集对局内所有"有效人类目标"
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 找不到任何人 → 返回空数组 (由调用方决定是否 Log Error)
+	 *   - 已变母体的不返回 (否则会出现"母体二次变异")
+	 *   - 已死的角色不返回 (死人不可能再变异)
+	 *
+	 * @return 活着的"人类"角色数组
+	 */
+	TArray<ABaseCharacter*> GetEligibleHumanTargets();
+
+	/**
+	 * 【业务核心 — 随机选母体】从候选清单随机选 1 个
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 候选空 → Log Error + return nullptr
+	 *   - 选出的 nullptr (中途死亡) → Log Error + return nullptr
+	 *
+	 * @param Candidates  候选清单 (来自 GetEligibleHumanTargets)
+	 * @return 选中的目标, nullptr=失败
+	 */
+	ABaseCharacter* SelectRandomTarget(const TArray<ABaseCharacter*>& Candidates);
+};

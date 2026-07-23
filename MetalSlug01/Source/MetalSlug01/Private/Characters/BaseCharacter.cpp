@@ -35,6 +35,10 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "TimerManager.h" // 为了使用定时器
 #include "Weapons/BaseWeapon.h"
+// 【v93.2 大厂架构新增】母体复用 Melee 缝合算法 (MeleeSwStrategy::StartMotherTrace/StopMotherTrace)
+#include "Weapons/MeleeSwStrategy.h"
+// 【v93.2 大厂架构新增】模式校验 — ARoomGameState::CurrentMatchMode (真理源)
+#include "Systems/RoomGameState.h"
 // 【P0 2026.07.06 大厂架构重构】引入 AI 攻击蒙太奇解析器 (职责链兜底)
 // 背景: BP 配置错误 (LightAttackMontages 数组越界) 直接导致 GetAttackMontage 返回 null
 //       旧版硬路径 → AI 不攻击 → 玩家看到"AI 跟着我不打"
@@ -144,8 +148,15 @@ ABaseCharacter::ABaseCharacter()
 	WeaponAttach    = CreateDefaultSubobject<UWeaponAttachmentComponent>(TEXT("WeaponAttach"));
 	CharacterIcon   = CreateDefaultSubobject<UCharacterIconComponent>(TEXT("CharacterIcon"));
 
-	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p"),
-		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent);
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】母体攻击 Strategy
+	//   - 复用 UMeleeSwStrategy 算法 (零重复架构), 但路径走 Owner Mesh (而非武器 Mesh)
+	//   - 每个 Pawn 一份 Strategy (IgnoreActors / LastFrame 状态不能共享)
+	//   - CreateDefaultSubobject 创建 — 默认所有角色都持有, 不论刀战/生化 (刀战路径不调用, 0 影响)
+	//   - bUseOwnerMesh 默认 false (StartMotherTrace 内置 true)
+	MotherTraceStrategy = CreateDefaultSubobject<UMeleeSwStrategy>(TEXT("MotherTraceStrategy"));
+
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p"),
+		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get());
 
 	// ==========================================
 	// 角色模型设置
@@ -477,6 +488,29 @@ void ABaseCharacter::Tick(float DeltaTime)
 	}
 
 	// [REMOVED 2026.07.08 用户指令] 严禁 C++ 兜底移动, AI 100% BT 驱动
+
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】驱动母体 trace 的 BoxTrace 缝合
+	//   - 大厂原则 — 单一真理源: Strategy 内部 TraceState 字段 (IsActive() 派生)
+	//   - 调用方: ANS_MeleeTraceState::NotifyBegin 设 Active=true (经 StartMotherTrace)
+	//   - 退出:   ANS_MeleeTraceState::NotifyEnd   设 Active=false (经 StopMotherTrace)
+	//   - Tick 中: 委托 Strategy.TickDetection 做 BoxTrace (复用现有 Tick 系统)
+	//
+	// 【注意】TickDetection 内部已经处理 TraceState==Idle 的 no-op, 这里不需要再判断
+	// 母体路径 TickDetection 走 Owner Mesh + 母体 Socket, 命中调 Server_ReportMotherAttackHit
+	//
+	// 【v98.1 重复扣血修复 — 母体路径 Tick 守卫】
+	//   母体 trace 在两端都会触发 (UE AnimNotify 在 replicated Montage 上端点都跑):
+	//     - 服务器端命中 → 调 Server_ReportMotherAttackHit → 服务器本地执行 Implementation → 1 次变母体
+	//     - 客户端端命中 → 调 Server_ReportMotherAttackHit RPC → 服务器 Implementation → 又 1 次变母体 ❌
+	//   守卫 (镜像 BaseWeapon::Tick):
+	//     - 服务器端: HasAuthority=true 且 IsLocallyControlled=true (host 玩家/AI) → 跑
+	//     - 客户端端: HasAuthority=false 且 IsLocallyControlled=true (本地玩家) → 跑
+	//     - 远端 Pawn: IsLocallyControlled=false → 跳过 → 不调 RPC
+	//   大厂原则: 单一入口数据源 (Tick 守卫保证同一 Pawn 不会两端同时跑)
+	if (MotherTraceStrategy && (HasAuthority() || IsLocallyControlled()))
+	{
+		MotherTraceStrategy->TickDetection(nullptr, DeltaTime);
+	}
 }
 
 
@@ -513,6 +547,17 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	//       如果不同步, 客户端 Pawn.FactionTag == Empty → AI 看到玩家 = Neutral (默认) →
 	//       bDetectEnemies=true 但 Neutral 被跳过 → 玩家永远不在 BT 视野 → AI 不会追玩家
 	DOREPLIFETIME(ABaseCharacter, FactionTag);
+
+	// 【v93.1 大厂架构新增】母体变异状态同步
+	// 大厂原则 — 单一真理源:
+	//   - 服务器: URoomMotherMutationSubsystem::MutateCharacterToMother 写入 Target->bIsMother = true
+	//   - 客户端: OnRep_bIsMother 收到 → Broadcast 让 BT / UI 知道该角色已变异为母体
+	// 为什么 Replicated:
+	//   - AI BT 需要识别母体 (不走人类攻击逻辑)
+	//   - 玩家 HUD 需要知道"我是母体了, 切母体视角"
+	//   - 镜像 v27 FactionTag: 没有 Replicated = 客户端永远是默认值 → 业务失效
+	DOREPLIFETIME(ABaseCharacter, bIsMother);
+	DOREPLIFETIME(ABaseCharacter, bIsHuman);
 }
 
 
@@ -1324,6 +1369,132 @@ bool ABaseCharacter::Server_ReportAIAttackHit_Validate(AActor* HitActor, float D
 }
 
 
+// ==========================================
+// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】母体攻击命中上报 RPC
+// ==========================================
+// 复用动机 (用户需求 2026.07.25):
+//   - 母体无武器 → 不能走 Weapon->Server_ReportHit
+//   - 但 BoxTrace 缝合算法复用 MeleeSwStrategy (零重复)
+//   - 母体路径: 命中调 Owner->Server_ReportMotherAttackHit (本函数)
+//   - 命中后行为: 玩家 → PlayerComboComponent, AI → AIAttackComponent
+//   - 终极行为: 调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用, 不重复实现)
+//
+// 转发壳模式 (与 Server_ReportAIAttackHit 对称):
+//   - RPC 必在 Actor (UE 5.6 硬约束), 实现转发到账本归属组件
+//   - 玩家/AI 判定: 用 bIsCurrentlyAttackerAI (复用 Server_ReportAIAttackHit 真理源)
+
+void ABaseCharacter::Server_ReportMotherAttackHit_Implementation(AActor* HitActor)
+{
+	// 零兜底 — HitActor 必非空
+	if (!HitActor)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Server_ReportMotherAttackHit: 收到空 HitActor, 忽略."));
+		return;
+	}
+
+	// 大厂原则 — 账本归属: 玩家 → PlayerComboComponent, AI → AIAttackComponent
+	// 决策: 复用 IsAttackerAI() (真理源, 与 Server_ReportAIAttackHit 同源)
+	const bool bIsAI = IsAttackerAI();
+	if (bIsAI)
+	{
+		if (UAIAttackComponent* AI = ResolveAIAttack())
+		{
+			AI->Server_ReportMotherAttackHit_Implementation(HitActor);
+			return;
+		}
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_ReportMotherAttackHit: AI 路径找不到 AIAttackComponent — 拒绝. "
+			     "【v93.2 零兜底】检查 BP 子类 Components 面板."));
+	}
+	else
+	{
+		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+		{
+			Combo->Server_ReportMotherAttackHit_Implementation(HitActor);
+			return;
+		}
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_ReportMotherAttackHit: 玩家路径找不到 PlayerComboComponent — 拒绝. "
+			     "【v93.2 零兜底】检查 BP 子类 Components 面板."));
+	}
+}
+
+
+bool ABaseCharacter::Server_ReportMotherAttackHit_Validate(AActor* HitActor)
+{
+	// 零兜底 — HitActor 必非空
+	if (!HitActor)
+	{
+		return false; // RPC 拒绝 (大厂原则 - 永不静默放行)
+	}
+	return true;
+}
+
+
+// ==========================================
+// 【v93.2 大厂架构】母体 trace 启动/停止 — ANS_MeleeTraceState 入口
+// ==========================================
+// 复用动机 (用户需求 2026.07.25):
+//   - 母体复用 UANS_MeleeTraceState 类 (美术不学新标签)
+//   - ANS_MeleeTraceState::NotifyBegin 内调 OwnerChar->StartMotherTrace(bIsHeavy)
+//   - ANS_MeleeTraceState::NotifyEnd   内调 OwnerChar->StopMotherTrace()
+//
+// 大厂原则 — 不重复架构:
+//   - 委托 MotherTraceStrategy (UMeleeSwStrategy 实例) 走 StartMotherTrace
+//   - Strategy 内部处理 Mesh 校验 / Socket 校验 (零兜底)
+//   - Tick 驱动 BoxTrace 缝合 (复用现有 Tick 系统)
+//
+// 零兜底:
+//   - MotherTraceStrategy == nullptr → Log Error + return false (构造函数已创建, 找不到即配置错)
+
+bool ABaseCharacter::StartMotherTrace(bool bIsHeavy)
+{
+	// 零兜底 — Strategy 必非空 (构造函数 CreateDefaultSubobject 已创建)
+	if (!MotherTraceStrategy)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 为空 — 拒绝启动. "
+			     "【v93.2 零兜底】构造函数应已创建该字段. 检查 BP 子类是否覆盖了 C++ 默认值."));
+		return false;
+	}
+
+	// 模式校验 — 大厂原则: 母体 trace 只在生化模式有效, 刀战模式不调用 (但防御性 Log 仍保留)
+	const AGameStateBase* GameStateBase = GetWorld() ? GetWorld()->GetGameState() : nullptr;
+	if (const ARoomGameState* RoomGS = Cast<ARoomGameState>(GameStateBase))
+	{
+		if (RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter] StartMotherTrace: 当前模式=%d 不是 Zombie — 拒绝启动母体 trace. "
+				     "【v93.2 零兜底】母体攻击只能在生化模式触发."),
+				static_cast<int32>(RoomGS->CurrentMatchMode));
+			return false;
+		}
+	}
+
+	// 委托 Strategy 处理 (Strategy 内部 Socket 校验 / 跨帧状态初始化)
+	// 注: StartMotherTrace 内部设 bUseOwnerMesh=true, 走 Owner Mesh 路径
+	return MotherTraceStrategy->StartMotherTrace(this, bIsHeavy);
+}
+
+
+void ABaseCharacter::StopMotherTrace()
+{
+	// 零兜底 — Strategy 必非空
+	if (!MotherTraceStrategy)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] StopMotherTrace: MotherTraceStrategy 为空 — 拒绝停止. "
+			     "【v93.2 零兜底】构造函数应已创建该字段."));
+		return;
+	}
+
+	// 委托 Strategy 处理 (幂等 — 内部 TraceState=Idle 时 no-op)
+	MotherTraceStrategy->StopMotherTrace(this);
+}
+
+
 /* 下面是旧版实现 (Phase 2 重构前), 保留作参考, 实际不再被调用 — 已被转发壳替代 */
 
 
@@ -1924,6 +2095,22 @@ ABaseWeapon* ABaseCharacter::GetCurrentWeapon() const
 			 "如果是 BP 子类, 检查 Components 面板的 'WeaponAttach' 是否被重命名或删除."),
 		*GetName());
 	return nullptr;
+}
+
+
+/**
+ * 【v93 大厂架构】GetMotherAttackMontage 转发壳实现
+ *
+ * 直接读 this->MotherAttackMontage (Pawn 字段, 真理源), 不走 Component 解析路径
+ * 因为母亲蒙太奇是 Pawn 蓝图配置, 不是 Component 状态.
+ *
+ * 调用方零兜底:
+ *   - PlayerComboComponent 拿到 nullptr → Log Error + return false (拒绝攻击)
+ *   - AIAttackComponent::Multicast_PlayAttackAnim_Implementation 拿到 nullptr → 静默跳过 (客户端路径, 不重复服务器已报错)
+ */
+UAnimMontage* ABaseCharacter::GetMotherAttackMontage() const
+{
+	return MotherAttackMontage;
 }
 
 
@@ -3248,4 +3435,71 @@ void ABaseCharacter::OnReloadPressed(const FInputActionValue& /*Value*/)
 
 	// 转发 (服务器会校验弹药/换弹中, 拒绝 + Log Verbose)
 	CurrentWeapon->Server_StartReload();
+}
+
+
+// ==========================================
+// 【v93.1 大厂架构新增】母体变异 — OnRep + RPC 实现
+// ==========================================
+
+/**
+ * OnRep_bIsMother — 客户端 bIsMother 字段变化时由引擎自动调用
+ *
+ * 大厂原则 — UE 5.6 OnRep:
+ *   - 必须用 UFUNCTION() 标记 (头文件已声明)
+ *   - 客户端独有, 服务器不调用
+ *   - bIsMother 由 false→true 时触发变异广播
+ *
+ * 大厂原则 — 业务分离:
+ *   - 本函数只负责: Broadcast OnMotherStatusChanged + 日志
+ *   - 变身动画 / 粒子 / 音效由 BP 蓝图订阅委托执行 (美术决定具体效果)
+ */
+void ABaseCharacter::OnRep_bIsMother()
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] OnRep_bIsMother: '%s' bIsMother=%d (HasAuthority=%d)"),
+		*GetName(), bIsMother ? 1 : 0, HasAuthority() ? 1 : 0);
+
+	// 大厂原则 — 互斥语义校验 (服务器 MutateCharacterToMother 已同步设置两个字段)
+	// 客户端这里仅做可观测性日志, 不修正 (因为 bIsHuman 已是 Replicated 镜像)
+	if (bIsMother && bIsHuman)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] OnRep_bIsMother: bIsMother=true 但 bIsHuman=true, 互斥语义违反. "
+			     "【根因】服务器 MutateCharacterToMother 没同步写 bIsHuman, 或网络同步丢失. 检查 URoomMotherMutationSubsystem::MutateCharacterToMother."));
+	}
+
+	// 广播委托 (HUD / BP 蓝图订阅播变身特效)
+	if (bIsMother)
+	{
+		OnMotherStatusChanged.Broadcast(GetName());
+	}
+}
+
+
+/**
+ * Multicast_PlayMutationFX_Implementation
+ *
+ * 服务器广播 / 客户端接收 — 播放母体变异视觉特效
+ *
+ * 大厂原则 — RPC 纯数据化 (v31.6):
+ *   - 参数 TargetName 是 FString, 不传 Actor* (UE 网络边界序列化要求)
+ *   - 业务方: URoomMotherMutationSubsystem::MutateCharacterToMother 服务器触发
+ *
+ * 大厂原则 — UE 5.6 NetMulticast 行为:
+ *   - 服务器自己调用时也执行 Implementation (ListenServer)
+ *   - 远端客户端收到时执行 Implementation
+ *   - Dedicated Server 上服务器实例不渲染 (合理 — 服务器不渲染)
+ *
+ * @param TargetName 被变异角色的名称 (服务器本地读 Target->GetName())
+ */
+void ABaseCharacter::Multicast_PlayMutationFX_Implementation(const FString& TargetName)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Multicast_PlayMutationFX: Target='%s', HasAuthority=%d"),
+		*TargetName, HasAuthority() ? 1 : 0);
+
+	// 大厂原则 — 业务分离: 实际特效 / 粒子 / 音效 由 BP 蓝图订阅 OnMotherStatusChanged 执行
+	// 本 RPC 仅做日志 + Broadcast (镜像 Multicast_NotifyKill 的纯数据原则)
+	OnMotherStatusChanged.Broadcast(TargetName);
 }

@@ -5,7 +5,57 @@
 // 标准库 & UE 引擎头文件
 // ==========================================
 #include "CoreMinimal.h"
+// ERoomMatchMode 枚举(用于 ParseMatchModeFromGameModeString 签名)
+#include "Data/Enums/RoomEnums.h"
+// UBlueprintFunctionLibrary 基类(UE 静态工具类标准模式)
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "SessionResult.generated.h"
+
+/**
+ * @class URoomMatchModeUtils
+ * @brief 房间比赛模式转换工具 — 字符串 ↔ ERoomMatchMode 的单一真理源
+ *
+ * 大厂原则 (Single Source of Truth):
+ *   - SessionSettings GAME_MODE 字段(广告层)只能存字符串 ("刀战模式" / "生化模式")
+ *   - GameState CurrentMatchMode(运行时决策层)必须用 ERoomMatchMode 枚举
+ *   - 这两个表示层之间必须有一个**唯一**的转换入口 — 即本工具
+ *   - 任何业务方(创房 / 加入 / GameState写入)都必须走本工具,不允许散落硬编码
+ *
+ * 调用方:
+ *   - LANRoomPage::OnCreateSessionComplete 创房前: PendingGameMode 字符串 → ERoomMatchMode
+ *   - GameFlowSubsystem::HandleStateEntry(InRoom): 把 TargetRoomMode 写入 GameState
+ *   - RoomService::RequestAddAI: 读 GameState->CurrentMatchMode(不再硬编码 Melee)
+ *
+ * 【零兜底原则】:
+ *   - 输入字符串为空 / 未识别 → 返回 ERoomMatchMode::None + Log Error
+ *   - 调用方拿到 None → 必须显式拒绝(不允许静默 fallback 到默认)
+ *
+ * 设计: 继承自 UBlueprintFunctionLibrary (UE 静态工具类标准模式)
+ *   - 不需要实例化, 静态方法直接通过 K2 Node 调用
+ *   - 自动暴露到 BP 蓝图节点列表
+ */
+UCLASS()
+class METALSLUG01_API URoomMatchModeUtils : public UBlueprintFunctionLibrary
+{
+	GENERATED_BODY()
+
+public:
+	/**
+	 * 把 SessionSettings GAME_MODE 字符串(中文 DisplayName)解析为 ERoomMatchMode
+	 * @param GameModeString "刀战模式" / "生化模式" / 其他未识别字符串
+	 * @return ERoomMatchMode::Melee/Zombie 或 ERoomMatchMode::None(失败, 已 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Room", meta = (DisplayName = "Parse Match Mode From Game Mode String"))
+	static ERoomMatchMode ParseMatchModeFromGameModeString(const FString& GameModeString);
+
+	/**
+	 * ERoomMatchMode → 中文 DisplayName(用于 SessionSettings 写回)
+	 * @param Mode 模式枚举
+	 * @return "刀战模式" / "生化模式" / 空字符串(失败)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Room", meta = (DisplayName = "Get Game Mode String From Match Mode"))
+	static FString GetGameModeStringFromMatchMode(ERoomMatchMode Mode);
+};
 
 /**
  * @struct FRoomSessionResult

@@ -27,6 +27,9 @@
 // 引入会话管理器 (SetSkipLoginRoomDisplayInfo - v54.5.1 skip-login 房间名专用)
 #include "Systems/Session/SessionManagerSubsystem.h"
 
+// 引入 SessionResult.h (URoomMatchModeUtils 字符串↔ERoomMatchMode 转换工具 - v93.1 单一真理源)
+#include "Systems/Session/SessionResult.h"
+
 // 引入 UGameplayStatics 类（提供 OpenLevel 等静态函数）
 // 作用: 用于执行关卡切换、玩家查询等通用静态操作
 #include "Kismet/GameplayStatics.h"
@@ -417,24 +420,39 @@ void UGameFlowSubsystem::BootToLogin()
 			? TEXT("Japanese_Temple_Demo") : TestSettings->DebugSkipBattleMapName;
 
 		// Step 3b: 设房间模式 (GameState.CurrentMatchMode)
-		ERoomMatchMode RoomMode = ERoomMatchMode::Melee;
+		// 【v93 大厂架构修复】必须走 SetCurrentMatchMode 公开 API, 不能直接赋值:
+		//   - 直接赋值 GS->CurrentMatchMode = RoomMode → 绕开 OnRep 路径 → OnMatchModeChanged 永不 Broadcast
+		//   - 走 SetCurrentMatchMode → 服务器手动 Broadcast + 客户端 OnRep 触发 Broadcast → UI 立即响应
+		//   - 这是 UE 5.6 ReplicatedUsing 字段的"显式优于隐式" 规范 (镜像 SetTotalRounds)
+		//
+		// 【v93.1 大厂架构修复】零兜底 + 与正式路径共用单一真理源 (SetTargetRoomMode):
+		//   - 旧 (v93 之前): None → Melee 兜底 (违反零兜底) → 隐藏配置错
+		//   - 新: DebugSkipRoomMode=None → Log Error + 强制开发者在 Project Settings 配置
+		//   - 与正式路径共用同一字段 SetTargetRoomMode → 后续 InitGame 不再触发, 由本分支直接调 GS->SetCurrentMatchMode
+		ERoomMatchMode RoomMode = ERoomMatchMode::None;
 		if (TestSettings)
 		{
 			RoomMode = TestSettings->GetDebugSkipRoomMode();
-			if (RoomMode == ERoomMatchMode::None)
-			{
-				RoomMode = ERoomMatchMode::Melee;
-				UE_LOG(LogGameFlow, Warning,
-					TEXT("[GameFlow][测试绕行] DebugSkipRoomMode=None, 强制用 Melee"));
-			}
 		}
+		// 零兜底: None → 显式报错 + 拒绝写入 GS, 强制修复 Project Settings
+		if (RoomMode == ERoomMatchMode::None)
+		{
+			UE_LOG(LogGameFlow, Error,
+				TEXT("[GameFlow][测试绕行] DebugSkipRoomMode == ERoomMatchMode::None. "
+				     "【零兜底】拒绝默认分配 Melee, 拒绝写入 GS->SetCurrentMatchMode. "
+				     "【修复路径】Project Settings → MetalSlug Test Settings → Debug Skip Room Mode 必须配 1 (Melee) 或 2 (Zombie)."));
+			return;
+		}
+		// 单一真理源: 写入 TargetRoomMode 字段 (与正式路径共用), 让任何后续读取都有一致数据
+		SetTargetRoomMode(RoomMode);
 		if (UWorld* World = GetWorld())
 		{
 			if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
 			{
-				GS->CurrentMatchMode = RoomMode;
+				GS->SetCurrentMatchMode(RoomMode);
 				UE_LOG(LogGameFlow, Log,
-					TEXT("[GameFlow][测试绕行] 已设置 CurrentMatchMode=%d"), (int32)RoomMode);
+					TEXT("[GameFlow][测试绕行] 已设置 CurrentMatchMode=%d (Mode=%s)"),
+					(int32)RoomMode, RoomMode == ERoomMatchMode::Melee ? TEXT("Melee") : TEXT("Zombie"));
 			}
 		}
 
@@ -442,22 +460,21 @@ void UGameFlowSubsystem::BootToLogin()
 		//   根因: TransitToState 会同步广播 OnStateChanged(InRoom)，RoomInsidePage::NativeConstruct
 		//          在广播时就执行，此时必须读到 SkipLoginRoomName，否则显示硬编码默认值 "未命名房间"
 		//   单一职责: SessionManager 是 skip-login 房间名真理源, GameFlowSubsystem 是唯一写入入口
-		FString SkipLoginRoomName;
-		if (RoomMode == ERoomMatchMode::Melee)
+		//   单一真理源 (v93.1): 字符串转换走 URoomMatchModeUtils::GetGameModeStringFromMatchMode, 不允许散落硬编码
+		const FString GameModeStr = URoomMatchModeUtils::GetGameModeStringFromMatchMode(RoomMode);
+		if (GameModeStr.IsEmpty())
 		{
-			SkipLoginRoomName = FString::Printf(TEXT("测试-刀战模式-%s"), *BattleMapName);
+			// URoomMatchModeUtils 已 Log Error, 这里再 Log 一次根因上下文
+			UE_LOG(LogGameFlow, Error,
+				TEXT("[GameFlow][测试绕行] RoomMode 解析 GameMode 字符串失败 (已 Log Error). 拒绝写入 SkipLoginRoomName."));
+			return;
 		}
-		else
-		{
-			SkipLoginRoomName = FString::Printf(TEXT("测试-生化模式-%s"), *BattleMapName);
-		}
+		const FString SkipLoginRoomName = FString::Printf(TEXT("测试-%s-%s"), *GameModeStr, *BattleMapName);
 		if (UGameInstance* GI = GetWorld()->GetGameInstance())
 		{
 			if (USessionManagerSubsystem* SessionMgr = GI->GetSubsystem<USessionManagerSubsystem>())
 			{
-				FString SkipLoginGameMode = (RoomMode == ERoomMatchMode::Melee)
-					? TEXT("刀战模式") : TEXT("生化模式");
-				SessionMgr->SetSkipLoginRoomDisplayInfo(SkipLoginRoomName, SkipLoginGameMode);
+				SessionMgr->SetSkipLoginRoomDisplayInfo(SkipLoginRoomName, GameModeStr);
 			}
 		}
 
@@ -614,21 +631,76 @@ void UGameFlowSubsystem::HandleStateEntry(EMatchState State)
 		// 新方案 (大厂分层架构):
 		//   - Host 端创房后, 调用方 (LANRoomPage) 通过 SetTargetRoomMapName + bIsHostListenServer 双通道
 		//   - 这里根据 bIsHostListenServer 决定是否加 ?listen
+		//
+		// 【v93 大厂架构修复】把 TargetRoomMode 也通过 URL 参数传给新地图
+		//   关键时序: HandleStateEntry(InRoom) 执行时, GameState 仍然是当前地图 (L_Login) 的 GS,
+		//   不是新房间地图的 GS. 必须通过 URL Options 把模式信息传给新地图,
+		//   然后由新地图的 ARoomGameMode::InitGameState 解析 URL Options 并写入新 GS.
+		//
+		// UE 5.6 URL Options 完整链路 (从引擎源码逐层确认):
+		//   1. UGameplayStatics::OpenLevel(MapName, bAbs, Options):
+		//        Cmd = MapName + "?" + Options  (OpenLevel.cpp:993)
+		//        → 期望 Options **无** 前导 ? (因为 UE 内部会加)
+		//   2. URL.Split("?") 拆出 MapName / Options
+		//   3. FURL::FURL 解析:
+		//        Op = ["listen", "Mode=2"]  (无前导 ?)
+		//   4. World.cpp:5715-5719 重组 Options:
+		//        Options = "?listen?Mode=2"  (Op 前面都加 ?)
+		//        → InitGame(Options) 收到 "?listen?Mode=2"
+		//   5. AGameModeBase::InitGame(Options): OptionsString = Options = "?listen?Mode=2"
+		//   6. AGameModeBase::InitGameState: 我们读 OptionsString, 用 UGameplayStatics::ParseOption
+		//        ParseOption(OptionsString, "Mode") 工作流程:
+		//          - GrabOption 第一次: Left(1)=="?" → Result="listen?Mode=2" → 找下一个 ? → Result="listen"
+		//          - GrabOption 第二次: Left(1)=="?" → Result="Mode=2" → 无下一个 ? → Result="Mode=2"
+		//          - GetKeyValue: Key="Mode", Value="2"  ✓
+		//
+		// 大厂正确格式 (OpenLevel 第 4 个参数 Options):
+		//   - Host 创房: "listen?Mode=2" (无前导 ?, UE 自己加)
+		//   - Client 端: "Mode=2" (无 listen, 但 Mode 仍能解析)
 		// ==========================================
 		if (TargetRoomMapName != NAME_None)
 		{
 			// 仅当当前不在目标地图时才执行 OpenLevel，避免无谓重载
 			if (!CurrentMapName.Contains(TargetRoomMapName.ToString()))
 			{
-				if (bIsHostListenServer)
+				// 构建 URL Options (?Mode=数字) — 无前导 ? (UE 内部会加)
+				//   - Melee = 1, Zombie = 2
+				//   - None = 0 (不写入, 让 InitGameState 走默认分支, 记录 Log 引导修复)
+				FString ModeParamStr = TEXT("");
+				if (TargetRoomMode != ERoomMatchMode::None)
 				{
-					// Host 创房 → 走 Listen Server 模式
-					UGameplayStatics::OpenLevel(this, TargetRoomMapName, true, TEXT("listen"));
+					// 注意: ?Mode=数字 — 这里的 ? 是 ModeParamStr 内部的, 与 listen 之间用 ? 分隔
+					//   - 最终 OpenLevel 第 4 参数: "listen?Mode=2"  (注意前面没有 ?)
+					//   - UE OpenLevel 内部加 ?: "MapName?listen?Mode=2"
+					//   - FURL 解析: Op = ["listen", "Mode=2"]
+					//   - World.cpp 重组: Options = "?listen?Mode=2"
+					//   - InitGameState ParseOption("Mode") → 2  ✓
+					ModeParamStr = FString::Printf(TEXT("?Mode=%d"), static_cast<int32>(TargetRoomMode));
 				}
 				else
 				{
-					// Client 端被 ServerTravel 拉进图 (或 PIE 直接启动) → 不需要 ?listen
-					UGameplayStatics::OpenLevel(this, TargetRoomMapName);
+					UE_LOG(LogGameFlow, Warning,
+						TEXT("[GameFlowSubsystem] TargetRoomMode=ERoomMatchMode::None, "
+						     "URL 不传 Mode 参数. 新地图 ARoomGameMode::InitGameState 收到后拒绝写入 GS CurrentMatchMode. "
+						     "【修复】Host 创房前必须 LANRoomPage::OnConfirmCreateRoomClicked 调用 FlowSub->SetTargetRoomMode()."));
+				}
+
+				if (bIsHostListenServer)
+				{
+					// Host 创房 → 走 Listen Server 模式 ("listen" + ModeParamStr)
+					//   - "listen" 是 UE 标准 listen server 标记
+					//   - ModeParamStr = "?Mode=数字" (带前导 ?)
+					//   - 拼起来: "listen?Mode=2"  (无前导 ?, UE 内部加 ?)
+					UGameplayStatics::OpenLevel(this, TargetRoomMapName, true, TEXT("listen") + ModeParamStr);
+				}
+				else
+				{
+					// Client 端被 ServerTravel 拉进图 (或 PIE 直接启动) → 不需要 ?listen, 但 Mode 参数仍要带
+					//   - 传 "?Mode=2" (带前导 ?) → OpenLevel 加 ? → "MapName??Mode=2"
+					//   - FURL 解析: Op = ["Mode=2"]
+					//   - World.cpp 重组: Options = "?Mode=2"
+					//   - ParseOption("Mode") → 2  ✓
+					UGameplayStatics::OpenLevel(this, TargetRoomMapName, true, ModeParamStr);
 				}
 			}
 		}

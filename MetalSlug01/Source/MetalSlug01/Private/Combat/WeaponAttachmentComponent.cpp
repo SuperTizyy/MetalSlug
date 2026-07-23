@@ -613,6 +613,61 @@ void UWeaponAttachmentComponent::RequestWeaponSpawn(TSubclassOf<ABaseWeapon> Wea
 
 
 // ==========================================
+// 【v93 大厂架构新增】UnequipCurrentWeapon — 单一武器销毁入口
+// ==========================================
+//
+// 设计动机:
+//   - 旧 SpawnAIInternal line 1209-1219 inline 调 OldWeapon->Destroy() (v56.3 P0)
+//   - 旧 MutatePawnToMother 完全没调 (母体变异后武器残留 = v90 Bug)
+//   - 现在统一走本接口, 母体变异 / 武器切换 / 死亡重置 都能复用
+//
+// 服务器权威:
+//   - 客户端调用 → Log Error + return false (客户端不应调, 走 Multicast RPC 由服务器权威销毁)
+//   - 服务器调用 → Destroy() → Replicate CurrentWeapon=nullptr → 所有客户端 OnRep 触发
+
+bool UWeaponAttachmentComponent::UnequipCurrentWeapon()
+{
+	// 【大厂原则】零兜底 — 客户端不应调用本接口
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] UnequipCurrentWeapon: 非服务器调用, 拒绝销毁. "
+			     "Pawn=%s, HasAuthority=%d. "
+			     "【v93 零兜底】武器销毁必须由服务器权威执行, 客户端调用会破坏 Replicate 流程."),
+			*GetNameSafe(GetOwner()), GetOwner() ? GetOwner()->HasAuthority() ? 1 : 0 : -1);
+		return false;
+	}
+
+	// 无武器 — 业务正常 (可能多次调用幂等), Log Warning + return true
+	if (!CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] UnequipCurrentWeapon: CurrentWeapon 已为 nullptr, 无需销毁. "
+			     "Pawn=%s. (业务幂等正常, 不报错)."),
+			*GetNameSafe(GetOwnerCharacterChecked(this)));
+		return true;
+	}
+
+	// 抓快照 (Destroy 后 CurrentWeapon=nullptr, OnRep 已触发)
+	ABaseWeapon* WeaponToDestroy = CurrentWeapon;
+	const FString WeaponName = WeaponToDestroy->GetName();
+
+	// 显式置空 (OnRep_CurrentWeapon 立即触发, 客户端 UI 立刻清武器图标)
+	CurrentWeapon = nullptr;
+
+	// 销毁武器 Actor (服务器权威 → Replicate Destruction Bunch → 所有客户端立即消失)
+	WeaponToDestroy->Destroy();
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] UnequipCurrentWeapon: 销毁武器成功. Pawn=%s, Weapon='%s'. "
+		     "【v93 单一销毁入口】所有武器销毁都走这里 (母体变异/武器切换/死亡重置)."),
+		*GetNameSafe(GetOwnerCharacterChecked(this)), *WeaponName);
+
+	return true;
+}
+
+
+// ==========================================
 // 6. SpawnAndEquipWeapon — 服务器权威生成
 // ==========================================
 
@@ -1944,12 +1999,27 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 		WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Secondary)] ? TEXT("OK") : TEXT("FAIL/Empty"),
 		WeaponsInSlot[SlotTypeToArrayIndex(EWeaponSlotType::Melee)] ? TEXT("OK") : TEXT("FAIL/Empty"));
 
-	// 【v84 大厂架构修复】武器 Spawn 完成后必须广播弹夹信息
-	// 根因: 弹夹数量在武器 Spawn 之前广播 (BroadcastWeaponAmmoInfo 早于 Server_SpawnAllWeapons)
-	//        导致 HUD 显示的是"无武器默认值 1/1"而非实际弹药数量
-	// 解决方案: Server_SpawnAllWeapons 完成后立即广播弹夹数量
+	// 【v89 大厂架构修复】武器 Spawn 完成后必须走 Server_SwitchToWeaponSlot 同款"刷新 + 广播"链路
+	//
+	// 根因 (Bug 1):
+	//   - 旧版只调 BroadcastWeaponAmmoInfo (一次性 RPC 推 30/30)
+	//   - ListenServer 房主本地 CharacterIconComponent 在 BeginPlay 时 CurrentWeapon=None,
+	//     SubscribeToActiveWeaponAmmo 啥也没做 → 服务器本地无 OnAmmoChanged 订阅者
+	//   - 后续开火时 OnAmmoChanged.Broadcast() 在服务器本地无订阅者 → HUD 不更新
+	//   - 切枪后走 Server_SwitchToWeaponSlot 链路 → 内部调 RefreshWeaponIconOnHUDFromServer
+	//     → 内部调 SubscribeToActiveWeaponAmmo → 服务器本地订阅成功 → 切枪后开火才正常
+	//
+	// 大厂原则 - 与 SwitchToWeaponSlot 路径对称:
+	//   - 真理源 = RefreshWeaponIconOnHUDFromServer (内含 SubscribeToActiveWeaponAmmo 一次性订阅)
+	//   - 2 路径 (Spawn / Switch) 都走 Refresh + Broadcast 组合, 不允许 Spawn 走旁路
+	//   - 零兜底: 无 Spawn 不调 Refresh,WeaponID 为空让 RefreshWeaponIconOnHUDFromServer 内部 Log Error
 	if (UCharacterIconComponent* IconComp = Owner->FindComponentByClass<UCharacterIconComponent>())
 	{
+		// 1. 先刷新武器图标 (服务器查表, RPC 推 Icon) — 内部同时 SubscribeToActiveWeaponAmmo
+		const FString CurrentWeaponID = CurrentWeapon ? CurrentWeapon->WeaponRowName.ToString() : FString();
+		IconComp->RefreshWeaponIconOnHUDFromServer(CurrentWeaponID);
+
+		// 2. 立即推送当前弹夹数量 (配套 RPC 一次性推送初始 30/30)
 		IconComp->BroadcastWeaponAmmoInfo(Owner);
 	}
 }

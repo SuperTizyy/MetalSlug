@@ -53,6 +53,7 @@ FMatchSnapshot URoomStateService::GetMatchSnapshot() const
         Snapshot.MatchMode          = GS->CurrentMatchMode;
         Snapshot.RemainingSeconds   = GS->GetMatchRemainingSeconds();
         Snapshot.CurrentRound       = GS->CurrentRound;
+        Snapshot.TotalRounds        = GS->TotalRounds; // 【v92 大厂架构】UI 真理源
         Snapshot.AttackerTotalKills = GS->AttackerTotalKills;
         Snapshot.DefenderTotalKills = GS->DefenderTotalKills;
         Snapshot.AttackerWins       = GS->AttackerWins;

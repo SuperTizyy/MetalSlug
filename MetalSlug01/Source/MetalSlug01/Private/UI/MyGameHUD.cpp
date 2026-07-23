@@ -151,10 +151,11 @@ void AMyGameHUD::OnGameFlowStateChanged(EMatchState NewState)
 
 // 刷新倒计时和回合数的当前值（解决 HUD 显示后才绑定导致的初始值不刷新的问题）
 		// 【架构升级】改为通过 URoomStateService 读取（不直引 RoomGameState）
+		// 【v92 大厂架构重构】用 TotalRounds 替换 CurrentRound (大厂原则 — UI 显示用真理源, 不用内部计数)
 		if (URoomStateService* StateService = URoomStateService::Get(this))
 		{
 			const FMatchSnapshot Snapshot = StateService->GetMatchSnapshot();
-			GameHUDWidget->UpdateRemainingRoundsText(Snapshot.CurrentRound);
+			GameHUDWidget->UpdateTotalRoundsText(Snapshot.TotalRounds);
 			GameHUDWidget->OnMatchModeChangedForHUD(Snapshot.MatchMode);
 		}
 		else

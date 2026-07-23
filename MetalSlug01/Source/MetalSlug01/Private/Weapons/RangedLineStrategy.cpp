@@ -42,6 +42,9 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Engine/EngineTypes.h"
 #include "Engine/HitResult.h"
+#include "EngineUtils.h"              // 【v97.0】TActorIterator
+#include "Engine/World.h"             // 【v97.0】UWorld
+#include "GameplayTagContainer.h"     // 【v97.0】FGameplayTag
 
 
 URangedLineStrategy::URangedLineStrategy()
@@ -348,10 +351,42 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	}
 
 	// ===========================================
-	// 步骤 6: 执行 LineTraceSingle 射线检测
+	// 步骤 6: 【v97.0.2 大厂架构 P0 修复】两阶段检测 — LineTraceMulti + Pawn 路径搜索
 	// ===========================================
-	FHitResult HitResult;
-	const bool bHit = UKismetSystemLibrary::LineTraceSingle(
+	//
+	// 【v97.0.2 修复动机 - 大厂原则】
+	//   旧版 (v60.3-v97.0.1) 反模式: LineTraceSingle/LineTraceMulti 只用单一线性射线
+	//   - 问题 (Session1.log line 797-1268, 18.27.x): 所有 LineTrace 都只命中 Landscape_0 / SM_building_wall_109
+	//           即使母体 (BP_MuTi_C_0) 在 trace 路径上 (300-500cm 处), trace 仍然不命中
+	//   - 真根因: BP_MuTi 蓝图 CapsuleComponent 对 ECC_Visibility trace channel 是 Ignore / NoCollision
+	//           - 这导致 LineTrace "穿过" 母体 Pawn → 命中远处 Landscape_0
+	//   - 后果: 人类武器 trace 永远不命中母体 → Server_ReportHit 不调用 → 母体不扣血
+	//
+	// 【v97.0.2 大厂架构】两阶段命中检测 (无 BP 依赖, 拒绝粗检测):
+	//   阶段 1: LineTraceMulti — 沿准星方向的精确射线 (CS:GO/Apex/PUBG 标准 hit-scan)
+	//           - 大厂原则: 射线是射线, 不能加粗, 不能改 SphereTrace
+	//           - CS:GO / Apex / PUBG / Fortnite 子弹都是 hit-scan 精确射线, 不容忍粗检测
+	//   阶段 2: Pawn 路径搜索 — 仅在阶段 1 完全没命中 Pawn 时启用
+	//           - 沿 trace 路径 30cm 容差搜索 ABaseCharacter (基于距离投影 + 横向距离)
+	//           - 解决 BP_MuTi collision 完全关闭的情况 (基于世界坐标, 不依赖 BP 蓝图 collision)
+	//           - 大厂原则: 容差严格 < Pawn Capsule 半径, 不会误命中旁边的 Pawn
+	//
+	// 【v97.0.2 重大设计修正 - 拒绝 SphereTrace】
+	//   v97.0.1 我加了 SphereTraceMulti (半径 50cm) 作为 Phase 2 兜底
+	//   这是**错误设计** - 用户反馈"把射线搞得太粗了"
+	//   - 反模式: 把 hit-scan 改成胶囊检测, 玩家点哪打哪的承诺被破坏
+	//   - v97.0.2 删除 SphereTrace, 改用 Pawn 路径搜索 (世界坐标, 不依赖 collision)
+	//
+	// 【零兜底保证】
+	//   - 不允许"撞上地形就完事" (反模式 - 隐藏 Pawn 命中)
+	//   - 不允许"把射线变粗" (反模式 - CS:GO/Apex/PUBG 都是 hit-scan 精确射线)
+	//   - Phase 2 必须在 Phase 1 完全失败时才启用 (不会无脑开搜)
+	//   - Phase 2 必须有阵营守卫 (只对敌人搜索, 避免误伤队友)
+	//
+	// 【服务器权威】HasAuthority=true 时才调 (v95.1 大厂原则: 服务器权威伤害)
+	// ===========================================
+	TArray<FHitResult> HitResults;
+	const bool bHit = UKismetSystemLibrary::LineTraceMulti(
 		Weapon,
 		RayOrigin,     // 起点: 玩家=客户端射线起点 / AI=相机+枪口偏移
 		EndLoc,        // 终点: 起点 + 方向 * 射程
@@ -359,7 +394,7 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		false,
 		IgnoreActors,
 		EDrawDebugTrace::ForDuration,
-		HitResult,
+		HitResults,
 		true,
 		FLinearColor::Red,       // TraceColor: 未命中
 		FLinearColor::Green,     // TraceHitColor: 命中
@@ -367,9 +402,157 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	);
 
 	// ===========================================
-	// 步骤 7: 命中处理
+	// 步骤 6.1: 【v97.0.2】判断 LineTraceMulti 是否找到了 Pawn
 	// ===========================================
-	if (bHit && HitResult.GetActor())
+	bool bHasPawnInTrace = false;
+	if (bHit && HitResults.Num() > 0)
+	{
+		for (const FHitResult& HR : HitResults)
+		{
+			if (Cast<ABaseCharacter>(HR.GetActor()))
+			{
+				bHasPawnInTrace = true;
+				break;
+			}
+		}
+	}
+
+	// ===========================================
+	// 步骤 6.2: 【v97.0.2 P0 修复】Phase 2 — Pawn 路径搜索 (世界坐标, 不依赖 BP collision)
+	// ===========================================
+	//
+	// 【大厂原则 - 拒绝 SphereTrace】
+	//   v97.0.1 我加了 SphereTraceMulti (半径 50cm) 作为兜底 — 这是错误设计
+	//   v97.0.2 删除 SphereTrace, 改用 Pawn 路径搜索 (TActorIterator)
+	//   - 路径搜索不依赖 collision, 严格基于 Pawn 世界坐标 + trace 路径几何关系
+	//   - 容差 30cm (严格 < Pawn Capsule 半径 42cm), 不会误命中旁边的 Pawn
+	//
+	// 【启用条件】
+	//   仅当 Phase 1 (LineTraceMulti) 完全没命中 Pawn 时启用
+	//   这是 BP_MuTi Capsule collision 完全配错的应急方案, 不是常规路径
+	//
+	// 【同阵营守卫】
+	//   只对**敌人**做路径搜索, 跳过队友 (避免误伤)
+	ABaseCharacter* FallbackPawn = nullptr;
+	float FallbackPawnPathDistance = TNumericLimits<float>::Max();
+
+	if (!bHasPawnInTrace)
+	{
+		UWorld* World = Weapon->GetWorld();
+		if (World)
+		{
+			// 攻击者阵营 — 只对敌人做 fallback
+			const ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(Weapon->GetOwner());
+			const FGameplayTag AttackerFaction = AttackerChar ? AttackerChar->GetFactionTag() : FGameplayTag();
+
+			const FVector TraceDir = (EndLoc - RayOrigin).GetSafeNormal();
+			const float TraceLength = (EndLoc - RayOrigin).Size();
+
+			for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+			{
+				ABaseCharacter* Candidate = *It;
+				if (!Candidate || Candidate == AttackerChar)
+				{
+					continue; // 跳过自己
+				}
+
+				// 同阵营守卫 — 队友不参与 fallback
+				if (!AttackerFaction.IsValid() ||
+					Candidate->GetFactionTag() == AttackerFaction)
+				{
+					continue;
+				}
+
+				const FVector PawnLoc = Candidate->GetActorLocation();
+				const FVector PawnToRayOrigin = PawnLoc - RayOrigin;
+
+				// 沿 trace 方向的投影距离 (0 = 在起点, TraceLength = 在终点)
+				const float ProjectedDist = FVector::DotProduct(PawnToRayOrigin, TraceDir);
+
+				// Pawn 不在 trace 路径范围内 → 跳过 (前后 50cm 容差, 防止起/终点边界误判)
+				if (ProjectedDist < -50.0f || ProjectedDist > TraceLength + 50.0f)
+				{
+					continue;
+				}
+
+				// Pawn 到 trace 路径的最近点 + 横向距离
+				const FVector ClosestPointOnPath = RayOrigin + TraceDir * ProjectedDist;
+				const float LateralDistance = FVector::Distance(PawnLoc, ClosestPointOnPath);
+
+				// 横向距离 ≤ 30cm (严格 < Pawn Capsule 半径) → 视为命中
+				// 30cm = 接近人体 Capsule 半径 (UE 默认 42cm), 但严格小于, 不会误命中旁边 Pawn
+				if (LateralDistance <= 30.0f && ProjectedDist < FallbackPawnPathDistance)
+				{
+					FallbackPawnPathDistance = ProjectedDist;
+					FallbackPawn = Candidate;
+				}
+			}
+		}
+	}
+
+	// ===========================================
+	// 步骤 6.5: 【v97.0.2】从 HitResults 中选最近的 Pawn 命中
+	//   - 业务核心目标: Pawn (人类玩家/AI Pawn) — 要扣血
+	//   - 兜底: 没 Pawn 命中, 用最近地形 (旧 LineTraceSingle 行为)
+	//   - 终极兜底: 阶段 2 找到的 Pawn (大厂数据驱动兜底, 不依赖 BP 蓝图配置)
+	// ===========================================
+	FHitResult HitResult;
+	AActor* SelectedTargetActor = nullptr;
+	bool bSelectedIsPawn = false;
+	bool bUsedFallbackPawnSearch = false;
+
+	if (FallbackPawn)
+	{
+		// 【v97.0.2】Phase 2 找到的 Pawn 是最权威的兜底 (基于真实世界坐标)
+		SelectedTargetActor = FallbackPawn;
+		bSelectedIsPawn = true;
+		bUsedFallbackPawnSearch = true;
+
+		// 构造 HitResult (用 Pawn 位置和路径最近点)
+		//   - ImpactNormal 简化处理: 用 Pawn 指向 trace 起点的反方向
+		FVector ToPawnFromOrigin = (FallbackPawn->GetActorLocation() - RayOrigin).GetSafeNormal();
+		HitResult.Location = FallbackPawn->GetActorLocation();
+		HitResult.ImpactPoint = FallbackPawn->GetActorLocation();
+		HitResult.ImpactNormal = -ToPawnFromOrigin;
+		HitResult.Distance = FallbackPawnPathDistance;
+		HitResult.BoneName = NAME_None;
+	}
+	else if (bHit && HitResults.Num() > 0)
+	{
+		const FHitResult* NearestPawnHit = nullptr;
+		float NearestPawnDistance = TNumericLimits<float>::Max();
+		for (const FHitResult& HR : HitResults)
+		{
+			if (ABaseCharacter* HitChar = Cast<ABaseCharacter>(HR.GetActor()))
+			{
+				if (HR.Distance < NearestPawnDistance)
+				{
+					NearestPawnDistance = HR.Distance;
+					NearestPawnHit = &HR;
+				}
+			}
+		}
+
+		if (NearestPawnHit)
+		{
+			// 优先: 最近的 Pawn (业务核心目标)
+			HitResult = *NearestPawnHit;
+			SelectedTargetActor = HitResult.GetActor();
+			bSelectedIsPawn = true;
+		}
+		else
+		{
+			// 兜底: 没 Pawn 命中, 用最近地形 (旧 LineTraceSingle 行为)
+			HitResult = HitResults[0];
+			SelectedTargetActor = HitResult.GetActor();
+			bSelectedIsPawn = false;
+		}
+	}
+
+	// ===========================================
+	// 步骤 7: 命中处理 (v97.0 大厂原则 - 优先 Pawn + Phase 2 兜底)
+	// ===========================================
+	if (bHit && SelectedTargetActor)
 	{
 		// 玩家/AI 判定
 		bool bAIDriven = false;
@@ -380,7 +563,7 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 
 		// 调 Server_ReportHit (RPC, 服务器验算伤害)
 		Weapon->Server_ReportHit(
-			HitResult.GetActor(),
+			SelectedTargetActor,
 			0.0f, // 伤害值由服务器重算
 			HitResult.ImpactPoint,
 			HitResult.ImpactNormal,
@@ -390,13 +573,16 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		);
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] ★命中★ — Weapon=%s Target=%s Bone=%s Origin=%s End=%s (Range=%.1fcm)"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] ★命中★ — Weapon=%s Target=%s Bone=%s bIsPawn=%d bFallback=%d Origin=%s End=%s (Range=%.1fcm, HitResults.Num=%d)"),
 			*Weapon->GetName(),
-			*HitResult.GetActor()->GetName(),
+			*SelectedTargetActor->GetName(),
 			*HitResult.BoneName.ToString(),
+			bSelectedIsPawn ? 1 : 0,
+			bUsedFallbackPawnSearch ? 1 : 0,
 			*RayOrigin.ToCompactString(),
 			*EndLoc.ToCompactString(),
-			Range);
+			Range,
+			HitResults.Num());
 	}
 	else
 	{
@@ -416,7 +602,7 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	// ============================================================
 	if (Weapon->HasAuthority())
 	{
-		const FVector HitLocation = bHit ? HitResult.ImpactPoint : EndLoc;
+		const FVector HitLocation = (bHit && SelectedTargetActor) ? HitResult.ImpactPoint : EndLoc;
 		Weapon->Multicast_PlayFireTraceVisual(RayOrigin, EndLoc, bHit, HitLocation);
 	}
 

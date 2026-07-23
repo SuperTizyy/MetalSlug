@@ -126,10 +126,17 @@ public:
 	void OnPlayerKill(bool bIsHeadshot);
 
 	/**
-	 * 更新剩余局数文本的接口
+	 * 【v92 大厂架构重构】更新总局数文本 (替换 UpdateRemainingRoundsText)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 数据源: GameState.TotalRounds (Replicated, 由 GameMode.TotalRounds 注入)
+	 *   - 调用方: GameState.OnTotalRoundsUpdated 委托回调
+	 *   - 不接受"剩余局数"参数 (那是内部计数 CurrentRound, 不应该传到 UI)
+	 *
+	 * @param TotalRounds 总回合数 (来自 GameState.TotalRounds)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
-	void UpdateRemainingRoundsText(int32 RemainingRounds);
+	void UpdateTotalRoundsText(int32 TotalRounds);
 
 	/**
 	 * 更新队伍击杀统计文本
@@ -172,6 +179,22 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	void OnMatchModeChangedForHUD(ERoomMatchMode NewMode);
+
+	/**
+	 * 【v92 大厂架构新增】母体变异倒计时同步回调
+	 *
+	 * 单一真理源 — 由 GameState.OnMotherMutationChanged OnRep 触发
+	 * 职责: 转发给 Widget_MatchInfo, 由 Widget 内部决定显示/隐藏 + NativeTick 刷新数字
+	 *
+	 * 大厂原则 — 转发壳模式 (镜像 OnMatchModeChangedForHUD):
+	 *   - GameHUDWidget 不持有倒计时逻辑, 只做事件路由
+	 *   - Widget_MatchInfo 是唯一显示组件
+	 *
+	 * @param StartTime 服务器写入的开始时间戳 (<= 0 表示关闭)
+	 * @param Duration 倒计时总秒数 (<= 0 表示关闭)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void OnMotherMutationChanged(float StartTime, float Duration);
 
 	/**
 	 * 获取玩家状态 Widget（供其他类安全访问）

@@ -283,6 +283,46 @@ protected:
 	void ExecuteComboSequence();
 
 	/**
+	 * 【v93 大厂架构新增】母体左键攻击序列 — 无武器也能攻击
+	 *
+	 * 调用链路 (玩家母体左键):
+	 *   UPlayerComboComponent::LightAttack_Pressed (bIsMother 分支)
+	 *   → ExecuteMotherAttackSequence (本函数)
+	 *   → 调 Server_PlayAttackAnim RPC (复用现有 RPC, 不新增)
+	 *   → Multicast_PlayAttackAnim (所有客户端播蒙太奇)
+	 *
+	 * 镜像对称:
+	 *   - 玩家武器连击: ExecuteComboSequence (武器驱动, Combo1/Combo2 切换)
+	 *   - 玩家母体攻击: ExecuteMotherAttackSequence (母体 Pawn 驱动, 单一蒙太奇, 无连击)
+	 *
+	 * 大厂原则 — 不重复架构:
+	 *   - 复用现有 Server_PlayAttackAnim/Multicast_PlayAttackAnim RPC (单一真理源)
+	 *   - 不新增 RPC, 不新增 Multicast 函数
+	 *   - 客户端 Implementation 根据 bIsMother 选 Montage 来源 (武器 vs MotherAttackMontage)
+	 *
+	 * 零兜底:
+	 *   - MotherAttackMontage 未配 → Log Error + return (BP 配置错必须修复)
+	 *
+	 * 状态机:
+	 *   - 母体没有连击系统 (单一蒙太奇, 无 bSaveAttack / bCanReceiveInput)
+	 *   - 只设 bIsAttacking=true → 蒙太奇结束 → EndAttackState 清理
+	 */
+	void ExecuteMotherAttackSequence();
+
+	// ============================================================
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】玩家母体攻击命中上报
+	// ============================================================
+	// 复用动机 (用户需求 2026.07.25):
+	//   - 母体复用 ANS_MeleeTraceState + MeleeSwStrategy (零重复)
+	//   - 命中 RPC 走 Owner->Server_ReportMotherAttackHit → BaseCharacter 转发壳 → 本函数 (玩家路径)
+	//   - 命中后行为: 调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用)
+	//
+	// 与 UAIAttackComponent::Server_ReportMotherAttackHit_Implementation 对称:
+	//   - 防御层同构 (HitActor 有效 / 自伤 / 友军 / 已死 / 已母体)
+	//   - 唯一区别: 玩家路径 IsAttackerAI()=false, AI 路径 = true (决策由 BaseCharacter 转发壳做)
+	void Server_ReportMotherAttackHit_Implementation(AActor* HitActor);
+
+	/**
 	 * 【2026.07.12 P0 新增】蒙太奇结束回调 (替代 BP ANS_MeleeTrace NotifyEnd)
 	 *
 	 * 触发场景:

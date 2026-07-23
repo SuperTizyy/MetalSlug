@@ -1340,6 +1340,52 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 // 玩家 Spawn 主入口 — v31.1 完整实现
 // ==========================================
 
+// ==========================================
+// 【v93.1 大厂架构新增】业务层角色账本查询
+// ==========================================
+
+/**
+ * GetAllBattleCharacters — 对局内所有 ABaseCharacter 角色账本查询
+ *
+ * 大厂原则 — 单一入口:
+ *   - 业务方应走本函数, 不直接 GetAllActorsOfClass
+ *   - 本函数是未来账本缓存的预留接口 (若性能不够, 可内部加 TArray<TWeakObjectPtr<ABaseCharacter>>)
+ *
+ * 为什么不维护账本:
+ *   - SpawnAIInternal / HandlePlayerRequestSpawn 各调一次 SpawnActor, 散落 N 处
+ *   - 加账本需要每次 Spawn 后手动 AddUnique, 容易漏 (账本漂移)
+ *   - 选母体是每局 N 次 (N=玩家数+AI数), 不需要账本 — 直接 GetAllActorsOfClass 即可
+ *   - 镜像 v28: 大厅 AI 入队走 PendingAIQueue 账本, 但那是 UI 路径; 运行时战斗用 GetAllActorsOfClass
+ *
+ * 性能:
+ *   - N <= 20 (玩家 6 + AI 14), GetAllActorsOfClass 扫一次 < 0.01ms
+ *   - 每局选母体 N 次, 总开销 < 0.2ms, 完全可接受
+ *   - 若未来 N > 50 触发性能问题, 再引入 TArray<TWeakObjectPtr<ABaseCharacter>> 账本
+ */
+TArray<ABaseCharacter*> URoomSpawnSubsystem::GetAllBattleCharacters() const
+{
+	TArray<ABaseCharacter*> Result;
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomSpawn] GetAllBattleCharacters: World 为空, 返回空账本."));
+		return Result;
+	}
+
+	for (TActorIterator<ABaseCharacter> It(World, ABaseCharacter::StaticClass()); It; ++It)
+	{
+		if (ABaseCharacter* Char = *It)
+		{
+			Result.Add(Char);
+		}
+	}
+
+	return Result;
+}
+
+
 void URoomSpawnSubsystem::SpawnAllPlayersIntoBattle()
 {
 	// 【v48 大厂架构修复 P0】真正的根因修复
@@ -2136,4 +2182,340 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 				*DeadController->GetName());
 		}
 	}
+}
+
+
+// ==========================================
+// 【v90 大厂架构重构】母体 Pawn 原地重建 (生化模式独有)
+// ==========================================
+//
+// 设计动机 (Bug 2 — 2026.07.25 第 2 轮重构):
+//   v89 母体变异会跳到出生点. 但业务规则 (用户 2026.07.25 明确):
+//     "任何情况人类变成母体, 都是原地变成的, 不是回到出生点."
+//   v89 同时还有 4 个违规:
+//     1. 重复架构 — 释放 + 重新分配出生点 (母体不是重生, 不该走出生点账本)
+//     2. 重复架构 — SetSpawnLoadout(MotherCharRowName, "") 写入 SpawnLoadout 账本
+//        (母体不是新角色, 账本应该只由母亲系统维护 MotherCharacters)
+//     3. 重复架构 — SetGenericTeamId (新 Pawn.Replicated.FactionTag 自动同阵营, 不需显式设)
+//     4. 业务可调 — RowName 硬编码 TEXT("MT001") 散落业务层
+//
+// 大厂原则 — v90 业务分层 (与 HandlePlayerRequestSpawn 完全解耦):
+//   - HandlePlayerRequestSpawn / SpawnAIInternal = 出生点调度 (Spawn 账本)
+//   - MutatePawnToMother = 原地类变更 (不在 Spawn 账本 — 母体账本 = MotherCharacters)
+//   - 禁止业务层自己 Destroy + SpawnActor (违反 SRP / 集中调度)
+//
+// v90 流程 (5 步, 极简):
+//   1. 校验 Controller / RowName / OldPawn / World / DT_CharacterInfo (零兜底)
+//   2. 查 DT_CharacterInfo 找 BP_MuTi 蓝图类 (零兜底)
+//   3. 缓存 OldPawn.Location/Rotation (原地变位置)
+//   4. UnPossess + Destroy + SpawnActor (位置 = 旧位置) + Possess
+//   5. 验证 Possess 成功 (零兜底)
+//
+// v90 单一真理源 (Mirror v39 / v85 / v89 风格):
+//   - BP_MuTi Pawn 蓝图类: DT_CharacterInfo.CharacterBlueprint (RowName 由 GM 配置)
+//   - 位置:   OldPawn.GetActorLocation() (原地, 不动出生点)
+//   - 旋转:   OldPawn.GetActorRotation() (原地)
+//   - 阵营:   【v93.3 大厂架构修复】Step 5.5 显式切到 Offense (母体专属阵营), 不靠"自然继承"
+//              旧 (v90) 自述"FactionTag 自然 Replicated 同旧 Pawn (零兜底)" 是错的!
+//              实际流程: SpawnActor 出新 Pawn → 默认 FactionTag=EmptyTag → PossessedBy → SyncFactionTagFromController
+//                       从 PS.CurrentFactionTag (=Defense, 旧值) 同步 → 新 Pawn.FactionTag = Defense
+//                       → 母体攻击人类时, FFactionTags::CanDamage 同阵营守卫拒判 → 永远不变母体 (Session1.log line 765 bug)
+//              新 (v93.3): Step 5.5 集中调度, 写 Pawn + PlayerState + AIController 三处真理源
+//   - 武器:   母体不持武器, 不写 SpawnLoadout (改由 MotherCharacters 账本记身份)
+//   - 视觉:   Multicast_PlayMutationFX (业务层调) + bIsMother OnRep (双保险)
+
+bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FString& MotherCharRowName)
+{
+	// ===== 防御层 1: 入参校验 (零兜底) =====
+	if (!Controller)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: Controller 为空, 拒绝变异. "
+			     "【v90 修复】检查 URoomMotherMutationSubsystem::MutateCharacterToMother 调用方."));
+		return false;
+	}
+	if (MotherCharRowName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: MotherCharRowName 为空, 拒绝变异. "
+			     "【v90 零兜底】必须在 GM_RoomGameMode.ClassDefaults.MotherCharacterRowName 配 BP_MuTi RowName."));
+		return false;
+	}
+
+	// ===== 防御层 2: 拿原 Pawn =====
+	ABaseCharacter* OldPawn = Cast<ABaseCharacter>(Controller->GetPawn());
+	if (!OldPawn)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: Controller='%s' 当前 Pawn 为空, 拒绝变异."),
+			*Controller->GetName());
+		return false;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: World 为空, 拒绝变异."));
+		return false;
+	}
+
+	// ===== 防御层 3: DT_CharacterInfo 校验 =====
+	if (!CharacterDataTable)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: CharacterDataTable 为空, 拒绝变异. "
+			     "【v90 修复】检查 GM_RoomGameMode::InjectSubsystemConfigs 是否调 SetCharacterDataTable."));
+		return false;
+	}
+
+	// ===== Step 1: 查 DT_CharacterInfo 找 BP_MuTi 蓝图类 =====
+	static const FString CharCtx(TEXT("RoomSpawnSubsystem::MutatePawnToMother"));
+	FCharacterInfo* MotherInfo = CharacterDataTable->FindRow<FCharacterInfo>(FName(*MotherCharRowName), CharCtx);
+	if (!MotherInfo)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: RowName='%s' 在 DT_CharacterInfo 查不到. "
+			     "【v90 零兜底】必须配 BP_MuTi 蓝图类, 拒绝变异."),
+			*MotherCharRowName);
+		return false;
+	}
+	if (MotherInfo->CharacterBlueprint.IsNull())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: RowName='%s' 的 CharacterBlueprint 为空. "
+			     "【v90 零兜底】必须配 BP_MuTi 蓝图类, 拒绝变异."),
+			*MotherCharRowName);
+		return false;
+	}
+	TSubclassOf<ABaseCharacter> MotherClass = MotherInfo->CharacterBlueprint.LoadSynchronous();
+	if (!MotherClass)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: RowName='%s' LoadSynchronous 失败. "
+			     "【v90 零兜底】蓝图类路径错误, 拒绝变异."),
+			*MotherCharRowName);
+		return false;
+	}
+
+	// ===== Step 2: 【v90 关键删除】原地变 — 不动出生点, 不动 SpawnLoadout 账本 =====
+	//
+	// 业务核心 (用户 2026.07.25 明确):
+	//   "任何情况人类变成母体, 都是原地变成的, 不是回到出生点."
+	//
+	// 大厂原则 — 零兜底 + 拒绝重复架构:
+	//   ❌ ReleaseSpawnPointByController(Controller)            — 原地变, 出生点占用关系不变
+	//   ❌ GetAvailableSpawnPointForFaction(...)                 — 原地变, 不分配新出生点
+	//   ❌ SetSpawnLoadout(MotherCharRowName, "")                — 母体账本 = MotherCharacters, 不写 SpawnLoadout
+	//   ❌ SetGenericTeamId(...)                                 — Pawn.FactionTag 复制走继承, 不需显式设
+	//   ❌ PlayerSpawnDataCache.Add(Controller, ...)             — 母体不算 "新 Spawn", 不动 SpawnData 账本
+	//
+	// 缓存原 Pawn 位置/旋转 (原地变 — 业务核心)
+	const FVector OldPawnLocation = OldPawn->GetActorLocation();
+	const FRotator OldPawnRotation = OldPawn->GetActorRotation();
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[MotherMutation] MutatePawnToMother: 原地变准备. OldPawn='%s' Location=%s Rotation=%s → NewClass=%s."),
+		*OldPawn->GetName(),
+		*OldPawnLocation.ToString(),
+		*OldPawnRotation.ToString(),
+		*MotherClass->GetName());
+
+	// ===== Step 3: 销毁旧 Pawn + Spawn 新母体 Pawn (原地) =====
+	// 大厂原则 — 销毁前 UnPossess, 避免 Engine 触发 PossessedBy(nullptr) 副作用
+	Controller->UnPossess();
+
+	// 【v93 大厂架构修复】显式销毁旧 Pawn 的武器 (母体不持武器 — 旧 v90 漏掉这步 = 武器残留 Bug)
+	// 走 UWeaponAttachmentComponent::UnequipCurrentWeapon (单一销毁入口, v93 落地)
+	//   - 旧 Pawn Destroy 会级联销毁武器, 但 UE 销毁延迟一帧
+	//   - 期间武器 Mesh 仍可见 (挂在旧 Pawn 视觉坐标) — 客户端立刻收到 Destruction Bunch, 立即消失
+	if (UWeaponAttachmentComponent* OldWeaponAttach = OldPawn->ResolveWeaponAttach())
+	{
+		OldWeaponAttach->UnequipCurrentWeapon();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] MutatePawnToMother: 旧 Pawn '%s' 找不到 WeaponAttachmentComponent, 跳过武器销毁. "
+			     "【v93 警告】武器组件未挂载是配置错, 但不影响母体变异主流程."),
+			*OldPawn->GetName());
+	}
+
+	OldPawn->Destroy();
+
+	// SpawnCollisionHandlingOverride = AlwaysSpawn:
+	//   旧 Pawn 销毁是延迟一帧, 原地可能短暂重叠 — 必须 AlwaysSpawn 跳过碰撞检查
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = Controller;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	ABaseCharacter* NewMotherPawn = World->SpawnActor<ABaseCharacter>(
+		MotherClass, OldPawnLocation, OldPawnRotation, SpawnParams);
+	if (!NewMotherPawn)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: SpawnActor<%s> 失败 (Controller=%s, Loc=%s). "
+			     "【v90 零兜底】旧 Pawn 已 Destroy, 玩家暂时无 Pawn — 拒绝 Spawn 默认重来."),
+			*MotherClass->GetName(),
+			*Controller->GetName(),
+			*OldPawnLocation.ToString());
+		return false;
+	}
+
+	// ===== Step 4: 【v90 业务状态 — 不做额外业务操作】=====
+	// 新 Pawn 状态:
+	//   - Location/Rotation = 旧 Pawn 原位 (原地变核心)
+	//   - FactionTag = PossessedBy → SyncFactionTagFromController → 从 PlayerState.CurrentFactionTag 同步
+	//                          (生化模式玩家被变异前是 Defense 阵营, PS.CurrentFactionTag=Defense,
+	//                           所以新母体 Pawn.FactionTag 也变成 Defense — 这是 bug)
+	//                          → 必须在 Step 5.5 强制切到 Offense (大厂原则 — 母体专属阵营)
+	//   - bIsMother = false (默认值, 业务层在 MutateCharacterToMother 末尾显式设 + Multicast RPC)
+	//   - bIsHuman = true (默认值, 业务层在 MutateCharacterToMother 末尾显式设 false)
+	//   - 无武器 (母体 Pawn BP 应该本身就没武器, 这是 BP 设计问题)
+
+	// ===== Step 5: Possess + 验证 =====
+	Controller->Possess(NewMotherPawn);
+	if (Controller->GetPawn() != NewMotherPawn)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] MutatePawnToMother: Possess 后 Controller Pawn 与 NewMotherPawn 不一致. "
+			     "【v90 零兜底】拒绝移交, NewPawn 销毁回滚."),
+			*Controller->GetName());
+		NewMotherPawn->Destroy();
+		return false;
+	}
+
+	// ===== Step 5.5: 【v93.3 大厂架构 — 母体阵营切换】集中调度 FactionTag 写入 =====
+	//
+	// 根因 (用户 2026.07.25 反馈 Session1.log line 765):
+	//   - 母体 (BP_MuTi) 攻击人类 (BP_SWAT_C_1) 时, Server_ReportMotherAttackHit_Implementation
+	//     调 FFactionTags::CanDamage(Attacker.FactionTag, Victim.FactionTag, ...)
+	//   - CanDamage 守卫 3: 同阵营 → 拒绝扣血
+	//   - 但 Attacker.FactionTag 仍是 Defense (从旧 Pawn 继承, PossessedBy 没切) → 永远同阵营
+	//   - 结果: 母体攻击永远不变母体
+	//
+	// 旧 (v90-v93.2) 错误注释 (v90 自述):
+	//   - 注释写 "FactionTag = 旧 Pawn 阵营 (Replicated 走继承)" — 这是错的!
+	//   - 新 SpawnActor 的 Pawn 走默认构造函数 → FactionTag = EmptyTag
+	//   - PossessedBy → SyncFactionTagFromController → 从 PlayerState.CurrentFactionTag (=Defense, 旧值) 同步
+	//   - 所以新 Pawn.FactionTag = Defense, 而不是"自然复制旧 Pawn 阵营"
+	//
+	// 新 (v93.3) 大厂架构 — 集中调度 + 单一真理源:
+	//   母体变异时, 业务核心 = 切换到母体专属阵营 (Faction.Offense)
+	//   真真理源链 (3 个写点必须同步, 否则复活链会回滚):
+	//     1. NewMotherPawn->FactionTag = Offense (Replicated 自动同步所有客户端)
+	//     2. PlayerState.CurrentFactionTag = Offense (玩家路径真理源 — 不写则下次复活 SyncFactionTagFromController 又回 Defense)
+	//     3. BaseAIController.CachedFactionTag = Offense (AI 路径真理源 — 不写则 RequestRespawn 又读 Defense)
+	//   + SetGenericTeamId (UE AIPerception 协议层同步, 客户端 SightSense 立即生效)
+	//
+	// 单一真理源 — 3 处写点必须同步, 否则复活链会回滚:
+	//   - Pawn.FactionTag       → AI 当前能看到母体是 Offense (本次变异后立刻攻击人类能成功)
+	//   - PlayerState.CurrentFactionTag → 下次复活 SyncFactionTagFromController 不回滚
+	//   - AIC.CachedFactionTag  → RequestRespawn 拿阵营时仍能拿到 Offense
+	// 任意 1 处漏写 → 下一帧或下一次复活会回退到 Defense, 又被同阵营守卫拒判
+	//
+	// 不破坏刀战模式 (大厂原则 — 零耦合):
+	//   - 本函数只被 MutateCharacterToMother 调用, 母体变异专属入口
+	//   - 刀战模式不调本函数 → 永远不切 Offense → 刀战逻辑零影响
+	{
+		const FGameplayTag MotherFactionTag = FFactionTags::Offense();
+		const FGenericTeamId MotherTeamID = FFactionTags::ToGenericTeamId(MotherFactionTag);
+
+		// (1) 写 Pawn.FactionTag — Replicated 真理源 (单一入口)
+		NewMotherPawn->FactionTag = MotherFactionTag;
+		NewMotherPawn->SetGenericTeamId(MotherTeamID); // 同步 UE AIPerception 协议层缓存
+
+		// (2) 写 PlayerState.CurrentFactionTag (玩家路径真理源) — 防止下次复活被 SyncFactionTagFromController 回滚
+		if (ARoomPlayerState* PS = Controller->GetPlayerState<ARoomPlayerState>())
+		{
+			PS->CurrentFactionTag = MotherFactionTag; // ReplicatedUsing = OnRep_FactionTag, 客户端 OnRep 自动触发
+		}
+
+		// (3) 写 BaseAIController.CachedFactionTag (AI 路径真理源) — 防止 RequestRespawn 又读 Defense
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Controller))
+		{
+			BaseAIC->SetCachedFactionTag(MotherFactionTag); // 单一公开 API, 不写 Controller 私有字段
+		}
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] MutatePawnToMother: 母体阵营切换完成. NewMotherPawn='%s' FactionTag='%s' "
+			     "(Pawn + PlayerState + AIController 三处真理源同步, 防止复活链回滚)."),
+			*NewMotherPawn->GetName(), *MotherFactionTag.ToString());
+	}
+
+	// ===== Step 5.6: 【v93.4 大厂架构 — 母体血量初始化】集中调度 MaxHealth = MotherMaxHealth =====
+	//
+	// 业务规则 (用户 2026.07.25 明确):
+	//   - 变成母体后, 血量要变成 200
+	//   - 人类的各种武器都能对母体进行攻击 (FFactionTags::CanDamage 异阵营守卫已自动通过)
+	//   - 人类和人类之间无法互相伤害 (同阵营守卫已自动拒判)
+	//
+	// 大厂原则 — 配置驱动 + 单一真理源:
+	//   - MaxHealth 来自 ARoomGameMode::MotherMaxHealth (UPROPERTY EditDefaultsOnly)
+	//   - 策划可在 BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Max Health 调 (默认 200)
+	//   - 零硬编码: 不在 C++ 写 200.0f, 全部走配置
+	//   - 调 HealthComponent->InitializeHealth(MotherMaxHealth) 自动:
+	//     1) 写 MaxHealth = MotherMaxHealth (服务器本地)
+	//     2) 写 CurrentHealth = MotherMaxHealth (满血)
+	//     3) 清 bIsDead
+	//     4) 服务器主动 Broadcast OnHealthChanged (InitializeHealth 末尾已加 v93.4 修复)
+	//     5) DOREPLIFETIME(MaxHealth) 自动同步客户端 → 客户端 MaxHealth 也变 200
+	//     6) 客户端 OnRep_CurrentHealth 自动 Broadcast OnHealthChanged
+	//
+	// 不破坏刀战模式 (大厂原则 — 零耦合):
+	//   - 本步只在母体变异时跑 (Step 5.5 已切 Offense, 这是生化专属)
+	//   - 刀战模式 SpawnAIInternal / HandlePlayerRequestSpawn 走的是 ApplyCharacterConfigToCharacter
+	//     (InitializeHealth(PlayerConfigAsset->MaxHealth=100)), 不读 MotherMaxHealth
+	//   - 刀战逻辑零影响
+	{
+		// 大厂原则 — 显式优于隐式: 拿 GameMode (UserConfig 真理源) 必须有, 拿不到是配置错
+		ARoomGameMode* RoomGM = World ? World->GetAuthGameMode<ARoomGameMode>() : nullptr;
+		if (!RoomGM)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: GameMode 为空, 无法读 MotherMaxHealth 配置. "
+				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
+				     "检查 ARoomGameMode 是否正确注入."));
+		}
+		else if (RoomGM->MotherMaxHealth <= 0.0f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: GM.MotherMaxHealth=%.1f (≤0, 非法). "
+				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
+				     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Max Health (默认 200)."),
+				RoomGM->MotherMaxHealth);
+		}
+		else if (UHealthComponent* MotherHC = NewMotherPawn->ResolveHealthComponent())
+		{
+			MotherHC->InitializeHealth(RoomGM->MotherMaxHealth); // 写 MaxHealth + CurrentHealth + 广播
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation] MutatePawnToMother: 母体血量初始化完成. NewMotherPawn='%s' MaxHealth=%.1f (来自 GM.MotherMaxHealth). "
+				     "客户端会通过 DOREPLIFETIME(MaxHealth) 同步收到 200."),
+				*NewMotherPawn->GetName(), RoomGM->MotherMaxHealth);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: NewMotherPawn='%s' 找不到 HealthComponent. "
+				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
+				     "检查 BP_MuTi 蓝图是否挂了 HealthComponent."),
+				*NewMotherPawn->GetName());
+		}
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] MutatePawnToMother: 母体原地变异成功. Controller=%s → NewPawn=%s (Class=%s, Location=%s, RowName=%s). "
+		     "【v90 业务核心】母体在原地, 未回出生点. 母体账本 + 视觉特效 + 业务标记由 MotherMutationSubsystem 接管."),
+		*Controller->GetName(),
+		*NewMotherPawn->GetName(),
+		*MotherClass->GetName(),
+		*OldPawnLocation.ToString(),
+		*MotherCharRowName);
+
+	// 返回: 业务层 (RoomMotherMutationSubsystem) 后续会:
+	//   1. 拿 NewMotherPawn (Controller->GetPawn())
+	//   2. 业务层标记 bIsMother/bIsHuman (双字段同步)
+	//   3. 账本 MotherCharacters.AddUnique
+	//   4. Multicast_PlayMutationFX (v31.6 纯数据 RPC)
+	return true;
 }

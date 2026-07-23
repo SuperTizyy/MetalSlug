@@ -20,9 +20,12 @@
 #include "UI/Login/Pages/BattleRoom/RoomInsidePage.h"
 #include "Components/VerticalBox.h"
 #include "Components/Button.h"
+#include "Components/PanelWidget.h" // 【v93 修复】CreatePlayerLabelInBox 入参基类 (UPanelWidget)
 #include "Components/TextBlock.h"
 #include "Components/ScrollBox.h"
 #include "Components/EditableTextBox.h"
+#include "Components/CanvasPanel.h"  // 【v93 新增】刀战/生化模式容器
+#include "Components/WrapBox.h"      // 【v93 新增】生化模式专用 WrapBox 容器
 // 【2026.07.11 v29】FPendingAIEntry (路径 B: AI 占位数据) + ARoomGameMode (显式 GM->GetPendingAIInFaction)
 #include "Systems/AI/AIBehaviorTypes.h"
 #include "Systems/RoomGameMode.h"
@@ -183,6 +186,30 @@ void URoomInsidePage::NativeConstruct()
 		RoomService->OnHostChanged.AddDynamic(this, &URoomInsidePage::OnRoomServiceHostChanged);
 		RoomService->OnPlayerJoined.AddDynamic(this, &URoomInsidePage::OnRoomServicePlayerJoined);
 		RoomService->OnPlayerLeft.AddDynamic(this, &URoomInsidePage::OnRoomServicePlayerLeft);
+	}
+
+	// ==========================================================
+	// 【v93 新增】订阅 GameState 房间模式变化（互斥 Canvas 显示）
+	// ==========================================================
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+		{
+			GS->OnMatchModeChanged.AddDynamic(this, &URoomInsidePage::OnGameStateMatchModeChanged);
+
+			// 立即应用一次可见性 (用当前 GameState 模式)
+			ApplyVisibilityByMode(GS->CurrentMatchMode);
+
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomInsidePage] 订阅 GameState.OnMatchModeChanged, 当前模式=%d"),
+				static_cast<int32>(GS->CurrentMatchMode));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[RoomInsidePage] NativeConstruct: GameState 为空, 无法订阅 OnMatchModeChanged. "
+				     "延迟到 CheckForNewPlayers 补订阅."));
+		}
 	}
 
 	// ==========================================
@@ -1676,9 +1703,10 @@ void URoomInsidePage::CheckForNewPlayers()
  */
 void URoomInsidePage::RefreshRoomUI()
 {
-	// 清空攻守方列表
+	// 清空攻守方列表 + WrapBox (生化模式容器)
 	if (Box_AttackTeam) Box_AttackTeam->ClearChildren();
 	if (Box_DefenseTeam) Box_DefenseTeam->ClearChildren();
+	if (WrapBox_ZombiePlayers) WrapBox_ZombiePlayers->ClearChildren();
 
 	// 【v46 新增】获取 GameState 引用 (用于读 ReplicatedPendingAIQueue)
 	ARoomGameState* GS = GetWorld() ? GetWorld()->GetGameState<ARoomGameState>() : nullptr;
@@ -1781,12 +1809,26 @@ void URoomInsidePage::RefreshRoomUI()
 	// 新 (v29): 双数据流
 	//   路径 A 真人: KnownPlayerStates (PS 事件订阅链, v18/v27 验证可靠)
 	//   路径 B AI 占位: GM->GetPendingAIInFaction (大厅阶段独有, 战斗时已 Spawn 进 AIController)
-	// ==========================================
+	//
+	// 【v93 大厂架构】模式分发 (刀战/生化分离容器):
+	//   - Melee 模式: 路径 A/B 按 PS_FactionTag/Entry.FactionTag 分桶到 Box_AttackTeam/Box_DefenseTeam
+	//   - Zombie 模式: 路径 A/B 不分阵营, 全部塞进 WrapBox_ZombiePlayers (横向自动换行)
+	// ==========================================================
+	const ERoomMatchMode CurrentMode = GS ? GS->CurrentMatchMode : ERoomMatchMode::None;
+	const bool bIsZombieMode = (CurrentMode == ERoomMatchMode::Zombie);
+	const bool bIsMeleeMode = (CurrentMode == ERoomMatchMode::Melee);
+
+	// 生化模式: 准备 WrapBox_ZombiePlayers 容器
+	if (bIsZombieMode && WrapBox_ZombiePlayers)
+	{
+		WrapBox_ZombiePlayers->ClearChildren();
+	}
 
 	// ==========================================
 	// 路径 A: 真人玩家 (走 KnownPlayerStates)
 	// 大厂原则 - 单一真理源: PS (PlayerState) 是阵营/准备状态的真理源, 直接读 PS 字段 (不再绕道 URoomStateService 快照层)
 	// 旧 (v28) 错误: 用 GetAttackFactionSnapshots 查快照 → 又是绕一层, 还遇到 PlayerArray 空的问题
+	// 【v93 重构】Zombie 模式不区分阵营, 全部进 WrapBox_ZombiePlayers
 	// ==========================================
 	for (ARoomPlayerState* PS : KnownPlayerStates)
 	{
@@ -1799,6 +1841,29 @@ void URoomInsidePage::RefreshRoomUI()
 		FGameplayTag PS_FactionTag = PS->CurrentFactionTag;
 		bool         PS_bIsReady = PS->bIsReady;
 
+		// 【v93 模式分发】Zombie 模式: 直接用 WrapBox, 不分阵营
+		if (bIsZombieMode)
+		{
+			if (WrapBox_ZombiePlayers)
+			{
+				CreatePlayerLabelInBox(
+					WrapBox_ZombiePlayers,
+					PName,
+					/*bIsAI=*/ false,
+					CurrentHostName,
+					bAmILocalHost,
+					LocalAccountName,
+					/*bLabelReady=*/ PS_bIsReady);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] 生化模式渲染真人时 WrapBox_ZombiePlayers 为空! 跳过 PName=%s"), *PName);
+			}
+			continue;
+		}
+
+		// 【Melee 模式】按阵营分桶到 Box_AttackTeam/Box_DefenseTeam
 		UVerticalBox* TargetBox = nullptr;
 		if (PS_FactionTag == FFactionTags::Offense()) TargetBox = Box_AttackTeam;
 		else if (PS_FactionTag == FFactionTags::Defense()) TargetBox = Box_DefenseTeam;
@@ -1829,9 +1894,8 @@ void URoomInsidePage::RefreshRoomUI()
 	// 【v46 大厂架构修复】改用 GameState.ReplicatedPendingAIQueue (客户端可见)
 	// 旧路径读 GM->GetPendingAIInFaction — 但 ARoomGameMode.PendingAIQueue 不是 Replicated,
 	// 客户端读永远为空, 导致 AI 占位不显示
+	// 【v93 模式分发】Zombie 模式不分阵营, 全部进 WrapBox_ZombiePlayers
 	// ==========================================
-	// 【v46 修复】直接用已有的 GS 变量 (CheckForNewPlayers 已声明)
-	// 攻方 AI 占位
 	if (GS)
 	{
 		const TArray<FPendingAIEntry> PendingAttackAI = GS->ReplicatedPendingAIQueue.FilterByPredicate(
@@ -1847,6 +1911,25 @@ void URoomInsidePage::RefreshRoomUI()
 					*Entry.FactionTag.ToString());
 				continue;
 			}
+
+			// 【v93 模式分发】Zombie 模式: 直接用 WrapBox
+			if (bIsZombieMode)
+			{
+				if (WrapBox_ZombiePlayers)
+				{
+					CreatePlayerLabelInBox(
+						WrapBox_ZombiePlayers,
+						Entry.DisplayName,
+						/*bIsAI=*/ true,
+						CurrentHostName,
+						bAmILocalHost,
+						LocalAccountName,
+						/*bLabelReady=*/ false);
+				}
+				continue;
+			}
+
+			// 【Melee 模式】按阵营分桶
 			if (Box_AttackTeam)
 			{
 				CreatePlayerLabelInBox(
@@ -1874,6 +1957,25 @@ void URoomInsidePage::RefreshRoomUI()
 					*Entry.FactionTag.ToString());
 				continue;
 			}
+
+			// 【v93 模式分发】Zombie 模式: 直接用 WrapBox (跳过守方桶)
+			if (bIsZombieMode)
+			{
+				if (WrapBox_ZombiePlayers)
+				{
+					CreatePlayerLabelInBox(
+						WrapBox_ZombiePlayers,
+						Entry.DisplayName,
+						/*bIsAI=*/ true,
+						CurrentHostName,
+						bAmILocalHost,
+						LocalAccountName,
+						/*bLabelReady=*/ false);
+				}
+				continue;
+			}
+
+			// 【Melee 模式】按阵营分桶
 			if (Box_DefenseTeam)
 			{
 				CreatePlayerLabelInBox(
@@ -1915,7 +2017,21 @@ void URoomInsidePage::RefreshRoomUI()
 	{
 		int32 AttackCount = Box_AttackTeam ? Box_AttackTeam->GetChildrenCount() : 0;
 		int32 DefenseCount = Box_DefenseTeam ? Box_DefenseTeam->GetChildrenCount() : 0;
-		int32 TotalWithAI = AttackCount + DefenseCount;
+		int32 ZombieWrapCount = WrapBox_ZombiePlayers ? WrapBox_ZombiePlayers->GetChildrenCount() : 0;
+
+		// 【v93 大厂架构】模式分支计算总人数 (大厂原则 — 单一真理源, 互斥容器):
+		//   - Melee 模式: 用 AttackCount + DefenseCount (Box_AttackTeam/Box_DefenseTeam 内有人)
+		//   - Zombie 模式: 用 ZombieWrapCount (WrapBox_ZombiePlayers 内有人, Box_Attack/Defense 是空的)
+		//   - 其他模式: 全 0 → TotalWithAI = 1 (向下兼容, 不报错)
+		int32 TotalWithAI = 0;
+		if (bIsZombieMode)
+		{
+			TotalWithAI = ZombieWrapCount;
+		}
+		else
+		{
+			TotalWithAI = AttackCount + DefenseCount;
+		}
 		if (TotalWithAI < 1) TotalWithAI = 1;
 
 		// 直接拿 SessionInterface, 绕开 USessionManagerSubsystem 内部 bIsHost 护栏
@@ -1933,8 +2049,9 @@ void URoomInsidePage::RefreshRoomUI()
 						EOnlineDataAdvertisementType::ViaOnlineService);
 					SessionPtr->UpdateSession(NAME_GameSession, NamedSession->SessionSettings, true);
 					UE_LOG(LogTemp, Log,
-						TEXT("[RoomInsidePage] RefreshRoomUI: 推送 TOTAL_PLAYERS_WITH_AI=%d (Attack=%d, Defense=%d, Max=%d)"),
-						SafeTotal, AttackCount, DefenseCount, MaxPlayers);
+						TEXT("[RoomInsidePage] RefreshRoomUI: 推送 TOTAL_PLAYERS_WITH_AI=%d (Attack=%d, Defense=%d, ZombieWrap=%d, Max=%d, Mode=%s)"),
+						SafeTotal, AttackCount, DefenseCount, ZombieWrapCount, MaxPlayers,
+						bIsZombieMode ? TEXT("Zombie") : TEXT("Melee"));
 				}
 				else
 				{
@@ -1959,7 +2076,7 @@ void URoomInsidePage::RefreshRoomUI()
  *   - 零兜底: 各步骤出错显式 Log Error + 不渲染 (而不是"自动选个别的角色")
  */
 void URoomInsidePage::CreatePlayerLabelInBox(
-	UVerticalBox* TargetBox,
+	UPanelWidget* TargetBox,
 	const FString& PName,
 	bool bIsAI,
 	const FString& CurrentHostName,
@@ -2305,6 +2422,131 @@ void URoomInsidePage::OnRoomServiceHostChanged(bool bIsHostNow)
 }
 
 
+// ==========================================================
+// 【v93 新增】刀战/生化模式 Canvas 显示/隐藏
+// ==========================================================
+//
+// 职责:
+//   - 根据 GameState.CurrentMatchMode, 互斥显示 Canvas_MeleeContainer 或 Canvas_ZombieContainer
+//   - 模式切换时清空不匹配的旧 Box (避免残留 widget)
+//   - 触发 RefreshRoomUI 重新渲染当前模式的玩家标签
+//
+// 大厂原则:
+//   - 单一入口: ApplyVisibilityByMode 是 Canvas 显示/隐藏的唯一入口
+//   - 零兜底: Mode == None/未识别模式 → 全部 Collapsed + Log Error (强制修复)
+//   - 职责对等: Melee 和 Zombie 各有独立 Canvas, 互不耦合
+// ==========================================================
+
+/**
+ * OnGameStateMatchModeChanged
+ *
+ * GameState.OnMatchModeChanged 委托回调 (服务器写入触发或客户端 OnRep 触发)
+ * 流程:
+ *   1. 立即 ApplyVisibilityByMode(NewMode) 切换 Canvas 显隐
+ *   2. RefreshRoomUI 重新渲染当前模式的玩家标签
+ *
+ * 为什么必须 RefreshRoomUI:
+ *   - 模式切换后, 旧 Box (例如 Melee 的 VerticalBox) 可能残留旧 widget
+ *   - 新模式需要在新的 Canvas 里渲染对应模式的玩家/AI 标签
+ *   - RefreshRoomUI 会清空所有 Box 然后按当前模式渲染
+ */
+void URoomInsidePage::OnGameStateMatchModeChanged(ERoomMatchMode NewMode)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomInsidePage] OnGameStateMatchModeChanged: 房间模式变化, NewMode=%d"),
+		static_cast<int32>(NewMode));
+
+	// 1. 应用新模式的 Canvas 显隐
+	ApplyVisibilityByMode(NewMode);
+
+	// 2. 重新刷新玩家标签列表（按新模式渲染到对应 Canvas 内的容器）
+	RefreshRoomUI();
+}
+
+
+/**
+ * ApplyVisibilityByMode
+ *
+ * 根据模式设置 Canvas_MeleeContainer / Canvas_ZombieContainer 的 Visible/Collapsed
+ *
+ * 大厂原则 — 单一入口 + 互斥显示:
+ *   - Melee: Melee Visible, Zombie Collapsed, WrapBox Collapsed
+ *   - Zombie: Melee Collapsed, Zombie Visible, WrapBox Visible
+ *   - None/其他: 全部 Collapsed + Log Error (零兜底)
+ *
+ * @param Mode 当前游戏模式 (来自 GameState.CurrentMatchMode)
+ */
+void URoomInsidePage::ApplyVisibilityByMode(ERoomMatchMode Mode)
+{
+	if (Mode == ERoomMatchMode::Melee)
+	{
+		// 刀战模式: 刀战容器可见, 生化容器折叠
+		if (Canvas_MeleeContainer)
+		{
+			Canvas_MeleeContainer->SetVisibility(ESlateVisibility::Visible);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] ApplyVisibilityByMode: Canvas_MeleeContainer 为空! "
+				     "请检查 BP_WBP_RoomInsidePage 是否有名为 Canvas_MeleeContainer 的 CanvasPanel 控件."));
+		}
+		if (Canvas_ZombieContainer)
+		{
+			Canvas_ZombieContainer->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		if (WrapBox_ZombiePlayers)
+		{
+			WrapBox_ZombiePlayers->ClearChildren();
+			WrapBox_ZombiePlayers->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+	else if (Mode == ERoomMatchMode::Zombie)
+	{
+		// 生化模式: 生化容器可见, 刀战容器折叠
+		if (Canvas_MeleeContainer)
+		{
+			Canvas_MeleeContainer->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		if (Canvas_ZombieContainer)
+		{
+			Canvas_ZombieContainer->SetVisibility(ESlateVisibility::Visible);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] ApplyVisibilityByMode: Canvas_ZombieContainer 为空! "
+				     "请检查 BP_WBP_RoomInsidePage 是否有名为 Canvas_ZombieContainer 的 CanvasPanel 控件."));
+		}
+		if (WrapBox_ZombiePlayers)
+		{
+			WrapBox_ZombiePlayers->SetVisibility(ESlateVisibility::Visible);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] ApplyVisibilityByMode: WrapBox_ZombiePlayers 为空! "
+				     "请检查 BP_WBP_RoomInsidePage 是否有名为 WrapBox_ZombiePlayers 的 WrapBox 控件."));
+		}
+
+		// 清空刀战容器残留 widget (防止模式切换时 Box_AttackTeam/Box_DefenseTeam 残留旧模式 widget)
+		if (Box_AttackTeam) Box_AttackTeam->ClearChildren();
+		if (Box_DefenseTeam) Box_DefenseTeam->ClearChildren();
+	}
+	else
+	{
+		// 零兜底: 未识别模式 → 全部折叠 + 报错
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] ApplyVisibilityByMode: 未识别模式=%d, 所有 Canvas 折叠. "
+			     "【修复】检查 GameState.CurrentMatchMode 是否被合法赋值 (Melee/Zombie)."),
+			static_cast<int32>(Mode));
+		if (Canvas_MeleeContainer) Canvas_MeleeContainer->SetVisibility(ESlateVisibility::Collapsed);
+		if (Canvas_ZombieContainer) Canvas_ZombieContainer->SetVisibility(ESlateVisibility::Collapsed);
+		if (WrapBox_ZombiePlayers) WrapBox_ZombiePlayers->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+
 /**
  * ForceApplyHostIdentityToLocalWidget
  *
@@ -2321,8 +2563,9 @@ void URoomInsidePage::ForceApplyHostIdentityToLocalWidget()
 	const FString LocalAccountName = RoomService->GetCurrentAccountName();
 	if (LocalAccountName.IsEmpty()) return;
 
-	// 遍历 Box_AttackTeam 和 Box_DefenseTeam 两个容器, 找到本地玩家 widget
-	auto ApplyToBox = [&](UVerticalBox* Box)
+	// 遍历 Box_AttackTeam / Box_DefenseTeam / WrapBox_ZombiePlayers 三个容器, 找到本地玩家 widget
+	// 【v93 大厂架构】模式分支: Zombie 模式下玩家都在 WrapBox_ZombiePlayers, 不分阵营
+	auto ApplyToBox = [&](UPanelWidget* Box)
 	{
 		if (!Box) return;
 		for (int32 i = 0; i < Box->GetChildrenCount(); ++i)
@@ -2345,6 +2588,7 @@ void URoomInsidePage::ForceApplyHostIdentityToLocalWidget()
 
 	ApplyToBox(Box_AttackTeam);
 	ApplyToBox(Box_DefenseTeam);
+	ApplyToBox(WrapBox_ZombiePlayers);
 }
 
 /**

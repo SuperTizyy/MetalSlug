@@ -133,6 +133,16 @@ public:
 	virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage) override;
 
 	/**
+	 * @brief UE override: GameState 已创建后调用 (URL ?Mode= 解析写入 GS 的入口)
+	 *
+	 * 大厂原则 (Single Source of Truth):
+	 *   - InitGame 时 GameState **尚未创建** (GameState 在 InitGameState 中创建)
+	 *   - InitGameState 是写入 GS->CurrentMatchMode 的最早安全时机
+	 *   - InitGame 只负责 InjectSubsystemConfigs (DT / ModeRules / 复活延迟)
+	 */
+	virtual void InitGameState() override;
+
+	/**
 	 * @brief UE override: 属性初始化后调用 — Editor 反射可注入 Subsystem
 	 */
 	virtual void PostInitProperties() override;
@@ -734,23 +744,110 @@ public:
 	float RespawnDelaySeconds = 3.0f;
 
 	/**
-	 * 总局数（每边达到这个胜局数时比赛结束）
+	 * 总局数（生化模式使用，UI 显示 "总局数：xx"）
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 策划在 GameMode Class Defaults 配置
+	 *   - 运行时通过 InjectSubsystemConfigs 写入 GameState.TotalRounds (Replicated)
+	 *   - UI 订阅 GameState.TotalRounds 显示
+	 *
+	 * 【v92 大厂架构】ZombieTotalRounds 已删除, 统一用 TotalRounds 字段 (消除重复字段)
 	 */
-	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
-	int32 TotalRounds = 10;
-
-	/**
-	 * 生化模式总回合数
-	 */
-	UPROPERTY(EditDefaultsOnly, Category = "MetalSlug|Match")
-	int32 ZombieTotalRounds = 5;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "1", ClampMax = "20"))
+	int32 TotalRounds = 5;
 
 	/**
 	 * 刀战模式每局比赛时长（秒），在此可配置任意值
 	 * 例如 300=5分钟、600=10分钟、900=15分钟
+	 *
+	 * 单一真理源 — UI 的 Text_RoundCountdown 直接用此值:
+	 *   - ServerStartMatchTimer (Melee 模式) 写入 GameState.MatchEndTime = Now + 此值
+	 *   - UI Widget 通过 GetMatchRemainingSeconds() 计算剩余秒数
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "30", ClampMax = "3600"))
+	int32 MeleeMatchDurationSeconds = 600;
+
+	/**
+	 * 生化模式每局比赛时长（秒），在此可配置任意值
+	 * 例如 60=1分钟、120=2分钟、180=3分钟
+	 *
+	 * 单一真理源 — UI 的 Text_RoundCountdown 直接用此值:
+	 *   - ServerStartMatchTimer (Zombie 模式) 写入 GameState.MatchEndTime = Now + 此值
+	 *   - UI Widget 通过 GetMatchRemainingSeconds() 计算剩余秒数
+	 *
+	 * 大厂原则 — 对称设计:
+	 *   - MeleeMatchDurationSeconds (刀战每局时长) + ZombieMatchDurationSeconds (生化每局时长)
+	 *   - 两模式都有独立的倒计时, UI 镜像显示
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "30", ClampMax = "3600"))
+	int32 ZombieMatchDurationSeconds = 120;
+
+	/**
+	 * 【v92 大厂架构新增】生化模式母体变异倒计时（秒）
+	 *
+	 * 业务规则:
+	 *   生化模式每局开局, 玩家/AI 都是人类, 互相无敌
+	 *   此秒数倒计时结束后才会"变异"为母体 (Phase 3 母体死亡广播)
+	 *   默认 8 秒, 可由策划在 BP 中调整
+	 *
+	 * 大厂原则 — 业务可配:
+	 *   - 设 0 或负数 → 业务禁用母体变异倒计时 (按用户决策 A 静默跳过启动)
+	 *   - 设 > 0 → 启动倒计时, 写入 GameState.MotherMutationDuration Replicated 字段
+	 *
+	 * 调用方:
+	 *   - ARoomGameMode::InitLifecycleSubsystem 注入到 URoomLifecycleSubsystem
+	 *   - URoomLifecycleSubsystem::StartMotherMutationCountdown 读取并启动
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float MotherMutationDurationSeconds = 8.0f;
+
+	/**
+	 * 【v90 大厂架构新增】生化模式母体 Pawn RowName — 真理源
+	 *
+	 * 业务规则:
+	 *   倒计时结束后, 选中的目标 Pawn 类变更为"母体"
+	 *   - 蓝图 BP_MuTi 在 DT_CharacterInfo 中配 CharacterBlueprint (单源)
+	 *   - 本字段只配 RowName 字符串 (业务可调, 无需改 C++)
+	 *
+	 * 大厂原则 — 配置可调:
+	 *   - 必须非空 (零兜底)
+	 *   - 业务层 (RoomMotherMutationSubsystem::MutateCharacterToMother) 只读本字段
+	 *   - 不复活成出生点 (镜生态要求: 任何情况变母体都是原地变)
+	 *
+	 * 调用方:
+	 *   - URoomMotherMutationSubsystem::MutateCharacterToMother 读取
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match")
-	int32 MeleeMatchDurationSeconds = 600;
+	FString MotherCharacterRowName = TEXT("MT001");
+
+	/**
+	 * 【v93.4 大厂架构新增】生化模式母体最大血量 — 配置驱动真理源
+	 *
+	 * 业务规则 (用户 2026.07.25 明确):
+	 *   变成母体后, 血量上限 = 本字段值 (默认 200), 满血
+	 *   人类的各种武器都能对母体进行攻击 (走 FFactionTags::CanDamage 守卫, 异阵营 = 通过)
+	 *   人类和人类之间无法互相伤害 (同阵营守卫拒判, 已自动生效)
+	 *
+	 * 大厂原则 — 配置可调 + 单一真理源:
+	 *   - 必须 > 0 (零兜底)
+	 *   - 业务层 (RoomSpawnSubsystem::MutatePawnToMother Step 5.6) 只读本字段
+	 *   - 调 HealthComponent->InitializeHealth(MotherMaxHealth) 自动同步血量上限到所有客户端
+	 *     (MaxHealth 已 Replicated + OnRep_CurrentHealth 自动 broadcast)
+	 *
+	 * 不破坏刀战模式 (大厂原则 — 零耦合):
+	 *   - 本字段只被 MutatePawnToMother 读取, 母体变异专属入口
+	 *   - 刀战模式不调 MutatePawnToMother → 永远不读本字段 → 刀战逻辑零影响
+	 *
+	 * 调用方:
+	 *   - URoomSpawnSubsystem::MutatePawnToMother Step 5.6
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "1.0", ClampMax = "9999.0"))
+	float MotherMaxHealth = 200.0f;
 
 	/**
 	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色

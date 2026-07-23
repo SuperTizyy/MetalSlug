@@ -123,6 +123,16 @@ struct FMatchSnapshot
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     int32 CurrentRound = 0;
 
+    /**
+     * 【v92 大厂架构重构】总局数 (UI 显示用, 替换旧的 CurrentRound UI 用途)
+     *
+     * 大厂原则 — 职责分离:
+     *   - CurrentRound: 内部计数器 (Subsystem 使用)
+     *   - TotalRounds: UI 真理源 (UI 静态显示 "总局数：xx")
+     */
+    UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
+    int32 TotalRounds = 5;
+
     UPROPERTY(BlueprintReadOnly, Category = "RoomStateService")
     int32 AttackerTotalKills = 0;
 

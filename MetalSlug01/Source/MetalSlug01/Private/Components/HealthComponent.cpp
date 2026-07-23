@@ -35,6 +35,11 @@ void UHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME(UHealthComponent, CurrentHealth);
 	DOREPLIFETIME(UHealthComponent, bIsDead);
 
+	// 【v93.4 大厂架构修复】MaxHealth 必须 Replicated (单一真理源)
+	//   - 母体变异时 MaxHealth=200 (从 100 改), 客户端必须同步收到 200
+	//   - 不复制 → 客户端 HUD 永远读到默认 100, 血条进度算错
+	DOREPLIFETIME(UHealthComponent, MaxHealth);
+
 	// 【2026.07.11 P0 新增】: 同步无敌期字段
 	//   - bIsInvincible: 必须 ReplicatedUsing, 客户端 OnRep 自动广播事件
 	//   - InvincibilityExpiresAtWorldTime: 普通 Replicated 即可, 客户端只读计算剩余
@@ -49,9 +54,32 @@ void UHealthComponent::InitializeHealth(float InMax)
 {
 	// 【2026-06-15 简化】: 不再接收 InCurrent,初值 = MaxHealth
 	// 修复前构造函数传 InCurrent 是为了与 BaseCharacter 双轨同步,现在不再需要
+	const float OldMax = MaxHealth;
+	const float OldCurrent = CurrentHealth;
+
 	MaxHealth = FMath::Max(InMax, 1.0f);
 	CurrentHealth = MaxHealth;
 	bIsDead = false;
+
+	// 【v93.4 大厂架构修复】服务器主动广播血量变化
+	//
+	// 旧 (v93.3 之前) 反模式:
+	//   - InitializeHealth 不 broadcast 任何事件 → 服务器 HUD 不知道血量变了
+	//   - 服务器端 OnRep_CurrentHealth 不会被调用 (ReplicatedUsing 只对客户端生效)
+	//   - 服务器必须主动 Broadcast, 跟 ApplyDamage 一样 (大厂原则 — 单一真理源)
+	//
+	// 新 (v93.4):
+	//   - MaxHealth 或 CurrentHealth 真变化 → 主动 Broadcast(CurrentHealth) → HUD 立刻更新
+	//   - 客户端走 OnRep_CurrentHealth 自动 Broadcast (MaxHealth 是普通 Replicated, 无 OnRep)
+	//
+	// 为什么只在变化时 Broadcast (不无脑 Broadcast):
+	//   - 玩家 Spawn 路径会调 InitializeHealth(MaxHealth) → BeginPlay 之前 → HUD 还没订阅
+	//   - 此时 Broadcast 没意义, 浪费一次委托调用
+	//   - 大厂原则 - 零重复: 跟 ApplyDamage 一致, 只在真变化时通知
+	if (!FMath::IsNearlyEqual(OldMax, MaxHealth) || !FMath::IsNearlyEqual(OldCurrent, CurrentHealth))
+	{
+		OnHealthChanged.Broadcast(CurrentHealth);
+	}
 }
 
 

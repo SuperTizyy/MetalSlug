@@ -51,6 +51,9 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
 
+// 【v93 大厂架构】UAnimMontage 完整类型 (Multicast_PlayAttackAnim_Implementation 母体分支需要)
+#include "Animation/AnimMontage.h"
+
 // 引入 UGameplayStatics::ApplyPointDamage
 #include "Kismet/GameplayStatics.h"
 
@@ -74,6 +77,11 @@
 
 // UE 引擎日志
 #include "Engine/Engine.h"
+
+// 【v93.2 大厂架构新增】母体命中变母体调用 — RoomMotherMutationSubsystem::MutateCharacterToMother
+#include "Systems/Mother/RoomMotherMutationSubsystem.h"
+// 【v93.2 大厂架构新增】模式校验 — ARoomGameState::CurrentMatchMode (真理源)
+#include "Systems/RoomGameState.h"
 
 
 // ==========================================
@@ -805,6 +813,34 @@ void UAIAttackComponent::Multicast_PlayAttackAnim_Implementation(bool bIsHeavy, 
 		return;
 	}
 
+	// ============================================================
+	// 【v93 大厂架构】母体分支 — 母体无武器, 走 Pawn 字段配置蒙太奇
+	// ============================================================
+	//
+	// 大厂原则 — 镜像对称:
+	//   - 武器攻击路径 (line 808-821): CurrentWeapon->GetAttackMontage(...) + Combo1/Combo2 切换
+	//   - 母体攻击路径 (本块):                 Owner->GetMotherAttackMontage() + 单一蒙太奇
+	//
+	// 复用 RPC 协议:
+	//   - InComboIndex=0 约定为"母体专属" (PlayerComboComponent::ExecuteMotherAttackSequence 也传 0)
+	//   - InComboIndex=1/2 约定为"玩家武器连击段数"
+	//
+	// 零兜底:
+	//   - bIsMother=true 但 MotherAttackMontage 未配 → Log Warning + 静默跳过 (客户端不应重复报错)
+	//     (服务器 PlayerComboComponent::ExecuteMotherAttackSequence 已 Log Error)
+	if (OwnerCharacter->bIsMother)
+	{
+		UAnimMontage* MotherMontage = OwnerCharacter->GetMotherAttackMontage();
+		if (!MotherMontage)
+		{
+			// 客户端静默跳过 — 服务器已 Log Error, 不重复
+			return;
+		}
+		// 母体单一蒙太奇, 无 Section 切换
+		OwnerCharacter->PlayAnimMontage(MotherMontage, 1.0f);
+		return;
+	}
+
 	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
 	if (CurrentWeapon)
 	{
@@ -961,4 +997,125 @@ bool UAIAttackComponent::Server_ReportAIAttackHit_Validate(AActor* HitActor, flo
 	}
 
 	return true;
+}
+
+
+// ============================================================
+// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】AI 母体攻击命中上报
+// ============================================================
+// 复用动机 (用户需求 2026.07.25):
+//   - 母体复用 ANS_MeleeTraceState + MeleeSwStrategy (零重复)
+//   - 命中 RPC 走 Owner->Server_ReportMotherAttackHit → BaseCharacter 转发壳 → 本函数 (AI 路径)
+//   - 命中后行为: 调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用, 不重复实现变母体)
+//
+// 大厂原则 — 防御层同构:
+//   - 与 Server_ReportAIAttackHit 防御 1-5 完全镜像 (HitActor 有效/自伤/友军/无敌期)
+//   - 仅"命中后行为"不同: AIAttack 走 ApplyDamage, MotherAttack 走 MutateCharacterToMother
+//
+// 大厂原则 — 模式校验:
+//   - 母体只在生化模式有意义 (刀战模式无 Mother)
+//   - 但本函数不强制 Mode 校验 — RoomMotherMutationSubsystem::MutateCharacterToMother 内部有 Mode 校验
+//   - 这里只做"前置防御" (不重复 MutateCharacterToMother 的 bIsMother/bIsHuman 检查)
+
+void UAIAttackComponent::Server_ReportMotherAttackHit_Implementation(AActor* HitActor)
+{
+	// 【v40.6 P0】按需解析 Owner — 不依赖 BeginPlay 缓存
+	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
+	if (!OwnerCharacter)
+	{
+		return;
+	}
+
+	// 防御 1: HitActor 必须有效
+	if (!HitActor)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: AI 母体=%s 收到空 HitActor, 忽略"),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
+	// 防御 2: 目标必须是 ABaseCharacter
+	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
+	if (!Victim)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: AI 母体=%s -> HitActor=%s 不是 ABaseCharacter, 忽略"),
+			*OwnerCharacter->GetName(), *HitActor->GetName());
+		return;
+	}
+
+	// 防御 3: 目标已死则不变 (避免重复变母体)
+	if (Victim->IsDead())
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: AI 母体=%s -> Victim=%s 已死, 跳过变母体"),
+			*OwnerCharacter->GetName(), *Victim->GetName());
+		return;
+	}
+
+	// 防御 4: 自伤防御 (母体不打自己)
+	if (Victim == OwnerCharacter)
+	{
+		return;
+	}
+
+	// 防御 5: 【2026.07.11 P0 大厂架构】友军伤害守卫 (复用 FFactionTags::CanDamage)
+	//   - 同阵营 → 拒绝 + Log Warning
+	//   - 异阵营 → 通过 (这是异阵营, 人类 vs 母体)
+	if (!FFactionTags::CanDamage(
+			OwnerCharacter->GetFactionTag(),
+			Victim->GetFactionTag(),
+			TEXT("UAIAttackComponent::Server_ReportMotherAttackHit"),
+			OwnerCharacter->GetName(),
+			Victim->GetName()))
+	{
+		return;
+	}
+
+	// 防御 6: 目标已是母体 → 拒绝 (二次变母体无意义, 由 MutateCharacterToMother 内部 bIsMother 检查覆盖)
+	//   这里加显式检查是为了"早失败" — 避免调 Subsystem 走一圈再被拒
+	if (Victim->bIsMother)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: AI 母体=%s -> Victim=%s 已是母体, 跳过"),
+			*OwnerCharacter->GetName(), *Victim->GetName());
+		return;
+	}
+
+	// 防御 7: 模式校验 — 大厂原则: 母体攻击只在生化模式触发 (刀战模式无意义)
+	const AGameStateBase* GameStateBase = GetWorld() ? GetWorld()->GetGameState() : nullptr;
+	if (const ARoomGameState* RoomGS = Cast<ARoomGameState>(GameStateBase))
+	{
+		if (RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: 当前模式=%d 不是 Zombie — 拒绝变母体. "
+				     "【v93.2 零兜底】母体攻击只能在生化模式触发. Owner=%s Victim=%s"),
+				static_cast<int32>(RoomGS->CurrentMatchMode),
+				*OwnerCharacter->GetName(), *Victim->GetName());
+			return;
+		}
+	}
+
+	// ============================================================
+	// 终极行为 — 大厂复用 (零重复架构)
+	// ============================================================
+	// 调 RoomMotherMutationSubsystem::MutateCharacterToMother 变母体
+	//   - 该函数内部有 bIsMother / bIsHuman / 出生点 / 武器销毁等全套防御
+	//   - 本函数不需要重复这些防御
+	//
+	// 大厂原则 — 复用而非重写:
+	//   - 不在本函数内实现 UnPossess/Destroy/Spawn/Possess (那是 MutateCharacterToMother 的职责)
+	//   - 不在本函数内调 Multicast_PlayMutationFX (MutateCharacterToMother 内部已调)
+	if (URoomMotherMutationSubsystem* MutSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MutSys->MutateCharacterToMother(Victim);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: 找不到 RoomMotherMutationSubsystem — 拒绝变母体. "
+			     "【v93.2 零兜底】检查 ARoomGameMode::InjectSubsystemConfigs 是否调用."));
+	}
 }

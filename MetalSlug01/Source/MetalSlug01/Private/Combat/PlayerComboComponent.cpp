@@ -33,6 +33,13 @@
 
 // 引入动画实例 (用于 OnMontageEnded 绑定 — 2026.07.12 P0 修复, 替代 BP ANS_MeleeTrace)
 #include "Animation/AnimInstance.h"
+
+// 【v93.2 大厂架构新增】母体命中变母体调用 — RoomMotherMutationSubsystem::MutateCharacterToMother
+#include "Systems/Mother/RoomMotherMutationSubsystem.h"
+// 【v93.2 大厂架构新增】模式校验 — ARoomGameState::CurrentMatchMode (真理源)
+#include "Systems/RoomGameState.h"
+// 【v93.2 大厂架构新增】友军伤害守卫 (复用 FFactionTags::CanDamage)
+#include "Data/Faction/FactionTags.h"
 // 引入动画蒙太奇 (CachedPlayerMontage 类型需要)
 #include "Animation/AnimMontage.h"
 
@@ -280,6 +287,30 @@ void UPlayerComboComponent::LightAttack_Pressed()
 		return;
 	}
 
+	// 死人不能攻击
+	if (OwnerCharacter->IsDead())
+	{
+		return;
+	}
+
+	// ============================================================
+	// 【v93 大厂架构】母体分支 — 母体无武器也能攻击
+	// ============================================================
+	//
+	// 大厂原则 — 分支最早做:
+	//   母体变异后武器已销毁 (MutatePawnToMother v93 修复), CurrentWeapon == nullptr
+	//   武器分支(line 289-301)会 return, 永远走不到攻击流程
+	//   必须在武器检查之前分流, 避免母体左键失效
+	//
+	// 复用现有 Server_PlayAttackAnim/Multicast_PlayAttackAnim RPC (单一真理源):
+	//   - ComboIndex = 0 表示"母体专属蒙太奇" (InComboIndex 不是 1/2 走 Combo1/Combo2)
+	//   - 客户端 Multicast_PlayAttackAnim_Implementation 根据 bIsMother 选不同 Montage 来源
+	if (OwnerCharacter->bIsMother)
+	{
+		ExecuteMotherAttackSequence();
+		return;
+	}
+
 	// ============================================================
 	// 【v60.x 大厂架构 — 武器类型检查】
 	// 同一个物理键（左键）同时绑定了 FireAction 和 LightAttackAction
@@ -297,12 +328,6 @@ void UPlayerComboComponent::LightAttack_Pressed()
 	if (CurrentWeapon->GetMeshType() != EWeaponMeshType::Melee)
 	{
 		// 是枪械 — 不处理 LightAttack, 让 OnFirePressed 处理
-		return;
-	}
-
-	// 死人不能攻击
-	if (OwnerCharacter->IsDead())
-	{
 		return;
 	}
 
@@ -752,6 +777,89 @@ void UPlayerComboComponent::ExecuteComboSequence()
 }
 
 
+// ==========================================
+// 【v93 大厂架构新增】ExecuteMotherAttackSequence — 母体左键攻击序列
+// ==========================================
+//
+// 镜像 ExecuteComboSequence 结构, 但:
+//   - 不依赖武器 (母体无武器)
+//   - 单一蒙太奇 (无 Combo 切换)
+//   - 复用现有 Server_PlayAttackAnim RPC, ComboIndex=0 表示"母体专属"
+//   - 客户端 Multicast_PlayAttackAnim_Implementation 根据 bIsMother 选 MotherAttackMontage
+//
+// 大厂原则 — RPC 边界:
+//   - Server_PlayAttackAnim RPC 必须从 BaseCharacter 调 (UE 5.6 RPC 必须在 Actor 上)
+//   - 这里 Owner->Server_PlayAttackAnim(...) 是转发壳调用, 网络协议与玩家路径完全一致
+//
+// 大厂原则 — 零兜底:
+//   - MotherAttackMontage 未配 → Log Error + return (BP_MuTi 必填)
+//   - HasAuthority() 守卫 (客户端调 Server RPC 是 UE 标准做法, 但 ExecuteMotherAttackSequence 本身只判断一次)
+
+void UPlayerComboComponent::ExecuteMotherAttackSequence()
+{
+	// ==================================================================
+	// 【v40.6 P0】按需解析 Owner — 不依赖 BeginPlay 缓存
+	// ===================================================================
+	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
+	if (!OwnerCharacter)
+	{
+		return;
+	}
+
+	// 大厂原则 — 零兜底: MotherAttackMontage 必须配 (BP_MuTi 必填字段)
+	UAnimMontage* MotherMontage = OwnerCharacter->GetMotherAttackMontage();
+	if (!MotherMontage)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerCombo] ExecuteMotherAttackSequence: MotherAttackMontage 为空. "
+			     "Pawn=%s (Class=%s). "
+			     "【v93 零兜底】拒绝攻击. "
+			     "【修复路径】打开 BP_MuTi.uasset → ClassDefaults → Combat|Mother → Mother Attack Montage 必填 (e.g. AM_MotherAttack). "
+			     "刀战模式零影响 — bIsMother 永远是 false, 走不到这里."),
+			*OwnerCharacter->GetName(),
+			*OwnerCharacter->GetClass()->GetName());
+		return;
+	}
+
+	// 防御性校验: bIsMother 必须为 true (本函数调用方已保证, 但显式检查防御代码漂移)
+	if (!OwnerCharacter->bIsMother)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerCombo] ExecuteMotherAttackSequence: bIsMother=false, 拒绝执行母体攻击. "
+			     "Pawn=%s. 【v93 零兜底】本函数仅供母体调用, 非母体走 ExecuteComboSequence."),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[PlayerCombo] ExecuteMotherAttackSequence ENTER. Owner=%s Local=%d Auth=%d MotherMontage=%s"),
+		*OwnerCharacter->GetName(),
+		OwnerCharacter->IsLocallyControlled() ? 1 : 0,
+		OwnerCharacter->HasAuthority() ? 1 : 0,
+		*MotherMontage->GetName());
+
+	// 本机播放 (ListenServer 也走本机播放, Multicast RPC 在远端客户端播)
+	OwnerCharacter->PlayAnimMontage(MotherMontage, 1.0f);
+
+	// 【复用现有 RPC — 不新增】调 Server_PlayAttackAnim 走网络同步
+	//   - bIsHeavy=false (左键是轻击语义)
+	//   - InComboIndex=0 (母体专属蒙太奇, 客户端 Implementation 用 bIsMother 判定走 MotherAttackMontage)
+	//   - 这与 ExecuteComboSequence 调 Server_PlayAttackAnim(false, ComboIndex) 协议完全一致
+	OwnerCharacter->Server_PlayAttackAnim(false, 0);
+
+	// 大厂原则 — 镜像 ExecuteComboSequence:
+	//   - 蒙太奇结束回调绑到 OnPlayerAttackMontageEnded 清理状态锁
+	//   - 母体没有武器, 所以不调 StartDamageTrace (ANS_MeleeTraceState 不适用)
+	//   - 母体走 BP_MuTi Pawn 上的蓝图蒙太奇通知 (如果有需要可由美术在 BP_MuTi 蓝图 AnimBP 加自定义 Notify)
+	BindMontageEndCallback(MotherMontage);
+
+	// 大厂原则 — 状态机:
+	//   - 母体没连击系统, 只设 bIsAttacking=true 防止重复触发
+	//   - 不设 bSaveAttack / bCanReceiveInput (无连击逻辑)
+	bIsAttacking = true;
+}
+
+
 /**
  * 【2026.07.12 P0 新增】蒙太奇结束回调 (替代 BP ANS_MeleeTrace NotifyEnd)
  *
@@ -970,4 +1078,110 @@ UPlayerConfigAsset* UPlayerComboComponent::GetPlayerConfigAsset() const
 
 	// 【v56.5】PlayerConfigAsset 是 TSoftObjectPtr，需要 LoadSynchronous 获取实际指针
 	return RoomGM->PlayerConfigAsset.LoadSynchronous();
+}
+
+
+// ============================================================
+// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】玩家母体攻击命中上报
+// ============================================================
+// 复用动机 (用户需求 2026.07.25):
+//   - 母体复用 ANS_MeleeTraceState + MeleeSwStrategy (零重复)
+//   - 命中 RPC 走 Owner->Server_ReportMotherAttackHit → BaseCharacter 转发壳 → 本函数 (玩家路径)
+//   - 命中后行为: 调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用)
+//
+// 大厂原则 — 与 AIAttackComponent 镜像对称:
+//   - 防御 1-7 与 Server_ReportMotherAttackHit_Implementation (AI) 完全同构
+//   - 唯一区别: 调用方 (BaseCharacter 转发壳) 已用 IsAttackerAI() 区分玩家/AI, 本函数无须再分
+
+void UPlayerComboComponent::Server_ReportMotherAttackHit_Implementation(AActor* HitActor)
+{
+	// 【v40.6 P0】按需解析 Owner — 不依赖 BeginPlay 缓存
+	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
+	if (!OwnerCharacter)
+	{
+		return;
+	}
+
+	// 防御 1: HitActor 必须有效
+	if (!HitActor)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 玩家母体=%s 收到空 HitActor, 忽略"),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
+	// 防御 2: 目标必须是 ABaseCharacter
+	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
+	if (!Victim)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 玩家母体=%s -> HitActor=%s 不是 ABaseCharacter, 忽略"),
+			*OwnerCharacter->GetName(), *HitActor->GetName());
+		return;
+	}
+
+	// 防御 3: 目标已死则不变 (避免重复变母体)
+	if (Victim->IsDead())
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 玩家母体=%s -> Victim=%s 已死, 跳过变母体"),
+			*OwnerCharacter->GetName(), *Victim->GetName());
+		return;
+	}
+
+	// 防御 4: 自伤防御 (母体不打自己)
+	if (Victim == OwnerCharacter)
+	{
+		return;
+	}
+
+	// 防御 5: 友军伤害守卫 (复用 FFactionTags::CanDamage)
+	if (!FFactionTags::CanDamage(
+			OwnerCharacter->GetFactionTag(),
+			Victim->GetFactionTag(),
+			TEXT("UPlayerComboComponent::Server_ReportMotherAttackHit"),
+			OwnerCharacter->GetName(),
+			Victim->GetName()))
+	{
+		return;
+	}
+
+	// 防御 6: 目标已是母体 → 拒绝 (二次变母体无意义)
+	if (Victim->bIsMother)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 玩家母体=%s -> Victim=%s 已是母体, 跳过"),
+			*OwnerCharacter->GetName(), *Victim->GetName());
+		return;
+	}
+
+	// 防御 7: 模式校验 — 大厂原则: 母体攻击只在生化模式触发
+	const AGameStateBase* GameStateBase = GetWorld() ? GetWorld()->GetGameState() : nullptr;
+	if (const ARoomGameState* RoomGS = Cast<ARoomGameState>(GameStateBase))
+	{
+		if (RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 当前模式=%d 不是 Zombie — 拒绝变母体. "
+				     "【v93.2 零兜底】母体攻击只能在生化模式触发. Owner=%s Victim=%s"),
+				static_cast<int32>(RoomGS->CurrentMatchMode),
+				*OwnerCharacter->GetName(), *Victim->GetName());
+			return;
+		}
+	}
+
+	// ============================================================
+	// 终极行为 — 大厂复用 (零重复架构)
+	// ============================================================
+	if (URoomMotherMutationSubsystem* MutSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MutSys->MutateCharacterToMother(Victim);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 找不到 RoomMotherMutationSubsystem — 拒绝变母体. "
+			     "【v93.2 零兜底】检查 ARoomGameMode::InjectSubsystemConfigs 是否调用."));
+	}
 }

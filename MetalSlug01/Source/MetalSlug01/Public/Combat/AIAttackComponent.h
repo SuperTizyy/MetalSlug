@@ -205,6 +205,30 @@ public:
 	bool Server_ReportAIAttackHit_Validate(AActor* HitActor, float Damage);
 
 
+	// ============================================================
+	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】AI 母体攻击命中上报
+	// ============================================================
+	// 复用动机 (用户需求 2026.07.25):
+	//   - 母体复用 ANS_MeleeTraceState 类 (美术不学新标签)
+	//   - 复用 MeleeSwStrategy BoxTrace 缝合算法 (零重复架构)
+	//   - 母体命中 RPC 走 Owner->Server_ReportMotherAttackHit → 转发到本组件 (AI 路径)
+	//   - 命中后行为: 调 RoomMotherMutationSubsystem::MutateCharacterToMother (大厂复用)
+	//
+	// 与 Server_ReportAIAttackHit 的对称:
+	//   - 防御层同构 (IsDead / 自伤 / 友军 / 无敌期)
+	//   - 仅"命中后行为"不同: AIAttack 走 ApplyDamage, MotherAttack 走 MutateCharacterToMother
+	//
+	// 防御层: bIsHuman + 未死校验 (母体只能变活人, 不能变死人 / 已变母体 / AI)
+	//   - 防御 1: HitActor 必非空
+	//   - 防御 2: HitActor 是 ABaseCharacter
+	//   - 防御 3: Victim 未死
+	//   - 防御 4: 自伤防御 (母体不打自己)
+	//   - 防御 5: 友军防御 (母体不攻击同阵营 — 实际上母体通常单一阵营, 但保留校验防误配)
+	//   - 防御 6: Victim 必须是 bIsHuman=true (不能打母体 — 重复防御, 由 MutateCharacterToMother 内部 bIsMother 检查覆盖)
+	//   - 防御 7: 模式校验 (生化模式才能变母体, 刀战模式无意义)
+	void Server_ReportMotherAttackHit_Implementation(AActor* HitActor);
+
+
 	// ==========================================
 	// 6. 内部状态字段 (Phase 2.2 从 BaseCharacter 迁移)
 	// ==========================================

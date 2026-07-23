@@ -275,10 +275,72 @@ void ABaseWeapon::StopWeaponTrace()
  *   - 删除 BaseWeapon 内重复字段 → 真理源唯一 (Strategy 内部)
  *   - 删除 Tick 内重复 BoxTrace → 0 算法 (委托)
  *   - 旧 StartWeaponTrace / StopWeaponTrace 保留为转发壳, 兼容历史调用
+ *
+ * 【v95.1 大厂架构 P0 修复 — 服务器权威 + 客户端本地预测】
+ *   根因 (从 Session1.log 定位):
+ *     日志: "LogNet: UNetDriver::ProcessRemoteFunction: No owning connection for actor BP_Weapon_ShovelLarge_C_0.
+ *            Function Server_ReportHit will not be processed."
+ *     → 远端玩家 Pawn 的武器在 Session1 客户端跑了 trace, 命中后调 Server_ReportHit
+ *       但武器 Actor 没有 owning connection → RPC 失败 → 伤害不传导
+ *
+ *   架构分析 (大厂原则 - 服务器权威):
+ *     - 武器 Actor 是 bReplicates=true → 所有客户端都有这个武器实例
+ *     - 所有客户端都跑 Tick → 所有客户端都跑 Strategy.TickDetection (BoxTrace)
+ *     - 所有客户端都调 Server_ReportHit → 但只有本地控制 Pawn 的客户端能成功发 RPC
+ *     - 远端玩家的武器 RPC 全部失败 (owning connection 不存在) → 客户端 trace 是"无用功"
+ *     - 反过来: 服务器也是每个武器都跑 trace, 自己 trace 命中后调 Server_ReportHit
+ *       Implementation (本地直接执行) → 扣血 1 次 (✓ 正确)
+ *     - 客户端 trace 命中 + 发 RPC → 服务器 Implementation → 又扣血 1 次 (✗ 重复扣血)
+ *
+ *   修复方案 (大厂原则 - 服务器权威 + 客户端本地预测 + 职责分离):
+ *     - 服务器 (Authority): 跑所有武器 trace (玩家 + AI, 权威命中判定 → 扣血)
+ *     - 客户端 (本地玩家控制 Pawn): 跑本地玩家武器 trace (本地预测, 仅画视觉)
+ *     - 客户端 (远端玩家控制 Pawn): 跳过 trace (避免 owning connection 失败, 也避免重复 RPC)
+ *
+ *   收益:
+ *     1. 不再有 "No owning connection" 警告 — 根因消除
+ *     2. 服务器权威: 扣血只在服务器, 不会出现客户端 RPC 成功 + 服务器自身 trace 的重复扣血
+ *     3. 客户端 trace 仍有价值: 本地玩家 trace 命中后画 BoxTrace 视觉 (EDrawDebugTrace 仍工作)
+ *     4. 远端玩家 trace 完全跳过: 节省 CPU + 不发无效 RPC
+ *
+ *   零重复扣血 (大厂原则):
+ *     - 服务器跑 trace 命中 → 调 Server_ReportHit (本地直接执行 Implementation) → 扣血 1 次
+ *     - 客户端不调 Server_ReportHit (Tick 跳过) → 没有重复扣血
+ *     - 客户端仅画 BoxTrace 视觉 (EDrawDebugTrace 是本地行为, 不影响服务器)
+ *
+ *   互不冲突:
+ *     - 服务器权威伤害: 命中 → ApplyPointDamage → HealthComponent.OnHealthChanged → OnRep_CurrentHealth → 客户端 HUD 同步
+ *     - 客户端本地预测: BoxTrace 视觉立即反馈玩家 (命中时绿色 Box), 服务器同步后再扣血
+ *
+ *   【不影响其他调用方】Ranged 路径走 Server_StartFire RPC → 服务器端 PerformSingleShot → 不走 Tick 委托, 修复对 Ranged 无影响
+ *   【不影响 AI】AI 是服务器控制, HasAuthority()=true → 服务器守卫通过 → AI 武器 trace 正常跑
+ *   【不影响母体】母体路径 bUseOwnerMesh=true → TickDetection 走 Owner.Mesh 路径, 与武器路径完全对称
  */
 void ABaseWeapon::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	// 【v95.1 大厂架构 P0 修复】Tick 守卫 — 服务器权威 + 客户端本地预测
+	//
+	// 服务器跑所有 trace (玩家 + AI, 权威伤害判定)
+	// 客户端只跑本地控制 Pawn 的 trace (本地预测, 仅画视觉)
+	// 客户端跳过远端控制 Pawn 的 trace (避免 owning connection 失败 + 避免重复扣血)
+	const ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+	if (!OwnerChar)
+	{
+		// 武器没 Owner → 异常状态, 跳过 trace (大厂原则 - 不浪费 CPU)
+		return;
+	}
+
+	const bool bIsAuthority = HasAuthority();
+	const bool bIsLocallyControlled = OwnerChar->IsLocallyControlled();
+
+	// 服务器 (Authority) || 本地玩家控制 Pawn → 跑 trace
+	// 远端玩家控制 Pawn → 跳过 (避免 RPC 失败 + 节省 CPU)
+	if (!bIsAuthority && !bIsLocallyControlled)
+	{
+		return;
+	}
 
 	// v75 架构清理: 仅委托 Strategy.TickDetection (Strategy 内部自带"激活态"判断)
 	if (DamageStrategy.GetObject())

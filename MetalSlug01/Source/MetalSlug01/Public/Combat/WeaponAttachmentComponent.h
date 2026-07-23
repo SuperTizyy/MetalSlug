@@ -294,6 +294,32 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
 	void RequestWeaponSpawn(TSubclassOf<ABaseWeapon> WeaponClass);
 
+	/**
+	 * 【v93 大厂架构新增】卸下并销毁当前武器 — 公开 API
+	 *
+	 * 业务背景:
+	 *   母体变异时 (URoomSpawnSubsystem::MutatePawnToMother), 旧 Pawn 的武器必须立即销毁
+	 *   - 武器以旧 Pawn 为 Owner (FActorSpawnParameters::Owner = OldPawn), 旧 Pawn Destroy 会级联销毁
+	 *   - 但 UE 销毁是延迟一帧, 期间武器 Mesh 仍可见 (挂在旧 Pawn 视觉坐标)
+	 *   - 必须显式调 Destroy, 让客户端立刻收到 Destruction Bunch, 立即消失
+	 *
+	 * 大厂原则 — 单一销毁入口:
+	 *   - 旧版 SpawnAIInternal 临时 inline 调 OldWeapon->Destroy() (v56.3 P0) — 重复架构
+	 *   - 现在统一走本接口 (单一真理源), 母体变异 / 死亡重置 / 武器切换都能复用
+	 *
+	 * 服务器权威:
+	 *   - 必须 HasAuthority() 才执行 (其他客户端不调用)
+	 *   - 销毁后 CurrentWeapon=nullptr 自动 Replicate → 所有客户端 OnRep_CurrentWeapon 触发
+	 *
+	 * 零兜底:
+	 *   - CurrentWeapon 已为 nullptr → Log Warning + return false (不报错, 业务正常)
+	 *   - 销毁失败 (UE 内部错误) → Log Error + return false
+	 *
+	 * @return true=成功销毁或本来就无武器, false=销毁失败 (UE 内部异常)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapon")
+	bool UnequipCurrentWeapon();
+
 	// ==========================================
 	// 公开获取/写入接口
 	// ==========================================
