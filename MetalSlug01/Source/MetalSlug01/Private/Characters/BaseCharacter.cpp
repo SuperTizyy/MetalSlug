@@ -55,6 +55,7 @@
 #include "Systems/RoomPlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "Sound/SoundBase.h"           // v76 — 武器切换音效 (USoundBase 完整定义)
+#include "Components/AudioComponent.h"  // v100.1 — 回血音组件 (UAudioComponent 完整定义)
 #include "Weapons/WeaponSlotType.h"    // v76 — EWeaponSlotType (LexToString)
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
@@ -68,6 +69,8 @@
 #include "Combat/CombatDeathComponent.h"   // 战斗死亡
 #include "Combat/WeaponAttachmentComponent.h" // 武器装备
 #include "Combat/CharacterIconComponent.h"  // 头像/武器图标
+#include "Combat/MotherSpawnParticleComponent.h"  // 【v99.1 新增】母体出生粒子
+#include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称)
 
 // ==========================================
 // 1. 构造函数
@@ -130,6 +133,15 @@ ABaseCharacter::ABaseCharacter()
 	//   - 激活时: 派发 OnFlickerStarted → BP 子类 Timeline 驱动
 	FlickerComponent = CreateDefaultSubobject<UInvincibilityFlickerComponent>(TEXT("FlickerComponent"));
 
+	// 【v101 大厂架构新增】母体残血虚弱闪烁组件 — 与 FlickerComponent 完全对称
+	//   - 业务规则 (用户 2026.07.27): 母体被打到残血 (≤ 100) → 启动虚弱闪烁; 回血 (> 100) → 停止
+	//   - 触发源: HealthComponent->OnHealthChanged 订阅 + 阈值检测
+	//   - 数据/视觉分离: HealthComp 持数据, 本组件持视觉 (MID 操作)
+	//   - 协议: 身体材质蓝图必须有 "FlickerAmount" 标量参数 (与 FlickerComponent 共享)
+	//   - 不破坏刀战模式: 刀战 BP 阈值场景不触发, 母体 BP 默认 100.0 触发
+	//   - 零重复: 复用 InvincibilityFlickerComponent 的协议 / PrepareMaterials / Slot 过滤
+	MotherLowHealthFlicker = CreateDefaultSubobject<UMotherLowHealthFlickerComponent>(TEXT("MotherLowHealthFlicker"));
+
 	// ==========================================
 	// 【2026.07.12 P0 大厂重构 Phase 2】5 个业务组件 (BaseCharacter 拆分)
 	// ==========================================
@@ -148,6 +160,23 @@ ABaseCharacter::ABaseCharacter()
 	WeaponAttach    = CreateDefaultSubobject<UWeaponAttachmentComponent>(TEXT("WeaponAttach"));
 	CharacterIcon   = CreateDefaultSubobject<UCharacterIconComponent>(TEXT("CharacterIcon"));
 
+	// 【v99.1 大厂架构新增】母体出生粒子特效组件
+	//   - 所有角色都挂载(零架构分支), 刀战 BP 不配 MotherSpawnParticleSystem → 收到 RPC 时组件内部拒绝
+	//   - 实际触发由 Multicast_PlayMutationFX 统一分发, 不走 OnRep
+	MotherSpawnParticle = CreateDefaultSubobject<UMotherSpawnParticleComponent>(TEXT("MotherSpawnParticle"));
+
+	// 【v99.3 大厂架构新增】母体出生音效组件
+	//   - 与 MotherSpawnParticle 完全对称: 所有角色都挂载, 刀战 BP 不配 MotherSpawnSound → 收到 RPC 时组件内部拒绝
+	//   - 实际触发由 Multicast_PlayMutationFX 统一分发, 不走 OnRep
+	MotherSpawnSound = CreateDefaultSubobject<UMotherSpawnSoundComponent>(TEXT("MotherSpawnSound"));
+
+	// 【v100 大厂架构新增】击杀音效组件 — 通用
+	//   - 所有角色都挂载(零架构分支), 无论玩家 / AI / Mother / 普通角色
+	//   - 触发由 Multicast_NotifyKill 统一分发 — 复用现有 RPC(零新建)
+	//   - 数据驱动: GameMode.KillStreakIconDataTable 查表(与 HUD 连杀图标共享)
+	//   - 不破坏刀战模式: 刀战也能正常播击杀音效
+	KillSound = CreateDefaultSubobject<UKillSoundComponent>(TEXT("KillSound"));
+
 	// 【v93.2 大厂架构 — 母体复用 Melee 缝合算法】母体攻击 Strategy
 	//   - 复用 UMeleeSwStrategy 算法 (零重复架构), 但路径走 Owner Mesh (而非武器 Mesh)
 	//   - 每个 Pawn 一份 Strategy (IgnoreActors / LastFrame 状态不能共享)
@@ -155,8 +184,8 @@ ABaseCharacter::ABaseCharacter()
 	//   - bUseOwnerMesh 默认 false (StartMotherTrace 内置 true)
 	MotherTraceStrategy = CreateDefaultSubobject<UMeleeSwStrategy>(TEXT("MotherTraceStrategy"));
 
-	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p"),
-		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get());
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p MotherSpawnParticle=%p MotherSpawnSound=%p KillSound=%p MotherLowHealthFlicker=%p"),
+		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get(), MotherSpawnParticle, MotherSpawnSound, KillSound, MotherLowHealthFlicker);
 
 	// ==========================================
 	// 角色模型设置
@@ -239,6 +268,16 @@ void ABaseCharacter::BeginPlay()
 	if (!ResolveCharacterEvents())
 	{
 		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] CharacterEvents 组件未挂载!"));
+	}
+
+	// 【v100.1 大厂架构】订阅 HealthRegenComponent 回血状态变化
+	// 触发场景 (业务规则 2026.07.26 母体): 不被打 + 不移动 5 秒后, 服务器 Tick 检测到开始回血
+	// 服务器路径: HealthRegenComponent::OnRegenStateChanged(true).Broadcast
+	//             → HandleRegenStateChanged → Multicast_PlayRegenSound RPC 推所有客户端
+	// 客户端路径: 收到 RPC → Multicast_PlayRegenSound_Implementation 创建循环音组件
+	if (UHealthRegenComponent* HRC = ResolveHealthRegenComponent())
+	{
+		HRC->OnRegenStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleRegenStateChanged);
 	}
 }
 
@@ -549,8 +588,9 @@ void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ABaseCharacter, FactionTag);
 
 	// 【v93.1 大厂架构新增】母体变异状态同步
-	// 大厂原则 — 单一真理源:
-	//   - 服务器: URoomMotherMutationSubsystem::MutateCharacterToMother 写入 Target->bIsMother = true
+	// 大厂原则 — 单一真理源 (v99.1 收敛):
+	//   - 服务器: URoomSpawnSubsystem::MutatePawnToMother Step 5.7 写入 NewMotherPawn->bIsMother = true
+	//           (统一母体生成入口, 首次变异 + 母体复活都走这里)
 	//   - 客户端: OnRep_bIsMother 收到 → Broadcast 让 BT / UI 知道该角色已变异为母体
 	// 为什么 Replicated:
 	//   - AI BT 需要识别母体 (不走人类攻击逻辑)
@@ -686,11 +726,11 @@ void ABaseCharacter::RefreshCharacterIcon()
  * Client_RefreshCharacterIcon_Implementation — 转发壳 (UFUNCTION(Client) 在 Actor 上)
  * 真实逻辑: CharacterIconComponent::Client_RefreshCharacterIcon_Implementation
  */
-void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar)
+void ABaseCharacter::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar, bool bInIsMother)
 {
 	if (UCharacterIconComponent* Icon = ResolveCharacterIcon())
 	{
-		Icon->Client_RefreshCharacterIcon_Implementation(InCharacterID, Avatar);
+		Icon->Client_RefreshCharacterIcon_Implementation(InCharacterID, Avatar, bInIsMother);
 	}
 }
 
@@ -2331,15 +2371,53 @@ bool ABaseCharacter::GetCrosshairWorldDirection_Const(FVector& OutWorldDirection
  * @param bIsAssist  true=助攻提示 (HUD 展示图标不同)
  */
 void ABaseCharacter::Multicast_NotifyKill_Implementation(const FString& KillerName, const FString& VictimName,
-                                                       EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer)
+                                                       EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer,
+                                                       EKillStreakType InStreakType, USoundBase* KillSoundAsset)
 {
 	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] Multicast_NotifyKill: Killer=%s, Victim=%s, Method=%d, IsAssist=%d, bIsKillerPlayer=%d, HasAuthority=%d"),
+		TEXT("[BaseCharacter] Multicast_NotifyKill: Killer=%s, Victim=%s, Method=%d, IsAssist=%d, bIsKillerPlayer=%d, StreakType=%d, HasAuthority=%d"),
 		*KillerName, *VictimName, static_cast<int32>(KillMethod), bIsAssist ? 1 : 0,
-		bIsKillerPlayer ? 1 : 0, HasAuthority() ? 1 : 0);
+		bIsKillerPlayer ? 1 : 0, static_cast<int32>(InStreakType), HasAuthority() ? 1 : 0);
 
 	// 大厂原则 (v31.6 零兜底): 字符串字段允许为空 (即没读到 PS 名字), 不允许静默崩溃
 	// 击杀者加分逻辑: 已在服务器 TakeDamage 流程中本地加, 不依赖 RPC 边界
+
+	// ==========================================
+	// 【v100 大厂架构 — 击杀音效】全员播放 (不论 Killer 是玩家/AI)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.07.26 明确):
+	//   - "击杀敌人或母体需要播放声音,每个连杀都是不同的声音"
+	//   - 旁观者也要听到击杀声(游戏惯例 — 队友击杀大家都有 audio cue)
+	//
+	// 大厂原则 — 与 KillFeed 业务规则解耦:
+	//   - KillFeed 业务 (旧 v40.9): 只在 bIsKillerPlayer=true 时显示(玩家视角)
+	//   - 音效 (新 v100): 全员播放 — 不论 Killer 是玩家还是 AI
+	//
+	// 大厂原则 — 触发位置在 bIsKillerPlayer 守卫之前:
+	//   - 老版本在 bIsKillerPlayer=false 时 return — 音效就放不出来了
+	//   - 新版: 音效独立触发,不受 Killer 类型限制
+	//
+	// v105 大厂架构修复 — 服务器查表后 RPC 推送音效资产:
+	//   - 根因: PlayKillSound 在客户端调用 EnsureKillStreakDataTable → World->GetAuthGameMode() 返回 nullptr
+	//   - 修复: 服务器在调用前查表, 把 USoundBase* 作为参数传给客户端
+	//   - 客户端直接播放 KillSoundAsset, 不再需要查 GameMode
+	if (InStreakType != EKillStreakType::None && !bIsAssist)
+	{
+		if (KillSoundAsset)
+		{
+			UGameplayStatics::PlaySoundAtLocation(this, KillSoundAsset, GetActorLocation(), GetActorRotation());
+			UE_LOG(LogTemp, Display,
+				TEXT("[BaseCharacter] Multicast_NotifyKill: 播放击杀音效 Asset=%s (来自服务器 RPC 参数)"),
+				*KillSoundAsset->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter] Multicast_NotifyKill: KillSoundAsset 为空, 无法播放音效. StreakType=%d"),
+				static_cast<int32>(InStreakType));
+		}
+	}
 
 	// 【v40.9 P0 大厂架构】只有 Killer 是玩家时才推送 KillFeed 图标
 	// 业务规则: "击杀图标只用于玩家击杀其他玩家或者AI时才显示，被击杀不应该显示别人的击杀图标"
@@ -2350,7 +2428,7 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(const FString& KillerNa
 
 	if (!bIsKillerPlayer)
 	{
-		// AI 击杀: KillFeed 不显示，直接 return
+		// AI 击杀: KillFeed 不显示，音效已在上面播完(音效无 Killer 类型限制)
 		// 连杀图标逻辑: 仅在当前玩家是击杀者时才更新（原有逻辑不变）
 		return;
 	}
@@ -2543,8 +2621,10 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 
 		// 广播助攻信息给所有客户端 — 纯数据 RPC, 不传 Actor*
 		// 【v40.9】助攻者的 KillFeed 显示由 bIsKillerPlayer 决定（主击杀者是否为玩家）
+		// 【v100】助攻不计入连杀 → StreakType=None → KillSoundComponent 收到 None 不播音
+		//     （助攻只显示图标,不刷"二连杀"音效 — 与 KillStreakWidget 业务一致）
 		const FString AssistantName = AssistantPS->GetPlayerName();
-		AssistantChar->Multicast_NotifyKill(AssistantName, VictimName, KillMethod, /*bIsAssist=*/true, bIsKillerPlayer);
+		AssistantChar->Multicast_NotifyKill(AssistantName, VictimName, KillMethod, /*bIsAssist=*/true, bIsKillerPlayer, EKillStreakType::None, /*KillSoundAsset=*/nullptr);
 	}
 
 	// 清理时间戳 (Victim 已死, 历史不再需要)
@@ -3452,7 +3532,9 @@ void ABaseCharacter::OnReloadPressed(const FInputActionValue& /*Value*/)
  *
  * 大厂原则 — 业务分离:
  *   - 本函数只负责: Broadcast OnMotherStatusChanged + 日志
- *   - 变身动画 / 粒子 / 音效由 BP 蓝图订阅委托执行 (美术决定具体效果)
+ *   - 母体出生粒子 / 音效已由 Multicast_PlayMutationFX 统一触发 (v99.1 / v99.3),
+ *     本函数不再重复触发 (避免双发)
+ *   - BP 蓝图订阅做"动画/屏幕震动"等附加效果 (OnMotherStatusChanged 委托)
  */
 void ABaseCharacter::OnRep_bIsMother()
 {
@@ -3484,7 +3566,11 @@ void ABaseCharacter::OnRep_bIsMother()
  *
  * 大厂原则 — RPC 纯数据化 (v31.6):
  *   - 参数 TargetName 是 FString, 不传 Actor* (UE 网络边界序列化要求)
- *   - 业务方: URoomMotherMutationSubsystem::MutateCharacterToMother 服务器触发
+ *   - 业务方 (v99.1 收敛): URoomSpawnSubsystem::MutatePawnToMother Step 7 服务器唯一触发点
+ *     首次变异 / 母体复活都走这一处, 不存在第二份调用
+ *   - 客户端 Implementation: 触发 UMotherSpawnParticleComponent::PlaySpawnParticle (本地 5 秒粒子)
+ *                            + Broadcast OnMotherStatusChanged (BP 蓝图订阅做音效 / 屏幕震动等)
+ *   - OnRep_bIsMother 仅做状态广播, 不触发粒子 (避免双发)
  *
  * 大厂原则 — UE 5.6 NetMulticast 行为:
  *   - 服务器自己调用时也执行 Implementation (ListenServer)
@@ -3499,7 +3585,224 @@ void ABaseCharacter::Multicast_PlayMutationFX_Implementation(const FString& Targ
 		TEXT("[BaseCharacter] Multicast_PlayMutationFX: Target='%s', HasAuthority=%d"),
 		*TargetName, HasAuthority() ? 1 : 0);
 
-	// 大厂原则 — 业务分离: 实际特效 / 粒子 / 音效 由 BP 蓝图订阅 OnMotherStatusChanged 执行
-	// 本 RPC 仅做日志 + Broadcast (镜像 Multicast_NotifyKill 的纯数据原则)
+	// 大厂原则 — 关注点分离:
+	//   - Multicast_PlayMutationFX = 唯一视觉入口(首次变异 + 母体复活)
+	//   - OnRep_bIsMother = 状态复制, 不触发视觉(避免双发)
+	//   - 委托 Broadcast 仍保留, BP 蓝图可订阅做"音效/动画/屏幕震动"等附加效果
+	//
+	// 大厂原则 — 视觉一刀切(粒子 + 音效)由同一 RPC 触发:
+	//   - MotherSpawnParticle: 视觉粒子 (5 秒)
+	//   - MotherSpawnSound: 听觉音效 (一次性)
+	//   - 两者职责分离, 各为独立组件, 共同响应同一 RPC, 避免重复 RPC
+	//   - 任一组件缺失(Resolver 找不到)→ Log Error + continue, 不影响另一个组件播放
+	if (UMotherSpawnParticleComponent* Particle = ResolveMotherSpawnParticle())
+	{
+		Particle->PlaySpawnParticle();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Multicast_PlayMutationFX: 找不到 MotherSpawnParticle 组件(Owner=%s). "
+				 "【零兜底】不允许静默跳过, 检查 BP 是否挂载 MotherSpawnParticle 子对象."),
+			*GetName());
+	}
+
+	if (UMotherSpawnSoundComponent* Sound = ResolveMotherSpawnSound())
+	{
+		Sound->PlaySpawnSound();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Multicast_PlayMutationFX: 找不到 MotherSpawnSound 组件(Owner=%s). "
+				 "【零兜底】不允许静默跳过, 检查 BP 是否挂载 MotherSpawnSound 子对象."),
+			*GetName());
+	}
+
 	OnMotherStatusChanged.Broadcast(TargetName);
+}
+
+
+// ==========================================
+// 【v100.1 大厂架构 — 母体待机回血 RPC + 事件桥】
+// ==========================================
+
+/**
+ * ABaseCharacter::HandleRegenStateChanged
+ *
+ * 服务器端事件桥 (OnRegenStateChanged 委托 → RPC):
+ *   - 触发方: HealthRegenComponent::SetRegeneratingState 内部 OnRegenStateChanged.Broadcast
+ *   - 调用方: BaseCharacter::BeginPlay 末尾 AddUniqueDynamic 订阅
+ *   - 业务: 把"回血状态变化"转成 NetMulticast RPC 推所有客户端
+ *
+ * 大厂原则 — 零兜底:
+ *   - bIsNowRegenerating=true → 读 HealthRegenComponent->RegenSound
+ *     - Sound != nullptr: Multicast_PlayRegenSound(Sound)
+ *     - Sound == nullptr: Log Warning + 不广播 (业务可禁用, 不是错误)
+ *   - bIsNowRegenerating=false → Multicast_StopRegenSound
+ *
+ * 唯一调用方: 自己的 OnRegenStateChanged 委托 (服务器端)
+ */
+void ABaseCharacter::HandleRegenStateChanged(bool bIsNowRegenerating)
+{
+	// 服务器权威 — 服务器不响应自己的 OnRegenStateChanged (因为服务器自己 Multicast 也会本地执行)
+	// 但服务器需要触发 Multicast 让远端客户端播放
+	// 注: UE 5.6 NetMulticast Reliable 在 ListenServer 上服务器自己也会执行 Implementation
+	//     但在 Dedicated Server 上服务器不渲染 — 这是标准行为, 不需特别处理
+	if (!HasAuthority())
+	{
+		// 客户端不应收到 HealthRegenComponent 委托 (因为 TickComponent 客户端 return)
+		// 防御: 万一有重复广播
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: 客户端收到事件 (HasAuthority=false). "
+				 "忽略 — 服务器权威. Owner=%s bIsNowRegenerating=%d"),
+			*GetName(), bIsNowRegenerating ? 1 : 0);
+		return;
+	}
+
+	if (bIsNowRegenerating)
+	{
+		UHealthRegenComponent* HRC = ResolveHealthRegenComponent();
+		if (!HRC)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: ResolveHealthRegenComponent 失败. "
+					 "【零兜底】理论上不应该 — HealthRegenComponent 是基础组件."));
+			return;
+		}
+
+		USoundBase* Sound = HRC->RegenSound;
+		if (!Sound)
+		{
+			// 业务可禁用 (RegenSound=nullptr), 不是错误 — 仅 Verbose
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: RegenSound=nullptr, 不广播. "
+					 "Owner=%s. 如需启用声音, 在 BP HealthRegenComponent 字段配 Sound 资产."),
+				*GetName());
+			return;
+		}
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: 触发 Multicast_PlayRegenSound. "
+				 "Owner=%s, Sound=%s"),
+			*GetName(), *Sound->GetName());
+		Multicast_PlayRegenSound(Sound);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: 触发 Multicast_StopRegenSound. "
+				 "Owner=%s"),
+			*GetName());
+		Multicast_StopRegenSound();
+	}
+}
+
+
+/**
+ * ABaseCharacter::Multicast_PlayRegenSound_Implementation
+ *
+ * 客户端实现: 接收 Sound 资产引用 → 创建/缓存 UAudioComponent 循环播放
+ *
+ * 大厂原则 — 单一真理源:
+ *   - ActiveRegenAudioComponent 是本机唯一缓存 (避免重复 Spawn)
+ *   - 已存在 → 先 Stop + Destroy 再 Spawn 新组件 (避免残留)
+ *
+ * 大厂原则 — 零兜底:
+ *   - Sound=nullptr → Log Warning + return (业务禁用声音, 不算错)
+ *   - GetMesh() 为空 → Log Error (BP 配错, 不允许)
+ *   - SpawnSoundAttached 失败 → Log Error (引擎异常)
+ */
+void ABaseCharacter::Multicast_PlayRegenSound_Implementation(USoundBase* Sound)
+{
+	if (!Sound)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: Sound=nullptr, 拒绝播放. "
+				 "Owner=%s. (业务可能故意禁用声音)"),
+			*GetName());
+		return;
+	}
+
+	// 幂等: 已有活跃组件 → 先销毁 (避免多实例重叠)
+	if (ActiveRegenAudioComponent)
+	{
+		ActiveRegenAudioComponent->Stop();
+		ActiveRegenAudioComponent->DestroyComponent();
+		ActiveRegenAudioComponent = nullptr;
+	}
+
+	// 必须挂到 Mesh 上 (3D 衰减 + 跟角色移动)
+	USkeletalMeshComponent* BodyMesh = GetMesh();
+	if (!BodyMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: GetMesh() 为空! "
+				 "Owner=%s. 【零兜底】检查 BP 是否有 Mesh 组件."),
+			*GetName());
+		return;
+	}
+
+	// 附身到 Mesh, 循环播放, 不自动销毁
+	ActiveRegenAudioComponent = UGameplayStatics::SpawnSoundAttached(
+		Sound,
+		BodyMesh,
+		NAME_None, // attach to root socket
+		FVector::ZeroVector,
+		FRotator::ZeroRotator,
+		EAttachLocation::KeepRelativeOffset,
+		/*bStopWhenAttachedToDestroyed=*/true,
+		/*VolumeMultiplier=*/1.0f,
+		/*PitchMultiplier=*/1.0f,
+		/*StartTime=*/0.0f,
+		/*AttenuationSettings=*/nullptr,
+		/*ConcurrencySettings=*/nullptr,
+		/*bAutoDestroy=*/false // 关键: 不自动销毁, 我们手动控制
+	);
+
+	if (!ActiveRegenAudioComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: SpawnSoundAttached 失败. "
+				 "Owner=%s, Sound=%s. 【零兜底】检查 Sound 资产是否损坏."),
+			*GetName(), *Sound->GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: 创建循环音组件成功. "
+			 "Owner=%s, Sound=%s"),
+		*GetName(), *Sound->GetName());
+}
+
+
+/**
+ * ABaseCharacter::Multicast_StopRegenSound_Implementation
+ *
+ * 客户端实现: 停止 + 销毁活跃音组件
+ *
+ * 大厂原则 — 零兜底:
+ *   - 没找到活跃组件 → Log Verbose (可能本机没开过音, 正常情况)
+ *   - 找到 → Stop + DestroyComponent (下次激活时新建)
+ */
+void ABaseCharacter::Multicast_StopRegenSound_Implementation()
+{
+	if (!ActiveRegenAudioComponent)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[BaseCharacter][v100.1] Multicast_StopRegenSound: ActiveRegenAudioComponent=nullptr. "
+				 "Owner=%s. (本机可能没开过音, 正常情况)"),
+			*GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter][v100.1] Multicast_StopRegenSound: 停止 + 销毁音组件. "
+			 "Owner=%s, Sound=%s"),
+		*GetName(),
+		ActiveRegenAudioComponent->Sound ? *ActiveRegenAudioComponent->Sound->GetName() : TEXT("nullptr"));
+
+	ActiveRegenAudioComponent->Stop();
+	ActiveRegenAudioComponent->DestroyComponent();
+	ActiveRegenAudioComponent = nullptr;
 }

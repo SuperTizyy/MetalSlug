@@ -330,9 +330,12 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 
 	// 大厂原则 — 业务分层 (v90 重构): Spawn 调度归 SpawnSubsystem, 本函数只负责
 	//   1. 委派 Pawn 重建 (调 SpawnSys->MutatePawnToMother, 原地变 — 不回出生点)
-	//   2. 业务层标记 bIsMother + bIsHuman (双字段同步, Replicated 自动复制)
-	//   3. 账本 MotherCharacters.AddUnique
-	//   4. RPC 广播视觉特效 (Multicast_PlayMutationFX)
+	//   2. 母体账本 MotherCharacters.AddUnique
+	//   3. 验证链 — 阵营 / 血量 (业务层强制让根因立刻可见)
+	//
+	// 【v99.1 大厂架构重构】母体 Pawn 业务字段 + 复活链真理源 + 视觉 RPC 全部下沉到 MutatePawnToMother
+	//   - bIsMother / bIsHuman / PS->bIsMother / Multicast_PlayMutationFX 由 SpawnSubsystem 统一写入
+	//   - 复活链直接调 MutatePawnToMother 不再漏写状态 / 漏发 RPC
 	//
 	// 旧 (v18-v88) 占位反模式:
 	//   - 直接设 Target->bIsMother=true + 跳过 Pawn 重建
@@ -423,12 +426,20 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 		return false;
 	}
 
-	// ===== Step 3: 业务层标记 bIsMother (服务器本地 — Replicated 自动同步所有客户端) =====
-	// 大厂原则 — 双字段同步: bIsMother=true 时 bIsHuman=false (互斥语义, 注释约定)
-	//   - bIsMother ReplicatedUsing = OnRep_bIsMother → 客户端 OnRep → Broadcast OnMotherStatusChanged
-	//   - bIsHuman Replicated (无 OnRep) → 客户端同步 (镜像 bIsMother)
-	NewMotherPawn->bIsMother = true;
-	NewMotherPawn->bIsHuman = false;
+	// ===== Step 2.5: 【v99.1 大厂架构 — 状态/RPC 已下沉到 MutatePawnToMother】=====
+	//
+	// 历史 (v90-v99):
+	//   - 旧版业务层 Step 3 + Step 3.7 写 Pawn.bIsMother / bIsHuman / PS->bIsMother
+	//   - 旧版 Step 4 触发 Multicast_PlayMutationFX RPC
+	//   - 与 MutatePawnToMother 各管一段 → 复活链直接调 Spawn 函数会漏写状态与漏发 RPC → Bug
+	//
+	// 新 (v99.1) 单一真理源 — 母体 Pawn 创建入口 = MutatePawnToMother:
+	//   - 母体 Pawn 业务字段 (bIsMother/bIsHuman) → MutatePawnToMother Step 5.7
+	//   - 复活链真理源 PS->bIsMother → MutatePawnToMother Step 6
+	//   - 视觉特效 Multicast_PlayMutationFX → MutatePawnToMother Step 7
+	//   - 业务层只负责: 选目标、委派 Pawn 重建、记账 (MotherCharacters 业务账本)
+	//
+	// 业务层只追加验证链 (Step 3.5 / 3.6), 不写状态不触发 RPC
 
 	// ===== Step 3.5: 【v93.3 大厂架构 — 阵营验证】业务层强制验证 FactionTag = Faction.Offense =====
 	//
@@ -502,23 +513,12 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 	MotherCharacters.AddUnique(NewMotherPawn);
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[MotherMutation] MutateCharacterToMother: '%s' 已变异为母体 (母体数=%d, Class=%s, Location=%s)"),
+		TEXT("[MotherMutation] MutateCharacterToMother: '%s' 已变异为母体 (母体数=%d, Class=%s, Location=%s). "
+		     "【v99.1 大厂架构】状态写入 + Multicast RPC 触发已在 MutatePawnToMother 末尾统一执行,本函数不重复触发."),
 		*NewMotherPawn->GetName(),
 		MotherCharacters.Num(),
 		*NewMotherPawn->GetClass()->GetName(),
 		*NewMotherPawn->GetActorLocation().ToString());
-
-	// ===== Step 4: 【RPC 边界 — 服务器广播】通知所有客户端播母体变异特效 =====
-	// 纯数据 RPC (v31.6 大厂原则): 传 FString 而不是 Actor*
-	// 跨 RPC 边界传 Actor* 在 UE 5.6 会因 NetGUID 失效导致 null 解引用 (v31.6 修复)
-	//
-	// 双保险链路:
-	//   - 服务器 Multicast_PlayMutationFX(TargetName) → 所有客户端 Implementation → Broadcast OnMotherStatusChanged
-	//   - 客户端 bIsMother OnRep_bIsMother → Broadcast OnMotherStatusChanged (重复触发, BP 幂等 OK)
-	//
-	// 注意: RowName 在 Multicast 客户端不需要, 只传 TargetName (视觉特效需要)
-	const FString TargetName = NewMotherPawn->GetName();
-	NewMotherPawn->Multicast_PlayMutationFX(TargetName);
 
 	return true;
 }

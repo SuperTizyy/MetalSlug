@@ -441,6 +441,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Room|Spawn")
 	FName TAG_Faction_Defense;
 
+	/**
+	 * 【v104 新增】母体复活点 TAG
+	 *
+	 * 来源: ScanAndCachePlayerStarts 扫描 PlayerStartTag=Faction_Mother 的 PlayerStart
+	 * 用途: 母体出生和复活时从 MotherSpawnPoints 中随机选取
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Room|Spawn")
+	FName TAG_Faction_Mother;
+
 	// ==========================================
 	// 转换辅助方法 (public 让 RoomGameMode 委派入口可调)
 	// ==========================================
@@ -477,6 +486,19 @@ protected:
 
 	UPROPERTY()
 	TArray<APlayerStart*> DefenseSpawnPoints;
+
+	/**
+	 * 【v104 新增】母体复活点数组
+	 *
+	 * 来源: ScanAndCachePlayerStarts 扫描 PlayerStartTag=Faction_Mother 的 PlayerStart
+	 * 用途: 母体出生和复活时从这些点中随机选取
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 与 AttackSpawnPoints / DefenseSpawnPoints 同级管理
+	 *   - 母体专用的复活点，不与攻守方共享
+	 */
+	UPROPERTY()
+	TArray<APlayerStart*> MotherSpawnPoints;
 
 	UPROPERTY()
 	TSet<APlayerStart*> OccupiedSpawnPoints;

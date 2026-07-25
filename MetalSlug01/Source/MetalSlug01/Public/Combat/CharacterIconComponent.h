@@ -171,7 +171,7 @@ public:
 	 * @param Avatar        头像贴图 (服务器查表后传入, 避免客户端查表)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
-	void Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar);
+	void Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar, bool bInIsMother);
 
 	/**
 	 * HUD 未就绪时的延迟重试
@@ -337,11 +337,18 @@ public:
 	 * 根因: 开火消耗弹药后，弹夹数量必须实时更新到 HUD
 	 * 解决方案: 订阅激活武器的 OnAmmoChanged，弹药变化时自动广播弹夹信息
 	 *
-	 * @param NewAmmo    当前弹药数量
+	 * 【v100 大厂架构 — 完整 3 参数】删除 ReserveAmmo 兜底
+	 *   旧 (v85-v99) 注释："ReserveAmmo 这里不知道 (OnAmmoChanged 只传 CurrentAmmo/MagazineSize)"
+	 *   → 用缓存里的 OldReserveAmmo 兜底 (反模式)
+	 *   → 换弹时 ReserveAmmo 减小, HUD 总子弹不变
+	 *   新 (v100): 委托 3 参数, 这里直接接 ReserveAmmo, 删兜底
+	 *
+	 * @param NewAmmo      当前弹药数量
 	 * @param MagazineSize 弹匣最大容量
+	 * @param ReserveAmmo  备用弹药 (换弹时减小, 必须实时同步)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
-	void OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize);
+	void OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize, int32 ReserveAmmo);
 
 	/**
 	 * 【v85 大厂架构新增】订阅当前激活武器的弹药变化事件

@@ -87,7 +87,11 @@ void UWeaponFireComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 
 void UWeaponFireComponent::OnRep_CurrentAmmo()
 {
-	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize);
+	// 【v100 大厂架构 — 完整 3 参数】
+	// 客户端 OnRep_CurrentAmmo 触发时, ReserveAmmo 字段值也已 Replicated 同步到本地
+	// (服务器每次改 ReserveAmmo 都会触发一系列 Replicated 字段 Bunch 推送)
+	// → 直接读 this->ReserveAmmo 拿最新值, 不需要额外 OnRep_ReserveAmmo
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 }
 
 
@@ -213,7 +217,8 @@ void UWeaponFireComponent::InitializeFromWeaponConfig(const FWeaponInfo& InWeapo
 		*InWeaponRowName.ToString(), MagazineSize, ReserveAmmo, FireRateRPM);
 
 	// 立即广播一次 OnAmmoChanged (服务器本地, 让 HUD 立刻更新)
-	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize);
+	// 【v100 大厂架构 — 完整 3 参数】换弹周期内所有 Broadcast 都传 ReserveAmmo
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 }
 
 
@@ -520,7 +525,8 @@ void UWeaponFireComponent::PerformSingleShot(const FVector& ClientRayOrigin, con
 	}
 
 	// 广播 (服务器本地)
-	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize);
+	// 【v100 大厂架构 — 完整 3 参数】换弹周期内所有 Broadcast 都传 ReserveAmmo
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 
 	// 多播播放开火蒙太奇 (服务器 → 所有客户端)
 	MulticastPlayFireMontage();
@@ -569,7 +575,8 @@ void UWeaponFireComponent::OnReloadTimerExpired()
 	bIsReloading = false;
 
 	// 广播 (服务器本地)
-	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize);
+	// 【v100 大厂架构 — 完整 3 参数】换弹完成的 ReserveAmmo 减小, 必须传完整 3 参数
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 	OnReloadStateChanged.Broadcast(false);
 
 	UE_LOG(LogTemp, Log,

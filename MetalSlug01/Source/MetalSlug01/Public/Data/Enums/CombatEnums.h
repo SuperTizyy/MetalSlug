@@ -62,21 +62,26 @@ enum class EKillMethod : uint8
 
 /**
  * @enum EKillStreakType
- * @brief 连杀类型（用于连杀图标显示）
+ * @brief 连杀类型（用于连杀图标 + 击杀音效显示）
  * - None: 无
  * - Headshot: 爆头
- * - OneKill ~ FiveKills: 一杀到五杀
+ * - OneKill ~ FiveKills: 一杀到五杀 (封顶语义: >= 5 杀都归 FiveKills)
+ *
+ * 业务规则 (用户 2026.07.26):
+ *   - "连杀超过五杀,再激活连杀还是五杀图标和声音"
+ *   - 即: 第 6 / 7 / 8 杀都显示 FiveKills 图标 + 播放 FiveKills 音效,不区分
+ *   - 实现方式: 镜像函数 GetKillStreakType 用 Kills >= 5 → FiveKills (封顶,无新枚举值)
  */
 UENUM(BlueprintType)
 enum class EKillStreakType : uint8
 {
-	None        UMETA(DisplayName = "无"),
-	Headshot    UMETA(DisplayName = "爆头"),
-	OneKill     UMETA(DisplayName = "一杀"),
-	TwoKills    UMETA(DisplayName = "二杀"),
-	ThreeKills  UMETA(DisplayName = "三杀"),
-	FourKills   UMETA(DisplayName = "四杀"),
-	FiveKills   UMETA(DisplayName = "五杀")
+	None          UMETA(DisplayName = "无"),
+	Headshot      UMETA(DisplayName = "爆头"),
+	OneKill       UMETA(DisplayName = "一杀"),
+	TwoKills      UMETA(DisplayName = "二杀"),
+	ThreeKills    UMETA(DisplayName = "三杀"),
+	FourKills     UMETA(DisplayName = "四杀"),
+	FiveKills     UMETA(DisplayName = "五杀")
 };
 
 /**

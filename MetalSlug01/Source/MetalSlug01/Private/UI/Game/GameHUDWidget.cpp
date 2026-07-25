@@ -1050,6 +1050,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 		// 【2026.07.14 新增】订阅无敌期状态变化 - 控制复活进度条显示/隐藏
 		Events->OnInvincibilityChanged.AddDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
 
+		// 【v105 新增】订阅武器面板显隐状态变化 - 母体无武器时隐藏弹药 UI
+		Events->OnWeaponPanelVisibilityChanged.AddUObject(this, &UGameHUDWidget::OnWeaponPanelVisibilityChanged);
+
 		CachedCharacterEvents = Events;
 
 		UE_LOG(LogTemp, Log,
@@ -1104,35 +1107,52 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 		//       → BroadcastWeaponAmmoInfo 读到空弹药 → HUD 显示为空
 		//       → 用户需要切枪才能看到弹夹数
 		// 解决方案: HUD 订阅成功后，从 CharacterEvents::OnWeaponAmmoInfoReady 缓存快照直接补发到 UI
+		//
+		// 【v105.2 大厂架构改造】母体路径强制 1/1
+		// 业务规则 (用户 2026.07.27 反馈):
+		//   - 母体没有武器, 弹药数据固定 1/1 (跟刀战模式一样显示弹药 UI)
+		//   - 武器图标显示 DT_WeaponInfo.MT001
+		//   - 不再隐藏 WeaponPanel
 		{
-			// 检查缓存的弹药数据
-			int32 CachedCurrentAmmo = -1;
-			int32 CachedMagazineSize = -1;
-			int32 CachedReserveAmmo = -1;
-			bool bCachedIsMelee = false;
-			if (Events->GetCachedWeaponAmmoInfo(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee))
+			if (Character->bIsMother)
 			{
-				UE_LOG(LogTemp, Log,
-					TEXT("[GameHUDWidget][Bind-Snapshot] 补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
-					CachedCurrentAmmo, CachedMagazineSize, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee ? 1 : 0);
-				OnWeaponAmmoInfoReady(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo);
+				// 母体弹药固定 1/1 (母体攻击不消耗弹药)
+				UE_LOG(LogTemp, Display,
+					TEXT("[GameHUDWidget][Bind-Snapshot] 母体弹药固定 1/1 (Owner=%s)"),
+					*Character->GetName());
+				OnWeaponAmmoInfoReady(1, 1, 1);
 			}
 			else
 			{
-				// 如果 CharacterEvents 没有缓存，直接从武器组件读取
-				if (ABaseWeapon* CurrentWeapon = Character->GetCurrentWeapon())
+				// 检查缓存的弹药数据
+				int32 CachedCurrentAmmo = -1;
+				int32 CachedMagazineSize = -1;
+				int32 CachedReserveAmmo = -1;
+				bool bCachedIsMelee = false;
+				if (Events->GetCachedWeaponAmmoInfo(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee))
 				{
-					if (UWeaponFireComponent* FireComp = CurrentWeapon->FindComponentByClass<UWeaponFireComponent>())
+					UE_LOG(LogTemp, Log,
+						TEXT("[GameHUDWidget][Bind-Snapshot] 补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
+						CachedCurrentAmmo, CachedMagazineSize, CachedMagazineSize, CachedReserveAmmo, bCachedIsMelee ? 1 : 0);
+					OnWeaponAmmoInfoReady(CachedCurrentAmmo, CachedMagazineSize, CachedReserveAmmo);
+				}
+				else
+				{
+					// 如果 CharacterEvents 没有缓存，直接从武器组件读取
+					if (ABaseWeapon* CurrentWeapon = Character->GetCurrentWeapon())
 					{
-						const int32 CurrentAmmo = FireComp->GetCurrentAmmo();
-						const int32 MagazineSize = FireComp->GetMagazineSize();
-						const int32 ReserveAmmo = FireComp->GetReserveAmmo();
-						const bool bIsMelee = (CurrentWeapon->GetMeshType() == EWeaponMeshType::Melee);
+						if (UWeaponFireComponent* FireComp = CurrentWeapon->FindComponentByClass<UWeaponFireComponent>())
+						{
+							const int32 CurrentAmmo = FireComp->GetCurrentAmmo();
+							const int32 MagazineSize = FireComp->GetMagazineSize();
+							const int32 ReserveAmmo = FireComp->GetReserveAmmo();
+							const bool bIsMelee = (CurrentWeapon->GetMeshType() == EWeaponMeshType::Melee);
 
-						UE_LOG(LogTemp, Log,
-							TEXT("[GameHUDWidget][Bind-Snapshot] 从武器组件补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
-							CurrentAmmo, MagazineSize, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
-						OnWeaponAmmoInfoReady(CurrentAmmo, MagazineSize, ReserveAmmo);
+							UE_LOG(LogTemp, Log,
+								TEXT("[GameHUDWidget][Bind-Snapshot] 从武器组件补发弹药: %d/%d (MagSize=%d, Reserve=%d, Melee=%d)"),
+								CurrentAmmo, MagazineSize, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
+							OnWeaponAmmoInfoReady(CurrentAmmo, MagazineSize, ReserveAmmo);
+						}
 					}
 				}
 			}
@@ -1229,6 +1249,11 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			}
 		}
 
+		// 【v105.2 大厂架构改造】武器面板永久显示 — 弹药 UI 和武器图标都由各自 RPC 推送内容
+		// 不再基于 bIsMother 隐藏 Widget_WeaponPanel
+		//   - 弹药: Client_RefreshWeaponAmmo RPC + HUD 订阅时 1/1 补发
+		//   - 武器图标: Client_RefreshWeaponIcon RPC (服务端查表推 MuTiWeapon)
+
 		// 清理重试定时器
 		if (UWorld* World = GetWorld())
 		{
@@ -1282,6 +1307,7 @@ void UGameHUDWidget::UnbindFromCharacterEvents()
 		CachedCharacterEvents->OnWeaponIconReady.RemoveDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
 		CachedCharacterEvents->OnWeaponAmmoInfoReady.RemoveDynamic(this, &UGameHUDWidget::OnWeaponAmmoInfoReady);
 		CachedCharacterEvents->OnInvincibilityChanged.RemoveDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
+		CachedCharacterEvents->OnWeaponPanelVisibilityChanged.RemoveAll(this);
 
 		CachedCharacterEvents = nullptr;
 		CharacterEventsRetryCount = 0;
@@ -1446,6 +1472,51 @@ void UGameHUDWidget::OnWeaponAmmoInfoReady(int32 CurrentMag, int32 MagazineSize,
 		CurrentMag, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
 
 	Widget_WeaponPanel->UpdateWeaponAmmoText(CurrentMag, MagazineSize, ReserveAmmo, bIsMelee);
+}
+
+
+/**
+ * UGameHUDWidget::OnWeaponPanelVisibilityChanged 【v105 新增】
+ *
+ * 武器面板显隐状态变化回调 — 用于母体等无武器角色隐藏武器弹药 UI
+ *
+ * 业务规则 (用户 2026.07.27 明确):
+ *   - 母体没有武器, 不应该显示弹药 UI (Text_WeaponAmmo / Image_MeleeWeapon)
+ *   - 变成母体时隐藏武器面板, 变回人类时显示武器面板
+ *
+ * @param bIsVisible true=显示武器面板, false=隐藏武器面板
+ */
+/**
+ * UGameHUDWidget::OnWeaponPanelVisibilityChanged
+ *
+ * 触发场景: CharacterEvents::OnWeaponPanelVisibilityChanged 事件 (监听服/事件触发时的备用通道)
+ *
+ * 【v105 重构】主路径已改为 Client_RefreshCharacterIcon RPC 直接调 SetWeaponPanelVisible,
+ *              本函数保留作为 CharacterEvents 事件总线的备用通道 (用于没有走 RPC 的边缘 case)
+ */
+void UGameHUDWidget::OnWeaponPanelVisibilityChanged(bool bIsVisible)
+{
+	// 【v105 转发】统一走 SetWeaponPanelVisible (消除重复代码)
+	SetWeaponPanelVisible(bIsVisible);
+}
+
+
+void UGameHUDWidget::SetWeaponPanelVisible(bool bIsVisible)
+{
+	if (!Widget_WeaponPanel)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] SetWeaponPanelVisible: Widget_WeaponPanel 未绑定! "
+				 "请检查 WBP_GameHUDWidget 蓝图中是否正确拖入了 WeaponPanel 子控件"));
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] SetWeaponPanelVisible: bIsVisible=%d (Widget_WeaponPanel->%s)"),
+		bIsVisible ? 1 : 0, bIsVisible ? TEXT("显示") : TEXT("隐藏"));
+
+	// 控制武器面板显隐
+	Widget_WeaponPanel->SetVisibility(bIsVisible ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 }
 
 

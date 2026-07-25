@@ -1142,7 +1142,18 @@ void ARoomPlayerController::StartRespawnTimer(float InDelaySeconds)
  * OnPlayerRespawnTimerFinished
  *
  * 复活定时器到期回调
- * 调 Server_RequestSpawn 重生角色
+ * 【v102 大厂架构修复】调 GM->RequestRespawn 而非 Server_RequestSpawn
+ *
+ * 根因 (Session1.log 2026.07.27):
+ *   - 旧实现: Server_RequestSpawn() → 读取 PS->SelectedCharacterID (人类 CharID)
+ *   - 母体死亡时, PS->bIsMother=true, 但 SelectedCharacterID 仍是 JS001 (人类)
+ *   - Server_RequestSpawn 永远走人类路径 → 母体复活成人类 → 错
+ *
+ * 大厂原则 — 单一真理源 (v102 修复):
+ *   - GM->RequestRespawn() 内部读 PS->bIsMother 决定走哪条路径
+ *   - PS->bIsMother=true → 走 MutatePawnToMother 路径 → 母体复活成母体
+ *   - PS->bIsMother=false → 走 HandlePlayerRequestSpawn 路径 → 人类复活成人类
+ *   - Server_RequestSpawn 保留给开局生成 (没有母体复活问题)
  */
 void ARoomPlayerController::OnPlayerRespawnTimerFinished()
 {
@@ -1150,8 +1161,17 @@ void ARoomPlayerController::OnPlayerRespawnTimerFinished()
 
 	UE_LOG(LogTemp, Warning, TEXT("[Respawn] OnPlayerRespawnTimerFinished for %s"), *GetName());
 
-	// 向服务器请求复活
-	Server_RequestSpawn();
+	// 【v102 修复】通过 GameMode 走母体复活分支
+	if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
+	{
+		GM->RequestRespawn(this, false);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Respawn] OnPlayerRespawnTimerFinished: RoomGameMode 为空, 无法复活. Controller='%s'"),
+			*GetName());
+	}
 }
 
 /**

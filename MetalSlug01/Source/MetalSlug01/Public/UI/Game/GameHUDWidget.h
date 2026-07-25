@@ -209,6 +209,19 @@ public:
 	UWeaponPanelWidget* GetWidget_WeaponPanel() { return Widget_WeaponPanel; }
 
 	/**
+	 * 【v105 大厂架构】直接控制武器面板显隐
+	 *
+	 * 根因: 旧版走 CharacterEvents::OnWeaponPanelVisibilityChanged 事件总线,
+	 *       但 HUD 端订阅时序不对时丢失事件,导致弹药 UI 在母体时仍显示
+	 * 修复: CharacterIconComponent::Client_RefreshCharacterIcon RPC 携带 bIsMother 参数,
+	 *       客户端收到后直接调本函数控制 Widget_WeaponPanel Visibility
+	 *
+	 * @param bIsVisible true=显示武器面板, false=隐藏武器面板
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void SetWeaponPanelVisible(bool bIsVisible);
+
+	/**
 	 * 获取计分板 Widget（供 Controller 调用）
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
@@ -499,6 +512,9 @@ protected:
 	/** 武器弹药数量加载完毕回调 【v84 大厂架构新增】 */
 	UFUNCTION()
 	void OnWeaponAmmoInfoReady(int32 CurrentMag, int32 MagazineSize, int32 ReserveAmmo);
+
+	/** 武器面板显隐状态变化回调 【v105 新增 - 母体无武器时隐藏弹药 UI】 */
+	void OnWeaponPanelVisibilityChanged(bool bIsVisible);
 
 	// ==========================================
 	// 8. 无敌期进度条控制 (2026.07.14 重构)

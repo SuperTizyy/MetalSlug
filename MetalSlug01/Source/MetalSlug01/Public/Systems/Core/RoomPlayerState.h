@@ -13,6 +13,7 @@
 
 // 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 #include "Data/Enums/RoomEnums.h"
+#include "Data/Enums/CombatEnums.h"  // 【v100 新增】EKillStreakType 连杀类型
 #include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
 
 // UE 自动生成的头文件
@@ -172,6 +173,62 @@ public:
 	 */
 	void Server_MarkTeamExplicitlyChosen();
 
+	/**
+	 * 【2026.07.26 v99 P0】玩家是否已被变异为母体 (复活链真理源)
+	 *
+	 * 业务核心 (用户 2026.07.26 明确):
+	 *   - 生化模式: 母体死后复活, 必须原地复活成母体, 不能复活成人类
+	 *
+	 * 根因 (Session1.log line 1161-1218):
+	 *   - 旧版 RequestRespawn 直接读 PlayerSpawnDataCache.CharID (永远是"JS001" 人类)
+	 *   - 即使死前 Pawn 是 BP_MuTi, 复活时一律走 HandlePlayerRequestSpawn → 复活成 BP_SWAT_C 人类
+	 *
+	 * 大厂原则 — 单一真理源 + Replicated:
+	 *   - 写点: URoomMotherMutationSubsystem::MutateCharacterToMother 末尾设 true
+	 *   - 写点: URoomSpawnSubsystem::MutatePawnToMother → 业务层调 MutateCharacterToMother
+	 *   - 读点: URoomSpawnSubsystem::RequestRespawn 读 PS->bIsMother, true 走母体复活流程
+	 *   - 读点: 同局内任何复活链入口 (玩家 / AI)
+	 *
+	 * 网络同步:
+	 *   - Replicated (无 OnRep — UI 不需要监听, 复活流程是服务器内部决策)
+	 *   - 客户端不需要实时感知 (它只关心视觉 OnRep_bIsMother 由 Pawn 提供)
+	 *
+	 * 跨进程同步说明:
+	 *   - 服务器: 写 true 后, PS 字段 Replicated 自动同步客户端
+	 *   - 客户端: 仅用于可观测性 (Log/调试), 不参与复活决策 (决策在服务器跑)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战模式从不调 MutateCharacterToMother → bIsMother 永远是 false
+	 *   - RequestRespawn 读 false 走老路径 → 刀战逻辑零影响
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|State")
+	bool bIsMother = false;
+
+	/**
+	 * 【v99.1 大厂架构 — 母体复活位置真理源】玩家 Pawn 上次死亡的世界 Transform
+	 *
+	 * 写入时机:
+	 *   - UCombatDeathComponent::ExecuteDeathLocal 头部 (HasAuthority) — 死亡瞬间缓存当前 Pawn Transform
+	 *   - 复活前由 URoomSpawnSubsystem::MutatePawnToMother 读取, 读取后由调用方负责清空
+	 *
+	 * 读取时机:
+	 *   - URoomSpawnSubsystem::MutatePawnToMother 复活链 (OldPawn 已销毁时, 拿 PS 上次的死亡位置)
+	 *
+	 * 大厂原则 — 单一真理源 (零兜底):
+	 *   - 旧版复活链没有死亡 Transform → 用了 ZeroVector → SpawnActor(0,0,0) 失败
+	 *   - v99.1: 死亡时主动缓存到 PlayerState, 复活链精确还原
+	 *   - bHasLastDeathTransform 标志位 — 防止"未死亡过"被误读为 (0,0,0)
+	 *
+	 * 跨模式安全:
+	 *   - 刀战模式走出生点路径, 不读本字段(永远 bHasLastDeathTransform=false → 不会误用)
+	 *   - 本字段不影响 BP/UI 显示(纯服务器内部决策用)
+	 */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|State")
+	FTransform LastDeathTransform;
+
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|State")
+	bool bHasLastDeathTransform = false;
+
 	// ==========================================
 	// 3. 计分板数据 (Scoreboard Data)
 	// ==========================================
@@ -251,6 +308,96 @@ protected:
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_ScoreboardData, BlueprintReadOnly, Category = "Scoreboard")
 	int32 RoomAssists;
+
+	// ==========================================
+	// 4. 【v100 大厂架构 — 连杀真理源】连杀追踪 (服务端权威)
+	// ==========================================
+public:
+	/**
+	 * 【v100 大厂架构 — 连杀计数真理源】当前连杀数 (服务端权威)
+	 *
+	 * 历史痛点 (v22-v99):
+	 *   - 旧版连杀计数只存在于 UKillStreakWidget::CurrentKillStreak (HUD 客户端 widget)
+	 *   - 该字段不在服务端 → 音效/Multicast_NotifyKill RPC 等服务器逻辑无法感知连杀数
+	 *   - 真正的真理源分裂:HUD 显示是 widget 自己算,但游戏逻辑(音效/分级)无数据源
+	 *
+	 * 新版 (v100):
+	 *   - 真理源迁移到 PlayerState (服务端权威)
+	 *   - Replicated (所有客户端可读 — HUD widget 可订阅 OnRep 显示)
+	 *   - 服务器通过 ServerUpdateKillStreak(bIsAssist, bIsHeadshot) 维护
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 服务端算 StreakType → 跨 RPC 边界 → 所有客户端一致播放音效
+	 *   - 客户端 HUD widget: 改读此字段(后续 PR 跟进)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战模式同样调用 ServerUpdateKillStreak(无模式判断)
+	 *   - 字段依然有效 — 连杀系统在所有模式通用
+	 *
+	 * 零兜底:
+	 *   - < 0 视作 0(防御初始值) — 大厂原则: 不允许"特殊值"标志位
+	 *   - 超时不重置(超时判定在 ServerUpdateKillStreak 内部按 WorldTime 比较)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_KillStreak, BlueprintReadOnly, Category = "Scoreboard|Streak")
+	int32 CurrentKillStreak = 0;
+
+	/**
+	 * 【v100 大厂架构 — 连杀超时判定】上次击杀时间戳 (服务端专用, 仅服务器)
+	 *
+	 * 设计:
+	 *   - Server-only 字段 — 不 Replicate(客户端 HUD widget 改读 CurrentKillStreak 即可)
+	 *   - 服务器调 ServerUpdateKillStreak 比较 LastKillWorldTimeSeconds 与 Now - KillStreakDuration
+	 *   - 超时 → 重置 CurrentKillStreak = 0; 否则累加
+	 *
+	 * NOT Replicated 原因:
+	 *   - 客户端不需要时间戳(超时逻辑全部由服务器算)
+	 *   - 减少带宽(数据驱动 RPC 边界)
+	 *   - 真理源全在服务端 → 客户端只能看到"最终结果" CurrentKillStreak
+	 */
+	UPROPERTY()
+	float LastKillWorldTimeSeconds = -1.f;
+
+	/**
+	 * 【v100 大厂架构 — 连杀计算入口】服务器专用: 玩家击杀时累加/重置连杀
+	 *
+	 * 入口: UCombatDeathComponent::PerformKillSettlement 中
+	 *       AddKillScore 之前调一次, 让本 PlayerState 更新连杀计数
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 服务器累加 → CurrentKillStreak 字段(Replicated)
+	 *   - 计算 EKillStreakType → 通过返回值传出 → 上层传给 Multicast_NotifyKill RPC
+	 *
+	 * @param bIsAssist  是否助攻(true = 助攻,不计入连杀)
+	 * @param bIsHeadshot  是否爆头(影响 StreakType 计算)
+	 * @return            累加/重置后的 EKillStreakType (服务器传给 RPC,客户端用此值决定播哪个音)
+	 *
+	 * 零兜底:
+	 *   - 不在 PlayerState 无效时返回 None(必须让调用方感知错误)
+	 *   - 实际调用方必走 GetRoomPlayerState() 守卫
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard|Streak")
+	EKillStreakType ServerUpdateKillStreak(bool bIsAssist, bool bIsHeadshot);
+
+	/**
+	 * 【v100 大厂架构 — 连杀超时清理】服务器专用: 重置连杀(死亡时调)
+	 *
+	 * 入口: UCombatDeathComponent::PerformKillSettlement 中
+	 *       AddDeath 时同步调(死亡清零)
+	 *
+	 * 不复制到客户端(客户端 widget 自己监听死亡流 — 后续 HUD 改造步骤)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard|Streak")
+	void ServerResetKillStreak();
+
+protected:
+	/**
+	 * 【v100 OnRep】连杀数复制到客户端 (HUD widget 改读此处)
+	 *
+	 * 当前 v100 阶段:KillStreakWidget 暂不改 widget 内部字段读 PS(后续 PR)
+	 * 当前只读 + Log 镜像 (便于调试和验证 RPC 链路)
+	 */
+	UFUNCTION()
+	void OnRep_KillStreak();
 
 public:
 	/**

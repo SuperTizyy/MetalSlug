@@ -46,7 +46,16 @@ class UAnimMontage;
 struct FWeaponInfo;
 
 // 弹药状态变化多播: 服务器 OnAmmoChanged/OnReloadStateChanged → 客户端 HUD 订阅
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnAmmoChanged, int32, NewAmmo, int32, MagazineSize);
+//
+// 【v100 大厂架构 — 完整 3 参数】弹药全状态同步
+//   旧 (v85-v99) 委托签名 = (NewAmmo, MagazineSize) 故意不传 ReserveAmmo
+//   → 客户端 CharacterIconComponent 用缓存里的 "OldReserveAmmo" 兜底 (反模式)
+//   → 换弹时 ReserveAmmo 减小, HUD 总子弹不变
+//   新 (v100) 委托签名 = (NewAmmo, MagazineSize, ReserveAmmo) — 完整弹药状态
+//   → 客户端/服务器本地都拿到完整真理源, 删兜底
+//   → 真理源在 WeaponFireComponent 字段 (Replicated), 委托直接广播
+//   → 替换 CallSite 4 处: OnRep_CurrentAmmo / InitializeFromWeaponConfig / PerformSingleShot / OnReloadTimerExpired
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnAmmoChanged, int32, NewAmmo, int32, MagazineSize, int32, ReserveAmmo);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnReloadStateChanged, bool, bIsReloading);
 
 /**

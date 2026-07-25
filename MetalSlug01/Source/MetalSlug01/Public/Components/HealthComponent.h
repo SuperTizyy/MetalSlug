@@ -71,6 +71,26 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Health")
 	bool IsDead() const { return bIsDead; }
 
+	/**
+	 * 【v100.3 大厂架构 — 单一真理源】是否满血
+	 *
+	 * 业务规则 (用户 2026.07.26): 母体回血触发条件之一 = "满血状态"
+	 *   - 旧版: HealthRegenComponent 不知道"满血"概念, 任何时候都能回血
+	 *   - 新版: 满血检验 = HealthComponent 权威数据源 (大厂原则 - 单一真理源)
+	 *
+	 * 实现细节:
+	 *   - 用 KINDA_SMALL_NUMBER 容差 (避免浮点误差: 100.0 vs 99.99999)
+	 *   - MaxHealth > 0 守卫 (除 0 保护)
+	 *   - BlueprintPure 可被蓝图调用, BP 类也能复用
+	 *
+	 * 调用方: HealthRegenComponent::TickComponent (开始回血前先校验)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Health")
+	bool IsFullHealth() const
+	{
+		return MaxHealth > 0.0f && CurrentHealth >= MaxHealth - KINDA_SMALL_NUMBER;
+	}
+
 	// === 事件订阅 (供 BaseCharacter::BeginPlay 中绑定) ===
 	/** 死亡事件: Actor 订阅后触发 Die() 流程 */
 	UPROPERTY(BlueprintAssignable, Category = "Health")

@@ -56,6 +56,9 @@
 // 引入 WeaponFireComponent (弹药数据真理源 — v84 大厂架构新增)
 #include "Components/WeaponFireComponent.h"
 
+// 【v105 大厂架构新增】引入 GameHUDWidget (Client_RefreshCharacterIcon RPC 携带 bIsMother 时直接控制 WeaponPanel 显隐)
+#include "UI/Game/GameHUDWidget.h"
+
 // 引入 TimerManager (SetTimer / ClearTimer 用于重试机制)
 #include "TimerManager.h"
 
@@ -322,6 +325,11 @@ void UCharacterIconComponent::RefreshCharacterIcon()
 		return;
 	}
 
+	// 【v105 诊断】确认 bIsMother 状态
+	UE_LOG(LogTemp, Display,
+		TEXT("[CharacterIconComponent] RefreshCharacterIcon ENTER: Owner=%s, bIsMother=%d, bIsHuman=%d"),
+		*Owner->GetName(), Owner->bIsMother ? 1 : 0, Owner->bIsHuman ? 1 : 0);
+
 	// ============================================================
 	// Step 1: 从 ARoomPlayerState::SelectedCharacterID 读 CharacterID
 	// ============================================================
@@ -350,9 +358,62 @@ void UCharacterIconComponent::RefreshCharacterIcon()
 	}
 
 	// ============================================================
+	// Step 2.5: 【v105 大厂架构新增】母体专属头像 + 武器 UI 处理
+	//
+	// 业务规则 (用户 2026.07.27 明确):
+	//   - 母体头像: 使用母体专属头像 (DT_CharacterInfo 的 "MT001" 行 AvatarIcon)
+	//   - 母体武器图标: 显示 MT001 (DT_WeaponInfo 的 "MT001" 行 WeaponIcon)
+	//   - 母体弹药 UI: 显示 1/1 (母体没有弹药, 固定格式)
+	//
+	// 大厂原则 - 单一真理源:
+	//   - 母体判断: Owner->bIsMother (由 MutatePawnToMother 写入, 是 SSOT)
+	//   - 母体头像 ID: "MT001" (需要在 DT_CharacterInfo 里配对应行)
+	//   - 母体武器 ID: "MT001" (需要在 DT_WeaponInfo 里配对应行)
+	//   - 两张表统一用 RowName="MT001" — 避免分裂配置
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式 Owner->bIsMother 永远是 false → 走正常路径
+	// ============================================================
+	// 【v105.3 大厂架构 — 用户反馈 2026.07.27】
+	//
+	// 业务规则:
+	//   - DT_CharacterInfo RowName = "MT001" (母体头像) — 不是 "MuTi"
+	//   - DT_WeaponInfo RowName    = "MT001" (母体武器图标) — 跟头像统一
+	//
+	// 大厂原则 — 单一命名真理源:
+	//   - 母体在两张 DataTable 里用同一个 RowName="MT001" — 配置统一, 避免分裂
+	//   - 业务命名"母体 = MuTi"用于 Pawn Class / Blueprint 路径 (BlueprintReadOnly)
+	//   - 数据表命名"母体 = MT001"用于 DataTable RowName (唯一查找键)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式 Owner->bIsMother 永远是 false → 走正常路径, 不进本分支
+	// ============================================================
+	FString FinalCharID = CharID;
+	FString WeaponIDToShow;
+	if (Owner->bIsMother)
+	{
+		// 母体使用专属头像 ID (DT_CharacterInfo RowName="MT001")
+		FinalCharID = TEXT("MT001");
+		// 母体使用专属武器 ID (DT_WeaponInfo RowName="MT001")
+		WeaponIDToShow = TEXT("MT001");
+		UE_LOG(LogTemp, Display,
+			TEXT("[CharacterIconComponent] RefreshCharacterIcon: 检测到母体, 使用 DT_CharacterInfo.RowName='MT001' 查头像 + DT_WeaponInfo.RowName='MT001' 查武器图标 (Owner=%s)"),
+			*Owner->GetName());
+
+		// 【v105.2 大厂架构 — 用户反馈 2026.07.27】
+		// 业务规则: 母体仍显示 WeaponPanel, 弹药数据固定 1/1 (母体攻击无弹药消耗)
+		// 弹药 RPC 在 BroadcastWeaponAmmoInfo 末尾已根据 bIsMother 特殊处理 (强制 1/1)
+	}
+	else
+	{
+		// 非母体: 使用当前装备的武器
+		WeaponIDToShow = Owner->GetSpawnWeaponID();
+	}
+
+	// ============================================================
 	// Step 3: 服务器查表拿 Avatar
 	// ============================================================
-	UTexture2D* Avatar = GetCharacterAvatarFromTable(CharID);
+	UTexture2D* Avatar = GetCharacterAvatarFromTable(FinalCharID);
 
 	// ============================================================
 	// Step 4: 通知所属客户端刷新头像 (RPC 走 Actor 层, 不能直接调 Component.Implementation)
@@ -367,7 +428,7 @@ void UCharacterIconComponent::RefreshCharacterIcon()
 	//   大厂原则 - 职责分层: RPC 必须在 Actor, Component 只负责业务逻辑
 	if (Owner)
 	{
-		Owner->Client_RefreshCharacterIcon(CharID, Avatar);
+		Owner->Client_RefreshCharacterIcon(FinalCharID, Avatar, Owner->bIsMother);
 
 		// [v40.1 P0 修复] 服务器同时触发武器图标刷新 (走 RPC 路径)
 		//   旧版: RefreshCharacterIcon 只发头像 RPC, RefreshWeaponIconOnHUD 由 Client_RefreshCharacterIcon_Implementation 末尾触发
@@ -375,7 +436,15 @@ void UCharacterIconComponent::RefreshCharacterIcon()
 		//         → Icon=nullptr → 客户端 HUD UpdateWeaponIconFromID 查 AuthGameMode=nullptr → 武器图标永远不显示
 		//   新版: 服务器 RefreshCharacterIcon 内显式调 RefreshWeaponIconOnHUD → 服务器 HasAuthority=true → 查表 → Client_RefreshWeaponIcon(WeaponID, Icon) RPC 推完整 Icon
 		//         → Client_RefreshCharacterIcon_Implementation 末尾不再调 RefreshWeaponIconOnHUD (避免双重 Refresh, 且永远拿不到 Icon)
-		RefreshWeaponIconOnHUD();
+		//   【v105.3】母体路径: 调用 RefreshWeaponIconOnHUDFromServer("MT001") 显示母体专属武器图标
+		if (Owner->bIsMother)
+		{
+			RefreshWeaponIconOnHUDFromServer(WeaponIDToShow);
+		}
+		else
+		{
+			RefreshWeaponIconOnHUD();
+		}
 	}
 	else
 	{
@@ -405,7 +474,7 @@ void UCharacterIconComponent::RefreshCharacterIcon()
  * @param InCharacterID  角色 ID (用于缓存 + 验证)
  * @param Avatar        头像贴图 (服务器查表后传入, 避免客户端查表)
  */
-void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar)
+void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const FString& InCharacterID, UTexture2D* Avatar, bool bInIsMother)
 {
 	// ============================================================
 	// 前置检查: Owner 必须有效 【v84 使用 ResolveOwnerCharacter】
@@ -426,6 +495,22 @@ void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const F
 	if (!Owner->IsLocallyControlled())
 	{
 		return;
+	}
+
+	// 【v105.2 大厂架构】弹药数据走"1/1"专用通道, 但 Widget_WeaponPanel 仍保持显示
+	// 根因: 用户反馈 (2026.07.27) 母体也需要显示武器图标 + 弹药 UI (弹药固定 1/1)
+	//       而不是隐藏整个 WeaponPanel
+	// 弹药强制 1/1 由 Client_RefreshWeaponAmmo_Implementation + BroadcastWeaponAmmoInfo 母体路径负责
+	//
+	// 大厂原则 - 删除重复架构:
+	//   - 旧 (v105) 走 CharacterEvents::SetWeaponPanelVisibility 事件总线 (HUD 端订阅时序竞争丢失)
+	//   - 新 (v105.2) Widget_WeaponPanel 永远显示,弹药 UI 由弹药 RPC 控制内容
+	//   - 旧 (v105) 在 RefreshCharacterIcon 内调 HUD->SetWeaponPanelVisible(!bIsMother)
+	//     - 现已统一改为 true (永远显示), 直接调 GameHUDWidget::SetWeaponPanelVisible(true)
+	if (Owner->TryResolveHUDWidget(/*bLogWarning=*/false) && Owner->GameHUDWidget)
+	{
+		// 母体也保持 WeaponPanel 显示 (弹药 UI 由弹药 RPC 控制显示内容)
+		Owner->GameHUDWidget->SetWeaponPanelVisible(/*bIsVisible=*/ true);
 	}
 
 	// ============================================================
@@ -758,7 +843,7 @@ UTexture2D* UCharacterIconComponent::GetCharacterAvatarFromTable(const FString& 
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[CharacterIconComponent] GetCharacterAvatarFromTable: 查不到 CharID='%s' 在 CharacterDataTable. "
-				 "根因: DT_CharacterList 没有这个 RowName, 或 RowName 拼写错误. "
+				 "根因: DT_CharacterInfo 没有这个 RowName (母体须配 RowName='MT001'), 或 RowName 拼写错误. "
 				 "【大厂原则】拒绝返回默认贴图, 强制修复 DataTable 配置."),
 			*CharID);
 		return nullptr;
@@ -768,7 +853,7 @@ UTexture2D* UCharacterIconComponent::GetCharacterAvatarFromTable(const FString& 
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[CharacterIconComponent] GetCharacterAvatarFromTable: CharID='%s' 行的 AvatarIcon 字段为空. "
-				 "根因: DT_CharacterList 里这行的 AvatarIcon 没配. "
+				 "根因: DT_CharacterInfo 里这行的 AvatarIcon 没配. "
 				 "【大厂原则】拒绝返回 nullptr 兜底, 强制修复 DataTable."),
 			*CharID);
 		return nullptr;
@@ -826,7 +911,7 @@ UDataTable* UCharacterIconComponent::ResolveCharacterDataTable() const
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[CharacterIconComponent] ResolveCharacterDataTable: ARoomGameMode->CharacterDataTable 为空. "
-			 "根因: BP_RoomGameMode 没配 CharacterDataTable (DT_CharacterList). "
+			 "根因: BP_RoomGameMode 没配 CharacterDataTable (DT_CharacterInfo). "
 			 "【大厂原则】拒绝返回 nullptr 兜底, 强制修复 BP 配置."),
 			*Owner->GetName());
 		return nullptr;
@@ -1264,6 +1349,30 @@ void UCharacterIconComponent::BroadcastWeaponAmmoInfo(ABaseCharacter* InOwner)
 	int32 ReserveAmmo = 0;
 	bool bIsMelee = false;
 
+	// 【v105.2 大厂架构】母体特殊路径 — 没有武器, 弹药固定 1/1
+	// 业务规则 (用户 2026.07.27 反馈): 母体仍显示弹药 UI (1/1) + 武器图标 (MT001)
+	if (InOwner->bIsMother)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[CharacterIconComponent] BroadcastWeaponAmmoInfo: 检测到母体, 强制 1/1 弹药 (InOwner='%s'). "
+				 "【v105.2 大厂架构】母体无武器但仍显示弹药 UI, 弹药数据固定为 1/1."),
+			*InOwner->GetName());
+		CurrentAmmo = 1;
+		MagazineSize = 1;
+		ReserveAmmo = 1;
+		bIsMelee = true; // 标记为近战, HUD 显示 "1/1" 格式
+
+		// 服务器本地 + RPC 推送 (与普通武器路径完全对称)
+		UCharacterEvents* Events = InOwner->ResolveCharacterEvents();
+		if (Events)
+		{
+			Events->SetCachedWeaponAmmoInfo(CurrentAmmo, MagazineSize, ReserveAmmo, bIsMelee);
+			Events->OnWeaponAmmoInfoReady.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+		}
+		InOwner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo);
+		return;
+	}
+
 	ABaseWeapon* CurrentWeapon = InOwner->GetCurrentWeapon();
 	if (!CurrentWeapon)
 	{
@@ -1380,8 +1489,11 @@ void UCharacterIconComponent::RefreshWeaponIconOnHUDFromServer(const FString& In
 // -----------------------------------------------------------------------------
 // 【v85 大厂架构新增】弹药变化回调 — WeaponFireComponent::OnAmmoChanged 订阅
 // 【v85.3 大厂重构】直接用 NewAmmo/MagazineSize, 不再调 BroadcastWeaponAmmoInfo (SERVER ONLY)
+// 【v100 大厂重构】 接收完整 3 参数, 删除 OldReserveAmmo 兜底(注释自述"缓存兜底" = 反模式)
+//   真理源 = WeaponFireComponent.ReserveAmmo (Replicated) → 委托 3 参数直接传
+//   客户端/服务器本地都拿完整弹药状态, HUD 一击必准
 // -----------------------------------------------------------------------------
-void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize)
+void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineSize, int32 ReserveAmmo)
 {
 	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();
 	if (!OwnerChar)
@@ -1399,29 +1511,22 @@ void UCharacterIconComponent::OnWeaponAmmoChanged(int32 NewAmmo, int32 MagazineS
 		return;
 	}
 
-	// 零兜底 — 服务器/客户端都走这条路, 不走 BroadcastWeaponAmmoInfo (那是 SERVER ONLY 的 RPC 推入口)
-	//   ReserveAmmo 这里不知道 (OnAmmoChanged 只传 CurrentAmmo/MagazineSize),
-	//   保留缓存的 ReserveAmmo, 不重置
-	//   如果缓存从未写入 (bCachedWeaponAmmoValid=false), 退化用 0 (不允许 -1 显示在 HUD 上)
-	int32 OldReserveAmmo = 0;
-	bool bOldIsMelee = false;
-	int32 OldCurrentAmmo = 0;
-	int32 OldMagazineSize = 0;
-	const bool bHasValidCache = Events->GetCachedWeaponAmmoInfo(OldCurrentAmmo, OldMagazineSize, OldReserveAmmo, bOldIsMelee);
-	if (!bHasValidCache)
-	{
-		// 缓存从未初始化 — ReserveAmmo 用 0 而非 -1 (避免 HUD 显示 -1)
-		OldReserveAmmo = 0;
-		UE_LOG(LogTemp, Verbose,
-			TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: CharacterEvents 缓存无效, ReserveAmmo 退化到 0. "
-				 "正常情况: Server RPC 先推 Client_RefreshWeaponAmmo 写入缓存, 再触发本回调."));
-	}
-	Events->SetCachedWeaponAmmoInfo(NewAmmo, MagazineSize, OldReserveAmmo, /* bIsMelee */ false);
-	Events->OnWeaponAmmoInfoReady.Broadcast(NewAmmo, MagazineSize, OldReserveAmmo);
+	// 【v100 大厂架构 — 零兜底】全弹药状态参数化, 缓存从外部传入, 不再读"老缓存"
+	//   旧 (v85.3) 兜底:
+	//     - 拿不到 ReserveAmmo → 调 GetCachedWeaponAmmoInfo 拿 OldReserveAmmo
+	//     - 缓存空 → 退化到 0 (注释自述"不允许 -1 显示在 HUD 上")
+	//   旧版大厂反模式:
+	//     - HUD 总子弹 = 缓存值 (永远不变) → 换弹看不见
+	//     - 缓存空 → 显示 0 (误导玩家)
+	//   新 (v100):
+	//     - 委托 3 参数直接传 ReserveAmmo, 单一真理源
+	//     - 缓存写入 = 当前事件的新值 (覆盖), HUD 拉快照也是新值
+	Events->SetCachedWeaponAmmoInfo(NewAmmo, MagazineSize, ReserveAmmo, /* bIsMelee */ false);
+	Events->OnWeaponAmmoInfoReady.Broadcast(NewAmmo, MagazineSize, ReserveAmmo);
 
 	UE_LOG(LogTemp, Verbose,
-		TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: %d/%d, ReserveAmmo=%d. "
+		TEXT("[CharacterIconComponent] OnWeaponAmmoChanged: %d/%d, ReserveAmmo=%d (v100 完整 3 参数). "
 			 "Owner='%s'"),
-		NewAmmo, MagazineSize, OldReserveAmmo,
+		NewAmmo, MagazineSize, ReserveAmmo,
 		*OwnerChar->GetName());
 }

@@ -260,6 +260,39 @@ public:
 	void SetCachedWeaponID(const FString& InWeaponID) { CachedWeaponID = InWeaponID; }
 
 	/**
+	 * 【v99.1 大厂架构 — 母体复活位置真理源】AI 上次死亡 Transform
+	 *
+	 * 写入时机:
+	 *   - UCombatDeathComponent::ExecuteDeathLocal 头部 (HasAuthority) — 死亡瞬间缓存
+	 *   - 复活前由 URoomSpawnSubsystem::MutatePawnToMother 读取并清空
+	 *
+	 * 读取时机:
+	 *   - URoomSpawnSubsystem::MutatePawnToMother 复活链路径 (OldPawn 为空时)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 旧版复活链用 ZeroVector → SpawnActor(0,0,0) → 原点碰撞失败
+	 *   - v99.1: 死亡时主动缓存, 复活时读取, 移除所有原点兜底
+	 *
+	 * 跨模式安全:
+	 *   - 刀战模式不调本字段(刀战走出生点路径,不读死亡 Transform)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
+	FTransform CachedDeathTransform;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
+	bool bHasCachedDeathTransform = false;
+
+	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
+	void SetCachedDeathTransform(const FTransform& InTransform)
+	{
+		CachedDeathTransform = InTransform;
+		bHasCachedDeathTransform = true;
+	}
+
+	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
+	void ClearCachedDeathTransform() { bHasCachedDeathTransform = false; }
+
+	/**
 	 * 【v54.4 大厂架构】关卡预放 AI 默认 AIController Class
 	 *
 	 * 调用方: AMeleeAIController::SetupMeleeAI (关卡预放 AI 路径)

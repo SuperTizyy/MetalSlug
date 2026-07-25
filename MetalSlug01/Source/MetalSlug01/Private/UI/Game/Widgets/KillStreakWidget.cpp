@@ -188,13 +188,19 @@ void UKillStreakWidget::OnKillStreakExpired()
  */
 EKillStreakType UKillStreakWidget::GetKillStreakType(int32 Kills, bool bIsHeadshot) const
 {
-	// 爆头击杀优先显示爆头图标
+	// 爆头击杀优先显示爆头图标 (爆头音效也优先)
 	if (bIsHeadshot)
 	{
 		return EKillStreakType::Headshot;
 	}
 
-	// 根据击杀数返回对应图标类型
+	// 【业务规则 2026.07.26 — 封顶语义】
+	//   "连杀超过五杀,再激活连杀还是五杀图标和声音"
+	//   - Kills >= 5 统一归 FiveKills (不再区分 5/6/7/8 杀)
+	//   - 玩家每次击杀 RecordKill 都会:
+	//     (a) 重新显示 FiveKills 图标 (IconDisplayTimer 续期)
+	//     (b) 重新播放 FiveKills 音效 (Multicast_NotifyKill → KillSoundComp)
+	//   - 实现 = Kills >= 5 单一分支, 镜像 RoomPlayerState::ServerUpdateKillStreak
 	if (Kills >= 5)
 	{
 		return EKillStreakType::FiveKills;

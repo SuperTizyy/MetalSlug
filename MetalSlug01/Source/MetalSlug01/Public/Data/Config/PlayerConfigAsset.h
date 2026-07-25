@@ -106,9 +106,13 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Config|Regen", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float EnergyRegenRate = 0.0f;
 
-	/** 停止移动后开始回复的延迟 (秒) */
+	/**
+	 * 停止移动后开始回复的延迟 (秒)
+	 * 【v100.1 大厂架构 — 业务规则 2026.07.26】母体"不被打不移动 5 秒"开始回血
+	 * BP 子类可覆盖 (刀战模式默认 0 = 不开启自动回血, 仍走 bEnableAutoRegen=false 路径)
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Config|Regen", meta = (ClampMin = "0.0", UIMin = "0.0"))
-	float RegenerationDelay = 2.0f;
+	float RegenerationDelay = 5.0f;
 
 	// ============================================================
 	// 6. 助攻系统 (BaseCharacter)

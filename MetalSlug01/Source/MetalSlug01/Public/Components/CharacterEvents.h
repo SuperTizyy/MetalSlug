@@ -122,6 +122,24 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponIconReady, const FString&,
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnWeaponAmmoInfoReady, int32, CurrentMag, int32, MagazineSize, int32, ReserveAmmo);
 
+// ----------------------------------------
+// 9. 武器面板显隐状态事件 【v105 新增 - 母体无武器弹药显示】
+// ----------------------------------------
+/**
+ * 武器面板显隐状态变化 — 用于母体等无武器角色隐藏武器弹药 UI
+ *
+ * 业务规则 (用户 2026.07.27 明确):
+ *   - 母体没有武器, 不应该显示弹药 UI (Text_WeaponAmmo / Image_MeleeWeapon)
+ *   - 变成母体时隐藏武器面板, 变回人类时显示武器面板
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 真理源在 CharacterIconComponent (调用 SetWeaponPanelVisibility)
+ *   - CharacterEvents 作为事件总线, 转发状态变化给 HUD
+ *
+ * @param bIsVisible true=显示武器面板, false=隐藏武器面板
+ */
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnWeaponPanelVisibilityChanged, bool);
+
 
 // ==========================================
 // UCharacterEvents - 角色状态事件总线
@@ -214,6 +232,9 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Weapon")
 	FOnWeaponAmmoInfoReady OnWeaponAmmoInfoReady;
 
+	/** 武器面板显隐状态变化 【v105 新增 - 母体无武器时隐藏弹药 UI】 */
+	FOnWeaponPanelVisibilityChanged OnWeaponPanelVisibilityChanged;
+
 	// ==========================================
 	// 【2026-07-01 P0 新增】快照访问器 (订阅者主动拉取)
 	// ==========================================
@@ -289,6 +310,18 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Snapshot")
 	bool GetCachedWeaponAmmoInfo(int32& OutCurrentAmmo, int32& OutMagazineSize, int32& OutReserveAmmo, bool& OutbIsMelee) const;
+
+	/**
+	 * 【v105 新增】广播武器面板显隐状态变化 — 用于母体等无武器角色隐藏武器弹药 UI
+	 *
+	 * 业务规则 (用户 2026.07.27 明确):
+	 *   - 母体没有武器, 不应该显示弹药 UI
+	 *   - 变成母体时隐藏武器面板, 变回人类时显示武器面板
+	 *
+	 * @param bIsVisible true=显示武器面板, false=隐藏武器面板
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Weapon")
+	void SetWeaponPanelVisibility(bool bIsVisible);
 
 protected:
 	// ==========================================

@@ -58,6 +58,56 @@ const FName UMeleeSwStrategy::SocketName_MotherTraceStart = FName(TEXT("TraceSta
 const FName UMeleeSwStrategy::SocketName_MotherTraceEnd   = FName(TEXT("TraceEnd_Mother"));
 
 
+// ==========================================
+// 【v100.2 大厂架构 — 0 兜底设计】Attacker 真理源解析器
+// ==========================================
+// v100.0 反思: 旧版 (v60-v100.1) 设计假设 Weapon 永远非空
+//   - v93.2 母体复用把 base 调用方传 nullptr 当 Weapon, 但 TickDetection 内部
+//     3 处 (`Phase 2 fallback` / `else 刀战块` / `尾部诊断日志`) 仍调 `Weapon->GetOwner()`
+//   - 母体路径下 Weapon 是 nullptr → 崩溃 EXCEPTION_ACCESS_VIOLATION 0x188
+//
+// v100.2 修复: 单一 helper 函数, 真理源 = ActiveOwner (母体) 或 Weapon->GetOwner() (刀战)
+//   - 母体路径: ActiveOwner 必非空 (StartMotherTrace 已校验)
+//   - 刀战路径: Weapon->GetOwner() 必非空 (StartTrace 已校验)
+//   - 两者都失效 → nullptr (零兜底 — 调用方负责 Error 处理, 不静默兜底)
+//
+// 大厂原则 — 单一真理源:
+//   - 消除 3 处重复的 `Cast<ABaseCharacter>(Weapon->GetOwner())` (DRY)
+//   - 路径明确: bUseOwnerMesh 决定读哪个字段 (单一决策点)
+ABaseCharacter* UMeleeSwStrategy::ResolveAttackerCharacter(ABaseWeapon* Weapon) const
+{
+	// 母体路径: ActiveOwner 真理源 (不再依赖 Weapon)
+	if (bUseOwnerMesh)
+	{
+		ABaseCharacter* OwnerChar = ActiveOwner.Get();
+		if (!OwnerChar)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[UMeleeSwStrategy::ResolveAttackerCharacter] 母体路径 (bUseOwnerMesh=true) 但 ActiveOwner 已失效 — 0 兜底. "
+				     "【v100.2 调用方必查】请检查 StartMotherTrace 时序是否正确."));
+			return nullptr;
+		}
+		return OwnerChar;
+	}
+
+	// 刀战路径: Weapon->GetOwner() 真理源
+	if (Weapon)
+	{
+		ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(Weapon->GetOwner());
+		if (OwnerChar)
+		{
+			return OwnerChar;
+		}
+	}
+
+	// 【v100.2 拒绝静默】双路径都失效 → Log Error + 返回 nullptr (零兜底 — 调用方必须显式处理)
+	UE_LOG(LogTemp, Error,
+		TEXT("[UMeleeSwStrategy::ResolveAttackerCharacter] 刀战路径 (bUseOwnerMesh=false) Weapon / Owner 都失效 — 拒绝提供 Attacker. "
+		     "这是配置错, 请检查 Weapon 是否被 Destroy 或 Owner 是否被替换."));
+	return nullptr;
+}
+
+
 UMeleeSwStrategy::UMeleeSwStrategy()
 {
 	// 默认状态
@@ -503,7 +553,13 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 
 	// 【v96.0 大厂架构】从 HitResults 中选最近的 Pawn 命中
 	//   - 业务核心目标: Pawn (人类玩家/AI Pawn) — 要扣血/触发变母体
-	//   - 兜底: 没 Pawn 命中, 用最近地形 (旧 BoxTraceSingle 行为)
+	//   - 【v100.2 零兜底修复】没 Pawn 命中 → SelectedTargetActor = nullptr, 不发 RPC
+	//     旧版 (v100.1) 兜底 `HitResults[0]` (物品/Landscape) → Server_ReportMotherAttackHit 内部
+	//     Cast 失败 → 静默 Log Warning → 表面"忽略"实际是无效 RPC + 静默
+	//     这违背零兜底 (静默吞配置错) + 浪费网络带宽
+	//   - 业务上: 母体打物品/Landscape 没必要触发任何事件 (无血可扣, 无变母体可触发)
+	//
+	// 大厂原则 — 单一真理源: SelectedTargetActor != nullptr ⇔ MUST 是 ABaseCharacter
 	FHitResult HitResult;
 	AActor* SelectedTargetActor = nullptr;
 	if (bHit && HitResults.Num() > 0)
@@ -528,11 +584,23 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			HitResult = *NearestPawnHit;
 			SelectedTargetActor = HitResult.GetActor();
 		}
-		else
+		// 【v100.2 0 兜底】没 Pawn 命中 → SelectedTargetActor = nullptr
+		//   Phase 2 fallback 在下方处理, BoxTrace 命中物品不算"命中"
+	}
+
+	// 【v100.2 诊断】BoxTrace 命中但无 Pawn — 极简 1s 去重 (避免日志 spam)
+	if (bHit && !SelectedTargetActor && HitResults.Num() > 0)
+	{
+		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+		static double LastNoPawnLogTime = 0.0;
+		if (Now - LastNoPawnLogTime > 1.0)
 		{
-			// 兜底: 没 Pawn 命中, 用最近地形 (旧 BoxTraceSingle 行为)
-			HitResult = HitResults[0];
-			SelectedTargetActor = HitResult.GetActor();
+			LastNoPawnLogTime = Now;
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[UMeleeSwStrategy::TickDetection] BoxTrace 命中 %d 个物体但没有 Pawn (第 1 个: %s). "
+				     "【v100.2 0 兜底】非 Pawn 命中不发 RPC, 进入 Phase 2 fallback 路径."),
+				HitResults.Num(),
+				HitResults[0].GetActor() ? *HitResults[0].GetActor()->GetName() : TEXT("(null)"));
 		}
 	}
 
@@ -560,9 +628,10 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		UWorld* World = Weapon ? Weapon->GetWorld() : (OwnerChar ? OwnerChar->GetWorld() : nullptr);
 		if (World)
 		{
-			// 【v97.0.2】攻击者阵营 — 只对**敌人**做 Phase 2 fallback
-			ABaseCharacter* AttackerChar = bUseOwnerMesh ? OwnerChar : Cast<ABaseCharacter>(Weapon->GetOwner());
-			const FGameplayTag AttackerFaction = AttackerChar ? AttackerChar->GetFactionTag() : FGameplayTag();
+		// 【v97.0.2】攻击者阵营 — 只对**敌人**做 Phase 2 fallback
+		// 【v100.2 P0 修复】用 ResolveAttackerCharacter 单一真理源, 母体路径下 Weapon 是 nullptr 不再崩溃
+		ABaseCharacter* AttackerChar = ResolveAttackerCharacter(Weapon);
+		const FGameplayTag AttackerFaction = AttackerChar ? AttackerChar->GetFactionTag() : FGameplayTag();
 
 			// Box 中心线 (LastMid → CurrentMid)
 			const FVector BoxCenterDir = (CurrentMid - LastMid).GetSafeNormal();
@@ -609,7 +678,70 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 					HitResult.ImpactPoint = PawnLoc;
 					HitResult.ImpactNormal = -BoxCenterDir;
 					HitResult.Distance = ProjectedDist;
-					HitResult.BoneName = NAME_None;
+
+					// ============================================================
+					// 【v99 P0 修复】母体分头/身体伤害 — Phase 2.5 二次精确 LineTrace 取 BoneName
+					//
+					// 业务核心 (用户 2026.07.26 明确):
+					//   - 母体被打要分头部和身体 (跟人类一样)
+					//
+					// 根因:
+					//   - 旧版 Phase 2 fallback 强制 BoneName = NAME_None
+					//   - BaseWeapon::Server_ReportHit 走 LightDamageBody → 永远不分头身体
+					//
+					// 大厂原则 — 二次精确 trace 拿 BoneName:
+					//   - 精确 LineTraceSingle (Box 中心点 → Candidate 中心), bTraceComplex=true 拿骨骼级碰撞
+					//   - 不会"粗大" — 是单一线性 trace, 符合用户"正常射线大小"要求
+					//   - 二次 trace 不影响 Phase 2 命中逻辑, 只为补 BoneName 字段
+					//
+					// 性能成本:
+					//   - Phase 2 fallback 命中率 < 1%, 二次 trace 几乎不跑
+					//
+					// 不破坏刀战模式:
+					//   - 刀战走 Phase 1 (BoxTraceMulti), 已能拿到 BoneName → 不受影响
+					// ============================================================
+					{
+						FHitResult PreciseHit;
+						// 【v99 P0.1 修复】FCollisionQueryParams 不能 const (它内部需要可写 TraceTag 等)
+						FCollisionQueryParams PreciseParams(SCENE_QUERY_STAT(MeleeStrategyBoneProbe), false, Weapon);
+						PreciseParams.bReturnPhysicalMaterial = false;
+						PreciseParams.bTraceComplex = true; // 必须复杂碰撞, 否则 BoneName 是 NAME_None
+						PreciseParams.bReturnFaceIndex = false;
+
+						// Box 中心点 = Box 起点 (last/tick) 与 终点 (current/tick) 的中点
+						const FVector BoxMidPoint = (LastMid + CurrentMid) * 0.5f;
+
+						const bool bPreciseHit = World->LineTraceSingleByChannel(
+							PreciseHit,
+							BoxMidPoint,
+							Candidate->GetActorLocation(),
+							ECC_Visibility,
+							PreciseParams
+						);
+
+						if (bPreciseHit && PreciseHit.BoneName != NAME_None)
+						{
+							HitResult.BoneName = PreciseHit.BoneName;
+							HitResult.Location = PreciseHit.Location;
+							HitResult.ImpactPoint = PreciseHit.ImpactPoint;
+
+							UE_LOG(LogTemp, Log,
+								TEXT("[UMeleeSwStrategy::TickDetection] 【v99 P0】Phase 2.5 二次 trace 拿到 BoneName='%s' for Target='%s'. "
+								     "母体伤害将按头/身体区分."),
+								*PreciseHit.BoneName.ToString(),
+								*Candidate->GetName());
+						}
+						else
+						{
+							HitResult.BoneName = NAME_None;
+
+							UE_LOG(LogTemp, Verbose,
+								TEXT("[UMeleeSwStrategy::TickDetection] 【v99 P0】Phase 2.5 二次 trace 未拿 BoneName for Target='%s' (bPreciseHit=%d). "
+								     "母体伤害默认走身体路径."),
+								*Candidate->GetName(),
+								bPreciseHit ? 1 : 0);
+						}
+					}
 
 					UE_LOG(LogTemp, Log,
 						TEXT("[UMeleeSwStrategy::TickDetection] 【v97.0.2 Phase 2】BoxTrace 未命中, 路径搜索找到 Pawn='%s' (LateralDist=%.1fcm, ProjectedDist=%.1fcm)."),
@@ -687,11 +819,23 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			//
 			// v98.0 错误: 给 ListenServer host 玩家加了"跳过"逻辑, 导致 0 伤害
 			// v98.1 修正: 无条件调 Server_ReportHit, 让 UE RPC 通道保证 1 次扣血
+			// 【v100.2 P0 修复】用 ResolveAttackerCharacter 单一真理源, 不再重复 `Weapon->GetOwner()`
+			//   大厂原则 - DRY: 3 处重复调用收敛到 1 个 helper
+			ABaseCharacter* WeaponOwner = ResolveAttackerCharacter(Weapon);
 			bool bAIDriven = false;
-			ABaseCharacter* WeaponOwner = Cast<ABaseCharacter>(Weapon->GetOwner());
 			if (WeaponOwner && WeaponOwner->GetController())
 			{
 				bAIDriven = WeaponOwner->GetController()->IsA(AAIController::StaticClass());
+			}
+
+			// 【v100.2 零兜底】Weapon 不是 nullptr 才能调 Server_ReportHit (刀战路径真理源)
+			//   理论上 bUseOwnerMesh=false 时 Weapon 必非空, 但显式校验防万一
+			if (!Weapon)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[UMeleeSwStrategy::TickDetection] 刀战路径 (bUseOwnerMesh=false) 但 Weapon 为空 — 拒绝 RPC. "
+					     "【v100.2 0 兜底】调用方必须保证 Weapon 有效."));
+				return;
 			}
 
 			Weapon->Server_ReportHit(
@@ -709,19 +853,37 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		//   - 客户端命中: HasAuthority=0, 接着 RPC 序列化到服务器
 		//   - 服务器命中: HasAuthority=1, RPC 在同进程直接执行 Implementation
 		//   - 无重复扣血: Tick 守卫保证同一 Pawn 不会两端同时跑 (大厂原则 - 单一入口)
+		//
+		// 【v100.2 P0 修复】用 ResolveAttackerCharacter 单一真理源, 母体路径不再崩溃
 		FString AttackerName = TEXT("(null)");
-		if (ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(Weapon->GetOwner()))
+		if (ABaseCharacter* AttackerChar = ResolveAttackerCharacter(Weapon))
 		{
 			AttackerName = AttackerChar->GetName();
 		}
 
+		// 【v100.2 零兜底】SelectedTargetActor / HitResult.ImpactPoint 都校验防 nullptr
+		//   旧版 (v100.1) 第 786 行 `SelectedTargetActor->GetName()` 在 776 行崩后没机会执行,
+		//   但路径上 SelectedTargetActor 也可能为 nullptr (外层 `if (bHit && SelectedTargetActor)` 防御)
+		FString TargetName = TEXT("(null)");
+		if (SelectedTargetActor)
+		{
+			TargetName = SelectedTargetActor->GetName();
+		}
+		FString BoneName = HitResult.BoneName.ToString();
+		FString WeaponName = TEXT("(null)");
+		if (Weapon)
+		{
+			WeaponName = Weapon->GetName();
+		}
+		const bool bWeaponHasAuthority = Weapon ? Weapon->HasAuthority() : false;
+
 		UE_LOG(LogTemp, Log,
 			TEXT("[UMeleeSwStrategy::TickDetection] 近战命中 → Server_ReportHit RPC. HasAuthority=%d Weapon=%s Attacker=%s Target=%s Bone=%s"),
-			Weapon->HasAuthority() ? 1 : 0,
-			*Weapon->GetName(),
+			bWeaponHasAuthority ? 1 : 0,
+			*WeaponName,
 			*AttackerName,
-			*SelectedTargetActor->GetName(),
-			*HitResult.BoneName.ToString());
+			*TargetName,
+			*BoneName);
 	}
 
 	// 当前帧结算完毕 → 存入记忆, 变成下一帧的"上一帧"

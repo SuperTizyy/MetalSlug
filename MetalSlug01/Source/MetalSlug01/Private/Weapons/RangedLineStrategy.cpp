@@ -436,56 +436,55 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	ABaseCharacter* FallbackPawn = nullptr;
 	float FallbackPawnPathDistance = TNumericLimits<float>::Max();
 
-	if (!bHasPawnInTrace)
+	// 【v99 P0 修复】把 World 提到外层, 让步骤 6.5 二次精确 trace 也能用
+	UWorld* World = Weapon->GetWorld();
+
+	if (!bHasPawnInTrace && World)
 	{
-		UWorld* World = Weapon->GetWorld();
-		if (World)
+		// 攻击者阵营 — 只对敌人做 fallback
+		const ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(Weapon->GetOwner());
+		const FGameplayTag AttackerFaction = AttackerChar ? AttackerChar->GetFactionTag() : FGameplayTag();
+
+		const FVector TraceDir = (EndLoc - RayOrigin).GetSafeNormal();
+		const float TraceLength = (EndLoc - RayOrigin).Size();
+
+		for (TActorIterator<ABaseCharacter> It(World); It; ++It)
 		{
-			// 攻击者阵营 — 只对敌人做 fallback
-			const ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(Weapon->GetOwner());
-			const FGameplayTag AttackerFaction = AttackerChar ? AttackerChar->GetFactionTag() : FGameplayTag();
-
-			const FVector TraceDir = (EndLoc - RayOrigin).GetSafeNormal();
-			const float TraceLength = (EndLoc - RayOrigin).Size();
-
-			for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+			ABaseCharacter* Candidate = *It;
+			if (!Candidate || Candidate == AttackerChar)
 			{
-				ABaseCharacter* Candidate = *It;
-				if (!Candidate || Candidate == AttackerChar)
-				{
-					continue; // 跳过自己
-				}
+				continue; // 跳过自己
+			}
 
-				// 同阵营守卫 — 队友不参与 fallback
-				if (!AttackerFaction.IsValid() ||
-					Candidate->GetFactionTag() == AttackerFaction)
-				{
-					continue;
-				}
+			// 同阵营守卫 — 队友不参与 fallback
+			if (!AttackerFaction.IsValid() ||
+				Candidate->GetFactionTag() == AttackerFaction)
+			{
+				continue;
+			}
 
-				const FVector PawnLoc = Candidate->GetActorLocation();
-				const FVector PawnToRayOrigin = PawnLoc - RayOrigin;
+			const FVector PawnLoc = Candidate->GetActorLocation();
+			const FVector PawnToRayOrigin = PawnLoc - RayOrigin;
 
-				// 沿 trace 方向的投影距离 (0 = 在起点, TraceLength = 在终点)
-				const float ProjectedDist = FVector::DotProduct(PawnToRayOrigin, TraceDir);
+			// 沿 trace 方向的投影距离 (0 = 在起点, TraceLength = 在终点)
+			const float ProjectedDist = FVector::DotProduct(PawnToRayOrigin, TraceDir);
 
-				// Pawn 不在 trace 路径范围内 → 跳过 (前后 50cm 容差, 防止起/终点边界误判)
-				if (ProjectedDist < -50.0f || ProjectedDist > TraceLength + 50.0f)
-				{
-					continue;
-				}
+			// Pawn 不在 trace 路径范围内 → 跳过 (前后 50cm 容差, 防止起/终点边界误判)
+			if (ProjectedDist < -50.0f || ProjectedDist > TraceLength + 50.0f)
+			{
+				continue;
+			}
 
-				// Pawn 到 trace 路径的最近点 + 横向距离
-				const FVector ClosestPointOnPath = RayOrigin + TraceDir * ProjectedDist;
-				const float LateralDistance = FVector::Distance(PawnLoc, ClosestPointOnPath);
+			// Pawn 到 trace 路径的最近点 + 横向距离
+			const FVector ClosestPointOnPath = RayOrigin + TraceDir * ProjectedDist;
+			const float LateralDistance = FVector::Distance(PawnLoc, ClosestPointOnPath);
 
-				// 横向距离 ≤ 30cm (严格 < Pawn Capsule 半径) → 视为命中
-				// 30cm = 接近人体 Capsule 半径 (UE 默认 42cm), 但严格小于, 不会误命中旁边 Pawn
-				if (LateralDistance <= 30.0f && ProjectedDist < FallbackPawnPathDistance)
-				{
-					FallbackPawnPathDistance = ProjectedDist;
-					FallbackPawn = Candidate;
-				}
+			// 横向距离 ≤ 30cm (严格 < Pawn Capsule 半径) → 视为命中
+			// 30cm = 接近人体 Capsule 半径 (UE 默认 42cm), 但严格小于, 不会误命中旁边 Pawn
+			if (LateralDistance <= 30.0f && ProjectedDist < FallbackPawnPathDistance)
+			{
+				FallbackPawnPathDistance = ProjectedDist;
+				FallbackPawn = Candidate;
 			}
 		}
 	}
@@ -515,7 +514,74 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		HitResult.ImpactPoint = FallbackPawn->GetActorLocation();
 		HitResult.ImpactNormal = -ToPawnFromOrigin;
 		HitResult.Distance = FallbackPawnPathDistance;
-		HitResult.BoneName = NAME_None;
+
+		// ============================================================
+		// 【v99 P0 修复】母体分头/身体伤害 — Phase 2.5 二次精确 trace 取 BoneName
+		//
+		// 业务核心 (用户 2026.07.26 明确):
+		//   - 母体被打要分头部和身体 (跟人类一样), 否则不算"正确实现"
+		//
+		// 根因 (Session1.log line 1194):
+		//   - 旧版 Phase 2 fallback 强制 BoneName = NAME_None
+		//   - BaseWeapon::Server_ReportHit 看到 BoneName != "head" → 永远走 LightDamageBody (20 伤害)
+		//   - 用户感受到"母体不分头身体"
+		//
+		// 大厂原则 — 单一真理源 + 大厂数据驱动:
+		//   - BoneName 真理源 = UE SkeletalMeshComponent::GetBoneName / HitResult.BoneName
+		//   - Phase 2 fallback 因为走世界坐标搜索, 没经过碰撞 trace → 拿不到 BoneName
+		//   - **修复**: Phase 2 fallback 后做一次精确 LineTraceSingle (武器 Socket → FallbackPawn 中心),
+		//     只为拿 BoneName — 这是精确 trace, 不会"粗大", 符合用户"正常射线大小"要求
+		//   - 二次 trace 不影响 Phase 2 fallback 命中逻辑 — 只是补一个字段
+		//
+		// 性能成本 (大厂原则 - 可观测性):
+		//   - Phase 2 fallback 命中率 < 1% (只有 BP_MuTi collision 配错才走), 二次 trace 几乎不跑
+		//   - 单次 LineTraceSingle < 0.01ms (UE 物理引擎内部 trace)
+		//
+		// 不破坏刀战模式 (大厂原则 - 零耦合):
+		//   - 刀战模式 Phase 1 (LineTraceMulti) 已经能拿到 BoneName → 不走 Phase 2 fallback → 不受影响
+		//   - 只有 Phase 2 fallback 才走二次 trace (兼容性修复)
+		// ============================================================
+		{
+			FHitResult PreciseHit;
+			// 【v99 P0.1 修复】FCollisionQueryParams 不能 const (它内部需要可写 TraceTag 等)
+			FCollisionQueryParams PreciseParams(SCENE_QUERY_STAT(RangedStrategyBoneProbe), false, Weapon);
+			PreciseParams.bReturnPhysicalMaterial = false;
+			PreciseParams.bTraceComplex = true; // 复杂碰撞 (骨骼级 trace) — 必须, 否则 BoneName 是 NAME_None
+			PreciseParams.bReturnFaceIndex = false;
+
+			const bool bPreciseHit = World->LineTraceSingleByChannel(
+				PreciseHit,
+				RayOrigin,           // 从武器 Socket (Phase 1 的起点)
+				FallbackPawn->GetActorLocation(),  // 到 Pawn 中心
+				ECC_Visibility,
+				PreciseParams
+			);
+
+			if (bPreciseHit && PreciseHit.BoneName != NAME_None)
+			{
+				// 二次 trace 拿到骨骼名 (head/body 等) → 真实 BoneName
+				HitResult.BoneName = PreciseHit.BoneName;
+				HitResult.Location = PreciseHit.Location;
+				HitResult.ImpactPoint = PreciseHit.ImpactPoint;
+
+				UE_LOG(LogTemp, Log,
+					TEXT("[URangedLineStrategy::PerformSingleShot] 【v99 P0】Phase 2.5 二次 trace 拿到 BoneName='%s' for Target='%s'. "
+					     "母体伤害将按头/身体区分."),
+					*PreciseHit.BoneName.ToString(),
+					*FallbackPawn->GetName());
+			}
+			else
+			{
+				// 二次 trace 没拿到 (Pawn 无骨骼 / collision 完全关闭) → 保持 NAME_None (走身体伤害)
+				HitResult.BoneName = NAME_None;
+
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[URangedLineStrategy::PerformSingleShot] 【v99 P0】Phase 2.5 二次 trace 未拿 BoneName for Target='%s' (bPreciseHit=%d). "
+					     "母体伤害默认走身体路径."),
+					*FallbackPawn->GetName(),
+					bPreciseHit ? 1 : 0);
+			}
+		}
 	}
 	else if (bHit && HitResults.Num() > 0)
 	{

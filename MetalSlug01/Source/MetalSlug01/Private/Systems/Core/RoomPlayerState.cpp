@@ -11,6 +11,9 @@
 // 引入房间 GameState（用于 AddTeamKill 队伍击杀统计）
 #include "Systems/RoomGameState.h"
 #include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
+#include "Data/Enums/CombatEnums.h"   // 【v100 新增】EKillStreakType (连杀真理源派生)
+#include "Data/Config/PlayerConfigAsset.h" // 【v100 新增】UPlayerConfigAsset (连杀超时秒数)
+#include "Systems/RoomGameMode.h"     // 【v100 新增】ARoomGameMode (拿 PlayerConfigAsset)
 
 
 // ==========================================
@@ -77,11 +80,18 @@ void ARoomPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID2); // 注册新变量的网络同步
 	// 【v52 P0】第 3 把武器同步 (近战) — 必须 DOREPLIFETIME, 否则客户端永远拿不到
 	DOREPLIFETIME(ARoomPlayerState, SelectedWeaponID3);
+	// 【2026.07.26 v99 P0】母体状态同步 — 复活链真理源 (RequestRespawn 读它决定是否原地变母体)
+	DOREPLIFETIME(ARoomPlayerState, bIsMother);
+	// 【v99.1 大厂架构】母体复活位置真理源 — 死亡 Transform + 标志位
+	DOREPLIFETIME(ARoomPlayerState, LastDeathTransform);
+	DOREPLIFETIME(ARoomPlayerState, bHasLastDeathTransform);
 
 	// 注册计分板数据的网络同步
 	DOREPLIFETIME(ARoomPlayerState, RoomScore);
 	DOREPLIFETIME(ARoomPlayerState, RoomKills);
 	DOREPLIFETIME(ARoomPlayerState, RoomDeaths);
+	// 【v100 大厂架构】连杀计数真理源 — Replicate 让所有客户端能本地播对应音
+	DOREPLIFETIME(ARoomPlayerState, CurrentKillStreak);
 	DOREPLIFETIME(ARoomPlayerState, RoomAssists);
 }
 
@@ -261,9 +271,189 @@ void ARoomPlayerState::ResetScoreboardStats()
 		RoomDeaths = 0;
 		RoomAssists = 0;
 
+		// 【v100 大厂架构】连杀计数同步清零(避免回合切换后继承上一局的连杀)
+		CurrentKillStreak = 0;
+		LastKillWorldTimeSeconds = -1.f;
+
 		// 通知所有客户端刷新
 		OnRep_ScoreboardData();
 	}
+}
+
+
+// ==========================================
+// 4b. 【v100 大厂架构 — 连杀真理源】服务器累加/重置
+// ==========================================
+
+/**
+ * 【v100 大厂架构 — 连杀算法入口】服务器专用: 玩家击杀时累加/重置连杀
+ *
+ * 业务流程:
+ *   1. UCombatDeathComponent::PerformKillSettlement 中
+ *   2. KillerPS->AddKillScore() 之前 调 KillerPS->ServerUpdateKillStreak(bIsAssist, bIsHeadshot)
+ *   3. 内部按 LastKillWorldTimeSeconds + KillStreakDuration 决定:
+ *      - 超时或首次击杀 → CurrentKillStreak = 0 后 +1
+ *      - 未超时 → CurrentKillStreak += 1
+ *   4. 计算 EKillStreakType 返回 (服务器传给 Multicast_NotifyKill RPC → 客户端播音)
+ *
+ * 大厂原则 — 与 KillStreakWidget 镜像:
+ *   - bIsHeadshot=true 优先 → 返回 Headshot
+ *   - 否则按 CurrentKillStreak 封顶分级(>= 5 → FiveKills,无 FivePlusKills)
+ *   - bIsAssist=true → 助攻,不计入连杀,重置为 0 并返回 None
+ *     (与 widget RecordKill 业务保持一致 — RecordKill 客户端不为助攻计数)
+ *
+ * @param bIsAssist    是否助攻(为 true → 重置连杀, 返回 None)
+ * @param bIsHeadshot  是否爆头
+ * @return             计算后的连杀类型 — 服务器传给 RPC 供客户端播音
+ *
+ * 零兜底:
+ *   - 找不到 GameMode 拿不到 KillStreakDuration → Log Error + 用默认 10s (零兜底不强求,但要报警)
+ *   - bIsAssist=true → 返回 None (语义:助攻不计入连杀,客户端收到 None 应拒绝播放连杀音)
+ */
+EKillStreakType ARoomPlayerState::ServerUpdateKillStreak(bool bIsAssist, bool bIsHeadshot)
+{
+	// 零兜底守卫: 任何字段写只能在服务器跑
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerState][v100] ServerUpdateKillStreak: 必须在服务器调用! "
+				 "Player=%s. 返回 None 让调用方感知错误."),
+			*GetPlayerName());
+		return EKillStreakType::None;
+	}
+
+	// 助攻不计入连杀 + 不播连杀音(惯例: 助攻只显示图标,不刷"二连杀")
+	if (bIsAssist)
+	{
+		CurrentKillStreak = 0; // 重置
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomPlayerState][v100] ServerUpdateKillStreak: bIsAssist=true, 重置连杀. Player=%s"),
+			*GetPlayerName());
+		return EKillStreakType::None;
+	}
+
+	// 获取超时阈值 — 优先级: GameMode->PlayerConfigAsset.KillStreakDuration > 10s 默认(零兜底)
+	float KillStreakDuration = 10.0f;
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameMode* RoomGM = World->GetAuthGameMode<ARoomGameMode>())
+		{
+			if (RoomGM->PlayerConfigAsset.IsValid())
+			{
+				if (UPlayerConfigAsset* Config = RoomGM->PlayerConfigAsset.LoadSynchronous())
+				{
+					KillStreakDuration = Config->KillStreakDuration;
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[RoomPlayerState][v100] ServerUpdateKillStreak: PlayerConfigAsset 加载失败, 使用默认 10s. "
+							 "Player=%s. 【修复】检查 DA_PlayerConfig 资产是否被删除."),
+						*GetPlayerName());
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomPlayerState][v100] ServerUpdateKillStreak: PlayerConfigAsset 未配, 使用默认 10s. "
+						 "Player=%s. 【修复】在 GM_RoomGameMode Class Defaults → Room|Config → PlayerConfigAsset 配 DA_PlayerConfig."),
+					*GetPlayerName());
+			}
+		}
+	}
+
+	// 累加/重置判定
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	if (LastKillWorldTimeSeconds < 0.f || (Now - LastKillWorldTimeSeconds) > KillStreakDuration)
+	{
+		// 首次击杀 / 超时后第一次击杀 → 重置为 0(然后立即 +1)
+		CurrentKillStreak = 0;
+	}
+	LastKillWorldTimeSeconds = Now;
+	CurrentKillStreak += 1;
+
+	// 计算 EKillStreakType(镜像 UKillStreakWidget::GetKillStreakType 逻辑)
+	// 【业务规则 2026.07.26】"超过五杀再激活还是五杀图标和声音"
+	//   - 不新增枚举值(无 FivePlusKills,大厂原则 - 不为业务不需要的概念建抽象)
+	//   - 封顶语义: Kills >= 5 都归 FiveKills (图标 + 音效都按五杀播)
+	//   - 这样玩家连杀 6/7/8 杀时, 每次都重新触发一次 FiveKills 图标 + 音效
+	EKillStreakType ResultStreakType = EKillStreakType::None;
+	if (bIsHeadshot)
+	{
+		ResultStreakType = EKillStreakType::Headshot; // 爆头优先
+	}
+	else if (CurrentKillStreak >= 5)
+	{
+		ResultStreakType = EKillStreakType::FiveKills; // 封顶: 5+ 杀都是五杀
+	}
+	else if (CurrentKillStreak >= 4)
+	{
+		ResultStreakType = EKillStreakType::FourKills;
+	}
+	else if (CurrentKillStreak >= 3)
+	{
+		ResultStreakType = EKillStreakType::ThreeKills;
+	}
+	else if (CurrentKillStreak >= 2)
+	{
+		ResultStreakType = EKillStreakType::TwoKills;
+	}
+	else if (CurrentKillStreak >= 1)
+	{
+		ResultStreakType = EKillStreakType::OneKill;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomPlayerState][v100] ServerUpdateKillStreak: Player=%s, StreakCount=%d, Result=%d, bIsHeadshot=%d"),
+		*GetPlayerName(), CurrentKillStreak, static_cast<int32>(ResultStreakType), bIsHeadshot ? 1 : 0);
+
+	return ResultStreakType;
+}
+
+/**
+ * 【v100 大厂架构 — 连杀超时清理】服务器专用: 重置连杀(死亡时调)
+ *
+ * 业务流程:
+ *   - UCombatDeathComponent::PerformKillSettlement 中
+ *   - VictimPS->AddDeath() 之后 立即调 VictimPS->ServerResetKillStreak()
+ *
+ * 不复制 OnRep_KillStreak (客户端 widget 自己监听死亡流)
+ */
+void ARoomPlayerState::ServerResetKillStreak()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerState][v100] ServerResetKillStreak: 必须在服务器调用! Player=%s"),
+			*GetPlayerName());
+		return;
+	}
+
+	if (CurrentKillStreak > 0)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomPlayerState][v100] ServerResetKillStreak: Player=%s, PreviousStreak=%d, 重置为 0."),
+			*GetPlayerName(), CurrentKillStreak);
+		CurrentKillStreak = 0;
+		LastKillWorldTimeSeconds = -1.f;
+		// ReplicatedUsing 触发 OnRep_KillStreak → 客户端 HUD 收到新值
+	}
+}
+
+
+/**
+ * 【v100 OnRep_KillStreak — 客户端接收连杀数据】
+ *
+ * 当前 v100 阶段:
+ *   - KillStreakWidget 仍是本地 widget 内部字段(单数据源分裂,后续 PR 跟进)
+ *   - 此处仅作为日志镜像 — 验证 RPC 链路 + 数据流正确
+ *   - TODO(后续 PR): KillStreakWidget 改读 ARoomPlayerState::CurrentKillStreak
+ */
+void ARoomPlayerState::OnRep_KillStreak()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomPlayerState][v100] OnRep_KillStreak: Player=%s, CurrentKillStreak=%d"),
+		*GetPlayerName(), CurrentKillStreak);
 }
 
 

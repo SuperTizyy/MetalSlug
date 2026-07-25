@@ -199,6 +199,30 @@ bool UCharacterEvents::GetCachedWeaponAmmoInfo(int32& OutCurrentAmmo, int32& Out
 
 
 /**
+ * UCharacterEvents::SetWeaponPanelVisibility 【v105 新增】
+ *
+ * 广播武器面板显隐状态变化 — 用于母体等无武器角色隐藏武器弹药 UI
+ *
+ * 业务规则 (用户 2026.07.27 明确):
+ *   - 母体没有武器, 不应该显示弹药 UI (Text_WeaponAmmo / Image_MeleeWeapon)
+ *   - 变成母体时隐藏武器面板, 变回人类时显示武器面板
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 调用方: CharacterIconComponent::RefreshCharacterIcon (读取 Owner->bIsMother)
+ *   - 本函数只负责缓存 + 广播, 不做业务判断
+ *
+ * @param bIsVisible true=显示武器面板, false=隐藏武器面板
+ */
+void UCharacterEvents::SetWeaponPanelVisibility(bool bIsVisible)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[CharacterEvents] SetWeaponPanelVisibility: bIsVisible=%d"),
+		bIsVisible ? 1 : 0);
+	OnWeaponPanelVisibilityChanged.Broadcast(bIsVisible);
+}
+
+
+/**
  * UCharacterEvents::SetCachedACValue
  */
 void UCharacterEvents::SetCachedACValue(int32 InAC)

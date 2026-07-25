@@ -63,6 +63,11 @@ class UDissolveComponent;
 class UFootstepComponent;
 class UHealthRegenComponent;
 class UInvincibilityFlickerComponent;  // 【v40.8 新增】无敌期视觉闪烁
+class UMotherSpawnParticleComponent;   // 【v99.1 新增】母体出生粒子特效
+class UMotherSpawnSoundComponent;       // 【v99.3 新增】母体出生音效
+class UMotherLowHealthFlickerComponent; // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
+class UKillSoundComponent;              // 【v100 新增】击杀音效 (通用, 所有模式都触发)
+class UAudioComponent;                   // 【v100.1 新增】回血音组件 (服务器 RPC 创建, 客户端本地缓存)
 
 // 【v38 修复】模板函数 ResolveComponent<T> 调用 FindComponentByClass<T>(), 需要完整类型
 // UE 的 FindComponentByClass 是模板, 内部涉及 StaticClass(), 必须看到完整类型定义
@@ -83,6 +88,10 @@ class UInvincibilityFlickerComponent;  // 【v40.8 新增】无敌期视觉闪�
 #include "Components/FootstepComponent.h"
 #include "Components/HealthRegenComponent.h"
 #include "Combat/InvincibilityFlickerComponent.h"  // 【v40.8 新增】
+#include "Combat/MotherSpawnParticleComponent.h"    // 【v99.1 新增】母体出生粒子
+#include "Combat/MotherSpawnSoundComponent.h"        // 【v99.3 新增】母体出生音效
+#include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
+#include "Combat/KillSoundComponent.h"               // 【v100 新增】击杀音效
 
 // 引入 DataTable 行结构体（引擎 FindRow 模板需要）
 #include "Data/Tables/WeaponTableRow.h"
@@ -115,7 +124,7 @@ class ARoomPlayerState;
 #include "Weapons/WeaponSlotType.h"
 
 // 【v76 大厂架构 — 武器切换音效】USoundBase 前向声明 (Multicast RPC 签名需要)
-// class USoundBase;
+class USoundBase;
 
 // 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
 #include "GenericTeamAgentInterface.h"
@@ -409,6 +418,59 @@ public:
 	//   迁移: 旧调用点 ARoomGameMode::SpawnAIInternal 改用 FFactionTags::AttitudeBetween / IsSameSide
 
 	/**
+	 * 【v100.1 大厂架构 — 母体待机回血音 RPC】服务器调 → 所有客户端播放循环音
+	 *
+	 * 业务规则 (用户 2026.07.26):
+	 *   - "开始回血后开始播放声音" — 服务器检测到 HealthRegenComponent bIsRegenerating=false→true
+	 *   - 触发链路: HealthRegenComponent::OnRegenStateChanged(true).Broadcast
+	 *     → BaseCharacter::HandleRegenStateChanged 订阅 (BeginPlay 注册)
+	 *     → Owner->Multicast_PlayRegenSound(Sound)
+	 *     → 客户端 Implementation: UGameplayStatics::SpawnSoundAttached 创建循环音组件
+	 *
+	 * 大厂原则 — RPC 边界纯数据:
+	 *   - 传 USoundBase* (UE 内部会复制引用到客户端, 不复制资产内容)
+	 *   - 客户端 Implementation 创建 UAudioComponent 缓存到 ActiveRegenAudioComponent
+	 *   - Sound 资产 = HealthRegenComponent::RegenSound (BP 配置, 真理源)
+	 *
+	 * @param Sound 要播放的循环音 (从 HealthRegenComponent::RegenSound 读取)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlayRegenSound(USoundBase* Sound);
+
+	/**
+	 * 【v100.1 大厂架构 — 停止回血音 RPC】服务器调 → 所有客户端停止 + 销毁音组件
+	 *
+	 * 业务规则 (用户 2026.07.26): "结束回血后关闭此声音"
+	 * 触发场景: 被打 / 开始移动 / 死亡 / 满血 / bEnableAutoRegen=false
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 没找到 ActiveRegenAudioComponent → Log Warning 但不崩溃 (可能本机没开过音)
+	 *   - 销毁组件而非 Stop+Keep (避免下次激活时残留)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_StopRegenSound();
+
+	/**
+	 * 【v100.1 大厂架构 — 回血状态变化事件订阅者 (服务器端)】
+	 *
+	 * 触发方: HealthRegenComponent::OnRegenStateChanged 委托
+	 * 调用方: BaseCharacter::BeginPlay 末尾 AddDynamic
+	 * 业务: 服务器把 Component 状态变化转成 RPC 推给所有客户端
+	 *
+	 * @param bIsNowRegenerating true=开始回血 / false=停止回血
+	 */
+	UFUNCTION()
+	void HandleRegenStateChanged(bool bIsNowRegenerating);
+
+	/**
+	 * 【v100.1 大厂架构 — 客户端活跃的回血音组件】
+	 * 服务器 RPC 创建, 客户端 Implementation 缓存, 客户端实现销毁
+	 * 注意: 不 Replicate (仅客户端本地有效, 服务器不需要)
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UAudioComponent> ActiveRegenAudioComponent = nullptr;
+
+	/**
 	 * 【v54 大厂架构重构 — UAIProfileAsset 已删除】MeleeProfile 字段整个删除
 	 *
 	 * 历史 (Phase 1 - v53):
@@ -531,6 +593,128 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Flicker")
 	UInvincibilityFlickerComponent* FlickerComponent;
+
+	/**
+	 * 【v101 大厂架构新增】母体残血虚弱闪烁组件 — 与 InvincibilityFlickerComponent 完全对称
+	 *
+	 * 职责:
+	 *   - 订阅 HealthComponent->OnHealthChanged
+	 *   - 检测阈值 (CurrentHealth <= WeakHealthThreshold)
+	 *   - 写 Replicated 字段 bIsWeakFlickering (服务器权威, 客户端 OnRep 同步)
+	 *   - 派发 OnWeakFlickerStarted/OnWeakFlickerStopped 到 BP 子类 (Timeline 驱动)
+	 *
+	 * 大厂原则 - 与 InvincibilityFlickerComponent 对称 (零重复):
+	 *   - 共享同一材质参数 FlickerAmount (BP Timeline 可共用)
+	 *   - 共享同一协议验证逻辑 (PrepareMaterials / ValidateMaterialHasFlickerParameter)
+	 *   - 共享同一 Socket Slot 过滤 (TargetMaterialSlotIndices)
+	 *
+	 * 大厂原则 - 数据/视觉分离 (与 InvincibilityFlickerComponent 同款):
+	 *   - HealthComponent 只管数据 (CurrentHealth)
+	 *   - 本组件只管视觉 (MID 操作 + Replicated 状态字段)
+	 *   - BP 子类只管动画 (Timeline)
+	 *
+	 * 业务规则 (用户 2026.07.27 明确):
+	 *   - 触发: CurrentHealth <= WeakHealthThreshold (默认 100.0)
+	 *   - 停止: CurrentHealth >  WeakHealthThreshold
+	 *   - 阈值由 BP_MuTi 配置 (策划可调, 不写死)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战 BP 不配 WeakHealthThreshold 触发场景, 血量始终 > 100 → 不闪烁
+	 *   - 母体 BP 配 WeakHealthThreshold=100, 残血时启动闪烁 — 模式隔离
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Mother")
+	UMotherLowHealthFlickerComponent* MotherLowHealthFlicker;
+
+	/**
+	 * 【v99.1 大厂架构新增】母体出生粒子特效组件 — 仅生化模式生效
+	 *
+	 * 职责:
+	 *   - 监听 Multicast_PlayMutationFX 触发 → 附着 Cascade 粒子到 Body Mesh → 5 秒后销毁
+	 *   - 5 秒生命周期由组件 Timer 控制,不依赖粒子资产自带循环
+	 *
+	 * 大厂原则 - 职责单一:
+	 *   - 不复制(视觉本地播放)
+	 *   - 不持有母体业务状态(走 Pawn.bIsMother Replicated)
+	 *   - 不接收 OnRep_bIsMother 触发(避免与 Multicast RPC 双发)
+	 *   - v99.2 删除运行期模式校验 (真理源在 Server 侧 MutatePawnToMother)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Mother")
+	UMotherSpawnParticleComponent* MotherSpawnParticle;
+
+	/**
+	 * 【v99.1 大厂架构新增】Lazy resolve MotherSpawnParticleComponent
+	 *
+	 * 走 v38 ResolveComponent<T> 统一模板,与其他 Resolver 同款路径
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UMotherSpawnParticleComponent* ResolveMotherSpawnParticle()
+	{
+		return ResolveComponent<UMotherSpawnParticleComponent>(MotherSpawnParticle, TEXT("MotherSpawnParticle"));
+	}
+
+	/**
+	 * 【v99.3 大厂架构新增】母体出生音效组件
+	 *
+	 * 职责:
+	 *   - 监听 Multicast_PlayMutationFX 触发 → 在母体位置 PlaySoundAtLocation 一次
+	 *   - 3D 衰减,玩家能听到母体从远处生成
+	 *   - 一次性播放,无 Timer / 无状态
+	 *
+	 * 大厂原则 - 职责单一:
+	 *   - 不复制(音效本地播放)
+	 *   - 不持有母体业务状态(走 Pawn.bIsMother Replicated)
+	 *   - 不接收 OnRep_bIsMother 触发(避免与 Multicast RPC 双发)
+	 *   - 与 UMotherSpawnParticleComponent 完全对称架构
+	 *   - v99.3 零等待 (不运行期校验 GameState.CurrentMatchMode)
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Mother")
+	UMotherSpawnSoundComponent* MotherSpawnSound;
+
+	/**
+	 * 【v99.3 大厂架构新增】Lazy resolve MotherSpawnSoundComponent
+	 *
+	 * 走 v38 ResolveComponent<T> 统一模板,与 ResolveMotherSpawnParticle 对称
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UMotherSpawnSoundComponent* ResolveMotherSpawnSound()
+	{
+		return ResolveComponent<UMotherSpawnSoundComponent>(MotherSpawnSound, TEXT("MotherSpawnSound"));
+	}
+
+	/**
+	 * 【v100 大厂架构新增】击杀音效组件 — 通用,所有模式都触发
+	 *
+	 * 架构定位:
+	 *   - 仿 UMotherSpawnSoundComponent,但通用(玩家 / AI / Mother / 任意 Pawn 都挂)
+	 *   - 数据驱动:KillSound 资产不在组件字段,而是查 GameMode.KillStreakIconDataTable
+	 *     (单一真理源 — 与 HUD 连杀图标同表共享)
+	 *   - 接口:PlayKillSound(EKillStreakType) 接收连杀类型,查表播放对应 Sound
+	 *
+	 * 大厂原则 — 单一入口:
+	 *   - 触发方: ABaseCharacter::Multicast_NotifyKill_Implementation
+	 *   - 复用现有 RPC — 不新建 NetMulticast (避免重复 RPC)
+	 *   - 触发对象: Victim (在 Victim 当前位置播放)
+	 *
+	 * v100 零等待:
+	 *   - 组件不运行期校验模式 / 阵营 / 任何"上游应该做的"
+	 *   - 真理源在 Multicast_NotifyKill 调用前已决定
+	 *
+	 * 零兜底:
+	 *   - 缺表 / 找不到 Row / 缺 Sound → Log Error + 拒绝播放
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Kill")
+	UKillSoundComponent* KillSound;
+
+	/**
+	 * 【v100 大厂架构新增】Lazy resolve KillSoundComponent
+	 *
+	 * 走 v38 ResolveComponent<T> 统一模板(与 ResolveMotherSpawnSound 对称)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UKillSoundComponent* ResolveKillSound()
+	{
+		return ResolveComponent<UKillSoundComponent>(KillSound, TEXT("KillSound"));
+	}
 
 	/** 脚步音效 (地面检测 + 音效播放) */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Footstep")
@@ -759,6 +943,19 @@ public:
 	UInvincibilityFlickerComponent* ResolveFlickerComponent()
 	{
 		return ResolveComponent<UInvincibilityFlickerComponent>(FlickerComponent, TEXT("FlickerComponent"));
+	}
+
+	/**
+	 * 【v101 新增】母体残血虚弱闪烁组件 - 通用 resolver 入口
+	 *
+	 * 大厂原则 - 与 ResolveFlickerComponent 完全对称:
+	 *   - 走 ResolveComponent<T> 模板 (字段 → FindComponentByClass → Log Error)
+	 *   - 调用方拿到 nullptr 时已 Log Error, 不允许静默跳过
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UMotherLowHealthFlickerComponent* ResolveMotherLowHealthFlicker()
+	{
+		return ResolveComponent<UMotherLowHealthFlickerComponent>(MotherLowHealthFlicker, TEXT("MotherLowHealthFlicker"));
 	}
 
 	/**
@@ -2173,7 +2370,7 @@ protected:
 	 *                      实现转发到 CharacterIconComponent::Client_RefreshCharacterIcon_Implementation
 	 */
 	UFUNCTION(Client, Reliable)
-	void Client_RefreshCharacterIcon(const FString& InCharacterID, class UTexture2D* Avatar);
+	void Client_RefreshCharacterIcon(const FString& InCharacterID, class UTexture2D* Avatar, bool bInIsMother);
 
 	/**
 	 * 客户端 RPC — 接收武器图标数据 (服务器查好 Icon 直接 RPC 推给客户端)
@@ -2252,10 +2449,16 @@ public:
 	 * @param VictimName  被击杀者姓名
 	 * @param KillMethod  击杀方式 (服务器本地读 Weapon->GetLastKillMethod())
 	 * @param bIsAssist   true=这是助攻消息, false=普通击杀
+	 *
+	 * 【v100 大厂架构 — 连杀音效扩展】
+	 *   - 加 EKillStreakType StreakType 参数(纯数据, RPC 序列化稳定)
+	 *   - 扩展业务: 客户端 Implementation 决定播哪个连杀音效 (Headshot / OneKill / ...)
+	 *   - 服务器在调用 Multicast 之前已算好 StreakType (经 ARoomPlayerState::ServerUpdateKillStreak)
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_NotifyKill(const FString& KillerName, const FString& VictimName,
-	                          EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer);
+	                          EKillMethod KillMethod, bool bIsAssist, bool bIsKillerPlayer,
+	                          EKillStreakType InStreakType, class USoundBase* KillSoundAsset);
 
 	/**
 	 * 获取击杀者 PlayerState

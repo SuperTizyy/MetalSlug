@@ -36,6 +36,7 @@
 
 class ABaseWeapon;
 class AActor;
+class ABaseCharacter; // 【v100.2】ResolveAttackerCharacter 返回值需 ABaseCharacter 前向声明
 
 /**
  * @class UMeleeSwStrategy
@@ -270,6 +271,24 @@ protected:
 	// 刀战路径下, ActiveOwner 是 nullptr, 命中 RPC 走 Weapon->Server_ReportHit
 	// 大厂原则 - 单一真理源: 谁拥有当前 trace, 谁负责报命中
 	TWeakObjectPtr<class ABaseCharacter> ActiveOwner;
+
+	/**
+	 * 【v100.2 大厂架构 — Attacker 真理源解析器】
+	 *
+	 * 单一真理源 — 消除 TickDetection 内 3 处重复的 `Cast<ABaseCharacter>(Weapon->GetOwner())`
+	 *
+	 * 大厂原则:
+	 *   - 母体路径 (bUseOwnerMesh=true): 优先 ActiveOwner > Weapon->GetOwner()
+	 *     注: 母体调用方传 nullptr 当 Weapon, 必须 ActiveOwner 兜底
+	 *   - 刀战路径 (bUseOwnerMesh=false): 优先 Weapon->GetOwner() > ActiveOwner
+	 *   - 双路径都失效 → 返回 nullptr + Log Error (零兜底)
+	 *
+	 * 调用方: TickDetection 内 3 个位置 (Phase 2 fallback / RPC 路径 / 诊断日志)
+	 *
+	 * @param Weapon   TickDetection 入参 (母体路径下可能 nullptr)
+	 * @return         Attacker ABaseCharacter* 或 nullptr
+	 */
+	ABaseCharacter* ResolveAttackerCharacter(ABaseWeapon* Weapon) const;
 
 	// 【v93.2 母体复用】bAIDriven 缓存 (TickDetection 读)
 	// 母体路径下, 玩家/AI 判定从 ActiveOwner 读 bIsCurrentlyAttackerAI

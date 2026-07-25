@@ -63,8 +63,12 @@
 // 包含 RoomPlayerState 以读 GetPlayerName (击杀结算用)
 #include "Systems/Core/RoomPlayerState.h"
 
+// 【v99.1 大厂架构】母体复活位置真理源 — BaseAIController.CachedDeathTransform
+#include "Systems/BaseAIController.h"
+
 // 包含 FactionTags 集中定义 (CanDamage 三层防御)
 #include "Data/Faction/FactionTags.h"
+#include "Data/Tables/KillIconTableRow.h" // 【v105 新增】FKillStreakIconInfo (服务器查表获取击杀音效)
 
 // UE 引擎组件: 移动/胶囊体/骨骼网格
 #include "GameFramework/CharacterMovementComponent.h"
@@ -526,6 +530,38 @@ void UCombatDeathComponent::ExecuteDeathLocal()
 	if (Owner->HasAuthority())
 	{
 		ReleaseOccupiedSpawnPoint();
+	}
+
+	// 【v99.1 大厂架构 — 母体复活位置真理源】死亡时主动缓存最后 Transform
+	//
+	// 业务核心 (用户 2026.07.26):
+	//   "任何情况人类变成母体, 都是原地变成的, 不是回到出生点."
+	//   母体死后复活也必须原地复活 (零兜底 — 禁用 ZeroVector / GetSpawnLocation 等)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 玩家路径: ARoomPlayerState::LastDeathTransform + bHasLastDeathTransform (Replicated)
+	//   - AI 路径:   ABaseAIController::CachedDeathTransform + bHasCachedDeathTransform (运行时真理源)
+	//   - 复活链 MutatePawnToMother 读此字段, 不用 ZeroVector
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式走出生点路径(URoomSpawnSubsystem::HandlePlayerRequestSpawn / SpawnAIInternal),
+	//     不读 PS->LastDeathTransform / AIC->CachedDeathTransform
+	//   - 死亡时仍缓存(无人读, 仅是冗余数据), 不影响业务
+	if (Owner->HasAuthority())
+	{
+		const FTransform DeathTransform = Owner->GetActorTransform();
+		if (APlayerController* PC = Cast<APlayerController>(Owner->GetController()))
+		{
+			if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+			{
+				PS->LastDeathTransform = DeathTransform;
+				PS->bHasLastDeathTransform = true;
+			}
+		}
+		else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Owner->GetController()))
+		{
+			BaseAIC->SetCachedDeathTransform(DeathTransform);
+		}
 	}
 
 	// 【2026.07.13 v40.6 反扎堆账本】死亡时释放仇恨账本 (与 ReleaseOccupiedSpawnPoint 对等)
@@ -1099,7 +1135,7 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 	{
 		VictimName = VictimPS->GetPlayerName();
 		// 【v31.6 大厂重构】服务器侧死亡计数
-		VictimPS->AddDeath();
+		// 【v100】VictimPS->AddDeath() 已下移到下面"清零连杀"块中,避免重复调用
 	}
 	else
 	{
@@ -1118,6 +1154,84 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 		}
 	}
 
+	// ==========================================
+	// 【v100 大厂架构 — 连杀真理源累加 + 重置 Victim 连杀】
+	//   时序关键: AddKillScore 之后立即调 — 因为 ServerUpdateKillStreak 返回 EKillStreakType
+	//   而 EKillStreakType 要传给 Multicast_NotifyKill RPC 用, 必须在 RPC 调用前完成
+	// ==========================================
+	EKillStreakType CalculatedStreakType = EKillStreakType::None;
+	USoundBase* KillSoundAsset = nullptr; // 【v105 新增】服务器查表后 RPC 传给客户端
+	if (KillerCharacter)
+	{
+		if (ARoomPlayerState* KillerPS = KillerCharacter->GetRoomPlayerState())
+		{
+			const bool bIsHeadshot = (KillMethod == EKillMethod::PrimaryHeadshot ||
+				KillMethod == EKillMethod::SecondaryHeadshot ||
+				KillMethod == EKillMethod::MeleeHeadshot);
+			CalculatedStreakType = KillerPS->ServerUpdateKillStreak(false, bIsHeadshot);
+
+			// 【v105 大厂架构】服务器查表获取击杀音效资产
+			// 根因: PlayKillSound 在客户端调用 EnsureKillStreakDataTable → World->GetAuthGameMode() 返回 nullptr
+			// 修复: 服务器在调用前查表, 把 USoundBase* 作为参数传给客户端
+			if (CalculatedStreakType != EKillStreakType::None)
+			{
+				UWorld* World = GetWorld();
+				if (ARoomGameMode* GM = World ? World->GetAuthGameMode<ARoomGameMode>() : nullptr)
+				{
+					if (UDataTable* KillStreakTable = GM->KillStreakIconDataTable)
+					{
+						// 查找对应 StreakType 的行
+						const FString EnumValueName = UEnum::GetValueAsString(CalculatedStreakType);
+						FString RowNameStr = EnumValueName;
+						int32 ColonPos = INDEX_NONE;
+						if (RowNameStr.FindLastChar(TEXT(':'), ColonPos))
+						{
+							RowNameStr = RowNameStr.RightChop(ColonPos + 1);
+						}
+						const FName RowName(*RowNameStr);
+						static const FString ContextStr(TEXT("KillSoundLookup"));
+						if (FKillStreakIconInfo* Row = KillStreakTable->FindRow<FKillStreakIconInfo>(RowName, ContextStr, false))
+						{
+							KillSoundAsset = Row->KillSound;
+						}
+						else
+						{
+							UE_LOG(LogTemp, Warning,
+								TEXT("[CombatDeathComponent][v105] PerformKillSettlement: KillStreakIconDataTable 找不到 Row '%s' (StreakType=%d). 音效不会播放."),
+								*RowNameStr, static_cast<int32>(CalculatedStreakType));
+						}
+					}
+					else
+					{
+						UE_LOG(LogTemp, Warning,
+							TEXT("[CombatDeathComponent][v105] PerformKillSettlement: GM->KillStreakIconDataTable 为空. 音效不会播放."));
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[CombatDeathComponent][v105] PerformKillSettlement: AuthGameMode 不是 ARoomGameMode. 音效不会播放."));
+				}
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[CombatDeathComponent][v100] PerformKillSettlement: Killer '%s' 没有 ARoomPlayerState, "
+					 "无法算 EKillStreakType. RPC 推送 None (音效会被 KillSoundComponent 拒绝)."),
+				*KillerCharacter->GetName());
+		}
+	}
+
+	// Victim 死亡 — 同步清零连杀 (避免下一回合继承)
+	// 【v100】复用函数级已有的 VictimPS (上面第 1132 行已获取),不重复声明避免 C4456
+	// 注: 上面 if/else 已经对 VictimPS==nullptr 做了 Log Error, 这里跳过二次
+	if (VictimPS)
+	{
+		VictimPS->AddDeath();
+		VictimPS->ServerResetKillStreak();
+	}
+
 	// 4. 广播击杀消息 (纯数据 RPC, 不会再 nullptr 崩溃)
 	// 【v40.9 P0 大厂架构】传入 bIsKillerPlayer — 只有玩家击杀才显示 KillFeed 图标
 	//
@@ -1126,15 +1240,18 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 	// - AI Pawn (被 AAIController 控制) → false ✅
 	// 注意: KillerCharacter != nullptr 时 KillerCharacter 必定是 ABaseCharacter*
 	//        AI 击杀玩家时 KillerCharacter 是 AI Pawn (不为 nullptr), 但 IsPlayerControlled() = false
+	//
+	// 【v100.1 大厂原则 — 零兜底】KillerCharacter == nullptr 路径:
+	//   - 旧版 (兜底): 用 OneKill 假音效,注释自述"不让击杀完全无声"
+	//   - 问题: 没有真实 Killer 时播"一杀"音效是伪造游戏事件,违反可观测性
+	//   - 新版: 不广播 — 没有 Killer 就没有击杀事件,这是真实业务语义
+	//   - 如果 Killer 真的丢了 (Destroy 时序竞态), 由 UE 网络机制自动不送达,不算 bug
 	const bool bIsKillerPlayer = (KillerCharacter && KillerCharacter->IsPlayerControlled());
 	if (KillerCharacter)
 	{
-		KillerCharacter->Multicast_NotifyKill(KillerName, VictimName, KillMethod, /*bIsAssist=*/false, bIsKillerPlayer);
+		// 【v100】新增 StreakType 参数 — 客户端按此播对应连杀音效
+		// 【v105】新增 KillSoundAsset 参数 — 服务器查表后 RPC 推送音效资产
+		KillerCharacter->Multicast_NotifyKill(KillerName, VictimName, KillMethod, /*bIsAssist=*/false, bIsKillerPlayer, CalculatedStreakType, KillSoundAsset);
 	}
-	else
-	{
-		// 没找到 Killer 时 (AI 攻击等), 受害者自己广播一条 (用 Unknown 作为 KillerName)
-		// bIsKillerPlayer=false → KillFeed 图标不显示 (符合业务规则)
-		Owner->Multicast_NotifyKill(KillerName, VictimName, KillMethod, /*bIsAssist=*/false, /*bIsKillerPlayer=*/false);
-	}
+	// else: 零兜底 — 不广播击杀消息(没有 Killer 就没有击杀事件)
 }

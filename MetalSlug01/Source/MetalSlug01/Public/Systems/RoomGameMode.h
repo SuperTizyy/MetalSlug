@@ -431,6 +431,29 @@ public:
 	TSoftObjectPtr<class UWeaponSoundMapAsset> WeaponSoundMapAsset;
 
 	/**
+	 * 【v100 大厂架构 — 单一真理源迁移】连杀图标/音效数据表 (共享 HUD + KillSound)
+	 *
+	 * 真理源迁移 (v100 大厂重构):
+	 *   - 旧 (v41 之前): UGameHUDWidget 内字段
+	 *     - BP_HUD_xxx 各自配一次 → 多 HUD 蓝图配同一资产 = 配置反模式(类似 v36 前 BP 角色配 DT 模式)
+	 *   - 新 (v100): 集中在 GameMode 配一次, 所有消费者通过 GM 拿到
+	 *     - BP_GM_RoomGameMode → Class Defaults → Room|Data → Kill Streak Icon DataTable
+	 *     - 运行时消费者:
+	 *       ① UGameHUDWidget::NativeConstruct 走 GM 拉 → 注入 Widget_KillStreak (图标)
+	 *       ② UKillSoundComponent::EnsureKillStreakDataTable lazy 拉 (音效)
+	 *     - 找不到 GM / GM 字段为空 → Log Error + 强制修复 (零兜底)
+	 *
+	 * 行结构: FKillStreakIconInfo (含 StreakType/StreakIcon/KillSound 三个字段)
+	 *
+	 * 大厂原则 — 共享数据源:
+	 *   - 图标 + 音效属于同一业务概念"连杀显示"
+	 *   - 一张表, 一行配, 一对一映射 = 单一真理源
+	 *   - BP 策划在一个地方就能改图标和音效
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Room|Data")
+	class UDataTable* KillStreakIconDataTable;
+
+	/**
 	 * @brief 处理玩家的生成请求
 	 * @param PlayerToSpawn           目标玩家控制器
 	 * @param CharRowName             角色 DataTable 的行名

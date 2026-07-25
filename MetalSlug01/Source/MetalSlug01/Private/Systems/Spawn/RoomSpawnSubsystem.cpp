@@ -14,6 +14,7 @@
 #include "Data/Tables/WeaponTableRow.h"      // 【v54.3 新增】FWeaponInfo (DT_WeaponInfo 行)
 #include "Weapons/BaseWeapon.h"              // 【v54.3 新增】ABaseWeapon (ResolveWeaponClassFromID 返回类型)
 #include "Combat/WeaponAttachmentComponent.h" // 【v52 P0 新增】Server_SpawnAllWeapons 调用
+#include "Combat/CharacterIconComponent.h"    // 【v105 新增】MutatePawnToMother 末尾调用刷新头像
 #include "Data/Config/PlayerConfigAsset.h"
 #include "Characters/BaseCharacter.h"
 #include "Components/HealthComponent.h"
@@ -185,6 +186,7 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	// 重新扫描时清空
 	AttackSpawnPoints.Reset();
 	DefenseSpawnPoints.Reset();
+	MotherSpawnPoints.Reset(); // 【v104 新增】清空母体复活点
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -201,6 +203,11 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	{
 		TAG_Faction_Defense = FName(TEXT("Faction_Defense"));
 	}
+	// 【v104 新增】母体复活点 TAG
+	if (TAG_Faction_Mother.IsNone())
+	{
+		TAG_Faction_Mother = FName(TEXT("Faction_Mother"));
+	}
 
 	// 兼容旧 TAG
 	const FName LegacyTag_Attack = FName(TEXT("Faction_Attack"));
@@ -208,6 +215,7 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	int32 TotalFound = 0;
 	int32 MatchedFaction = 0;
 	int32 LegacyMatched = 0;
+	int32 MotherMatched = 0; // 【v104 新增】
 	int32 ErrorSkipped = 0;
 
 	for (TActorIterator<APlayerStart> It(World); It; ++It)
@@ -222,6 +230,14 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 
 		const FName PlayerStartTag = PS->PlayerStartTag;
 		const FString StartName = PS->GetName();
+
+		// 【v104 新增】母体复活点分支 (优先级最高，因为它有特殊用途)
+		if (PlayerStartTag == TAG_Faction_Mother)
+		{
+			MotherSpawnPoints.Add(PS);
+			++MotherMatched;
+			continue; // 母体点不归入攻守方阵营
+		}
 
 		if (PlayerStartTag == TAG_Faction_Offense)
 		{
@@ -248,22 +264,35 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 			// 零兜底: 没 tag / 不匹配 → 显式 Log Error, 跳过
 			++ErrorSkipped;
 			UE_LOG(LogTemp, Error,
-				TEXT("[Spawn] PlayerStart '%s' 没有阵营 Tag (期望 '%s' / '%s'). "
+				TEXT("[Spawn] PlayerStart '%s' 没有阵营 Tag (期望 '%s' / '%s' / '%s'). "
 				     "【拒绝默认归类 - 大厂原则】此点不会分配给任何阵营."
-				     " 修复: 在编辑器 Details → Player Start Tag 配 Faction_Offense / Faction_Defense."),
+				     " 修复: 在编辑器 Details → Player Start Tag 配 Faction_Offense / Faction_Defense / Faction_Mother."),
 				*StartName,
 				*TAG_Faction_Offense.ToString(),
-				*TAG_Faction_Defense.ToString());
+				*TAG_Faction_Defense.ToString(),
+				*TAG_Faction_Mother.ToString());
 		}
 	}
 
 	bSpawnPointsScanned = true;
 
-	UE_LOG(LogTemp, Warning,
-		TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 错误跳过 %d. "
-		     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d"),
-		TotalFound, MatchedFaction, LegacyMatched, ErrorSkipped,
-		AttackSpawnPoints.Num(), DefenseSpawnPoints.Num());
+	// 【v104 新增】日志输出母体复活点统计
+	if (MotherSpawnPoints.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 错误跳过 %d. "
+			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=0 【警告】母体点缺失!"),
+			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, ErrorSkipped,
+			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 错误跳过 %d. "
+			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=%d"),
+			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, ErrorSkipped,
+			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num(), MotherSpawnPoints.Num());
+	}
 }
 
 AActor* URoomSpawnSubsystem::GetAvailableSpawnPointForFaction(FGameplayTag PlayerFactionTag, bool bRemoveOccupied, AController* OccupancyOwner)
@@ -1929,12 +1958,128 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 		return;
 	}
 
+	// ===== 【v99 P0 大厂架构 — 母体复活链真理源】预先读 PS->bIsMother =====
+	//
+	// 业务核心 (用户 2026.07.26 明确):
+	//   - 生化模式: 母体死后复活必须原地复活成母体
+	//
+	// 根因 (Session1.log line 1161-1218):
+	//   - 旧版 RequestRespawn 走 HandlePlayerRequestSpawn, 用 PlayerSpawnDataCache.CharID (人类 CharID)
+	//   - 即使死前是 BP_MuTi, 复活时一律走人类路径 → 复活成 BP_SWAT_C 人类 → 错
+	//
+	// 大厂原则 — 单一真理源 (SSOT):
+	//   - 真理源: ARoomPlayerState::bIsMother (服务器设, Replicated 自动同步)
+	//   - 写点: URoomMotherMutationSubsystem::MutateCharacterToMother Step 3.7
+	//   - 读点: 本函数 (复活链决策点, 复活前读最新值)
+	//
+	// 时序关键 (大厂原则 — 零时序竞争):
+	//   - Die() 同步链路: ApplyDamage → OnDeath → ExecuteDeathLocal → Die() → 派发 RequestRespawn
+	//   - 在 RequestRespawn 入口读 PS->bIsMother 时, 死亡 Pawn 的 bIsMother=true 已生效
+	//   - 3s 后实际复活时, PS->bIsMother 仍是 true (除非中途调过反变异, 但本项目无反变异 API)
+	//   - 所以**同步读 + 3s 延迟**都正确, 无时序竞争
+	//
+	// AI 路径说明:
+	//   - AI 没有 PlayerState, 单独走 Cast<AAIController> 分支
+	//   - 母体 AI 复活 = 母体变母体 (永远变异, 因为 DA_AIProfile_*.SpawnCharacterRowName 是固定 CharRowName)
+	//   - 真正的"AI 母体复活"问题不在本次范围, 玩家路径先修
+	bool bDeadWasMother = false;
+	if (const ARoomPlayerState* PS = DeadController->GetPlayerState<ARoomPlayerState>())
+	{
+		bDeadWasMother = PS->bIsMother;
+	}
+
 	UE_LOG(LogTemp, Warning,
-		TEXT("[Respawn] RequestRespawn: Controller=%s, bImmediate=%d"),
-		*DeadController->GetName(), bImmediateRespawn);
+		TEXT("[Respawn] RequestRespawn: Controller=%s, bImmediate=%d, bDeadWasMother=%d"),
+		*DeadController->GetName(), bImmediateRespawn, bDeadWasMother ? 1 : 0);
 
 	if (Cast<ARoomPlayerController>(DeadController))
 	{
+		// ===== 【v99 P0 大厂架构】母体复活分支: 走 MutatePawnToMother 而非 HandlePlayerRequestSpawn =====
+		//
+		// 业务规则 (用户 2026.07.26 明确):
+		//   - 母体死后复活必须原地变成母体, 不能复活成人类
+		//   - 复活路径 = URoomMotherMutationSubsystem::MutateCharacterToMother (单一入口)
+		//   - 单一真理源 = GM.MotherCharacterRowName (BP_MuTi 的 CharRowName)
+		//
+		// 大厂原则 — 职责分层 + 集中调度:
+		//   - 复活链决策 = RoomSpawnSubsystem (本函数)
+		//   - 母体原地变 = RoomMotherMutationSubsystem::MutateCharacterToMother (业务层调 SpawnSubsystem::MutatePawnToMother)
+		//   - 母体 CharRowName 真理源 = ARoomGameMode::MotherCharacterRowName
+		//
+		// 为什么不在 SpawnAI 路径处理 (避免重复架构):
+		//   - AI 母体死后复活永远变母体 (Profile 写死), 不需要玩家路径的 bIsMother 判断
+		//   - SpawnAIInternal 复活路径已读 AIC.CachedCharRowName, 母体 Profile 配的就是母体 CharRowName
+		//   - 玩家路径独立处理: 用 PS->bIsMother 判断, 因为玩家大厅选的是人类 CharID
+		if (bDeadWasMother)
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[Respawn] 母体玩家复活分支 — Controller='%s' PS->bIsMother=true → 走 MutatePawnToMother 路径. "
+				     "【v99 P0】不再读 PlayerSpawnDataCache.CharID (那是人类 CharID, 会错误复活成人类)."),
+				*DeadController->GetName());
+
+			// 模式校验: 只有生化模式 (Zombie) 才允许母体复活, 刀战模式 bIsMother 应永为 false
+			ARoomGameMode* RoomGM = GetWorld() ? GetWorld()->GetAuthGameMode<ARoomGameMode>() : nullptr;
+			if (!RoomGM)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] RoomGameMode 为空, 拒绝母体复活. Controller='%s'"),
+					*DeadController->GetName());
+				return;
+			}
+			if (RoomGM->MotherCharacterRowName.IsEmpty())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] GM.MotherCharacterRowName 为空, 拒绝母体复活. "
+					     "【v99 零兜底】配置错 — 必须配 BP_MuTi 的 CharRowName. "
+					     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Character RowName."),
+					*DeadController->GetName());
+				return;
+			}
+
+			// 母体原地复活: 走 SpawnSubsystem::MutatePawnToMother 单一入口 (零兜底 — 不需要 Target Pawn)
+			//
+			// 大厂原则 — 职责单一:
+			//   - MutateCharacterToMother(ABaseCharacter*) 需要活 Pawn, 复活链无 Pawn
+			//   - MutatePawnToMother(Controller, RowName) 接受 Controller, 内部从 Controller->GetPawn() 拿
+			//   - 复活链直接调 MutatePawnToMother (跳过 MutateCharacterToMother 的"业务层标记 bIsMother"层)
+			//   - bIsMother 已经在 PS 上设过 (死亡前), MutatePawnToMother 内 Step 5.5 切阵营 + Step 5.6 写血
+			//   - 业务层 Step 3.7 (PlayerState.bIsMother=true) 不会重复跑 (MutatePawnToMother 不调它)
+			//   - **不重复**: 复活链直接调 SpawnSubsystem 入口, 跳过业务层 (避免 MutateCharacterToMother 重新写 bIsMother 触发 RPC)
+			//
+			// 不破坏刀战模式:
+			//   - 刀战模式 PS->bIsMother=false → 不进本分支 → 永远走老路径
+			const FString& MotherCharRowName = RoomGM->MotherCharacterRowName;
+			if (bImmediateRespawn)
+			{
+				// 立即调 (本项目目前未用 bImmediateRespawn=true 的玩家路径)
+				MutatePawnToMother(DeadController, MotherCharRowName);
+			}
+			else
+			{
+				// 延迟 3s 后调 — 与人类复活路径一致, 给玩家"死亡 → 复活"反馈
+				// 零兜底: 延迟后 Controller 可能失效 (TWeakObjectPtr 校验)
+				TWeakObjectPtr<AController> WeakCtrl = DeadController;
+				TWeakObjectPtr<URoomSpawnSubsystem> WeakSys = this;
+				FTimerHandle LocalHandle;
+				GetWorld()->GetTimerManager().SetTimer(LocalHandle,
+					[WeakCtrl, WeakSys, MotherCharRowName]()
+					{
+						AController* C = WeakCtrl.Get();
+						if (!C)
+						{
+							return; // Controller 已销毁, 跳过 (合法竞态, 不报错)
+						}
+						if (URoomSpawnSubsystem* Sys = WeakSys.Get())
+						{
+							Sys->MutatePawnToMother(C, MotherCharRowName);
+						}
+					},
+					RespawnDelaySeconds, false);
+			}
+			return; // 母体复活分支已处理, 不走下面老路径
+		}
+
+		// ===== 人类复活路径 (刀战 + 生化模式都走这里) =====
 		// 玩家复活 (复用 HandlePlayerRequestSpawn)
 		FPlayerSpawnData* Cached = PlayerSpawnDataCache.Find(DeadController->GetUniqueID());
 		if (!Cached)
@@ -2226,6 +2371,10 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 
 bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FString& MotherCharRowName)
 {
+	// 母体复活时占用出生点记录
+	// 【v104 新增】复活时需要记录 Controller → SpawnPoint 映射，供死亡时释放
+	AController* OccupancyOwner = Controller;
+
 	// ===== 防御层 1: 入参校验 (零兜底) =====
 	if (!Controller)
 	{
@@ -2242,14 +2391,125 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		return false;
 	}
 
-	// ===== 防御层 2: 拿原 Pawn =====
-	ABaseCharacter* OldPawn = Cast<ABaseCharacter>(Controller->GetPawn());
-	if (!OldPawn)
+	// ===== 【v103 大厂架构 — 幂等检查】防止多次调用生成多个母体 =====
+	//
+	// 根因 (Session2.log 2026.07.27):
+	//   - 母体死亡后, Die() 派发 RequestRespawn → 设置 Timer 延迟复活
+	//   - 3s 后 Timer 到期 → MutatePawnToMother 被调用 → 生成新母体 Pawn + Possess
+	//   - 但 Controller 上可能还有其他 Timer (比如 UI 刷新、动画回调等) 也在触发 MutatePawnToMother
+	//   - 结果: 多次调用 → 多次 SpawnActor → 生成多个母体 Pawn → 玩家同时看到多个母体
+	//
+	// 大厂原则 — 幂等性:
+	//   - MutatePawnToMother 是"母体 Pawn 创建"的唯一入口
+	//   - 第一次调用: Controller 还没有母体 Pawn → 创建新母体
+	//   - 后续调用: Controller 已有母体 Pawn → 拒绝 (幂等 no-op)
+	//   - 不抛异常, 不报错, 只是 Log Display 并返回 true (表示"已经完成")
+	//
+	// 校验逻辑:
+	//   1. Controller->GetPawn() 非空 → Pawn 已存在
+	//   2. Pawn->bIsMother == true → 已是母体 → 幂等返回
+	//   3. Pawn->GetClass() 是母体类 → 已是母体 → 幂等返回
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[MotherMutation] MutatePawnToMother: Controller='%s' 当前 Pawn 为空, 拒绝变异."),
-			*Controller->GetName());
-		return false;
+		APawn* ExistingPawn = Controller->GetPawn();
+		if (ExistingPawn && !ExistingPawn->IsPendingKillPending())
+		{
+			ABaseCharacter* ExistingChar = Cast<ABaseCharacter>(ExistingPawn);
+			if (ExistingChar && ExistingChar->bIsMother)
+			{
+				UE_LOG(LogTemp, Display,
+					TEXT("[MotherMutation] MutatePawnToMother: 幂等跳过 — Controller='%s' 已有母体 Pawn='%s' (bIsMother=true). "
+					     "【v103 幂等修复】防止多次调用生成多个母体."),
+					*Controller->GetName(),
+					*ExistingPawn->GetName());
+				return true;
+			}
+		}
+	}
+
+	// ===== 防御层 2: 拿原 Pawn =====
+	//
+	// 【v104 大厂架构重构】复活时从 MotherSpawnPoints 随机选取
+	//
+	// 旧 (v90-v103):
+	//   - 复活链从 PS->LastDeathTransform 读取死亡位置
+	//   - 用户需求 (2026.07.27): 母体复活应该随机在 MotherPoint 复活
+	//
+	// 新 (v104) 单一真理源:
+	//   - 母体复活: 从 MotherSpawnPoints 随机选取一个点 (扫描时按 Faction_Mother TAG 分类)
+	//   - 母体变异 (bWasAliveBeforeMutation=true): 用旧 Pawn 当前位置
+	//
+	// 大厂原则 — 业务分离:
+	//   - 变异: 原位置 (被母体攻击时变母体)
+	//   - 复活: MotherPoint (母体专属复活点)
+	ABaseCharacter* OldPawn = Cast<ABaseCharacter>(Controller->GetPawn());
+	FVector OldPawnLocation = FVector::ZeroVector;
+	FRotator OldPawnRotation = FRotator::ZeroRotator;
+	bool bWasAliveBeforeMutation = (OldPawn != nullptr);
+
+	if (bWasAliveBeforeMutation)
+	{
+		// 变异核心: 用旧 Pawn 当前位置 (被母体攻击时变母体)
+		OldPawnLocation = OldPawn->GetActorLocation();
+		OldPawnRotation = OldPawn->GetActorRotation();
+	}
+	else
+	{
+		// 【v104 复活链路径】母体复活 — 从 MotherSpawnPoints 随机选取
+		//
+		// 大厂原则 — 单一真理源:
+		//   - 随机选取一个未占用的 MotherSpawnPoints
+		//   - 如果没有可用点 → Log Error + 拒绝复活 (零兜底)
+		//   - 不允许用其他阵营的出生点 (MotherSpawnPoints 独立管理)
+		ScanAndCachePlayerStarts(false); // 确保数组已扫描
+
+		if (MotherSpawnPoints.Num() == 0)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: 复活链 — MotherSpawnPoints 为空! "
+				     "【v104 零兜底】母体复活必须有至少一个 Faction_Mother 复活点. "
+				     "修复: 在地图中添加 PlayerStart, Player Start Tag = 'Faction_Mother'."),
+				*Controller->GetName());
+			return false;
+		}
+
+		// 过滤掉已被占用的点
+		TArray<APlayerStart*> AvailableMotherSpawns;
+		for (APlayerStart* SpawnPoint : MotherSpawnPoints)
+		{
+			if (SpawnPoint && !OccupiedSpawnPoints.Contains(SpawnPoint))
+			{
+				AvailableMotherSpawns.Add(SpawnPoint);
+			}
+		}
+
+		if (AvailableMotherSpawns.Num() == 0)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: 复活链 — 所有 %d 个母体复活点都被占用! "
+				     "【v104 零兜底】拒绝在占用点上复活. 排查 OccupiedSpawnPoints 泄漏."),
+				MotherSpawnPoints.Num());
+			return false;
+		}
+
+		// 随机选取
+		const int32 RandomIndex = FMath::RandRange(0, AvailableMotherSpawns.Num() - 1);
+		APlayerStart* SelectedSpawn = AvailableMotherSpawns[RandomIndex];
+		OldPawnLocation = SelectedSpawn->GetActorLocation();
+		OldPawnRotation = SelectedSpawn->GetActorRotation();
+
+		// 占用该点 (供后续释放)
+		OccupiedSpawnPoints.Add(SelectedSpawn);
+		if (OccupancyOwner)
+		{
+			OccupiedSpawnByController.Add(OccupancyOwner, SelectedSpawn);
+		}
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] MutatePawnToMother: 复活链路径 — 从 MotherSpawnPoints 随机选取. Controller=%s Selected='%s' Loc=%s Rot=%s."),
+			*Controller->GetName(),
+			*SelectedSpawn->GetName(),
+			*OldPawnLocation.ToString(),
+			*OldPawnRotation.ToString());
 	}
 
 	UWorld* World = GetWorld();
@@ -2310,38 +2570,62 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 	//   ❌ SetGenericTeamId(...)                                 — Pawn.FactionTag 复制走继承, 不需显式设
 	//   ❌ PlayerSpawnDataCache.Add(Controller, ...)             — 母体不算 "新 Spawn", 不动 SpawnData 账本
 	//
-	// 缓存原 Pawn 位置/旋转 (原地变 — 业务核心)
-	const FVector OldPawnLocation = OldPawn->GetActorLocation();
-	const FRotator OldPawnRotation = OldPawn->GetActorRotation();
+	// 【v99 P0 修复】OldPawnLocation/OldPawnRotation 已在防御层 2 (line 2388) 设置, 不重复声明
 
-	UE_LOG(LogTemp, Log,
-		TEXT("[MotherMutation] MutatePawnToMother: 原地变准备. OldPawn='%s' Location=%s Rotation=%s → NewClass=%s."),
-		*OldPawn->GetName(),
-		*OldPawnLocation.ToString(),
-		*OldPawnRotation.ToString(),
-		*MotherClass->GetName());
-
-	// ===== Step 3: 销毁旧 Pawn + Spawn 新母体 Pawn (原地) =====
-	// 大厂原则 — 销毁前 UnPossess, 避免 Engine 触发 PossessedBy(nullptr) 副作用
-	Controller->UnPossess();
-
-	// 【v93 大厂架构修复】显式销毁旧 Pawn 的武器 (母体不持武器 — 旧 v90 漏掉这步 = 武器残留 Bug)
-	// 走 UWeaponAttachmentComponent::UnequipCurrentWeapon (单一销毁入口, v93 落地)
-	//   - 旧 Pawn Destroy 会级联销毁武器, 但 UE 销毁延迟一帧
-	//   - 期间武器 Mesh 仍可见 (挂在旧 Pawn 视觉坐标) — 客户端立刻收到 Destruction Bunch, 立即消失
-	if (UWeaponAttachmentComponent* OldWeaponAttach = OldPawn->ResolveWeaponAttach())
+	// 【v99 P0.1 修复】OldPawn 在复活链可能为 nullptr, 单独处理 Log
+	if (bWasAliveBeforeMutation)
 	{
-		OldWeaponAttach->UnequipCurrentWeapon();
+		UE_LOG(LogTemp, Log,
+			TEXT("[MotherMutation] MutatePawnToMother: 原地变准备. OldPawn='%s' Location=%s Rotation=%s → NewClass=%s."),
+			*OldPawn->GetName(),
+			*OldPawnLocation.ToString(),
+			*OldPawnRotation.ToString(),
+			*MotherClass->GetName());
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[MotherMutation] MutatePawnToMother: 旧 Pawn '%s' 找不到 WeaponAttachmentComponent, 跳过武器销毁. "
-			     "【v93 警告】武器组件未挂载是配置错, 但不影响母体变异主流程."),
-			*OldPawn->GetName());
+		UE_LOG(LogTemp, Log,
+			TEXT("[MotherMutation] MutatePawnToMother: 复活链路径 — OldPawn 已销毁, NewClass=%s (新母体将生成在 ZeroVector)."),
+			*MotherClass->GetName());
 	}
 
-	OldPawn->Destroy();
+	// ===== Step 3: 销毁旧 Pawn + Spawn 新母体 Pawn (原地) =====
+	//
+	// 【v99 P0 修复】复活链路径下 OldPawn 已销毁,跳过销毁逻辑
+	//
+	// 大厂原则 — 复活链兼容:
+	//   - 老路径 (被母体攻击时变母体): OldPawn 存在,走完整销毁+Spawn
+	//   - 复活链 (母体死后复活): OldPawn 不存在,只走 Spawn + Possess
+	if (bWasAliveBeforeMutation)
+	{
+		// 大厂原则 — 销毁前 UnPossess, 避免 Engine 触发 PossessedBy(nullptr) 副作用
+		Controller->UnPossess();
+
+		// 【v93 大厂架构修复】显式销毁旧 Pawn 的武器 (母体不持武器 — 旧 v90 漏掉这步 = 武器残留 Bug)
+		// 走 UWeaponAttachmentComponent::UnequipCurrentWeapon (单一销毁入口, v93 落地)
+		//   - 旧 Pawn Destroy 会级联销毁武器, 但 UE 销毁延迟一帧
+		//   - 期间武器 Mesh 仍可见 (挂在旧 Pawn 视觉坐标) — 客户端立刻收到 Destruction Bunch, 立即消失
+		if (UWeaponAttachmentComponent* OldWeaponAttach = OldPawn->ResolveWeaponAttach())
+		{
+			OldWeaponAttach->UnequipCurrentWeapon();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[MotherMutation] MutatePawnToMother: 旧 Pawn '%s' 找不到 WeaponAttachmentComponent, 跳过武器销毁. "
+				     "【v93 警告】武器组件未挂载是配置错, 但不影响母体变异主流程."),
+				*OldPawn->GetName());
+		}
+
+		OldPawn->Destroy();
+	}
+	else
+	{
+		// 【v99 复活链路径】OldPawn 已销毁,Controller 已 UnPossess (死亡链路自动),不需要重复 UnPossess
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] MutatePawnToMother: 复活链路径 - 跳过旧 Pawn 销毁 (OldPawn 已 SetLifeSpan 销毁)."),
+			*Controller->GetName());
+	}
 
 	// SpawnCollisionHandlingOverride = AlwaysSpawn:
 	//   旧 Pawn 销毁是延迟一帧, 原地可能短暂重叠 — 必须 AlwaysSpawn 跳过碰撞检查
@@ -2353,25 +2637,46 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		MotherClass, OldPawnLocation, OldPawnRotation, SpawnParams);
 	if (!NewMotherPawn)
 	{
+		// 【v99 P0.1 修复】临时变量避免 UE_LOG 格式串模板推断失败 (UE 5.6 严格模式拒绝 *FString.ToString())
+		const FString MotherClassName = MotherClass->GetName();
+		const FString OldPawnLocationStr = OldPawnLocation.ToString();
 		UE_LOG(LogTemp, Error,
 			TEXT("[MotherMutation] MutatePawnToMother: SpawnActor<%s> 失败 (Controller=%s, Loc=%s). "
 			     "【v90 零兜底】旧 Pawn 已 Destroy, 玩家暂时无 Pawn — 拒绝 Spawn 默认重来."),
-			*MotherClass->GetName(),
+			*MotherClassName,
 			*Controller->GetName(),
-			*OldPawnLocation.ToString());
+			*OldPawnLocationStr);
 		return false;
 	}
 
-	// ===== Step 4: 【v90 业务状态 — 不做额外业务操作】=====
-	// 新 Pawn 状态:
-	//   - Location/Rotation = 旧 Pawn 原位 (原地变核心)
-	//   - FactionTag = PossessedBy → SyncFactionTagFromController → 从 PlayerState.CurrentFactionTag 同步
-	//                          (生化模式玩家被变异前是 Defense 阵营, PS.CurrentFactionTag=Defense,
-	//                           所以新母体 Pawn.FactionTag 也变成 Defense — 这是 bug)
-	//                          → 必须在 Step 5.5 强制切到 Offense (大厂原则 — 母体专属阵营)
-	//   - bIsMother = false (默认值, 业务层在 MutateCharacterToMother 末尾显式设 + Multicast RPC)
-	//   - bIsHuman = true (默认值, 业务层在 MutateCharacterToMother 末尾显式设 false)
-	//   - 无武器 (母体 Pawn BP 应该本身就没武器, 这是 BP 设计问题)
+	// ===== Step 4.5: 【v99.2 大厂架构 — 零等待视觉触发】立即广播 Multicast_PlayMutationFX =====
+	//
+	// 根因 (用户 2026.07.26 反馈):
+	//   - 旧版 v99.1 RPC 放在 Step 7 (Step 5.5~6 全部写完之后) → 客户端等 4~5 帧才看到粒子
+	//   - 用户期望: "角色一生成立马执行" = Pawn Replication 与粒子触发同一帧
+	//
+	// v99.2 大厂重构 — 提前到 SpawnActor 之后立即:
+	//   - 客户端下一帧收到 RPC 时, Pawn 实体已同步到本地 (Pawn Replication 与 Multicast RPC 同一帧入队)
+	//   - 粒子只校验 Owner / Mesh / 资产 (不依赖 bIsMother / FactionTag / 血量等 Replicated 字段)
+	//   - 不会与 Step 5.5~6 写入冲突 — 粒子是纯视觉附加, 状态字段独立
+	//   - 跳过运行期 GameState 模式校验 (v99.2 组件层已删) → 零等待
+	//
+	// 不破坏刀战模式 (大厂原则 — 零耦合):
+	//   - 本函数只被生物化模式调用 (HandlePlayerRequestSpawn / SpawnAIInternal 走老路, 不进这里)
+	//   - 母体变异 / 母体复活都走这一处 → 视觉与状态写入由 MutatePawnToMother 统一编排
+	//
+	// 不破坏 bIsMother / FactionTag 等真理源 (大厂原则 — 单一真理源):
+	//   - Step 5.5 (FactionTag) / Step 5.7 (bIsMother) / Step 6 (PS->bIsMother) 仍在 Step 4.5 之后写
+	//   - 粒子只是视觉, 与这些 Replicated 字段可独立并行
+	//   - BP 蓝图订阅 OnMotherStatusChanged 仍由 Multicast_PlayMutationFX 触发 (Step 5.7 之后 OnRep 也会触发, 幂等)
+	{
+		const FString TargetName = NewMotherPawn->GetName();
+		NewMotherPawn->Multicast_PlayMutationFX(TargetName);
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] MutatePawnToMother: 母体 RPC 已立即广播 (v99.2 零等待). Target=%s (SpawnActor 之后立即发, 客户端下一帧即收到)."),
+			*TargetName);
+	}
 
 	// ===== Step 5: Possess + 验证 =====
 	Controller->Possess(NewMotherPawn);
@@ -2503,19 +2808,124 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		}
 	}
 
+	// ===== Step 5.7: 【v99.1 大厂架构 — 母体 Pawn 业务字段集中写入】Pawn.bIsMother + bIsHuman =====
+	//
+	// 历史 (v90-v99): 这两个字段写在 URoomMotherMutationSubsystem::MutateCharacterToMother Step 3,
+	//                  与 MutatePawnToMother 各管一段 → 复活链直接调本函数会漏写 → bIsMother 永远 false → 错
+	//
+	// 新 (v99.1) 单一真理源 — 母体 Pawn 创建入口 = 本函数:
+	//   - bIsMother / bIsHuman / PS->bIsMother / Multicast_PlayMutationFX 全部由本函数统一负责
+	//   - 复活链 (RequestRespawn 直接调本函数) 与首次变异 (业务层调本函数) 走同一段写入 → 永不漏
+	//   - 业务层 MutateCharacterToMother 中重复的 Step 3 + Step 3.7 全部删除 (后续 todo 处理)
+	//
+	// 互斥语义:
+	//   - bIsMother = true, bIsHuman = false(注释约定,OnRep_bIsMother 校验)
+	NewMotherPawn->bIsMother = true;
+	NewMotherPawn->bIsHuman = false;
+
+	// 【v99 P0.1 修复】临时变量避免 UE_LOG 格式串模板推断失败 (UE 5.6 严格模式)
+	const FString ControllerName = Controller->GetName();
+	const FString NewPawnName = NewMotherPawn->GetName();
+	const FString MotherClassName = MotherClass->GetName();
+	const FString OldPawnLocationStr = OldPawnLocation.ToString();
 	UE_LOG(LogTemp, Display,
 		TEXT("[MotherMutation] MutatePawnToMother: 母体原地变异成功. Controller=%s → NewPawn=%s (Class=%s, Location=%s, RowName=%s). "
 		     "【v90 业务核心】母体在原地, 未回出生点. 母体账本 + 视觉特效 + 业务标记由 MotherMutationSubsystem 接管."),
-		*Controller->GetName(),
-		*NewMotherPawn->GetName(),
-		*MotherClass->GetName(),
-		*OldPawnLocation.ToString(),
+		*ControllerName,
+		*NewPawnName,
+		*MotherClassName,
+		*OldPawnLocationStr,
 		*MotherCharRowName);
 
-	// 返回: 业务层 (RoomMotherMutationSubsystem) 后续会:
-	//   1. 拿 NewMotherPawn (Controller->GetPawn())
-	//   2. 业务层标记 bIsMother/bIsHuman (双字段同步)
-	//   3. 账本 MotherCharacters.AddUnique
-	//   4. Multicast_PlayMutationFX (v31.6 纯数据 RPC)
+	// ===== Step 6: 【v99 P0 大厂架构 — 复活链真理源】写 PlayerState.bIsMother = true =====
+	//
+	// 业务核心 (用户 2026.07.26 明确):
+	//   - 生化模式: 母体死后复活, 必须原地复活成母体
+	//
+	// 根因 (Session1.log line 1161-1218):
+	//   - 旧版复活链直接调 HandlePlayerRequestSpawn, 用 PlayerSpawnDataCache.CharID (人类 CharID)
+	//   - 即使死前是 BP_MuTi, 复活时一律走人类路径 → 复活成 BP_SWAT_C 人类 → 错
+	//
+	// 大厂原则 — 单一真理源 (SSOT) — MutatePawnToMother 统一写 PS->bIsMother:
+	//   - 老路径 (MutateCharacterToMother → MutatePawnToMother): 业务层 Step 3.7 已删除,这里**唯一**写点
+	//   - 复活链 (RequestRespawn → 直接 MutatePawnToMother): **这里**写,保证复活链不漏
+	//   - **统一真理源**: MutatePawnToMother 是"母体 Pawn 创建"的最终入口 → 它写 PS->bIsMother 才是真理源
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式从不调 MutatePawnToMother → PS->bIsMother 永远是 false → RequestRespawn 走老路径
+	if (APlayerController* PC = Cast<APlayerController>(Controller))
+	{
+		if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+		{
+			PS->bIsMother = true; // 服务器本地写, Replicated 自动同步客户端
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation] MutatePawnToMother: 已设 PlayerState.bIsMother=true (复活链真理源 — 单一入口). "
+				     "下次 RequestRespawn 读到 PS->bIsMother=true → 走母体原地复活路径. "
+				     "【v99 P0】兼容复活链 (直接调 MutatePawnToMother 跳过业务层)."));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: PlayerController='%s' 没有 ARoomPlayerState — 复活链真理源缺失. "
+				     "【v99 零兜底】母体死后复活会错误地变成人类. "
+				     "修复: 检查 ARoomGameMode::AddPlayerToRoom 是否正确 Spawn 了 ARoomPlayerState."),
+				*PC->GetName());
+		}
+	}
+
+	// ===== Step 7: 【v99.2 已删除 — RPC 已在 Step 4.5 立即广播】=====
+	//
+	// 历史 (v99.1):
+	//   - 旧逻辑: Multicast_PlayMutationFX 在 Step 7 触发
+	//   - 客户端需要等 Step 5.5 (FactionTag=Offense) / Step 5.6 (血量) / Step 5.7 (bIsMother) / Step 6 (PS->bIsMother)
+	//   - 客户端每帧等一组 Replicated 字段 → 4~5 帧后才看到粒子 = "延时"
+	//
+	// v99.2 大厂重构:
+	//   - RPC 提前到 Step 4.5 (SpawnActor 之后立即)
+	//   - 粒子只校验 Owner / Mesh / 资产, 不依赖后续 Replicated 字段
+	//   - 状态写入 (Step 5.5 ~ 6) 仍走原顺序, 互不耦合
+	//   - 整个项目 Multicast_PlayMutationFX 唯一触发点 = MutatePawnToMother Step 4.5
+
+	// ===== Step 7: 【v105 大厂架构新增】刷新母体专属头像 UI =====
+	//
+	// 业务规则 (用户 2026.07.27 明确):
+	//   - 变成母体后, 头像必须变成母体图片 (DT_CharacterInfo 的 MuTi 行 AvatarIcon)
+	//   - 武器图标必须显示 MT001 (DT_WeaponInfo 的 MT001 行 WeaponIcon)
+	//   - 武器弹药 UI 必须隐藏 (母体无武器)
+	//
+	// 大厂原则 - 集中调度:
+	//   - 母体 UI 刷新入口 = MutatePawnToMother 末尾 (与粒子特效 Multicast_PlayMutationFX 同位置)
+	//   - CharacterIconComponent::RefreshCharacterIcon 会根据 Owner->bIsMother 自动:
+	//     1. 使用母体头像 ID ("MuTi") 查表显示母体头像
+	//     2. 调用 RefreshWeaponIconOnHUD() 显示 MT001 武器图标
+	//     3. 【v105.2】弹药 RPC BroadcastWeaponAmmoInfo (母体路径强制 1/1) - 弹药 UI 显示 "1/1"
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式不调 MutatePawnToMother → 不走这段代码 → 头像/武器图标逻辑零影响
+	//   - bIsMother 永远是 false → RefreshCharacterIcon 走正常人类路径
+	if (ABaseCharacter* MotherChar = Cast<ABaseCharacter>(NewMotherPawn))
+	{
+		if (UCharacterIconComponent* IconComp = MotherChar->FindComponentByClass<UCharacterIconComponent>())
+		{
+			// 【v105 诊断日志】确认 bIsMother 状态
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation] MutatePawnToMother: 已调用 RefreshCharacterIcon 刷新母体 UI. Pawn=%s, bIsMother=%d, bIsHuman=%d"),
+				*NewMotherPawn->GetName(), MotherChar->bIsMother ? 1 : 0, MotherChar->bIsHuman ? 1 : 0);
+			IconComp->RefreshCharacterIcon();
+
+			// 【v105.2 大厂架构】母体弹药广播 (强制 1/1)
+			// 业务规则 (用户 2026.07.27 反馈): 母体仍显示弹药 UI, 弹药数据固定 1/1
+			// CharacterIconComponent::BroadcastWeaponAmmoInfo 已识别 bIsMother 路径 (强制 1/1)
+			IconComp->BroadcastWeaponAmmoInfo(MotherChar);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] MutatePawnToMother: 找不到 CharacterIconComponent (Pawn=%s). "
+					 "【v105 零兜底】拒绝刷新母体 UI, 头像/武器图标不会更新."),
+				*NewMotherPawn->GetName());
+		}
+	}
+
 	return true;
 }
