@@ -372,9 +372,16 @@ void ARoomGameMode::InjectSubsystemConfigs()
 		LifeSys->SetTotalRounds(TotalRounds);
 		LifeSys->SetZombieMatchDuration(ZombieMatchDurationSeconds);
 
+		// 【v108 大厂架构新增】注入母体变异数量 + 目标选择策略
+		// 数据流: GM → Subsystem (InitGame 一次性, 改配置需重启游戏 — 用户决策)
+		// 读取方: URoomMotherMutationSubsystem::HandleCountdownExpired (SetTimer 回调, 此刻需要访问)
+		LifeSys->SetMotherMutationCount(MotherMutationCount);
+		LifeSys->SetMotherSelectionPolicy(MotherSelectionPolicy);
+
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomGameMode] 注入 LifecycleSubsystem: MotherMutationDuration=%.2fs, TotalRounds=%d, ZombieMatchDuration=%ds"),
-			MotherMutationDurationSeconds, TotalRounds, ZombieMatchDurationSeconds);
+			TEXT("[RoomGameMode] 注入 LifecycleSubsystem: MotherMutationDuration=%.2fs, TotalRounds=%d, ZombieMatchDuration=%ds, MotherMutationCount=%d, MotherSelectionPolicy=%d"),
+			MotherMutationDurationSeconds, TotalRounds, ZombieMatchDurationSeconds,
+			MotherMutationCount, static_cast<int32>(MotherSelectionPolicy));
 	}
 	else
 	{

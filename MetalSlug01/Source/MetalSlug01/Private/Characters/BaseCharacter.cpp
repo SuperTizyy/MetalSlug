@@ -53,6 +53,10 @@
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomPlayerController.h"
+// 【v110 P0 修复】引入 Controller 完整定义以做 IsA<APlayerController>() 类型判定
+//   旧版用 IsLocallyControlled() 误判 ListenServer 上 AI Pawn 为本地玩家
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Controller.h"
 #include "Kismet/GameplayStatics.h"
 #include "Sound/SoundBase.h"           // v76 — 武器切换音效 (USoundBase 完整定义)
 #include "Components/AudioComponent.h"  // v100.1 — 回血音组件 (UAudioComponent 完整定义)
@@ -195,6 +199,59 @@ ABaseCharacter::ABaseCharacter()
 	GetMesh()->SetRelativeLocation(FVector(0.f, 0.f, -90.f)); // 往下挪一点，对齐胶囊体底盘
 	GetMesh()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f)); // 把脸转到正前方
 
+	// ==========================================
+	// 【v110 P0 终极修复】Collision — 强制所有 ABaseCharacter 派生 BP 都正确响应 ECC_Visibility
+	// ==========================================
+	//
+	// 【真根因 — v99.3 修复不完整,v110 完整修复】
+	//   v99.3: SetCollisionResponseToChannel(ECC_Visibility, ECR_Block) ✅
+	//   v99.3 漏掉 2 个关键点 (本次 v110 补全):
+	//     (a) 没设 SetCollisionEnabled(QueryAndPhysics)
+	//         → UE 5.6 ACharacter Mesh 默认 QueryOnly (够),但 BP_MuTi 可能设成 NoCollision → 射线穿过
+	//     (b) 没设 SetCollisionResponseToAllChannels(ECR_Block)
+	//         → 默认 Channel 设置可能被 BP 单 Channel 覆盖 → 部分 Channel Ignore → 射线穿过
+	//
+	// 【注】USkeletalMeshComponent 没有 bUseComplexAsSimpleCollision 字段
+	//   - 该字段属于 UStaticMeshComponent (静态网格才有此概念)
+	//   - USkeletalMesh 默认就是 complex collision — 只要 CollisionEnabled != NoCollision
+	//     + bTraceComplex=true → Mesh 三角面自动参与 trace
+	//
+	// 【用户反馈 (Session1.log 2026.07.30)】
+	//   - 玩家打母体正常 (但这其实是用户的另一个测试场景,Session1.log 没体现)
+	//   - AI 人类打玩家母体,射线穿过母体 → 命中身后墙 (LineTraceMulti bHit=true, 但 bHasPawnInTrace=false)
+	//   - 用户明确: "AI 射线角度正确穿过了母体" — 不是方向问题,是 collision 问题
+	//
+	// 【大厂原则 — 真理源在 C++ 构造函数,不是 BP】
+	//   - BP archetype 可能覆盖 C++ 默认 (v36/v38 反复踩坑)
+	//   - 修复方案: 在构造函数**强制**设 CollisionEnabled + AllChannels Block
+	//   - 所有 ABaseCharacter 派生 BP (BP_MuTi / BP_SWAT_C / BP_GruntAI) 自动受益
+	//   - BP 蓝图即使把 Collision 设错,C++ 构造函数也强制覆盖回正确值
+	//
+	// 【为什么不是只设单 Channel Response】
+	//   - 只设 ECC_Visibility Block → AllChannels 默认还是 1 Channel 1 Channel 设的状态
+	//   - BP 子类可能在 BP 蓝图里单独设某个 Channel = Ignore → 射线绕过
+	//   - 设 AllChannels=Block 后再单独 Ignore Camera → 简洁无歧义
+	// ==========================================
+
+	// (1) Mesh Collision — 全身三角面参与 trace (USkeletalMesh 默认 complex,无需 bUseComplexAsSimpleCollision)
+	GetMesh()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);  // 【v110 P0】强制 Query 模式 (物理 Body + Mesh 三角面)
+	GetMesh()->SetCollisionResponseToAllChannels(ECR_Block);             // 【v110 P0】所有通道默认 Block (再单独开放 Ignore)
+	GetMesh()->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);  // 显式重申 (大厂零冗余 — 真理源明确)
+	GetMesh()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);    // 相机通道 Ignore (避免反射/穿透)
+	// 注: USkeletalMeshComponent 没有 bUseComplexAsSimpleCollision 字段 (那是 UStaticMeshComponent 的)
+	//     SkeletalMesh 默认就是 complex collision — CollisionEnabled=QueryAndPhysics 已足够 bTraceComplex=true 命中三角面
+
+	// (2) Capsule Collision — 双保险 (Capsule 命中作为 fallback,即使 Mesh 三角面问题也不会穿过)
+	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);  // 强制 Query 模式
+	GetCapsuleComponent()->SetCollisionResponseToAllChannels(ECR_Block);             // 所有通道默认 Block
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block); // 显式重申
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);    // 相机通道 Ignore
+
+	// 【v110 修复后预期效果】
+	//   - 玩家射线 (bTraceComplex=true) → 命中母体 Mesh 三角面 (全身任何部位)
+	//   - AI 射线 (bTraceComplex=true)    → 命中母体 Mesh 三角面 (全身任何部位)
+	//   - 玩家/AI 走完全相同的 collision 路径 (大厂镜像 — 零差异)
+
 	// 5. 【2026-06-15 重构】初始化战斗属性
 	// 注: MaxHealth/CurrentHealth/bIsDead 已下沉到 HealthComponent
 	//     MaxEnergy/CurrentEnergy 已下沉到 EnergyComponent
@@ -243,6 +300,39 @@ ABaseCharacter::ABaseCharacter()
 void ABaseCharacter::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// 【v109 大厂架构】删除 v108 BeginPlay 的字符串匹配兜底
+	//
+	// 旧 (v108) 反模式 — 大厂原则被违反:
+	//   if (GetClass()->GetName().Contains(TEXT("MuTi")) || GetClass()->GetName().Contains(TEXT("Mother")))
+	//   {
+	//       bIsMother = true;
+	//       bIsHuman = false;
+	//   }
+	//
+	// 为什么是反模式 (大厂原则):
+	//   1. 用类名模糊匹配代替类型检查 (应该用 IsA<AZombieMotherBase> 之类)
+	//   2. 类名改了就不工作 (脆弱, 不可维护)
+	//   3. 掩盖根因: 关卡预放的 BP_MuTi 没走 MutatePawnToMother → 业务层跳过 → 状态字段缺失
+	//   4. 与"单一真理源"原则冲突: bIsMother 真理源 = 业务层 MutatePawnToMother Step 5.7 写入,
+	//      BeginPlay 不应该有自己的真理源写入
+	//   5. **真正的兜底行为**: 如果 MutatePawnToMother 写漏了, BeginPlay 兜底 → 配置错误永远看不见
+	//
+	// 新 (v109) 零兜底 — 单一真理源:
+	//   - 母体 Pawn 创建真理源 = URoomSpawnSubsystem::MutatePawnToMother Step 5.7 写 bIsMother
+	//   - 关卡预放 BP_MuTi Pawn: 必须在 BP 蓝图细节面板**手动配** bIsMother=true (类型安全, 编译期可查)
+	//   - 业务层调用 (MutateCharacterToMother 路径): MutatePawnToMother 自动写入 bIsMother=true
+	//   - 复活链 (RequestRespawn → MutatePawnToMother): 同上, 自动写入
+	//   - BeginPlay 不再干预 bIsMother (大厂原则 — 职责单一)
+	//
+	// 用户 UE 编辑器必做 (修复后, 关卡预放 BP_MuTi 需要):
+	//   1. 打开 Content/Blueprints/Characters/BP_MuTi.uasset
+	//   2. Class Defaults → Combat|Mother → 勾选 bIsMother (或者直接设 bIsMother=true)
+	//   3. Compile + Save
+	//   — 这是类型安全的配置, 不会因类改名失效, 不会掩盖业务层错误
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式不调 MutatePawnToMother, 也没有 BP_MuTi, 这段代码对刀战模式 0 影响
 
 	// 【2026-06-15 重构】: 订阅 HealthComponent 事件
 	// 原因: 血量数据已下沉到 Component, BaseCharacter 通过事件转发来驱动 HUD 刷新
@@ -2187,9 +2277,13 @@ ARoomPlayerState* ABaseCharacter::GetRoomPlayerState() const
 /**
  * ABaseCharacter::GetAimRayFromCrosshairOrEyes (非 const 版本)
  *
- * 大厂原则 — 路由策略:
- *   - 本地玩家 → HUD 拿 Crosshair 世界射线 (玩家射线 = 玩家准星)
- *   - AI / 远端 → 攻击者眼睛视图方向 (AI 没 HUD)
+ * 大厂原则 — 路由策略 (v110 类型判定标准):
+ *   - 真实玩家 (Controller = APlayerController) → HUD 拿 Crosshair 世界射线
+ *   - AI (Controller = AAIController) → 攻击者 BaseAimRotation + 武器 Muzzle Socket
+ *
+ * 历史修正:
+ *   - v60.11-v109: 用 IsLocallyControlled() 判定玩家/AI → ListenServer 上 AI Pawn 误判
+ *   - v110: 改用 Controller 类型 (Cast<APlayerController>) → ListenServer / Dedicated Server / Client 都正确
  *
  * 关键设计 (v60.11 修订 — 编译错误 C2662 修复):
  *   - 本方法**非 const** — 玩家路径需要 TryResolveHUDWidget, 该方法会缓存 GameHUDWidget 字段
@@ -2208,9 +2302,36 @@ bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector
 	OutRayDirection = FVector::ForwardVector;
 
 	// ===========================================
-	// 路径 A: 本地玩家 → HUD 拿 Crosshair 世界射线
+	// 路径 A: 真实玩家 (Controller = APlayerController) → HUD 拿 Crosshair 世界射线
 	// ===========================================
-	if (IsLocallyControlled())
+	//
+	// 【v110 P0 关键修复 — AI/玩家判定标准】
+	//   旧 (v60.11-v109) 反模式: 用 IsLocallyControlled() 判定
+	//     - ListenServer 上 AI Pawn 同样 IsLocallyControlled=true (服务器是 AI 的本地控制者)
+	//     - 导致 AI Pawn 在 ListenServer 上走到 HUD 路径 → "HUD ??.... Pawn=BP_SWAT_AI_C_0"
+	//     - HUD 永远拿不到 (AI 没 HUD) → 返回 false → AI 永远开不了枪
+	//
+	//   新 (v110) 大厂标准: 用 Controller 类型判定
+	//     - 玩家 Pawn Controller = APlayerController 派生 (BP_RoomPlayerController 等)
+	//     - AI Pawn Controller = AAIController 派生 (BP_MeleeAIController / BP_ZombieAIController)
+	//     - 这是 UE 引擎硬约束 — Controller 类型 = Pawn 类型,不会变
+	//     - 与 IsLocallyControlled 完全正交 (Dedicated Server / ListenServer / Client 都能正确分流)
+	//
+	//   大厂原则 — 类型判定 > 网络身份判定:
+	//     - "我是谁" = Controller 类型 (静态, 永不改变)
+	//     - "我在哪跑" = IsLocallyControlled (动态, 与网络拓扑有关)
+	//     - "我要拿什么射线" = 我是谁 (玩家要 HUD, AI 要 BaseAim)
+	//
+	// 修复前日志 (用户 Session1.log):
+	//   [BaseCharacter::GetAimRayFromCrosshairOrEyes] 本地玩家 HUD 未就绪.
+	//   Pawn=BP_SWAT_AI_C_0. 【v60.11 零兜底】拒绝射线 — HUD 没初始化, Crosshair 不可用.
+	//   ↑ 这是 AI Pawn 在 ListenServer 上误判成"本地玩家" 走到 HUD 路径
+	//
+	// ===========================================
+	const AController* MyController = GetController();
+	const bool bIsRealPlayer = MyController && MyController->IsA<APlayerController>();
+
+	if (bIsRealPlayer)
 	{
 		// (a) 必须有 HUD (玩家专属), 没 HUD 是 BP/初始化错
 		if (!TryResolveHUDWidget(false))
@@ -2250,6 +2371,17 @@ bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector
 	// 路径 B: AI → 攻击者准星方向 (BaseAimRotation = BT 控制的旋转)
 	// 【v60.12】GetBaseAimRotation
 	// 玩家路径已移到 RangedLineStrategy::PerformSingleShot (v60.13)
+	//
+	// 【v109 镜像方案大厂架构 - AI 路径补全 Origin】
+	//   历史 (v108): Origin 是 ZeroVector,Strategy 内部有 AI 分支兜底
+	//   大厂原则: 镜像玩家 — Origin 也要算准确(玩家准星 Origin = Crosshair World Origin)
+	//   AI 路径 Origin = Weapon Mesh 上的 Muzzle Socket 世界位置(枪口真实位置)
+	//   - 与 CS:GO/Apex/PUBG/Valorant 一致:子弹从枪口射出
+	//   - 这样 Strategy 完全不必区分 AI/玩家,只信入参射线即可
+	//
+	// 大厂原则 — 零兜底:
+	//   - Owner 必须有 Weapon → 否则 BT 不应该调到这里(前面已校验)
+	//   - Mesh 必须有 Muzzle Socket → 否则 BP 配置错,显式化
 	// ===========================================
 	const FRotator BaseAim = GetBaseAimRotation();
 	if (BaseAim.Vector().IsNearlyZero())
@@ -2259,6 +2391,61 @@ bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector
 			     "Pawn=%s. 【v60.12 零兜底】拒绝射线 — 攻击者没方向, 不能盲射."),
 			*GetName());
 		return false;
+	}
+
+	// [v109 大厂架构] AI 路径 Origin = Weapon Muzzle Socket (镜生态要求)
+	//   - 与玩家路径 Origin (Crosshair World Origin) 严格对齐
+	//   - Strategy 不再需要自己算 Muzzle Socket(零冗余)
+	if (const ABaseWeapon* CurrentWeapon = GetCurrentWeapon())
+	{
+		if (UMeshComponent* WeaponMesh = CurrentWeapon->GetMeshComponent())
+		{
+			// 约定俗成 Socket 名 fallback (与 v108 Strategy 一致): Muzzle / Socket_Muzzle / MuzzleSocket
+			FName MuzzleSocketToUse = NAME_None;
+			const TArray<FName> CandidateSocketNames = { TEXT("Muzzle"), TEXT("Socket_Muzzle"), TEXT("MuzzleSocket") };
+			for (const FName& Candidate : CandidateSocketNames)
+			{
+				if (WeaponMesh->DoesSocketExist(Candidate))
+				{
+					MuzzleSocketToUse = Candidate;
+					break;
+				}
+			}
+
+			if (!MuzzleSocketToUse.IsNone())
+			{
+				OutRayOrigin = WeaponMesh->GetSocketLocation(MuzzleSocketToUse);
+			}
+			else
+			{
+				// 配错 Log: AI 没 Muzzle Socket(纯警告,不让 GetAimRay 整体失败)
+				UE_LOG(LogTemp, Warning,
+					TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] 【v109】Pawn=%s 武器 '%s' Mesh 缺 MuzzleSocket (尝试过: Muzzle / Socket_Muzzle / MuzzleSocket). "
+					     "AI 射线起点回退到 Actor 位置 (精度略差, 不影响命中判定). "
+					     "【修复】打开 BP_Weapon_*** Mesh → Add Socket → 名称必须用 'Muzzle'."),
+					*GetName(),
+					*CurrentWeapon->GetName());
+
+				OutRayOrigin = GetActorLocation();
+			}
+		}
+		else
+		{
+			// 没 Mesh Component → 用 Actor 位置兜底 + Warning
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] 【v109】Pawn=%s 武器 '%s' 缺 MeshComponent, Origin 回退到 Actor 位置."),
+				*GetName(),
+				*CurrentWeapon->GetName());
+			OutRayOrigin = GetActorLocation();
+		}
+	}
+	else
+	{
+		// 没武器 → BT 应该已校验过(否则不在这里走)
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::GetAimRayFromCrosshairOrEyes] 【v109】Pawn=%s 没 CurrentWeapon, Origin 回退到 Actor 位置."),
+			*GetName());
+		OutRayOrigin = GetActorLocation();
 	}
 
 	OutRayDirection = BaseAim.Vector();
@@ -3539,19 +3726,51 @@ void ABaseCharacter::OnReloadPressed(const FInputActionValue& /*Value*/)
 void ABaseCharacter::OnRep_bIsMother()
 {
 	UE_LOG(LogTemp, Display,
-		TEXT("[BaseCharacter] OnRep_bIsMother: '%s' bIsMother=%d (HasAuthority=%d)"),
-		*GetName(), bIsMother ? 1 : 0, HasAuthority() ? 1 : 0);
+		TEXT("[BaseCharacter] OnRep_bIsMother: '%s' bIsMother=%d bIsHuman=%d (HasAuthority=%d)"),
+		*GetName(), bIsMother ? 1 : 0, bIsHuman ? 1 : 0, HasAuthority() ? 1 : 0);
 
-	// 大厂原则 — 互斥语义校验 (服务器 MutateCharacterToMother 已同步设置两个字段)
-	// 客户端这里仅做可观测性日志, 不修正 (因为 bIsHuman 已是 Replicated 镜像)
-	if (bIsMother && bIsHuman)
+	// ============================================================
+	// 【v93.2 大厂架构 — 互斥校验延迟到下一帧】防 Replicated 时序误报
+	// ============================================================
+	//
+	// 根因 (用户 2026.07.31 日志 line 113):
+	//   - 服务器 MutatePawnToMother Step 5.7 写入顺序: bIsHuman=false → bIsMother=true
+	//   - 同一帧同一 Bunch 推送到客户端, 但 UE Actor Channel 内属性推送按 DOREPLIFETIME 注册顺序,
+	//     与代码写入顺序**无关**! OnRep_bIsMother 可能比 bIsHuman 的 Replicated 值**先**到达客户端
+	//   - 旧版 OnRep 立即校验 → bIsHuman 仍是默认值 true → 误报"互斥语义违反"
+	//
+	// 修复 (零兜底, 不消除真错):
+	//   - 推迟到下一帧 (SetTimerForNextTick) 让本帧所有 Replicated 属性都到达后再校验
+	//   - 真错仍然会被捕获 (跨帧还存在 = 状态确实没同步)
+	//   - 误报消失 (同一帧到达的属性差异自然消除)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式 bIsMother 永远 false → OnRep 内部 if 拒判 → 0 性能开销
+	// ============================================================
+	if (bIsMother)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] OnRep_bIsMother: bIsMother=true 但 bIsHuman=true, 互斥语义违反. "
-			     "【根因】服务器 MutateCharacterToMother 没同步写 bIsHuman, 或网络同步丢失. 检查 URoomMotherMutationSubsystem::MutateCharacterToMother."));
+		if (UWorld* World = GetWorld())
+		{
+			TWeakObjectPtr<ABaseCharacter> WeakSelf = this;
+			World->GetTimerManager().SetTimerForNextTick([WeakSelf]()
+			{
+				if (ABaseCharacter* Self = WeakSelf.Get())
+				{
+					if (Self->bIsMother && Self->bIsHuman)
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[BaseCharacter] OnRep_bIsMother(延迟校验): '%s' bIsMother=true 但 bIsHuman=true, 互斥语义真违反. "
+							     "【根因】服务器 MutatePawnToMother Step 5.7 两个字段都写了, 但客户端 Actor Channel 推送顺序与代码写入顺序无关. "
+							     "bIsHuman Replicated 值在 bIsMother OnRep 触发时还没到达 → 跨帧持续存在 = 真错. "
+							     "修复: 检查 BaseCharacter::GetLifetimeReplicatedProps 中 bIsMother 和 bIsHuman 的注册顺序."),
+							*Self->GetName());
+					}
+				}
+			});
+		}
 	}
 
-	// 广播委托 (HUD / BP 蓝图订阅播变身特效)
+	// 广播委托 (HUD / BP 蓝图订阅播变身特效) — 立即广播, 不延迟 (业务层 UX 及时性优先)
 	if (bIsMother)
 	{
 		OnMotherStatusChanged.Broadcast(GetName());

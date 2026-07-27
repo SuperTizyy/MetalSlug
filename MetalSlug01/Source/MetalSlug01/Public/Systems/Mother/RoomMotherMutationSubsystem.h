@@ -7,6 +7,8 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "UObject/ObjectPtr.h"
 #include "GameplayTagContainer.h"
+// v108 — EMotherSelectionPolicy (母体变异目标选择策略)
+#include "Systems/AI/AIBehaviorTypes.h"
 #include "RoomMotherMutationSubsystem.generated.h"
 
 class ABaseCharacter;
@@ -129,6 +131,66 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Mother")
 	int32 GetMotherMutationCount() const;
 
+	/**
+	 * 【v107 2026.07.28 生化模式 BT】存活母体数 — 严格定义"还在场景里 + 没死 + IsValid"
+	 *
+	 * 业务规则 (用户 2026.07.28 明确):
+	 *   - "只剩一个母体" = AliveMotherCount == 1
+	 *   - 死掉的母体不计入 (死亡 Pawn 不再复活才算)
+	 *   - 客户端/服务器调用统一读同一份业务账本 (MotherCharacters, TWeakObjectPtr 失效自动跳过)
+	 *
+	 * 调用方:
+	 *   - BTService_UpdateZombieState 每 ZombieTargetRefreshIntervalSeconds 派生写 BB.AliveMotherCount
+	 *   - BTDecorator_Zombie_MotherCount (人类分支条件)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 不 GetAllActorsOfClass 散查
+	 *   - MotherCharacters 是业务层唯一账本 (与 v93.1 SpawnedAICharacters 同思路)
+	 *   - TWeakObjectPtr 自动失效 → 死亡 Pawn 不计入, 无需主动清理
+	 *
+	 * @return 当前存活母体数 (>=0)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Mother")
+	int32 GetAliveMotherCount() const;
+
+	/**
+	 * 【v107 2026.07.28 生化模式 BT】存活人类数 — 对局内所有活着的非母体 ABaseCharacter
+	 *
+	 * 定义 (严格):
+	 *   - 对局内所有 ABaseCharacter (玩家 Pawn + AI Pawn)
+	 *   - !IsDead() && !bIsMother (排除死亡 + 已变异母体)
+	 *
+	 * 调用方:
+	 *   - BTService_UpdateZombieState 写 BB.AliveHumanCount
+	 *   - URoomZombieRallySubsystem::CountHumanNearPoint (集合点选点人数统计用)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 走 URoomSpawnSubsystem::GetAllBattleCharacters() (业务层账本单一入口)
+	 *   - 不 GetAllActorsOfClass 散查
+	 *
+	 * @return 当前存活人类数 (>=0)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Mother")
+	int32 GetAliveHumanCount() const;
+
+	/**
+	 * 【v108 大厂架构】新回合开始时重置母体账本
+	 *
+	 * 根因 (用户 2026.07.29):
+	 *   - AliveMotherCount=120 → MotherCharacters 跨回合累积, 10 回合 × 12 变异/回合 = 120
+	 *   - StartNextZombieRound() 启动新回合时没有清理 MotherCharacters
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::StartNextZombieRound() 末尾调
+	 *   - 业务: 每回合开始, 旧母体状态清零, 重新走倒计时变异
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 本函数幂等: 多次调用效果相同
+	 *   - 不检查当前回合数 (回合切换逻辑由 Lifecycle 负责)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Mother")
+	void ResetForNewRound();
+
 protected:
 	/** GameMode 引用 (业务调用与权威校验的入口) */
 	UPROPERTY(Transient)
@@ -181,4 +243,25 @@ protected:
 	 * @return 选中的目标, nullptr=失败
 	 */
 	ABaseCharacter* SelectRandomTarget(const TArray<ABaseCharacter*>& Candidates);
+
+	/**
+	 * 【v108 大厂架构新增】按策略过滤候选清单
+	 *
+	 * 业务规则 (用户 2026.07.30 明确):
+	 *   母体变异目标选择策略有 3 种:
+	 *   - Random:     不过滤, 玩家+AI 都可选 (默认)
+	 *   - AIOnly:     只保留 AI (Cast<AAIController>(Char->GetController()) 非空)
+	 *   - PlayerOnly: 只保留玩家 (GetController() 是 APlayerController 派生)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - AIOnly / PlayerOnly 候选过滤后可能为空 → 返回空数组 (由调用方 Log Error)
+	 *   - Controller 为空 (异常 Pawn) → Log Warning + 跳过 (不阻塞主流程)
+	 *
+	 * @param Candidates  全部候选清单 (来自 GetEligibleHumanTargets)
+	 * @param Policy      选择策略 (来自 Lifecycle.CachedMotherSelectionPolicy)
+	 * @return 过滤后的候选清单 (可能为空)
+	 */
+	TArray<ABaseCharacter*> FilterCandidatesByPolicy(
+		const TArray<ABaseCharacter*>& Candidates,
+		EMotherSelectionPolicy Policy);
 };

@@ -251,4 +251,138 @@ public:
     /** 难度缩放后的移动参数 */
     UFUNCTION(BlueprintPure, Category = "AI|Config")
     FAIMovementParams GetScaledMovement(EAIDifficultyTier Tier) const;
+
+    // ========================================================================
+    // 【v107 2026.07.28 生化模式 AI】独立 Zombie 专属参数段
+    // ========================================================================
+    //
+    // 设计原则 (大厂架构 — 模式隔离 + 零复用 Melee 字段):
+    //   - 生化模式远程射击参数与刀战近战 AttackRange 等参数语义不同 (远程 = cm 级别, 近战 = 贴身)
+    //   - 强制独立字段, 不允许"复用 AttackRange 当射击距离" — 否则策划调刀战误改生化, 业务绑定
+    //   - 集合点专属半径也不允许借 Combat.AcceptanceRadius — 集合点距离语义不同 (阵营层级)
+    //
+    // 真理源链路:
+    //   DA_AIBehaviorConfig_ZombieHuman.uasset → ZombieHuman (本字段段)
+    //     ↓ URoomZombieRallySubsystem / BTService_UpdateZombieState / BTTask_SelectZombieRallyPoint
+    //     ↓ BTTask/Decorator/Service 读 (不重新声明, 强制复用本字段段)
+
+    /**
+     * 目标刷新间隔 (秒) — BTService_UpdateZombieTargets 派生频率
+     * 典型值 0.2~0.5, 太大响应慢, 太小 CPU 浪费
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
+        meta = (ClampMin = "0.05", ClampMax = "2.0",
+                DisplayName = "TargetRefreshIntervalSeconds (目标刷新间隔秒数)"))
+    float ZombieTargetRefreshIntervalSeconds = 0.25f;
+
+    /**
+     * 集合点到达半径 (cm) — BTTask_SelectZombieRallyPoint 与原生 MoveTo 用
+     * 与 FAICombatParams.AcceptanceRadius 严格分离 (语义不同)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
+        meta = (ClampMin = "10.0", ClampMax = "1000.0",
+                DisplayName = "RallyArrivalRadius (集合点到达半径 cm)"))
+    float ZombieRallyArrivalRadius = 80.f;
+
+    /**
+     * 集合点附近人数统计半径 (cm) — URoomZombieRallySubsystem 选"人类最多点"用
+     * 注意: 数值必须 >= ZombieRallyArrivalRadius, 否则 AI 站到点上仍不在统计半径内
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
+        meta = (ClampMin = "100.0", ClampMax = "5000.0",
+                DisplayName = "RallyPopulationRadius (集合点人数统计半径 cm)"))
+    float ZombieRallyPopulationRadius = 800.f;
+
+    /**
+     * 主武器开火距离 (cm) — BTService_UpdateZombieTargets 选母体目标用
+     * 母体攻击距离在生化模式独立配置, 与刀战 AttackRange 完全分离
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
+        meta = (ClampMin = "100.0", ClampMax = "10000.0",
+                DisplayName = "PrimaryWeaponFireRange (主武器开火距离 cm)"))
+    float ZombiePrimaryFireRange = 3500.f;
+
+    /**
+     * 移动中射击脉冲时长 (秒) — 人类"边走边打"循环节拍
+     * 简化为开火 N 秒 + 暂停短时间 (可选后续用 BTService 节流)
+     * 默认 1.0s: 持续开火 1 秒后看 BT 是否切换分支
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
+        meta = (ClampMin = "0.1", ClampMax = "5.0",
+                DisplayName = "MoveAndFireBurstSeconds (边走边打脉冲秒数)"))
+    float ZombieMoveAndFireBurstSeconds = 1.0f;
+
+    // ========================================================================
+    // 【v110 2026.07.30 生化模式 AI】人类 AI 后退配置
+    // ========================================================================
+    //
+    // 设计原则 (大厂架构 — BT 为主 C++ 为辅):
+    //   - 何时后退 ← BTDecorator_MotherTooClose (读取本字段)
+    //   - 如何后退 ← BTTask_MoveAwayFromTarget (复用 Melee 后退原子能力)
+    //   - C++ 只提供距离事实 (BTService_UpdateMotherDistance) 和决策守卫 (Decorator)
+    //
+    // 业务规则:
+    //   - 人类 AI 在 "Human: Last Mother Pursuit" 分支中
+    //   - 当与母体距离 < RetreatDistanceThreshold 时, 面朝母体后退
+    //   - 后退完成后继续追击/射击
+    //
+    // 真理源链路:
+    //   DA_AIBehaviorConfig_ZombieHuman → ZombieHuman 后退字段
+    //     ↓ BTDecorator_MotherTooClose::DistanceThreshold 读取
+    //     ↓ BTTask_MoveAwayFromTarget::StepDistance 读取
+
+    /**
+     * 后退触发距离阈值 (cm) — BTDecorator_MotherTooClose 使用
+     *
+     * 语义:
+     *   - AI 距离母体 < RetreatDistanceThreshold → 后退
+     *   - AI 距离母体 >= RetreatDistanceThreshold → 正常追击/射击
+     *
+     * 编辑器配置路径:
+     *   DA_AIBehaviorConfig_ZombieHuman → Behavior|Zombie|Retreat
+     *   → Retreat Distance Threshold
+     *
+     * 典型值: 200~500cm (根据武器射程和母体攻击范围调整)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|Retreat",
+        meta = (ClampMin = "0.0", ClampMax = "10000.0",
+                DisplayName = "Retreat Distance Threshold (后退触发距离阈值 cm)"))
+    float RetreatDistanceThreshold = 300.f;
+
+    /**
+     * 单次后退距离 (cm) — BTTask_MoveAwayFromTarget 使用
+     *
+     * 语义:
+     *   - 每次后退操作移动的距离
+     *   - AI 位置 + (AI-母体)方向 × RetreatStepDistance
+     *
+     * 编辑器配置路径:
+     *   DA_AIBehaviorConfig_ZombieHuman → Behavior|Zombie|Retreat
+     *   → Retreat Step Distance
+     *
+     * 典型值: 100~300cm (太小会反复进退, 太大可能超出地图边界)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|Retreat",
+        meta = (ClampMin = "50.0", ClampMax = "2000.0",
+                DisplayName = "Retreat Step Distance (单次后退距离 cm)"))
+    float RetreatStepDistance = 150.f;
+
+    /**
+     * 后退到位判定半径 (cm) — BTTask_MoveAwayFromTarget 使用
+     *
+     * 语义:
+     *   - 到达目标点 AcceptanceRadius 范围内即视为"后退到位"
+     *   - 太小会导致 AI 在目标点附近徘徊
+     *   - 太大导致后退不彻底
+     *
+     * 编辑器配置路径:
+     *   DA_AIBehaviorConfig_ZombieHuman → Behavior|Zombie|Retreat
+     *   → Retreat Acceptance Radius
+     *
+     * 典型值: 50~100cm
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|Retreat",
+        meta = (ClampMin = "10.0", ClampMax = "500.0",
+                DisplayName = "Retreat Acceptance Radius (后退到位判定半径 cm)"))
+    float RetreatAcceptanceRadius = 60.f;
 };

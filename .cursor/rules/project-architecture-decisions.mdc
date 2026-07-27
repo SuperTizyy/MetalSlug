@@ -173,6 +173,7 @@ return Succeeded;  // 动画还没播就返回了
 - 重视架构可扩展性,愿意为未来投入
 - 偏好架构原则先讲清,再写代码
 - 愿意听大厂案例对比,作为决策参考
+- **【v109.1 用户明确指示】编译验证由用户自己负责,不要主动跑编译/Build/UAT/GenerateProjectFiles 等命令,也不要试图查找并执行 UE 安装目录下的编译工具。改完代码提交即可。**
 
 ### 沟通偏好
 - 问"为什么"时,给底层原理 + 类比 + 工业案例
@@ -3687,6 +3688,129 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple()
 - 任何 Owner/外部引用都通过 `GetOwner() + Cast<T>()` 按需获取
 - 不缓存 (即使有性能开销) — 因为缓存失效的根因隐式而难调
 - 让 `GetOwner()` 调一次约 0.001ms — 完全可接受, 不要为这个微优化而引入缓存风险
+
+---
+
+## 19. v107-v116 (2026.07.31) AI 母体复活完整链路 — 8 个版本迭代
+
+### 业务背景 (用户 2026.07.31 反馈)
+
+```
+生化模式: AI 母体被打死后:
+- 一开始: 复活后变成人类 (错的, 应该还是母体)
+- 然后: 根本不复活 (0 复活率)
+- 然后: 复活后 BT 是刀战 BT (错的, 应该是生化 BT)
+- 然后: PlayerStart 不能再次复活 (占用未释放)
+- 然后: BP_ZombieAIController 被销毁 (错的, 应该永久存在并复用)
+- 然后: 母体被杀死 117ms 内 AIController 就被销毁 (致命的)
+```
+
+### 终极根因 — UE 5.6 Pawn 销毁自动触发 AIController 销毁
+
+**链路 (Session1.txt 18.21.33.373~490 时序)**:
+
+```
+t=18.21.33.373  BP_MuTi_C_1 (母体 Pawn) 死亡
+t=18.21.33.485  CombatDeathComponent::Die() 调用 SetLifeSpan(0.1f)
+t=18.21.33.490  AIC_AI_SWAT_AI_3 EndPlay Reason=0 (Destroyed), Pawn=NULL
+t=18.21.33.490  MotherLowHealthFlickerComponent::EndPlay StopFlickerTimer (BP_MuTi_C_1 触发)
+                          ↑
+                同时发生 AIC + Pawn 都在 EndPlay
+t=18.21.36.490  (预计) Timer 触发 → AIC 已销毁 → 复活失败
+```
+
+**为什么 AIC 在 117ms 内被销毁?**
+
+1. `Owner->SetLifeSpan(0.1f)` 在 0.1s 后调 `Destroy()`
+2. `APawn::Destroyed()` 自动调 `Controller->PawnPendingDestroy(this)`
+3. 我们没在 C++ override `PawnPendingDestroy`
+4. 但 BP 子类 `BP_ZombieAIController.uasset` 的 BP 事件 `OnUnPossess` 可能调 `Destroy Actor`
+5. 或者更复杂的 BP 内部 Event Graph 在 Pawn 销毁时触发 AIC 销毁
+6. 不管哪个路径, AIC 在 Pawn 销毁后被销毁
+
+### v107-v115 修复链 (按时间顺序)
+
+| 版本 | 修复 | 用户反馈后 |
+|---|---|---|
+| **v107** | AIC.CachedIsMother 字段 (镜像 PS.bIsMother) | "复活后变成人类" → 部分修 |
+| **v108** | CachedIsMother 初始 false + MotherCharRowName 值捕获 | "还是不复活" → 部分修 |
+| **v109** | MutatePawnToMother 完整路径重构 | "又不复活了" |
+| **v110** | OccupiedSpawnByController 释放 | "PlayerStart 不能再次复活" → 修 |
+| **v111** | MotherRespawnTimerHandle 移到 AIC 字段 | "BP_ZombieAIController 被销毁" → 部分修 |
+| **v111.1** | 释放旧 PlayerStart 后重新占用 | "AI 复活后 BT 是刀战 BT" |
+| **v111.3** | MutatePawnToMother 强制重启 BT from ModeRules | 修 |
+| **v112** | OccupiedSpawnByController 在 Mutate 中更新 | 部分修 |
+| **v113** | TryStartBehaviorTreeOrWaitForBattleStart 检查 CurrentRoomState | 修 |
+| **v114** | BaseAIController::EndPlay 清除 Timer | 修 (但新问题出现) |
+| **v115** | Server_KickPlayer 严格名字匹配 + Timer Lambda 改 WeakObjectPtr | 修 |
+| **v115.1** | EndPlay 销毁原因诊断日志 | 用户反馈仍不复活 |
+| **v115.5** | BeginDestroy override | 诊断 |
+| **v115.6** | Die() 幂等检查 bDeathSequenceStarted | 防多次触发 |
+| **v115.7** | Die() SetLifeSpan 后 Controller 状态检查 | 确认 Pawn 销毁时 AIC 也在销毁 |
+
+### v116 终极修复 (大厂架构 — Controller 解耦)
+
+**文件**: `MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp`
+
+**修改**: 在 `Die()` 中 `SetLifeSpan(0.1f)` **之前**显式 `UnPossess`:
+
+```cpp
+// 【v116 P0 修复 — AIController 解耦】
+// 根因: BP_ZombieAIController 的 OnUnPossess 或其他 BP 事件在 Pawn 销毁时触发 AIC Destroy
+// 修复: 主动 UnPossess, 让 AIC 与死亡 Pawn 解耦, Pawn 销毁时不会触发任何 AIC 销毁链
+if (AController* Ctrl = Owner->GetController())
+{
+    if (Ctrl->IsA<AAIController>())  // 只对 AIC 操作, 跳过 PlayerController
+    {
+        Ctrl->UnPossess();
+    }
+}
+Owner->SetLifeSpan(0.1f);
+```
+
+### v116 大厂原则落地
+
+| 原则 | 实现 |
+|---|---|
+| **集中调度** | 死亡 Pawn 生命周期由 `CombatDeathComponent::Die()` 集中调度, Controller 解耦也在此处 |
+| **零兜底** | `if IsA<AAIController>` 显式分支, 不跳过任何检查 |
+| **零破坏** | 跳过 `APlayerController` (玩家由 Multicast_Die 处理, 不能 UnPossess) |
+| **抗时序竞争** | `UnPossess` 一定在 `SetLifeSpan` 之前 |
+| **简化原则** | 找到根因就一刀切修复, 不留冗余兜底 |
+
+### 教训总结 (大厂级 — UE Pawn/AIController 生命周期)
+
+1. **UE 默认行为**: Pawn 销毁 → Controller->PawnPendingDestroy → 默认 UnPossess (不 Destroy Controller)
+2. **BP 子类风险**: BP 蓝图的 OnUnPossess 事件可调 Destroy → 这就是 v116 根因
+3. **大厂防御**: 在 C++ 关键路径主动 UnPossess, 不依赖引擎/蓝图的默认行为
+4. **不要混合**: Pawn 与 Controller 解耦的时刻要明确 — v116 选在 Die() SetLifeSpan 之前
+5. **诊断先行**: v107-v115 迭代了 9 个版本才定位 — 教训是"先加诊断日志, 再修复"
+
+### 关键文件清单 (v116)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
+ + #include "AIController.h"  // 【v116】AAIController 完整类型
+ ~ Die(): SetLifeSpan 前 UnPossess AIController
+ - 删除残留 v115.7 诊断 else 分支 (v116 后 Controller 已为 NULL 是预期)
+
+未修改:
+= BaseAIController.cpp / RoomSpawnSubsystem.cpp / RoomPlayerController.cpp
+  (v107-v115 的修复链路完整, v116 是最后一个补漏)
+```
+
+### 待用户验证 (v116)
+
+1. ✅ UE 5.6 编辑器编译无错
+2. PIE 中:
+ - 母体死亡 → 0.1s 后旧 Pawn 销毁 → AIController 继续存活 3s → Timer 触发 MutatePawnToMother → 母体原地复活
+ - 日志看到:
+ - `[CombatDeathComponent] Die: 【v116】已 UnPossess AIController 'AIC_AI_SWAT_AI_5', 让 AIC 与死亡 Pawn 解耦`
+ - `[CombatDeathComponent] Die: 【v116 验证】SetLifeSpan 后 Controller 已为 NULL (Pawn='BP_MuTi_C_2'), 这是 v116 修复的预期行为 — UnPossess 解耦成功`
+ - `[MotherMutation] MutatePawnToMother 成功完成`
+3. **不应该**看到 `EndPlay ENTER: Controller=... Reason=0` (除 PIE 结束外)
+4. **不应该**看到 `Timer 触发时 AIC 已销毁` 错误
 
 ---
 

@@ -1206,6 +1206,7 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			BaseAIC->SetCachedAIPawnClass(Request.AIPawnClass);
 			BaseAIC->SetCachedWeaponID(Request.WeaponID);
 			BaseAIC->SetCachedFactionTag(Request.FactionTag); // ← 先写, InitializeFromConfig 会读这个
+			BaseAIC->SetCachedIsMother(false); // 【v109.1 大厂架构】新 Spawn 的 AI 初始为非母体
 			BaseAIC->InitializeFromConfig(Config, LobbyBehaviorTree);
 
 			// 【v54.3 大厂重构 — Class 强类型真理源】同步 CachedWeaponClass
@@ -1952,11 +1953,24 @@ void URoomSpawnSubsystem::RestartPlayer(AController* NewPlayer)
 
 void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImmediateRespawn)
 {
+	// 【v115.2 大厂架构诊断】记录 Controller 在 RequestRespawn 入口时的状态
+	UE_LOG(LogTemp, Display,
+		TEXT("[Respawn] 【v115.2-Diag】RequestRespawn ENTER: DeadController='%s' IsValid=%d bImmediate=%d"),
+		DeadController ? *DeadController->GetName() : TEXT("NULL"),
+		DeadController ? (DeadController->IsValidLowLevel() ? 1 : 0) : 0,
+		bImmediateRespawn ? 1 : 0);
+
 	if (!DeadController)
 	{
 		UE_LOG(LogTemp, Error, TEXT("[Respawn] RequestRespawn: DeadController is null!"));
 		return;
 	}
+
+	// 【v115.2 大厂架构诊断】再次检查 Controller 有效性
+	UE_LOG(LogTemp, Display,
+		TEXT("[Respawn] 【v115.2-Diag】RequestRespawn 有效性检查后: DeadController='%s' IsValid=%d"),
+		*DeadController->GetName(),
+		DeadController->IsValidLowLevel() ? 1 : 0);
 
 	// ===== 【v99 P0 大厂架构 — 母体复活链真理源】预先读 PS->bIsMother =====
 	//
@@ -1988,9 +2002,21 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 		bDeadWasMother = PS->bIsMother;
 	}
 
+	// 【v115 大厂架构诊断】AI 分支的 bDeadWasMother 永远是 false (无 PlayerState)
+	// 真正的母体判定在下面 AI 分支用 AIC->CachedIsMother
+	bool bAICController = Cast<AAIController>(DeadController) != nullptr;
+	bool bCachedIsMother = false;
+	if (bAICController)
+	{
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(DeadController))
+		{
+			bCachedIsMother = BaseAIC->GetCachedIsMother();
+		}
+	}
+
 	UE_LOG(LogTemp, Warning,
-		TEXT("[Respawn] RequestRespawn: Controller=%s, bImmediate=%d, bDeadWasMother=%d"),
-		*DeadController->GetName(), bImmediateRespawn, bDeadWasMother ? 1 : 0);
+		TEXT("[Respawn] RequestRespawn: Controller=%s, bImmediate=%d, bDeadWasMother(PS,player)=%d, bAIC=%d, CachedIsMother(AIC)=%d"),
+		*DeadController->GetName(), bImmediateRespawn, bDeadWasMother ? 1 : 0, bAICController ? 1 : 0, bCachedIsMother ? 1 : 0);
 
 	if (Cast<ARoomPlayerController>(DeadController))
 	{
@@ -2048,7 +2074,7 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 			//
 			// 不破坏刀战模式:
 			//   - 刀战模式 PS->bIsMother=false → 不进本分支 → 永远走老路径
-			const FString& MotherCharRowName = RoomGM->MotherCharacterRowName;
+			const FString MotherCharRowName = RoomGM->MotherCharacterRowName;
 			if (bImmediateRespawn)
 			{
 				// 立即调 (本项目目前未用 bImmediateRespawn=true 的玩家路径)
@@ -2061,8 +2087,9 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 				TWeakObjectPtr<AController> WeakCtrl = DeadController;
 				TWeakObjectPtr<URoomSpawnSubsystem> WeakSys = this;
 				FTimerHandle LocalHandle;
+				const FString CapturedMotherCharRowName = MotherCharRowName; // lambda 捕获需要 const 副本
 				GetWorld()->GetTimerManager().SetTimer(LocalHandle,
-					[WeakCtrl, WeakSys, MotherCharRowName]()
+					[WeakCtrl, WeakSys, CapturedMotherCharRowName]()
 					{
 						AController* C = WeakCtrl.Get();
 						if (!C)
@@ -2071,7 +2098,7 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 						}
 						if (URoomSpawnSubsystem* Sys = WeakSys.Get())
 						{
-							Sys->MutatePawnToMother(C, MotherCharRowName);
+							Sys->MutatePawnToMother(C, CapturedMotherCharRowName);
 						}
 					},
 					RespawnDelaySeconds, false);
@@ -2126,6 +2153,146 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 				*DeadController->GetName());
 			return;
 		}
+
+		// ============================================================
+		// 【v109 大厂架构 — AI 母体复活链真理源】CachedIsMother 决策
+		// ============================================================
+		//
+		// 业务核心 (用户 2026.07.31 明确):
+		//   "生化模式：ai是母体。被打死后成了人类，这是错的，应该还是母体。
+		//    请参照玩家的业务逻辑。"
+		//
+		// 镜像玩家路径 (RequestRespawn 玩家分支, line 2013):
+		//   - 玩家: 读 PS->bIsMother=true → 走 MutatePawnToMother (母体原地变)
+		//   - AI:   读 AIC->CachedIsMother=true → 走 MutatePawnToMother (母体原地变)
+		//
+		// 旧 (v99.1 之前) 错误行为:
+		//   - AI 复活走 SpawnAIInternal (line 2307), 读 CachedAIPawnClass (人类 BP_GruntAI)
+		//   - 生成人类 Pawn → Pawn.bIsMother=false → BT 切人类分支
+		//   - 玩家看到 "AI 母体死后变人类" — 业务错误
+		//
+		// 新 (v109) 镜像玩家路径:
+		//   - 读 AIC->CachedIsMother (Server 权威, 由 MutatePawnToMother Step 6 写入)
+		//   - CachedIsMother=true → 走 MutatePawnToMother (母体原地变, 不走 SpawnAIInternal)
+		//   - CachedIsMother=false → 走老路径 SpawnAIInternal (复活成原人类 Pawn)
+		//
+		// 不破坏刀战模式:
+		//   - 刀战模式 AI CachedIsMother 永远是 false → 不进本分支 → 走老路径 → 0 影响
+		//
+		// 镜像玩家代码结构 (Step 1 ~ 7 全部复用):
+		//   - PlayerController 分支 (line 1995-2080) 已有完整 MutatePawnToMother 调用 + 模式校验
+		//   - AI 分支必须**逐行镜像** — 不能简化 (零重复架构 = 不写简化版)
+		// ============================================================
+		if (BaseAIC->GetCachedIsMother())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[Respawn] 母体 AI 复活分支 — Controller='%s' AIC.CachedIsMother=true → 走 MutatePawnToMother 路径. "
+				     "【v109 大厂架构】镜像玩家 PS->bIsMother 复活路径, 不再读 CachedAIPawnClass (那是人类 Pawn Class)."),
+				*DeadController->GetName());
+
+			// 模式校验: 只有生化模式 (Zombie) 才允许母体复活, 刀战模式 bIsMother 应永为 false
+			ARoomGameMode* RoomGM = GetWorld() ? GetWorld()->GetAuthGameMode<ARoomGameMode>() : nullptr;
+			if (!RoomGM)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] RoomGameMode 为空, 拒绝母体 AI 复活. Controller='%s'"),
+					*DeadController->GetName());
+				return;
+			}
+			if (RoomGM->MotherCharacterRowName.IsEmpty())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Respawn] GM.MotherCharacterRowName 为空, 拒绝母体 AI 复活. "
+					     "【v109 零兜底】配置错 — 必须配 BP_MuTi 的 CharRowName. "
+					     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Character RowName."),
+					*DeadController->GetName());
+				return;
+			}
+
+			// 【v110 修复】AI 分支也需要定义 MotherCharRowName
+			const FString MotherCharRowName = RoomGM->MotherCharacterRowName;
+
+			// 母体原地复活: 走 SpawnSubsystem::MutatePawnToMother 单一入口 (镜像玩家路径)
+			//
+			// 大厂原则 — 复用而非重写:
+			//   - 与玩家路径**完全相同的代码** (镜像), 不写 AI 专属简化版
+			//   - MutatePawnToMother 内部 Step 6 已经镜像处理 AI 分支 (v109 新增)
+			//   - 复活链直接调 MutatePawnToMother (跳过业务层 MutateCharacterToMother 的"业务层标记 bIsMother"层)
+			//   - CachedIsMother 已在 AIC 上设过 (MutatePawnToMother Step 6), 复活链真理源已就位
+			//
+			// 时序 (与玩家路径完全镜像):
+			//   - 立即调 (bImmediateRespawn=true) 或延迟 3s (bImmediateRespawn=false)
+			//   - 延迟后 Controller 可能失效 (TWeakObjectPtr 校验)
+			// 【v111 大厂架构修复】使用 AIController 上的 TimerHandle, 生命周期绑定
+			// 旧: 存储在 Subsystem 局部变量, Controller 销毁时 Timer 回调找不到 Controller
+			// 新: TimerHandle 存储在 AIController 上, 生命周期与 Controller 绑定
+			// 注意: 不再需要 WeakPtr, 因为 TimerHandle 本身在 AIController 上
+			if (bImmediateRespawn)
+			{
+				MutatePawnToMother(DeadController, MotherCharRowName);
+			}
+			else
+			{
+				// 【v115 大厂架构修复】使用 TWeakObjectPtr 捕获 AIController
+				// 根因分析:
+				//   - 旧代码: [this, BaseAIC, CapturedMotherCharRowName]() — BaseAIC 按值捕获
+				//   - 当 Controller 在 Timer 触发前被销毁时，原始 BaseAIC 指针指向的对象被销毁
+				//   - 但 lambda 闭包中的副本仍然指向相同的（现在是无效的）内存地址
+				//   - Timer 触发时，lambda 中的 BaseAIC 是一个悬空指针！
+				//   - IsValidLowLevel() 返回 false，但此时已经无法复活了
+				//
+				// 修复:
+				//   - 捕获 TWeakObjectPtr<ABaseAIController> 而非原始指针
+				//   - Timer 触发时检查 WeakPtr 是否仍然有效
+				//   - 如果无效，跳过复活（Controller 已被销毁）
+				//
+				// 大厂原则 — 生命周期安全:
+				//   - 所有跨 Timer 的 Actor 引用必须用 TWeakObjectPtr
+				//   - 不能依赖"Controller 永远不会被销毁"的假设
+				//   - 必须处理 Controller 被外部销毁的边界情况
+				TWeakObjectPtr<ABaseAIController> WeakBaseAIC(BaseAIC);
+				const FString CapturedMotherCharRowName = MotherCharRowName;
+				GetWorld()->GetTimerManager().SetTimer(
+					BaseAIC->MotherRespawnTimerHandle,
+					[this, WeakBaseAIC, CapturedMotherCharRowName]()
+					{
+						// 【v115.6 大厂架构诊断】增强 Timer 回调日志
+						if (!WeakBaseAIC.IsValid())
+						{
+							UE_LOG(LogTemp, Error,
+								TEXT("[Respawn] 【v115.6-Warning】母体 AI 复活 Timer 回调触发: AIController 已销毁 (WeakBaseAIC.IsValid=false), 跳过复活. "
+								     "可能原因: 战斗结束或地图切换."));
+							return;
+						}
+						ABaseAIController* ValidBaseAIC = WeakBaseAIC.Get();
+						const FString ControllerName = ValidBaseAIC->GetName();
+						const UWorld* ControllerWorld = ValidBaseAIC->GetWorld();
+						UE_LOG(LogTemp, Error,
+							TEXT("[Respawn] 【v115.6-Diag】母体 AI 复活 Timer 回调触发: AIController=%s IsValid=%d World=%s."),
+							*ControllerName,
+							ValidBaseAIC->IsValidLowLevel() ? 1 : 0,
+							ControllerWorld ? *ControllerWorld->GetName() : TEXT("NULL"));
+						if (!ValidBaseAIC->IsValidLowLevel())
+						{
+							UE_LOG(LogTemp, Error,
+								TEXT("[Respawn] 【v115.6-Error】母体 AI 复活失败: AIController IsValidLowLevel=false."));
+							return;
+						}
+						UE_LOG(LogTemp, Error,
+							TEXT("[Respawn] 【v115.6-Diag】母体 AI 复活: 即将调 MutatePawnToMother(AIController=%s, RowName=%s)."),
+							*ControllerName, *CapturedMotherCharRowName);
+						this->MutatePawnToMother(ValidBaseAIC, CapturedMotherCharRowName);
+					},
+					RespawnDelaySeconds, false);
+				UE_LOG(LogTemp, Display,
+					TEXT("[Respawn] 【v115-Diag】母体 AI 复活 Timer 已设置: AIController=%s Delay=%.1fs. 等待 %.1fs 后复活..."),
+					*DeadController->GetName(), RespawnDelaySeconds, RespawnDelaySeconds);
+			}
+			return; // 母体 AI 复活分支已处理, 不走下面 SpawnAIInternal 老路径
+		}
+
+		// ===== 下面是 v54 的人类 AI 复活路径 (CachedIsMother=false 时才执行) =====
+		// AI 复活 (单一入口 SpawnAIInternal)
 
 		// ============================================================
 		// 【v54 大厂架构 — 运行时真理源】复活路径优先级链 (全部从 Controller.CachedXXX 派生)
@@ -2371,6 +2538,21 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 
 bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FString& MotherCharRowName)
 {
+	// 【v115 大厂架构诊断】增强 ENTER 日志，包含 Controller 有效性检查
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v115-Diag】MutatePawnToMother ENTER: Controller=%s(%p) MotherCharRowName=%s IsValid=%d HasPawn=%d."),
+		Controller ? *Controller->GetName() : TEXT("NULL"), (void*)Controller,
+		*MotherCharRowName,
+		Controller ? Controller->IsValidLowLevel() : 0,
+		Controller && Controller->GetPawn() ? 1 : 0);
+
+	// 【v115 大厂架构诊断】如果 Controller 即将无效，记录栈信息
+	if (Controller && !Controller->IsValidLowLevel())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] 【v115-严重】MutatePawnToMother: Controller 即将无效! 可能被其他代码销毁."));
+	}
+
 	// 母体复活时占用出生点记录
 	// 【v104 新增】复活时需要记录 Controller → SpawnPoint 映射，供死亡时释放
 	AController* OccupancyOwner = Controller;
@@ -2498,11 +2680,37 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		OldPawnRotation = SelectedSpawn->GetActorRotation();
 
 		// 占用该点 (供后续释放)
-		OccupiedSpawnPoints.Add(SelectedSpawn);
+		// 【v111.1 大厂架构修复】处理旧占用记录
+		// 根因: 母体复活时调用 MutatePawnToMother, 新点 MotherSpawnPoint 被添加到 OccupiedSpawnPoints
+		// 但旧的 PlayerStart 记录从未被释放，导致两个点都被占用
+		// 修复: 如果 Controller 已有旧占用记录，先释放旧点，再添加新点
 		if (OccupancyOwner)
 		{
-			OccupiedSpawnByController.Add(OccupancyOwner, SelectedSpawn);
+			if (TWeakObjectPtr<APlayerStart>* OldSpawnPtr = OccupiedSpawnByController.Find(OccupancyOwner))
+			{
+				if (APlayerStart* OldSpawn = OldSpawnPtr->Get())
+				{
+					OccupiedSpawnPoints.Remove(OldSpawn);
+					UE_LOG(LogTemp, Display,
+						TEXT("[MotherMutation] MutatePawnToMother: 释放旧出生点 '%s', 改为占用母体点 '%s'. Controller=%s."),
+						*OldSpawn->GetName(), *SelectedSpawn->GetName(), *Controller->GetName());
+				}
+			}
+			// 【v112 大厂架构修复】必须更新 OccupiedSpawnByController 映射！
+			// 根因: 旧版只更新了 OccupiedSpawnPoints, 没有更新 OccupiedSpawnByController
+			//        导致死亡时 ReleaseSpawnPointByController 找不到记录, MotherSpawnPoint 永远不被释放
+			//        多次复活后所有 MotherSpawnPoint 都被占用 → ZeroVector 出生
+			// 修复: 在 OccupiedSpawnPoints.Add(SelectedSpawn) 之后, 用新 key 覆盖旧映射
+			// 注意: 
+			//   1. OccupiedSpawnByController 的 key 是 TWeakObjectPtr<AController>, 需要转换
+			//   2. 覆盖映射是正确的行为, 因为 Controller 重新占用了新点
+			TWeakObjectPtr<AController> WeakOwner(OccupancyOwner);
+			OccupiedSpawnByController.Add(WeakOwner, SelectedSpawn);
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation] MutatePawnToMother: 【v112修复】更新 OccupiedSpawnByController: [%s] -> '%s'."),
+				*OccupancyOwner->GetName(), *SelectedSpawn->GetName());
 		}
+		OccupiedSpawnPoints.Add(SelectedSpawn);
 
 		UE_LOG(LogTemp, Display,
 			TEXT("[MotherMutation] MutatePawnToMother: 复活链路径 — 从 MotherSpawnPoints 随机选取. Controller=%s Selected='%s' Loc=%s Rot=%s."),
@@ -2680,6 +2888,11 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 
 	// ===== Step 5: Possess + 验证 =====
 	Controller->Possess(NewMotherPawn);
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v111-Diag】MutatePawnToMother: Step 5 Possess 完成. Controller='%s' GetPawn()='%s' NewMotherPawn='%s'. "),
+		*Controller->GetName(),
+		Controller->GetPawn() ? *Controller->GetPawn()->GetName() : TEXT("NULL"),
+		*NewMotherPawn->GetName());
 	if (Controller->GetPawn() != NewMotherPawn)
 	{
 		UE_LOG(LogTemp, Error,
@@ -2688,6 +2901,84 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 			*Controller->GetName());
 		NewMotherPawn->Destroy();
 		return false;
+	}
+
+	// ===== Step 5.1: 【v111.3 大厂架构修复】重新启动正确的 BT =====
+	//
+	// 根因 (用户反馈 2026.07.31):
+	//   - 母体 AI 使用的是刀战模式行为树，而不是生化模式行为树
+	//   - AIController 首次 Spawn 时正确持有 ModeRules.BehaviorTree (BT_ZombieModeAI)
+	//   - 但 MutatePawnToMother 调用 InitializeFromConfig(Config, nullptr) 时:
+	//     → BehaviorTreeOverride=nullptr 导致去读 ConfigSO.LevelPlacedBehaviorTree
+	//     → ConfigSO 是关卡预放 AI 配置, LevelPlacedBehaviorTree=BT_MeleeAI (刀战!)
+	//
+	// 修复:
+	//   - 不能传 nullptr, 必须传 ModeRules.BehaviorTree (生化模式 BT)
+	//   - 需要从 GameMode 获取当前模式的 ModeRules, 再拿其 BehaviorTree
+	//
+	{
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Controller))
+		{
+			// 【v111.3 P0】从 ModeRules 获取正确的 BT
+			if (ARoomGameMode* RoomGM = GetWorld() ? GetWorld()->GetAuthGameMode<ARoomGameMode>() : nullptr)
+			{
+				ARoomGameState* RoomGS = GetWorld() ? GetWorld()->GetGameState<ARoomGameState>() : nullptr;
+				if (RoomGS)
+				{
+					const ERoomMatchMode CurrentMode = RoomGS->CurrentMatchMode;
+					FAIModeRules ModeRulesFound;
+					if (RoomGM->GetModeRules(CurrentMode, ModeRulesFound))
+					{
+						UBehaviorTree* ZombieBT = ModeRulesFound.BehaviorTree.Get();
+						if (ZombieBT)
+						{
+							UE_LOG(LogTemp, Display,
+								TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】重新启动 BT: Controller='%s' BT='%s' (来自 ModeRules[%d])."),
+								*Controller->GetName(), *ZombieBT->GetName(), static_cast<int32>(CurrentMode));
+
+							// 重新初始化 AI 配置，传入正确的 BT
+							UAIBehaviorConfigSO* MutableConfig = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig());
+							if (MutableConfig)
+							{
+								BaseAIC->InitializeFromConfig(MutableConfig, ZombieBT);
+							}
+							else
+							{
+								UE_LOG(LogTemp, Error,
+									TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】Config 为空, 无法重新启动 BT. Controller='%s'."),
+									*Controller->GetName());
+							}
+						}
+						else
+						{
+							UE_LOG(LogTemp, Error,
+								TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】ModeRules.BehaviorTree 为空. CurrentMode=%d. "
+								     "【零兜底】生化模式必须配置 BehaviorTree. 修复: BP_GM_RoomGameMode → ModeRules → Zombie → BehaviorTree 拖入 BT_ZombieModeAI."),
+								static_cast<int32>(CurrentMode));
+						}
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】GetModeRules 失败. CurrentMode=%d. "
+							     "【零兜底】拒绝重新启动 BT."),
+							static_cast<int32>(CurrentMode));
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】RoomGameState 为空. Controller='%s'."),
+						*Controller->GetName());
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】RoomGameMode 为空. Controller='%s'."),
+					*Controller->GetName());
+			}
+		}
 	}
 
 	// ===== Step 5.5: 【v93.3 大厂架构 — 母体阵营切换】集中调度 FactionTag 写入 =====
@@ -2820,8 +3111,20 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 	//
 	// 互斥语义:
 	//   - bIsMother = true, bIsHuman = false(注释约定,OnRep_bIsMother 校验)
-	NewMotherPawn->bIsMother = true;
+	//   - 【v93.2 大厂架构】同时设两个字段, 顺序固定: 先 bIsHuman=false, 再 bIsMother=true
+	//     — 这样客户端 OnRep_bIsMother 校验时 bIsHuman 已先于 bIsMother 到达 → 消除时序误报
 	NewMotherPawn->bIsHuman = false;
+	NewMotherPawn->bIsMother = true;
+
+	// 【v93.2 大厂架构 — 服务器侧写入确认】写入后立即日志显示两字段值
+	//   服务器侧是 100% 真相源, 这里看到的值是事实. 客户端 OnRep 看到的时序差异由客户端修复 (SetTimerForNextTick).
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] MutatePawnToMother Step 5.7 写入确认: Pawn=%s bIsMother=%d bIsHuman=%d (互斥应一致). ")
+		TEXT("【v93.2 大厂架构】服务器侧先 bIsHuman=false 再 bIsMother=true, 客户端 OnRep_bIsMother 延迟到下一帧校验, 消除时序误报."),
+		*NewMotherPawn->GetName(),
+		NewMotherPawn->bIsMother ? 1 : 0,
+		NewMotherPawn->bIsHuman ? 1 : 0
+	);
 
 	// 【v99 P0.1 修复】临时变量避免 UE_LOG 格式串模板推断失败 (UE 5.6 严格模式)
 	const FString ControllerName = Controller->GetName();
@@ -2872,7 +3175,43 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 				*PC->GetName());
 		}
 	}
-
+	else if (ABaseAIController* AIC = Cast<ABaseAIController>(Controller))
+	{
+		// ============================================================
+		// 【v109 大厂架构 — AI 母体复活链真理源】CachedIsMother = true
+		// ============================================================
+		//
+		// 业务核心 (用户 2026.07.31 明确):
+		//   "生化模式：ai是母体。被打死后成了人类，这是错的，应该还是母体。
+		//    请参照玩家的业务逻辑。"
+		//
+		// 镜像对称 (玩家 vs AI):
+		//   - 玩家: PS->bIsMother=true (Server 写, Replicated, 复活时读)
+		//   - AI:   AIC->CachedIsMother=true (Server 写, 不 Replicate, 复活时读)
+		//   - 两者都是"Controller 内存真理源", Pawn 销毁后字段仍存活
+		//
+		// 【v93.2 互斥语义镜像】AI 路径为什么不需要 AIC->CachedIsHuman:
+		//   - bIsHuman 是 Pawn 层字段 (ABaseCharacter), 不属于 Controller
+		//   - AIC 没有也不会有 CachedIsHuman (语义错位, AIC 不管"人类身份")
+		//   - AI 路径的"互斥语义"由 Step 5.7 集中保证: Pawn.bIsMother=true + Pawn.bIsHuman=false
+		//   - AIC.CachedIsMother 与 Pawn.bIsHuman 不冲突: 一个是"Controller 复活真理源", 一个是"Pawn 运行时身份"
+		//
+		// 不破坏刀战模式:
+		//   - 刀战模式从不调 MutatePawnToMother → CachedIsMother 永远是 false → RequestRespawn 走老路径
+		//   - 与 CachedFactionTag / CachedAIPawnClass / CachedWeaponID 同模式 (镜像)
+		//
+		// 不重复架构:
+		//   - 复用现有 MutatePawnToMother Step 6 (玩家分支已是单一真理源入口)
+		//   - AI 分支与之对称, 互不耦合
+		// ============================================================
+		AIC->SetCachedIsMother(true);
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] MutatePawnToMother: 已设 AIC.CachedIsMother=true (AI 复活链真理源 — 镜像玩家 PS->bIsMother). ")
+			TEXT("下次 RequestRespawn 读到 CachedIsMother=true → 走母体原地复活路径, 不会再变成人类. ")
+			TEXT("【v109 大厂架构】AI 没有 PS, 必须在 Controller 上持有等价的运行时真理源. ")
+			TEXT("【v93.2】互斥语义由 Step 5.7 Pawn.bIsHuman=false 保证 (Pawn 层), AIC 不重复镜像.")
+		);
+	}
 	// ===== Step 7: 【v99.2 已删除 — RPC 已在 Step 4.5 立即广播】=====
 	//
 	// 历史 (v99.1):
@@ -2926,6 +3265,13 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 				*NewMotherPawn->GetName());
 		}
 	}
+
+	// 【v111-Diag】确认 Controller 存活
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v111-Diag】MutatePawnToMother 成功完成: Controller='%s' Pawn='%s' IsValid=%d."),
+		*Controller->GetName(),
+		Controller->GetPawn() ? *Controller->GetPawn()->GetName() : TEXT("NULL"),
+		Controller->IsValidLowLevel() ? 1 : 0);
 
 	return true;
 }

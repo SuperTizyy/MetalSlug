@@ -1,12 +1,8 @@
 // Copyright (c) 2026.
 //
-// 【P0 v23.2 BT 原子库】BTTask — 退一步 (面朝敌人后退)
+// 【P0 v23.2 BT 原子库 + v40.10 重构】BTTask — 退一步 (面朝敌人后退)
 //
-// v23.2 修复 "回头走" 根因:
-//   v23 之前 MoveTo 期间 AI 朝向 = 移动方向 = 朝 RetreatPoint
-//   → 看起来 AI 背对玩家走 ("回头走")
-//
-// v23.2 标准实现:
+// v23.2 标准实现 (回头走修复):
 //   ExecuteTask:
 //     1. 保存 Pawn 原 Movement 设置 (OrientRotationToMovement / UseControllerDesiredRotation)
 //     2. 临时:
@@ -27,12 +23,18 @@
 //   - 朝向: FocalPoint 控制, 不受 MoveTo 干扰
 //   - 移动: MoveToLocation 走 StepBackLoc (远离玩家的方向)
 //   - 结果: AI 面朝玩家, 身体后退
+//
+// v40.10 大厂重构:
+//   Save/Restore Movement 配置抽离到 UAIFacingMoveHelper 公共 API
+//   - FTaskMemory 不再持有 Movement 字段, 持有 FMovementOrientationSnapshot (Helper 数据)
+//   - Configure/Restore 由 Helper 负责 (单一真理源)
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "BehaviorTree/BTTaskNode.h"
 #include "BehaviorTree/BehaviorTreeTypes.h"
+#include "Systems/AI/AIFacingMoveHelper.h" // v40.10: 复用工具
 #include "BTTask_MoveAwayFromTarget.generated.h"
 
 class AAIController;
@@ -86,10 +88,8 @@ private:
 		bool bMoveStarted = false;
 		float WaitTime = 0.f;
 
-		// v23.2: 保存 Pawn 原 Movement 设置 (ExecuteTask 时存, 完成/Abort 时恢复)
-		bool bMovementSettingsSaved = false;
-		bool bSavedOrientRotationToMovement = false;
-		bool bSavedUseControllerDesiredRotation = false;
+		// v40.10: 朝向快照 (由 UAIFacingMoveHelper::ConfigureFacingMove 写入, RestoreFacingMove 清空)
+		FMovementOrientationSnapshot FacingSnapshot;
 	};
 
 	FORCEINLINE FTaskMemory& GetTaskMemory(uint8* NodeMemory) const
@@ -100,7 +100,4 @@ private:
 	FVector ComputeStepBackLocation(APawn* AIPawn, AActor* TargetActor) const;
 	bool StartMoveTo(UBehaviorTreeComponent& OwnerComp, const FVector& Dest);
 	void CheckArrival(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory);
-
-	// v23.2: 恢复 Pawn 原 Movement 设置
-	void RestoreMovementSettings(FTaskMemory& Mem, AAIController* AIC) const;
 };

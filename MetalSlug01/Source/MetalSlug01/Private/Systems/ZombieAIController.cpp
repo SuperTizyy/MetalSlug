@@ -84,6 +84,7 @@ void AZombieAIController::SetupZombieAI(UAIBehaviorConfigSO* ZombieConfig)
 		{
 			EffectiveFaction = MyPawn->FactionTag;
 			SetCachedFactionTag(EffectiveFaction);
+			SetCachedIsMother(false); // 【v109.1 大厂架构】新 Spawn 的生化 AI 初始为非母体
 		}
 	}
 

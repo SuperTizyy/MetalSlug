@@ -15,6 +15,7 @@
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "AIController.h" // v108 — FilterCandidatesByPolicy 判 AI vs Player
 #include "Math/UnrealMathUtility.h"
 
 // ==========================================
@@ -153,32 +154,111 @@ void URoomMotherMutationSubsystem::HandleCountdownExpired()
 		return;
 	}
 
-	// 2. 随机选母体
-	ABaseCharacter* Selected = SelectRandomTarget(Candidates);
-	if (!Selected)
+	// 【v108 大厂架构新增】按策略过滤候选 (AIOnly / PlayerOnly / Random)
+	// 真理源: Lifecycle.CachedMotherSelectionPolicy ← GM.MotherSelectionPolicy (InitGame 一次性注入)
+	EMotherSelectionPolicy Policy = EMotherSelectionPolicy::Random;
+	if (Lifecycle)
+	{
+		Policy = Lifecycle->GetCachedMotherSelectionPolicy();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] HandleCountdownExpired: Lifecycle 未注入, 默认走 Random 策略. "
+			     "【修复】检查 ARoomGameMode::InjectSubsystemConfigs."));
+	}
+	TArray<ABaseCharacter*> FilteredCandidates = FilterCandidatesByPolicy(Candidates, Policy);
+
+	// 大厂原则 — 零兜底: 策略过滤后候选空 → 报错 + 退出 (用户决策: 强制策划扩玩家/AI 数量)
+	if (FilteredCandidates.Num() == 0)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[MotherMutation] HandleCountdownExpired: 选母体失败 (Selected=nullptr), 拒绝触发变异."));
+			TEXT("[MotherMutation] HandleCountdownExpired: 策略过滤后候选空 (Policy=%d, 原候选=%d). "
+			     "【根因】1) AIOnly 模式但全是玩家; "
+			     "2) PlayerOnly 模式但全是 AI; "
+			     "3) 候选 Pawn Controller 全部为空 (BP 配错)."),
+			static_cast<int32>(Policy), Candidates.Num());
 		return;
 	}
+
+	// 【v108 大厂架构新增】获取母体变异数量 (GM 注入, 默认 1)
+	int32 MotherCount = 1;
+	if (Lifecycle)
+	{
+		MotherCount = Lifecycle->GetCachedMotherMutationCount();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] HandleCountdownExpired: Lifecycle 未注入, 默认 MotherCount=1."));
+	}
+
+	// 大厂原则 — 显式优于隐式: Clamp 校验 (Lifecycle 已 ClampMin=1, 但防御性再校验)
+	MotherCount = FMath::Max(1, MotherCount);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] HandleCountdownExpired: 候选 %d → 策略过滤后 %d → 即将变异 %d 个母体 (Policy=%d)"),
+		Candidates.Num(), FilteredCandidates.Num(), MotherCount, static_cast<int32>(Policy));
 
 	// 3. 标记 (防御层 1 + 2 写入)
 	bMotherMutationFired_Local = true;
 	RoomGS->MarkMotherMutationFired();
 
-	UE_LOG(LogTemp, Display,
-		TEXT("[MotherMutation] HandleCountdownExpired: 选中母体 '%s' (%s), 即将变异"),
-		*Selected->GetName(),
-		*GetNameSafe(Selected->GetController()));
-
-	// 4. 触发变异
-	const bool bSuccess = MutateCharacterToMother(Selected);
-	if (!bSuccess)
+	// 【v108 大厂架构重构】循环选 N 个目标, 每个选完从清单移除 (避免重复选同一人)
+	int32 ActualMutated = 0;
+	for (int32 i = 0; i < MotherCount; ++i)
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[MotherMutation] HandleCountdownExpired: MutateCharacterToMother 失败, 但已标记 MotherMutationHasFired, "
-			     "本局将不再触发. 排查 BP_MuTi 蓝图类加载 / SpawnSubsystem 配置."));
+		// 实时检查候选清单 (循环中可能被前面变异导致死亡而失效)
+		if (FilteredCandidates.Num() == 0)
+		{
+			// 大厂原则 — 零兜底 (用户决策): 候选不足 → Log Error + 中断循环 (强制策划扩玩家/AI)
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] HandleCountdownExpired: 候选不足 (期望=%d, 已变异=%d, 剩余=%d). "
+				     "【根因】场景中活人不够, 部分母体未生成. "
+				     "【修复】增加玩家/AI 数量, 或降低 GM.MotherMutationCount."),
+				MotherCount, ActualMutated, FilteredCandidates.Num());
+			break;
+		}
+
+		// 2. 选母体
+		ABaseCharacter* Selected = SelectRandomTarget(FilteredCandidates);
+		if (!Selected)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] HandleCountdownExpired: 选母体失败 (i=%d/%d), 拒绝继续. "
+				     "【根因】候选清单中有 nullptr 或角色刚好被销毁."),
+				i + 1, MotherCount);
+			break;
+		}
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] HandleCountdownExpired: 第 %d/%d 个母体 选中 '%s' (%s)"),
+			i + 1, MotherCount,
+			*Selected->GetName(),
+			*GetNameSafe(Selected->GetController()));
+
+		// 4. 触发变异
+		const bool bSuccess = MutateCharacterToMother(Selected);
+		if (!bSuccess)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] HandleCountdownExpired: MutateCharacterToMother 失败 (i=%d/%d, Target='%s'). "
+				     "继续选下一个, 但本局已标记 MotherMutationHasFired, 不再重复触发."),
+				i + 1, MotherCount, *Selected->GetName());
+			// 大厂原则: 即使失败也继续 (失败原因通常与本次循环无关, 不阻塞)
+		}
+		else
+		{
+			++ActualMutated;
+		}
+
+		// 大厂原则 — 显式优于隐式: 选完即从清单移除 (避免重复选同一人)
+		FilteredCandidates.Remove(Selected);
 	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] HandleCountdownExpired: 完成 (期望=%d, 实际变异成功=%d)"),
+		MotherCount, ActualMutated);
 }
 
 
@@ -289,6 +369,98 @@ ABaseCharacter* URoomMotherMutationSubsystem::SelectRandomTarget(const TArray<AB
 	}
 
 	return Selected;
+}
+
+
+// ==========================================
+// 【v108 大厂架构新增 — 策略过滤候选】
+// ==========================================
+
+TArray<ABaseCharacter*> URoomMotherMutationSubsystem::FilterCandidatesByPolicy(
+	const TArray<ABaseCharacter*>& Candidates,
+	EMotherSelectionPolicy Policy)
+{
+	TArray<ABaseCharacter*> Filtered;
+
+	switch (Policy)
+	{
+	case EMotherSelectionPolicy::Random:
+	{
+		// Random: 不过滤, 全部候选都可被选中
+		Filtered = Candidates;
+		break;
+	}
+
+	case EMotherSelectionPolicy::AIOnly:
+	{
+		// AIOnly: 只保留 AI Pawn (Controller 是 AAIController 派生)
+		Filtered.Reserve(Candidates.Num());
+		for (ABaseCharacter* Char : Candidates)
+		{
+			if (!IsValid(Char))
+			{
+				continue;
+			}
+			AController* Ctrl = Char->GetController();
+			if (!Ctrl)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[MotherMutation] FilterCandidatesByPolicy(AIOnly): '%s' Controller 为空, 跳过. "
+					     "【根因】BP 配错 / Pawn 未成功 Possess."),
+					*Char->GetName());
+				continue;
+			}
+			if (Ctrl->IsA<AAIController>())
+			{
+				Filtered.Add(Char);
+			}
+		}
+		break;
+	}
+
+	case EMotherSelectionPolicy::PlayerOnly:
+	{
+		// PlayerOnly: 只保留玩家 Pawn (Controller 是 APlayerController 派生)
+		Filtered.Reserve(Candidates.Num());
+		for (ABaseCharacter* Char : Candidates)
+		{
+			if (!IsValid(Char))
+			{
+				continue;
+			}
+			AController* Ctrl = Char->GetController();
+			if (!Ctrl)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[MotherMutation] FilterCandidatesByPolicy(PlayerOnly): '%s' Controller 为空, 跳过. "
+					     "【根因】BP 配错 / Pawn 未成功 Possess."),
+					*Char->GetName());
+				continue;
+			}
+			if (Ctrl->IsA<APlayerController>())
+			{
+				Filtered.Add(Char);
+			}
+		}
+		break;
+	}
+
+	default:
+	{
+		// 防御性: 枚举值非法 (理论上不应发生, 但 UE UENUM 加新值时不写 case 会落到这里)
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] FilterCandidatesByPolicy: 未知策略=%d, 拒绝过滤. "
+			     "【修复】检查 EMotherSelectionPolicy 枚举是否新增了值未处理."),
+			static_cast<int32>(Policy));
+		break;
+	}
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] FilterCandidatesByPolicy: Policy=%d 候选 %d → 过滤后 %d"),
+		static_cast<int32>(Policy), Candidates.Num(), Filtered.Num());
+
+	return Filtered;
 }
 
 
@@ -541,4 +713,116 @@ int32 URoomMotherMutationSubsystem::GetMotherMutationCount() const
 		return RoomGS->MotherMutationCount;
 	}
 	return 0;
+}
+
+
+// ==========================================
+// 【v107 2026.07.28 生化模式 BT】存活母体数
+// ==========================================
+//
+// 严格定义 (用户 2026.07.28 明确):
+//   - AliveMotherCount == 1 才算"只剩一个母体" — 人类追杀分支触发条件
+//   - 死掉的母体不计入 (Pawn Destroy 后自动失效)
+//   - 复活中的母体不计入 (Pawn 还没生成)
+//   - 等待变异的"候选人类"不计入 (还没变异)
+//
+// 大厂原则 — 单一真理源:
+//   - 不 GetAllActorsOfClass 散查
+//   - MotherCharacters 是业务账本 (TArray<TWeakObjectPtr<ABaseCharacter>>)
+//   - TWeakObjectPtr 自动失效: 死亡 Pawn 自然被跳过
+//   - 遍历时验证 IsValid + !IsDead + bIsMother
+
+int32 URoomMotherMutationSubsystem::GetAliveMotherCount() const
+{
+	int32 AliveCount = 0;
+
+	for (const TWeakObjectPtr<ABaseCharacter>& WeakMother : MotherCharacters)
+	{
+		const ABaseCharacter* Mother = WeakMother.Get();
+		if (!IsValid(Mother))           { continue; } // Pawn 已销毁
+		if (Mother->IsDead())           { continue; } // 死亡 (复活不算存活)
+		if (!Mother->bIsMother)         { continue; } // 数据不一致保护
+		++AliveCount;
+	}
+
+	return AliveCount;
+}
+
+
+// ==========================================
+// 【v107 2026.07.28 生化模式 BT】存活人类数
+// ==========================================
+//
+// 严格定义:
+//   - 玩家 Pawn + AI Pawn, 全对局内所有 ABaseCharacter
+//   - !IsDead() && !bIsMother (排除死亡 + 已变异母体)
+//
+// 大厂原则 — 单一真理源:
+//   - 走 URoomSpawnSubsystem::GetAllBattleCharacters() (业务层账本)
+//   - 不 GetAllActorsOfClass (散查反模式)
+//
+// 注: 母体账本中的母体如果"被感染再次变异" (业务不允许), 这里会重复计入 — 防御层靠 !bIsMother 排除
+// 注: 此函数每 ZombieTargetRefreshIntervalSeconds 调用一次, N<=20 性能可接受
+
+int32 URoomMotherMutationSubsystem::GetAliveHumanCount() const
+{
+	int32 AliveCount = 0;
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return 0;
+	}
+
+	if (!Spawn)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] GetAliveHumanCount: SpawnSubsystem 未注入, 返回 0. "
+			     "【修复】检查 URoomMotherMutationSubsystem::InitializeSubsystem 是否被 ARoomGameMode::InjectSubsystemConfigs 调用."));
+		return 0;
+	}
+
+	const TArray<ABaseCharacter*> AllBattleChars = Spawn->GetAllBattleCharacters();
+
+	// 【v108 大厂可观测性】记录扫描结果
+	if (AllBattleChars.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] GetAliveHumanCount: GetAllBattleCharacters 返回空! "
+			     "【根因】场景中无 ABaseCharacter Pawn (玩家/AI 均未生成). "
+			     "检查: 1) 战斗是否已开始 (PerformGameStart 是否调用); "
+			     "2) 玩家/AI 是否成功 Spawn; "
+			     "3) ABaseCharacter::bPendingDestruction 残留导致遍历被过滤."));
+	}
+
+	for (ABaseCharacter* Char : AllBattleChars)
+	{
+		if (!IsValid(Char))      { continue; }
+		if (Char->IsDead())     { continue; } // 死亡排除
+		if (Char->bIsMother)   { continue; } // 已变异母体排除
+		++AliveCount;
+	}
+
+	// 【v108 大厂可观测性】记录结果
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] GetAliveHumanCount: AllChars=%d → 有效人类=%d"),
+		AllBattleChars.Num(), AliveCount);
+
+	return AliveCount;
+}
+
+
+// ==========================================
+// 【v108 大厂架构】新回合开始时重置母体账本
+// ==========================================
+
+void URoomMotherMutationSubsystem::ResetForNewRound()
+{
+	const int32 OldCount = MotherCharacters.Num();
+	MotherCharacters.Empty();
+	bMotherMutationFired_Local = false;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] ResetForNewRound: 清空 MotherCharacters (%d→0), 重置 bMotherMutationFired_Local."),
+		OldCount);
 }

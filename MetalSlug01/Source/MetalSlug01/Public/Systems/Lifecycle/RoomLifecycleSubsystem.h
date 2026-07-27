@@ -35,6 +35,10 @@
 // Room 共享枚举 (ERoomState / ERoomMatchMode)
 #include "Data/Enums/RoomEnums.h"
 
+// v108 — EMotherSelectionPolicy (母体变异目标选择策略)
+// 业务可配 (GameMode.MotherSelectionPolicy → Subsystem.CachedMotherSelectionPolicy)
+#include "Systems/AI/AIBehaviorTypes.h"
+
 // 自动生成的反射头 — 必须放在所有 #include 之后, forward declaration 之前
 // 大厂注意 (UE 5.6 UHT 严格模式): .generated.h 必须用裸文件名, 不能带目录前缀
 //   UHT Parser 中: includeNameString 跟 GeneratedHeaderFileName 做字面 OrdinalIgnoreCase 比对
@@ -203,6 +207,38 @@ public:
 	 */
 	void SetMotherMutationDuration(float InSeconds) { MotherMutationDurationSeconds = InSeconds; }
 
+	/**
+	 * 【v108 大厂架构新增】注入母体变异数量
+	 * @param InCount 数量 (来自 GameMode.MotherMutationCount, 已 ClampMin=1 ClampMax=10)
+	 * @note 注入时机: InitGame 一次性, 改配置需重启游戏 (用户决策)
+	 */
+	void SetMotherMutationCount(int32 InCount)
+	{
+		CachedMotherMutationCount = FMath::Max(1, InCount);
+	}
+
+	/**
+	 * 【v108 大厂架构新增】注入母体变异目标选择策略
+	 * @param InPolicy 策略 (来自 GameMode.MotherSelectionPolicy)
+	 * @note 注入时机: InitGame 一次性, 改配置需重启游戏 (用户决策)
+	 */
+	void SetMotherSelectionPolicy(EMotherSelectionPolicy InPolicy)
+	{
+		CachedMotherSelectionPolicy = InPolicy;
+	}
+
+	/**
+	 * 【v108 大厂架构新增】读取母体变异数量 (供 MotherMutationSubsystem 在 SetTimer 回调中读取)
+	 * @return GameMode 注入的母体数量 (默认 1)
+	 */
+	int32 GetCachedMotherMutationCount() const { return CachedMotherMutationCount; }
+
+	/**
+	 * 【v108 大厂架构新增】读取母体变异目标选择策略
+	 * @return GameMode 注入的策略枚举 (默认 Random)
+	 */
+	EMotherSelectionPolicy GetCachedMotherSelectionPolicy() const { return CachedMotherSelectionPolicy; }
+
 	// ==========================================
 	// 查询接口
 	// ==========================================
@@ -263,6 +299,29 @@ protected:
 	 * <= 0 表示禁用 (匹配逻辑里不启动倒计时)
 	 */
 	float MotherMutationDurationSeconds = 8.0f;
+
+	/**
+	 * 【v108 大厂架构新增】母体变异数量 (由 GameMode.MotherMutationCount 注入)
+	 *
+	 * 业务规则: 倒计时结束后生成多少个母体
+	 * - 默认 1 (跟现状一致, 最小风险)
+	 * - ClampMin=1, ClampMax=10 由 GM 暴露字段控制
+	 *
+	 * 数据流: GameMode.MotherMutationCount → Subsystem (InitGame 一次性注入, 改配置需重启游戏)
+	 * 读取方: URoomMotherMutationSubsystem::HandleCountdownExpired (SetTimer 回调, 此刻需要访问)
+	 */
+	int32 CachedMotherMutationCount = 1;
+
+	/**
+	 * 【v108 大厂架构新增】母体变异目标选择策略 (由 GameMode.MotherSelectionPolicy 注入)
+	 *
+	 * 业务规则: 倒计时结束后按什么策略选目标
+	 * - Random / AIOnly / PlayerOnly (见 EMotherSelectionPolicy)
+	 *
+	 * 数据流: GameMode.MotherSelectionPolicy → Subsystem (InitGame 一次性注入)
+	 * 读取方: URoomMotherMutationSubsystem::HandleCountdownExpired
+	 */
+	EMotherSelectionPolicy CachedMotherSelectionPolicy = EMotherSelectionPolicy::Random;
 
 	/**
 	 * 开局延迟秒数 (由 GameMode 注入, 启动 PerformGameStart 时写入)

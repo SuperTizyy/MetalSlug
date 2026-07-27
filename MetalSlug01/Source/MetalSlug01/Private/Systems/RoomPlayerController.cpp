@@ -672,7 +672,23 @@ void ARoomPlayerController::Server_QueueAIForBattleSpawn_Implementation(const FA
  */
 void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& PlayerNameToKick)
 {
-	if (!HasAuthority()) return;
+	// 【v115.4 大厂架构诊断】函数入口立即记录（使用 Error 级别确保输出）
+	UE_LOG(LogTemp, Error,
+		TEXT("[KickPlayer] 【v115.4-FUNC-ENTRY】Server_KickPlayer_Implementation ENTER: PlayerNameToKick='%s', HasAuth=%d, PC='%s'"),
+		*PlayerNameToKick, HasAuthority() ? 1 : 0, *GetName());
+
+	// 【v115.3 大厂架构诊断】记录每次调用
+	UE_LOG(LogTemp, Warning,
+		TEXT("[KickPlayer] 【v115.3-Diag】Server_KickPlayer 被调用: PlayerNameToKick='%s', HasAuthority=%d, PC='%s', World='%s'"),
+		*PlayerNameToKick, HasAuthority() ? 1 : 0,
+		*GetName(),
+		GetWorld() ? *GetWorld()->GetName() : TEXT("NULL"));
+
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[KickPlayer] 【v115.4-拒绝】HasAuthority=false, 直接 return"));
+		return;
+	}
 
 	// ==========================================
 	// 阶段 1: 检查是否是 AI 占位 (大厅阶段 PendingAIQueue 里有这个 DisplayName)
@@ -692,6 +708,10 @@ void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& Play
 	// 阶段 2: 检查是否是已生成的 AI (战斗阶段, 有 AIController)
 	// ==========================================
 	bool bIsAIController = false;
+	
+	// 【v115.2 大厂架构诊断】记录当前所有 Controller
+	UE_LOG(LogTemp, Display, TEXT("[KickPlayer] 【v115.2-Diag】开始遍历所有 Controller..."));
+	
 	for (FConstControllerIterator It = GetWorld()->GetControllerIterator(); It; ++It)
 	{
 		if (AAIController* AIC = Cast<AAIController>(It->Get()))
@@ -699,13 +719,24 @@ void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& Play
 			// AI Controller 的名字格式: AIC_AI_GruntAI_1 (SpawnAIInternal 里拼的)
 			// PlayerNameToKick 是 "AI_GruntAI_1" 格式
 			const FString AICName = AIC->GetName();
-			if (AICName.EndsWith(PlayerNameToKick))
+			// 【v115 大厂架构修复】使用精确匹配而非 EndsWith
+			// 根因: 旧代码 "AIC_AI_SWAT_AI_5".EndsWith("AI_SWAT_AI_5") = true
+			//        导致踢 "AI_SWAT_AI_5" 时错误匹配到 "AIC_AI_SWAT_AI_5"！
+			// 修复: 只接受 "AIC_" + PlayerNameToKick 的精确前缀匹配
+			const FString ExpectedFullName = TEXT("AIC_") + PlayerNameToKick;
+			
+			// 【v115.2 大厂架构诊断】记录每个 Controller 的匹配检查
+			UE_LOG(LogTemp, Display,
+				TEXT("[KickPlayer] 检查 Controller: AICName='%s' vs ExpectedFullName='%s', Match=%d"),
+				*AICName, *ExpectedFullName, AICName == ExpectedFullName ? 1 : 0);
+			
+			if (AICName == ExpectedFullName)
 			{
 				// 大厂原则 - 显式意图: 战斗阶段 AI 是真人在打, 不允许"房主踢 AI"瞬间消失
 				// (战斗进行时踢 AI 等于作弊)
 				// 但用户当前是测试期, 先支持踢, 后续可加"战斗中禁止踢 AI"规则
 				UE_LOG(LogTemp, Warning,
-					TEXT("[KickPlayer] 战斗阶段踢 AI '%s' (AIC='%s') — 立即销毁 Controller, 残留 Pawn 由 UE GC"),
+					TEXT("[KickPlayer] 【v115.2-严重】准备销毁 AI Controller: PlayerNameToKick='%s' AIC='%s' — 这是踢人操作!"),
 					*PlayerNameToKick, *AICName);
 				AIC->Destroy();
 				bIsAIController = true;
@@ -713,7 +744,10 @@ void ARoomPlayerController::Server_KickPlayer_Implementation(const FString& Play
 			}
 		}
 	}
+	
 	if (bIsAIController) return;
+	
+	UE_LOG(LogTemp, Display, TEXT("[KickPlayer] 【v115.2-Diag】没有匹配到 AI Controller, 继续检查其他阶段..."));
 
 	// ==========================================
 	// 阶段 3: 真人玩家 — 走原有逻辑

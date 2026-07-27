@@ -1,0 +1,391 @@
+# 【v107 2026.07.28】生化模式 BT/BB 编辑器配置清单 (大厂架构)
+
+> 本文档配套代码实现: 用户在 UE 5.6 编辑器手工创建的资产 + 配置路径。
+> 所有 C++ 侧的字段、Service、Task 已完成 (见 `Source/MetalSlug01/`),
+> 本文档只覆盖**编辑器侧**一次性配置 (创建资产 + 链接蓝图)。
+
+---
+
+## 1. 资产文件结构
+
+```
+Content/
+├── Blueprints/
+│   ├── AI/
+│   │   ├── BB_ZombieModeAI.uasset       ← 新建 (Blackboard Data)
+│   │   ├── BT_ZombieModeAI.uasset       ← 新建 (Behavior Tree)
+│   │   └── BP_ZombieAIController.uasset ← 新建 (继承 AZombieAIController)
+│   ├── Objectives/
+│   │   └── BP_ZombieRallyPoint.uasset   ← 新建 (继承 AZombieRallyPoint)
+│   └── Data/
+│       └── DA_AIBehaviorConfig_ZombieHuman.uasset ← 新建 (继承 UAIBehaviorConfigSO)
+```
+
+---
+
+## 2. BB_ZombieModeAI 必备 Blackboard Keys
+
+打开 `BB_ZombieModeAI.uasset`,创建以下 Keys:
+
+### 2.1 复用 Melee 公共 Key (与 BB_AI_Melee 同名, 让 BT 原生 Decorator 可复用)
+
+| Key Name | Type | 说明 |
+|---|---|---|
+| `TargetActor` | Object (AActor) | 通用目标 (镜像当前身份的目标) |
+| `DistanceToTarget` | Float | 距离目标距离 |
+| `bHasTarget` | Bool | 是否有目标 |
+| `HealthPercent` | Float | 血量百分比 |
+| `AttackRange` | Float | (复用, 母体攻击距离用) |
+
+### 2.2 生化专属 Key (与 Melee 完全隔离)
+
+| Key Name | Type | 说明 | 真理源 |
+|---|---|---|---|
+| `bIsMother` | Bool | Pawn 是否是母体 | `BaseCharacter::bIsMother` (已 Replicated) |
+| `bIsHuman` | Bool | Pawn 是否是人类 | `BaseCharacter::bIsHuman` |
+| `AliveMotherCount` | Int | 存活母体数 | `URoomMotherMutationSubsystem::GetAliveMotherCount()` |
+| `AliveHumanCount` | Int | 存活人类数 | `URoomMotherMutationSubsystem::GetAliveHumanCount()` |
+| `NearestHumanTarget` | Object (AActor) | 母体最近人类 | `BTService_UpdateZombieTargets` |
+| `NearestMotherTarget` | Object (AActor) | 人类最近母体 | `BTService_UpdateZombieTargets` |
+| `LockedRallyPoint` | Object (AActor) | 锁定集合点 | `BTTask_SelectZombieRallyPoint` |
+| `bRallyPointLocked` | Bool | 是否已锁点 | 同上 |
+| `DistanceToRallyPoint` | Float | 距离集合点 | 同上 |
+| `CurrentAmmo` | Int | 弹夹弹药 | `BTService_UpdateWeaponAmmo` |
+| `MagazineSize` | Int | 弹夹容量 | 同上 |
+| `ReserveAmmo` | Int | 备用弹药 | 同上 |
+| `bIsReloading` | Bool | 换弹中 | 同上 |
+| `bAmmoSupplyAvailable` | Bool | 弹药补给可用 (预留 false) | 业务未开放, 保持 false |
+| `AmmoSupplyTarget` | Object (AActor) | 弹药补给目标 (预留 null) | 业务未开放 |
+
+---
+
+## 3. BT_ZombieModeAI 编辑器结构
+
+打开 `BT_ZombieModeAI.uasset`,选择 BB 为 `BB_ZombieModeAI`,按以下结构搭建:
+
+### 3.0 Root 配置 (⚠️ 关键配置)
+
+```
+Root (Selector)  ← 在 Details 面板配置以下两项:
+├── Service_UpdateZombieState   (挂根, 0.25s 派生身份+人数快照)
+├── Service_UpdateZombieTargets (挂根, 0.25s 派生最近目标)
+└── Service_UpdateWeaponAmmo    (挂根, 0.10s 派生弹药状态)
+```
+
+**⚠️ Service 配置警告 (必读):**
+- `Service_UpdateWeaponAmmo` → `MagazineSizeKey` 的 BB Key Selector 必须选 **`MagazineSize`**
+  - ❌ 不要选 `MaxMagazineAmmo` (C++ 写入的 Key 名是 `MagazineSize`)
+  - 选错 Key 名 → 弹药状态写入错误 Key → 后续 Decorator 永远读到 0 → 人类永不开火
+- Root Selector 详情面板 → 勾 **`Restart Tree on Search Abort = true`**
+  - 身份切换时立即重启 BT,不等下一 Tick
+
+### 3.1 母体分支 — Sequence "Mother: Chase and Infect"
+
+```
+Sequence "Mother: Chase and Infect"
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bIsMother, Query: Is Set (true)
+│
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: NearestHumanTarget, Query: Is Set
+│
+├── BTTask: Rotate to face BB entry (UE 原生)
+│   └── Key: TargetActor
+│
+├── BTTask: Move To (UE 原生) ★ [v107 新增,勿漏]
+│   ├── Key: TargetActor
+│   ├── Acceptance Radius: 150 (cm, 贴近就够)
+│   └── bObserveTarget: false
+│
+├── BTTask: PlayAttackMontage (复用 Melee)
+│   ├── 执行结果: Succeeded → 走下个 Task WaitMontageFinish
+│   └── 异常: 没要到蒙太奇 → 上游 Decorator 拦截 (不卡死)
+│
+└── BTTask: WaitMontageFinish (复用 Melee)
+    ├── Wait Time: 1.00s
+    └── Wait Timeout: 3.0s  ← ★ 建议不超过 3s (蒙太奇通常 1-2s)
+```
+
+### 3.2 人类最后母体分支 — Sequence "Human: Last Mother Pursuit"
+
+```
+Sequence "Human: Last Mother Pursuit"
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bIsHuman, Query: Is Set (true)
+│
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: AliveMotherCount, Query: Numeric Value == 1
+│
+├── Decorator: Blackboard Based Condition  ★ [v107 新增,勿漏]
+│   ├── Observer Aborts: Both
+│   └── BB Key: NearestMotherTarget, Query: Is Set (确保有目标再追)
+│
+└── SimpleParallel (Finish with main task)
+    │
+    ├── Main Task:
+    │   BTTask: Move To (UE 原生)
+    │       ├── Key: TargetActor (= NearestMotherTarget)
+    │       ├── Acceptance Radius: 200 (cm)
+    │       └── bObserveTarget: true  ← 边走边看,关键
+    │
+    └── Background Tree: "持续射击子树"
+        │
+        ├── Decorator: Blackboard Based Condition
+        │   └── BB Key: NearestMotherTarget, Query: Is Set  ★ [v107 新增]
+        │
+        ├── Decorator: CooldownReady (复用 Melee)
+        │   └── CooldownEndTimeKey: CooldownEndTime
+        │
+        ├── Decorator: Zombie Ammo Empty  ★ [必须 Invert]
+        │   └── CurrentAmmoKey: CurrentAmmo
+        │   └── ⚠️ 右键 → Invert = true (语义: 弹药非空才放行)
+        │
+        ├── Loop (UE 原生, Infinite)
+        │
+        ├── BTTask: StartPrimaryFire
+        │   └── TargetActorKey: TargetActor
+        │
+        ├── Wait (UE 原生, Wait Time: 1.00s)  ← 与 ConfigSO.ZombieMoveAndFireBurstSeconds 匹配
+        │
+        └── BTTask: StopPrimaryFire
+```
+
+### 3.3 人类补给分支 — Sequence "Human: Find Ammo Supply"
+
+```
+Sequence "Human: Find Ammo Supply"
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bIsHuman, Query: Is Set (true)
+│
+├── Decorator: Zombie Ammo Empty
+│   ├── Observer Aborts: Both
+│   └── CurrentAmmoKey: CurrentAmmo
+│   └── ⚠️ 此 Decorator 语义: CurrentAmmo <= 0 → 返回 true → 放行 (弹药空才找补给,无需 Invert)
+│
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bAmmoSupplyAvailable, Query: Is Set (true)
+│   └── ⚠️ 当前为 false → 此分支实际不会进入 (补给未开放,属于正常行为)
+│
+├── BTTask: Move To (UE 原生)
+│   └── Key: AmmoSupplyTarget
+│
+└── BTTask: ReloadPrimaryWeapon (自定义)
+    └── 失败: 无武器/满弹药/正在换弹 → 返回 Failed
+```
+
+### 3.4 人类守点分支 — Sequence "Human: Rally Guard"
+
+```
+Sequence "Human: Rally Guard"
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bIsHuman, Query: Is Set (true)
+│
+├── Decorator: Blackboard Based Condition
+│   ├── Observer Aborts: Both
+│   └── BB Key: bRallyPointLocked, Query: Is Not Set (false)
+│   └── ⚠️ bRallyPointLocked == true 时此分支不进入 (已锁点,不走守点分支)
+│
+├── BTTask: SelectZombieRallyPoint (自定义)
+│   └── 选点逻辑: Nearest (最近点) 或 MostPopulated (人类最多点)
+│   └── 失败: 无集合点 / NavMesh 不可达 → 返回 Failed (BT 不兜底漫游)
+│
+└── SimpleParallel (Finish with main task)
+    │
+    ├── Main Task:
+    │   BTTask: Move To (UE 原生)
+    │       ├── Key: LockedRallyPoint
+    │       ├── Acceptance Radius: 80 (ConfigSO.ZombieRallyArrivalRadius)
+    │       └── bObserveTarget: true
+    │
+    └── Background Tree: "持续观察射击子树"
+        │
+        ├── Decorator: Blackboard Based Condition
+        │   └── BB Key: NearestMotherTarget, Query: Is Set
+        │
+        ├── Decorator: CooldownReady (复用 Melee)  ★ [v107 新增]
+        │   └── CooldownEndTimeKey: CooldownEndTime
+        │
+        ├── Decorator: Zombie Ammo Empty  ★ [必须 Invert]
+        │   ├── CurrentAmmoKey: CurrentAmmo
+        │   └── ⚠️ 右键 → Invert = true (语义: 弹药非空才放行开火)
+        │
+        ├── Loop (UE 原生, Infinite)
+        │
+        ├── BTTask: StartPrimaryFire
+        │   └── TargetActorKey: TargetActor
+        │
+        ├── Wait (UE 原生, Wait Time: 1.00s)  ← 与 ConfigSO.ZombieMoveAndFireBurstSeconds 匹配
+        │
+        └── BTTask: StopPrimaryFire
+```
+
+---
+
+## ⚠️ 关键配置警告 (Editor 内必须验证)
+
+| # | 位置 | 问题 | 修复方式 |
+|---|---|---|---|
+| 🔴 | `Service_UpdateWeaponAmmo` → `MagazineSizeKey` | 选成 `MaxMagazineAmmo` 会导致弹药 BB 写入错误 Key | 选 `MagazineSize` |
+| 🔴 | `分支 2` + `分支 4` 的 `Zombie Ammo Empty` 装饰器 | 未勾 Invert → 条件反了 (空时放行,满时拒判) | 右键 → Invert = true |
+| 🟠 | `分支 1` WaitMontageFinish → `Wait Timeout` | 设 10s 过长 → 蒙太奇卡住 10s 才退出 | 建议 ≤ 3.0s |
+| 🟡 | Root Selector → `Restart Tree on Search Abort` | 不勾 → 身份切换不立即重启 BT | 勾选 |
+
+---
+
+## 4. BP_ZombieAIController 配置
+
+```
+1. 在 Content Browser → Content/Blueprints/AI/
+2. 右键 → Blueprint Class → 搜索 "ZombieAIController" → 创建 BP_ZombieAIController
+3. 打开 BP_ZombieAIController (继承自 AZombieAIController)
+4. Class Defaults → 不需要额外配置 (BT 启动继承自 BaseAIController.InitializeFromConfig)
+5. Compile + Save
+```
+
+---
+
+## 5. BP_ZombieRallyPoint 配置
+
+```
+1. Content Browser → Content/Blueprints/Objectives/
+2. 右键 → Blueprint Class → 搜索 "ZombieRallyPoint" → 创建 BP_ZombieRallyPoint
+3. 打开 BP_ZombieRallyPoint
+4. Class Defaults:
+   - PointID: "RallyA" (或其他唯一 ID, 必须非空)
+   - PopulationRadius: 800 (cm, 人数统计半径)
+   - ArrivalRadiusOverride: 0 (用 ConfigSO 默认)
+5. Compile + Save
+6. 拖 BP_ZombieRallyPoint 到关卡里,放置 3-5 个在防御位置
+   每个实例的 PointID 必须唯一 (RallyA / RallyB / RallyC / ...)
+```
+
+---
+
+## 6. DA_AIBehaviorConfig_ZombieHuman 配置
+
+```
+1. Content Browser → Content/Blueprints/Data/
+2. 右键 → Miscellaneous → Data Asset → 选 UAIBehaviorConfigSO → 创建 DA_AIBehaviorConfig_ZombieHuman
+3. 打开 DA_AIBehaviorConfig_ZombieHuman
+4. Behavior | Zombie 段 (用户配置关键参数):
+   - ZombieTargetRefreshIntervalSeconds: 0.25
+   - ZombieRallyArrivalRadius: 80
+   - ZombieRallyPopulationRadius: 800
+   - ZombiePrimaryFireRange: 3500
+   - ZombieMoveAndFireBurstSeconds: 1.0
+5. 其他段按需配置 (Profile / Perception / Combat / Movement)
+6. Compile + Save
+```
+
+---
+
+## 7. GM_RoomGameMode 配置 (ModeRulesByMode[Zombie])
+
+```
+1. 打开 Content/Blueprints/GM_RoomGameMode (BP 蓝图)
+2. Class Defaults → 找到 ModeRulesByMode 数组
+3. 展开 ERoomMatchMode::Zombie 项
+4. 配置:
+   - AIControllerClass: BP_ZombieAIController (选 BP 类)
+   - BehaviorTree: BT_ZombieModeAI (选 BT 资产)
+   - AttackTeamFaction: Faction.Offense
+   - DefenseTeamFaction: Faction.Defense
+   - bRoundBased: true (生化是回合制)
+   - TotalRounds: 5 (或自定义)
+5. Compile + Save
+
+注意:
+- Melee 项不要改 (仍是 AIControllerClass=BP_MeleeAIController, BT=BT_MeleeAI)
+- 任何 ModeRulesByMode[Zombie] 字段为空 → 大厅 AI Spawn 时 Log Error + 拒绝 Spawn
+```
+
+---
+
+## 8. BP_GruntAI (关卡预放 AI) 配置
+
+```
+1. 打开关卡预放的 BP_GruntAI (或新创 BP_ZombieHumanAI 子类)
+2. Class Defaults → AI|Phase2 段:
+   - LevelPlacedAIControllerClass: BP_ZombieAIController
+   - LevelPlacedBehaviorTree: BT_ZombieModeAI
+   - WeaponClass: BP_Weapon_Rifle (主武器, 必须配)
+3. AI Attack Components 配置 (与 Melee 同, 但 BT 启动会跑 Zombie BT):
+   - AttackInterval: 1.0 (秒, 与开火脉冲匹配)
+4. Compile + Save
+```
+
+---
+
+## 9. 母体 Pawn 配置 (感染蒙太奇 + Trace Socket)
+
+```
+1. 准备 BP_ZombieMother (继承 BP_BaseCharacter)
+2. Anim Blueprints 必须配:
+   - MotherAttackMontage: AM_MotherAttack (策划制作, 必须配)
+   - MotherAttackTraceSocketName: "RightHand_Mother" (在 Skeletal Mesh 上)
+3. WeaponFireComponent: 不配 (母体近战, 用 AIAttackComponent 走感染协议)
+4. Compile + Save
+```
+
+---
+
+## 10. 验证清单 (编译后 PIE)
+
+```
+□ 编译通过 (UHT + C++, 0 error)
+□ 地图放置至少 3 个 BP_ZombieRallyPoint, PointID 唯一 (RallyA/B/C)
+□ 关卡内 NavMeshBoundsVolume 已 Build Paths
+□ PIE 进游戏 (Listen Server)
+□ 关卡预放 BP_GruntAI 在地图里
+□ 倒计时结束前 AI 是人类, 自动选最近集合点并走过去
+□ AI 选集合点 → 站在点上守 (BT 守点分支)
+□ 选点完成后, 同一 AI 第二次重新选 → 不重选 (LockedRallyPoint 已设, bRallyPointLocked=true)
+□ 标记某个 AI 为母体 → BT 切到母体分支 → 找最近人类并感染
+□ 母体死亡 → 复活成人类 → 重新选集合点
+□ 母体数 > 人类数 → 重新匹配的 AI 选"人类最多集合点"
+□ 关闭补给预留逻辑 (bAmmoSupplyAvailable=false) → 弹药空且无备弹时, AI 守点停火不漫游
+□ HUD 显示武器图标 + 弹药数 (WeaponFireComponent 同步正确)
+□ 切到 Melee 模式 → BT_MeleeAI 正常加载, 刀战逻辑不受影响 (模式隔离验证)
+□ Listen Server + 远端客户端: 集合点选点/感染/弹药同步正确 (服务器权威验证)
+```
+
+---
+
+## 11. 已知约束 (大厂架构原则 — 不允许绕过)
+
+| 约束 | 后果 |
+|---|---|
+| 关卡无集合点 | BT Service 派生失败, AI 静止 (不漫游, 不兜底) |
+| PointID 重复 | Subsystem 拒绝注册 + Log Error |
+| DA_AIProfile_*.WeaponID 为空 | 武器不生成 + Log Error (已有 v36 修复) |
+| 武器缺 WeaponFireComponent | BTService_UpdateWeaponAmmo Log Warning + BB 不可开火 |
+| 母体无 MotherAttackMontage | OnAIRequestAttack_Simple 警告, BT 跳过攻击 (不动目标) |
+| ModeRules[Zombie].BehaviorTree 为空 | SpawnAIInternal 拒绝 + Log Error |
+| ModeRules[Zombie].AIControllerClass 为空 | SpawnAIInternal 拒绝 + Log Error |
+
+---
+
+## 12. 配套代码索引
+
+| 类型 | 文件 |
+|---|---|
+| Blackboard Key Names | `Public/Systems/AI/AIBehaviorTypes.h` |
+| Config (Zombie 段) | `Public/Data/AI/AIBehaviorConfigSO.h` |
+| 人数真理源 | `Public/Systems/Mother/RoomMotherMutationSubsystem.h/.cpp` |
+| 集合点 Actor | `Public/World/Objectives/ZombieRallyPoint.h/.cpp` |
+| 集合点 Subsystem | `Public/Systems/Zombie/RoomZombieRallySubsystem.h/.cpp` |
+| BT Service: 身份+人数 | `Public/Systems/AI/Services/BTService_UpdateZombieState.h/.cpp` |
+| BT Service: 目标选择 | `Public/Systems/AI/Services/BTService_UpdateZombieTargets.h/.cpp` |
+| BT Service: 弹药快照 | `Public/Systems/AI/Services/BTService_UpdateWeaponAmmo.h/.cpp` |
+| BT Task: 选点 | `Public/Systems/AI/Tasks/BTTask_SelectZombieRallyPoint.h/.cpp` |
+| BT Task: 开火/停火 | `Public/Systems/AI/Tasks/BTTask_StartPrimaryFire.h/.cpp` |
+| BT Task: 换弹 | `Public/Systems/AI/Tasks/BTTask_ReloadPrimaryWeapon.h/.cpp` |
+| BT Decorator: 弹药空 | `Public/Systems/AI/Decorators/BTDecorator_ZombieAmmoEmpty.h/.cpp` |
+| AIController | `Public/Systems/ZombieAIController.h/.cpp` (已存在) |

@@ -44,6 +44,9 @@
 // 包含 RoomGameMode 以调 RequestRespawn
 #include "Systems/RoomGameMode.h"
 
+// 【v109 大厂架构】包含 BaseAIController 以设置 CachedIsMother 复活真理源
+#include "Systems/BaseAIController.h"
+
 // 【v39 修复】包含 RoomSpawnSubsystem 以调 ReleaseSpawnPoint
 // 根因: ReleaseSpawnPoint 整个项目 0 调用 — 死亡时出生点永远不释放
 //       → 玩家复活时 GetAvailableSpawnPointForFaction 看到全部 5 个出生点被占用 → 返回 nullptr → 拒绝 Spawn → 玩家不复活
@@ -65,6 +68,9 @@
 
 // 【v99.1 大厂架构】母体复活位置真理源 — BaseAIController.CachedDeathTransform
 #include "Systems/BaseAIController.h"
+
+// 【v116 P0 修复】显式 UnPossess 需要 AAIController 类型识别 (IsA<AAIController>())
+#include "AIController.h"
 
 // 包含 FactionTags 集中定义 (CanDamage 三层防御)
 #include "Data/Faction/FactionTags.h"
@@ -413,6 +419,18 @@ void UCombatDeathComponent::Die()
 		return;
 	}
 
+	// 【v115.6 大厂架构修复】幂等检查：防止 Die() 被多次调用（短时间内多次击杀）
+	if (bDeathSequenceStarted)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CombatDeathComponent] Die: 幂等跳过 — 死亡序列已开始. Pawn=%s, HasAuthority=%d"),
+			*Owner->GetName(), Owner->HasAuthority() ? 1 : 0);
+		return;
+	}
+
+	// 标记死亡序列已开始（必须在任何可能重复调用的代码之前）
+	bDeathSequenceStarted = true;
+
 	UE_LOG(LogTemp, Warning,
 		TEXT("[CombatDeathComponent] Die: Pawn=%s, HasAuthority=%d"),
 		*Owner->GetName(), Owner->HasAuthority() ? 1 : 0);
@@ -437,12 +455,75 @@ void UCombatDeathComponent::Die()
 	//    原因: Pawn 销毁后, Controller 的 Pawn 引用失效, GetController() 可能返回 nullptr
 	if (AController* MyController = Owner->GetController())
 	{
+		// 【v115.2 大厂架构诊断】记录 Controller 在派发复活请求前的状态
+		UE_LOG(LogTemp, Display,
+			TEXT("[CombatDeathComponent] Die: Controller='%s' IsValid=%d Pawn='%s'. 即将派发复活请求..."),
+			*MyController->GetName(), MyController->IsValidLowLevel() ? 1 : 0,
+			*Owner->GetName());
+		
+		// ============================================================
+		// 【v109.1 大厂架构 — CachedIsMother 死亡时同步】非母体清零, 母体保真
+		// ============================================================
+		//
+		// 业务核心 (用户 2026.07.31 明确):
+		//   "AI 是母体被打死后应该还是母体, 不是人类."
+		//
+		// 根因 (Session1.log):
+		//   - v109 只在 MutatePawnToMother Step 6 写入 CachedIsMother=true
+		//   - 没有任何清理逻辑 — 非母体人类 AI 死亡时, CachedIsMother 仍是初始值 false (或残留母体死亡时的 true)
+		//   - 第 3 次死亡: BP_SWAT_AI_C_4 非母体死, CachedIsMother=true (残留母体 AIC_AI_SWAT_AI_2 的)
+		//   - → RequestRespawn 读 CachedIsMother=true → 走 MutatePawnToMother → 错误复活成母体
+		//
+		// 镜像玩家路径 (ARoomPlayerState::bIsMother):
+		//   - 玩家死亡: PS->bIsMother 保持 true (Pawn 层字段, 不在 PS 层操作)
+		//   - 玩家复活: PS->bIsMother=true → 走 MutatePawnToMother → 正确复活成母体
+		//   - 玩家切换: ChangePlayerTeam 显式重置 bIsHuman=false
+		//
+		// 修复 (死亡时同步):
+		//   - 非母体死 (bIsMother=false): SetCachedIsMother(false) — 明确清零
+		//   - 母体死 (bIsMother=true): SetCachedIsMother(true) — 保持不变 (与玩家路径镜像)
+		//
+		// 大厂原则 — 不重复架构:
+		//   - 不在 RequestRespawn 内部修改 (那是调用方, 不是死亡方)
+		//   - 不在 MotherMutationSubsystem 修改 (那是业务层, 不是死亡层)
+		//   - 集中在本函数 (Die) — 死亡方的唯一入口, 与 SetCachedFactionTag/WeaponID 同位置
+		//
+		// 大厂原则 — 不破坏刀战模式:
+		//   - 刀战模式不调 MutatePawnToMother → CachedIsMother 永远是 false
+		//   - 刀战 AI 死亡时 SetCachedIsMother(false) = 幂等, 无影响
+		// ============================================================
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(MyController))
+		{
+			// 【v109.1】按死亡时 Pawn 身份设置 CachedIsMother — 非母体清零, 母体保真
+			if (Owner->bIsMother)
+			{
+				// 母体死亡: 保持 true (与玩家路径镜像 — 母体复活时读 true 走 MutatePawnToMother)
+				BaseAIC->SetCachedIsMother(true);
+				UE_LOG(LogTemp, Display,
+					TEXT("[CombatDeathComponent] Die: 母体死亡 — 保持 AIC.CachedIsMother=true (复活时走母体路径). Pawn=%s, AIC=%s."),
+					*Owner->GetName(), *BaseAIC->GetName());
+			}
+			else
+			{
+				// 非母体死亡: 清零 (防止残留 true 导致复活成母体)
+				BaseAIC->SetCachedIsMother(false);
+				UE_LOG(LogTemp, Display,
+					TEXT("[CombatDeathComponent] Die: 非母体死亡 — 已清零 AIC.CachedIsMother=false (复活时走人类路径). Pawn=%s, AIC=%s."),
+					*Owner->GetName(), *BaseAIC->GetName());
+			}
+		}
+
 		if (ARoomGameMode* GM = Cast<ARoomGameMode>(Owner->GetWorld()->GetAuthGameMode()))
 		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[CombatDeathComponent] Die: 派发复活请求: Controller=%s (Pawn=%s 即将销毁)"),
-				*MyController->GetName(), *Owner->GetName());
-			GM->RequestRespawn(MyController, false);
+	UE_LOG(LogTemp, Warning,
+		TEXT("[CombatDeathComponent] Die: 派发复活请求: Controller=%s (Pawn=%s 即将销毁)"),
+		*MyController->GetName(), *Owner->GetName());
+	GM->RequestRespawn(MyController, false);
+	
+	// 【v115.2 大厂架构诊断】检查 Controller 在 RequestRespawn 返回后是否仍然有效
+	UE_LOG(LogTemp, Display,
+		TEXT("[CombatDeathComponent] Die: RequestRespawn 返回后, Controller='%s' IsValid=%d."),
+		*MyController->GetName(), MyController->IsValidLowLevel() ? 1 : 0);
 		}
 		else
 		{
@@ -481,7 +562,60 @@ void UCombatDeathComponent::Die()
 	UE_LOG(LogTemp, Warning,
 		TEXT("[CombatDeathComponent] Die: 延迟销毁 Pawn: %s (SetLifeSpan 0.1f 让 Replication 推送)"),
 		*Owner->GetName());
+
+	// 【v116 P0 修复 — AIController 解耦】在 SetLifeSpan 之前显式 UnPossess
+	// 根因 (Session1.log 2026.07.31 line 113-117):
+	//   - AIC_AI_SWAT_AI_3 / AIC_AI_SWAT_AI_5 死亡后 117ms 即被 UE 自动销毁 (Reason=0 Destroyed, Pawn=NULL)
+	//   - Timer 设置的是 3s 后复活 → Timer 触发时 AIC 早已不存在 → 复活失败
+	// UE 行为:
+	//   - Pawn 销毁时,如果仍被 Controller Possess, 引擎会调用 Controller->PawnPendingDestroy
+	//   - BP 子类 (BP_ZombieAIController) 可能 override PawnPendingDestroy → Destroy(this)
+	//   - 即使没 override,某些 BP 蓝图可能在 OnUnPossess 事件中调用 Destroy(this)
+	// 防御性修复:
+	//   - 在 SetLifeSpan 之前主动 UnPossess,让 AIController 不再引用死亡 Pawn
+	//   - Pawn 销毁时不会触发任何 AIController 销毁链 → AIController 继续存活到 Timer 触发
+	//   - Timer 触发后 MutatePawnToMother 内部 Controller->Possess(NewMotherPawn) 重新绑定
+	// 不破坏玩家路径:
+	//   - 玩家死亡由 Multicast_Die_Implementation 中 PC->StartRespawnTimer 处理
+	//   - 本函数只对 AAIController UnPossess, 跳过 APlayerController (避免破坏 PlayerState 链路)
+	// 不破坏刀战模式:
+	//   - 刀战模式 AI 死亡 → AIController 复用 → SpawnAIInternal 重新 Possess 新 Pawn
+	//   - 如果 AIC 被销毁,SpawnAIInternal 走"重建 Controller" 分支 (已实现)
+	if (AController* Ctrl = Owner->GetController())
+	{
+		if (Ctrl->IsA<AAIController>())
+		{
+			Ctrl->UnPossess();
+			UE_LOG(LogTemp, Display,
+				TEXT("[CombatDeathComponent] Die: 【v116】已 UnPossess AIController '%s', 让 AIC 与死亡 Pawn 解耦, 防止 Pawn 销毁触发 AIC 自动销毁."),
+				*Ctrl->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[CombatDeathComponent] Die: 【v116】Controller '%s' 非 AI 类型, 跳过 UnPossess (玩家路径不破坏)."),
+				*Ctrl->GetName());
+		}
+	}
 	Owner->SetLifeSpan(0.1f);
+
+	// 【v115.7 大厂架构诊断】在 Pawn SetLifeSpan 之后检查 Controller 状态
+	// 如果 Controller 在这里已经被销毁，说明有其他代码路径在触发 Destroy
+	if (AController* Ctrl = Owner->GetController())
+	{
+		if (!Ctrl->IsValidLowLevel())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[CombatDeathComponent] Die: 【v115.7-严重】SetLifeSpan 后 Controller 已失效! Pawn=%s Ctrl=%s"),
+				*Owner->GetName(), *Ctrl->GetName());
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[CombatDeathComponent] Die: 【v116 验证】SetLifeSpan 后 Controller 已为 NULL (Pawn='%s'), 这是 v116 修复的预期行为 — UnPossess 解耦成功."),
+			*Owner->GetName());
+	}
 }
 
 

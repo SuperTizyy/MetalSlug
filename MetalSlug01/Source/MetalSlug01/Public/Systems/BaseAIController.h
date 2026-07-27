@@ -145,6 +145,70 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
 	void SetCachedFactionTag(const FGameplayTag& InTag) { CachedFactionTag = InTag; }
 
+	// ==========================================
+	// 【v109 大厂架构 — AI 母体状态运行时真理源】CachedIsMother
+	// ==========================================
+	//
+	// 设计动机 (用户原话 2026.07.31):
+	//   "生化模式：ai是母体。被打死后成了人类，这是错的，应该还是母体。
+	//    请参照玩家的业务逻辑。"
+	//
+	// 业务核心 (生化模式, 镜像 PS->bIsMother):
+	//   - 玩家母体死亡 → 复活时读 PS->bIsMother=true → 走 MutatePawnToMother 路径
+	//   - AI 母体死亡 → 复活时读 AIC->CachedIsMother=true → 走 MutatePawnToMother 路径
+	//   - 真理源对称: 玩家有 PS->bIsMother (Server 权威, Replicated), AI 必须在 AIC 上有等价字段
+	//
+	// 为什么需要新字段 (而不是直接读 Pawn->bIsMother):
+	//   - Pawn->bIsMother 死时随 Pawn.Destroy() 销毁 (死 Pawn = 回收, 字段失效)
+	//   - 复活时 Controller 复用, 但 Pawn 已不存在 → 读 Pawn->bIsMother 永远 false
+	//   - AIC.CachedIsMother 是"上一次存活时的状态", Pawn 销毁后仍存活于 Controller 上
+	//   - 与 CachedFactionTag / CachedAIPawnClass / CachedWeaponID 一致: 复活真理源都在 Controller
+	//
+	// 不复制 (大厂原则 — 镜像 CachedFactionTag):
+	//   - AI 不跨网络切换阵营 (服务器权威), 客户端永远不知道也不需要知道 AI 的 CachedIsMother
+	//   - 客户端通过 Pawn.bIsMother (DOREPLIFETIME) + OnRep_bIsMother 知道当前 Pawn 是母体
+	//   - 与 CachedFactionTag / CachedAIPawnClass / CachedWeaponID 一致: 都不 Replicate
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式从不调 MutatePawnToMother → CachedIsMother 永远是 false → RequestRespawn 走老路径
+	// ==========================================
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
+	bool CachedIsMother = false;
+
+	UFUNCTION(BlueprintPure, Category = "AI|Spawn")
+	bool GetCachedIsMother() const { return CachedIsMother; }
+
+	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
+	void SetCachedIsMother(bool bInIsMother) { CachedIsMother = bInIsMother; }
+
+	// ============================================================
+	// 【v111 大厂架构 — 复活 Timer 生命周期绑定】MotherRespawnTimerHandle
+	// ============================================================
+	//
+	// 业务核心 (用户 2026.07.31 反馈):
+	//   "AI是母体被打死后不复活了"
+	//
+	// 根因 (Session1.log 2026.07.31):
+	//   - Die() 派发 RequestRespawn → SetTimer(3s) → Timer 存储在 Subsystem 局部变量
+	//   - 3s 后 Timer 回调: Controller=INVALID → AIController 在 3s 内被销毁
+	//   - 结果: 母体无法复活
+	//
+	// v111 大厂架构修复:
+	//   - 旧: Timer 存储在 Subsystem 局部变量, Controller 销毁时 Timer 回调找不到 Controller
+	//   - 新: Timer 存储在 AIController 上, 生命周期与 Controller 绑定
+	//   - 回调中直接用 this (AIController), 不需要 WeakPtr
+	//
+	// 镜像对称:
+	//   - 玩家复活 Timer: PlayerController.RespawnTimerHandle (已有)
+	//   - AI 复活 Timer: AIController.MotherRespawnTimerHandle (新增)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式 AI 不调 MutatePawnToMother → 不设 Timer → 字段永远是默认值
+	//   - 不影响现有逻辑
+	// ============================================================
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
+	FTimerHandle MotherRespawnTimerHandle;
+
 	// ============================================================
 	// 【v54 大厂架构 — 运行时真理源 (复活用)】AI Pawn Class + WeaponID
 	// ============================================================
@@ -375,6 +439,7 @@ public:
 protected:
 	virtual void BeginPlay() override;
 	virtual void OnPossess(APawn* InPawn) override;
+	virtual void BeginDestroy() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
 

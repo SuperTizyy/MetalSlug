@@ -142,66 +142,74 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	}
 
 	// ===========================================
-	// 步骤 2: 获取 PlayerController (仅本地玩家)
+	// 步骤 2: 决定射线起点和方向 — v109 大厂镜像方案
 	// ===========================================
-	APlayerController* PC = Cast<APlayerController>(WeaponOwner->GetInstigatorController());
-	if (!PC)
+	//
+	// 【v109 大厂架构 P0 修复 — 玩家/AI 完全镜像】
+	//
+	//   旧版历史 (按时间累积的反模式):
+	//     - v60.3-v107: 外层 Cast<APlayerController> 守卫,直接拒绝 AI (AI 永远打不出射线)
+	//     - v85.4:     修玩家路径(加 TAL+枪口偏移算武器起点)
+	//     - v108:      加 AI 分支(用 ZeroVector 区分 AI → Strategy 内部算 Muzzle+朝向)
+	//                   ⚠️ v108 修改不完整 — 嵌套了第二层 if/else,使所有 AI 分支变成死代码
+	//     - v109:      重写整个步骤 2,彻底消除死代码
+	//
+	//   v109 终极修复 — "算射线" 关注点统一在 ABaseCharacter::GetAimRayFromCrosshairOrEyes:
+	//     - 玩家: IA_Fire → GetAimRayFromCrosshairOrEyes (本地玩家读 HUD Crosshair) → Server_StartFire RPC (传射线)
+	//     - AI  :  BT → GetAimRayFromCrosshairOrEyes (IsLocallyControlled=false → Muzzle Socket + BaseAimRotation)
+	//             → Weapon->StartFire (服务器本地直接调,不走 RPC,因为 BT 就在 Server 跑)
+	//
+	//   Strategy 不再做任何"算射线" 工作 — 完全信任入参射线(零冗余)
+	//
+	//   单一真理源 — 大厂原则:
+	//     - "用什么射线打谁" 的真理源 = ABaseCharacter::GetAimRayFromCrosshairOrEyes
+	//     - Strategy 只是把射线投射出去 + 命中过滤 + Server_ReportHit RPC 转发
+	//
+	//   大厂原则 — 镜像玩家 + 零兜底:
+	//     - 玩家/AI 都从同一 API 拿射线(对称设计 — 这才是"AI 镜像玩家" 的大厂级实现)
+	//     - 玩家路径特殊性: 传进来的是相机位置 → 服务器需要 + Forward × (TAL + MuzzleOffset) 反推武器起点
+	//     - AI 路径特殊性: 传进来的就是 Muzzle Socket 位置 → 直接用
+	// ===========================================
+
+	FVector RayDirection;
+	FVector RayOrigin;
+
+	// 步骤 2a: 入参校验 — 零兜底
+	if (ClientRayOrigin.IsNearlyZero() || ClientRayDirection.IsNearlyZero())
 	{
-		// AI 路径: 不走相机射线，由 BaseCharacter::GetAimRayFromCrosshairOrEyes 的 AI 路径处理
 		UE_LOG(LogTemp, Error,
-			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 PlayerController — 拒绝射线. (AI 路径应由 BaseCharacter::GetAimRay 处理)"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 零兜底】Weapon=%s 调用方未提供有效射线 — "
+			     "ClientRayOrigin=%s ClientRayDirection=%s. "
+			     "【修复】确认 ABaseCharacter::GetAimRayFromCrosshairOrEyes 的调用方"),
+			*Weapon->GetName(),
+			*ClientRayOrigin.ToCompactString(),
+			*ClientRayDirection.ToCompactString());
+		return false;
+	}
+
+	// 步骤 2b: 转换射线方向为单位向量
+	RayDirection = ClientRayDirection.GetSafeNormal();
+	if (RayDirection.IsNearlyZero())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s ClientRayDirection GetSafeNormal 后为零, 拒绝射线."),
 			*Weapon->GetName());
 		return false;
 	}
 
-	// ===========================================
-	// 步骤 3 (v82 大厂架构修复): 决定射线来源和方向
-	//
-	// 【v85.4 大厂架构修复】玩家路径正确计算射线起点
-	//
-	// 根因 (从 Session1.log 定位):
-	//   用户报告: "主武器射线检测没有算 TargetArmLength，之前好的，被改坏了"
-	//
-	// 问题分析:
-	//   客户端用 DeprojectScreenPositionToWorld 从屏幕中心算出射线起点
-	//   - Deproject 返回的 WorldOrigin = 相机位置 = Pawn位置 + CameraBoom偏移
-	//   - 这个偏移已经包含了 TargetArmLength
-	//   - 所以服务器不应该再添加 TargetArmLength
-	//
-	// 修复方案:
-	//   玩家路径: 直接用客户端传来的射线起点（所见即所射）
-	//   AI 路径: 服务器用自己的相机数据 (需要加 TargetArmLength)
-	// ===========================================
-	FVector RayDirection;
-	FVector RayOrigin;
+	// 步骤 2c: 玩家/AI 区分 — bIsLocalPlayerFire=true 走玩家路径 (相机+TAL+MuzzleOffset),
+	//                                       false 走 AI 路径 (直接用入参射线 — Muzzle+朝向)
+	APlayerController* InstigatorPC = WeaponOwner ? Cast<APlayerController>(WeaponOwner->GetInstigatorController()) : nullptr;
+	const bool bIsLocalPlayerFire = (InstigatorPC != nullptr) && InstigatorPC->IsLocalController();
 
-	if (!ClientRayOrigin.IsNearlyZero())
+	if (bIsLocalPlayerFire)
 	{
-		// 玩家路径: 射线起点 = 相机位置 + 相机前方 × (枪长度 + 弹簧臂长度)
-		//   - ClientRayOrigin = 相机位置 (来自 HUD Deproject)
-		//   - ClientRayDirection = 相机前方 (来自 HUD Deproject)
-		// ============================================================
-		// 步骤 3a: 获取相机位置和弹簧臂长度
-		// ============================================================
-		const FVector CameraLocation = ClientRayOrigin;
-		const FVector CameraForward = ClientRayDirection.GetSafeNormal();
-
-		if (CameraForward.IsNearlyZero())
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 相机前方为零 — 拒绝射线."),
-				*Weapon->GetName());
-			return false;
-		}
-
-		// ============================================================
-		// 步骤 3b: 获取弹簧臂长度 (TargetArmLength) — 【v85.x 零兜底】必须获取真实值
-		// ============================================================
+		// 玩家路径 (v60.16 公式): RayOrigin = ClientRayOrigin + RayDirection × (TAL + MuzzleOffset)
 		ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
 		if (!CharacterOwner)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 ACharacter — 拒绝射线."),
+				TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 玩家路径】Weapon=%s Owner 不是 ACharacter, 拒绝射线."),
 				*Weapon->GetName());
 			return false;
 		}
@@ -211,25 +219,21 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		if (!CameraBoom)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 找不到 CameraBoom (SpringArmComponent) — 拒绝射线. 修复: 检查角色 BP 的 CameraBoom 是否正确挂载."),
+				TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 玩家路径】Weapon=%s 找不到 CameraBoom (SpringArmComponent), 拒绝射线. "
+				     "修复: 检查玩家 BP 的 CameraBoom 是否正确挂载."),
 				*Weapon->GetName());
 			return false;
 		}
 
 		const float TargetArmLength = CameraBoom->TargetArmLength;
-
-		// ============================================================
-		// 步骤 3c: 计算射线起点 = 相机位置 + 相机前方 × (枪长度 + 弹簧臂长度)
-		// ============================================================
 		const float MuzzleOffset = Weapon->MuzzleOffset;
 		const float TotalOffset = TargetArmLength + MuzzleOffset;
-		RayOrigin = CameraLocation + CameraForward * TotalOffset;
-		RayDirection = CameraForward;
+		RayOrigin = ClientRayOrigin + RayDirection * TotalOffset;
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] 玩家路径 — Weapon=%s CameraLoc=%s TAL=%.1f MuzzleOffset=%.1f TotalOffset=%.1f RayOrigin=%s RayDir=%s"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 玩家路径】Weapon=%s CameraLoc=%s TAL=%.1f MuzzleOffset=%.1f TotalOffset=%.1f RayOrigin=%s RayDir=%s"),
 			*Weapon->GetName(),
-			*CameraLocation.ToCompactString(),
+			*ClientRayOrigin.ToCompactString(),
 			TargetArmLength,
 			MuzzleOffset,
 			TotalOffset,
@@ -238,104 +242,28 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	}
 	else
 	{
-		// AI 路径 / 兼容旧调用: 服务器侧自己算射线
-		//   - 如果是 AI 控制的 Pawn: 用 BaseAimRotation (BT 控制的旋转)
-		//   - 如果是 ListenServer 本地玩家: 用本地 PC->Deproject
-		// ===========================================
-		// 步骤 3a: 获取相机位置和方向 (v60.16 核心)
-		// ===========================================
-		APlayerCameraManager* CameraMgr = PC->PlayerCameraManager;
-		if (!CameraMgr)
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s PlayerCameraManager 为空 — 拒绝射线."),
-				*Weapon->GetName());
-			return false;
-		}
+		// AI 路径 (v109 大厂镜像): RayOrigin = ClientRayOrigin (GetAimRayFromCrosshairOrEyes AI 路径已算好)
+		//   - ClientRayOrigin = Muzzle Socket 世界位置
+		//   - ClientRayDirection = Character 朝向 (BaseAimRotation, BT 已控制 AI 面朝目标)
+		//   - 这才是"AI 跟玩家走完全相同的 Strategy" 的大厂镜像方案
+		RayOrigin = ClientRayOrigin;
 
-		const FVector CameraLocation = CameraMgr->GetCameraLocation();
-
-		// 获取相机旋转，计算相机朝向方向
-		const FRotator CameraRotation = CameraMgr->GetCameraRotation();
-		const FVector CameraForward = CameraRotation.Vector(); // 单位向量，指向相机朝向
-
-		if (CameraForward.IsNearlyZero())
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 相机朝向为零 — 拒绝射线."),
-				*Weapon->GetName());
-			return false;
-		}
-
-		// ===========================================
-		// 步骤 3b: 获取 TargetArmLength (相机到角色中心的距离)
-		// ===========================================
-		ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
-		if (!CharacterOwner)
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s Owner 不是 ACharacter — 拒绝射线."),
-				*Weapon->GetName());
-			return false;
-		}
-
-		// 获取角色的 CameraBoom (SpringArmComponent)
-		USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(
-			CharacterOwner->GetComponentByClass(USpringArmComponent::StaticClass()));
-
-		float TargetArmLength = 300.0f; // 默认值
-		if (CameraBoom)
-		{
-			TargetArmLength = CameraBoom->TargetArmLength;
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s 找不到 CameraBoom，用默认值 TAL=300cm."),
-				*Weapon->GetName());
-		}
-
-		// ===========================================
-		// 步骤 3c: 计算枪口偏移后的射线起点 (v60.16 核心公式)
-		// ===========================================
-		const float MuzzleOffset = Weapon->MuzzleOffset;
-		const float TotalOffset = TargetArmLength + MuzzleOffset;
-		RayOrigin = CameraLocation + CameraForward * TotalOffset;
-
-		// ===========================================
-		// 步骤 3d: 获取射击方向 (准星屏幕坐标 → 世界射线)
-		// ===========================================
-		int32 ViewportSizeX, ViewportSizeY;
-		PC->GetViewportSize(ViewportSizeX, ViewportSizeY);
-
-		const FVector2D CrosshairScreenPos = FVector2D(
-			ViewportSizeX * 0.5f,
-			ViewportSizeY * 0.5f
-		);
-
-		FVector WorldOrigin;
-		WorldOrigin = FVector::ZeroVector;
-		FVector WorldDirection;
-		const bool bDeprojectOK = PC->DeprojectScreenPositionToWorld(
-			CrosshairScreenPos.X,
-			CrosshairScreenPos.Y,
-			WorldOrigin,
-			WorldDirection
-		);
-
-		if (!bDeprojectOK || WorldDirection.IsNearlyZero())
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[URangedLineStrategy::PerformSingleShot] Weapon=%s DeprojectScreenPositionToWorld 失败 — 拒绝射线."),
-				*Weapon->GetName());
-			return false;
-		}
-
-		RayDirection = WorldDirection;
+		UE_LOG(LogTemp, Log,
+			TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 AI 路径镜像】Weapon=%s Owner=%s RayOrigin=%s RayDir=%s "
+			     "(前置已通过 GetAimRayFromCrosshairOrEyes AI 分支算出)"),
+			*Weapon->GetName(),
+			WeaponOwner ? *WeaponOwner->GetName() : TEXT("<null>"),
+			*RayOrigin.ToCompactString(),
+			*RayDirection.ToCompactString());
 	}
 
+
+//
+// (v109 重写后:内嵌的双层 if/else 死代码已删除,见步骤 2 注释说明)
+// ===========================================
+
 	// ===========================================
-	// 步骤 4: 计算射线终点 (玩家/AI 路径统一)
+	// 步骤 4: 计算射线终点 (玩家/AI 路径统一 — v109 大厂镜像后没有任何"算射线" 工作残留)
 	// ===========================================
 	const float Range = Weapon->AttackRange;
 	const FVector EndLoc = RayOrigin + RayDirection * Range;
@@ -350,17 +278,28 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		IgnoreActors.Add(Owner);
 	}
 
-	// ===========================================
-	// 步骤 6: 【v97.0.2 大厂架构 P0 修复】两阶段检测 — LineTraceMulti + Pawn 路径搜索
-	// ===========================================
-	//
-	// 【v97.0.2 修复动机 - 大厂原则】
-	//   旧版 (v60.3-v97.0.1) 反模式: LineTraceSingle/LineTraceMulti 只用单一线性射线
-	//   - 问题 (Session1.log line 797-1268, 18.27.x): 所有 LineTrace 都只命中 Landscape_0 / SM_building_wall_109
-	//           即使母体 (BP_MuTi_C_0) 在 trace 路径上 (300-500cm 处), trace 仍然不命中
-	//   - 真根因: BP_MuTi 蓝图 CapsuleComponent 对 ECC_Visibility trace channel 是 Ignore / NoCollision
-	//           - 这导致 LineTrace "穿过" 母体 Pawn → 命中远处 Landscape_0
-	//   - 后果: 人类武器 trace 永远不命中母体 → Server_ReportHit 不调用 → 母体不扣血
+// ===========================================
+// 步骤 6: 【v97.0.2 大厂架构 P0 修复 → v99.3 升级全身骨骼覆盖】
+//   两阶段命中检测 — LineTraceMulti (bTraceComplex=true) + Pawn 路径搜索
+// ===========================================
+//
+// 【v97.0.2 修复动机 - 大厂原则】
+//   旧版 (v60.3-v97.0.1) 反模式: LineTraceSingle/LineTraceMulti 只用单一线性射线
+//   - 问题 (Session1.log line 797-1268, 18.27.x): 所有 LineTrace 都只命中 Landscape_0 / SM_building_wall_109
+//           即使母体 (BP_MuTi_C_0) 在 trace 路径上 (300-500cm 处), trace 仍然不命中
+//   - 真根因 (v97.0.2): BP_MuTi 蓝图 CapsuleComponent 对 ECC_Visibility trace channel 是 Ignore
+//           - 这导致 LineTrace "穿过" 母体 Pawn → 命中远处 Landscape_0
+//   - 后果: 人类武器 trace 永远不命中母体 → Server_ReportHit 不调用 → 母体不扣血
+//
+// 【v99.3 升级 - 全身骨骼覆盖】
+//   上一版 (v97.0.2) 用 bTraceComplex=false 只 trace 物理 Body
+//   真根因: BP_MuTi 物理资产 Mutant_PhysicsAsset 17 个 Body 团在一起 (PhAT 没调好)
+//         只靠 Body trace 时,只有 "看得最清楚" 的 Body (通常是 spine 区域) 命中
+//         实际玩起来 = "打手打脚不扣血,只有胸口能扣血"
+//   修复: bTraceComplex=true → Mesh 三角面参与 trace → 全身都能精确命中
+//   - 大厂原则 (CS:GO/Apex/Valorant/Fortnite 标准): 现代射击游戏都用 complex trace 配合 per-vertex/face 伤害分布
+//   - 物理 Body 团在一起的问题对 complex trace 无影响 — 三角面是角色皮肤精度,与 Body 解耦
+//   - 这样 BP_MuTi 既不需要重生成 PhysicsAsset 也不需要调 PhAT Body 大小,母体全身可被命中
 	//
 	// 【v97.0.2 大厂架构】两阶段命中检测 (无 BP 依赖, 拒绝粗检测):
 	//   阶段 1: LineTraceMulti — 沿准星方向的精确射线 (CS:GO/Apex/PUBG 标准 hit-scan)
@@ -386,12 +325,20 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	// 【服务器权威】HasAuthority=true 时才调 (v95.1 大厂原则: 服务器权威伤害)
 	// ===========================================
 	TArray<FHitResult> HitResults;
+
+	// 【v99.3 关键改动】bTraceComplex=true — Mesh 三角面参与 trace
+	// 上一版 (v97.0.2) 用 false,只 trace 物理 Body
+	// 但 BP_MuTi 物理资产 Mutant_PhysicsAsset 17 个 Body 团在一起 (PhAT 没调好)
+	// → 只靠 Body trace,玩家打手打脚打头全打不到 (Body 被 spine 区域遮挡)
+	// → 现在改成 true: Mesh 三角面(皮肤精度)参与 trace
+	// → 全身任何部位都能被精确命中 (与 Body 大小无关,与 Mutant Mesh 顶点/三角面精度相关)
+	// → 符合 CS:GO/Apex/Valorant 大厂标准 (现代射击游戏都用 per-vertex trace)
 	const bool bHit = UKismetSystemLibrary::LineTraceMulti(
 		Weapon,
-		RayOrigin,     // 起点: 玩家=客户端射线起点 / AI=相机+枪口偏移
+		RayOrigin,     // 起点: v109 大厂镜像 — 玩家=相机+TAL+MuzzleOffset, AI=GetAimRayFromCrosshairOrEyes 已算 Muzzle Socket
 		EndLoc,        // 终点: 起点 + 方向 * 射程
 		UEngineTypes::ConvertToTraceType(ECC_Visibility),
-		false,
+		true,          // 【v99.3 关键】bTraceComplex=true — Mesh 三角面 + 物理 Body 都参与 trace
 		IgnoreActors,
 		EDrawDebugTrace::ForDuration,
 		HitResults,
@@ -479,8 +426,9 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 			const FVector ClosestPointOnPath = RayOrigin + TraceDir * ProjectedDist;
 			const float LateralDistance = FVector::Distance(PawnLoc, ClosestPointOnPath);
 
-			// 横向距离 ≤ 30cm (严格 < Pawn Capsule 半径) → 视为命中
+			// 【v97.0.2】横向距离 ≤ 30cm (严格 < Pawn Capsule 半径) → 视为命中
 			// 30cm = 接近人体 Capsule 半径 (UE 默认 42cm), 但严格小于, 不会误命中旁边 Pawn
+			// 真根因修复在 BP 层 (BP_MuTi 对 ECC_Visibility 设 Block), 不要扩大容差兜底
 			if (LateralDistance <= 30.0f && ProjectedDist < FallbackPawnPathDistance)
 			{
 				FallbackPawnPathDistance = ProjectedDist;

@@ -496,9 +496,58 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 	//   BTService_InitWanderHome: 负责 BT 级 BB Key 初始化 (WanderHome)
 }
 
+// BeginDestroy：当 Actor 即将被销毁时调用
+void ABaseAIController::BeginDestroy()
+{
+	// 【v115.6 大厂架构诊断】记录完整的状态信息来追踪销毁源头
+	const FString WorldName = GetWorld() ? *GetWorld()->GetName() : TEXT("NULL");
+	const FString PawnName = GetPawn() ? *GetPawn()->GetName() : TEXT("NULL");
+	const bool bHasTimer = MotherRespawnTimerHandle.IsValid();
+	const bool bIsPendingKill = IsPendingKillPending();
+	
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseAIController] 【v115.6-BEGIN-DESTROY】BeginDestroy! Controller=%s, World=%s, Pawn=%s, HasTimer=%d, IsPendingKill=%d, Address=%p"),
+		*GetName(), *WorldName, *PawnName, bHasTimer ? 1 : 0, bIsPendingKill ? 1 : 0, this);
+	
+	Super::BeginDestroy();
+}
+
 // EndPlay：当 Actor 离开游戏世界时调用，用于清理资源
 void ABaseAIController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// 【v115.7 大厂架构诊断】在 EndPlay 入口立即打印标记
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseAIController] 【v115.7-EndPlay-ENTER】Controller=%s Reason=%d. 即将调用 Super::EndPlay."),
+		*GetName(), static_cast<int32>(EndPlayReason));
+
+	// 【v115 大厂架构诊断】记录 EndPlayReason 追踪 Controller 销毁原因
+	// EndPlayReason 类型:
+	//   0 = Destroyed (显式 Destroy 调用)
+	//   1 = LevelTransition (关卡切换)
+	//   2 = EndPlayInEditor (编辑器停止播放)
+	//   3 = QuitFromEditor (编辑器退出)
+	//   4 = PIEEnded (PIE 结束)
+	//   5+ = EngineShutdown 等
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseAIController] EndPlay ENTER: Controller=%s Reason=%d (0=Destroyed 1=LevelTransition 2=PIEEnded 3=QuitFromEditor) Pawn=%s bTimerValid=%d"),
+		*GetName(), static_cast<int32>(EndPlayReason),
+		GetPawn() ? *GetPawn()->GetName() : TEXT("NULL"),
+		MotherRespawnTimerHandle.IsValid() ? 1 : 0);
+
+	// 【v115.1 大厂架构诊断】记录调用栈
+	if (EndPlayReason == EEndPlayReason::Destroyed)
+	{
+		// UE 不直接暴露调用栈，但我们可以通过检查一些标志来推断原因
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseAIController] 【v115.1-严重】Controller 被 Destroy! Controller=%s. 请检查以下可能原因: 1) Server_KickPlayer 2) SpawnAIInternal 错误处理 3) 其他代码显式 Destroy"),
+			*GetName());
+		// 打印一些有用的状态信息
+		if (UBlackboardComponent* BBComp = GetBlackboardComponent())
+		{
+			UE_LOG(LogTemp, Display, TEXT("[BaseAIController] 【v115.1-Diag】BB=%s IsValid=%d"),
+				*BBComp->GetName(), BBComp->IsValidLowLevel() ? 1 : 0);
+		}
+	}
 	// 【P0 2026.07.06】取消订阅 RoomGameMode::OnBattleStarted 委托
 	// 避免 GameMode 持有失效的 lambda 引用导致野指针访问
 	if (OnBattleStartedHandle.IsValid())
@@ -524,8 +573,31 @@ void ABaseAIController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		LockMovementForCooldown(false);
 	}
 
+	// 【v114 大厂架构修复】清除母体复活 Timer
+	// 根因 (Session1.log 2026.07.31):
+	//   - AIC_AI_SWAT_AI_2 在 16.27.05 死亡，设置 3 秒 Timer
+	//   - 在 16.27.08 Timer 回调触发时，AIController 已销毁（dangling pointer）
+	//   - BaseAIC->IsValidLowLevel() 返回 false，但 Timer 仍然被设置了
+	//   - 回调执行时 BaseAIC 指针无效，导致复活逻辑失败
+	// 修复: EndPlay 时清除 Timer，避免 Controller 销毁后回调触发
+	if (MotherRespawnTimerHandle.IsValid())
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(MotherRespawnTimerHandle);
+			UE_LOG(LogTemp, Display,
+				TEXT("[BaseAIController] EndPlay: 清除 MotherRespawnTimerHandle. Controller=%s"),
+				*GetName());
+		}
+		MotherRespawnTimerHandle.Invalidate();
+	}
+
 	// 调用父类 EndPlay，确保引擎基类的清理逻辑正常执行
 	Super::EndPlay(EndPlayReason);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseAIController] EndPlay EXIT: Controller=%s Reason=%d 完成清理"),
+		*GetName(), static_cast<int32>(EndPlayReason));
 }
 
 
@@ -826,8 +898,26 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 	// 3. 订阅 OnBattleStarted, 收到后启动 BT
 	//    用 TWeakObjectPtr 防止 GameMode 销毁后回调访问野指针
 	//    Handle 存到成员, EndPlay 时取消订阅 (避免泄漏)
+	//
+	// 【v113 大厂架构修复】复活路径 Bug:
+	//   - 复活时 OnBattleStartedHandle 已被清空 (OldPawn 销毁时清了)
+	//   - 进入这个分支，订阅 OnBattleStarted
+	//   - 但 RoomGameMode::bBattleStartedBroadcasted 永远不会被设置 (只 LifecycleSubsystem 内部设置)
+	//   - 所以 AI 永远看到 bBattleStartedBroadcasted=0，订阅后永远等待
+	//   - 但 CurrentRoomState == BattleInProgress，战斗确实已开始了
+	// 修复: 订阅前检查 CurrentRoomState，如果战斗已开始，直接启动 BT（不用订阅）
 	if (!OnBattleStartedHandle.IsValid())
 	{
+		// 【v113 修复】订阅前检查：如果战斗已开始（CurrentRoomState），直接启动 BT
+		if (RoomGM->CurrentRoomState == ERoomState::BattleInProgress)
+		{
+			UE_LOG(LogBaseAI, Warning,
+				TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: 【v113修复】CurrentRoomState=InProgress，跳过订阅直接启动 BT"),
+				*GetName());
+			StartBehaviorTreeFromConfigInternal();
+			return;
+		}
+
 		TWeakObjectPtr<ARoomGameMode> WeakRoomGM(RoomGM);
 		TWeakObjectPtr<ABaseAIController> WeakSelf(this);
 		OnBattleStartedHandle = RoomGM->OnBattleStarted.AddLambda(

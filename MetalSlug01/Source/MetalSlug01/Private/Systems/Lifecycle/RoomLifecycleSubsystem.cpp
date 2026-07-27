@@ -306,6 +306,13 @@ bool URoomLifecycleSubsystem::StartNextZombieRound()
 	// 重新启动比赛计时器 (使用与首局相同的 ZombieMatchDurationSeconds, 重置 MatchEndTime)
 	StartMatchTimer();
 
+	// 【v108 大厂架构】新回合开始, 重启母体变异倒计时
+	// 重置母体账本 (跨回合累积 Bug 修复: AliveMotherCount=120)
+	if (URoomMotherMutationSubsystem* MutationSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MutationSys->ResetForNewRound();
+	}
+
 	// 【v92 大厂架构】新回合开始, 重启母体变异倒计时 (玩家/AI 重置为人类, 重新走 8s 变异倒计时)
 	StartMotherMutationCountdown();
 

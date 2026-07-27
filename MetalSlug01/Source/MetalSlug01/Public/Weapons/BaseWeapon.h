@@ -657,6 +657,13 @@ public:
 	TObjectPtr<class UWeaponFireComponent> WeaponFireComponent;
 
 	/**
+	 * 【v107】公开 WeaponFireComponent getter — BT Service 需要按需访问
+	 * 与 v40.6 反模式对应: 不缓存, 每次调用 GetWeaponFireComponent 拿字段
+	 */
+	UFUNCTION(BlueprintPure, Category = "Weapon")
+	UWeaponFireComponent* GetWeaponFireComponent() const { return WeaponFireComponent; }
+
+	/**
 	 * DamageStrategy — 武器伤害策略 (RangedLineStrategy / MeleeSwStrategy)
 	 *
 	 * 调用方: WeaponFireComponent::PerformSingleShot (服务器) / ANS_MeleeTraceState (客户端)

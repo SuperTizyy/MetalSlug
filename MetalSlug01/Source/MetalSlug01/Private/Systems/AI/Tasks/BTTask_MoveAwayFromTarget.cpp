@@ -1,6 +1,6 @@
 // Copyright (c) 2026.
 //
-// 【P0 v23.2 BT 原子库】BTTask — 退一步 (面朝敌人后退)
+// 【P0 v23.2 BT 原子库 + v40.10 重构】BTTask — 退一步 (面朝敌人后退)
 //
 // v23.2 重大修复 "回头走":
 //   v23 之前的实现: MoveToLocation → AI 朝向 = 移动方向 → "回头走"
@@ -9,14 +9,28 @@
 //     - OrientRotationToMovement = ✔ 时, MoveTo 会强制 AI 朝向 = 移动方向
 //     - RetreatPoint 在 AI 后方, AI 朝 RetreatPoint 走 → "回头走"
 //
-//   修复方案 (v23.2): 在 MoveAway 期间临时关 OrientRotationToMovement + 开 UseControllerDesiredRotation
-//     - 关掉 OrientRotationToMovement 后, AI 朝向由 UseControllerDesiredRotation / FocalPoint 控制
-//     - 配合 AIC->SetFocalPoint(TargetActor) 强制 AI 朝向 Target
-//     - 任务结束时恢复原值 (避免污染其他 BT 分支)
-//     - 这是"面朝敌人后退"的标准实现, 大厂 Uncharted/Last of Us 用同样手法
+// v23.2 标准实现:
+//   ExecuteTask:
+//     1. 保存 Pawn 原 Movement 设置 (OrientRotationToMovement / UseControllerDesiredRotation)
+//     2. 临时:
+//        - OrientRotationToMovement = false (不让 MoveTo 抢 AI 朝向)
+//        - UseControllerDesiredRotation = true (让 Controller 控制朝向)
+//     3. AIC->SetFocus(TargetActor, EAIFocusPriority::Gameplay)
+//        (Gameplay 优先级最高, 压过 MoveTo 默认 MoveFocus, AI 必定朝 Target)
+//     4. MoveToLocation(RetreatPoint)
+//   TickTask 完成/Abort:
+//     1. ClearFocus(EAIFocusPriority::Gameplay)
+//     2. 恢复原 Movement 设置
+//   退出条件:
+//     - MoveTo 到达 AcceptanceRadius → Succeeded (恢复设置)
+//     - MoveTo Waiting 超 MaxWaitTime → 强制 Succeeded (恢复设置)
+//     - AbortTask → Aborted (恢复设置)
 //
-// v23.1: TooClose 改成纯 <
-// v23.2: 修复回头走 (临时调 Pawn Movement 设置)
+// v40.10 大厂重构:
+//   抽离 SaveMovementSettings / RestoreMovementSettings / SetFocus 到 UAIFacingMoveHelper
+//   - 单一真理源: Movement 配置策略集中在 Helper, 任何"边移动边面向"的 BTTask 复用
+//   - DRY: 不再私有函数 Copy-Paste
+//   - 零行为变化: API 等价, 行为完全一致
 
 #include "Systems/AI/Tasks/BTTask_MoveAwayFromTarget.h"
 
@@ -24,10 +38,11 @@
 #include "BehaviorTree/BehaviorTreeComponent.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "GameFramework/Character.h"
-#include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Navigation/PathFollowingComponent.h"
 #include "NavigationSystem.h"
+
+#include "Systems/AI/AIFacingMoveHelper.h"
 
 UBTTask_MoveAwayFromTarget::UBTTask_MoveAwayFromTarget()
 {
@@ -44,8 +59,7 @@ FString UBTTask_MoveAwayFromTarget::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("退一步 (面向敌人后退) — %.0fcm。\n"
 		"算法: AI 位置 + (AI-目标)方向 × %.0fcm。\n"
-		"v23.2 修复回头走: 临时开 UseControllerDesiredRotation + 关 OrientRotationToMovement,\n"
-		"配合 AIC->SetFocalPoint 强制 AI 朝向目标。\n"
+		"v40.10: 通过 UAIFacingMoveHelper 复用朝向机制 (单一真理源)。\n"
 		"到达 AcceptanceRadius=%.0fcm 后 Succeeded。\n"
 		"被阻挡 %.1fs 强制 Succeeded。"),
 		StepDistance, StepDistance, AcceptanceRadius, MaxWaitTime);
@@ -58,7 +72,6 @@ EBTNodeResult::Type UBTTask_MoveAwayFromTarget::ExecuteTask(
 	new (&Mem) FTaskMemory();
 	Mem.bMoveStarted = false;
 	Mem.WaitTime = 0.f;
-	Mem.bMovementSettingsSaved = false;
 
 	AAIController* AIC = OwnerComp.GetAIOwner();
 	if (!AIC)
@@ -86,29 +99,22 @@ EBTNodeResult::Type UBTTask_MoveAwayFromTarget::ExecuteTask(
 	}
 
 	// ============================================
-	// v23.2: 临时调整 Pawn 的 Movement 设置 + FocalPoint
+	// v40.10: 朝向机制下沉到 UAIFacingMoveHelper
+	//   之前 30+ 行 (Save + 改 Movement + SetFocus) → 1 行调用
+	//   Helper 内部: 保存 Movement + 改朝向方式 + SetFocus
 	// ============================================
-	// 目的: MoveTo 期间 AI 朝向固定朝 Target (不退步时转向)
-	// 退出任务时恢复原值, 不污染其他分支
-	if (ACharacter* AICharacter = Cast<ACharacter>(AIPawn))
+	const bool bFacingConfigured = UAIFacingMoveHelper::ConfigureFacingMove(
+		Cast<ACharacter>(AIPawn),
+		AIC,
+		TargetActor,
+		Mem.FacingSnapshot);
+
+	if (!bFacingConfigured)
 	{
-		if (UCharacterMovementComponent* MoveComp = AICharacter->GetCharacterMovement())
-		{
-			// 保存原值, 用于 AbortTask/完成时恢复
-			Mem.bSavedOrientRotationToMovement = MoveComp->bOrientRotationToMovement;
-			Mem.bSavedUseControllerDesiredRotation = MoveComp->bUseControllerDesiredRotation;
-			Mem.bMovementSettingsSaved = true;
-
-			// 关 OrientRotationToMovement (不让 MoveTo 抢 AI 朝向)
-			MoveComp->bOrientRotationToMovement = false;
-
-			// 开 UseControllerDesiredRotation (让 FocalPoint 控制朝向)
-			MoveComp->bUseControllerDesiredRotation = true;
-		}
+		// 【零兜底】Helper 失败 (Character/Target 无效) → 拒绝 MoveTo, 否则回头走
+		// Helper 内部已 Log Error 解释根因
+		return EBTNodeResult::Failed;
 	}
-
-	// 用 SetFocalPoint 强制 AI 朝向 Target (Gameplay 优先级最高, 压过 MoveTo 的 MoveFocus)
-	AIC->SetFocus(TargetActor, EAIFocusPriority::Gameplay);
 
 	// ============================================
 	// 退步逻辑
@@ -117,9 +123,9 @@ EBTNodeResult::Type UBTTask_MoveAwayFromTarget::ExecuteTask(
 
 	if (!StartMoveTo(OwnerComp, StepBackLoc))
 	{
-		// MoveTo 启动失败, 恢复 + 清理
-		RestoreMovementSettings(Mem, AIC);
-		AIC->ClearFocus(EAIFocusPriority::Gameplay);
+		// MoveTo 启动失败, 恢复朝向 (Helper 内幂等)
+		UAIFacingMoveHelper::RestoreFacingMove(
+			Cast<ACharacter>(AIPawn), AIC, Mem.FacingSnapshot);
 		return EBTNodeResult::Failed;
 	}
 
@@ -148,11 +154,12 @@ EBTNodeResult::Type UBTTask_MoveAwayFromTarget::AbortTask(
 	if (AIC)
 	{
 		AIC->StopMovement();
-		AIC->ClearFocus(EAIFocusPriority::Gameplay);
 
-		// 恢复 Pawn 原 Movement 设置
+		// v40.10: 恢复朝向 (Helper 内幂等 — Snapshot 无效就跳过)
 		FTaskMemory& Mem = GetTaskMemory(NodeMemory);
-		RestoreMovementSettings(Mem, AIC);
+		UAIFacingMoveHelper::RestoreFacingMove(
+			Cast<ACharacter>(AIC->GetPawn()), AIC, Mem.FacingSnapshot);
+
 		Mem.bMoveStarted = false;
 	}
 
@@ -222,10 +229,10 @@ void UBTTask_MoveAwayFromTarget::CheckArrival(
 
 	if (MoveStatus == EPathFollowingStatus::Idle)
 	{
-		// v23.2: 任务完成, 恢复 Pawn Movement 设置 + 清理 Focus
+		// v40.10: 完成 — 恢复朝向 (Helper 内幂等)
 		FTaskMemory& Mem = GetTaskMemory(NodeMemory);
-		RestoreMovementSettings(Mem, AIC);
-		AIC->ClearFocus(EAIFocusPriority::Gameplay);
+		UAIFacingMoveHelper::RestoreFacingMove(
+			Cast<ACharacter>(AIC->GetPawn()), AIC, Mem.FacingSnapshot);
 		Mem.bMoveStarted = false;
 
 		FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
@@ -239,41 +246,12 @@ void UBTTask_MoveAwayFromTarget::CheckArrival(
 		{
 			Mem.WaitTime = 0.f;
 
-			// 超时也要恢复设置
-			RestoreMovementSettings(Mem, AIC);
-			AIC->ClearFocus(EAIFocusPriority::Gameplay);
+			// 超时也要恢复朝向
+			UAIFacingMoveHelper::RestoreFacingMove(
+				Cast<ACharacter>(AIC->GetPawn()), AIC, Mem.FacingSnapshot);
 			Mem.bMoveStarted = false;
 
 			FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
 		}
 	}
-}
-
-void UBTTask_MoveAwayFromTarget::RestoreMovementSettings(
-	FTaskMemory& Mem, AAIController* AIC) const
-{
-	if (!Mem.bMovementSettingsSaved)
-	{
-		return;
-	}
-
-	if (!AIC)
-	{
-		return;
-	}
-
-	if (APawn* AIPawn = AIC->GetPawn())
-	{
-		if (ACharacter* AICharacter = Cast<ACharacter>(AIPawn))
-		{
-			if (UCharacterMovementComponent* MoveComp = AICharacter->GetCharacterMovement())
-			{
-				// 恢复执行任务前的原值
-				MoveComp->bOrientRotationToMovement = Mem.bSavedOrientRotationToMovement;
-				MoveComp->bUseControllerDesiredRotation = Mem.bSavedUseControllerDesiredRotation;
-			}
-		}
-	}
-
-	Mem.bMovementSettingsSaved = false;
 }

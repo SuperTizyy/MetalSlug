@@ -25,6 +25,41 @@ class AAIController;
  *       这个枚举是"AI 自我认知"的语义, 跟 FactionTag 解耦.
  *       所有需要按身份走不同逻辑的地方读这个.
  */
+
+/**
+ * 【v108 大厂架构新增】生化模式母体变异目标选择策略
+ *
+ * 业务规则 (用户 2026.07.30 明确):
+ *   倒计时结束后, 按本枚举指定的策略选 1~N 个目标变异为母体
+ *   - Random:     从全部活人候选中随机选 N 个 (默认, 适合竞技平衡)
+ *   - AIOnly:     只从 AI 候选中选 N 个 (玩家不会变母体)
+ *   - PlayerOnly: 只从玩家候选中选 N 个 (AI 不会变母体)
+ *
+ * 大厂原则 — 业务可配 + 单一真理源:
+ *   - 真理源: GM_RoomGameMode.MotherSelectionPolicy (UE 编辑器可配)
+ *   - 数据流: GM → URoomLifecycleSubsystem → URoomMotherMutationSubsystem (单向注入, InitGame 时一次性)
+ *   - 零兜底: 候选不足 → Log Error + 中断循环 (不静默跳过)
+ *
+ * 调用方:
+ *   - URoomMotherMutationSubsystem::HandleCountdownExpired (本局倒计时到期)
+ *   - 玩家/AI 的 Pawn 选完后走 MutateCharacterToMother
+ *
+ * 不影响刀战模式:
+ *   - 刀战模式 GameMode.CurrentMatchMode != Zombie → HandleCountdownExpired 不被调用
+ */
+UENUM(BlueprintType)
+enum class EMotherSelectionPolicy : uint8
+{
+	/** 全部候选随机 (玩家+AI 一起抽签, 默认) */
+	Random      UMETA(DisplayName = "Random (随机, 玩家+AI)"),
+
+	/** 只选 AI (玩家永远不会变母体) */
+	AIOnly      UMETA(DisplayName = "AI Only (只选 AI)"),
+
+	/** 只选玩家 (AI 永远不会变母体) */
+	PlayerOnly  UMETA(DisplayName = "Player Only (只选玩家)"),
+};
+
 UENUM(BlueprintType)
 enum class EAIRole : uint8
 {
@@ -779,4 +814,39 @@ namespace AIBlackboardKeyNames
     constexpr const TCHAR* CirclePoint     = TEXT("CirclePoint");  // BTTask_PickCirclePoint 写入, 攻击后选环绕点
 
     // 【v22】精简: AttackRangeMin / AttackRangeMax 已从 BB 移除, 决策改由 C++ Decorator 内计算
+
+    // 【v107 2026.07.28 生化模式 AI】专属 Blackboard Keys — 独立于刀战 BB, 完全隔离
+    namespace ZombieBlackboardKeyNames
+    {
+        // 身份 (服务器写入, 客户端只读 — 镜像 BaseCharacter::bIsMother/bIsHuman 但走 BB 通道)
+        // 设计: BB 通道允许 BT Decorator 用 Blackboard Based Condition 直接判断, 不需要在 Task/Service 内做 Cast
+        constexpr const TCHAR* bIsMother         = TEXT("bIsMother");
+        constexpr const TCHAR* bIsHuman          = TEXT("bIsHuman");
+
+        // 人数快照 (BTService_UpdateZombieState 写入, Decorator 读)
+        // 真理源: URoomMotherMutationSubsystem::MotherCharacters + URoomSpawnSubsystem::GetAllBattleCharacters
+        constexpr const TCHAR* AliveMotherCount  = TEXT("AliveMotherCount");
+        constexpr const TCHAR* AliveHumanCount   = TEXT("AliveHumanCount");
+
+        // 锁定目标 (BTService_UpdateZombieTargets 写入, BT Task 读)
+        // 母体 → 最近人类(AI 或 玩家); 人类 → 最近存活母体; 严格走距离最近, 不引入仇恨/评分
+        constexpr const TCHAR* NearestHumanTarget = TEXT("NearestHumanTarget");
+        constexpr const TCHAR* NearestMotherTarget = TEXT("NearestMotherTarget");
+
+        // 集合点锁定 (BTTask_SelectZombieRallyPoint 写入, BT 守卫/移动读)
+        // 大厂原则: 锁点写入后永不迁移, 一局内只选一次 — 严格避免来回切换
+        constexpr const TCHAR* LockedRallyPoint     = TEXT("LockedRallyPoint");
+        constexpr const TCHAR* bRallyPointLocked    = TEXT("bRallyPointLocked");
+        constexpr const TCHAR* DistanceToRallyPoint = TEXT("DistanceToRallyPoint");
+
+        // 弹药快照 (BTService_UpdateWeaponAmmo 写入, 换弹分支/开火守卫读)
+        constexpr const TCHAR* CurrentAmmo  = TEXT("CurrentAmmo");
+        constexpr const TCHAR* MagazineSize = TEXT("MagazineSize");
+        constexpr const TCHAR* ReserveAmmo  = TEXT("ReserveAmmo");
+        constexpr const TCHAR* bIsReloading = TEXT("bIsReloading");
+
+        // 弹药补给预留 (当前保持 false/null — 显式表示"未开放", 杜绝任何兜底补给)
+        constexpr const TCHAR* bAmmoSupplyAvailable = TEXT("bAmmoSupplyAvailable");
+        constexpr const TCHAR* AmmoSupplyTarget      = TEXT("AmmoSupplyTarget");
+    }
 }

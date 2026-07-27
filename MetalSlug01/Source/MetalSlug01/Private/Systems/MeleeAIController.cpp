@@ -185,6 +185,7 @@ void AMeleeAIController::SetupMeleeAI(UAIBehaviorConfigSO* MeleeConfig)
 			//   关卡预放 AI 没有 Profile 反查链, 但 Spawn 参数来自 ConfigSO
 			//   写入这些字段让 RequestRespawn 复用 (复活时不需要重新查 ConfigSO)
 			SetCachedAIPawnClass(BaseChar->GetClass());
+			SetCachedIsMother(false); // 【v109.1 大厂架构】新 Spawn 的 AI 初始为非母体
 
 			// 【v54.4 大厂架构重构 — Class 强类型 + 单一真理源 + 零中间层】
 			//   旧 (v54.3 — FString 中间层):

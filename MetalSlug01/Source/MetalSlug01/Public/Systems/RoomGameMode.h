@@ -873,6 +873,48 @@ public:
 	float MotherMaxHealth = 200.0f;
 
 	/**
+	 * 【v108 大厂架构新增】生化模式母体变异目标选择策略
+	 *
+	 * 业务规则 (用户 2026.07.30 明确):
+	 *   倒计时结束后, 按本字段指定的策略选 1~N 个目标变异为母体
+	 *   - Random:     玩家+AI 一起抽签 (默认)
+	 *   - AIOnly:     只选 AI
+	 *   - PlayerOnly: 只选玩家
+	 *
+	 * 大厂原则 — 业务可配 + 单一真理源:
+	 *   - 真理源: 本字段 (UE 编辑器 BP_GM_RoomGameMode 配置)
+	 *   - 数据流: GM → URoomLifecycleSubsystem (SetMotherSelectionPolicy) → URoomMotherMutationSubsystem
+	 *   - 注入时机: InitGame 阶段一次性注入 (用户决策: 改配置需重启游戏)
+	 *   - 候选不足 → Log Error + 中断循环 (零兜底)
+	 *
+	 * 不影响刀战模式:
+	 *   - 刀战模式不读本字段 (HandleCountdownExpired 模式守卫已拦)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match")
+	EMotherSelectionPolicy MotherSelectionPolicy = EMotherSelectionPolicy::Random;
+
+	/**
+	 * 【v108 大厂架构新增】生化模式母体变异数量
+	 *
+	 * 业务规则 (用户 2026.07.30 明确):
+	 *   倒计时结束后生成多少个母体 (默认 1)
+	 *   - 1 = 单母体 (现状, 经典生化玩法)
+	 *   - 2-3 = 多母体 (高难度 / 后期残局)
+	 *
+	 * 大厂原则 — 业务可调 + 零兜底:
+	 *   - ClampMin=1 (至少 1 个, 否则循环退出无意义)
+	 *   - ClampMax=10 (场景中活人可能不够, 超过没意义)
+	 *   - 候选不足 → Log Error + 中断循环 (用户决策: 强制策划扩玩家/AI 数量)
+	 *   - 选出的目标从候选清单移除 (避免重复选同一人)
+	 *
+	 * 不影响刀战模式:
+	 *   - 刀战模式不读本字段
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
+		meta = (ClampMin = "1", ClampMax = "10"))
+	int32 MotherMutationCount = 1;
+
+	/**
 	 * @brief 倒计时结束后触发，负责遍历所有人并生成真实的 3D 角色
 	 */
 	void SpawnAllPlayersIntoBattle();
