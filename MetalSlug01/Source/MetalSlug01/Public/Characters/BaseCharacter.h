@@ -18,6 +18,10 @@
 // 改造: 改为精确子表头, 不再 include 整个 432 行 StaticTable.h
 #include "Data/Enums/CombatEnums.h"
 
+// 【v133 P0 大厂扩展】引入 EAIAttackType 公共枚举 (BTTask_PlayAttackMontage 暴露给 BT 编辑器的攻击类型)
+// 必须 include 完整类型 (enum class 不能前向声明在跨编译单元用)
+#include "Systems/AI/AIBehaviorTypes.h"
+
 // 引入新增的 4 个 Component (健康/能量/溶解/脚步)
 #include "Components/HealthComponent.h"
 #include "Components/EnergyComponent.h"
@@ -62,6 +66,7 @@ class UCharacterEvents;
 class UDissolveComponent;
 class UFootstepComponent;
 class UHealthRegenComponent;
+class UMotherSlowComponent;                    // 【v133.5 新增】母体被主武器击中后降速 (镜像 Invincibility 模式)
 class UInvincibilityFlickerComponent;  // 【v40.8 新增】无敌期视觉闪烁
 class UMotherSpawnParticleComponent;   // 【v99.1 新增】母体出生粒子特效
 class UMotherSpawnSoundComponent;       // 【v99.3 新增】母体出生音效
@@ -88,6 +93,7 @@ class UAudioComponent;                   // 【v100.1 新增】回血音组件 (
 #include "Components/FootstepComponent.h"
 #include "Components/HealthRegenComponent.h"
 #include "Combat/InvincibilityFlickerComponent.h"  // 【v40.8 新增】
+#include "Combat/MotherSlowComponent.h"  // 【v133.5 新增】母体被主武器击中后降速
 #include "Combat/MotherSpawnParticleComponent.h"    // 【v99.1 新增】母体出生粒子
 #include "Combat/MotherSpawnSoundComponent.h"        // 【v99.3 新增】母体出生音效
 #include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
@@ -129,6 +135,29 @@ class USoundBase;
 // 【Phase 1 重构】 IG_TeamAttitude (UE5 官方阵营协议) — 由 ABaseCharacter 实现
 #include "GenericTeamAgentInterface.h"
 
+// 【v132 2026.08.02 终极重构】 IAISightTargetInterface (UE5 官方 AI 视野协议) — 由 ABaseCharacter 实现
+//
+// 业务背景 (用户 2026.08.02 第五轮反馈):
+//   "还是老样子, 为什么不用官方推荐的解决方案呢?"
+//
+// 之前 (v129 - v131.5) 我们自建 BTDecorator_HasLineOfSight + 自创多 trace 方案
+//   - 业界共识: UE 自带 LineOfSightTo / UAISense_Sight 只 trace capsule center (已知限制)
+//   - 业界共识: 自定义视线检测必须 override `IAISightTargetInterface::CanBeSeenFrom`
+//   - 我之前嫌它要 override Target Actor "麻烦", 偷懒走了自创方案 — 用户指出错误
+//   - v132 修正: 用 UE 官方推荐方案, Target Actor override CanBeSeenFrom, AI 视野系统自动调用
+//
+// v132 方案 (UE 官方 + 业界共识):
+//   - BaseCharacter 实现 IAISightTargetInterface
+//   - override CanBeSeenFrom — 实现"trace 多个 Pawn 关键点" (业界共识: 头/胸/脚)
+//   - AI Perception 用 UAISenseConfig_Sight 配置 (项目中已存在)
+//   - 删 BTDecorator_HasLineOfSight 整个文件 — BT 只负责距离/HP, 不负责 LoS (LoS 归 AI Perception + IAISightTargetInterface)
+//
+// 大厂原则:
+//   - 用 UE 官方推荐接口 — 不重写轮子
+//   - 单一真理源 (Single Source of Truth) — AI Perception 是 AI 视野的真理源, BT 装饰器是装饰源
+//   - 删 v129 - v131.5 重复架构 — BTDecorator_HasLineOfSight 与 IAISightTargetInterface 重复实现视线检测
+#include "Perception/AISightTargetInterface.h"
+
 // UE 自动生成的头文件（必须放在最后）
 #include "BaseCharacter.generated.h"
 
@@ -166,7 +195,7 @@ class UGameHUDWidget;             // 游戏 HUD 容器
  * 4. 蓝图友好：所有关键参数都暴露给蓝图可配置
  */
 UCLASS()
-class METALSLUG01_API ABaseCharacter : public ACharacter, public IGenericTeamAgentInterface
+class METALSLUG01_API ABaseCharacter : public ACharacter, public IGenericTeamAgentInterface, public IAISightTargetInterface
 {
 	GENERATED_BODY()
 
@@ -294,6 +323,35 @@ public:
 	virtual void SetGenericTeamId(const FGenericTeamId& NewTeamID) override;
 	virtual FGenericTeamId GetGenericTeamId() const override;
 	virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const override;
+
+	// ============================================================
+	// 【v132 2026.08.02 新增】IAISightTargetInterface — UE 官方 AI 视野协议
+	// ============================================================
+	//
+	// 业界共识 — Lyra / UE 5.6 官方推荐:
+	//   - AI 视野系统默认只 trace 到 capsule center (UE 已知限制 10+ 年)
+	//   - 自定义视线检测必须 override IAISightTargetInterface::CanBeSeenFrom
+	//   - AI Perception 在每次视野检测时自动调用此 override (零额外配置)
+	//
+	// v132 实现 (业界共识 — trace Pawn 多个关键点):
+	//   - Phase 1: trace ObserverLocation → Pawn 头 (Mesh "head" socket) — AI 仰视主视角
+	//   - Phase 2: trace ObserverLocation → Pawn 胸 (Pawn Capsule 中心) — 标准视线
+	//   - Phase 3: trace ObserverLocation → Pawn 脚 (Pawn Capsule 底部) — AI 俯视
+	//   任一命中 Pawn (或子组件) → Visible
+	//
+	// 大厂原则 — UE 官方推荐 > 自创方案:
+	//   - 删 BTDecorator_HasLineOfSight (v129 - v131.5 自创方案)
+	//   - 用 IAISightTargetInterface (UE 官方 + 业界共识)
+	//   - BT 只负责距离/HP 决策, 不负责 LoS — 职责分离
+	//   - 与 IGenericTeamAgentInterface 对称 — 都是 UE 官方协议接口
+	virtual UAISense_Sight::EVisibilityResult CanBeSeenFrom(
+		const FCanBeSeenFromContext& Context,
+		FVector& OutSeenLocation,
+		int32& OutNumberOfLoSChecksPerformed,
+		int32& OutNumberOfAsyncLosCheckRequested,
+		float& OutSightStrength,
+		int32* UserData = nullptr,
+		const FOnPendingVisibilityQueryProcessedDelegate* Delegate = nullptr) override;
 
 	/**
 	 * 【Phase 1】阵营的 GameplayTag 形式 (统一入口)
@@ -427,28 +485,33 @@ public:
 	 *     → Owner->Multicast_PlayRegenSound(Sound)
 	 *     → 客户端 Implementation: UGameplayStatics::SpawnSoundAttached 创建循环音组件
 	 *
-	 * 大厂原则 — RPC 边界纯数据:
-	 *   - 传 USoundBase* (UE 内部会复制引用到客户端, 不复制资产内容)
-	 *   - 客户端 Implementation 创建 UAudioComponent 缓存到 ActiveRegenAudioComponent
+	 * 【v133.11 P0 大厂架构 — 严格 OwnerOnly】
+ *   - 业务背景 (用户 2026.08.02):"母体回血时的音效不能给场景中其他人听到"
+ *   - 旧实现 (v100.1): NetMulticast RPC → 所有客户端都执行 → 所有人听到
+ *   - 新实现 (v133.11): Client RPC → 只发给 Owner (母体本人) → 只有母体本人听到
+ *   - 大厂原则 — RPC 边界纯数据: 传 USoundBase* (UE 内部会复制引用到客户端)
+ *   - 客户端 Implementation 创建 UAudioComponent 缓存到 ActiveRegenAudioComponent
 	 *   - Sound 资产 = HealthRegenComponent::RegenSound (BP 配置, 真理源)
 	 *
 	 * @param Sound 要播放的循环音 (从 HealthRegenComponent::RegenSound 读取)
 	 */
-	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_PlayRegenSound(USoundBase* Sound);
+	UFUNCTION(Client, Reliable)
+	void Client_PlayRegenSound(USoundBase* Sound);
 
 	/**
-	 * 【v100.1 大厂架构 — 停止回血音 RPC】服务器调 → 所有客户端停止 + 销毁音组件
+	 * 【v100.1 大厂架构 — 停止回血音 RPC】服务器调 → 客户端停止 + 销毁音组件
 	 *
 	 * 业务规则 (用户 2026.07.26): "结束回血后关闭此声音"
 	 * 触发场景: 被打 / 开始移动 / 死亡 / 满血 / bEnableAutoRegen=false
+	 *
+	 * 【v133.11 P0 大厂架构 — 严格 OwnerOnly】配对 Client_PlayRegenSound, 也只发给 Owner
 	 *
 	 * 大厂原则 — 零兜底:
 	 *   - 没找到 ActiveRegenAudioComponent → Log Warning 但不崩溃 (可能本机没开过音)
 	 *   - 销毁组件而非 Stop+Keep (避免下次激活时残留)
 	 */
-	UFUNCTION(NetMulticast, Reliable)
-	void Multicast_StopRegenSound();
+	UFUNCTION(Client, Reliable)
+	void Client_StopRegenSound();
 
 	/**
 	 * 【v100.1 大厂架构 — 回血状态变化事件订阅者 (服务器端)】
@@ -593,6 +656,29 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Flicker")
 	UInvincibilityFlickerComponent* FlickerComponent;
+
+	/**
+	 * 【v133.5 大厂架构新增】母体被主武器击中后降速组件 — 与 InvincibilityFlickerComponent 完全对称
+	 *
+	 * 职责:
+	 *   - 状态字段: bIsSlowed (Replicated) + SlowExpiresAtWorldTime (Replicated)
+	 *   - 真理源: 慢速状态完全在这个组件, 不下放到 BaseCharacter
+	 *   - 触发源: CombatDeathComponent::TakeDamage 末尾 (主武器击中母体)
+	 *   - 派发: OnSlowStateChanged → BaseCharacter 订阅 → 改 MaxWalkSpeed
+	 *
+	 * 大厂原则 - 与 InvincibilityFlickerComponent 完全对称 (零重复):
+	 *   - 状态都 Replicated + OnRep
+	 *   - 服务器主动 Broadcast + 客户端 OnRep Broadcast (双发保证)
+	 *   - 拒绝缩短 (多次激活取较晚到期)
+	 *   - 死亡时 Deactivate (防御型设计)
+	 *
+	 * 与 InvincibilityFlickerComponent 唯一区别:
+	 *   - InvincibilityFlickerComponent 订阅 OnHealthChanged (健康数据驱动)
+	 *   - 本组件被 CombatDeathComponent::TakeDamage 显式调用 (战斗事件驱动)
+	 *   - 这避免"血量变化触发降速"这种隐式误触发 — 显式 > 隐式
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Mother")
+	UMotherSlowComponent* MotherSlowComponent;
 
 	/**
 	 * 【v101 大厂架构新增】母体残血虚弱闪烁组件 — 与 InvincibilityFlickerComponent 完全对称
@@ -959,6 +1045,19 @@ public:
 	}
 
 	/**
+	 * 【v133.5 新增】母体被主武器击中后降速组件 - 通用 resolver 入口
+	 *
+	 * 大厂原则 - 与 ResolveFlickerComponent / ResolveMotherLowHealthFlicker 完全对称:
+	 *   - 走 ResolveComponent<T> 模板 (字段 → FindComponentByClass → Log Error)
+	 *   - 调用方拿到 nullptr 时已 Log Error, 不允许静默跳过
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UMotherSlowComponent* ResolveMotherSlowComponent()
+	{
+		return ResolveComponent<UMotherSlowComponent>(MotherSlowComponent, TEXT("MotherSlowComponent"));
+	}
+
+	/**
 	 * 【2026.07.12 P0 大厂重构 Phase 2】角色头像/武器图标刷新组件 (Phase 2.5)
 	 * 职责: RefreshCharacterIcon/Client_RefreshCharacterIcon_Implementation/RetryRefreshCharacterIcon
 	 *       + RefreshWeaponIconOnHUD/GetCharacterAvatarFromTable
@@ -1299,6 +1398,24 @@ protected:
 	 */
 	UFUNCTION()
 	void OnHealthComponentInvincibilityChanged(bool bIsNowInvincible);
+
+	/**
+	 * 【v133.5 大厂架构新增】MotherSlowComponent 状态变化回调
+	 *
+	 * 触发场景:
+	 *   - 服务器: CombatDeathComponent::TakeDamage 末尾 → ActivateSlow → ServerBroadcast
+	 *   - 客户端: OnRep_SlowStateChanged → ClientBroadcast
+	 *   - 双发保证 (与 Invincibility 完全对称)
+	 *
+	 * 职责:
+	 *   - 读 Component.bIsSlowed
+	 *   - 真理源分流: 玩家读 PlayerConfig->MotherSlowSpeed, AI 读 ConfigSO->MotherSlowSpeed
+	 *   - 改 MaxWalkSpeed (恢复 OldSpeed / 应用 SlowSpeed)
+	 *
+	 * @note 服务器/客户端都执行 (同一份视觉逻辑)
+	 */
+	UFUNCTION()
+	void HandleSlowStateChanged();
 
 	/**
 	 * 【2026-07-01 新增】本地执行死亡流程
@@ -1956,6 +2073,38 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
 	bool OnAIRequestAttack_Simple();
 
+	/**
+	 * 【v133 P0 大厂扩展 — BT 编辑器可配置】AI 攻击可配置入口转发壳
+	 *
+	 * 大厂原则 — 单一职责:
+	 *   - BaseCharacter 转发壳: 把 UE 调用面 (BP/BT 可调) 暴露在 Actor 上
+	 *   - AIAttackComponent 接管: 实际副作用 (Resolver/锁脚/BB写入) 全部在 Component 内部
+	 *   - 与 OnAIRequestAttack_Simple 对称: 转发壳模式完全一致
+	 *
+	 * 真实调用方 (v133+):
+	 *   - BTTask_PlayAttackMontage (v133) → 本方法 → AIAttackComponent::OnAIRequestAttack_WithOptions
+	 *
+	 * @return true=攻击发起成功; false=任一前置检查失败 (内部已 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	bool OnAIRequestAttack_WithOptions(EAIAttackType InAttackType, int32 InComboIndex, bool bInLockMovement);
+
+	/**
+	 * 【v133.1 P0 大厂扩展 — 徒手 AI 直接指定蒙太奇】转发壳
+	 *
+	 * 大厂原则 — 单一职责:
+	 *   - BaseCharacter 转发壳: 把 UE 调用面 (BP/BT 可调) 暴露在 Actor 上
+	 *   - AIAttackComponent 接管: 实际副作用 (锁脚/BB写入) 全部在 Component 内部
+	 *
+	 * 真实调用方 (v133.1+):
+	 *   - BTTask_PlayAttackMontage (v133.1) 在 ExplicitMontage!=nullptr 时调本方法
+	 *   - 适用: 母体 Zombie 抓人 / 临时测试 / 武器 BP 过渡期
+	 *
+	 * @return true=攻击发起成功; false=前置检查失败 (内部已 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	bool OnAIRequestAttack_ExplicitMontage(UAnimMontage* InExplicitMontage, bool bInLockMovement);
+
 
 	// ==========================================
 	// 6. 战斗 RPC (网络动作同步)
@@ -2488,6 +2637,39 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Aim")
 	bool GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector& OutRayDirection);
+
+	/**
+	 * 【v130 新增 / v131 增强】ComputeFireRayTowardsTarget — 算 Muzzle → Target 方向的完整射线 (3D 追踪)
+	 *
+	 * 业务背景 (用户 2026.08.02 反馈):
+	 *   - GetAimRayFromCrosshairOrEyes AI 路径用 BaseAimRotation (水平方向)
+	 *   - 玩家 Target 在不同高度 (跳起/下蹲/错位) → AI 不会跟随 → 子弹飘了
+	 *   - 想要: 3D 追踪射线 (跟随 Target 上下位置 — CS:GO/Apex/PUBG 大厂标准)
+	 *
+	 * 算法 (v131 升级):
+	 *   - Origin            = Weapon Mesh Muzzle Socket (与 v109 GetAimRayFromCrosshairOrEyes 一致)
+	 *   - TargetAimPoint    = Target.ActorLocation + (0, 0, 60) (向上偏移 60cm = 胸口位置)
+	 *   - Direction         = (TargetAimPoint - MuzzleLocation).GetSafeNormal()
+	 *                       → 完整 3D 方向, 自动跟随 Target 上下 + 命中胸口
+	 *
+	 * v130 → v131 升级:
+	 *   - v130 指向 Target.ActorLocation (Capsule 中心 88cm) → 命中 Capsule 时 trace 沿 line
+	 *     进入点 = Capsule 底部 (脚) → 用户感受到"打脚"
+	 *   - v131 指向 Target.ActorLocation + 60cm (Capsule 中心 + 60cm = 148cm = 胸口) → 命中胸口
+	 *   - 大厂原则 — 与玩家准星一致: 玩家准星默认指向胸口, AI 也应该跟玩家一致
+	 *
+	 * 与 v109 GetAimRayFromCrosshairOrEyes 关系:
+	 *   - v109 是"AI 准星方向" (水平, 用于无 Target / Target 拿不到)
+	 *   - v131 是"AI 枪口指向 Target 胸口" (3D, 用于 BT 已知 Target Actor 时)
+	 *   - 大厂原则 — 显式优于隐式: 两个 API 各司其职, BT 选择用哪个
+	 *
+	 * @param TargetActor       输入: 目标 Actor (必须有效, 由调用方保证)
+	 * @param OutRayOrigin      输出: 射线起点 (Muzzle Socket 世界坐标)
+	 * @param OutRayDirection   输出: 射线方向 (单位向量, 已归一化, 3D 完整)
+	 * @return true=成功, false=Muzzle Socket 找不到 / TargetActor 无效 (Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Aim")
+	bool ComputeFireRayTowardsTarget(AActor* TargetActor, FVector& OutRayOrigin, FVector& OutRayDirection);
 
 	/**
 	 * GetCrosshairWorldDirection_Const — 纯 const 查询 (仅供真正 const 上下文调用)

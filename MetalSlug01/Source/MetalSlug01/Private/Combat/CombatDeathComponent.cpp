@@ -41,6 +41,11 @@
 // 包含 HealthRegenComponent 以重置回血状态
 #include "Components/HealthRegenComponent.h"
 
+// 【v133.5 新增】包含 MotherSlowComponent (主武器击中母体降速组件)
+//   - CombatDeathComponent::TakeDamage 末尾调 ActivateSlow
+//   - CombatDeathComponent::Die 防御型调 DeactivateSlow
+#include "Combat/MotherSlowComponent.h"
+
 // 包含 RoomGameMode 以调 RequestRespawn
 #include "Systems/RoomGameMode.h"
 
@@ -75,6 +80,8 @@
 // 包含 FactionTags 集中定义 (CanDamage 三层防御)
 #include "Data/Faction/FactionTags.h"
 #include "Data/Tables/KillIconTableRow.h" // 【v105 新增】FKillStreakIconInfo (服务器查表获取击杀音效)
+#include "Data/Config/PlayerConfigAsset.h" // 【v133.5 新增】主武器击中母体降速真理源 (玩家路径)
+#include "Data/AI/AIBehaviorConfigSO.h"    // 【v133.5 新增】主武器击中母体降速真理源 (AI 路径)
 
 // UE 引擎组件: 移动/胶囊体/骨骼网格
 #include "GameFramework/CharacterMovementComponent.h"
@@ -384,6 +391,84 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 
 		// 注: Die() 由 HealthComponent::OnDeath 事件触发 (BaseCharacter 订阅)
 		//     旧 TakeDamage → Die() 路径已废弃, 改走事件驱动
+	}
+
+	// ============================================================
+	// 8. 【v133.5 大厂架构 — 主武器击中母体 → 降速触发】
+	// ============================================================
+	//
+	// 业务规则 (用户 2026.08.02 明确):
+	//   - 主武器 (EWeaponMeshType::Primary) 击中母体 → 降速到 MotherSlowSpeed (默认 100)
+	//   - 默认 2 秒后恢复 (用户决策 v133.5)
+	//
+	// 大厂原则 — 集中调度 + 单一真理源:
+	//   - 触发入口唯一: 本函数 (CombatDeathComponent::TakeDamage)
+	//   - 真理源分流: 玩家读 PlayerConfigAsset, AI 读 ConfigSO (镜像 v133.4 血量)
+	//   - 状态字段: MotherSlowComponent->bIsSlowed (Replicated)
+	//   - 实际改 MaxWalkSpeed: BaseCharacter 订阅 OnSlowStateChanged (跨边界最小化)
+	//
+	// 判定条件 (按顺序, 短路 AND):
+	//   - 仅服务器 (HasAuthority)
+	//   - 受害者是母体 (bIsMother==true)
+	//   - 受害者未死 (IsDead()==false) — 否则去死吧, 不用降速
+	//   - 武器 MeshType == Primary (主武器)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式没有 bIsMother Pawn → 永远不触发
+	//   - 副武器 / 近战 击中母体 → 不触发 (只 Primary)
+	//
+	// 时序保证:
+	//   - 在 HealthComponent.ApplyDamage 之后 (已扣血/已过无敌期/已过阵营守卫)
+	//   - 在 IsDead 分支之后 (死了就不必降速)
+	//   - 在 ReturnActualDamage 之前 (与扣血同一调用栈)
+	if (Owner->HasAuthority() && Owner->bIsMother && !Owner->IsDead())
+	{
+		// 读 DamageCauser (Weapon) 的 MeshType
+		ABaseWeapon* Weapon = Cast<ABaseWeapon>(DamageCauser);
+		if (Weapon && Weapon->GetMeshType() == EWeaponMeshType::Primary)
+		{
+			// 真理源分流: 读对应 Config 的 SlowDurationSeconds
+			float SlowDurationSeconds = 0.0f;
+
+			// 优先判断 Controller: 玩家路径 vs AI 路径
+			AController* Ctrl = Owner->GetController();
+			if (Cast<APlayerController>(Ctrl) != nullptr)
+			{
+				// 玩家路径: 真理源 = PlayerConfigAsset.SlowDurationSeconds
+				if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+				{
+					if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+					{
+						SlowDurationSeconds = PC->SlowDurationSeconds;
+					}
+				}
+			}
+			else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Ctrl))
+			{
+				// AI 路径: 真理源 = ConfigSO.SlowDurationSeconds
+				if (UAIBehaviorConfigSO* Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig()))
+				{
+					SlowDurationSeconds = Config->SlowDurationSeconds;
+				}
+			}
+
+			// 激活慢速 — MotherSlowComponent 内部已经 Log 配错/拒绝缩短 等
+			// 【v133.5.1 修复】必须传入当前 MaxWalkSpeed (Component 不知道 MovementComponent, 零跨边界)
+			if (UMotherSlowComponent* SlowComp = Owner->ResolveMotherSlowComponent())
+			{
+				const float CurrentMaxWalkSpeed = Owner->GetCharacterMovement()
+					? Owner->GetCharacterMovement()->MaxWalkSpeed
+					: 0.0f;
+
+				SlowComp->ActivateSlow(SlowDurationSeconds, CurrentMaxWalkSpeed);
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[CombatDeathComponent] 【v133.5 触发】主武器击中母体 → 降速. "
+					     "Owner=%s Weapon=%s MeshType=Primary Duration=%.2fs CurrentSpeed=%.1f (真理源=%s)"),
+					*Owner->GetName(), *Weapon->GetName(), SlowDurationSeconds, CurrentMaxWalkSpeed,
+					Cast<APlayerController>(Ctrl) ? TEXT("PlayerConfigAsset") : TEXT("ConfigSO"));
+			}
+		}
 	}
 
 	return ActualDamage;
@@ -714,6 +799,50 @@ void UCombatDeathComponent::ExecuteDeathLocal()
 	if (UHealthComponent* HC = Owner->ResolveHealthComponent())
 	{
 		HC->DeactivateInvincibility();
+	}
+
+	// 0.6. 【v133.5 大厂架构】死亡时强制取消慢速状态 — 与 DeactivateInvincibility 完全对称
+	//    原因: 边缘 case — 母体在降速期内被打死 → Timer 残留 → 新 Pawn 复活时被误认为降速
+	//    防御型设计: 防止死亡事件链残留 Timer 状态污染下一个生命周期
+	if (UMotherSlowComponent* SlowComp = Owner->ResolveMotherSlowComponent())
+	{
+		SlowComp->DeactivateSlow();
+	}
+
+	// 0.7. 【v133.6 P0 大厂架构 — AI 复活后不攻击修复】死亡时强制清 AIController::bIsCurrentlyAttacking
+	//    ==========================================================
+	//    真根因 (用户 2026.08.02 反馈):
+	//      "Play Attack Montage 节点, 母体被击杀复活后就不能播放蒙太奇了"
+	//
+	//    链路分析:
+	//      - AIController.bIsCurrentlyAttacking 是 Controller 层字段, 不是 Pawn 层
+	//      - v116 修复后 AIC 复用 (Pawn 死后不销毁 AIC, 等 MutatePawnToMother 复活)
+	//      - 死亡时 bIsCurrentlyAttacking 残留 = true (OnAIAttackMontageEnded 可能没触发)
+	//      - 复活后: 新 Pawn → AIC 仍持 bIsCurrentlyAttacking=true
+	//      - OnAIRequestAttack_* 步骤 0 守卫: if (BaseAIC->IsCurrentlyAttacking()) return true;
+	//      - BTTask 永远看到 Succeeded (但不播蒙太奇) → AI 不攻击
+	//
+	//    修复 (大厂原则 — 防御型设计, 镜像 DeactivateInvincibility/Slow):
+	//      - 死亡链路第 0 步强制设 false, 不依赖蒙太奇自然结束的回调
+	//      - 幂等: 即使 bIsCurrentlyAttacking 已经是 false 也无害
+	//      - 这与 DeactivateInvincibility/DeactivateSlow 完全对称, 是"防御型设计" 的统一模式
+	//
+	//    大厂原则:
+	//      - 死亡链路是状态重置的"权威入口", 所有可污染复活后状态的字段必须在这里清
+	//      - 不依赖回调触发 (蒙太奇回调在死亡时序下不可靠)
+	//      - 不读 AIController 内部字段绕过 (直接调 Controller API, 职责分离)
+	//    ==========================================================
+	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Owner->GetController()))
+	{
+		if (BaseAIC->IsCurrentlyAttacking())
+		{
+			BaseAIC->SetCurrentlyAttacking(false);
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[CombatDeathComponent] 【v133.6 P0 修复】死亡时强制清 AIController.bIsCurrentlyAttacking. "
+				     "Owner=%s AIController=%s (复活后 AI 攻击蒙太奇可正常播放, 不会被步骤 0 守卫误判)"),
+				*Owner->GetName(), *BaseAIC->GetName());
+		}
 	}
 
 	// 1. 武器掉落 (复制本地指针以防 CurrentWeapon 被清空)

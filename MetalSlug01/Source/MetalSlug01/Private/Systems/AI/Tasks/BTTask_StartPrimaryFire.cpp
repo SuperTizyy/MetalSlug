@@ -26,6 +26,7 @@
 
 #include "AIController.h"
 #include "BehaviorTree/BehaviorTreeComponent.h"
+#include "BehaviorTree/BlackboardComponent.h"  // 【v130 新增】BB 读取 TargetActor
 #include "GameFramework/Pawn.h"
 
 #include "Characters/BaseCharacter.h"
@@ -35,14 +36,30 @@
 UBTTask_StartPrimaryFire::UBTTask_StartPrimaryFire()
 {
 	NodeName = TEXT("Start Primary Fire");
+
+	// 【v130 新增】TargetActorKey 注册 — Object 类型过滤
+	//   - 让 BT 编辑器下拉只显示 Object Key, 不会选错类型
+	TargetActorKey.AddObjectFilter(this,
+		GET_MEMBER_NAME_CHECKED(UBTTask_StartPrimaryFire, TargetActorKey),
+		AActor::StaticClass());
 }
 
 
 FString UBTTask_StartPrimaryFire::GetStaticDescription() const
 {
-	return TEXT("调 CurrentWeapon->StartFire (镜像玩家 IA_Fire)\n"
-				"射线算法 = BaseCharacter::GetAimRayFromCrosshairOrEyes (AI 路径)\n"
-				"无目标/武器 → Failed");
+	const FString TargetInfo = TargetActorKey.SelectedKeyName.IsNone()
+		? TEXT("无 TargetActor Key (走 v109 BaseAimRotation 水平射线 — 旧行为)")
+		: FString::Printf(TEXT("TargetActor Key='%s' (v130 3D 追踪射线 — 跟随 Target 上下)"),
+			*TargetActorKey.SelectedKeyName.ToString());
+
+	return FString::Printf(TEXT(
+		"调 CurrentWeapon->Server_StartFire (镜像玩家 IA_Fire)\n"
+		"射线起点 = Weapon Mesh Muzzle Socket\n"
+		"射线方向算法:\n"
+		"  - %s\n"
+		"  - 无效 TargetKey → fallback 到 BaseCharacter::GetAimRayFromCrosshairOrEyes\n"
+		"无武器/无 Pawn/无 AIController → Failed (零兜底)"),
+		*TargetInfo);
 }
 
 
@@ -77,28 +94,69 @@ EBTNodeResult::Type UBTTask_StartPrimaryFire::ExecuteTask(
 	}
 
 	// ===========================================
-	// 【v109 大厂镜像方案 P0 关键修复】
-	// 算射线 — 用 BaseCharacter 已有的 GetAimRayFromCrosshairOrEyes API (line 2240)
-	//   - 玩家路径:本地玩家 → HUD Crosshair World Ray (玩家准星)
-	//   - AI 路径: IsLocallyControlled=false → GetBaseAimRotation (BT 控制的旋转)
-	//              + WeaponMesh Muzzle Socket (由 GetAimRayFromCrosshairOrEyes 内部算)
-	//   - 两条路径函数签名一致,AI 跟玩家完全对称
+	// 【v130 大厂 3D 追踪 P0 关键修复】
+	// 算射线 — 优先用 TargetActor 算 3D 追踪射线,fallback 到 v109 GetAimRayFromCrosshairOrEyes
+	//   - 用户反馈 (2026.08.02): AI 水平射击, 不能跟随 Target 上下位置
+	//   - 旧版 (v109) 根因: AI 路径用 BaseAimRotation (水平, 准星旋转, 不跟随 Target 高度)
+	//   - 新版 (v130) 修复: 优先用 ComputeFireRayTowardsTarget (3D, Muzzle→Target 方向)
 	//
-	// 为什么 BT 不自己算 (v107 反模式):
-	//   - BT 用 SelfLocation 作起点: 不准,应该用 Muzzle Socket
-	//   - BT 用 (Target-Self) 作方向: 够用,但起点配错让射线从脚下发出
-	//   - 把"算射线" 关注点抽到 BaseCharacter 才是大厂级抽象
+	// 大厂原则 — Target Data 优先 (零兜底优于隐式 fallback):
+	//   路径 A: 配 TargetActorKey + TargetActor 有效 → 3D 追踪射线 (v130 新行为)
+	//   路径 B: 没配 / TargetActor 无效 → fallback v109 (旧行为, 兼容)
+	//   路径 C: v109 也失败 → BT Failed (零兜底, 不允许射线空跑)
+	//
+	// 大厂原则 — 与玩家 BP_BaseCharacter 镜像 100%:
+	//   - 玩家路径: PlayerCameraManager → HUD Crosshair (也是 3D 完整射线)
+	//   - AI 路径: ComputeFireRayTowardsTarget → 3D (跟玩家一致 — CS:GO/Apex/Valorant 大厂标准)
 	// ===========================================
 	FVector ClientRayOrigin;
 	FVector ClientRayDirection;
-	if (!SelfPawn->GetAimRayFromCrosshairOrEyes(ClientRayOrigin, ClientRayDirection))
+	bool bGotRay = false;
+
+	// 路径 A: 优先用 TargetActor 算 3D 追踪射线 (v130 新增)
+	const bool bHasTargetKey = !TargetActorKey.SelectedKeyName.IsNone();
+	if (bHasTargetKey)
 	{
-		// 内部已 Log Error 解释根因(HUD 没初始化 / BaseAimRotation 是 Zero 等)
-		UE_LOG(LogBehaviorTree, Warning,
-			TEXT("[BTTask_StartPrimaryFire] AIC='%s' GetAimRayFromCrosshairOrEyes 失败, 拒绝开火. "
-			     "(详见上一行 UE_LOG Error 排查路径)"),
-			*AIC->GetName());
-		return EBTNodeResult::Failed;
+		UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
+		if (BB)
+		{
+			AActor* TargetActor = Cast<AActor>(BB->GetValueAsObject(TargetActorKey.SelectedKeyName));
+			if (IsValid(TargetActor))
+			{
+				bGotRay = SelfPawn->ComputeFireRayTowardsTarget(TargetActor, ClientRayOrigin, ClientRayDirection);
+				if (bGotRay)
+				{
+					UE_LOG(LogBehaviorTree, Verbose,
+						TEXT("[BTTask_StartPrimaryFire] 【v130 3D 追踪】AIC='%s' Target='%s' "
+						     "Origin=%s Direction=%s (自动跟随 Target 上下)"),
+						*AIC->GetName(),
+						*TargetActor->GetName(),
+						*ClientRayOrigin.ToCompactString(),
+						*ClientRayDirection.ToCompactString());
+				}
+			}
+			else
+			{
+				UE_LOG(LogBehaviorTree, Verbose,
+					TEXT("[BTTask_StartPrimaryFire] 【v130】AIC='%s' TargetActorKey 配了但 BB 里是空, fallback 到 v109. "
+					     "(检查上层装饰器顺序 — LineOfSight/InAttackRange 应该先拒判, 这里不该走到)"),
+					*AIC->GetName());
+			}
+		}
+	}
+
+	// 路径 B: fallback v109 (旧行为, 保持兼容)
+	if (!bGotRay)
+	{
+		bGotRay = SelfPawn->GetAimRayFromCrosshairOrEyes(ClientRayOrigin, ClientRayDirection);
+		if (!bGotRay)
+		{
+			UE_LOG(LogBehaviorTree, Warning,
+				TEXT("[BTTask_StartPrimaryFire] AIC='%s' GetAimRayFromCrosshairOrEyes 失败, 拒绝开火. "
+				     "(详见上一行 UE_LOG Error 排查路径)"),
+				*AIC->GetName());
+			return EBTNodeResult::Failed;
+		}
 	}
 
 	// ===========================================

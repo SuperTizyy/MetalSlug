@@ -254,4 +254,33 @@ void AMeleeAIController::SetupMeleeAI(UAIBehaviorConfigSO* MeleeConfig)
 				InvSeconds, *BaseChar->GetName());
 		}
 	}
+
+	// ============================================================
+	// 【v133.4 2026.08.02 大厂架构 — 真理源分离】AI Pawn 应用 ConfigSO 血量
+	// ============================================================
+	//
+	// 历史 (v41-v133.3 反模式):
+	//   - SetupMeleeAI 末尾没调任何 ConfigSO 血量写入
+	//   - AI 血量 = HealthComponent 默认值 100 (写死在 HealthComponent.h)
+	//   - ConfigSO 加 MaxHealth 字段被 PlayerConfigAsset 覆盖 (ApplyCharacterConfigToCharacter 误调用)
+	//
+	// 新架构 (v133.4):
+	//   - 关卡预放 AI 路径走 ApplyAICharacterConfigToCharacter (读 ConfigSO.Health)
+	//   - 真理源 = ConfigSO.Health.MaxHealth / MotherMaxHealth (按 bIsMother 分流)
+	//   - 与大厅 AI 路径对称 (SpawnAIInternal 也调 ApplyAICharacterConfigToCharacter)
+	// ============================================================
+	if (ABaseCharacter* BaseChar = Cast<ABaseCharacter>(GetPawn()))
+	{
+		if (BaseChar->HasAuthority())
+		{
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				SpawnSys->ApplyAICharacterConfigToCharacter(BaseChar);
+				UE_LOG(LogTemp, Log,
+					TEXT("[MeleeAI] SetupMeleeAI: 【v133.4】已调 ApplyAICharacterConfigToCharacter (真理源=ConfigSO.Health) "
+					     "Pawn=%s bIsMother=%d"),
+					*BaseChar->GetName(), BaseChar->bIsMother ? 1 : 0);
+			}
+		}
+	}
 }

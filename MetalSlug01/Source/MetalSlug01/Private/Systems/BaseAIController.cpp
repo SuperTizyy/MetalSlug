@@ -386,13 +386,23 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 			// 零兜底: 配置未加载时 Log Error, 不允许静默用默认值
 			if (RuntimeConfig)
 			{
-				const float WS = RuntimeConfig->GetScaledMovement().WalkSpeed;
+				const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
+
+				// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+				//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
+				//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
+				const float WS = Char->bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
+
 				if (WS <= 0.f)
 				{
 					UE_LOG(LogBaseAI, Error,
-						TEXT("[%s] OnPossess: 配置表 WalkSpeed=%.0f <= 0, AI 不会移动! "
-							 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0 (例如 250)"),
-						*GetName(), WS);
+						TEXT("[%s] OnPossess: 配置表 %s=%.0f <= 0 (bIsMother=%d), AI 不会移动! "
+							 "修复: DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
+						*GetName(),
+						Char->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
+						WS,
+						Char->bIsMother ? 1 : 0,
+						Char->bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
 					Move->MaxWalkSpeed = 0.f;
 				}
 				else
@@ -705,13 +715,19 @@ void ABaseAIController::OnConfigLoaded()
 		{
 			if (RuntimeConfig)
 			{
-				const float WS = RuntimeConfig->GetScaledMovement().WalkSpeed;
+				const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
+
+				// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+				const float WS = Char->bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
+
 				Move->MaxWalkSpeed = WS;
 				Char->bIsMovementLocked = false;
 				bMovementLockedForCooldown = false;
 				UE_LOG(LogBaseAI, Verbose,
-					TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f"),
-					*GetName(), WS);
+					TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f (bIsMother=%d, %s)"),
+					*GetName(), WS,
+					Char->bIsMother ? 1 : 0,
+					Char->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"));
 			}
 		}
 	}
@@ -1028,6 +1044,41 @@ void ABaseAIController::StartBehaviorTreeFromConfigInternal()
 	}
 
 	// 运行行为树，启动 AI 的行为逻辑
+	// 【v133.8 P0 大厂架构修复 — 母体复活后不能播放蒙太奇 终极修复】
+	// ==========================================================
+	// 真根因 (用户 2026.08.02 反馈 v133.6+v133.7 修复后仍存在):
+	//   - v111.3 修复: MutatePawnToMother 末尾调 InitializeFromConfig 重启 BT
+	//   - 但 InitializeFromConfig → OnConfigLoaded → TryStartBehaviorTreeOrWaitForBattleStart
+	//                       → StartBehaviorTreeFromConfigInternal → RunBehaviorTree(BT)
+	//   - UE 5.6 行为树: 如果 BT 已经在跑, RunBehaviorTree(BT) 第二次是 **no-op**!
+	//   - 母体被击杀 → AIC 复用 (v116 修复) → BT 实例仍在跑
+	//   - 复活 → InitializeFromConfig 重启 BT → 但 RunBehaviorTree 不生效
+	//   - 旧 Pawn 的 BT 状态保留 (BB.TargetActor=空, bAttackStarted=脏, etc.)
+	//   - 复活后 BT 跑 PlayAttackMontage → 走 ExplicitMontage 路径 → 实际播放蒙太奇
+	//   - 但**旧蒙太奇残留** (老蒙太奇 OnMontageEnded 没触发 / 状态机已卡死) → 新蒙太奇播放不响应
+	//
+	// 修复 (UE 5.6 标准 API):
+	//   - RunBehaviorTree 之前必须 StopLogic (UE 官方 restart 模式)
+	//   - StopLogic 触发 BT Activity 完整 Stop → 旧 BT 状态清零
+	//   - 再次 RunBehaviorTree(BT) → 全新 BT 实例启动
+	//
+	// 大厂原则 — 防御型设计:
+	//   - Restart BT 是幂等的 (没在跑时 StopLogic 自动忽略)
+	//   - 复活链 BT 状态恢复的"权威入口" 在 RestartTree
+	//   - 不依赖 bBehaviorTreeStarted flag (flag 状态可能被外部重置)
+	// ==========================================================
+	if (BrainComponent && BrainComponent->IsRunning())
+	{
+		UE_LOG(LogBaseAI, Display,
+			TEXT("[%s] StartBehaviorTreeFromConfigInternal: 【v133.8 修复】检测到 BT 已在跑, 强制 StopLogic 重启. "
+			     "BT='%s' (旧 BT 状态在复活链中可能脏, 必须清理)"),
+			*GetName(), *GetNameSafe(BT));
+
+		// UE 标准 API: StopLogic 停止当前 BT Activity (会触发 OnCeaseRelevant 处理)
+		// 第二参数 "Restart" 是给自定义日志系统看的, 不影响行为
+		BrainComponent->StopLogic(TEXT("RestartAfterRespawn"));
+	}
+
 	RunBehaviorTree(BT);
 	// 标记行为树已启动，避免重复启动
 	bBehaviorTreeStarted = true;
@@ -2003,15 +2054,27 @@ void ABaseAIController::LockMovementForCooldown(bool bLock)
 		// 【v42 2026.07.14 大厂架构重构】恢复速度从配置表读 WalkSpeed
 		// RuntimeConfig 在 Possess 后 SetupMeleeAI 已加载, GetScaledMovement() 一定有效
 		float RestoreSpeed = 0.f; // 默认 0 (零兜底: 配置未加载时不允许 AI 乱跑)
+
+		// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+		const bool bIsMother = MyChar ? MyChar->bIsMother : false;
+
 		if (RuntimeConfig)
 		{
-			RestoreSpeed = RuntimeConfig->GetScaledMovement().WalkSpeed;
+			const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
+			//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
+			//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
+			RestoreSpeed = bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
+
 			if (RestoreSpeed <= 0.f)
 			{
 				UE_LOG(LogBaseAI, Error,
-					TEXT("[%s] LockMovementForCooldown: 配置表 WalkSpeed=%.0f <= 0, AI 不会移动! "
-						 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0"),
-					*GetName(), RestoreSpeed);
+					TEXT("[%s] LockMovementForCooldown: 配置表 %s=%.0f <= 0 (bIsMother=%d), AI 不会移动! "
+						 "修复: DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
+					*GetName(),
+					bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
+					RestoreSpeed,
+					bIsMother ? 1 : 0,
+					bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
 				RestoreSpeed = 0.f;
 			}
 		}
@@ -2030,8 +2093,9 @@ void ABaseAIController::LockMovementForCooldown(bool bLock)
 		bMovementLockedForCooldown = false;
 
 		UE_LOG(LogBaseAI, Verbose,
-			TEXT("[%s] LockMovementForCooldown: UNLOCK (MaxWalkSpeed=%.0f, bIsMovementLocked=false)"),
-			*GetName(), RestoreSpeed);
+			TEXT("[%s] LockMovementForCooldown: UNLOCK (MaxWalkSpeed=%.0f, bIsMovementLocked=false, bIsMother=%d, 真理源=%s)"),
+			*GetName(), RestoreSpeed, bIsMother ? 1 : 0,
+			bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"));
 	}
 }
 

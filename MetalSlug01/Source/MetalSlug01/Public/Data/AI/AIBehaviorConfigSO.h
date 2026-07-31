@@ -209,6 +209,112 @@ public:
     TSoftClassPtr<class ABaseWeapon> LevelPlacedWeaponClass;
 
     // ========================================================================
+    // 【v133.4 2026.08.02】AI 血量配置（人类 vs 母体分离）
+    // ========================================================================
+    //
+    // 设计原则 (大厂架构 — 单一真理源 + 职责对等):
+    //   - 人类 AI / 母体 AI 是两个独立真理源,不允许互相覆盖
+    //   - 真理源: DA_AIBehaviorConfig_XXX → Health → MaxHealth / MotherMaxHealth
+    //   - 调用方按 Pawn.bIsMother 分流:
+    //     - bIsMother=true  → MotherMaxHealth (母体 AI)
+    //     - bIsMother=false → MaxHealth      (人类 AI, 默认)
+    //
+    // 编辑器配置路径:
+    //   DA_AIBehaviorConfig_MeleeGrunt → Health → Max Health (人类 AI)
+    //   DA_AIBehaviorConfig_ZombieMother → Health → Mother Max Health (母体 AI)
+    //
+    // 典型值:
+    //   - 人类 AI MaxHealth: 100~200 (与玩家相当)
+    //   - 母体 AI MotherMaxHealth: 200~500 (母体更强壮)
+    //
+    // 【零兜底】字段 <= 0 → HealthComponent->InitializeHealth 拒绝写入, AI 血量 = 默认值 100
+    // ========================================================================
+
+    /**
+     * 人类 AI 最大血量 — 所有非母体 AI 真理源
+     *
+     * 适用场景:
+     *   - 关卡预放 AI (Level 预置): AMeleeAIController::SetupMeleeAI 末尾写入
+     *   - 大厅 AI (房主 UI 添加): URoomSpawnSubsystem::SpawnAIInternal 末尾写入
+     *   - AI 复活 (死亡后): URoomSpawnSubsystem::RequestRespawn 触发路径
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health",
+        meta = (ClampMin = "1.0", UIMin = "1.0",
+                DisplayName = "MaxHealth (人类 AI 最大血量)"))
+    float MaxHealth = 100.0f;
+
+    /**
+     * 母体 AI 最大血量 — 母体 AI 真理源
+     *
+     * 适用场景:
+     *   - 关卡预放母体 AI (Level 预置): SetupMeleeAI 末尾按 bIsMother 分流
+     *   - 母体 AI 复活链 (RequestRespawn → MutatePawnToMother)
+     *
+     * 调用方按 Pawn.bIsMother 分流 (与 MaxHealth 严格分离)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health",
+        meta = (ClampMin = "1.0", UIMin = "1.0",
+                DisplayName = "MotherMaxHealth (母体 AI 最大血量)"))
+    float MotherMaxHealth = 300.0f;
+
+    // ========================================================================
+    // 【v133.5 2026.08.02】母体被主武器击中后降速 (Combat|Mother)
+    // ========================================================================
+    //
+    // 设计原则 (大厂架构 — 单一真理源 + 职责对等):
+    //   - 主武器 (EWeaponMeshType::Primary) 击中母体 → 降速 X 秒
+    //   - 触发入口: CombatDeathComponent::TakeDamage 末尾 (唯一)
+    //   - 状态字段: UMotherSlowComponent (Replicated, 镜像 Invincibility 模式)
+    //   - 实际改 MaxWalkSpeed: BaseCharacter 订阅 OnSlowStateChanged
+    //
+    // 编辑器配置路径:
+    //   DA_AIBehaviorConfig_XXX → Combat|Mother → Mother Slow Speed / Slow Duration Seconds
+    //
+    // 典型值:
+    //   - MotherSlowSpeed: 100 (典型降速, 配置 50~200)
+    //   - SlowDurationSeconds: 2.0 (默认 2s, 配置 0.5~5.0)
+    //
+    // 【零兜底】字段 ≤ 0 → 拒绝激活 (强制策划修复)
+    // ========================================================================
+
+    /**
+     * 母体被主武器击中后的目标移速 (cm/s)
+     *
+     * 真理源: DA_AIBehaviorConfig_XXX → Combat|Mother → Mother Slow Speed
+     *
+     * 适用场景:
+     *   - 关卡预放母体 AI: 击中后 MaxWalkSpeed = MotherSlowSpeed
+     *   - 母体 AI 复活链: 同上
+     *
+     * 触发链:
+     *   1. 武器击中 (Server_ReportHit) → ApplyPointDamage
+     *   2. CombatDeathComponent::TakeDamage (服务器: 友军守卫 + 无敌期拦截 + ApplyDamage)
+     *   3. TakeDamage 末尾判定: Weapon.MeshType==Primary && Victim.bIsMother=true
+     *   4. 调 MotherSlowComponent::ActivateSlow(2.0f)
+     *   5. 状态变更 → BaseCharacter 订阅 OnSlowStateChanged → 改 MaxWalkSpeed
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Mother",
+        meta = (ClampMin = "0.0", UIMin = "0.0",
+                DisplayName = "Mother Slow Speed (母体被主武器击中后移速)"))
+    float MotherSlowSpeed = 100.0f;
+
+    /**
+     * 母体被主武器击中后降速持续时间 (秒)
+     *
+     * 真理源: DA_AIBehaviorConfig_XXX → Combat|Mother → Slow Duration Seconds
+     *
+     * 适用场景: 同 MotherSlowSpeed
+     *
+     * 默认 2.0 秒 (用户业务规则 2026.08.02)
+     * - ≤ 0 → 拒绝激活 (零兜底)
+     * - 多次激活取较晚到期 (大厂原则 - 拒绝缩短)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Mother",
+        meta = (ClampMin = "0.0", UIMin = "0.0",
+                DisplayName = "Slow Duration Seconds (降速持续时间)"))
+    float SlowDurationSeconds = 2.0f;
+
+    // ========================================================================
     // 所有 AI 共用
     // ========================================================================
 
@@ -296,11 +402,18 @@ public:
     /**
      * 主武器开火距离 (cm) — BTService_UpdateZombieTargets 选母体目标用
      * 母体攻击距离在生化模式独立配置, 与刀战 AttackRange 完全分离
+     *
+     * 【v133.10 用户业务指令 2026.08.02】扫描半径默认 = 全图大小
+     *   - 0 = 扫描全图 (无距离限制, 选最近的有效目标)
+     *   - >0 = 按此距离过滤 (cm, 单位米=cm/100)
+     *   - 大厂原则: 距离过滤是反大厂默认 — 复活链路敌人可能跨地图复活, 不该被距离限制
+     *     单一真理源: 距离判断应该交给 BT Decorator (InAttackRange), 不该在 Service 提前过滤
+     *   - 因此默认改为 0 (不过滤), 策划需要时才填值
      */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie",
-        meta = (ClampMin = "100.0", ClampMax = "10000.0",
-                DisplayName = "PrimaryWeaponFireRange (主武器开火距离 cm)"))
-    float ZombiePrimaryFireRange = 3500.f;
+        meta = (ClampMin = "0.0", ClampMax = "100000.0",
+                DisplayName = "PrimaryWeaponFireRange (主武器开火距离 cm, 0=全图)"))
+    float ZombiePrimaryFireRange = 0.f;
 
     /**
      * 移动中射击脉冲时长 (秒) — 人类"边走边打"循环节拍
@@ -385,4 +498,70 @@ public:
         meta = (ClampMin = "10.0", ClampMax = "500.0",
                 DisplayName = "Retreat Acceptance Radius (后退到位判定半径 cm)"))
     float RetreatAcceptanceRadius = 60.f;
+
+    // ========================================================================
+    // 【v120 2026.08.01 生化模式 AI】集合点反射式换点配置
+    // ========================================================================
+    //
+    // 业务背景 (用户 2026.08.01 反馈):
+    //   "AI 在地图中任意的集合点附近 100cm, 且 AI 附近 50cm 范围内有母体时, 更换 LockedRallyPoint"
+    //   这是事件触发的换点, 与 BTTask_SelectZombieRallyPoint 的 PeriodicReselect 是正交的
+    //   - PeriodicReselect: BT 调度频率的"账本同步"重选点
+    //   - ReflexChange: 母体威胁触发的"防御性换点" — 立即换,不等下一个 BT Tick
+    //
+    // 设计原则 (大厂架构 — BT 为主 C++ 为辅):
+    //   - 何时换点 ← BTService_ReflexRallyChange (读取本字段段)
+    //   - 换哪个点 ← URoomZombieRallySubsystem::SelectRallyPoint_Nearest_Excluding (账本)
+    //   - 怎么写 BB ← BTService_ReflexRallyChange 效仿 BTTask 写 BB.LockedRallyPoint/Locked/Distance
+    //
+    // 真理源链路:
+    //   DA_AIBehaviorConfig_ZombieHuman → ReflexChange (本字段段)
+    //     ↓ BTService_ReflexRallyChange 派生事实
+    //     ↓ 触发条件调用 URoomZombieRallySubsystem::SelectRallyPoint_Nearest_Excluding
+    //
+    // 典型值:
+    //   - ReflexChangeRallyPointRadius: 100cm (用户给定)
+    //   - ReflexChangeMotherThreatRadius: 50cm (用户给定)
+
+    /**
+     * 反射式换点 — 触发半径 1 (cm)
+     *
+     * 语义: AI 距离当前 LockedRallyPoint <= ReflexChangeRallyPointRadius 时, 视为"已经在集合点附近"
+     *       进入反射式换点的判定前半段 (后半段: 母体威胁半径)
+     *
+     * 典型值: 100cm (用户 2026.08.01 业务给定)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|ReflexChange",
+        meta = (ClampMin = "10.0", ClampMax = "1000.0",
+                DisplayName = "ReflexChange RallyPoint Radius (反射式换点触发半径 cm)"))
+    float ReflexChangeRallyPointRadius = 100.f;
+
+    /**
+     * 反射式换点 — 母体威胁半径 (cm)
+     *
+     * 语义: AI 附近 < ReflexChangeMotherThreatRadius 范围内存在任何存活母体 → 触发换点
+     *       与 BTService_UpdateMotherDistance (派生 DistanceToMother) 严格分离 — 维度不同
+     *       - DistanceToMother: AI 与最"目标"母体(锁定)距离 (1 vs 1)
+     *       - MotherThreatRadius: AI 与"任何"母体(全账本)距离 (1 vs N)
+     *
+     * 典型值: 50cm (用户 2026.08.01 业务给定)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|ReflexChange",
+        meta = (ClampMin = "10.0", ClampMax = "1000.0",
+                DisplayName = "ReflexChange Mother Threat Radius (反射式换点母体威胁半径 cm)"))
+    float ReflexChangeMotherThreatRadius = 50.f;
+
+    /**
+     * 反射式换点 — Service 派生 Tick 间隔 (秒)
+     *
+     * 语义: BTService_ReflexRallyChange 多久检查一次上面两个条件
+     *       太小 (例如 0.05s) → CPU 浪费, 母体离 50cm 移动不会这么快
+     *       太大 (例如 1.0s) → 响应慢, 母体都走到脸上了才换点
+     *
+     * 典型值: 0.2s (与 BTService_UpdateZombieTargets 同量大厂标准)
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Behavior|Zombie|ReflexChange",
+        meta = (ClampMin = "0.05", ClampMax = "2.0",
+                DisplayName = "ReflexChange Tick Interval (反射式换点 Tick 间隔秒数)"))
+    float ReflexChangeTickIntervalSeconds = 0.2f;
 };

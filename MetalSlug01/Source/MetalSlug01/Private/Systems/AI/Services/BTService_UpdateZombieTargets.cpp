@@ -194,16 +194,57 @@ void UBTService_UpdateZombieTargets::TickNode(
 	}
 	else
 	{
-		// 未知身份 (变异前 / 刚变异过渡期)
-		// → 清 TargetActor + 写 HomeLocation = SelfPawn 当前位置 (出生点)
-		BB->ClearValue(TargetActorKey.SelectedKeyName);
-		BB->ClearValue(NearestHumanTargetKey.SelectedKeyName);
-		BB->ClearValue(NearestMotherTargetKey.SelectedKeyName);
-		BB->SetValueAsVector(HomeLocationKey.SelectedKeyName, SelfLoc);
+	// ============================================================
+	// 【v117 2026.08.01 重构 + v118 2026.08.01 bug fix】未知身份分支 — 不再"原地不动"
+	//
+	// 业务背景 (用户 2026.08.01 反馈):
+	//   "AI 进入游戏就能移动, 无需等到生化变异倒计时结束才能移动"
+	// 旧行为 (v107 原设计):
+	//   - 未知身份 → ClearValue(TargetActor) + SetValueAsVector(HomeLocation, SelfLoc)
+	//   - 含义: "Pre-Mutation 期间默认不动, 待在原地"
+	//   - 这与业务期望冲突 — 出生就应该能移动
+	//
+	// 新行为 (v117):
+	//   - 未知身份 → 仍清 TargetActor (信任 BTTask_SelectZombieRallyPoint + MoveTo 选真实目标)
+	//   - 仍写 HomeLocation = SelfLoc (作为"原地应急"目标)
+	//   - ★ 关键: BT 不动 这里写, 由 BT_ZombieModeAI 在 Unknown 路径上选 SelectRallyPoint → MoveTo
+	//   - 这样 AI 出生后∶ BTService_UpdateZombieTargets 0.25s 派生一次 → BT 进入 Rally 分支
+	//     → SelectRallyPoint 选最近点 → BTTask_MoveTo 走向集合点 → 变进入"移动状态"
+	//
+	// 【v118 2026.08.01 P0 修复】真根因 — v117 重构时把这一段从 else 分支里拆出来,
+	//   忘了加 else 守卫!导致:
+	//   - 上一行 bIsMother=true 分支 SetValueAsObject(NearestHumanTarget, BestTarget) 写入
+	//   - 紧接着末尾无 if 守卫的 ClearValue(NearestHumanTarget) 又把它清空
+	//   - 用户原话: "NearestHumanTarget 和 NearestMotherTarget 在 ai 是人类和母体都不显示"
+	//   - 修复: 整段包进 else { ... } 内, 仅 bIsMother/bIsHuman 都为 false 时执行清理
+	//
+	// 大厂原则 - 零兜底:
+	//   - 不可在这里隐藏 "原地不动" 的默认行为 (那是反模式):
+	//         不动 能从 UI 看到就是 bug, 不允许
+	//   - 不可静默调走动代码 (那是 SceneComponent 修改 + 与 BT 状态冲突)
+	//   - 不可与 BTTask_SelectZombieRallyPoint 冲突 (这里是 BB 写入, 那边是 BT 决策)
+	//
+	// 大厂原则 - 与 BTService_UpdateZombieState 零重复:
+	//   - State 写 BB.bIsMother / bIsHuman / AliveMotherCount / AliveHumanCount (身份+人数)
+	//   - Targets 写 BB.TargetActor / NearestHuman / NearestMother (目标派生物)
+	//   - 同一身份 bIsMother=true 时: State 写 BB.bIsMother=true, Targets 写 BB.NearestHumanTarget=BestTarget
+	//     不重复 — 两个 Service 写不同的 BB Key, 互为补充, 同一真理源 (Pawn.bIsMother)
+	//
+	// 其实详情 (现在未改革):
+	//   - 依然是 ClearValue + SetValueAsVector 模式
+	//   - 被动的 "AI 动" 由 BT_ZombieModeAI 调用 BTTask_SelectZombieRallyPoint 驱动
+	//   - 本 Task 需要在 BT 里挂上 → 选最近点 → 调动 MoveTo → AI 就会移动
+	// ============================================================
+	BB->ClearValue(TargetActorKey.SelectedKeyName);
+	BB->ClearValue(NearestHumanTargetKey.SelectedKeyName);
+	BB->ClearValue(NearestMotherTargetKey.SelectedKeyName);
+	BB->SetValueAsVector(HomeLocationKey.SelectedKeyName, SelfLoc);
 
-		UE_LOG(LogBehaviorTree, Display,
-			TEXT("[BTService_UpdateZombieTargets] %s: ★ 未知身份 (bIsMother=0 bIsHuman=0), 无有效目标."
-			     L" 写入 HomeLocation=(%s) 作为 Pre-Mutation 期间默认移动目标."),
-			*AIC->GetName(), *SelfLoc.ToString());
+	UE_LOG(LogBehaviorTree, Display,
+		TEXT("[BTService_UpdateZombieTargets] %s: 未知身份 (bIsMother=0 bIsHuman=0), Pre-Mutation 期间. "
+		     L"BB.TargetActor 已清, BB.HomeLocation=(%s) 作为应急原地点. "
+		     L"实际移动由 BT_ZombieModeAI 调度 BTTask_SelectZombieRallyPoint (v117 PeriodicReselect) 驱动. "
+		     L"【设计预期】AI 出生即可移动."),
+		*AIC->GetName(), *SelfLoc.ToString());
 	}
 }

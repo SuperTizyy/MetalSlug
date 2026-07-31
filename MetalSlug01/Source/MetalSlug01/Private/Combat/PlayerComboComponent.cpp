@@ -589,15 +589,21 @@ void UPlayerComboComponent::EndAttackState()
 		if (UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement())
 		{
 			// 【v56.5 大厂架构修复】从 PlayerConfigAsset 读取 MaxWalkSpeed，不再硬编码
-			// 
+			//
 			// 根因: 旧版 EndAttackState 硬编码 MaxWalkSpeed=400.0f
 			//        当 DA_PlayerConfigAsset.MaxWalkSpeed 配成 600 时，攻击结束后速度变成 400
 			//
-			// 修复: 从 PlayerConfigAsset 读取配置的 MaxWalkSpeed，保持移动速度一致性
+			// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+			//   - bIsMother=true  → MotherMaxWalkSpeed (母体玩家)
+			//   - bIsMother=false → MaxWalkSpeed      (人类玩家, 默认)
+			//
+			// 修复: 从 PlayerConfigAsset 读取配置的 MaxWalkSpeed，按 bIsMother 分流
 			float TargetWalkSpeed = 600.0f;  // 默认值兜底
 			if (UPlayerConfigAsset* PlayerConfig = GetPlayerConfigAsset())
 			{
-				TargetWalkSpeed = PlayerConfig->MaxWalkSpeed;
+				TargetWalkSpeed = OwnerCharacter->bIsMother
+					? PlayerConfig->MotherMaxWalkSpeed
+					: PlayerConfig->MaxWalkSpeed;
 			}
 			MoveComp->MaxWalkSpeed = TargetWalkSpeed;
 		}

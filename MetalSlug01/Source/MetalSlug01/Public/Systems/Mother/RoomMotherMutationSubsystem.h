@@ -125,6 +125,46 @@ public:
 	const TArray<TWeakObjectPtr<ABaseCharacter>>& GetMotherCharacters() const { return MotherCharacters; }
 
 	/**
+	 * 【v128 2026.08.02 大厂架构】母体账本注册入口 — 单一真理源
+	 *
+	 * 业务背景 (用户 2026.08.02 反馈):
+	 *   "NearestMotherTarget BB Key 在母体被击杀复活后不更新值"
+	 *
+	 * 设计原则 (大厂 — 集中调度 + 单一真理源):
+	 *   - 母体账本写入 = 母体 Pawn 创建唯一入口 (URoomSpawnSubsystem::MutatePawnToMother)
+	 *   - 本接口是该入口写账本的通道,业务层禁止其他路径直接 AddUnique
+	 *   - 集中调度: 任何"添加母体到账本"都走这里 → 日志统一 + 大厂原则可观测
+	 *
+	 * 调用方:
+	 *   - URoomSpawnSubsystem::MutatePawnToMother 末尾 (复活链 + 首次变异链)
+	 *   - URoomMotherMutationSubsystem::MutateCharacterToMother 兼容保留 (业务层账本不变量,双保险)
+	 *
+	 * 幂等性:
+	 *   - 内部 AddUnique 用 == 比较,同一 Pawn 多次调用安全
+	 *
+	 * @param MotherPawn 新母体 Pawn (服务器权威,跨场景同步由它 Replicated bIsMother 字段负责)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Mother")
+	void RegisterMotherPawn(ABaseCharacter* MotherPawn);
+
+	/**
+	 * 【v128 2026.08.02 大厂架构】母体账本反注册 (母体死亡时调) — 主动清理失效条目
+	 *
+	 * 业务背景:
+	 *   - TWeakObjectPtr 在 Pawn Destroy 后自动失效,Get()->IsValid=false
+	 *   - 但 TWeakObjectPtr 本身还在数组里,长期累积会膨胀 (Round 跨局变 100+ 条)
+	 *   - 主动反注册 → 账本清爽 + 业务查询 O(1)
+	 *
+	 * 调用方:
+	 *   - URoomSpawnSubsystem::MutatePawnToMother Step 5 之前 (销毁旧 Pawn 时调)
+	 *   - 或 URoomSpawnSubsystem::MutatePawnToMother 末尾 AddUnique 前清除失效项
+	 *
+	 * @param MotherPawn 要清理的 Pawn (可为 nullptr,安全 no-op)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Mother")
+	void UnregisterMotherPawn(ABaseCharacter* MotherPawn);
+
+	/**
 	 * 【业务查询 — 母体变异计数】对局内已触发母体变异的总次数 (Replicated)
 	 * 大厂原则 — SSOT: ARoomGameState::MotherMutationCount 是唯一真理源, 本函数转发
 	 */

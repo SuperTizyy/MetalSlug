@@ -323,17 +323,17 @@ struct FAIMovementParams
 	GENERATED_BODY()
 
 	/**
-	 * 【v42 2026.07.14】AI 移动速度 (cm/s) — 唯一速度参数
+	 * 【v42 2026.07.14】AI 移动速度 (cm/s) — 人类 AI 通用速度参数
 	 *
-	 * 设计: AI 所有移动 (前进/后退/追逐) 统一走此参数.
-	 *       不再区分 WalkSpeed/RunSpeed 两个字段.
+	 * 设计: 人类 AI 所有移动 (前进/后退/追逐) 统一走此参数.
+	 *       母体 AI 速度见 MotherWalkSpeed 字段 (与人类严格分离).
 	 *
 	 * 配置:
 	 *   - 在 DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 配置
 	 *   - 典型值: 200~600 cm/s
 	 *
 	 * 调用方:
-	 *   - ABaseAIController::OnPossess: 初始化 MaxWalkSpeed
+	 *   - ABaseAIController::OnPossess: 初始化 MaxWalkSpeed (按 bIsMother 分流)
 	 *   - ABaseAIController::LockMovementForCooldown: Unlock 时恢复
 	 *   - ABaseAIController::ComputeArrivalDecision: 前进/后退都用此速度
 	 *
@@ -341,6 +341,26 @@ struct FAIMovementParams
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0"))
 	float WalkSpeed = 250.f;
+
+	/**
+	 * 【v133.3 2026.08.02】母体 AI 移动速度 (cm/s) — 母体 AI 专属速度参数
+	 *
+	 * 设计原则 (大厂架构 — 单一真理源 + 职责对等):
+	 *   - 与 WalkSpeed 严格分离: 母体 / 人类是两个独立真理源,不允许互相覆盖
+	 *   - 真理源: DA_AIBehaviorConfig_XXX → Movement → MotherWalkSpeed
+	 *   - 调用方按 Pawn.bIsMother 分流:
+	 *     - bIsMother=true  → MotherWalkSpeed (策划可配比人类快或慢)
+	 *     - bIsMother=false → WalkSpeed (人类 AI)
+	 *
+	 * 编辑器配置路径:
+	 *   DA_AIBehaviorConfig_ZombieMother → Movement → MotherWalkSpeed
+	 *
+	 * 典型值: 400~800 cm/s (母体比人类快, 体现变异加速感)
+	 *
+	 * 【零兜底】如果 MotherWalkSpeed <= 0, 母体 AI 不移动, Log Error 强制修复配置
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0"))
+	float MotherWalkSpeed = 500.f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0"))
 	float AcceptanceRadius = 60.f;
@@ -833,10 +853,11 @@ namespace AIBlackboardKeyNames
         constexpr const TCHAR* NearestHumanTarget = TEXT("NearestHumanTarget");
         constexpr const TCHAR* NearestMotherTarget = TEXT("NearestMotherTarget");
 
-        // 集合点锁定 (BTTask_SelectZombieRallyPoint 写入, BT 守卫/移动读)
-        // 大厂原则: 锁点写入后永不迁移, 一局内只选一次 — 严格避免来回切换
+        // 集合点锁定 (BTService_ReflexRallyChange 写入, BT 守卫/移动读)
+        // v122 重构: 删 BTTask_SelectZombieRallyPoint 后, 集合点写入由 ReflexService 负责
+        // 大厂原则 - 零值原则: 未锁点 = LockedRallyPoint == nullptr; 已锁点 = LockedRallyPoint != nullptr
+        //   不需要 bRallyPointLocked bool 标记 (那是冗余)
         constexpr const TCHAR* LockedRallyPoint     = TEXT("LockedRallyPoint");
-        constexpr const TCHAR* bRallyPointLocked    = TEXT("bRallyPointLocked");
         constexpr const TCHAR* DistanceToRallyPoint = TEXT("DistanceToRallyPoint");
 
         // 弹药快照 (BTService_UpdateWeaponAmmo 写入, 换弹分支/开火守卫读)
@@ -850,3 +871,23 @@ namespace AIBlackboardKeyNames
         constexpr const TCHAR* AmmoSupplyTarget      = TEXT("AmmoSupplyTarget");
     }
 }
+
+/**
+ * 【v133 P0 大厂扩展 — BT 编辑器可配置】AI 攻击类型枚举
+ *
+ * 单一真理源 — 共享于 BTTask_PlayAttackMontage / AIAttackComponent / BaseCharacter:
+ *   - BTTask 编辑器里展示这个枚举 (策划可下拉选 Light / Heavy)
+ *   - AIAttackComponent::OnAIRequestAttack_WithOptions 按这个枚举分流调 Resolver
+ *   - BaseCharacter 转发壳签名直接用这个枚举 (零反射 / 零字符串转换)
+ *
+ * 大厂原则 — 共享枚举 (而不是 BTTask 头里独立定义):
+ *   - 如果 AIAttackComponent 要 include BTTask 头, 形成反向依赖 (Component 不应该依赖 Task)
+ *   - 公共枚举放在 AIBehaviorTypes.h 是 UE 大厂标准 (Epic Lyra / Paragon 都这么干)
+ *   - 任何模块都可以 include AIBehaviorTypes.h, 不形成循环依赖
+ */
+UENUM(BlueprintType)
+enum class EAIAttackType : uint8
+{
+    Light UMETA(DisplayName = "Light (轻击连击)"),
+    Heavy UMETA(DisplayName = "Heavy (重击单段)")
+};

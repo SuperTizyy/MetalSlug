@@ -6,6 +6,7 @@
 #include "Systems/Core/RoomPlayerState.h"
 #include "Systems/BaseAIController.h"
 #include "Systems/RoomPlayerController.h"
+#include "Systems/Mother/RoomMotherMutationSubsystem.h" // 【v128 新增】URoomMotherMutationSubsystem (RegisterMotherPawn / UnregisterMotherPawn)
 #include "Data/Enums/RoomEnums.h"
 #include "Data/Faction/FactionTags.h"
 #include "Data/AI/AIBehaviorConfigSO.h"
@@ -101,12 +102,38 @@ void URoomSpawnSubsystem::ApplyCharacterConfigToCharacter(ABaseCharacter* Charac
 	// ==========================================
 	// 1. HealthComponent 初始化
 	// ==========================================
+	//
+	// 【v133.4 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+	//   - bIsMother=true  → MotherMaxHealth (母体玩家, 变异增强)
+	//   - bIsMother=false → MaxHealth      (人类玩家, 默认)
 	if (UHealthComponent* HC = Character->ResolveHealthComponent())
 	{
-		HC->InitializeHealth(PlayerConfigAsset->MaxHealth);
+		const float EffectiveMaxHealth = Character->bIsMother
+			? PlayerConfigAsset->MotherMaxHealth
+			: PlayerConfigAsset->MaxHealth;
+
+		// 【零兜底】配错 <= 0 → 显式 Error, 不静默
+		if (EffectiveMaxHealth <= 0.f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: %sMaxHealth=%.1f (<=0, 配错). "
+				     "Pawn=%s (bIsMother=%d) 无法初始化血量. "
+				     "【修复】DA_PlayerConfig → Config|Health → %s 设置 > 0."),
+				Character->bIsMother ? TEXT("Mother") : TEXT(""),
+				EffectiveMaxHealth,
+				*Character->GetName(),
+				Character->bIsMother ? 1 : 0,
+				Character->bIsMother ? TEXT("MotherMaxHealth") : TEXT("MaxHealth"));
+			return;
+		}
+
+		HC->InitializeHealth(EffectiveMaxHealth);
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: MaxHealth=%.1f (Pawn=%s)"),
-			PlayerConfigAsset->MaxHealth, *Character->GetName());
+			TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: bIsMother=%d, MaxHealth=%.1f (Pawn=%s, 真理源=%s)"),
+			Character->bIsMother ? 1 : 0,
+			EffectiveMaxHealth,
+			*Character->GetName(),
+			Character->bIsMother ? TEXT("MotherMaxHealth") : TEXT("MaxHealth"));
 	}
 
 	// ==========================================
@@ -148,19 +175,143 @@ void URoomSpawnSubsystem::ApplyCharacterConfigToCharacter(ABaseCharacter* Charac
 	// ==========================================
 	if (UCharacterMovementComponent* MoveComp = Character->GetCharacterMovement())
 	{
-		MoveComp->MaxWalkSpeed = PlayerConfigAsset->MaxWalkSpeed;
+		// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+		//   - bIsMother=true  → MotherMaxWalkSpeed (母体玩家, 变异加速感)
+		//   - bIsMother=false → MaxWalkSpeed      (人类玩家, 默认)
+		//
+		// 注意: MutateCharacterToMother 完成后会再次调用本函数, 此时 Pawn 已被重建为母体 BP,
+		//       bIsMother=true → 立即切到 MotherMaxWalkSpeed (用户明确指示)
+		const float EffectiveWalkSpeed = Character->bIsMother
+			? PlayerConfigAsset->MotherMaxWalkSpeed
+			: PlayerConfigAsset->MaxWalkSpeed;
+
+		// 【零兜底】配错 <= 0 → 显式 Error, 不静默
+		if (EffectiveWalkSpeed <= 0.f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: %sMaxWalkSpeed=%.1f (<=0, 配错). "
+				     "Pawn=%s (bIsMother=%d) 无法移动. 【修复】DA_PlayerConfig → Config|Movement → %s 设置 > 0."),
+				Character->bIsMother ? TEXT("Mother") : TEXT(""),
+				EffectiveWalkSpeed,
+				*Character->GetName(),
+				Character->bIsMother ? 1 : 0,
+				Character->bIsMother ? TEXT("MotherMaxWalkSpeed") : TEXT("MaxWalkSpeed"));
+			return;
+		}
+
+		MoveComp->MaxWalkSpeed = EffectiveWalkSpeed;
 		// 下蹲速度默认是正常速度的一半
-		MoveComp->MaxWalkSpeedCrouched = PlayerConfigAsset->MaxWalkSpeed * 0.5f;
+		MoveComp->MaxWalkSpeedCrouched = EffectiveWalkSpeed * 0.5f;
+
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: MaxWalkSpeed=%.1f CrouchedSpeed=%.1f (Pawn=%s)"),
-			PlayerConfigAsset->MaxWalkSpeed,
-			PlayerConfigAsset->MaxWalkSpeed * 0.5f,
-			*Character->GetName());
+			TEXT("[RoomSpawnSubsystem] ApplyCharacterConfig: bIsMother=%d, MaxWalkSpeed=%.1f CrouchedSpeed=%.1f (Pawn=%s, 真理源=%s)"),
+			Character->bIsMother ? 1 : 0,
+			EffectiveWalkSpeed,
+			EffectiveWalkSpeed * 0.5f,
+			*Character->GetName(),
+			Character->bIsMother ? TEXT("MotherMaxWalkSpeed") : TEXT("MaxWalkSpeed"));
 	}
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[RoomSpawnSubsystem] ApplyCharacterConfigToCharacter 完成: Pawn=%s"),
 		*Character->GetName());
+}
+
+
+// ==========================================
+// 【v133.4 2026.08.02 大厂架构】AI ConfigSO 配置应用 (真理源分离)
+// ==========================================
+//
+// 真理源分离 (大厂原则 — 单一真理源 + 职责对等):
+//   - 玩家路径 = PlayerConfigAsset (ApplyCharacterConfigToCharacter)
+//   - AI 路径   = ConfigSO.AIBehaviorConfig (ApplyAICharacterConfigToCharacter)
+//
+// 之前 v41 的反模式:
+//   - AI 路径也调 ApplyCharacterConfigToCharacter → AI 血量被 PlayerConfigAsset.MaxHealth=100 覆盖
+//   - 真理源混淆 → AI 配置失效 (ConfigSO 的血量永远不会被应用)
+//   - ConfigSO 加血量字段毫无意义 (被 PlayerConfigAsset 覆盖)
+//
+// 新架构 (v133.4):
+//   - AI 路径只调 ApplyAICharacterConfigToCharacter → 读 ConfigSO.Health
+//   - 玩家路径调 ApplyCharacterConfigToCharacter → 读 PlayerConfigAsset
+//   - 真理源严格分离, ConfigSO 字段真正生效
+//
+// 调用方:
+//   - URoomSpawnSubsystem::SpawnAIInternal (大厅 AI Spawn 成功后)
+//   - AMeleeAIController::SetupMeleeAI 末尾 (关卡预放 AI)
+//   - URoomSpawnSubsystem::MutatePawnToMother 末尾 (母体 AI 复活)
+// ==========================================
+void URoomSpawnSubsystem::ApplyAICharacterConfigToCharacter(ABaseCharacter* Character)
+{
+	if (!Character)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfigToCharacter: Character 为空!"));
+		return;
+	}
+
+	// ==========================================
+	// 1. 拿 ConfigSO — 真理源 (运行时)
+	// ==========================================
+	// 大厂原则 — 单一真理源:
+	//   - ConfigSO 走 BaseAIController->GetConfig() 取得 (运行时, 单一入口)
+	//   - 不直接读 Config->SpawnInvincibilitySeconds (避免与 BaseAIController 重复实现)
+	UAIBehaviorConfigSO* Config = nullptr;
+
+	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Character->GetController()))
+	{
+		// 【v133.4.1 大厂架构】GetConfig() 返回 const, 但本函数只读字段 (MotherMaxHealth/MaxHealth)
+		// const_cast 用于消除编译错误, 实际不修改 Config 字段 — 真理源仍是只读
+		Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig());
+	}
+
+	if (!Config)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfigToCharacter: AI=%s 的 BaseAIController->GetConfig() 为空. "
+			     "【v133.4 零兜底】拒绝应用 ConfigSO, AI 配置失败. "
+			     "【修复】检查 ConfigSO 是否在 AIController ClassDefaults 配. "
+			     "如果该 Pawn 是 Player Controller 管辖, 请用 ApplyCharacterConfigToCharacter 而非本函数."),
+			*Character->GetName());
+		return;
+	}
+
+	// ==========================================
+	// 2. HealthComponent 初始化 (按 bIsMother 分流)
+	// ==========================================
+	//
+	// 【v133.4 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+	//   - bIsMother=true  → ConfigSO.MotherMaxHealth (母体 AI)
+	//   - bIsMother=false → ConfigSO.MaxHealth      (人类 AI)
+	if (UHealthComponent* HC = Character->ResolveHealthComponent())
+	{
+		const float EffectiveMaxHealth = Character->bIsMother
+			? Config->MotherMaxHealth
+			: Config->MaxHealth;
+
+		// 【零兜底】配错 <= 0 → 显式 Error, 不静默
+		if (EffectiveMaxHealth <= 0.f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfig: %s=%.1f (<=0, 配错). "
+				     "AI=%s (bIsMother=%d) 无法初始化血量. "
+				     "【修复】DA_AIBehaviorConfig_XXX → Health → %s 设置 > 0."),
+				Character->bIsMother ? TEXT("MotherMaxHealth") : TEXT("MaxHealth"),
+				EffectiveMaxHealth,
+				*Character->GetName(),
+				Character->bIsMother ? 1 : 0,
+				Character->bIsMother ? TEXT("MotherMaxHealth") : TEXT("MaxHealth"));
+			return;
+		}
+
+		HC->InitializeHealth(EffectiveMaxHealth);
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfig: bIsMother=%d, MaxHealth=%.1f (AI=%s, 真理源=%s)"),
+			Character->bIsMother ? 1 : 0,
+			EffectiveMaxHealth,
+			*Character->GetName(),
+			Character->bIsMother ? TEXT("ConfigSO.MotherMaxHealth") : TEXT("ConfigSO.MaxHealth"));
+	}
 }
 
 // ==========================================
@@ -1281,7 +1432,9 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		// else: 关卡预放 AI 路径 → 走 AMeleeAIController::SetupMeleeAI (内部调 RequestWeaponSpawn)
 
 		// 【v41 大厂架构】应用角色战斗参数配置
-		ApplyCharacterConfigToCharacter(AIPawn);
+		// 【v133.4 真理源分离】AI 路径改调 ApplyAICharacterConfigToCharacter (读 ConfigSO)
+		// 旧版调 ApplyCharacterConfigToCharacter 会用 PlayerConfigAsset, 真理源混淆 → 改 ConfigSO 加字段无意义
+		ApplyAICharacterConfigToCharacter(AIPawn);
 
 		// 【v45 大厂架构修复】AI 复活无敌期激活
 		//
@@ -2809,6 +2962,24 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		// 大厂原则 — 销毁前 UnPossess, 避免 Engine 触发 PossessedBy(nullptr) 副作用
 		Controller->UnPossess();
 
+		// 【v128 P0 大厂架构修复 — 母体账本清理】销毁旧 Pawn 前先清账本
+		//
+		// 业务背景 (用户 2026.08.02 反馈):"NearestMotherTarget 母体被击杀复活后不更新值"
+		//   - 根因 = 复活链漏 AddUnique (主因, v128 已修)
+		//   - 副作用 = MotherCharacters 数组累积失效 TWeakObjectPtr (长期膨胀)
+		//
+		// 清理时机 (本函数内):
+		//   - 在 OldPawn->Destroy() 之前调 → 业务账本先同步,再走 UE 销毁
+		//   - 这样账本永远干净,GetMotherCharacters 读到的全是有效 Pawn
+		//
+		// 大厂原则 — 零冗余:
+		//   - 即使后续 RegisterMotherPawn 再加入新 Pawn,账本容量可控
+		//   - 防止 Round 跨局变 100+ 条账本 (v93.5 风险点)
+		if (URoomMotherMutationSubsystem* MotherSys = URoomMotherMutationSubsystem::Get(this))
+		{
+			MotherSys->UnregisterMotherPawn(OldPawn);
+		}
+
 		// 【v93 大厂架构修复】显式销毁旧 Pawn 的武器 (母体不持武器 — 旧 v90 漏掉这步 = 武器残留 Bug)
 		// 走 UWeaponAttachmentComponent::UnequipCurrentWeapon (单一销毁入口, v93 落地)
 		//   - 旧 Pawn Destroy 会级联销毁武器, 但 UE 销毁延迟一帧
@@ -3039,63 +3210,111 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 			*NewMotherPawn->GetName(), *MotherFactionTag.ToString());
 	}
 
-	// ===== Step 5.6: 【v93.4 大厂架构 — 母体血量初始化】集中调度 MaxHealth = MotherMaxHealth =====
+	// ===== Step 5.6: 【v133.4 大厂架构 — 母体血量初始化】真理源迁移到 PlayerConfigAsset.MotherMaxHealth (玩家) 或 ConfigSO.MotherMaxHealth (AI) =====
 	//
-	// 业务规则 (用户 2026.07.25 明确):
-	//   - 变成母体后, 血量要变成 200
-	//   - 人类的各种武器都能对母体进行攻击 (FFactionTags::CanDamage 异阵营守卫已自动通过)
-	//   - 人类和人类之间无法互相伤害 (同阵营守卫已自动拒判)
+	// 业务规则 (用户 2026.08.02 明确):
+	//   - UPlayerConfigAsset 也要分人类最大血量和母体最大血量
+	//   - UAIBehaviorConfigSO 也要分人类最大血量和母体最大血量
+	//   - 母体血量真理源:
+	//     - 玩家 = PlayerConfigAsset.MotherMaxHealth
+	//     - AI   = ConfigSO.MotherMaxHealth (BaseAIController.GetConfig())
+	//   - 不再读 GM.MotherMaxHealth (废弃, 但保留字段兼容老配置)
+	//
+	// 历史:
+	//   - v93.4 (2026.07.25) 旧真理源 = GM.MotherMaxHealth = 200
+	//   - v133.4 (2026.08.02) 新真理源 = PlayerConfigAsset.MotherMaxHealth (玩家) 或 ConfigSO.MotherMaxHealth (AI)
 	//
 	// 大厂原则 — 配置驱动 + 单一真理源:
-	//   - MaxHealth 来自 ARoomGameMode::MotherMaxHealth (UPROPERTY EditDefaultsOnly)
-	//   - 策划可在 BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Max Health 调 (默认 200)
+	//   - 真理源按 Controller 类型分流 (玩家/AI 是两个独立真理源)
+	//   - 策划可在 DA_PlayerConfig / DA_AIBehaviorConfig_XXX 各自配
 	//   - 零硬编码: 不在 C++ 写 200.0f, 全部走配置
 	//   - 调 HealthComponent->InitializeHealth(MotherMaxHealth) 自动:
 	//     1) 写 MaxHealth = MotherMaxHealth (服务器本地)
 	//     2) 写 CurrentHealth = MotherMaxHealth (满血)
 	//     3) 清 bIsDead
-	//     4) 服务器主动 Broadcast OnHealthChanged (InitializeHealth 末尾已加 v93.4 修复)
-	//     5) DOREPLIFETIME(MaxHealth) 自动同步客户端 → 客户端 MaxHealth 也变 200
-	//     6) 客户端 OnRep_CurrentHealth 自动 Broadcast OnHealthChanged
+	//     4) 服务器主动 Broadcast OnHealthChanged
+	//     5) DOREPLIFETIME(MaxHealth) 自动同步客户端
 	//
 	// 不破坏刀战模式 (大厂原则 — 零耦合):
 	//   - 本步只在母体变异时跑 (Step 5.5 已切 Offense, 这是生化专属)
-	//   - 刀战模式 SpawnAIInternal / HandlePlayerRequestSpawn 走的是 ApplyCharacterConfigToCharacter
-	//     (InitializeHealth(PlayerConfigAsset->MaxHealth=100)), 不读 MotherMaxHealth
-	//   - 刀战逻辑零影响
+	//   - 刀战模式不走这里
 	{
-		// 大厂原则 — 显式优于隐式: 拿 GameMode (UserConfig 真理源) 必须有, 拿不到是配置错
-		ARoomGameMode* RoomGM = World ? World->GetAuthGameMode<ARoomGameMode>() : nullptr;
-		if (!RoomGM)
+		// 【v133.4 真理源分离】按 Controller 类型分流
+		float MotherMaxHealthValue = 0.f;
+
+		if (APlayerController* PC = Cast<APlayerController>(Controller))
 		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[MotherMutation] MutatePawnToMother: GameMode 为空, 无法读 MotherMaxHealth 配置. "
-				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
-				     "检查 ARoomGameMode 是否正确注入."));
+			// 玩家路径: 真理源 = PlayerConfigAsset.MotherMaxHealth
+			if (PlayerConfigAsset && PlayerConfigAsset->MotherMaxHealth > 0.f)
+			{
+				MotherMaxHealthValue = PlayerConfigAsset->MotherMaxHealth;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[MotherMutation] MutatePawnToMother: 玩家路径 — PlayerConfigAsset.MotherMaxHealth 无效 (Pawn=%s). "
+					     "【v133.4 修复】请在 DA_PlayerConfig.uasset → Config|Health → Mother Max Health 配置有效值 (>0). "
+					     "【废弃警告】GM.MotherMaxHealth 不再是真理源, 请迁移到 PlayerConfigAsset."),
+					*NewMotherPawn->GetName());
+			}
 		}
-		else if (RoomGM->MotherMaxHealth <= 0.0f)
+		else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Controller))
 		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[MotherMutation] MutatePawnToMother: GM.MotherMaxHealth=%.1f (≤0, 非法). "
-				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
-				     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Max Health (默认 200)."),
-				RoomGM->MotherMaxHealth);
-		}
-		else if (UHealthComponent* MotherHC = NewMotherPawn->ResolveHealthComponent())
-		{
-			MotherHC->InitializeHealth(RoomGM->MotherMaxHealth); // 写 MaxHealth + CurrentHealth + 广播
-			UE_LOG(LogTemp, Display,
-				TEXT("[MotherMutation] MutatePawnToMother: 母体血量初始化完成. NewMotherPawn='%s' MaxHealth=%.1f (来自 GM.MotherMaxHealth). "
-				     "客户端会通过 DOREPLIFETIME(MaxHealth) 同步收到 200."),
-				*NewMotherPawn->GetName(), RoomGM->MotherMaxHealth);
+			// AI 路径: 真理源 = ConfigSO.MotherMaxHealth
+			// 【v133.4.1 大厂架构】GetConfig() 返回 const, 只读字段, const_cast 消除编译错误
+			if (UAIBehaviorConfigSO* Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig()))
+			{
+				if (Config->MotherMaxHealth > 0.f)
+				{
+					MotherMaxHealthValue = Config->MotherMaxHealth;
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[MotherMutation] MutatePawnToMother: AI 路径 — ConfigSO.MotherMaxHealth=%.1f (≤0, 配错). "
+						     "【v133.4 修复】请在 DA_AIBehaviorConfig_XXX → Health → Mother Max Health 配置有效值 (>0). "
+						     "Pawn=%s"),
+						Config->MotherMaxHealth, *NewMotherPawn->GetName());
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[MotherMutation] MutatePawnToMother: AI 路径 — BaseAIController->GetConfig() 为空. "
+					     "【v133.4 零兜底】拒绝写血量. "
+					     "Pawn=%s. 检查 ConfigSO 是否在 AIController ClassDefaults 配."),
+					*NewMotherPawn->GetName());
+			}
 		}
 		else
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[MotherMutation] MutatePawnToMother: NewMotherPawn='%s' 找不到 HealthComponent. "
-				     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
-				     "检查 BP_MuTi 蓝图是否挂了 HealthComponent."),
+				TEXT("[MotherMutation] MutatePawnToMother: Controller 既不是 Player 也不是 ABaseAIController 派生 (Pawn=%s). "
+				     "【v133.4 零兜底】拒绝写血量."),
 				*NewMotherPawn->GetName());
+		}
+
+		if (MotherMaxHealthValue > 0.f)
+		{
+			if (UHealthComponent* MotherHC = NewMotherPawn->ResolveHealthComponent())
+			{
+				MotherHC->InitializeHealth(MotherMaxHealthValue); // 写 MaxHealth + CurrentHealth + 广播
+				UE_LOG(LogTemp, Display,
+					TEXT("[MotherMutation] MutatePawnToMother: 母体血量初始化完成. NewMotherPawn='%s' MaxHealth=%.1f "
+					     "(真理源=%s, Controller=%s). "
+					     "客户端会通过 DOREPLIFETIME(MaxHealth) 同步."),
+					*NewMotherPawn->GetName(), MotherMaxHealthValue,
+					Cast<APlayerController>(Controller) ? TEXT("PlayerConfigAsset.MotherMaxHealth") : TEXT("ConfigSO.MotherMaxHealth"),
+					*Controller->GetName());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[MotherMutation] MutatePawnToMother: NewMotherPawn='%s' 找不到 HealthComponent. "
+					     "【v93.4 零兜底】拒绝写血量, 母体会保持默认 100 满血. "
+					     "检查 BP_MuTi 蓝图是否挂了 HealthComponent."),
+					*NewMotherPawn->GetName());
+			}
 		}
 	}
 
@@ -3266,12 +3485,103 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		}
 	}
 
+	// 【v128 P0 修复 2026.08.02】母体账本同步 — 单一真理源 + 集中调度
+	//
+	// 根因 (用户 2026.08.02 反馈):
+	//   "NearestMotherTarget BB Key 在母体被击杀复活后不更新值. 被击杀后就一直是空"
+	//
+	// 触发链:
+	//   1. 母体首次变异: URoomMotherMutationSubsystem::MutateCharacterToMother 调
+	//      MotherCharacters.AddUnique(NewMotherPawn) (v128 前是直接的数组操作) → 账本有母体
+	//   2. 母体被击杀: ABaseCharacter::Destroy → TWeakObjectPtr.Get() 失效
+	//      但 TWeakObjectPtr 本身没从数组移除 (大厂原则 — 失效检测由读端 IsValid 处理)
+	//   3. 母体复活 (3s 后): RequestRespawn → MutatePawnToMother 直接调 (绕过业务层)
+	//      → 新 NewMotherPawn 生成 + Possess,但 **MotherCharacters 数组里挂的是旧 TWeakObjectPtr**
+	//   4. 人类 BTService_UpdateZombieTargets 读 MotherSys->GetMotherCharacters():
+	//      - 旧 TWeakObjectPtr.Get() = nullptr (Pawn 已 Destroy) → IsValid 守卫 → 跳过
+	//      - **没有任何代码补回新 NewMotherPawn 到 MotherCharacters**
+	//   5. → BTService 找不到活母体 → BB.NearestMotherTarget 永远是空
+	//
+	// 旧代码 (v99.1~v127) 反模式:
+	//   - MotherCharacters 写入 = MutateCharacterToMother (业务层, 首次变异才走)
+	//   - MotherCharacters 复活 = 漏写 (MutatePawnToMother 只管 Pawn 重建)
+	//   - 数据源分裂: 首次变异走业务层, 复活走 SpawnSubsystem
+	//
+	// v128 修复 (大厂原则 - 单一真理源 + 集中调度):
+	//   - MotherCharacters 写入 = 母体 Pawn 创建唯一入口 = MutatePawnToMother (本函数)
+	//   - 业务层 MutateCharacterToMother 已有的 RegisterMotherPawn (v128 重构) → 保留作为业务账本不变量
+	//     (首次变异时也调本函数, 所以双保险 — AddUnique 内部幂等)
+	//   - 复活链直接调本函数 → 现在也走 RegisterMotherPawn → 不漏
+	//
+	// 抗 "重复 RegisterMotherPawn" 副作用:
+	//   - AddUnique 内部用 == 判等, 同 Pawn 不重复
+	//   - TWeakObjectPtr 比较的是对象身份, 不是指针地址, 安全
+	//
+	// 大厂原则 — 集中调度 (零兜底):
+	//   - 任何 "添加母体到账本" 都走 RegisterMotherPawn 公开接口
+	//   - 不允许业务层直接 MotherCharacters.AddUnique (违反 SSOT)
+	//   - 未来扩展 (统计、事件、Replicate) 集中在这里, 调用方零改动
+	if (URoomMotherMutationSubsystem* MotherSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MotherSys->RegisterMotherPawn(NewMotherPawn);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] 【v128 严重】MutatePawnToMother: 找不到 RoomMotherMutationSubsystem, "
+			     "无法同步 MotherCharacters 账本. BTService_UpdateZombieTargets 读不到复活母体. "
+			     "【修复路径】1) BP_GM_RoomGameMode.uasset ClassDefaults → MotherMutationSubsystemClass "
+			     "应配 RoomMotherMutationSubsystem; 2) 检查 GM->InjectSubsystemConfigs 调用时机."),
+			*NewMotherPawn->GetName());
+	}
+
 	// 【v111-Diag】确认 Controller 存活
 	UE_LOG(LogTemp, Display,
 		TEXT("[MotherMutation] 【v111-Diag】MutatePawnToMother 成功完成: Controller='%s' Pawn='%s' IsValid=%d."),
 		*Controller->GetName(),
 		Controller->GetPawn() ? *Controller->GetPawn()->GetName() : TEXT("NULL"),
 		Controller->IsValidLowLevel() ? 1 : 0);
+
+	// ============================================================
+	// 【v133.3.1 2026.08.02 大厂架构 — 单一真理源修复】母体 Spawn 后仅切速度,不重置血量
+	// ============================================================
+	//
+	// 根因 (v133.3 引入):
+	//   - 调 ApplyCharacterConfigToCharacter → 内部调 HC->InitializeHealth(PlayerConfigAsset->MaxHealth=100)
+	//   - 覆盖了 MutatePawnToMother line 3132 已设的 GM.MotherMaxHealth=200
+	//   - 用户反馈: "变成母体生命值还是100所以闪红"
+	//   - 母体血量被覆盖成 100,业务错了
+	//
+	// 大厂原则 — 零覆盖 + 单一真理源:
+	//   - 母体血量真理源 = GM.MotherMaxHealth (已在 Step 5.6 写入)
+	//   - 母体速度真理源 = PlayerConfigAsset.MotherMaxWalkSpeed (bIsMother 分流)
+	//   - 不允许任何后续路径重写血量
+	//
+	// 修复方案:
+	//   - 只调 SetMaxWalkSpeedByMotherStatus (新方法),不动血量/能量/无敌期等
+	//   - 这是"最小干预"原则 — 只动需要变的字段
+	// ============================================================
+	if (NewMotherPawn)
+	{
+		if (UCharacterMovementComponent* MoveComp = NewMotherPawn->GetCharacterMovement())
+		{
+			if (PlayerConfigAsset && PlayerConfigAsset->MotherMaxWalkSpeed > 0.f)
+			{
+				MoveComp->MaxWalkSpeed = PlayerConfigAsset->MotherMaxWalkSpeed;
+				MoveComp->MaxWalkSpeedCrouched = PlayerConfigAsset->MotherMaxWalkSpeed * 0.5f;
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[MotherMutation] MutatePawnToMother: 【v133.3.1 修复】母体速度切到 MotherMaxWalkSpeed=%.1f "
+					     "(仅切速度, 不动血量/能量/无敌期 — 血量真理源仍是 GM.MotherMaxHealth=%.1f). "
+					     "Pawn=%s"),
+					PlayerConfigAsset->MotherMaxWalkSpeed,
+					NewMotherPawn->ResolveHealthComponent()
+						? NewMotherPawn->ResolveHealthComponent()->GetMax()
+						: 0.f,
+					*NewMotherPawn->GetName());
+			}
+		}
+	}
 
 	return true;
 }

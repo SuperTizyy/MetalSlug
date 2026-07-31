@@ -138,6 +138,82 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
 	bool OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharacter);
 
+	// ==========================================
+	// 【v133 P0 大厂扩展 — BT 编辑器可配置】AI 攻击可配置入口
+	// ==========================================
+
+	/**
+	 * AI 攻击可配置入口 (v133 P0 大厂扩展)
+	 *
+	 * 【大厂原则 — 单一入口 + 零兜底兼容】
+	 *   - 新版唯一公开攻击入口, BTTask_PlayAttackMontage v133 直接调这里
+	 *   - 旧版 OnAIRequestAttack_Simple 保留, 内部转调本方法 (默认 Light / ComboIndex=1 / 不锁脚)
+	 *   - 任何调用方都走这一个方法, 副作用集中在一处 (Single Source of Truth)
+	 *
+	 * 【参数语义 — 与 BTTask 编辑器配置对应】
+	 *   - AttackType:
+	 *     - Light → 调 ResolveLightAttackMontage(Weapon, ComboIndex) (连击段)
+	 *     - Heavy → 调 ResolveHeavyAttackMontage(Weapon) (单段重击, ComboIndex 忽略)
+	 *   - ComboIndex:
+	 *     - 仅 AttackType=Light 时生效
+	 *     - 1/2/3 → 对应武器 LightAttackMontages 数组第 0/1/2 个元素
+	 *     - 默认 1 (与 v40.4 OnAIRequestAttack_Simple 行为兼容)
+	 *     - 必须 < Weapon.LightAttackMontages.Num(), 否则 Resolver Log Error 拒绝兜底
+	 *   - bLockMovementDuringAttack:
+	 *     - true  → 攻击时临时 MaxWalkSpeed=0 (CS:GO/Apex 标准: 站着挥刀)
+	 *     - false → 攻击时 MaxWalkSpeed 保持原值 (MetalSlug 默认 AI 行为: 边走边挥刀)
+	 *     - 锁脚语义: PlayAnimMontage 前 SetMaxWalkSpeed(0), OnMontageEnded 回调复原
+	 *
+	 * 【与旧 OnAIRequestAttack_Simple 的关系】
+	 *   - 旧 Simple: 硬编码 Light/ComboIndex=1/不锁脚 → 调用本方法 (3 参数透传)
+	 *   - 新 WithOptions: BT 编辑器可配 3 个参数
+	 *
+	 * @param InOwnerCharacter    真实 Pawn 实例 (与 v40.7 P0 修复一致, 避免 CDO Archetype)
+	 * @param InAttackType        攻击类型 (Light/Heavy)
+	 * @param InComboIndex        轻击段索引 (1/2/3, 仅 Light 时生效)
+	 * @param bInLockMovement     攻击期间是否锁脚
+	 * @return true=攻击发起成功; false=前置检查失败 (内部已 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	bool OnAIRequestAttack_WithOptions(ABaseCharacter* InOwnerCharacter,
+		EAIAttackType InAttackType, int32 InComboIndex, bool bInLockMovement);
+
+	// ==========================================
+	// 【v133.1 P0 大厂扩展 — 不拿武器的 AI 直接指定蒙太奇】Explicit Montage 入口
+	// ==========================================
+
+	/**
+	 * AI 攻击入口 — 直接指定蒙太奇 (v133.1 P0 大厂扩展)
+	 *
+	 * 业务背景 (用户 2026.08.02 反馈):
+	 *   "母体不拿武器, 就是播放抓人蒙太奇"
+	 *   - 母体是徒手攻击 (Zombie Mutant), 武器 BP 没配 LightAttackMontages
+	 *   - BTTask 节点直接选 Montage 资产, 绕过武器 BP Resolver 链路
+	 *
+	 * 【大厂原则 — 单一真理源 + 三级回退】
+	 *   - 优先级 1 (最高): ExplicitMontage (BT 节点直接配) → 跳过 Resolver
+	 *   - 优先级 2: Resolver 按 AttackType/ComboIndex 查武器 BP
+	 *   - 优先级 3: 全部失败 → Log Error 放弃攻击
+	 *
+	 * 【优先级 1 适用场景】
+	 *   - 徒手 AI (母体 Zombie 抓人/无武器)
+	 *   - 测试用临时蒙太奇
+	 *   - 武器 BP 还没配好的过渡期
+	 *
+	 * 【与 OnAIRequestAttack_WithOptions 的关系】
+	 *   - 旧 WithOptions: 走 Resolver 链路 (Light/Heavy/ComboIndex)
+	 *   - 新 ExplicitMontage: 跳过 Resolver, 直接用传入的 Montage
+	 *   - 大厂原则: 单一入口收敛, 共享附带副作用 (锁脚/BB写入/OnMontageEnded)
+	 *
+	 * @param InOwnerCharacter    真实 Pawn 实例
+	 * @param InExplicitMontage   直接指定的蒙太奇 (BT 节点配的, 不能为 null)
+	 * @param bInLockMovement     攻击期间是否锁脚
+	 * @return true=攻击发起成功; false=前置检查失败 (内部已 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|AI")
+	bool OnAIRequestAttack_ExplicitMontage(ABaseCharacter* InOwnerCharacter,
+		UAnimMontage* InExplicitMontage, bool bInLockMovement);
+
 
 	// ==========================================
 	// 3. AI 攻击蒙太奇结束回调 (UFUNCTION + Dynamic Delegate 必须的签名)
@@ -258,13 +334,13 @@ private:
 	UPROPERTY()
 	TObjectPtr<UAnimMontage> CachedAIMontage = nullptr;
 
-	/**
-	 * 是否在等待 AI 攻击蒙太奇回调
-	 * 设计: 每次启动新攻击时设 true, 收到正确 Montage 的回调后 false
-	 *       超时机制: TickChaseFallback 通过 SetCurrentlyAttacking 5s 兜底
-	 *
-	 * 用 bool 比再创建 FName 标识简单 — 单 AI 单任务
-	 */
+/**
+ * 是否在等待 AI 攻击蒙太奇回调
+ * 设计: 每次启动新攻击时设 true, 收到正确 Montage 的回调后 false
+ *       超时机制: TickChaseFallback 通过 SetCurrentlyAttacking 5s 兜底
+ *
+ * 用 bool 比再创建 FName 标识简单 — 单 AI 单任务
+ */
 	UPROPERTY()
 	bool bIsWaitingForAIMontageCallback = false;
 

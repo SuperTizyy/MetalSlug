@@ -9,6 +9,7 @@
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Characters/BaseCharacter.h"
 #include "Components/HealthComponent.h" // v93.4 — MutateCharacterToMother Step 3.6 血量验证 (GetMax)
+#include "Data/Config/PlayerConfigAsset.h" // v133.4.1 — Step 3.6 验 MotherMaxHealth 字段 (GetPlayerConfigAsset 返回值)
 
 #include "Data/Faction/FactionTags.h" // v93.3 — MutateCharacterToMother Step 3.5 阵营验证 (IsOffense)
 
@@ -643,17 +644,31 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 		// 零兜底 = 强制报错, 不允许静默继续
 	}
 
-	// ===== Step 3.6: 【v93.4 大厂架构 — 血量验证】业务层强制验证 MaxHealth = MotherMaxHealth =====
+	// ===== Step 3.6: 【v133.4 大厂架构 — 血量验证】业务层强制验证 MaxHealth = MotherMaxHealth =====
 	//
-	// 业务规则 (用户 2026.07.25 明确):
-	//   - 母体血量要变成 200 (业务可调, 来自 GM.MotherMaxHealth)
+	// 业务规则 (用户 2026.08.02 明确):
+	//   - 母体血量要变成 MotherMaxHealth (业务可调, 来自 PlayerConfigAsset.MotherMaxHealth)
 	//
 	// 大厂原则 — 零兜底:
 	//   - MaxHealth 不对 → Log Error + 不中断流程 (与 Step 3.5 同理: 静默 return 会让半截变异)
 	//   - 业务层验证 = 强制让根因立刻可见, 策划/程序可立即修复
+	//
+	// 【v133.4 真理源迁移】验证期望值 = PlayerConfigAsset.MotherMaxHealth (不再是 GM.MotherMaxHealth)
+	//
+	// 【v133.4.1 真理源唯一入口】通过 Spawn->PlayerConfigAsset 读, 不通过 GM->PlayerConfigAsset
+	//   - GM.PlayerConfigAsset 是 TSoftObjectPtr (只配引用, 直指针在 SpawnSubsystem)
+	//   - Spawn->PlayerConfigAsset 才是直指针 (GM 通过 SetPlayerConfigAsset 注入)
+	//   - 大厂原则 — 单一真理源: SpawnSubsystem 持有 PlayerConfigAsset 业务实例
 	{
 		const UHealthComponent* MotherHC = NewMotherPawn->ResolveHealthComponent();
-		const float ExpectedMotherHealth = (RoomGM != nullptr) ? RoomGM->MotherMaxHealth : -1.0f;
+
+		// 【v133.4.1 真理源唯一入口】从 Spawn->PlayerConfigAsset 读 (TObjectPtr 直指针)
+		float ExpectedMotherHealth = -1.0f;
+		if (Spawn && Spawn->GetPlayerConfigAsset())
+		{
+			ExpectedMotherHealth = Spawn->GetPlayerConfigAsset()->MotherMaxHealth;
+		}
+
 		if (!MotherHC)
 		{
 			UE_LOG(LogTemp, Error,
@@ -665,24 +680,27 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 		else if (ExpectedMotherHealth <= 0.0f)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[MotherMutation] MutateCharacterToMother: GM.MotherMaxHealth=%.1f (≤0, 配置非法). "
-				     "【v93.4 零兜底】实际母体血量=%.1f, 与预期不一致. "
-				     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → MetalSlug|Match → Mother Max Health (默认 200)."),
+				TEXT("[MotherMutation] MutateCharacterToMother: PlayerConfigAsset.MotherMaxHealth=%.1f (≤0, 配置非法). "
+				     "【v133.4 零兜底】实际母体血量=%.1f, 与预期不一致. "
+				     "修复: DA_PlayerConfig.uasset → Config|Health → Mother Max Health (默认 200)."),
 				ExpectedMotherHealth, MotherHC->GetMax());
 		}
 		else if (!FMath::IsNearlyEqual(MotherHC->GetMax(), ExpectedMotherHealth))
 		{
 			UE_LOG(LogTemp, Error,
 				TEXT("[MotherMutation] MutateCharacterToMother: NewMotherPawn='%s' HealthComponent->MaxHealth=%.1f (期望=%.1f). "
-				     "【v93.4 零兜底】母体血量与配置不一致. "
-				     "可能根因: SpawnSubsystem::MutatePawnToMother Step 5.6 失败."),
+				     "【v133.4 零兜底】母体血量与配置不一致. "
+				     "可能根因: SpawnSubsystem::MutatePawnToMother Step 5.6 失败. "
+				     "【废弃警告】GM.MotherMaxHealth 不再是真理源, 请迁移到 PlayerConfigAsset.MotherMaxHealth."),
 				*NewMotherPawn->GetName(), MotherHC->GetMax(), ExpectedMotherHealth);
 			// 不 return false — 业务态已设, RPC 照常发; 但血量会错
 		}
 	}
 
-	// 记录到母体账本 (业务层唯一真理源, TWeakObjectPtr 天然失效检测)
-	MotherCharacters.AddUnique(NewMotherPawn);
+	// 【v128 P0 大厂架构 — 集中调度】母体账本注册走 RegisterMotherPawn 公开接口
+	//   - 不直接 MotherCharacters.AddUnique (违反 SSOT,业务层漏写后任意路径都能逃过)
+	//   - RegisterMotherPawn 内部统一日志 + 以后扩展(如统计、事件)都集中
+	RegisterMotherPawn(NewMotherPawn);
 
 	UE_LOG(LogTemp, Display,
 		TEXT("[MotherMutation] MutateCharacterToMother: '%s' 已变异为母体 (母体数=%d, Class=%s, Location=%s). "
@@ -693,6 +711,69 @@ bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Targe
 		*NewMotherPawn->GetActorLocation().ToString());
 
 	return true;
+}
+
+
+// ==========================================
+// 【v128 2026.08.02 大厂架构 — 账本集中调度入口】
+// ==========================================
+//
+// 为什么需要:
+void URoomMotherMutationSubsystem::RegisterMotherPawn(ABaseCharacter* MotherPawn)
+{
+	// 零兜底 — 入参校验
+	if (!MotherPawn)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] RegisterMotherPawn: 入参 MotherPawn=nullptr, 拒绝注册."));
+		return;
+	}
+
+	if (!IsValid(MotherPawn))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] RegisterMotherPawn: 入参 MotherPawn '%s' 已失效, 拒绝注册."),
+			*MotherPawn->GetName());
+		return;
+	}
+
+	const int32 OldCount = MotherCharacters.Num();
+	MotherCharacters.AddUnique(MotherPawn);
+	const int32 NewCount = MotherCharacters.Num();
+
+	if (OldCount != NewCount)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] 【v128 账本同步】RegisterMotherPawn: 新增 '%s' (%d → %d). "
+			     "账本是 BTService_UpdateZombieTargets / GetAliveMotherCount 的唯一真理源."),
+			*MotherPawn->GetName(), OldCount, NewCount);
+	}
+	// OldCount == NewCount: 幂等命中,Verb
+}
+
+void URoomMotherMutationSubsystem::UnregisterMotherPawn(ABaseCharacter* MotherPawn)
+{
+	if (!MotherPawn)
+	{
+		return; // 安全 no-op
+	}
+
+	const int32 OldCount = MotherCharacters.Num();
+	MotherCharacters.RemoveAll([MotherPawn](const TWeakObjectPtr<ABaseCharacter>& Weak)
+	{
+		ABaseCharacter* C = Weak.Get();
+		return C == nullptr || C == MotherPawn;
+	});
+	const int32 NewCount = MotherCharacters.Num();
+
+	const int32 Removed = OldCount - NewCount;
+	if (Removed > 0)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation] 【v128 账本清理】UnregisterMotherPawn: '%s' 共移除 %d 条 "
+			     "(含失效 TWeakObjectPtr, %d → %d). 防止账本长期膨胀."),
+			*MotherPawn->GetName(), Removed, OldCount, NewCount);
+	}
 }
 
 

@@ -164,7 +164,7 @@ bool URoomZombieRallySubsystem::LockRallyPointForAI(AController* Controller, con
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[ZombieRally] LockRallyPointForAI: Controller='%s' PointID 为空, 拒绝锁点. "
-			     "【修复】BTTask_SelectZombieRallyPoint 在 Subsystem 选点后写入 BB.LockedRallyPoint, 不能为空."),
+			     "【修复】BTService_ReflexRallyChange 在 Subsystem 选点后传入 PointID, 不能为空."),
 			*Controller->GetName());
 		return false;
 	}
@@ -179,28 +179,39 @@ bool URoomZombieRallySubsystem::LockRallyPointForAI(AController* Controller, con
 		return false;
 	}
 
-	// 【大厂原则 — 一局只锁一次】检查是否已经锁定其他点
-	if (const FString* ExistingLock = LockedRallyByAI.Find(Controller))
-	{
-		if (*ExistingLock != PointID)
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[ZombieRally] LockRallyPointForAI: Controller='%s' 已锁 PointID='%s', 拒绝覆盖锁定新点 '%s'. "
-				     "【v107 大厂原则】一局内只选一次, 已锁点 AI 不迁移. "
-				     "【修复】BT Decorator 必须用 bRallyPointLocked 拒判, 不允许绕过."),
-				*Controller->GetName(), **ExistingLock, *PointID);
-			return false;
-		}
-
-		// 同一 Controller 锁同一 PointID → 幂等成功
-		return true;
-	}
-
+	// 【v117 2026.08.01 重要】记录"账本登记" — 区别于"业务锁锁定"
+	//
+	// 业务背景:
+	//   原 LockRallyPointForAI 语义是"业务锁" — Controller 锁定后不允许迁移 (返回 false + Log Error)
+	//   v117 BTTask_SelectZombieRallyPoint 改为 PeriodicReselect, 每次 ExecuteTask 都会调用本函数
+	//   - 同一 Controller 锁同一 PointID → 幂等成功 (return true) ✓
+	//   - 同一 Controller 锁不同 PointID → 旧实现 Log Error + reject
+	//     新实现: 视为"账本更新" (PeriodicReselect 是合规流程), 覆盖 PointID
+	//
+	// 大厂原则:
+	//   - 幂等 / 覆盖 都是合规 — 都不 Log Error
+	//   - 业务上的"一局只锁一次"约束, 由 BTTask_SelectZombieRallyPoint 节点的 ReselectPolicy = LockOnce 保障
+	//   - 账本登记语义 = "记录当前选点", 不含"不让改"的强约束
+	//   - 哪个点都不能被其他人"同时锁定" (本函数 LockedRallyByAI 值 = 单 PointID)
+	//
+	// 注: BB.LockedRallyPoint 才是 BT 决策用 — 那些写在 BTService_ReflexRallyChange 写 BB 步骤 3
+	//   v122: BTTask_SelectZombieRallyPoint 已删除, bRallyPointLocked bool Key 也已删除
+	//   零值原则: 未锁点 = BB.LockedRallyPoint == nullptr; 已锁点 = BB.LockedRallyPoint != nullptr
+	const bool bAlreadyLocked = LockedRallyByAI.Contains(Controller);
 	LockedRallyByAI.Add(Controller, PointID);
 
-	UE_LOG(LogTemp, Log,
-		TEXT("[ZombieRally] LockRallyPointForAI: Controller='%s' 锁定 PointID='%s' 成功."),
-		*Controller->GetName(), *PointID);
+	if (bAlreadyLocked)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ZombieRally] LockRallyPointForAI: Controller='%s' 更新锁定 PointID='%s' (v117 PeriodicReselect 账本同步)."),
+			*Controller->GetName(), *PointID);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[ZombieRally] LockRallyPointForAI: Controller='%s' 锁定 PointID='%s' 成功."),
+			*Controller->GetName(), *PointID);
+	}
 
 	return true;
 }
@@ -430,6 +441,82 @@ AZombieRallyPoint* URoomZombieRallySubsystem::SelectRallyPoint_MostPopulated(ABa
 }
 
 
+// 【v120 2026.08.01】反射式换点专用 — 与 SelectRallyPoint_Nearest 镜像, 排除指定 PointID
+//
+// 实现要点 (大厂原则 - 零重复 + 复用现有算法):
+//   - 距离算法: 复用 SelectRallyPoint_Nearest 同款 ComputeFlatDistanceSq (匿名 namespace 内)
+//   - 稳定排序: 复用 PointID 字典序破局
+//   - 排除逻辑: 跳过 ExcludePointID 匹配的项, 选剩余中最近的
+//   - 边界: 账本空 / 排除后空 → return nullptr (调用方负责 Log Error)
+//
+// 与 SelectRallyPoint_Nearest 唯一区别: 循环里加 `if (ID == ExcludePointID) continue;`
+// 为什么不直接复用 SelectRallyPoint_Nearest + 二次过滤:
+//   - "选最近后再排除" 如果选出的就是 ExcludePointID, 第二次选谁? 还得重新排
+//   - 直接在循环里跳过 = 单次排序, 复杂度 O(N), 0 重复计算
+AZombieRallyPoint* URoomZombieRallySubsystem::SelectRallyPoint_Nearest_Excluding(
+	ABaseCharacter* QueryingCharacter, const FString& ExcludePointID) const
+{
+	if (!IsValid(QueryingCharacter))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ZombieRally] SelectRallyPoint_Nearest_Excluding: QueryingCharacter=nullptr, 拒绝选点."));
+		return nullptr;
+	}
+
+	if (RallyPointsByID.Num() == 0)
+	{
+		// 账本空 → 调用方负责 Log Error
+		return nullptr;
+	}
+
+	const FVector CharLoc = QueryingCharacter->GetActorLocation();
+
+	AZombieRallyPoint* Best = nullptr;
+	float BestDistSq = TNumericLimits<float>::Max();
+	FString BestID;
+
+	for (const auto& Pair : RallyPointsByID)
+	{
+		AZombieRallyPoint* Point = Pair.Value.Get();
+		if (!IsValid(Point))
+		{
+			// TWeakObjectPtr 失效 (Actor 销毁), 跳过
+			continue;
+		}
+
+		const FString& ID = Pair.Key;
+
+		// ★ 反射式换点专用: 排除当前锁点本身
+		// ExcludePointID 可能是空字符串 (调用方未锁点) — 不会匹配任何 PointID (假设策划 PointID 全部非空)
+		// 业务上 PointID 必非空 (RegisterRallyPoint 零兜底校验), 所以空 ExcludePointID = 不排除任何点
+		if (!ExcludePointID.IsEmpty() && ID == ExcludePointID)
+		{
+			continue;
+		}
+
+		const float DistSq = ComputeFlatDistanceSq(CharLoc, Point->GetActorLocation());
+
+		// 稳定排序: 并列最近时按 PointID 字典序升序
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			Best = Point;
+			BestID = ID;
+		}
+		else if (FMath::IsNearlyEqual(DistSq, BestDistSq))
+		{
+			if (ID < BestID)
+			{
+				Best = Point;
+				BestID = ID;
+			}
+		}
+	}
+
+	return Best;
+}
+
+
 // ==========================================
 // 查询
 // ==========================================
@@ -478,4 +565,202 @@ AZombieRallyPoint* URoomZombieRallySubsystem_GetRallyPointByID_Impl(const TMap<F
 AZombieRallyPoint* URoomZombieRallySubsystem::GetRallyPointByID(const FString& PointID) const
 {
 	return URoomZombieRallySubsystem_GetRallyPointByID_Impl(RallyPointsByID, PointID);
+}
+
+
+// ============================================================
+// 【v125 2026.08.01】visited set + 冷却窗口 — 反射式换点 v125 升级版
+// ============================================================
+
+// 【v125】记录 AI 访问集合点 (账本写入入口)
+//
+// 调用方:
+//   - BTService_ReflexRallyChange::PerformReflexChange 写 BB 成功后立即调
+//   - 第一次"出生即选"也算 (写 BB 后调本函数)
+//
+// 大厂原则:
+//   - 幂等: 重复写入同一 PointID → 更新时间戳 (用于冷却窗口判定)
+//   - 失效保护: Controller 销毁 → TWeakObjectPtr 自动失效 → 不会有悬挂
+//   - 静默退出: Controller 无效 / PointID 空 → return (不 Log, 由调用方决定)
+void URoomZombieRallySubsystem::RecordRallyVisit(AController* Controller, const FString& PointID)
+{
+	if (!IsValid(Controller))
+	{
+		// Controller 已失效 (AI 死亡/销毁触发) — 静默退出, 不刷错误日志
+		return;
+	}
+
+	if (PointID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[ZombieRally] RecordRallyVisit: Controller='%s' PointID 为空, 跳过记录. "
+			     "【修复】BTService_ReflexRallyChange::PerformReflexChange 写 BB 成功后传有效 PointID."),
+			*Controller->GetName());
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	const float Now = World->GetTimeSeconds();
+	const TWeakObjectPtr<AController> WeakCtrl(Controller);
+
+	// FindOrAdd 模式 — 第一次访问时新建, 后续访问时复用
+	FRallyPointVisitRecord& Record = VisitHistoryByController.FindOrAdd(WeakCtrl);
+	Record.LastVisitTimeByPoint.FindOrAdd(PointID) = Now;
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[ZombieRally] RecordRallyVisit: Controller='%s' 访问 PointID='%s' 时间戳=%.2f. "
+		     "(历史 PointID 数=%d, 用于反射式换点冷却 / visited set 偏好)"),
+		*Controller->GetName(), *PointID, Now, Record.LastVisitTimeByPoint.Num());
+}
+
+
+// 【v125】反射式换点 v125 升级版 — 冷却窗口 + visited set
+//
+// 核心算法 (2 阶段):
+//   阶段 1: 冷却窗口检查 — ExcludePointID 在 VisitHistory 中距离上次锁定 < MinLockDurationBeforeReflexChange → 拒绝换点
+//   阶段 2: 选点 — 遍历账本, 跳过 ExcludePointID, 给已访问过的点加权 (bias)
+//
+// 为什么这样设计:
+//   - 旧 (v124) 只有"排除当前点"逻辑 → BT Service 0.2s Tick 连续触发 → 0.2s 换一次 → 来回切换 A↔B
+//   - v125 加冷却窗口 + visited set 加权 → 刚锁 B 后 8s 内不能"换走 B" → 不会 A↔B 来回
+//
+// 同分处理 (大厂原则 - 稳定排序):
+//   - Score = DistSq × Bias² (平方后 bias 1.0 还是 4.0 区别更明显)
+//   - AgeFactor = TimeSince / 30s (Clamp 0..1, 0=刚访问, 1=30s 前访问)
+//   - Bias = Lerp(VisitBiasMultiplier, 1.0, AgeFactor) — 越久远 bias 越接近 1.0
+//   - 并列 Score → PointID 字典序升序
+AZombieRallyPoint* URoomZombieRallySubsystem::SelectRallyPoint_Nearest_ReflexChange(
+	ABaseCharacter* QueryingCharacter,
+	AController* Controller,
+	const FString& ExcludePointID,
+	float VisitBiasMultiplier) const
+{
+	if (!IsValid(QueryingCharacter))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ZombieRally] SelectRallyPoint_Nearest_ReflexChange: QueryingCharacter=nullptr, 拒绝选点."));
+		return nullptr;
+	}
+
+	// 参数验证: VisitBiasMultiplier >= 1.0 (1.0 = 无惩罚, < 1.0 = 反向奖励, 不合理)
+	if (VisitBiasMultiplier < 1.f)
+	{
+		// 防御: 错误的参数, 用默认 4.0
+		VisitBiasMultiplier = DefaultVisitBiasMultiplier;
+	}
+
+	UWorld* World = GetWorld();
+	const float Now = World ? World->GetTimeSeconds() : 0.f;
+
+	// 阶段 1: 冷却窗口检查
+	//
+	// 大厂原则: 物理正确性 — 时间只能前进, 冷却期内不允许"再换走"
+	// 业务原因: 防止 A↔B 来回切换 (Service 0.2s Tick, 条件一直满足 → 0.2s 换一次)
+	const TWeakObjectPtr<AController> WeakCtrl(Controller);
+	if (Controller && IsValid(Controller) && !ExcludePointID.IsEmpty())
+	{
+		if (const FRallyPointVisitRecord* Record = VisitHistoryByController.Find(WeakCtrl))
+		{
+			if (const float* LastTime = Record->LastVisitTimeByPoint.Find(ExcludePointID))
+			{
+				const float Elapsed = Now - *LastTime;
+				if (Elapsed < MinLockDurationBeforeReflexChange)
+				{
+					UE_LOG(LogTemp, Verbose,
+						TEXT("[ZombieRally] SelectRallyPoint_Nearest_ReflexChange: "
+						     "Controller='%s' 反射式换点冷却中 (ExcludePointID='%s' 仅过去 %.1fs, 需 %.1fs). 拒绝换点, 返回 nullptr."),
+						*Controller->GetName(), *ExcludePointID, Elapsed, MinLockDurationBeforeReflexChange);
+					return nullptr;
+				}
+			}
+		}
+	}
+
+	// 阶段 2: 选点 (visited set 加权)
+	if (RallyPointsByID.Num() == 0)
+	{
+		// 账本空 → 调用方负责 Log Error
+		return nullptr;
+	}
+
+	// 拿 AI 的访问历史 (visited set 镜像)
+	// 历史空 → 走纯距离 (等价于 v124 行为, 不报错)
+	const FRallyPointVisitRecord* History = Controller && IsValid(Controller)
+		? VisitHistoryByController.Find(WeakCtrl)
+		: nullptr;
+
+	const FVector CharLoc = QueryingCharacter->GetActorLocation();
+
+	AZombieRallyPoint* Best = nullptr;
+	float BestScore = TNumericLimits<float>::Max();
+	FString BestID; // 稳定排序用
+
+	for (const auto& Pair : RallyPointsByID)
+	{
+		AZombieRallyPoint* Point = Pair.Value.Get();
+		if (!IsValid(Point))
+		{
+			// TWeakObjectPtr 失效 (Actor 销毁), 跳过
+			continue;
+		}
+
+		const FString& ID = Pair.Key;
+
+		// 排除当前 BB 锁点本身 (v124 继承)
+		if (!ExcludePointID.IsEmpty() && ID == ExcludePointID)
+		{
+			continue;
+		}
+
+		const float DistSq = ComputeFlatDistanceSq(CharLoc, Point->GetActorLocation());
+
+		// 【v125】visited set 加权
+		// 越久远访问过的点 Bias 越接近 1.0 (不惩罚)
+		// 越近访问过的点 Bias = VisitBiasMultiplier (大幅惩罚)
+		float Bias = 1.0f;
+		if (History)
+		{
+			if (const float* LastTime = History->LastVisitTimeByPoint.Find(ID))
+			{
+				const float TimeSince = Now - *LastTime;
+				// 30s 内访问过 → bias 拉满; 30s 前访问过 → bias 接近 1.0
+				const float AgeFactor = FMath::Clamp(TimeSince / 30.0f, 0.0f, 1.0f);
+				Bias = FMath::Lerp(VisitBiasMultiplier, 1.0f, AgeFactor);
+			}
+		}
+		// Score = DistSq × Bias² (平方后 bias 差更明显)
+		const float Score = DistSq * Bias * Bias;
+
+		// 稳定排序: 并列 Score → PointID 字典序升序
+		if (Score < BestScore)
+		{
+			BestScore = Score;
+			Best = Point;
+			BestID = ID;
+		}
+		else if (FMath::IsNearlyEqual(Score, BestScore))
+		{
+			if (ID < BestID)
+			{
+				Best = Point;
+				BestID = ID;
+			}
+		}
+	}
+
+	if (Best)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ZombieRally] SelectRallyPoint_Nearest_ReflexChange: "
+			     "Controller='%s' 选点='%s' (Score=%.0f, 排除='%s', Bias=%.2f). "
+			     "v124 → v125 升级: 已访问过的点优先度降低, 近期换过点冷却期内拒绝再换."),
+			*QueryingCharacter->GetName(), *BestID, BestScore, *ExcludePointID, VisitBiasMultiplier);
+	}
+
+	return Best;
 }

@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -53,6 +53,9 @@
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomPlayerController.h"
+#include "Systems/Spawn/RoomSpawnSubsystem.h" // 【v133.5.1】HandleSlowStateChanged 读 PlayerConfigAsset 直指针
+#include "Data/Config/PlayerConfigAsset.h"     // 【v133.5.1】玩家路径真理源 (MotherSlowSpeed / MaxWalkSpeed / MotherMaxWalkSpeed)
+#include "Data/AI/AIBehaviorConfigSO.h"        // 【v133.5.1】AI 路径真理源 (MotherSlowSpeed)
 // 【v110 P0 修复】引入 Controller 完整定义以做 IsA<APlayerController>() 类型判定
 //   旧版用 IsLocallyControlled() 误判 ListenServer 上 AI Pawn 为本地玩家
 #include "GameFramework/PlayerController.h"
@@ -64,6 +67,16 @@
 #include "Data/Tables/WeaponTableRow.h"
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
+
+// 【v132 2026.08.02 新增】 IAISightTargetInterface 实现 (UE 官方 AI 视野协议)
+//
+// 业界共识 — UE 官方 + Lyra 推荐:
+//   - 自定义视线检测必须 override `IAISightTargetInterface::CanBeSeenFrom`
+//   - AI 视野系统每次检测时自动调用此 override
+//   - Trace 必须命中目标才能 Visible (业界共识方案: trace 多个 Pawn 关键点)
+#include "Perception/AISightTargetInterface.h"  // IAISightTargetInterface / FCanBeSeenFromContext
+#include "Perception/AISense_Sight.h"            // UAISense_Sight::EVisibilityResult
+#include "Engine/World.h"                        // LineTraceSingleByChannel
 
 // 【2026.07.12 P0 大厂架构 Phase 2】5 个新 ActorComponent 头文件 (转发壳依赖)
 // 注意: 头文件本身由别的 agent 编写 (可能在 PIE 同时编译), 这里只前向声明 + 假设依赖
@@ -145,6 +158,15 @@ ABaseCharacter::ABaseCharacter()
 	//   - 不破坏刀战模式: 刀战 BP 阈值场景不触发, 母体 BP 默认 100.0 触发
 	//   - 零重复: 复用 InvincibilityFlickerComponent 的协议 / PrepareMaterials / Slot 过滤
 	MotherLowHealthFlicker = CreateDefaultSubobject<UMotherLowHealthFlickerComponent>(TEXT("MotherLowHealthFlicker"));
+
+	// 【v133.5 大厂架构新增】母体被主武器击中后降速组件 — 与 InvincibilityFlickerComponent 完全对称
+	//   - 业务规则 (用户 2026.08.02): 主武器击中母体 → 降速到 MotherSlowSpeed (默认 100) → 2 秒后恢复
+	//   - 触发源: CombatDeathComponent::TakeDamage 末尾 (主武器 + 母体 判定)
+	//   - 数据/状态分离: Component 持状态 (bIsSlowed + SlowExpiresAtWorldTime), BaseCharacter 持表现 (MaxWalkSpeed)
+	//   - 状态字段 Replicated (镜像 Invincibility): 服务器写 + 客户端 OnRep 同步
+	//   - 派发 OnSlowStateChanged → BaseCharacter 订阅 → 改 MaxWalkSpeed
+	//   - 不破坏刀战模式: 刀战没母体, 永远不触发
+	MotherSlowComponent = CreateDefaultSubobject<UMotherSlowComponent>(TEXT("MotherSlowComponent"));
 
 	// ==========================================
 	// 【2026.07.12 P0 大厂重构 Phase 2】5 个业务组件 (BaseCharacter 拆分)
@@ -360,11 +382,24 @@ void ABaseCharacter::BeginPlay()
 		UE_LOG(LogTemp, Error, TEXT("[BaseCharacter] CharacterEvents 组件未挂载!"));
 	}
 
+	// 【v133.5 大厂架构新增】订阅 MotherSlowComponent.OnSlowStateChanged
+	//   - 触发源: CombatDeathComponent::TakeDamage 末尾 (主武器击中母体) → ActivateSlow
+	//   - 表现: BaseCharacter 改 MaxWalkSpeed (走真理源: MotherSlowSpeed / MotherMaxWalkSpeed)
+	//   - 服务器主动 Broadcast + 客户端 OnRep Broadcast = 双发保证 (与 Invincibility 镜像)
+	//
+	// 大厂原则 — 职责分离:
+	//   - Component 只管"是否慢速"状态, 不动 MaxWalkSpeed (跨边界)
+	//   - BaseCharacter 订阅事件 → 改 MaxWalkSpeed (知道 Movement 真实作用)
+	if (UMotherSlowComponent* SlowComponent = ResolveMotherSlowComponent())
+	{
+		SlowComponent->OnSlowStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleSlowStateChanged);
+	}
+
 	// 【v100.1 大厂架构】订阅 HealthRegenComponent 回血状态变化
 	// 触发场景 (业务规则 2026.07.26 母体): 不被打 + 不移动 5 秒后, 服务器 Tick 检测到开始回血
 	// 服务器路径: HealthRegenComponent::OnRegenStateChanged(true).Broadcast
-	//             → HandleRegenStateChanged → Multicast_PlayRegenSound RPC 推所有客户端
-	// 客户端路径: 收到 RPC → Multicast_PlayRegenSound_Implementation 创建循环音组件
+	//             → HandleRegenStateChanged → Client_PlayRegenSound RPC (OwnerOnly) — 仅母体本人听到
+	// 客户端路径: 收到 RPC → Client_PlayRegenSound_Implementation 创建循环音组件
 	if (UHealthRegenComponent* HRC = ResolveHealthRegenComponent())
 	{
 		HRC->OnRegenStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleRegenStateChanged);
@@ -475,6 +510,176 @@ void ABaseCharacter::OnHealthComponentInvincibilityChanged(bool bIsNowInvincible
 	UE_LOG(LogTemp, Display,
 		TEXT("[BaseCharacter][OnHealthComponentInvincibilityChanged] ★ 无敌期变化: Pawn=%s bIsNowInvincible=%d"),
 		*GetName(), bIsNowInvincible ? 1 : 0);
+}
+
+
+void ABaseCharacter::HandleSlowStateChanged()
+{
+	// ==========================================
+	// 【v133.5.3 大厂架构 — 修复永远不消退】母体被主武器击中后改 MaxWalkSpeed
+	// ==========================================
+	//
+	// 旧版 (v133.5.1) 痛点:
+	//   - "还原" 路径用真理源优先 (PlayerConfig / ConfigSO)
+	//   - 真理源缺失 → 拒绝还原 + Log Error → MaxWalkSpeed 永远 = slow speed
+	//   - 用户场景: 母体被主武器击中 → 2s 后 Slow Timer 触发 → DeactivateSlow → Broadcast
+	//            → HandleSlowStateChanged 还原路径 → 真理源缺失 → 拒绝还原 → 永远 = 100
+	//
+	// 大厂原则 — 零兜底 (v133.5.3 修复):
+	//   - 不要拒绝还原 — 必须给最可靠的值 (即使真理源缺失)
+	//   - 还原优先级: 玩家真理源 > 缓存 > 退化默认值 (UE 默认 600)
+	//   - 真理源缺失 → Log Error 但仍然还原 (不让用户卡在永远 100)
+	//
+	// 设计原则 (镜像 InvincibilityFlickerComponent):
+	//   - Component 持状态 (bIsSlowed), BaseCharacter 改 MaxWalkSpeed
+	//   - 跨边界: Component 不知道 MovementComponent 存在
+	//   - 服务器/客户端都执行 (双发保证, 同一份视觉逻辑)
+	//
+	// 真理源决策 (v133.5.3 修复后):
+	//   - 慢速速度: 玩家 = PlayerConfigAsset.MotherSlowSpeed, AI = ConfigSO.MotherSlowSpeed
+	//   - 原速度还原: 玩家路径优先 PlayerConfig 真理源 → 退化缓存 → 退化默认值
+	//                AI 路径用缓存 → 退化默认值
+	//
+	// 状态决策:
+	//   - bIsSlowed=true  → 改 MotherSlowSpeed (强制, 真理源) — 真理源缺失拒绝, **不还原**
+	//   - bIsSlowed=false → 还原 (真理源优先 > 缓存 > 退化默认值) — 配置错也还原, 不卡死
+
+	UMotherSlowComponent* SlowComp = ResolveMotherSlowComponent();
+	if (!SlowComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][HandleSlowStateChanged] MotherSlowComponent 解析失败. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	if (!MoveComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][HandleSlowStateChanged] CharacterMovement 为空. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	const bool bIsSlowedNow = SlowComp->IsSlowed();
+
+	// 慢速速度真理源: 玩家读 PlayerConfig, AI 读 ConfigSO
+	float MotherSlowSpeedValue = 0.0f;
+	bool bIsPlayerPath = false;
+
+	if (Cast<APlayerController>(GetController()) != nullptr)
+	{
+		// 玩家路径: 读 PlayerConfigAsset.Spawn->PlayerConfigAsset 直指针
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+		{
+			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+			{
+				MotherSlowSpeedValue = PC->MotherSlowSpeed;
+			}
+		}
+		bIsPlayerPath = true;
+	}
+	else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(GetController()))
+	{
+		// AI 路径: 读 ConfigSO.MotherSlowSpeed
+		if (UAIBehaviorConfigSO* Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig()))
+		{
+			MotherSlowSpeedValue = Config->MotherSlowSpeed;
+		}
+	}
+
+	// ==========================================
+	// 真理源决策 — 慢速 vs 还原
+	// ==========================================
+	// 【v133.5.3 修复】永远给一个值 — 配置错也用最可靠的退化值
+	float TargetSpeed = 0.0f;
+	const TCHAR* Reason = TEXT("");
+
+	if (bIsSlowedNow)
+	{
+		// 慢速中 → 强制 MotherSlowSpeed (真理源)
+		// 真理源缺失 → 拒绝激活 (零兜底, 但这种情况还没发生慢速, 不会卡死)
+		if (MotherSlowSpeedValue <= 0.0f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][HandleSlowStateChanged] 慢速速度真理源未配 MotherSlowSpeed=%.1f "
+				     "(Pawn=%s, 真理源=%s). 【v133.5.3 修复】检查 PlayerConfigAsset 或 ConfigSO 配置. 不强行设 MaxWalkSpeed."),
+				MotherSlowSpeedValue, *GetName(),
+				bIsPlayerPath ? TEXT("PlayerConfigAsset") : TEXT("ConfigSO"));
+			return;
+		}
+		TargetSpeed = MotherSlowSpeedValue;
+		Reason = TEXT("Slowed (MotherSlowSpeed)");
+	}
+	else
+	{
+		// ==========================================
+		// 【v133.5.3 修复】还原路径 — 永远给一个值, 拒绝 "永远不还原"
+		// ==========================================
+		// 真根因 (v133.5.1): 还原路径要求两个真理源都拿到才还原, 任意一个缺失 → 拒绝 → 永远 = slow speed
+		// 修复: 三级退化, 永远有值
+		//   1. 玩家路径真理源 (PlayerConfig.MaxWalkSpeed / MotherMaxWalkSpeed)
+		//   2. Component 缓存 (SlowComp->GetCachedBaseMaxWalkSpeed)
+		//   3. 退化默认值 (UE 默认 600.0f) — 真理源全错时使用, 保证角色能动
+		// 真理源缺失 → Log Error 报告, 但仍然还原 (不让角色永远卡死)
+		float RestoredSpeed = 0.0f;
+
+		if (bIsPlayerPath)
+		{
+			// 玩家路径: 用 PlayerConfig 真理源分流 (母体 → MotherMaxWalkSpeed, 人类 → MaxWalkSpeed)
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+				{
+					RestoredSpeed = bIsMother
+						? PC->MotherMaxWalkSpeed
+						: PC->MaxWalkSpeed;
+				}
+			}
+		}
+
+		if (RestoredSpeed > 0.0f)
+		{
+			// 玩家路径真理源拿到 → 直接用
+			TargetSpeed = RestoredSpeed;
+			Reason = TEXT("PlayerPath-Restored (PlayerConfig truth source)");
+		}
+		else
+		{
+			// AI 路径 / 玩家路径配置缺失 → 用 Component 缓存
+			const float CachedSpeed = SlowComp->GetCachedBaseMaxWalkSpeed();
+			if (CachedSpeed > 0.0f)
+			{
+				TargetSpeed = CachedSpeed;
+				Reason = TEXT("Cache-Restored (CachedBaseMaxWalkSpeed)");
+			}
+			else
+			{
+				// 【v133.5.3 最终修复】全部退化都没了 → 用 UE 默认 600
+				// 绝不容忍 "永远不还原" — 角色必须能动
+				UE_LOG(LogTemp, Error,
+					TEXT("[BaseCharacter][HandleSlowStateChanged] 还原速度真理源全缺失: 玩家路径=%s, 缓存=%.1f "
+					     "(Pawn=%s). 【v133.5.3 修复】检查 PlayerConfigAsset.MaxWalkSpeed / ConfigSO 配置. "
+					     "用退化默认值 600.0 防止 '永远不还原' bug."),
+					bIsPlayerPath ? TEXT("PlayerConfig") : TEXT("ConfigSO(N/A)"),
+					CachedSpeed, *GetName());
+				TargetSpeed = 600.0f; // UE ACharacter 默认 MaxWalkSpeed
+				Reason = TEXT("Fallback-Default (UE Default 600)");
+			}
+		}
+	}
+
+	// 应用目标速度
+	MoveComp->MaxWalkSpeed = TargetSpeed;
+	MoveComp->MaxWalkSpeedCrouched = TargetSpeed * 0.5f;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter][HandleSlowStateChanged] ★ 慢速状态变化: Pawn=%s bIsSlowed=%d → MaxWalkSpeed=%.1f "
+		     "(真理源=%s, SlowSpeed=%.1f, Reason=%s)"),
+		*GetName(), bIsSlowedNow ? 1 : 0, TargetSpeed,
+		bIsPlayerPath ? TEXT("PlayerConfig") : TEXT("ConfigSO"),
+		MotherSlowSpeedValue, Reason);
 }
 
 
@@ -1426,6 +1631,43 @@ bool ABaseCharacter::OnAIRequestAttack_Simple()
 	if (UAIAttackComponent* AI = ResolveAIAttack())
 	{
 		return AI->OnAIRequestAttack_Simple(this);
+	}
+	// else: ResolveAIAttack 内部已 Log Error
+	return false;
+}
+
+/**
+ * 【v133 P0 大厂扩展】OnAIRequestAttack_WithOptions — 转发壳
+ *
+ * 大厂原则 — 与 Simple 对称:
+ *   - BTTask_PlayAttackMontage (v133) 直接调本方法
+ *   - 内部调 AIAttackComponent::OnAIRequestAttack_WithOptions (传入真实 Pawn)
+ *   - 任何失败都已在 Component 内部 Log Error, 这里不重复报警
+ */
+bool ABaseCharacter::OnAIRequestAttack_WithOptions(
+	EAIAttackType InAttackType, int32 InComboIndex, bool bInLockMovement)
+{
+	if (UAIAttackComponent* AI = ResolveAIAttack())
+	{
+		return AI->OnAIRequestAttack_WithOptions(this, InAttackType, InComboIndex, bInLockMovement);
+	}
+	// else: ResolveAIAttack 内部已 Log Error
+	return false;
+}
+
+/**
+ * 【v133.1 P0 大厂扩展】OnAIRequestAttack_ExplicitMontage — 转发壳
+ *
+ * 大厂原则 — 与 WithOptions 对称:
+ *   - BTTask_PlayAttackMontage (v133.1) 在 ExplicitMontage!=nullptr 时调本方法
+ *   - 内部调 AIAttackComponent::OnAIRequestAttack_ExplicitMontage (传入真实 Pawn)
+ */
+bool ABaseCharacter::OnAIRequestAttack_ExplicitMontage(
+	UAnimMontage* InExplicitMontage, bool bInLockMovement)
+{
+	if (UAIAttackComponent* AI = ResolveAIAttack())
+	{
+		return AI->OnAIRequestAttack_ExplicitMontage(this, InExplicitMontage, bInLockMovement);
 	}
 	// else: ResolveAIAttack 内部已 Log Error
 	return false;
@@ -2454,6 +2696,148 @@ bool ABaseCharacter::GetAimRayFromCrosshairOrEyes(FVector& OutRayOrigin, FVector
 
 
 /**
+ * ABaseCharacter::ComputeFireRayTowardsTarget (v130 新增)
+ *
+ * 算法 (v130 大厂 3D 追踪方案):
+ *   - Origin     = Weapon Mesh Muzzle Socket (复用 v109 的搜索逻辑)
+ *   - Direction  = (Target.ActorLocation - MuzzleLocation).GetSafeNormal()
+ *                → 完整 3D 方向, 自动跟随 Target 上下位置
+ *
+ * 与 v109 GetAimRayFromCrosshairOrEyes AI 路径区别:
+ *   - v109: Direction = BaseAim.Vector() (水平, 准星旋转, 不跟随 Target 高度)
+ *   - v130: Direction = (Target - Muzzle)  (3D, 自动跟随 Target 高度)
+ *
+ *   用户反馈 (2026.08.02):
+ *     "AI 水平射击, 不能跟随 Target 上下位置"
+ *     → v109 是问题根源 (AI 朝向不随 Target 跳起而变)
+ *     → v130 修复 — 直接用 Muzzle → Target 方向, 自然 3D 追踪
+ *
+ * 大厂原则 — 数据驱动:
+ *   - BT 已知 TargetActor (装饰器已确认), 不需要二次校验
+ *   - BT 决策 = 用 v109 还是 v130 — BT 编辑器配 Key 控制
+ *
+ * 大厂原则 — 代码复用:
+ *   - Muzzle Socket 搜索逻辑 (v109) 不重复, 抽到局部 lambda
+ *   - 与 GetAimRayFromCrosshairOrEyes AI 路径共享 Muzzle 逻辑
+ */
+bool ABaseCharacter::ComputeFireRayTowardsTarget(
+	AActor* TargetActor,
+	FVector& OutRayOrigin,
+	FVector& OutRayDirection)
+{
+	// 默认值 (失败时)
+	OutRayOrigin = GetActorLocation();
+	OutRayDirection = FVector::ForwardVector;
+
+	if (!IsValid(TargetActor))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v130】Pawn=%s TargetActor 无效. "
+			     "【零兜底】调用方应该已 BT 校验, 这里保险."),
+			*GetName());
+		return false;
+	}
+
+	// 算 Muzzle Socket 起点 (复用 v109 搜索策略)
+	ABaseWeapon* CurrentWeapon = GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v130】Pawn=%s 没 CurrentWeapon, Origin 回退到 Actor 位置."),
+			*GetName());
+		OutRayOrigin = GetActorLocation();
+	}
+	else
+	{
+		UMeshComponent* WeaponMesh = CurrentWeapon->GetMeshComponent();
+		if (!WeaponMesh)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v130】Pawn=%s 武器 '%s' 没 MeshComponent, Origin 回退到 Actor 位置."),
+				*GetName(),
+				*CurrentWeapon->GetName());
+			OutRayOrigin = GetActorLocation();
+		}
+		else
+		{
+			// 复用 v109 的多候选 Socket 名 (Muzzle / Socket_Muzzle / MuzzleSocket)
+			FName MuzzleSocketToUse = NAME_None;
+			const TArray<FName> CandidateSocketNames = { TEXT("Muzzle"), TEXT("Socket_Muzzle"), TEXT("MuzzleSocket") };
+			for (const FName& Candidate : CandidateSocketNames)
+			{
+				if (WeaponMesh->DoesSocketExist(Candidate))
+				{
+					MuzzleSocketToUse = Candidate;
+					break;
+				}
+			}
+
+			if (!MuzzleSocketToUse.IsNone())
+			{
+				OutRayOrigin = WeaponMesh->GetSocketLocation(MuzzleSocketToUse);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v130】Pawn=%s 武器 '%s' 缺 MuzzleSocket (候选: Muzzle/Socket_Muzzle/MuzzleSocket). "
+					     "Origin 回退到 Actor 位置. "
+					     "【修复】Mesh 上加 Socket 'Muzzle'."),
+					*GetName(),
+					*CurrentWeapon->GetName());
+				OutRayOrigin = GetActorLocation();
+			}
+		}
+	}
+
+	// 算 3D 追踪方向 (v131 修复 — 跟随 Target 上下 + 命中胸口)
+	//   Direction = (Target.胸部位置 - Muzzle位置).GetSafeNormal()
+	//   胸部位置 = Target.ActorLocation + (0, 0, ChestHeightOffset)
+	//   ChestHeightOffset = 60cm (从 ActorLocation 向上抬, 命中 Pawn Capsule 胸口)
+	//
+	// v130 旧版 (打脚根因):
+	//   - Direction = (Target.ActorLocation - Muzzle).GetSafeNormal()
+	//   - Target.ActorLocation = Capsule 中心 (脚底 + 半高 88cm)
+	//   - 当 AI 在地面扫射 Target 高台时, Direction 抬到 Target 中心 588cm
+	//   - trace 沿 Direction 走到 Range 距离, EndLoc 远超 Target
+	//   - line 与 Target Capsule 的第一交点 = 进入点 (通常是胶囊底部 = 脚)
+	//   - 视觉上看: 子弹打脚, 不打胸口 (用户反馈)
+	//
+	// v131 修复:
+	//   - Direction 抬高到 Target.ActorLocation + 60cm (胸口高度)
+	//   - trace 沿 Direction 走到 Target → 命中胸口
+	//   - 与 v130 区别: v130 = 命中胶囊中心, v131 = 命中胸口
+	//   - 玩家准星通常也指向胸口 (CS:GO/Apex 大厂标准), AI 也应该跟玩家一致
+	const float ChestHeightOffset = 60.0f; // 厘米, 从 ActorLocation 向上 (从脚到胸)
+	const FVector TargetAimPoint = TargetActor->GetActorLocation() + FVector(0.f, 0.f, ChestHeightOffset);
+	const FVector DirectionRaw = TargetAimPoint - OutRayOrigin;
+	if (DirectionRaw.IsNearlyZero())
+	{
+		// Target 就在 Muzzle 位置 (AI 完全贴住 Target) → 用水平朝向兜底
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v131】Pawn=%s Target 跟 Muzzle 重叠 (距离≈0), 用 ForwardVector 兜底."),
+			*GetName());
+		OutRayDirection = GetActorForwardVector();
+	}
+	else
+	{
+		OutRayDirection = DirectionRaw.GetSafeNormal();
+	}
+
+	UE_LOG(LogBehaviorTree, Verbose,
+		TEXT("[BaseCharacter::ComputeFireRayTowardsTarget] 【v131 3D 追踪 + 胸口】Pawn=%s Target='%s' "
+		     "Origin=%s TargetAimPoint=%s (胸部偏移=%.0fcm) Direction=%s"),
+		*GetName(),
+		*TargetActor->GetName(),
+		*OutRayOrigin.ToCompactString(),
+		*TargetAimPoint.ToCompactString(),
+		ChestHeightOffset,
+		*OutRayDirection.ToCompactString());
+
+	return true;
+}
+
+
+/**
  * ABaseCharacter::GetCrosshairWorldDirection_Const (const 版本 — 仅 const 上下文用)
  *
  * 大厂原则 — const 正确性 + 性能权衡:
@@ -3117,6 +3501,176 @@ ETeamAttitude::Type ABaseCharacter::GetTeamAttitudeTowards(const AActor& Other) 
 		return FFactionTags::AttitudeBetween(FactionTag, OtherTag);
 	}
 	return ETeamAttitude::Neutral;
+}
+
+// ==========================================
+// 【v132 2026.08.02 新增】IAISightTargetInterface::CanBeSeenFrom — UE 官方 AI 视野协议
+// ==========================================
+//
+// 业务背景 (用户 2026.08.02 第五轮反馈):
+//   "还是老样子, 为什么不用官方推荐的解决方案呢?"
+//
+// 之前 (v129 - v131.5) 我们自建 BTDecorator_HasLineOfSight, 自创多 trace 方案
+//   - 业界共识: UE 自带 LineOfSightTo / UAISense_Sight 只 trace capsule center (已知限制)
+//   - 业界共识: 自定义视线检测必须 override IAISightTargetInterface::CanBeSeenFrom
+//   - 我之前嫌它要 override Target Actor "麻烦", 偷懒走了自创方案 — 用户指出错误
+//   - v132 修正: 用 UE 官方推荐方案
+//
+// 业界共识方案 (UE 5.6 + Lyra + Epic Developer Community):
+//   - 实现 IAISightTargetInterface, override CanBeSeenFrom (UE 5.2 新签名, 用 FCanBeSeenFromContext)
+//   - 在 CanBeSeenFrom 内做自定义视线检测 (业界共识: trace Pawn 多个关键点)
+//   - AI Perception 用 UAISenseConfig_Sight 配置 (项目中已存在 BP_MeleeAIController 等)
+//   - BT 不再需要 LoS 装饰器 (AI 视野系统自动调用, 写入 BB.HasLineOfSight 等)
+//
+// v132 实现 — trace Pawn 关键点 (业界共识 — UE 5.3 forum 推荐):
+//   - Phase 1: trace ObserverLocation → Pawn "head" socket (Mesh 上)
+//               AI 仰视主视角, 掩体挡下半身时头仍可见
+//   - Phase 2: trace ObserverLocation → Pawn Capsule 中心
+//               标准视线检测点
+//   - Phase 3: trace ObserverLocation → Pawn Capsule 底部
+//               AI 俯视, 掩体挡上半身时脚仍可见
+//   任一命中 Pawn 或其子组件 → Visible
+//
+// 用户场景验证 (AI 高地 Z=1463, Target 低地 Z=1016, 中间地面凸起):
+//   - 旧 BTDecorator (v131.5): Phase 1 trace 头 (高) → 撞墙 → 仍 PASS → AI 误开火
+//   - 新 IAISightTargetInterface (v132): 头撞墙 (Phase 1 FAIL) → 胸可能也撞墙 (Phase 2 FAIL) → 脚可能也撞墙 (Phase 3 FAIL) → NotVisible → AI 不开火 ✓
+//
+// 大厂原则 — UE 官方推荐 > 自创方案:
+//   - 删 BTDecorator_HasLineOfSight 整个文件 (v129 - v131.5)
+//   - 用 IAISightTargetInterface (UE 官方接口)
+//   - BT 只负责距离/HP/状态决策, 不负责 LoS (LoS 归 AI Perception + IAISightTargetInterface, 单一真理源)
+//   - 与 IGenericTeamAgentInterface 对称 — 都是 UE 官方协议接口, ABaseCharacter 是唯一实现者
+UAISense_Sight::EVisibilityResult ABaseCharacter::CanBeSeenFrom(
+	const FCanBeSeenFromContext& Context,
+	FVector& OutSeenLocation,
+	int32& OutNumberOfLoSChecksPerformed,
+	int32& OutNumberOfAsyncLosCheckRequested,
+	float& OutSightStrength,
+	int32* UserData,
+	const FOnPendingVisibilityQueryProcessedDelegate* Delegate)
+{
+	OutNumberOfLoSChecksPerformed = 0;
+	OutNumberOfAsyncLosCheckRequested = 0;
+	OutSightStrength = 0.f;
+	OutSeenLocation = GetActorLocation();
+
+	// 第 1 步: 基本校验 (大厂原则 — 零兜底)
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter::CanBeSeenFrom] '%s' World 为空, 视为 NotVisible."),
+			*GetName());
+		return UAISense_Sight::EVisibilityResult::NotVisible;
+	}
+
+	const FVector ObserverLocation = Context.ObserverLocation;
+
+	// 第 2 步: 退化防御 — 距离太近 < 30cm (避免 trace 自身)
+	const float DistToObserver = FVector::Dist(ObserverLocation, GetActorLocation());
+	if (DistToObserver < 30.f)
+	{
+		OutNumberOfLoSChecksPerformed = 1;
+		OutSightStrength = 1.f;
+		OutSeenLocation = GetActorLocation();
+		return UAISense_Sight::EVisibilityResult::Visible;
+	}
+
+	// 第 3 步: 配置 trace 参数
+	//   - 不 ignore Target 自己 (UE 官方示例也是这样: Context.IgnoreActor 是 Observer)
+	//   - 业界共识: 让 trace 真检测碰撞, 命中 Pawn 子组件也算 Visible
+	const ECollisionChannel SightChannel = ECC_Visibility;
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(BaseChar_CanBeSeenFrom), /*bTraceComplex=*/true);
+	// 注意: 不要 AddIgnoredActor(this) — UE 官方示例也没 ignore Target,
+	//       因为 trace 命中 Target 或其子组件是 Visible 的有效路径
+	Params.AddIgnoredActor(Context.IgnoreActor);
+
+	// 第 4 步: Pawn 关键点 (业界共识 — 头/胸/脚三选一命中即可)
+	//   - 头: 用 Mesh 上的 "head" socket (业界共识: UE 5.3 forum 推荐)
+	//   - 胸: Pawn 中心 (Capsule Component 中心)
+	//   - 脚: Pawn 底部 (Capsule Component 底部)
+	TArray<FVector> KeyPoints;
+
+	// 头 (Mesh "head" socket) — 优先用 socket, 没有就用 Capsule 顶部
+	FVector HeadLoc = FVector::ZeroVector;
+	bool bHasHeadSocket = false;
+	if (USkeletalMeshComponent* MeshComp = GetMesh())
+	{
+		if (MeshComp->DoesSocketExist(TEXT("head")))
+		{
+			HeadLoc = MeshComp->GetSocketLocation(TEXT("head"));
+			bHasHeadSocket = true;
+		}
+	}
+	if (bHasHeadSocket)
+	{
+		KeyPoints.Add(HeadLoc);
+	}
+	else
+	{
+		// 退化: 用 Capsule 顶部 (比头低一点, 但够用)
+		if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+		{
+			KeyPoints.Add(GetActorLocation() + FVector(0.f, 0.f, Capsule->GetScaledCapsuleHalfHeight() * 0.7f));
+		}
+	}
+
+	// 胸 (Capsule 中心)
+	KeyPoints.Add(GetActorLocation());
+
+	// 脚 (Capsule 底部)
+	if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+	{
+		KeyPoints.Add(GetActorLocation() + FVector(0.f, 0.f, -Capsule->GetScaledCapsuleHalfHeight() * 0.5f));
+	}
+
+	// 第 5 步: 关键点 trace — 任一命中 Target → Visible
+	int32 KeyIndex = 0;
+	for (const FVector& EndPt : KeyPoints)
+	{
+		FHitResult HitResult;
+		const bool bHit = World->LineTraceSingleByChannel(
+			HitResult, ObserverLocation, EndPt, SightChannel, Params);
+		++OutNumberOfLoSChecksPerformed;
+		++KeyIndex;
+
+		// 3 case 显式 if-else (大厂原则 — 不简化):
+		bool bVisible = false;
+		if (!bHit)
+		{
+			// 情况 1: 路径干净 (无阻挡) → Visible
+			bVisible = true;
+		}
+		else if (HitResult.GetActor() == this ||
+		         (HitResult.GetActor() && HitResult.GetActor()->IsOwnedBy(this)))
+		{
+			// 情况 2: 路径到达 this 或 this 的子组件 (Mesh 等) → Visible
+			bVisible = true;
+		}
+		else
+		{
+			// 情况 3: 路径撞墙 (非 Target) → NotVisible
+			bVisible = false;
+		}
+
+		if (bVisible)
+		{
+			OutSightStrength = 1.f;
+			OutSeenLocation = bHit ? HitResult.ImpactPoint : EndPt;
+			UE_LOG(LogBehaviorTree, Display,
+				TEXT("[CanBeSeenFrom] '%s' Visible via KeyPt #%d (EndPt=%s Hit=%s). Observer=%s"),
+				*GetName(), KeyIndex, *EndPt.ToCompactString(),
+				bHit ? *HitResult.GetActor()->GetName() : TEXT("None"),
+				*ObserverLocation.ToCompactString());
+			return UAISense_Sight::EVisibilityResult::Visible;
+		}
+	}
+
+	// 第 6 步: 全部关键点都撞墙 → NotVisible (物理短路)
+	UE_LOG(LogBehaviorTree, Display,
+		TEXT("[CanBeSeenFrom] '%s' NotVisible (3 KeyPts 全部撞墙). Observer=%s SelfLoc=%s"),
+		*GetName(), *ObserverLocation.ToCompactString(), *GetActorLocation().ToCompactString());
+	return UAISense_Sight::EVisibilityResult::NotVisible;
 }
 
 
@@ -3856,9 +4410,14 @@ void ABaseCharacter::Multicast_PlayMutationFX_Implementation(const FString& Targ
  *
  * 大厂原则 — 零兜底:
  *   - bIsNowRegenerating=true → 读 HealthRegenComponent->RegenSound
- *     - Sound != nullptr: Multicast_PlayRegenSound(Sound)
+ *     - Sound != nullptr: Client_PlayRegenSound(Sound) (OwnerOnly)
  *     - Sound == nullptr: Log Warning + 不广播 (业务可禁用, 不是错误)
- *   - bIsNowRegenerating=false → Multicast_StopRegenSound
+ *   - bIsNowRegenerating=false → Client_StopRegenSound (OwnerOnly)
+ *
+ * 【v133.11 P0 大厂架构 — 严格 OwnerOnly】
+ *   - 玩家母体: IsPlayerControlled()=true → 调 Client RPC → 只发给该玩家
+ *   - AI 母体: IsPlayerControlled()=false → 跳过 (业务决策 2026.08.02)
+ *   - 大厂原则: 不能让场景中其他人听到, 必须 OwnerOnly
  *
  * 唯一调用方: 自己的 OnRegenStateChanged 委托 (服务器端)
  */
@@ -3902,26 +4461,51 @@ void ABaseCharacter::HandleRegenStateChanged(bool bIsNowRegenerating)
 		}
 
 		UE_LOG(LogTemp, Display,
-			TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: 触发 Multicast_PlayRegenSound. "
-				 "Owner=%s, Sound=%s"),
-			*GetName(), *Sound->GetName());
-		Multicast_PlayRegenSound(Sound);
+			TEXT("[BaseCharacter][v133.11] HandleRegenStateChanged: 触发 Client_PlayRegenSound (OwnerOnly). "
+				 "Owner=%s Sound=%s IsPlayerControlled=%d"),
+			*GetName(), *Sound->GetName(), IsPlayerControlled() ? 1 : 0);
+
+		// 【v133.11 P0 大厂架构 — 严格 OwnerOnly】
+		//   - 玩家母体: Client RPC 只发给该玩家 (IsPlayerControlled()=true → PC->ClientRPC → 只有该玩家执行)
+		//   - AI 母体: 跳过 (AI 无 Owner 客户端, Client RPC 不会广播; 且按业务决定 — AI 母体不播回血音)
+		//   - 大厂原则 — 零兜底: 严格按 IsPlayerControlled() 分流, 不允许模糊边界
+		if (IsPlayerControlled())
+		{
+			Client_PlayRegenSound(Sound);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[BaseCharacter][v133.11] HandleRegenStateChanged: AI 母体不播回血音 (业务决策 2026.08.02). "
+					 "Owner=%s"),
+				*GetName());
+		}
 	}
 	else
 	{
 		UE_LOG(LogTemp, Display,
-			TEXT("[BaseCharacter][v100.1] HandleRegenStateChanged: 触发 Multicast_StopRegenSound. "
-				 "Owner=%s"),
-			*GetName());
-		Multicast_StopRegenSound();
+			TEXT("[BaseCharacter][v133.11] HandleRegenStateChanged: 触发 Client_StopRegenSound (OwnerOnly). "
+				 "Owner=%s IsPlayerControlled=%d"),
+			*GetName(), IsPlayerControlled() ? 1 : 0);
+
+		// 【v133.11 P0 大厂架构 — 严格 OwnerOnly】配对 Client_PlayRegenSound
+		if (IsPlayerControlled())
+		{
+			Client_StopRegenSound();
+		}
+		// AI 母体本就没播放音, 无需 Stop (IsPlayerControlled()=false 跳过)
 	}
 }
 
 
 /**
- * ABaseCharacter::Multicast_PlayRegenSound_Implementation
+ * ABaseCharacter::Client_PlayRegenSound_Implementation
  *
  * 客户端实现: 接收 Sound 资产引用 → 创建/缓存 UAudioComponent 循环播放
+ *
+ * 【v133.11 P0 大厂架构】严格 OwnerOnly (Client RPC)
+ *   - 只发给 Owner (母体本人) → 只有该玩家客户端执行本函数 → 只有该玩家听到
+ *   - 场景中其他玩家的客户端不调用本函数 → 完全听不到 (零串音)
  *
  * 大厂原则 — 单一真理源:
  *   - ActiveRegenAudioComponent 是本机唯一缓存 (避免重复 Spawn)
@@ -3932,12 +4516,12 @@ void ABaseCharacter::HandleRegenStateChanged(bool bIsNowRegenerating)
  *   - GetMesh() 为空 → Log Error (BP 配错, 不允许)
  *   - SpawnSoundAttached 失败 → Log Error (引擎异常)
  */
-void ABaseCharacter::Multicast_PlayRegenSound_Implementation(USoundBase* Sound)
+void ABaseCharacter::Client_PlayRegenSound_Implementation(USoundBase* Sound)
 {
 	if (!Sound)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: Sound=nullptr, 拒绝播放. "
+			TEXT("[BaseCharacter][v133.11] Client_PlayRegenSound: Sound=nullptr, 拒绝播放. "
 				 "Owner=%s. (业务可能故意禁用声音)"),
 			*GetName());
 		return;
@@ -3956,7 +4540,7 @@ void ABaseCharacter::Multicast_PlayRegenSound_Implementation(USoundBase* Sound)
 	if (!BodyMesh)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: GetMesh() 为空! "
+			TEXT("[BaseCharacter][v133.11] Client_PlayRegenSound: GetMesh() 为空! "
 				 "Owner=%s. 【零兜底】检查 BP 是否有 Mesh 组件."),
 			*GetName());
 		return;
@@ -3982,41 +4566,44 @@ void ABaseCharacter::Multicast_PlayRegenSound_Implementation(USoundBase* Sound)
 	if (!ActiveRegenAudioComponent)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: SpawnSoundAttached 失败. "
+			TEXT("[BaseCharacter][v133.11] Client_PlayRegenSound: SpawnSoundAttached 失败. "
 				 "Owner=%s, Sound=%s. 【零兜底】检查 Sound 资产是否损坏."),
 			*GetName(), *Sound->GetName());
 		return;
 	}
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[BaseCharacter][v100.1] Multicast_PlayRegenSound: 创建循环音组件成功. "
+		TEXT("[BaseCharacter][v133.11] Client_PlayRegenSound: 创建循环音组件成功 (OwnerOnly). "
 			 "Owner=%s, Sound=%s"),
 		*GetName(), *Sound->GetName());
 }
 
 
 /**
- * ABaseCharacter::Multicast_StopRegenSound_Implementation
+ * ABaseCharacter::Client_StopRegenSound_Implementation
  *
  * 客户端实现: 停止 + 销毁活跃音组件
+ *
+ * 【v133.11 P0 大厂架构】严格 OwnerOnly (Client RPC)
+ *   - 配对 Client_PlayRegenSound, 也只发给 Owner
  *
  * 大厂原则 — 零兜底:
  *   - 没找到活跃组件 → Log Verbose (可能本机没开过音, 正常情况)
  *   - 找到 → Stop + DestroyComponent (下次激活时新建)
  */
-void ABaseCharacter::Multicast_StopRegenSound_Implementation()
+void ABaseCharacter::Client_StopRegenSound_Implementation()
 {
 	if (!ActiveRegenAudioComponent)
 	{
 		UE_LOG(LogTemp, Verbose,
-			TEXT("[BaseCharacter][v100.1] Multicast_StopRegenSound: ActiveRegenAudioComponent=nullptr. "
+			TEXT("[BaseCharacter][v133.11] Client_StopRegenSound: ActiveRegenAudioComponent=nullptr. "
 				 "Owner=%s. (本机可能没开过音, 正常情况)"),
 			*GetName());
 		return;
 	}
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[BaseCharacter][v100.1] Multicast_StopRegenSound: 停止 + 销毁音组件. "
+		TEXT("[BaseCharacter][v133.11] Client_StopRegenSound: 停止 + 销毁音组件 (OwnerOnly). "
 			 "Owner=%s, Sound=%s"),
 		*GetName(),
 		ActiveRegenAudioComponent->Sound ? *ActiveRegenAudioComponent->Sound->GetName() : TEXT("nullptr"));

@@ -136,12 +136,13 @@ void UBTService_UpdateZombieState::TickNode(
 		*AliveHumanCountKey.SelectedKeyName.ToString());
 
 	// 未知身份 → 显式 Display 提醒 (大厂可观测性 — 根因立刻可见)
+	// 【v117 2026.08.01】不作为 Warning, 仅作为 Detail, 业务决策上这是合法的"Pre-Mutation"状态
 	if (!bCurrentIsMother && !bCurrentIsHuman)
 	{
-		UE_LOG(LogBehaviorTree, Display,
-			TEXT("[BTService_UpdateZombieState] %s: ★ 未知身份 (bIsMother=0 && bIsHuman=0)! "
-			     L"【根因】1) 变异倒计时未触发; 2) GM.MotherMutationDurationSeconds<=0; "
-			     L"3) CurrentMatchMode!=Zombie; 4) ModeRulesByMode[Zombie] 未配置."),
+		UE_LOG(LogBehaviorTree, Verbose,
+			TEXT("[BTService_UpdateZombieState] %s: 未知身份 (Pre-Mutation, bIsMother=0 bIsHuman=0). "
+			     L"BT_ZombieModeAI 进入 Pre-Mutation 路径 → 选集合点 → MoveTo → AI 移动. "
+			     L"变异后身份切换为 Mother/Human, BT 跳入对应战斗分支."),
 			*AIC->GetName());
 	}
 

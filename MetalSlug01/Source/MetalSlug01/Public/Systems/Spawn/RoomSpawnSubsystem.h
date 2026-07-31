@@ -128,6 +128,20 @@ public:
 	void SetPlayerConfigAsset(class UPlayerConfigAsset* InAsset) { PlayerConfigAsset = InAsset; }
 
 	/**
+	 * 【v133.4.1 2026.08.02 大厂架构 — 真理源唯一入口】获取 PlayerConfigAsset 直指针
+	 *
+	 * 为什么需要这个 getter:
+	 *   - GM.PlayerConfigAsset 是 TSoftObjectPtr (只配资产引用)
+	 *   - SpawnSubsystem.PlayerConfigAsset 才是 TObjectPtr 直指针 (GM 注入进来)
+	 *   - 业务层要读资产字段 (如 MotherMaxHealth), 必须经过这个 getter — 不许乱读 TSoftObjectPtr
+	 *
+	 * 调用方:
+	 *   - URoomMotherMutationSubsystem::MutateCharacterToMother Step 3.6 (母体血量验证)
+	 *   - 任何需要读 PlayerConfigAsset 业务字段的地方
+	 */
+	class UPlayerConfigAsset* GetPlayerConfigAsset() const { return PlayerConfigAsset; }
+
+	/**
 	 * 【v41 大厂架构】从配置资产读取并应用角色参数到角色
 	 *
 	 * 职责:
@@ -142,6 +156,31 @@ public:
 	 * @param Character 目标角色 (必须已 Spawn)
 	 */
 	void ApplyCharacterConfigToCharacter(ABaseCharacter* Character);
+
+	/**
+	 * 【v133.4 2026.08.02 大厂架构】应用 AI ConfigSO 配置到 AI Pawn
+	 *
+	 * 真理源分离:
+	 *   - ApplyCharacterConfigToCharacter: 玩家 Pawn 读 PlayerConfigAsset
+	 *   - ApplyAICharacterConfigToCharacter: AI Pawn 读 ConfigSO.AIBehaviorConfig
+	 *
+	 * 职责分工:
+	 *   - 玩家 vs AI 是两个独立真理源 (大厂原则 — 单一真理源 + 职责对等)
+	 *   - 不允许 AI 用 PlayerConfigAsset (会污染真理源)
+	 *
+	 * 设计:
+	 *   - ConfigSO 走 BaseAIController->GetConfig() 取得 (运行时)
+	 *   - 真理源 = ConfigSO.Health.MaxHealth / MotherMaxHealth (按 bIsMother 分流)
+	 *   - 其他字段 (无敌期、武器等) 由 SetupMeleeAI / SpawnAIInternal 各处自己负责
+	 *
+	 * 调用方:
+	 *   - URoomSpawnSubsystem::SpawnAIInternal (大厅 AI Spawn 成功后)
+	 *   - AMeleeAIController::SetupMeleeAI 末尾 (关卡预放 AI)
+	 *   - URoomSpawnSubsystem::MutatePawnToMother 末尾 (母体 AI 复活)
+	 *
+	 * @param Character AI Pawn (必须已 Spawn)
+	 */
+	void ApplyAICharacterConfigToCharacter(ABaseCharacter* Character);
 
 	/**
 	 * 【v54 大厂架构重构】注入 AI 默认配置

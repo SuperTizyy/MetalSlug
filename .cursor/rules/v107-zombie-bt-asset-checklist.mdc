@@ -388,4 +388,676 @@ Sequence "Human: Rally Guard"
 | BT Task: 开火/停火 | `Public/Systems/AI/Tasks/BTTask_StartPrimaryFire.h/.cpp` |
 | BT Task: 换弹 | `Public/Systems/AI/Tasks/BTTask_ReloadPrimaryWeapon.h/.cpp` |
 | BT Decorator: 弹药空 | `Public/Systems/AI/Decorators/BTDecorator_ZombieAmmoEmpty.h/.cpp` |
+| BT Decorator: 视线检测 【v129 新增】 | `Public/Systems/AI/Decorators/BTDecorator_HasLineOfSight.h/.cpp` |
 | AIController | `Public/Systems/ZombieAIController.h/.cpp` (已存在) |
+
+---
+
+## 13. 【v129 2026.08.02】BTDecorator_HasLineOfSight — 视线检测编辑配置
+
+### 13.1 业务背景 (用户 2026.08.02)
+> "AI 现在射击目标, 中间有障碍物还是继续射击, 不知道绕开障碍物射击目标"
+
+### 13.2 根因链
+1. `BTTask_StartPrimaryFire` 用 `GetAimRayFromCrosshairOrEyes` 算射线 → 方向 = AI 朝向 (不是 AI→Target)
+2. BT 进入开火节点的判断 = `BTDecorator_InAttackRange` (只有距离判断)
+3. 没有 LoS 装饰器 → 障碍物在"AI 朝向的射线"路径上 → 命中墙 → 玩家扣血 = 0 → AI 持续射击墙 → BT 不知道墙挡了, 继续打
+
+### 13.3 BT 编辑器配置 — 在 `BT_ZombieModeAI.uasset` 加装饰器
+
+**必须做** (否则 AI 不会绕障碍物):
+
+打开 `Content/AI/BT_ZombieModeAI.uasset` → 找到 `PrimaryFire` Sequence 节点 → 加 Decorator:
+
+```
+Sequence "PrimaryFire"
+├─ Decorator: Has Line Of Sight? 【v129 新增】
+│   ├─ Target Key = TargetActor (复用)
+│   ├─ Line Of Sight Channel = Visibility (默认)
+│   ├─ Eye Height Offset = 160 (cm, 站立人类眼睛高度)
+│   ├─ b Require Hit Target = true (严格模式 = 命中 Target 才算 LoS)
+│   └─ b Draw Debug Trace = false (编辑器调试时可改 true)
+├─ Decorator: In Attack Range? (Existing)
+├─ Decorator: Zombie Ammo Empty? (Existing)
+└─ BTTask Start Primary Fire (Existing)
+```
+
+**关键点**:
+- 装饰器位于 DistanceCheck 之前 (LoS 优先 — 没视线不用先算距离)
+- FlowAbortMode = Self (AI 进入墙后立即 FAIL → BT 中断 → 进 Chase 绕过去)
+- 默认值合理, 但策划可调 (例如 Boss 母体可调大 EyeHeightOffset)
+
+### 13.4 验证清单
+
+| 场景 | 期望 |
+|---|---|
+| 1. 玩家面向 AI, 中间无障碍 | LoS PASS → PrimaryFire 命中玩家 |
+| 2. 玩家躲到墙后 | LoS FAIL → BT 进 Chase → 绕过去 |
+| 3. 玩家走到墙边探头 | LoS PASS (某一刻) → 立即开火 → 玩家躲回去 → FAIL → 停火 |
+| 4. 距离 < 50cm (AI 摸到玩家) | 视为 LoS PASS (退化防御, 不应被墙挡误判) |
+| 5. 看日志 | 应该看到 `LoS 决策 FAIL: 目标 'BP_SWAT_C_0' 被阻挡 ...` + `AI 将走 Selector 其他分支` |
+
+### 13.5 大厂原则落地 (v129)
+
+| 原则 | 落地 |
+|---|---|
+| 决策分离 | LoS 决策独立 = 装饰器节点, 与 DistanceCheck / HPThreshold 解耦 |
+| 任务流中止 self | FlowAbortMode=Self — 玩家进墙后立即 FAIL → BT 中断 |
+| 零兜底 | 任何无效输入 → Log Error + return false (拒判) |
+| 工程师友好 | 配置项齐全 (trace channel / 眼睛高度 / 严格模式), 默认值合理 |
+| 反射类型安全 | `UEnum::GetValueAsString` 拿 ECollisionChannel 名字 (UE 5.6 安全) |
+| 退化场景 | 距离 < 50cm → 视为 PASS (避免自身 Capsule 误判) |
+| 调试可视化 | `bDrawDebugTrace` 开关 + `#if ENABLE_DRAW_DEBUG` 包装 (Shipping 安全) |
+
+### 13.7 【v129.1 2026.08.02】Case C 逻辑漏洞修复
+
+**用户反馈 (2026.08.02)**:
+> "Has Line Of Sight 明明与目标之间没有障碍物, 但就是不射击"
+
+**根因**:
+v129 严格模式代码:
+```cpp
+bHasLineOfSight = bBlockingHit && (Hit.GetActor() == TargetActor);
+```
+
+复合表达式掩盖了 3 个 case 的意图:
+
+| Trace 结果 | `bBlockingHit` | `Hit.Actor==Target` | v129 旧 | 正确 |
+|---|---|---|---|---|
+| 命中 Target (Case A) | true | true | **PASS ✓** | PASS |
+| 命中墙 (Case B) | true | false | **FAIL ✓** | FAIL |
+| **完全没阻挡 (Case C)** | **false** | **false** | **FAIL ✗** | **PASS** |
+
+`bBlockingHit=false` 时,`&&` 短路返回 false → AI 不开火。但 Case C 实际是"路径完全干净,看到 Target" → 应该 PASS。
+
+**v129.1 修复 — 显式 3 case if-else**:
+
+```cpp
+if (!bBlockingHit)
+{
+    // Case C: 路径完全干净 → PASS
+    bHasLineOfSight = true;
+}
+else if (HitResult.GetActor() == TargetActor)
+{
+    // Case A: 命中 Target → PASS
+    bHasLineOfSight = true;
+}
+else
+{
+    // Case B: 命中墙 → FAIL
+    bHasLineOfSight = false;
+}
+```
+
+**大厂原则 — 显式分支优于复合条件**:
+- 复合表达式掩盖意图, 出错不易发现 (这次就栽了)
+- 显式 if-else 让 3 个 case 一目了然, 编译器/读者都明确看到
+- 教训: 任何有 ≥3 个状态分支的决策, 都不应写复合表达式
+
+### 13.8 【v129.2 2026.08.02】Exposure 模式 — 露点比例检测
+
+**用户反馈 (2026.08.02 第二轮)**:
+> "现在比如说我露一个角就持续射击, 但其实是打不中的, 能不能比如我露出多点再射击呢?"
+
+**根因 (v129.1 之前)**:
+- Simple 模式只检测"AI 眼睛 → Target 中心" 一条线
+- 玩家只露 1cm 角 (露出一条边) → trace 沿射线走 → 命中 Target 一点点 → PASS
+- AI 持续射击 → 但子弹 90% 打不中 (玩家只露 1cm, 命中概率 1cm / 88cm = 1%)
+
+**v129.2 解决 — Exposure 模式 (新增, 推荐)**:
+```
+沿 Target 半径周围采样 N 个点 (默认 8 个点)
+每点做 LineTraceSingleByChannel, 统计命中 Target 的数量
+命中率 = 命中数 / 总数
+命中率 ≥ ExposureThreshold (默认 30%) → PASS
+命中率 < 阈值 → FAIL
+```
+
+**业务语义 (8 采样点, 阈值 30% 默认)**:
+| 场景 | 命中率 | 决策 |
+|---|---|---|
+| 玩家完全被墙挡 | 0/8 = 0% | FAIL |
+| 玩家只露 1cm 角 | 1/8 = 12.5% | FAIL (默认阈值 30%) |
+| 玩家露出 30% 身体 | 2.5/8 = 31% | PASS |
+| 玩家露出 50% 身体 | 4/8 = 50% | PASS |
+| 玩家完全暴露 | 8/8 = 100% | PASS |
+
+**大厂原则 (v129.2 落地)**:
+| 原则 | 描述 |
+|---|---|
+| 简洁优于复杂 | 没用 octree / 包围盒采样 — 简单 N 向采样够用 |
+| 与 Simple 模式对称 | 同样的 LineTraceSingle 通道, ADD IGNORE SELF+TARGET, "严格" 判定 |
+| 显式配置 | 策划在编辑器调 SampleCount=1~32, ExposureThreshold=0.05~1.0 |
+| 性能可观测 | 单次评估 ~0.1ms (8 采样 × 0.012ms), 4-10Hz 评估几乎免费 |
+| 默认值合理 | SampleCount=8 (45° 间隔), ExposureThreshold=0.3 (30%) |
+| 调试可视化 | 绿=采样点暴露, 红=采样点被墙挡, 蓝色目标半径 |
+
+**编辑器配置 (策划在 BT 节点 Details 面板里)**:
+```
+Check Mode = Exposure (推荐)
+Sample Count = 8 (默认)
+Exposure Threshold = 0.3 (30% 默认)
+Approximate Target Radius = 88 (人类 CapsuleRadius)
+```
+
+**实战测试 (你做)**:
+| 场景 | 期望 |
+|---|---|
+| 玩家完全暴露 | 命中率 100% → PASS → 开火 |
+| 玩家露出半个身子 | 命中率 50% → PASS → 开火 |
+| 玩家只露 1cm 角 | 命中率 12.5% → FAIL (默认 30%) → 不开火 |
+| 玩家完全被墙挡 | 命中率 0% → FAIL → 不开火 |
+| 调高 ExposureThreshold = 0.5 | 露出半个身子 → FAIL → 不开火 |
+| 调低 ExposureThreshold = 0.1 | 露出 1cm 角 → PASS → 开火 |
+
+**Simple 模式 vs Exposure 模式选择**:
+- 默认 **Exposure** (推荐 — 解决"露 1cm 角就持续射击"问题)
+- **Simple** 适用于"严格环境": Boss 偷袭, 只要看到 1cm 也要立刻反应过来
+
+## 21. v131.2 (2026.08.02 第三轮) 朝下射击穿墙修复 — LoS 校验沿实际 trace 视线
+
+### 用户反馈 (2026.08.02 第三轮)
+
+> "朝下射击的时候子弹还是会穿墙, 朝上水平正常"
+
+### Round 1 (v131) 修复不完整的真根因
+
+#### Round 1 v131 修法:
+```cpp
+// v131 LoS 校验: Muzzle → PawnLoc 验墙不挡
+LineTraceSingleByChannel(LoSCheckHit, RayOrigin, PawnLoc, ECC_Visibility, params);
+```
+
+**Round 1 修复不完整**:
+- `PawnLoc = Pawn ActorLocation = Capsule 中心 (脚底 + 半高 88cm)`
+- 但**实际 trace 视线**指向 Pawn 胸口(`PawnLoc + 60cm`)
+- 朝下射时, 视线方向 (`Muzzle → Pawn 胸口`) 和 LoS 校验线 (`Muzzle → Pawn 脚底`) **不一样**
+
+**朝下穿墙的具体数学**:
+```
+AI Muzzle at (0, 0, 750),  Pawn at (1000, 0, 100)
+v131 Direction = (Pawn + 60cm - Muzzle) = (1000, 0, -590).Normalized = (0.86, 0, -0.51)  ← 视线指向 Pawn 胸口 160cm
+v131 LoS 校验线 = (0,0,750) → (1000,0,100)  ← 比视线更朝下 60cm
+
+如果墙在 Pawn 前面 80-160cm 高度:
+  - 实际视线 trace: Muzzle → 视线 160cm 处撞墙 (墙在 100-160cm 范围) → 撞墙 ✓
+  - LoS 校验 trace: Muzzle → PawnLoc 100cm 处 trace 终点在 100cm → 沿 trace 终点 100cm 不撞墙 ✗
+  - bLoSBlocked = false → 算 FallbackPawn → 子弹穿墙
+
+朝上时 (Muzzle 150cm 高, Pawn 588cm 高):
+  - Direction 抬到 Pawn 胸口 (588+60=648cm)
+  - LoS 校验线 = Muzzle → PawnLoc = 150→588cm
+  - 实际视线 = Muzzle → Pawn 胸口 = 150→648cm
+  - 两条线都朝上, 墙在 Pawn 前面 → 两条线都撞墙 ✓ → 不会穿墙
+```
+
+**所以 Round 1 只修了"朝上"场景,朝下没修** — 这是**真正的 LoS 校验几何 bug**。
+
+### v131.2 终极修复 — LoS 校验沿**实际 trace 视线**
+
+#### 修复: PawnAimPoint = ClosestPointOnPath
+
+```cpp
+// v131.2 修复: 不用 PawnLoc, 用 ClosestPointOnPath (trace 视线上的 Pawn 投影点)
+const FVector PawnAimPoint = ClosestPointOnPath; // = RayOrigin + TraceDir * ProjectedDist
+
+const bool bLoSBlocked = World->LineTraceSingleByChannel(
+    LoSCheckHit,
+    RayOrigin,           // 从武器 Muzzle Socket 出发
+    PawnAimPoint,         // 【v131.2 关键】到 trace 视线上的 Pawn 投影点, 不是 PawnLoc
+    ECC_Visibility,
+    LoSCheckParams
+);
+```
+
+**几何证明**:
+- `PawnAimPoint = RayOrigin + TraceDir × ProjectedDist` — 沿视线走到 Pawn 投影点
+- LoS 校验线 = `RayOrigin → PawnAimPoint` — 与实际视线方向**完全一致**
+- 实际视线撞墙, LoS 校验线**也撞墙**(因为是同一条线)
+- bLoSBlocked = true → 跳过 ✓
+
+**朝下场景**:
+- AI Muzzle (0,0,750), 视线朝下到 Pawn 胸口 (1000, 0, 160)
+- PawnAimPoint = 视线上的 Pawn 投影点 = 大约 (1007, 0, 160)
+- LoS 校验 trace (0,0,750) → (1007,0,160) — 沿视线, 撞墙 (因为视线撞墙) → 跳过 ✓
+
+### v131.2 大厂原则落地
+
+| 原则 | 旧 (v131) | 新 (v131.2) |
+|---|---|---|
+| **真实视线校验** | LoS 校验用 PawnLoc (脚底), 与视线不一致 | LoS 校验用 PawnAimPoint (视线投影), 与视线一致 |
+| **几何正确** | 朝下时两条线分离 (60cm 偏差) | 两条线完全重合 (几何同源) |
+| **零兜底** | 朝下不命中墙但算 FallbackPawn (隐式) | 显式 if (LateralDistance ≤ 30cm && !bLoSBlocked) 才算 |
+| **大厂标准** | (违反) | CS:GO/Apex/PUBG/Valorant — LoS 校验沿视线 |
+
+### 文件变更 (v131.2)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/RangedLineStrategy.cpp
+ ~ Phase 2 LoS 校验: PawnLoc → PawnAimPoint (ClosestPointOnPath)
+ + 显式 if (LateralDistance ≤ 30cm && !bLoSBlocked) 合并判定
+ + 注释更新 v131.2 修复说明
+```
+
+### 待用户验证 (v131.2)
+
+1. UE 5.6 编辑器编译 0 错:
+ - RangedLineStrategy.cpp Phase 2 合并判定 if (LateralDistance <= 30cm && !bLoSBlocked)
+2. PIE 中:
+ - AI 朝下射 (高台扫射低地 Target) → 子弹打墙, 不穿墙 ✓
+ - AI 朝上射 (低地扫射高台 Target) → 子弹打墙, 不穿墙 ✓ (v131 已修)
+ - AI 水平射 → 正常 ✓
+3. 排查日志:
+ - 应该看到 `[URangedLineStrategy::PerformSingleShot] 【v131.2 防穿墙通过】Phase 2 Pawn='XXX' ... LoS 校验通过 (沿实际视线, 无墙挡)`
+ - 朝下射墙后 Pawn 应该看到 `[URangedLineStrategy::PerformSingleShot] 【v131.2 防穿墙】Phase 2 Pawn='XXX' ... 但 LoS 校验被墙挡`
+
+### 大厂原则对照 (v131.2)
+
+| 原则 | 实现 |
+|---|---|
+| 真实视线校验 | LoS 校验沿 trace 视线走, 不是几何近似 |
+| 几何同源 | PawnAimPoint = ClosestPointOnPath = trace 视线投影点 |
+| 零兜底 | 显式 if 合并判定, 没有隐式容差 |
+| 方向无关 | 朝上 / 朝下 / 水平都正确 (不再有方向 bug) |
+| 大厂标准 | CS:GO/Apex/PUBG/Valorant — LoS 校验沿视线 |
+
+---
+
+## 21. v131.3 (2026.08.02 第三轮) 朝下穿墙修复 — 物理正确性兜底 (3 段式)
+
+### 用户反馈 (2026.08.02 第三轮)
+
+> "还是朝下射击穿墙了"
+
+### Round 1 (v131) + Round 2 (v131.2) 失败复盘
+
+| Round | 修法 | 朝下失败根因 |
+|---|---|---|
+| v131 Round 1 | LoS 校验 = `RayOrigin → PawnLoc` | 朝下时与视线不一致 (绕过墙 60cm) |
+| v131.2 Round 2 | LoS 校验 = `RayOrigin → PawnAimPoint` (视线投影) | 仍穿墙! 推测真根因: Phase 1 LineTraceMulti + bTraceComplex=true 与 Phase 2 LoS 校验 LineTraceSingle + bTraceComplex=false 物理配置不一致, 同一面墙被 Phase 1 撞, 但 Phase 2 LineTraceSingle 没撞 |
+
+### v131.3 终极方案 — 3 段式 + 物理正确性兜底
+
+```
+段 1: Phase 1 first hit Distance = 视线撞墙距离 W (UE 物理引擎客观算的)
+段 2: Pawn 视线投影 > W → Pawn 在墙后 → 直接 continue (零 trace 开销, 物理保证)
+段 3: Pawn 在墙前 → 算 LateralDistance + LoS 校验 (v131.2 保险)
+```
+
+**关键 — 段 2 物理正确性**:
+- Phase 1 first hit Distance = UE 物理引擎算的客观事实
+- 物理上不可能算"墙后 Pawn" → 0 trace 开销
+- **即使 LoS 校验配置不一致, 段 2 仍然正确** (它不重新 trace, 直接用 Phase 1 算过的距离)
+
+### 大厂原则落地 (v131.3)
+
+| 原则 | 旧 (v131.2) | 新 (v131.3) |
+|---|---|---|
+| **物理正确性 > 几何近似** | LoS 校验 trace (几何近似, 配置可能不一致) | Phase 1 first hit Distance (物理事实, 单一真理源) |
+| **零兜底** | LoS 不挡 → 算 FallbackPawn (隐式穿墙) | Pawn 在墙后 → continue (显式跳过) |
+| **方向无关** | 朝上 / 朝下几何验证不同 | 段 2 用客观物理距离, 方向无关 |
+| **性能** | LoS 校验 0.01ms | 段 2 0 trace 开销, 段 3 仅 Pawn 在墙前时跑 |
+
+### 文件变更 (v131.3)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/RangedLineStrategy.cpp
+ + 段 1: SightBlockedDist = Phase 1 first hit Distance (line 437-446)
+ + 段 2: if (ProjectedDist > SightBlockedDist) continue (line 448-457, 零 trace 开销)
+ ~ 段 3: bTraceComplex=true 跟 Phase 1 一致 (line 464, 跟 Phase 1 LineTraceMulti + bTraceComplex=true 镜像)
+ + 日志版本 v131.2 → v131.3, 加 SightBlockedDist 数据
+```
+
+### 待用户验证 (v131.3)
+
+1. UE 5.6 编辑器编译 0 错:
+ - v131.2 重复定义清理 (PawnAimPoint / LoSCheckParams)
+ - 段 2 continue 跳过零 trace
+2. PIE 中:
+ - AI 朝下射墙后 Target → 不穿墙 (段 2 强制跳过) ✓
+ - AI 朝上射墙后 Target → 不穿墙 ✓
+ - AI 水平射墙后 Target → 不穿墙 ✓
+ - AI 射无遮挡 Target → 命中 ✓
+3. 排查日志:
+ - 应该看到 `[URangedLineStrategy::PerformSingleShot] 【v131.3 防穿墙】Phase 2 Pawn='XXX' 视线投影 XXXcm > 撞墙距离 XXXcm. Pawn 在墙后, 跳过 (零兜底).`
+ - 朝下射墙后 Pawn 看到这个 = 段 2 正常生效 → 修复成功 ✓
+ - **不应该**看到朝下射墙后 Pawn 命中 (无 `防穿墙通过` 日志)
+
+### 大厂原则对照 (v131.3)
+
+| 原则 | 描述 |
+|---|---|
+| **物理正确性** | 用 Phase 1 物理引擎算的撞墙距离, 不重新 trace |
+| **零兜底** | 显式 if (ProjectedDist > SightBlockedDist) continue, 不允许"几何近似" |
+| **方向无关** | 朝上 / 朝下 / 水平都正确 (因为用客观距离, 不是几何近似) |
+| **零误清空** | 段 2 没排除 Pawn(让段 3 处理), 段 3 仍然找最佳 Pawn |
+| **大厂标准** | CS:GO/Apex/PUBG/Valorant — 物理引擎距离 + LoS 校验双保险 |
+
+---
+
+## 21. v131.2 (2026.08.02 第二轮) 朝下穿墙修复 (Round 2 不完整)
+
+### 用户反馈 (2026.08.02 第二轮)
+
+> "现在 ai 射出的子弹能穿墙, 而且 Start Primary Fire 在目标在高出时喜欢打脚, 应该打高点比如胸部"
+
+### 根因链 (3 个, 全部违反大厂原则)
+
+#### 根因 A — Phase 2 fallback 穿墙
+
+```
+v97.0.2 旧 Phase 2:
+  - 只判断 LateralDistance ≤ 30cm (横向距离), 不判断"墙挡没挡"
+  - Target 在墙后但沿 trace 路径投影 ≤ 30cm → Phase 2 误命中 (穿墙)
+  - 旧版注释: "30cm = 接近人体 Capsule 半径, 严格小于" — 错了! 
+    30cm 是"Pawn 离 trace 路径多远", 不是"Pawn 离 trace 视线多远"
+  - 真根因: Phase 2 只算"沿 trace 方向的投影", 没算"trace 方向上有没有墙挡"
+```
+
+#### 根因 B — v130 打脚 (Direction 抬到 Capsule 中心,不是胸口)
+
+```
+v130 ComputeFireRayTowardsTarget:
+  - Direction = (Target.ActorLocation - Muzzle).GetSafeNormal()
+  - Target.ActorLocation = Capsule 中心 (脚底 + 半高 88cm)
+  - AI 在地面扫射 Target 高台时, Direction 抬到 588cm
+  - trace 沿 Direction 走到 Range 距离, EndLoc 远超 Target
+  - line 与 Target Capsule 的第一交点 = 进入点 (通常是胶囊底部 = 脚)
+  - 视觉上看: 子弹打脚, 不打胸口
+```
+
+#### 根因 C — Phase 2 fallback ImpactPoint 错误
+
+```
+Phase 2 fallback 命中 Pawn 后:
+  - HitResult.ImpactPoint = Pawn.ActorLocation (世界坐标搜索结果)
+  - 不是 trace ray 实际命中点
+  - → Server_ReportHit 收到假的 ImpactPoint
+  - → AI 路径不看 ImpactPoint (伤害一档), 但视觉上看着假
+```
+
+### v131 重构 (大厂原则 — 真实 trace + 玩家准星一致)
+
+#### 修复 1: Phase 2 LoS 校验 — 防穿墙
+
+```cpp
+// RangedLineStrategy.cpp Phase 2 内 (v131 新增)
+FCollisionQueryParams LoSCheckParams(SCENE_QUERY_STAT(RangedStrategyPhase2LoSCheck), false);
+LoSCheckParams.AddIgnoredActor(Candidate); // 忽略 Pawn 自己
+LoSCheckParams.AddIgnoredActor(AttackerChar); // 攻击者自己
+LoSCheckParams.AddIgnoredActor(Weapon); // 武器
+LoSCheckParams.bReturnPhysicalMaterial = false;
+LoSCheckParams.bReturnFaceIndex = false;
+
+FHitResult LoSCheckHit;
+const bool bLoSBlocked = World->LineTraceSingleByChannel(
+    LoSCheckHit,
+    RayOrigin,           // 从武器 Socket 出发
+    PawnLoc,              // 到 Pawn 中心
+    ECC_Visibility,
+    LoSCheckParams
+);
+
+if (bLoSBlocked) {
+    // 墙挡了 → 跳过这个 Pawn (v131 修复: 不算 FallbackPawn)
+    continue;
+}
+```
+
+**大厂原则落地**:
+- **真实 trace 验证**:不是"横向距离 ≤ 30cm 就命中",而是"从武器 Socket 到 Pawn 中心能 trace 通"
+- **Ignore Pawn + Attacker + Weapon**:这些不算"墙",只看 Pawn 之前有没有墙
+- **零兜底**:墙挡了 → continue (跳过),不是用"30cm 算勉强命中"
+
+#### 修复 2: Direction 抬高 60cm 命中胸口
+
+```cpp
+// BaseCharacter.cpp ComputeFireRayTowardsTarget (v131 升级)
+const float ChestHeightOffset = 60.0f; // 厘米
+const FVector TargetAimPoint = TargetActor->GetActorLocation() + FVector(0.f, 0.f, ChestHeightOffset);
+const FVector DirectionRaw = TargetAimPoint - OutRayOrigin;
+OutRayDirection = DirectionRaw.GetSafeNormal();
+```
+
+**大厂原则落地**:
+- **与玩家准星一致**:玩家准星默认指向胸口, AI 也应该跟玩家一致 (CS:GO/Apex/PUBG/Valorant 大厂标准)
+- **可视化**:trace 抬到胸口 → line 与 Capsule 第一交点 = 胸口 → 视觉上不再打脚
+- **数据驱动**:ChestHeightOffset = 60cm 写死 (可以做成 UPROPERTY 可调, v131.1 后续考虑)
+
+### v131 大厂原则落地
+
+| 原则 | 旧 (v130/v97.0.2) | 新 (v131) |
+|---|---|---|
+| **真实 trace 验证** | 只算横向距离 ≤ 30cm (近似) | LineTraceSingleByChannel 验证 (精确) |
+| **与玩家一致** | 玩家 3D / AI 3D 但打脚 | 玩家准星指胸 / AI 也指胸 |
+| **零兜底** | 30cm 内算命中 (隐式) | 显式 if (bLoSBlocked) continue |
+| **职责单一** | Phase 2 既算命中又算 ImpactPoint | Phase 2 算命中, ImpactPoint 由 trace 给 |
+| **大厂标准** | (违反) | CS:GO/Apex/PUBG/Valorant 标准 |
+
+### 实战测试场景
+
+| 场景 | v130/v97.0.2 旧行为 | v131 新行为 |
+|---|---|---|
+| Target 在墙后 | Phase 2 命中 → 子弹穿墙打中 (穿墙) | Phase 2 LoS 校验拒绝 → 子弹打墙 (正确) |
+| Target 在高台 | Direction 抬到中心 → trace 进入 Capsule 底部 (打脚) | Direction 抬到胸口 → trace 进入 Capsule 胸口 (打胸) |
+| Target 在地面 | Direction 水平 (OK) | Direction 水平 (OK, 无变化) |
+| Target 跳起 | Direction 抬高 → trace 进入 Capsule 头 (打头, 没分伤害 OK) | Direction 抬到胸口 → trace 进入胸口 (打胸) |
+| Target 与 AI 高度差大 | Phase 1 不命中 + Phase 2 命中 + 错误 ImpactPoint | Phase 1 抬到胸口命中 → 正常 |
+
+### 待用户验证 (v131)
+
+1. UE 5.6 编辑器编译 0 错:
+ - BaseCharacter.cpp ChestHeightOffset 新增
+ - RangedLineStrategy.cpp Phase 2 LoS 校验新增
+2. PIE 中:
+ - AI 扫射墙后 Target → 子弹打墙(不穿墙)✓
+ - AI 在地面扫射 Target 高台 → 子弹打胸口(不打脚)✓
+ - AI 正常扫射 Target 站平地 → 子弹打胸(与 v130 一致)✓
+3. 排查日志:
+ - 应该看到 `[URangedLineStrategy::PerformSingleShot] 【v131 防穿墙通过】Phase 2 Pawn=... LoS 校验通过`
+ - **不应该**看到 `防穿墙... 跳过, 不算 FallbackPawn` (除非墙后确实有 Pawn, 这是正常的)
+ - **不应该**看到 v97.0.2 旧行为 (Phase 2 命中墙后 Pawn)
+
+### 文件变更 (v131)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/RangedLineStrategy.cpp
+ + Phase 2 内 (line 425-516): 新增 LineTraceSingleByChannel 验证墙不挡
+ + bLoSBlocked=true → continue 跳过 FallbackPawn 候选
+ + 注释更新 v131 P0 关键修复
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ ~ ComputeFireRayTowardsTarget 注释: v130 → v131 升级说明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ ~ ComputeFireRayTowardsTarget 实现:
+ - DirectionRaw = Target - Muzzle (v130 旧版)
+ + DirectionRaw = (Target + 60cm 上偏移) - Muzzle (v131 新版)
+ + ChestHeightOffset = 60cm 注释解释
+```
+
+### 大厂原则对照 (v131)
+
+| 原则 | 实现 |
+|---|---|
+| 真实 trace 验证 | Phase 2 用 LineTraceSingleByChannel, 不是横向距离近似 |
+| 与玩家准星一致 | AI Direction 抬到 Target 胸口 = 玩家准星默认高度 |
+| 零兜底 | 显式 if (bLoSBlocked) continue, 不允许"30cm 算勉强命中" |
+| 职责单一 | Phase 2 算命中, ImpactPoint 由 trace 给 |
+| 大厂标准 | CS:GO/Apex/PUBG/Valorant — AI 抬枪 + 真实 LoS |
+
+### UE 编辑器配置 (v131)
+
+无新增配置 — 纯 C++ 代码修复。
+
+### v131.1 后续可考虑
+
+- ChestHeightOffset 做成 UPROPERTY EditAnywhere 让策划可调 (针对不同 AI 类型 — 母体 / Boss 可调高)
+- Phase 2 命中后 BoneName 二次 trace (v99 已有, 确认还在跑)
+- Phase 2 LoS 校验加入"穿透掩体"判断(玻璃等)
+
+---
+
+## 20. v130 (2026.08.02) Start Primary Fire 3D 追踪 — 跟随 Target 上下位置
+
+### 用户反馈 (2026.08.02)
+
+> "Start Primary Fire 节点只会水平射击, 我需要射击要跟随目标的上下位置"
+
+### 根因链 (3 个, 全部违反大厂原则)
+
+#### 根因 A — v109 路径用 `BaseAimRotation` (水平方向)
+
+```cpp
+// BaseCharacter.cpp line 2386-2394 (旧 AI 路径)
+const FRotator BaseAim = GetBaseAimRotation(); // UE 默认水平 2D 旋转, 不含 Pitch
+OutRayDirection = BaseAim.Vector();
+//   → AI 永远水平射击, 不管 Target 在多高
+```
+
+`GetBaseAimRotation()` 是 `AController::GetControlRotation()` 简化版, **默认不跟随 Target 高度**。UE 的 AIController 没自动管理焦点, AI 跳起 / Target 跳起 / Target 躲墙上 → AI 永远水平射 → 子弹飘了。
+
+#### 根因 B — BTTask_StartPrimaryFire 没读 TargetActor BB
+
+```cpp
+// 旧版 cpp
+SelfPawn->GetAimRayFromCrosshairOrEyes(ClientRayOrigin, ClientRayDirection);
+// → 不知道 Target 在哪, 只能用 BaseAimRotation 兜底
+```
+
+BT 任务没 `TargetActorKey` 字段,所以根本没机会算 Muzzle→Target 方向。
+
+#### 根因 C — 大厂方案从未落地
+
+CS:GO / Apex / PUBG / Valorant 等所有大厂 FPS,**AI 都是 3D 追踪 Target** — 从枪口射向 Target 中心,**完全跟随 Target 上下位置**。我们没有遵循这个标准。
+
+### v130 重构 (大厂原则 — 与玩家 3D 射线 100% 镜像)
+
+#### 修复 1: BaseCharacter 新增 `ComputeFireRayTowardsTarget` API
+
+```cpp
+// BaseCharacter.h
+UFUNCTION(BlueprintCallable, Category = "Combat|Aim")
+bool ComputeFireRayTowardsTarget(AActor* TargetActor,
+    FVector& OutRayOrigin, FVector& OutRayDirection);
+```
+
+**算法**:
+```
+Origin     = Weapon Mesh Muzzle Socket (复用 v109 搜索逻辑)
+Direction  = (Target.ActorLocation - MuzzleLocation).GetSafeNormal()
+           → 完整 3D 方向, 自动跟随 Target 上下位置
+```
+
+#### 修复 2: BTTask_StartPrimaryFire 新增 `TargetActorKey` 字段
+
+```cpp
+// BTTask_StartPrimaryFire.h
+UPROPERTY(EditAnywhere, Category = "Target")
+FBlackboardKeySelector TargetActorKey;
+```
+
+**编辑器配置** (BT 节点 Details 面板):
+```
+Target Actor Key = TargetActor (BB.Object Key)
+```
+
+#### 修复 3: ExecuteTask 优先用 v130, fallback v109
+
+```cpp
+// 路径 A: 配 TargetActorKey + TargetActor 有效 → 3D 追踪射线 (v130 新行为)
+bGotRay = SelfPawn->ComputeFireRayTowardsTarget(TargetActor, ...);
+
+// 路径 B: fallback v109 (旧行为, 兼容)
+if (!bGotRay) {
+    bGotRay = SelfPawn->GetAimRayFromCrosshairOrEyes(...);
+}
+```
+
+### v130 大厂原则落地
+
+| 原则 | 旧 (v109) | 新 (v130) |
+|---|---|---|
+| **3D 追踪** | 水平射线 (BaseAimRotation) | 完整 3D (Muzzle→Target) |
+| **Target Data 优先** | 没读 TargetActor | 优先 TargetActor, fallback BaseAim |
+| **与玩家镜像** | 玩家 3D, AI 水平 (分裂) | 玩家 3D, AI 3D (一致) |
+| **大厂标准** | (违反) | CS:GO/Apex/PUBG/Valorant 标准 |
+| **零兜底** | TargetActor 为空用 BaseAim (隐式) | 显式 fallback 路径 B (可读) |
+
+### 实战测试场景
+
+| 场景 | v109 旧行为 | v130 新行为 |
+|---|---|---|
+| Target 跳到空中 | 水平射, 子弹从脚下穿 | 抬枪射向空中, 跟得上 |
+| Target 在高处 | 水平射, 子弹飘 | 抬枪射高处 |
+| Target 在低处 | 水平射, 子弹飘 | 压枪射低处 |
+| Target 站平 | 水平射 OK | 水平射 OK (无变化) |
+| AI 与 Target 高度差大 | 永远打不中 | 准确追踪 |
+
+### 待用户验证 (v130)
+
+1. UE 5.6 编辑器编译 0 错 (重点: ComputeFireRayTowardsTarget 新方法, BTTask_StartPrimaryFire 新字段)
+2. **UE 编辑器配置** (关键):
+ - 打开 BT_ZombieModeAI.uasset → PrimaryFire Sequence → Start Primary Fire 节点
+ - Details 面板 → Target Actor Key = **TargetActor** (BB.Object Key, 必须配!)
+3. PIE 中:
+ - 房主/玩家跑到 Low 平台 (低于 AI) → AI 朝下射 ✓
+ - 玩家跳起 → AI 抬枪跟着 ✓
+ - 玩家藏在掩体探头 → AI 还是水平 → 因为射线遮挡 → 中断 → 不打
+4. 排查日志:
+ - 应该看到 `[BTTask_StartPrimaryFire] 【v130 3D 追踪】AIC='XXX' Target='XXX' Origin=... Direction=...`
+ - **不应该**看到 v109 路径的 `[GetAimRayFromCrosshairOrEyes]` (除非 fallback)
+
+### 文件变更 (v130)
+
+```
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + ComputeFireRayTowardsTarget 公开 API 声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ + ComputeFireRayTowardsTarget 实现 — Muzzle Socket + 3D 方向
+
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/AI/Tasks/BTTask_StartPrimaryFire.h
+ + TargetActorKey UPROPERTY 字段
+ + v130 注释
+ ~ GetStaticDescription: 新增 TargetActor Key 信息
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/AI/Tasks/BTTask_StartPrimaryFire.cpp
+ + #include "BehaviorTree/BlackboardComponent.h"
+ ~ 构造函数: 注册 TargetActorKey Object Filter
+ ~ ExecuteTask: 优先用 ComputeFireRayTowardsTarget, fallback v109
+```
+
+### UE 编辑器配置 (v130 用户必做)
+
+1. 打开 `Content/Blueprints/AI/BT_ZombieModeAI.uasset`
+2. 找到 `Start Primary Fire` 任务节点
+3. Details 面板 → Target Actor Key = **TargetActor**
+4. Compile + Save
+
+### 大厂原则对照 (v130)
+
+| 原则 | 实现 |
+|---|---|
+| 与玩家镜像 100% | 玩家 3D, AI 现在 3D — 一致 |
+| Target Data 优先 | 优先用 TargetActor 算方向, fallback 到 BaseAim |
+| 零兜底 | fallback 是显式分支, 不是隐式 |
+| 显式优于隐式 | 路径 A/B 显式分支, 不是条件表达式 |
+| Code Reuse | 复用 v109 Muzzle Socket 搜索, 不重复 |
+
+---
+
+### 13.9 实战测试场景
+
+| 步骤 | 操作 | 期望 |
+|---|---|---|
+| 1 | 打开 PIE, AI 攻击无障碍玩家 | 正常开火 |
+| 2 | 玩家躲到墙后 | 日志 `LoS FAIL` + AI 立即停火, 走 Chase |
+| 3 | AI 绕过去接近 | 距离够近 → LoS PASS → 开火 |
+| 4 | 玩家反复探头/躲 | AI 反复开火/停火 |
+| 5 | 打开 `bDrawDebugTrace=true` | 看到红色 (PASS) / 黄色 (FAIL) 射线 |

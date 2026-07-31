@@ -238,30 +238,96 @@ void UAIAttackComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
  */
 bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharacter)
 {
+	// ============================================================
+	// 【v133 P0 大厂重构 — 单一入口】OnAIRequestAttack_Simple 保留为转发壳
+	// ============================================================
+	//
+	// 历史 (v40.4 - v133 之前):
+	//   - OnAIRequestAttack_Simple 是唯一入口, 内部硬编码 Light + ComboIndex=1 + 不锁脚
+	//   - BT 编辑器无法配置这 3 个参数
+	//
+	// 新版 (v133 — 单一入口 + 零兜底兼容):
+	//   - 新入口 OnAIRequestAttack_WithOptions 接管所有攻击发起逻辑
+	//   - OnAIRequestAttack_Simple 退化为转发壳, 默认参数 (Light / ComboIndex=1 / 不锁脚)
+	//     与 v40.4 行为 100% 一致 — 不破坏任何现有调用方
+	//   - 大厂原则: 零兜底兼容 = 不破坏既有调用方, 新接口是主入口
+	//
+	// 单一入口收敛:
+	//   - BTTask_PlayAttackMontage (v133) → OnAIRequestAttack_WithOptions (BT 编辑器可配)
+	//   - 任何旧调用方 → OnAIRequestAttack_Simple → 转发到 WithOptions (默认参数)
+	//   - 实际副作用 (Resolver / 锁脚 / BB 写入 / OnMontageEnded) 全部在 WithOptions 一处
+	// ============================================================
+	return OnAIRequestAttack_WithOptions(InOwnerCharacter,
+		EAIAttackType::Light, /*ComboIndex=*/1, /*bLockMovement=*/false);
+}
+
+
+// ==========================================
+// 【v133 P0 大厂扩展】OnAIRequestAttack_WithOptions — AI 攻击可配置入口
+// ==========================================
+
+/**
+ * OnAIRequestAttack_WithOptions — AI 攻击可配置入口 (v133 主入口)
+ *
+ * 【大厂原则 — 单一入口收敛】
+ *   - 本方法是 AI 攻击发起**唯一**完整逻辑入口
+ *   - OnAIRequestAttack_Simple 退化为转发壳, 调用本方法 (默认 Light/ComboIndex=1/不锁脚)
+ *   - 任何 BT/BP 想要发起 AI 攻击都走这一个方法
+ *   - 未来加新参数 (例如 bOverrideAttackSpeed) 也只改这里一个签名
+ *
+ * 【参数语义】(详见头文件)
+ *   - InAttackType: Light / Heavy (决定调哪个 Resolver)
+ *   - InComboIndex: 仅 Light 时生效 (1/2/3 对应武器 LightAttackMontages 数组)
+ *   - bInLockMovement: true 时攻击期间 MaxWalkSpeed=0, 蒙太奇结束复原
+ *
+ * 【锁脚机制 — 单一真理源 + 对称清理】
+ *   - 锁脚时: CachedOriginalWalkSpeed 字段保存原速 (策划配的 MaxWalkSpeed)
+ *   - 复原时: OnMontageEnded 回调里 SetMaxWalkSpeed(CachedOriginalWalkSpeed)
+ *   - 锁脚期间防御: bIsMovementLockedDuringAttack 字段防止重叠锁脚
+ *   - 复原时防御: 即使 OnMontageEnded 没触发, Deactivate / EndPlay 也复原 (零兜底)
+ *
+ * 【完整流程 — 6 个阶段】
+ *   阶段 1: Owner / 死亡 / 武器检查 (零兜底)
+ *   阶段 2: 按 AttackType 调 Resolver (Level 0 唯一路径 — v32 零兜底)
+ *   阶段 3: 锁脚 (如果 bInLockMovement=true) — 保存原速 + SetMaxWalkSpeed(0)
+ *   阶段 4: 播放蒙太奇 + 绑 OnMontageEnded 回调 (事件驱动)
+ *   阶段 5: 同步网络 (Server_PlayAttackAnim) + SetAttackerIsAI(true)
+ *   阶段 6: 写 BB.CooldownEndTime (单一真理源 — 历史从 BTTask 收回)
+ *
+ * 【OnMontageEnded 复原锁脚】
+ *   - OnAIAttackMontageEnded 内部检测 bIsMovementLockedDuringAttack=true
+ *   - 自动 SetMaxWalkSpeed(CachedOriginalWalkSpeed)
+ *   - bIsMovementLockedDuringAttack = false (防止二次复原错误覆盖)
+ */
+bool UAIAttackComponent::OnAIRequestAttack_WithOptions(ABaseCharacter* InOwnerCharacter,
+	EAIAttackType InAttackType, int32 InComboIndex, bool bInLockMovement)
+{
 	// ================================================
 	// 【v40.7 P0 关键修复】验证传入的 Owner — 不再调用 GetOwner()
 	// ================================================
 	if (!InOwnerCharacter)
 	{
-		// 调用方 (BTTask / BaseCharacter 转发壳) 必须传入有效 Pawn
-		// 这是大厂修复 CDO 问题的标准手法: 调用方持有真实引用, 显式传入
 		UE_LOG(LogTemp, Error,
-			TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: InOwnerCharacter 为空! "
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: InOwnerCharacter 为空! "
 			     "调用方必须传入真实 Pawn 实例, 不能传 CDO/Archetype。"));
 		return false;
 	}
 
-	// 【v40.7 调试日志】确认拿到的是真实 Pawn
+	// 【v133 调试日志】显示当前攻击配置
 	UE_LOG(LogTemp, Display,
-		TEXT("[AIAttackComponent] OnAIRequestAttack_Simple ENTER. Owner=%s (Valid=%d)"),
+		TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions ENTER. Owner=%s (Valid=%d) "
+		     "AttackType=%s ComboIndex=%d bLockMovement=%d"),
 		*InOwnerCharacter->GetName(),
-		InOwnerCharacter->IsValidLowLevel() ? 1 : 0);
+		InOwnerCharacter->IsValidLowLevel() ? 1 : 0,
+		(InAttackType == EAIAttackType::Heavy) ? TEXT("Heavy") : TEXT("Light"),
+		InComboIndex,
+		bInLockMovement ? 1 : 0);
 
-	// 用传入的 InOwnerCharacter, 不再调用 GetOwner()
+	// 用传入的 InOwnerCharacter, 不再调用 GetOwner() — v40.7 修复
 	ABaseCharacter* OwnerCharacter = InOwnerCharacter;
 
 	// ============================================================
-	// 【v40.4 P0 删除】本地时间戳节流 (防御性兜底)
+	// 【v40.4 P0 删除】本地时间戳节流 (防御性兜底) — v133 维持
 	// ============================================================
 	//
 	// 历史 (v22-v40.3) 反模式 (重复架构):
@@ -273,16 +339,40 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	// 大厂原则:
 	//   - 单一节流点: BTDecorator_CooldownReady (实时, 0 延迟, BT 编辑器 100% 可见)
 	//   - 0 兜底: BT 配错应立即暴露 (ExecuteTask 返回 Failed), 不允许 C++ 节流掩盖
-	//   - 单一职责: OnAIRequestAttack_Simple 只负责"播放蒙太奇", 不做节流决策
-	//
-	// v40.4 修复: 阶段 1 整段删除, OnAIRequestAttack_Simple 只剩:
-	//   - 死/武器检查
-	//   - 蒙太奇解析 (Resolver Log Error)
-	//   - PlayAnimMontage
-	//   - 绑 OnMontageEnded 回调
-	//   - 写 BB.CooldownEndTime (单一真理源, OnAIRequestAttack_Simple 内部)
-	//   - 设攻击标志 (对称)
+	//   - 单一职责: OnAIRequestAttack_WithOptions 只负责"播放蒙太奇 + 锁脚", 不做节流决策
 	// ============================================================
+
+	// ============================================================
+	// 【v133.2 P0 大厂扩展 — 防打断守卫】步骤 0: 攻击中守卫
+	// ============================================================
+	//
+	// 业务背景 (用户 2026.08.02 反馈):
+	//   "Play Attack Montage 节点, 我需要播放蒙太奇时不能被打断, 实现边追边打效果"
+	//   - 旧版: BT 每次进入 Attack Sequence → PlayAnimMontage → 默认 StopAllMontages+播新
+	//   - 后果: 上一个蒙太奇被冲掉, 看不到完整挥刀动画
+	//
+	// 大厂原则 — 单一真理源 + 逻辑前移:
+	//   - 真理源: BaseAIController::bIsCurrentlyAttacking (已有, OnMontageEnded 设 false)
+	//   - 守卫: 攻击中 (PlayAnimMontage 运行中) → 拒绝新触发 → 返回 true (不返 Failed)
+	//   - 不返 Failed 原因: BT 看到 Failed 会回退 Chase → 下个 Tick 重新评估 → 无限循环
+	//     返 Succeeded 让 BT 继续到 WaitMontageFinish, 等蒙太奇自然结束
+	//
+	// bIsCurrentlyAttacking 的写入点:
+	//   - OnAIRequestAttack_* 成功播放后 SetCurrentlyAttacking(true) — 新增 (v133.2)
+	//   - OnAIAttackMontageEnded (蒙太奇结束回调) SetCurrentlyAttacking(false) — 已存在
+	//   - 这构成"播放中=true, 播完=false" 的完整生命周期
+	// ============================================================
+	if (const ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+	{
+		if (BaseAIC->IsCurrentlyAttacking())
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 正在攻击中 (bIsCurrentlyAttacking=true), "
+				     "拒绝新触发, 等待蒙太奇自然结束. 边追边打效果保持."),
+				*OwnerCharacter->GetName());
+			return true; // 【关键】返 true 不返 false — 让 BT 看到 Succeeded 继续到 WaitMontageFinish
+		}
+	}
 
 	// ============================================================
 	// 阶段 1: 死了不能打 / 没武器不能打
@@ -290,7 +380,7 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	if (OwnerCharacter->IsDead())
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: AI=%s 已死亡, 跳过"),
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 已死亡, 跳过"),
 			*OwnerCharacter->GetName());
 		return false;
 	}
@@ -298,53 +388,109 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	if (!OwnerCharacter->GetCurrentWeapon())
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: AI=%s 无 CurrentWeapon, 跳过"),
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 无 CurrentWeapon, 跳过"),
 			*OwnerCharacter->GetName());
 		return false;
 	}
 
 	// ============================================================
-	// 阶段 2: 走了大厂 Resolver 职责链 (Level 0 唯一路径 — v32 零兜底)
-	// ============================================================
-	// 设计要点:
-	//   - ComboIndex=1 对应玩家 Combo1 段 (玩家连击序列的第 1 段)
-	//   - 如果 BP 没配 Combo1, 解析器会 Log Error 拒绝兜底 (v32 零兜底)
+	// 阶段 2: 走大厂 Resolver 职责链 (按 AttackType 分流)
 	// ============================================================
 	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
-	const FAIAttackMontageResult ResolveResult =
-		UAIAttackMontageResolver::ResolveLightAttackMontage(CurrentWeapon, /*ComboIndex=*/1);
+	FAIAttackMontageResult ResolveResult;
+
+	if (InAttackType == EAIAttackType::Heavy)
+	{
+		// Heavy: 调 ResolveHeavyAttackMontage (单段重击, ComboIndex 忽略)
+		ResolveResult = UAIAttackMontageResolver::ResolveHeavyAttackMontage(CurrentWeapon);
+	}
+	else
+	{
+		// Light: 调 ResolveLightAttackMontage(ComboIndex) (连击段索引)
+		//   - 默认 ComboIndex=1 (与 v40.4 行为兼容)
+		//   - 必须 >= 1 (ClampMin=1 在 BT 编辑器强制, 这里是 C++ 直调防御)
+		const int32 SafeComboIndex = FMath::Max(InComboIndex, 1);
+		ResolveResult = UAIAttackMontageResolver::ResolveLightAttackMontage(
+			CurrentWeapon, SafeComboIndex);
+	}
 
 	if (!ResolveResult.Montage)
 	{
 		// 【v32 零兜底】Resolver 内部已 Log Error (组合索引越界/没配), 这里不再重复报警
 		UE_LOG(LogTemp, Log,
-			TEXT("[AIAttackComponent][OnAIRequestAttack_Simple] AI=%s 攻击放弃 (Level=%d, ComboIndex=%d). "
+			TEXT("[AIAttackComponent][OnAIRequestAttack_WithOptions] AI=%s 攻击放弃 "
+			     "(AttackType=%s, ComboIndex=%d, ResolverLevel=%d, ResolverIndex=%d). "
 			     "Resolver 已 Log Error 说明 BP 配置路径修复方法."),
-			*OwnerCharacter->GetName(), ResolveResult.FallbackLevel, ResolveResult.ResolvedIndex);
+			*OwnerCharacter->GetName(),
+			(InAttackType == EAIAttackType::Heavy) ? TEXT("Heavy") : TEXT("Light"),
+			InComboIndex,
+			ResolveResult.FallbackLevel,
+			ResolveResult.ResolvedIndex);
 		return false;
 	}
 
 	// ============================================================
-	// 阶段 3: 播放蒙太奇 + 绑 OnMontageEnded (事件驱动 Cooldown)
+	// 阶段 3: 锁脚 (如果 bInLockMovement=true)
 	// ============================================================
-	// 设计 (v32 大厂架构):
-	//   - 用 UAnimInstance::OnMontageEnded (multicast dynamic delegate)
-	//   - Combo1 自然播完 → 引擎回调 → OnAIAttackMontageEnded(false)
-	//   - OnAIAttackMontageEnded 通知 AIController 攻击结束 → BT 进入冷却
-	//   - 即使玩家跑远, 蒙太奇也完整播完 (用户明确要求!)
+	// 大厂原则 — 单一真理源 + 复用已有字段:
+	//   - 真理源: ABaseCharacter::bIsMovementLocked (已存在, 与玩家路径对称)
+	//   - 复原时: OnMontageEnded 回调里 bIsMovementLocked=false + RestoreMaxWalkSpeedFromConfig (已存在)
+	//   - 不缓存原速: RestoreMaxWalkSpeedFromConfig 从 AIRuntimeConfigComponent 重新读策划配的速度
+	//                  (这是大厂权威 — 单一真理源, 不允许缓存原速导致配置改了不生效)
 	//
-	// 安全 (P0 2026.07.07 修复 Ensure 崩溃):
-	//   - UE TMulticastScriptDelegate::AddInternal 有 ensure: 不能重复 AddDynamic
-	//   - 修复: RemoveDynamic 先解绑 + IsAlreadyBound 检查 (双保险)
+	// UE 标准 API: UCharacterMovementComponent::MaxWalkSpeed (单位 cm/s)
+	//   - 锁脚时设 0 → AI 站着挥刀 (CS:GO/Apex 标准)
+	//   - 不锁脚时不动 MaxWalkSpeed → AI 边走边挥刀 (MetalSlug 默认 AI 行为)
+	if (bInLockMovement)
+	{
+		if (UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement())
+		{
+			OwnerCharacter->bIsMovementLocked = true;
+			MoveComp->MaxWalkSpeed = 0.f;
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: 【v133 锁脚】"
+				     "AI=%s bIsMovementLocked=true + MaxWalkSpeed=0 "
+				     "(蒙太奇结束由 OnAIAttackMontageEnded 复原 RestoreMaxWalkSpeedFromConfig)"),
+				*OwnerCharacter->GetName());
+		}
+		else
+		{
+			// 没 CharacterMovement (退化): 不锁脚, 不报错 (非战斗 Pawn 不应进入攻击)
+			UE_LOG(LogTemp, Warning,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 没 CharacterMovement, "
+				     "无法锁脚, 攻击继续 (策划选 bLockMovement 但 Pawn 不是 Character)."),
+				*OwnerCharacter->GetName());
+		}
+	}
+
+	// ============================================================
+	// 阶段 4: 播放蒙太奇 + 绑 OnMontageEnded (事件驱动 Cooldown)
 	// ============================================================
 	UAnimMontage* AttackMontage = ResolveResult.Montage;
-	const float MontageLen = OwnerCharacter->PlayAnimMontage(AttackMontage, 1.0f, FName("Combo1"));
+	// 【v133】Heavy 用 "Heavy" 起始 Section 名 (Light 用 Combo1), 这样 Anim BP 可以按段区分
+	const FName StartSectionName = (InAttackType == EAIAttackType::Heavy) ? FName(TEXT("Heavy")) : FName(TEXT("Combo1"));
+	const float MontageLen = OwnerCharacter->PlayAnimMontage(AttackMontage, 1.0f, StartSectionName);
 	if (MontageLen <= 0.0f)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: PlayAnimMontage 失败 (返回 %.2f), "
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: PlayAnimMontage 失败 (返回 %.2f), "
 			     "AI=%s, 武器=%s"),
 			MontageLen, *OwnerCharacter->GetName(), *CurrentWeapon->GetName());
+
+		// 【v133 防御】PlayAnimMontage 失败时立即复原锁脚 (否则 AI 永远站桩)
+		if (bInLockMovement && OwnerCharacter->bIsMovementLocked)
+		{
+			OwnerCharacter->bIsMovementLocked = false;
+			if (UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement())
+			{
+				RestoreMaxWalkSpeedFromConfig(OwnerCharacter);
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: PlayAnimMontage 失败 → "
+					     "复原 bIsMovementLocked=false + RestoreMaxWalkSpeedFromConfig (锁脚失败防御)"));
+			}
+		}
 		return false;
 	}
 
@@ -370,54 +516,48 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 	}
 
 	// ============================================================
-	// 阶段 4: 同步给服务器 + 攻击扣血入口
+	// 阶段 5: 同步给服务器 + 攻击扣血入口
 	// ============================================================
-	// 4.1 同步给服务器 (AI 在服务器调用, Server RPC 在服务器本地直接走 _Implementation)
+	// 5.1 同步给服务器 (AI 在服务器调用, Server RPC 在服务器本地直接走 _Implementation)
 	// 注: 这里不传 Montage 指针, 沿用 ComboIndex 让服务器侧也走相同 fallback
-	// 【2026.07.12 P0 重构】RPC 转发壳已上移到 ABaseCharacter, 但 AI 在服务器调用 Server RPC
-	//   会触发 UE 5.6 "本地直接 _Implementation" 行为, 等价于直接调 Component 的 _Implementation
 	if (OwnerCharacter)
 	{
-		Server_PlayAttackAnim_Implementation(false, 1);
+		// 【v133】传递 ComboIndex 给 RPC, 服务器侧也按相同 ComboIndex 解析
+		Server_PlayAttackAnim_Implementation(false, InComboIndex);
 	}
 
-	// 4.2 攻击扣血入口 — 让 BaseWeapon::Tick 在 trace 命中时知道这是 AI 攻击
+	// 5.2 攻击扣血入口 — 让 BaseWeapon::Tick 在 trace 命中时知道这是 AI 攻击
 	// (蒙太奇播完后在 OnAIAttackMontageEnded 复位 false)
 	if (OwnerCharacter)
 	{
 		OwnerCharacter->SetAttackerIsAI(true);
-
-		// 【v74 大厂架构 — 蒙太奇时间轴驱动检测】
-		//   旧版 (v73) C++ 在 OnAIRequestAttack_Simple 强制调 StartDamageTrace
-		//   → 与美术在蒙太奇时间轴上拖 ANS_MeleeTraceState 标签冲突
-		//   新版 (v74) 单一真理源 = ANS_MeleeTraceState:
-		//     - 美术在蒙太奇时间轴"挥刀中段"位置拖 ANS_MeleeTraceState(Tracing) → 启 trace
-		//     - 在"收刀"位置 NotifyEnd → 关 trace
-		//   C++ 不再做硬编码启停 — 完全由蒙太奇时间轴决定 (与玩家路径对称)
 	}
 
 	// ============================================================
-	// 【v40.4 P0 关键修复】写 BB.CooldownEndTime — 单一真理源 (历史从 BTTask 收回)
+	// 【v133.2 P0 防打断】标记"攻击中" — 单一真理源对称
 	// ============================================================
-	//
-	// 历史 (v22-v40.3) 架构错误链:
-	//   - BTTask_PlayAttackMontage 写 BB.CooldownEndTime (硬编码 Key 名 + 重复架构)
-	//   - v40.4 重构删了 BTTask 中的写入 → 但**没有补回** OnAIRequestAttack_Simple
-	//   - 结果: BB.CooldownEndTime 永远 = 0 → BTDecorator_CooldownReady 看到
-	//     CooldownEndTime <= 0 → 永远返回 true → 冷却检查**失效** → AI 一直能攻击
-	//
+	// 大厂原则 — 完整生命周期:
+	//   - OnAIRequestAttack_WithOptions 成功播放后 → SetCurrentlyAttacking(true) (新增)
+	//   - OnAIAttackMontageEnded 蒙太奇自然结束 → SetCurrentlyAttacking(false) (v40.4 已存在)
+	//   - 攻击中守卫 (本函数步骤 0) 读 IsCurrentlyAttacking() 拒判新触发
+	//   - 守卫用 Verbose 日志 — 频繁触发不污染主控制台
+	// ============================================================
+	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+	{
+		BaseAIC->SetCurrentlyAttacking(true);
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 已设 bIsCurrentlyAttacking=true "
+			     "(蒙太奇自然结束由 OnAIAttackMontageEnded 复原 false)"),
+			*OwnerCharacter->GetName());
+	}
+
+	// ============================================================
+	// 阶段 6: 【v40.4 P0 关键修复】写 BB.CooldownEndTime — 单一真理源
+	// ============================================================
 	// v40.4 终极修复 (大厂原则 - 单一真理源 + 单一节流点):
-	//   - 唯一入口: OnAIRequestAttack_Simple 成功播蒙太奇后, 写 BB.CooldownEndTime
+	//   - 唯一入口: OnAIRequestAttack_WithOptions 成功播蒙太奇后, 写 BB.CooldownEndTime
 	//   - 硬编码 Key 名 = AIBlackboardKeyNames::CooldownEndTime = 唯一真理源
 	//   - BTDecorator_CooldownReady 实时读 World.Time vs BB.CooldownEndTime, 0 延迟决策
-	//   - 不写入 C++ 字段 bIsInAttackCooldown (v15 残留, 由 BT 决策不再用)
-	//
-	// 为什么不在 BTTask 里写 BB (大厂 BTTask 惯例的破例):
-	//   - BTTask 节点标准做法: 用 FBlackboardKeySelector 让策划在 BP 编辑器配 Key 名
-	//   - C++ 组件直接调硬编码 Key 名 — 因为 Component 是单一入口, Key 名是真理源
-	//   - 但 BTTask_PlayAttackMontage 是"调用 Component 的原子壳", 不该再写副作用
-	//   - 副作用全部下沉到 Component (单一职责: Component 知道所有写入路径)
-	// ============================================================
 	if (UWorld* World = OwnerCharacter->GetWorld())
 	{
 		float AttackInterval = 1.2f;  // 默认 1.2s 冷却
@@ -436,8 +576,6 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 		}
 
 		// 写 BB.CooldownEndTime (AIBlackboardKeyNames::CooldownEndTime = "CooldownEndTime")
-		// 【UE 5.6 const 保护】AAIController::GetBlackboardComponent() 返回 const
-		//                  必须在 ABaseAIController 非 const 方法内获取非 const 视图
 		if (AAIController* AIC = Cast<AAIController>(OwnerCharacter->GetController()))
 		{
 			if (UBlackboardComponent* BB = AIC->GetBlackboardComponent())
@@ -446,55 +584,294 @@ bool UAIAttackComponent::OnAIRequestAttack_Simple(ABaseCharacter* InOwnerCharact
 				const float CooldownEndTime = CurrentTime + AttackInterval;
 				BB->SetValueAsFloat(FName(AIBlackboardKeyNames::CooldownEndTime), CooldownEndTime);
 
-				// 【v40.5 P0 升级 Display 级 — 让冷却写入可见】
 				UE_LOG(LogTemp, Display,
-					TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: 写 BB.CooldownEndTime=%.2f (Now=%.2f + AttackInterval=%.2f)"),
+					TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: 写 BB.CooldownEndTime=%.2f "
+					     "(Now=%.2f + AttackInterval=%.2f)"),
 					CooldownEndTime, CurrentTime, AttackInterval);
 			}
 			else
 			{
 				UE_LOG(LogTemp, Warning,
-					TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: AI=%s 拿不到 BlackboardComponent! BT 冷却决策可能失效. "
-					     "【v40.4 修复后】BB.CooldownEndTime 必须由本函数写入, 没有 BB 就无法写入."),
+					TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 拿不到 BlackboardComponent! "
+					     "BT 冷却决策可能失效."),
 					*OwnerCharacter->GetName());
 			}
 		}
 	}
 
-	// ============================================================
-	// 【v35 撤回】trace 启动交给 BP AnimNotify (跟玩家路径对称)
-	//
-	// 旧版 (v32-v34): C++ 主动开 trace
-	//   - 问题: trace 窗口与蒙太奇挥刀动作不同步 (蒙太奇第一帧就开)
-	//   - 根因: 美术想在"挥刀中段"开, "收刀"关, C++ 硬编码做不到
-	//
-	// 新版 (v35): BP AnimNotify 控制
-	//   - 美术在 UE 编辑器打开 AI 蒙太奇 (跟武器共用同一个)
-	//   - 在"挥刀中段"位置加 ANS_MeleeTrace → PerformDamageTrace
-	//   - 在"收刀"位置加 ANS_MeleeTraceEnd → StopDamageTrace
-	//   - BP AnimNotify 拿武器: WeaponAttach->GetCurrentWeapon() (蓝图纯函数节点)
-	//
-	// 大厂原则 - 职责对等:
-	//   - 启动 trace = 美术/策划的责任 (蒙太奇节奏)
-	//   - 结束 trace = C++ 防泄漏清理 (蒙太奇自然结束时强制 StopDamageTrace)
-	//   - 这是"清理逻辑"不是"业务兜底" — 蒙太奇必然结束, 防 BP 通知漏触发造成 trace 永远开启
-	// ============================================================
-
 	UE_LOG(LogTemp, Log,
-		TEXT("[AIAttackComponent] OnAIRequestAttack_Simple: AI=%s 成功播放攻击动画 "
-		     "(Level=%d, Index=%d, Montage=%s, Length=%.2fs, 扣血等待 trace 命中)"),
+		TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 成功播放攻击动画 "
+		     "(AttackType=%s, ComboIndex=%d, Level=%d, Index=%d, Montage=%s, Length=%.2fs, "
+		     "bLockMovement=%d, 扣血等待 trace 命中)"),
 		*OwnerCharacter->GetName(),
+		(InAttackType == EAIAttackType::Heavy) ? TEXT("Heavy") : TEXT("Light"),
+		InComboIndex,
 		ResolveResult.FallbackLevel,
 		ResolveResult.ResolvedIndex,
 		*AttackMontage->GetName(),
-		MontageLen);
+		MontageLen,
+		bInLockMovement ? 1 : 0);
 	return true;
 }
 
 
 // ==========================================
-// 4. AI 攻击蒙太奇结束回调
+// 【v133.1 P0 大厂扩展】OnAIRequestAttack_ExplicitMontage — 徒手 AI 直接指定蒙太奇
 // ==========================================
+
+/**
+ * OnAIRequestAttack_ExplicitMontage — AI 攻击入口 (BT 节点直接配蒙太奇)
+ *
+ * 【大厂原则 — 单一入口收敛】
+ *   - 本方法是 OnAIRequestAttack_WithOptions 的"优先级 1 版本"
+ *   - 跳过 Resolver (LightAttackMontages/HeavyAttackMontage 配置链路)
+ *   - 直接用 BT 节点配置的 UAnimMontage 资产
+ *   - 其他副作用 (锁脚/BB写入/OnMontageEnded) 与 WithOptions 共享
+ *
+ * 【业务背景 (用户 2026.08.02 反馈)】
+ *   - 母体是徒手攻击 (Zombie Mutant), 武器 BP 没配 LightAttackMontages
+ *   - BT 节点直接选蒙太奇资产, 完全绕过武器 BP 配置
+ *   - 适用: 母体 Zombie 抓人 / 临时测试 / 武器 BP 过渡期
+ *
+ * 【完整流程 — 5 个阶段 (与 WithOptions 共享结构)】
+ *   阶段 1: Owner / 死亡 / 武器检查 (零兜底 — 武器检查改 Montage 检查)
+ *   阶段 2: 锁脚 (如果 bInLockMovement=true)
+ *   阶段 3: 播放蒙太奇 + 绑 OnMontageEnded 回调
+ *   阶段 4: 同步网络 (Server_PlayAttackAnim) + SetAttackerIsAI(true)
+ *   阶段 5: 写 BB.CooldownEndTime (单一真理源)
+ */
+bool UAIAttackComponent::OnAIRequestAttack_ExplicitMontage(ABaseCharacter* InOwnerCharacter,
+	UAnimMontage* InExplicitMontage, bool bInLockMovement)
+{
+	// ================================================
+	// 阶段 1: 验证传入参数 (零兜底)
+	// ================================================
+	if (!InOwnerCharacter)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: InOwnerCharacter 为空! "
+			     "调用方必须传入真实 Pawn 实例, 不能传 CDO/Archetype。"));
+		return false;
+	}
+
+	if (!InExplicitMontage)
+	{
+		// 【v133.1 零兜底】ExplicitMontage 必填 — 策划忘配就立即 Log Error
+		UE_LOG(LogTemp, Error,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: InExplicitMontage 为空! "
+			     "BT 节点应该传 ExplicitMontage 资产, 不允许 nullptr. "
+			     "修复: 打开 BT_ZombieModeAI.uasset → Play Attack Montage 节点"
+			     "→ Explicit Montage Override 字段拖拽一个 UAnimMontage 资产."));
+		return false;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage ENTER. Owner=%s (Valid=%d) "
+		     "ExplicitMontage=%s bLockMovement=%d"),
+		*InOwnerCharacter->GetName(),
+		InOwnerCharacter->IsValidLowLevel() ? 1 : 0,
+		*InExplicitMontage->GetName(),
+		bInLockMovement ? 1 : 0);
+
+	ABaseCharacter* OwnerCharacter = InOwnerCharacter;
+
+	// ============================================================
+	// 【v133.2 P0 大厂扩展 — 防打断守卫】步骤 0: 攻击中守卫
+	// ============================================================
+	//
+	// 业务背景 (用户 2026.08.02 反馈):
+	//   "Play Attack Montage 节点, 我需要播放蒙太奇时不能被打断, 实现边追边打效果"
+	//
+	// 大厂原则 — 与 WithOptions 完全对称:
+	//   - 真理源: BaseAIController::bIsCurrentlyAttacking (已有, OnMontageEnded 设 false)
+	//   - 守卫: 攻击中 → 拒绝新触发 → 返回 true (不返 Failed)
+	//   - 返 Succeeded 让 BT 继续到 WaitMontageFinish, 等蒙太奇自然结束
+	// ============================================================
+	if (const ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+	{
+		if (BaseAIC->IsCurrentlyAttacking())
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI=%s 正在攻击中 (bIsCurrentlyAttacking=true), "
+				     "拒绝新触发, 等待蒙太奇自然结束. 边追边打效果保持."),
+				*OwnerCharacter->GetName());
+			return true; // 【关键】返 true 不返 false — 让 BT 看到 Succeeded 继续到 WaitMontageFinish
+		}
+	}
+
+	// 死亡检查 (ExplicitMontage 路径不强制要武器, 但 Pawn 必须活着)
+	if (OwnerCharacter->IsDead())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI=%s 已死亡, 跳过"),
+			*OwnerCharacter->GetName());
+		return false;
+	}
+
+	// ============================================================
+	// 阶段 2: 锁脚 (如果 bInLockMovement=true)
+	// ============================================================
+	// 大厂原则 — 单一真理源 + 复用已有字段:
+	//   - 真理源: ABaseCharacter::bIsMovementLocked (已存在, 与玩家路径对称)
+	//   - 复原时: OnMontageEnded 回调里 bIsMovementLocked=false + RestoreMaxWalkSpeedFromConfig
+	//   - 不缓存原速: RestoreMaxWalkSpeedFromConfig 从 AIRuntimeConfigComponent 重新读
+	if (bInLockMovement)
+	{
+		if (UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement())
+		{
+			OwnerCharacter->bIsMovementLocked = true;
+			MoveComp->MaxWalkSpeed = 0.f;
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: 【v133.1 锁脚】"
+				     "AI=%s bIsMovementLocked=true + MaxWalkSpeed=0"),
+				*OwnerCharacter->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI=%s 没 CharacterMovement, "
+				     "无法锁脚, 攻击继续."),
+				*OwnerCharacter->GetName());
+		}
+	}
+
+	// ============================================================
+	// 阶段 3: 播放蒙太奇 + 绑 OnMontageEnded (事件驱动 Cooldown)
+	// ============================================================
+	// 【v133.1 关键】跳过 Resolver — 直接用 BT 配的 Montage
+	UAnimMontage* AttackMontage = InExplicitMontage;
+
+	// 起始 Section: 用 "Heavy" (ComboIndex 跳过时不读)
+	const FName StartSectionName = NAME_None; // 显式 None — 让 Montage 用默认起始 Section
+	const float MontageLen = OwnerCharacter->PlayAnimMontage(AttackMontage, 1.0f, StartSectionName);
+	if (MontageLen <= 0.0f)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: PlayAnimMontage 失败 (返回 %.2f), "
+			     "AI=%s, Montage=%s"),
+			MontageLen, *OwnerCharacter->GetName(), *AttackMontage->GetName());
+
+		// 【v133.1 防御】PlayAnimMontage 失败时立即复原锁脚
+		if (bInLockMovement && OwnerCharacter->bIsMovementLocked)
+		{
+			OwnerCharacter->bIsMovementLocked = false;
+			if (UCharacterMovementComponent* MoveComp = OwnerCharacter->GetCharacterMovement())
+			{
+				RestoreMaxWalkSpeedFromConfig(OwnerCharacter);
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: PlayAnimMontage 失败 → "
+					     "复原 bIsMovementLocked=false + RestoreMaxWalkSpeedFromConfig (锁脚失败防御)"));
+			}
+		}
+		return false;
+	}
+
+	// 绑 UAnimInstance::OnMontageEnded 回调 (与 WithOptions 完全对称)
+	if (USkeletalMeshComponent* CharMesh = OwnerCharacter->GetMesh())
+	{
+		if (UAnimInstance* AnimInst = CharMesh->GetAnimInstance())
+		{
+			AnimInst->OnMontageEnded.RemoveDynamic(this, &UAIAttackComponent::OnAIAttackMontageEnded);
+
+			if (!AnimInst->OnMontageEnded.IsAlreadyBound(this, &UAIAttackComponent::OnAIAttackMontageEnded))
+			{
+				AnimInst->OnMontageEnded.AddDynamic(this, &UAIAttackComponent::OnAIAttackMontageEnded);
+			}
+
+			CachedAIMontage = AttackMontage;
+			bIsWaitingForAIMontageCallback = true;
+		}
+	}
+
+	// ============================================================
+	// 阶段 4: 同步给服务器 + 攻击扣血入口
+	// ============================================================
+	if (OwnerCharacter)
+	{
+		// 【v133.1】ExplicitMontage 路径传 ComboIndex=1 (服务器侧仅用于日志, 服务器侧广播 Multicast_PlayAttackAnim 真正播的是客户端现有 Montage)
+		Server_PlayAttackAnim_Implementation(false, 1);
+	}
+
+	if (OwnerCharacter)
+	{
+		OwnerCharacter->SetAttackerIsAI(true);
+	}
+
+	// ============================================================
+	// 【v133.2 P0 防打断】标记"攻击中" — 单一真理源对称
+	// ============================================================
+	// 大厂原则 — 完整生命周期:
+	//   - OnAIRequestAttack_* 成功播放后 → SetCurrentlyAttacking(true) (新增)
+	//   - OnAIAttackMontageEnded 蒙太奇自然结束 → SetCurrentlyAttacking(false) (v40.4 已存在)
+	//   - 攻击中守卫 (OnAIRequestAttack_* 入口) 读 IsCurrentlyAttacking() 拒判新触发
+	//
+	// 大厂原则 — 防御型:
+	//   - 守卫返回 true (不返 false) — 避免 BT 看到 Failed 回退 Chase 导致循环
+	//   - 守卫用 Verbose 日志 — 频繁触发不污染主控制台
+	// ============================================================
+	if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+	{
+		BaseAIC->SetCurrentlyAttacking(true);
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI=%s 已设 bIsCurrentlyAttacking=true "
+			     "(蒙太奇自然结束由 OnAIAttackMontageEnded 复原 false)"),
+			*OwnerCharacter->GetName());
+	}
+
+	// ============================================================
+	// 阶段 5: 写 BB.CooldownEndTime (单一真理源 — 与 WithOptions 完全对称)
+	// ============================================================
+	if (UWorld* World = OwnerCharacter->GetWorld())
+	{
+		float AttackInterval = 1.2f;  // 默认 1.2s 冷却
+
+		if (AAIController* AIC = Cast<AAIController>(OwnerCharacter->GetController()))
+		{
+			if (const ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+			{
+				const float EffectiveInterval = BaseAIC->GetEffectiveAttackInterval();
+				if (EffectiveInterval > 0.f)
+				{
+					AttackInterval = EffectiveInterval;
+				}
+			}
+		}
+
+		if (AAIController* AIC = Cast<AAIController>(OwnerCharacter->GetController()))
+		{
+			if (UBlackboardComponent* BB = AIC->GetBlackboardComponent())
+			{
+				const float CurrentTime = World->GetTimeSeconds();
+				const float CooldownEndTime = CurrentTime + AttackInterval;
+				BB->SetValueAsFloat(FName(AIBlackboardKeyNames::CooldownEndTime), CooldownEndTime);
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: 写 BB.CooldownEndTime=%.2f "
+					     "(Now=%.2f + AttackInterval=%.2f)"),
+					CooldownEndTime, CurrentTime, AttackInterval);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI=%s 拿不到 BlackboardComponent! "
+					     "BT 冷却决策可能失效."),
+					*OwnerCharacter->GetName());
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI=%s 成功播放攻击动画 "
+		     "(ExplicitMontage=%s, Length=%.2fs, bLockMovement=%d, 扣血等待 trace 命中)"),
+		*OwnerCharacter->GetName(),
+		*AttackMontage->GetName(),
+		MontageLen,
+		bInLockMovement ? 1 : 0);
+	return true;
+}
+
 
 /**
  * OnAIAttackMontageEnded — AI 攻击蒙太奇自然/被打断结束时由引擎回调
@@ -642,6 +1019,12 @@ void UAIAttackComponent::OnAIAttackMontageEnded(UAnimMontage* Montage, bool bInt
 	//        但攻击结束后没有恢复速度 → AI 物理引擎 fallback 到默认值(玩家速度 400)
 	// 修复: 攻击蒙太奇结束后调用 RestoreMaxWalkSpeedFromConfig 恢复配置表速度
 	// 大厂原则 - 职责对等: 与玩家路径 PlayerComboComponent::EndAttackState 对称
+	//
+	// 【v133 P0 大厂扩展】对称清理 bIsMovementLocked:
+	//   - OnAIRequestAttack_WithOptions 阶段 3 设 bIsMovementLocked=true (锁脚)
+	//   - 本函数末尾对称 bIsMovementLocked=false + RestoreMaxWalkSpeedFromConfig
+	//   - 大厂原则 - 真理源唯一: 用 BaseCharacter 已有的 bIsMovementLocked 字段, 不在 Component 重复
+	OwnerCharacter->bIsMovementLocked = false;
 	RestoreMaxWalkSpeedFromConfig(OwnerCharacter);
 }
 
@@ -708,22 +1091,37 @@ void UAIAttackComponent::RestoreMaxWalkSpeedFromConfig(ABaseCharacter* OwnerChar
 	}
 
 	const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
-	if (MoveParams.WalkSpeed <= 0.f)
+
+	// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
+	//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
+	//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
+	const float EffectiveWalkSpeed = OwnerCharacter->bIsMother
+		? MoveParams.MotherWalkSpeed
+		: MoveParams.WalkSpeed;
+
+	if (EffectiveWalkSpeed <= 0.f)
 	{
 		// 【零兜底】配置表 WalkSpeed <= 0 → 显式报错, 不静默用默认值
 		UE_LOG(LogTemp, Error,
-			TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 的配置表 WalkSpeed=%.0f <= 0, "
+			TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 的配置表 %s=%.0f <= 0 (bIsMother=%d), "
 				 "AI 将保持 MaxWalkSpeed=0 (无法移动). "
-				 "【修复】DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0 (例如 250)"),
-			*OwnerCharacter->GetName(), MoveParams.WalkSpeed);
+				 "【修复】DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
+			*OwnerCharacter->GetName(),
+			OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
+			EffectiveWalkSpeed,
+			OwnerCharacter->bIsMother ? 1 : 0,
+			OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
 		return;
 	}
 
 	// 速度恢复成功
-	MoveComp->MaxWalkSpeed = MoveParams.WalkSpeed;
+	MoveComp->MaxWalkSpeed = EffectiveWalkSpeed;
 	UE_LOG(LogTemp, Log,
-		TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 速度恢复为 WalkSpeed=%.0f (配置表)"),
-		*OwnerCharacter->GetName(), MoveParams.WalkSpeed);
+		TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 速度恢复为 %s=%.0f (bIsMother=%d, 配置表)"),
+		*OwnerCharacter->GetName(),
+		OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
+		EffectiveWalkSpeed,
+		OwnerCharacter->bIsMother ? 1 : 0);
 }
 
 
