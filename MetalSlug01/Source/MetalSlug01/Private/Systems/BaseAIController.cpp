@@ -47,6 +47,9 @@
 #include "Kismet/GameplayStatics.h"
 // 引入房间游戏模式，用于订阅 OnBattleStarted 委托
 #include "Systems/RoomGameMode.h"
+// 【v120 重构】AI 复活无敌期从 PlayerConfigAsset 读取 (玩家/AI 共用)
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
+#include "Data/Config/PlayerConfigAsset.h"
 // 引入房间状态枚举，用于 ERoomState::BattleInProgress 判断
 #include "Data/Enums/RoomEnums.h"
 // 引入基础角色类，用于 Cast 判断 AI Pawn / 访问 bIsMovementLocked
@@ -1429,7 +1432,11 @@ TSoftClassPtr<ABaseWeapon> ABaseAIController::GetDefaultWeaponClass() const
     return nullptr;
 }
 
-// 【v54.2 大厂架构 — 真理源 + 零兜底 + 可观测性】AI 复活无敌期
+// 【v120 2026.08.03 大厂架构重构】AI 复活无敌期
+//
+// 重构内容:
+//   - 旧: ConfigSO.SpawnInvincibilitySeconds (AI 专属)
+//   - 新: PlayerConfigAsset.SpawnInvincibilitySeconds (玩家/AI 共用)
 //
 // 大厂原则:
 //   - RuntimeConfig 或 Config 缺失 → Log Error (暴露根因) + 返回 0
@@ -1438,22 +1445,29 @@ TSoftClassPtr<ABaseWeapon> ABaseAIController::GetDefaultWeaponClass() const
 //
 float ABaseAIController::GetSpawnInvincibilitySeconds() const
 {
-    if (RuntimeConfig && RuntimeConfig->GetConfig())
-    {
-        return RuntimeConfig->GetConfig()->SpawnInvincibilitySeconds;
-    }
-    // 【v54.2 可观测性】Config 缺失 → Log Error (首次警告, 不刷屏)
-    static bool bWarnedMissingConfig = false;
-    if (!bWarnedMissingConfig)
-    {
-        bWarnedMissingConfig = true;
-        UE_LOG(LogTemp, Error,
-            TEXT("[BaseAIController::GetSpawnInvincibilitySeconds] AIController='%s' 的 Config 缺失. "
-                 "【v54.2 零兜底】返回 0 表示【跳过激活】, 不是默认值. "
-                 "【修复】检查 InitializeFromConfig 是否被调用, 或 SpawnAIInternal 是否漏传 Config."),
-            *GetNameSafe(this));
-    }
-    return 0.f;
+	// 【v120 重构】从 RoomSpawnSubsystem::PlayerConfigAsset 读 (玩家/AI 共用真理源)
+	if (UWorld* World = GetWorld())
+	{
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(World))
+		{
+			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+			{
+				return PC->SpawnInvincibilitySeconds;
+			}
+		}
+	}
+	// 【v54.2 可观测性】Config 缺失 → Log Error (首次警告, 不刷屏)
+	static bool bWarnedMissingConfig = false;
+	if (!bWarnedMissingConfig)
+	{
+		bWarnedMissingConfig = true;
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseAIController::GetSpawnInvincibilitySeconds] AIController='%s' 的 PlayerConfigAsset 缺失. "
+				 "【v120 零兜底】返回 0 表示【跳过激活】, 不是默认值. "
+				 "【修复】检查 GM_RoomGameMode 的 PlayerConfigAsset 是否配置."),
+			*GetNameSafe(this));
+	}
+	return 0.f;
 }
 
 // 【v54 大厂架构重构】直接读 ConfigSO (替代 GetCurrentProfile)

@@ -403,7 +403,7 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 	//
 	// 大厂原则 — 集中调度 + 单一真理源:
 	//   - 触发入口唯一: 本函数 (CombatDeathComponent::TakeDamage)
-	//   - 真理源分流: 玩家读 PlayerConfigAsset, AI 读 ConfigSO (镜像 v133.4 血量)
+	//   - 真理源统一: 玩家/AI 都读 PlayerConfigAsset (v120 合并)
 	//   - 状态字段: MotherSlowComponent->bIsSlowed (Replicated)
 	//   - 实际改 MaxWalkSpeed: BaseCharacter 订阅 OnSlowStateChanged (跨边界最小化)
 	//
@@ -430,25 +430,12 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 			// 真理源分流: 读对应 Config 的 SlowDurationSeconds
 			float SlowDurationSeconds = 0.0f;
 
-			// 优先判断 Controller: 玩家路径 vs AI 路径
-			AController* Ctrl = Owner->GetController();
-			if (Cast<APlayerController>(Ctrl) != nullptr)
+			// 真理源统一: 玩家/AI 都读 PlayerConfigAsset.SlowDurationSeconds
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 			{
-				// 玩家路径: 真理源 = PlayerConfigAsset.SlowDurationSeconds
-				if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
 				{
-					if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
-					{
-						SlowDurationSeconds = PC->SlowDurationSeconds;
-					}
-				}
-			}
-			else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Ctrl))
-			{
-				// AI 路径: 真理源 = ConfigSO.SlowDurationSeconds
-				if (UAIBehaviorConfigSO* Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig()))
-				{
-					SlowDurationSeconds = Config->SlowDurationSeconds;
+					SlowDurationSeconds = PC->SlowDurationSeconds;
 				}
 			}
 
@@ -464,9 +451,8 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 
 				UE_LOG(LogTemp, Display,
 					TEXT("[CombatDeathComponent] 【v133.5 触发】主武器击中母体 → 降速. "
-					     "Owner=%s Weapon=%s MeshType=Primary Duration=%.2fs CurrentSpeed=%.1f (真理源=%s)"),
-					*Owner->GetName(), *Weapon->GetName(), SlowDurationSeconds, CurrentMaxWalkSpeed,
-					Cast<APlayerController>(Ctrl) ? TEXT("PlayerConfigAsset") : TEXT("ConfigSO"));
+						 "Owner=%s Weapon=%s MeshType=Primary Duration=%.2fs CurrentSpeed=%.1f (真理源=PlayerConfigAsset)"),
+					*Owner->GetName(), *Weapon->GetName(), SlowDurationSeconds, CurrentMaxWalkSpeed);
 			}
 		}
 	}

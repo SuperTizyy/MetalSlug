@@ -239,7 +239,7 @@ void AMeleeAIController::SetupMeleeAI(UAIBehaviorConfigSO* MeleeConfig)
 	//   - 与大厅路径对称: RoomSpawnSubsystem::SpawnAIInternal 在 Possess 后调 SpawnedChar->RequestWeaponSpawn(Class)
 
 	// 3. 复活无敌期激活 (走 BaseAIController 统一真理源入口 — v54.2 大厂原则)
-	//   - 真理源链: ConfigSO.SpawnInvincibilitySeconds (所有 AI 共用, 不分关卡预放/大厅入队/复活)
+	//   - 真理源: PlayerConfigAsset.SpawnInvincibilitySeconds (玩家/AI 共用, v120 合并)
 	//   - 入口: this->GetSpawnInvincibilitySeconds() (BaseAIController getter, 单一访问路径)
 	//   - 与 RoomSpawnSubsystem::SpawnAIInternal 使用同一入口 (消除重复架构)
 	const float InvSeconds = GetSpawnInvincibilitySeconds();
@@ -250,23 +250,23 @@ void AMeleeAIController::SetupMeleeAI(UAIBehaviorConfigSO* MeleeConfig)
 		{
 			BaseChar->ActivateSpawnInvincibility(InvSeconds);
 			UE_LOG(LogTemp, Log,
-				TEXT("[MeleeAI] SetupMeleeAI: 激活关卡预放 AI 复活无敌期 = %.2fs (Pawn=%s, 真理源=ConfigSO.SpawnInvincibilitySeconds)"),
+				TEXT("[MeleeAI] SetupMeleeAI: 激活关卡预放 AI 复活无敌期 = %.2fs (Pawn=%s, 真理源=PlayerConfigAsset.SpawnInvincibilitySeconds)"),
 				InvSeconds, *BaseChar->GetName());
 		}
 	}
 
 	// ============================================================
-	// 【v133.4 2026.08.02 大厂架构 — 真理源分离】AI Pawn 应用 ConfigSO 血量
+	// 【v133.4/v120 2026.08.03 大厂架构】AI Pawn 应用 PlayerConfigAsset 血量
 	// ============================================================
 	//
 	// 历史 (v41-v133.3 反模式):
-	//   - SetupMeleeAI 末尾没调任何 ConfigSO 血量写入
+	//   - SetupMeleeAI 末尾没调任何血量写入
 	//   - AI 血量 = HealthComponent 默认值 100 (写死在 HealthComponent.h)
 	//   - ConfigSO 加 MaxHealth 字段被 PlayerConfigAsset 覆盖 (ApplyCharacterConfigToCharacter 误调用)
 	//
-	// 新架构 (v133.4):
-	//   - 关卡预放 AI 路径走 ApplyAICharacterConfigToCharacter (读 ConfigSO.Health)
-	//   - 真理源 = ConfigSO.Health.MaxHealth / MotherMaxHealth (按 bIsMother 分流)
+	// 新架构 (v133.4/v120):
+	//   - 关卡预放 AI 路径走 ApplyAICharacterConfigToCharacter (读 PlayerConfigAsset.Health)
+	//   - 真理源 = PlayerConfigAsset.MaxHealth / MotherMaxHealth (按 bIsMother 分流)
 	//   - 与大厅 AI 路径对称 (SpawnAIInternal 也调 ApplyAICharacterConfigToCharacter)
 	// ============================================================
 	if (ABaseCharacter* BaseChar = Cast<ABaseCharacter>(GetPawn()))

@@ -33,6 +33,7 @@ class ABaseWeapon;        // 武器基类
 class APlayerStart;       // 玩家出生点 Actor
 class ARoomPlayerController; // 房间玩家控制器
 class AMeleeAIController;   // 近战 AI 控制器（AddAIToRoom 需要 Spawn）
+class AAirdropPickup;       // 空投 Pickup (v117)
 
 /**
  * @class ARoomGameMode
@@ -807,6 +808,77 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
 		meta = (ClampMin = "30", ClampMax = "3600"))
 	int32 ZombieMatchDurationSeconds = 120;
+
+	/**
+	 * 【生化模式】空投降临间隔（秒）
+	 *
+	 * 业务规则:
+	 *   - 每小局母体变异倒计时结束后，才开始首轮空投倒计时
+	 *   - 每次空投实际降临完毕后，由空投系统调用生命周期事件入口重启倒计时
+	 *   - 默认 120 秒，策划可在 GameMode 蓝图中调整
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|Airdrop",
+		meta = (ClampMin = "1.0", ClampMax = "3600.0"))
+	float AirdropIntervalSeconds = 120.0f;
+
+	// ==========================================
+	// 【v117 大厂架构新增】空投降临配置 — 单一真理源
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.03):
+	//   - 倒计时到期 → 在 AirDropPoints 列表的每个点位上方 AirDropPickupDropHeight cm 处生成空投
+	//   - 没被人类吃掉的旧空投先全部销毁
+	//   - 策划在 BP_GM_RoomGameMode 蓝图拖入配置, 不需要改代码
+	//
+	// 大厂原则 — 单一真理源:
+	//   - AirDropPoints / AirDropPickupClass / AirDropPickupDropHeight 是空投系统的唯一配置入口
+	//   - Subsystem 只读不修改, 改配置需要重启游戏 (用户决策)
+	//   - 刀战模式留空即可, Subsystem 永远不会生成空投 (模式守卫)
+	//
+	// 大厂原则 — 不污染项目设置:
+	//   - 不创建自定义 CollisionProfile
+	//   - 不改 DefaultEngine.ini
+	//   - 业务行为全部在 BP/GameMode 字段配置, 可追踪
+
+	/**
+	 * 空投降临点位 Tag 列表 (策划在 BP 配置)
+	 *
+	 * 用途: 关卡里摆 N 个空 Actor, 给它们打 Actor.Tag, Tag 名填到这里
+	 * 读取方: URoomAirdropSubsystem::SpawnAirdropAtAllPoints
+	 *
+	 * 【v117.2 修复】TArray<AActor*> → TArray<FName>
+	 *   - 根因: UE 5.6 禁止跨 Outer 引用 — GameMode 蓝图类在 /Game/UI/, 关卡 Place Actor
+	 *     在 /Game/Japanese_Temple/maps/Japanese_Temple_Demo/PersistentLevel
+	 *     → BP 序列化器阻止 BP_GM_RoomGameMode 引用 BP_AirDropPoint 关卡实例
+	 *     → 报错: "Illegal TEXT reference to a private object in external package"
+	 *   - 修复: 改用 Tag 扫描 — BP 只持有 FName 字符串, 运行时 TActorIterator 扫描
+	 *   - 这是 UE 5.6 大厂标准 (LYRA / Fortnite 都用 Actor Tag 扫描而不是直接引用)
+	 *   - 策划工作流: BP_AirDropPoint 关卡 Actor → Details Panel → Actor → Tags → 加 "AirdropPoint"
+	 *     然后在 GameMode.AirDropPointTags 填 "AirdropPoint"
+	 *
+	 * 默认空数组 → 业务禁用空投 (不静默, Log Warning 显式告知)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|Airdrop")
+	TArray<FName> AirDropPointTags;
+
+	/**
+	 * 空投 Pickup 蓝图类 (策划在 BP 配置)
+	 *
+	 * 用途: 必须是继承自 AAirdropPickup 的 BP 类, 蓝图挂 StaticMesh
+	 * 默认 nullptr → Log Error 拒绝 Spawn (强制策划配置)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|Airdrop")
+	TSubclassOf<AAirdropPickup> AirDropPickupClass;
+
+	/**
+	 * 空投生成高度偏移 (cm)
+	 *
+	 * 用途: 营造"从高处下落"的感觉 — 空投在点位上方 N cm 处生成
+	 * 默认 100cm, 策划可调 (建议 50~500)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|Airdrop",
+		meta = (ClampMin = "0.0", ClampMax = "1000.0"))
+	float AirDropPickupDropHeight = 100.0f;
 
 	/**
 	 * 【v92 大厂架构新增】生化模式母体变异倒计时（秒）

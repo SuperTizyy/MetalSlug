@@ -209,134 +209,19 @@ public:
     TSoftClassPtr<class ABaseWeapon> LevelPlacedWeaponClass;
 
     // ========================================================================
-    // 【v133.4 2026.08.02】AI 血量配置（人类 vs 母体分离）
+    // 【v120 2026.08.03】母体配置字段变更说明
     // ========================================================================
     //
-    // 设计原则 (大厂架构 — 单一真理源 + 职责对等):
-    //   - 人类 AI / 母体 AI 是两个独立真理源,不允许互相覆盖
-    //   - 真理源: DA_AIBehaviorConfig_XXX → Health → MaxHealth / MotherMaxHealth
-    //   - 调用方按 Pawn.bIsMother 分流:
-    //     - bIsMother=true  → MotherMaxHealth (母体 AI)
-    //     - bIsMother=false → MaxHealth      (人类 AI, 默认)
+    // 【v120 重构】以下字段已从本类删除，统一迁移到 PlayerConfigAsset:
+    //   - MaxHealth / MotherMaxHealth: 玩家/AI 共用，迁移到 PlayerConfigAsset
+    //   - MotherSlowSpeed / SlowDurationSeconds: 玩家/AI 共用，迁移到 PlayerConfigAsset
+    //   - SpawnInvincibilitySeconds: 玩家/AI 共用，迁移到 PlayerConfigAsset
     //
-    // 编辑器配置路径:
-    //   DA_AIBehaviorConfig_MeleeGrunt → Health → Max Health (人类 AI)
-    //   DA_AIBehaviorConfig_ZombieMother → Health → Mother Max Health (母体 AI)
-    //
-    // 典型值:
-    //   - 人类 AI MaxHealth: 100~200 (与玩家相当)
-    //   - 母体 AI MotherMaxHealth: 200~500 (母体更强壮)
-    //
-    // 【零兜底】字段 <= 0 → HealthComponent->InitializeHealth 拒绝写入, AI 血量 = 默认值 100
-    // ========================================================================
-
-    /**
-     * 人类 AI 最大血量 — 所有非母体 AI 真理源
-     *
-     * 适用场景:
-     *   - 关卡预放 AI (Level 预置): AMeleeAIController::SetupMeleeAI 末尾写入
-     *   - 大厅 AI (房主 UI 添加): URoomSpawnSubsystem::SpawnAIInternal 末尾写入
-     *   - AI 复活 (死亡后): URoomSpawnSubsystem::RequestRespawn 触发路径
-     */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health",
-        meta = (ClampMin = "1.0", UIMin = "1.0",
-                DisplayName = "MaxHealth (人类 AI 最大血量)"))
-    float MaxHealth = 100.0f;
-
-    /**
-     * 母体 AI 最大血量 — 母体 AI 真理源
-     *
-     * 适用场景:
-     *   - 关卡预放母体 AI (Level 预置): SetupMeleeAI 末尾按 bIsMother 分流
-     *   - 母体 AI 复活链 (RequestRespawn → MutatePawnToMother)
-     *
-     * 调用方按 Pawn.bIsMother 分流 (与 MaxHealth 严格分离)
-     */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Health",
-        meta = (ClampMin = "1.0", UIMin = "1.0",
-                DisplayName = "MotherMaxHealth (母体 AI 最大血量)"))
-    float MotherMaxHealth = 300.0f;
-
-    // ========================================================================
-    // 【v133.5 2026.08.02】母体被主武器击中后降速 (Combat|Mother)
-    // ========================================================================
-    //
-    // 设计原则 (大厂架构 — 单一真理源 + 职责对等):
-    //   - 主武器 (EWeaponMeshType::Primary) 击中母体 → 降速 X 秒
-    //   - 触发入口: CombatDeathComponent::TakeDamage 末尾 (唯一)
-    //   - 状态字段: UMotherSlowComponent (Replicated, 镜像 Invincibility 模式)
-    //   - 实际改 MaxWalkSpeed: BaseCharacter 订阅 OnSlowStateChanged
-    //
-    // 编辑器配置路径:
-    //   DA_AIBehaviorConfig_XXX → Combat|Mother → Mother Slow Speed / Slow Duration Seconds
-    //
-    // 典型值:
-    //   - MotherSlowSpeed: 100 (典型降速, 配置 50~200)
-    //   - SlowDurationSeconds: 2.0 (默认 2s, 配置 0.5~5.0)
-    //
-    // 【零兜底】字段 ≤ 0 → 拒绝激活 (强制策划修复)
-    // ========================================================================
-
-    /**
-     * 母体被主武器击中后的目标移速 (cm/s)
-     *
-     * 真理源: DA_AIBehaviorConfig_XXX → Combat|Mother → Mother Slow Speed
-     *
-     * 适用场景:
-     *   - 关卡预放母体 AI: 击中后 MaxWalkSpeed = MotherSlowSpeed
-     *   - 母体 AI 复活链: 同上
-     *
-     * 触发链:
-     *   1. 武器击中 (Server_ReportHit) → ApplyPointDamage
-     *   2. CombatDeathComponent::TakeDamage (服务器: 友军守卫 + 无敌期拦截 + ApplyDamage)
-     *   3. TakeDamage 末尾判定: Weapon.MeshType==Primary && Victim.bIsMother=true
-     *   4. 调 MotherSlowComponent::ActivateSlow(2.0f)
-     *   5. 状态变更 → BaseCharacter 订阅 OnSlowStateChanged → 改 MaxWalkSpeed
-     */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Mother",
-        meta = (ClampMin = "0.0", UIMin = "0.0",
-                DisplayName = "Mother Slow Speed (母体被主武器击中后移速)"))
-    float MotherSlowSpeed = 100.0f;
-
-    /**
-     * 母体被主武器击中后降速持续时间 (秒)
-     *
-     * 真理源: DA_AIBehaviorConfig_XXX → Combat|Mother → Slow Duration Seconds
-     *
-     * 适用场景: 同 MotherSlowSpeed
-     *
-     * 默认 2.0 秒 (用户业务规则 2026.08.02)
-     * - ≤ 0 → 拒绝激活 (零兜底)
-     * - 多次激活取较晚到期 (大厂原则 - 拒绝缩短)
-     */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combat|Mother",
-        meta = (ClampMin = "0.0", UIMin = "0.0",
-                DisplayName = "Slow Duration Seconds (降速持续时间)"))
-    float SlowDurationSeconds = 2.0f;
-
-    // ========================================================================
-    // 所有 AI 共用
-    // ========================================================================
-
-    /**
-     * 所有 AI 的复活无敌期 (秒) — 不分来源
-     *
-     * 适用场景:
-     *   1. 关卡预放 AI (Level 预置): AMeleeAIController::SetupMeleeAI 末尾激活
-     *   2. 大厅 AI (房主 UI 添加): URoomSpawnSubsystem::SpawnAIInternal 激活
-     *   3. AI 复活 (死亡后): URoomSpawnSubsystem::RequestRespawn 激活
-     *
-     * 编辑器配置路径:
-     *   DA_AIBehaviorConfig_XXX → Spawn → SpawnInvincibilitySeconds
-     *
-     * 取值约定:
-     *   - > 0  : 激活该秒数无敌
-     *   - <= 0 : 静默跳过 (用户明确选择: 0 = 不需要无敌期)
-     */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Spawn",
-        meta = (ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "10.0",
-                DisplayName = "SpawnInvincibilitySeconds (所有 AI 共用 — 复活无敌期秒数, 0=禁用)"))
-    float SpawnInvincibilitySeconds = 2.0f;
+    // 【v120 保留字段】纯 AI 行为参数 (不迁移):
+    //   - AttackRange / AttackCooldown / AttackRangeHysteresis 等攻击配置
+    //   - PerceptionConfig / bDetectNeutrals 等感知配置
+    //   - LevelPlacedBehaviorTree / LevelPlacedAIControllerClass 等 AI 生成配置
+    //   - Zombie* / Retreat* / ReflexChange* 等纯生化模式 AI 参数
 
     // ========================================================================
     // Getter 方法

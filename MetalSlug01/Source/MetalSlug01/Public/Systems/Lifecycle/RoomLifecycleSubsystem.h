@@ -207,11 +207,35 @@ public:
 	 */
 	void SetMotherMutationDuration(float InSeconds) { MotherMutationDurationSeconds = InSeconds; }
 
+	// 【生化模式】空投倒计时配置 (服务器权威, 由 GameMode 注入)
+	void SetAirdropInterval(float InSeconds) { AirdropIntervalSeconds = InSeconds; }
+
+	// 【生化模式】母体变异倒计时结束后启动首轮空投倒计时
+	void StartAirdropCountdown();
+
+	// 【生化模式】空投系统确认本次空投已降临完毕后调用，重新启动下一轮倒计时
+	UFUNCTION(BlueprintCallable, Category = "Room|Lifecycle|Airdrop")
+	void NotifyAirdropArrivalCompleted();
+
 	/**
-	 * 【v108 大厂架构新增】注入母体变异数量
-	 * @param InCount 数量 (来自 GameMode.MotherMutationCount, 已 ClampMin=1 ClampMax=10)
-	 * @note 注入时机: InitGame 一次性, 改配置需重启游戏 (用户决策)
+	 * 【v117 大厂架构新增】空投倒计时到期回调 (服务器内部)
+	 *
+	 * 业务规则 (用户 2026.08.03):
+	 *   - AirdropIntervalTimer 到期时调此函数
+	 *   - 调 AirdropSubsystem::SpawnAirdropAtAllPoints (生成新空投 + 清理旧空投)
+	 *   - 然后调 NotifyAirdropArrivalCompleted (启动下一轮倒计时, 等待下次降临)
+	 *
+	 * 大厂原则 — 单一入口:
+	 *   - 倒计时"到期"= 服务器业务事件 (不是 UI 事件)
+	 *   - UI 倒计时显示: GameState.OnRep_AirdropCountdownState 客户端被动渲染
+	 *   - 业务触发: 服务器 SetTimer 到期 → 本函数 → AirdropSubsystem.SpawnAirdropAtAllPoints
+	 *
+	 * 大厂原则 — 镜像 v93.1 MotherMutationTimerHandle:
+	 *   - StartAirdropCountdown 末尾 SetTimer(Duration) → 到期调本函数
+	 *   - ResetAirdropCountdown 内部 ClearTimer 防残留
+	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的
 	 */
+	void OnAirdropIntervalExpired();
 	void SetMotherMutationCount(int32 InCount)
 	{
 		CachedMotherMutationCount = FMath::Max(1, InCount);
@@ -277,6 +301,17 @@ protected:
 	FTimerHandle MotherMutationTimerHandle;
 
 	/**
+	 * 【v117 大厂架构新增】空投降临倒计时到期定时器句柄
+	 *
+	 * 大厂原则 — 镜像 MotherMutationTimerHandle:
+	 *   - StartAirdropCountdown 末尾 SetTimer(AirdropIntervalSeconds) → 到期调 OnAirdropIntervalExpired
+	 *   - OnAirdropIntervalExpired 调 AirdropSubsystem::SpawnAirdropAtAllPoints + NotifyAirdropArrivalCompleted
+	 *   - ResetMotherMutationCountdown 内部一并 ClearTimer 防残留
+	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的
+	 */
+	FTimerHandle AirdropIntervalTimerHandle;
+
+	/**
 	 * 是否已经广播过 OnBattleStarted (幂等保护)
 	 */
 	bool bBattleStartedBroadcasted = false;
@@ -299,6 +334,12 @@ protected:
 	 * <= 0 表示禁用 (匹配逻辑里不启动倒计时)
 	 */
 	float MotherMutationDurationSeconds = 8.0f;
+
+	/**
+	 * 空投倒计时总时长 (秒), 由 GameMode 注入, 默认 120 秒。
+	 * 只有母体变异倒计时结束后才会写入 GameState。
+	 */
+	float AirdropIntervalSeconds = 120.0f;
 
 	/**
 	 * 【v108 大厂架构新增】母体变异数量 (由 GameMode.MotherMutationCount 注入)

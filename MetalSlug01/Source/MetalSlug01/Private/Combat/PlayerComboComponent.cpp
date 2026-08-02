@@ -21,6 +21,11 @@
 // ==========================================
 // 引入本组件头文件
 #include "Combat/PlayerComboComponent.h"
+// 【v119 大厂架构新增】母体加速技能 — UseSkill 按键触发
+#include "Combat/MotherSkillComponent.h"
+// 【v120 大厂架构重构】母体技能参数从 PlayerConfigAsset 读取
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
+#include "Data/Config/PlayerConfigAsset.h"
 
 // 引入 Owner Character
 #include "Characters/BaseCharacter.h"
@@ -156,7 +161,7 @@ void UPlayerComboComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	// 清空 Input Action 引用 (避免 transient 引用残留)
 	LightAttackAction = nullptr;
 	HeavyAttackAction = nullptr;
-	UseSkillAction = nullptr;
+	IA_MotherSkill = nullptr;
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -176,11 +181,11 @@ void UPlayerComboComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
  */
 void UPlayerComboComponent::SetInputActions(UInputAction* InLightAttackAction,
                                             UInputAction* InHeavyAttackAction,
-                                            UInputAction* InUseSkillAction)
+                                            UInputAction* InIA_MotherSkill)
 {
 	LightAttackAction = InLightAttackAction;
 	HeavyAttackAction = InHeavyAttackAction;
-	UseSkillAction = InUseSkillAction;
+	IA_MotherSkill = InIA_MotherSkill;
 }
 
 
@@ -192,7 +197,7 @@ void UPlayerComboComponent::SetInputActions(UInputAction* InLightAttackAction,
  *     EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Started,   this, &LightAttack_Pressed);
  *     EnhancedInputComponent->BindAction(LightAttackAction, ETriggerEvent::Completed, this, &LightAttack_Released);
  *     EnhancedInputComponent->BindAction(HeavyAttackAction, ETriggerEvent::Started,   this, &HeavyAttack);
- *     EnhancedInputComponent->BindAction(UseSkillAction,    ETriggerEvent::Started,   this, &UseSkill);
+ *     EnhancedInputComponent->BindAction(IA_MotherSkill,    ETriggerEvent::Started,   this, &UseSkill);
  *
  *   新代码 (本方法): 把 this 改为 this (组件本身), 行为完全一致
  *
@@ -248,9 +253,9 @@ void UPlayerComboComponent::BindInputActions(UEnhancedInputComponent* EnhancedIn
 	}
 
 	// 绑定技能: Started → UseSkill
-	if (UseSkillAction)
+	if (IA_MotherSkill)
 	{
-		EnhancedInputComponent->BindAction(UseSkillAction, ETriggerEvent::Started,
+		EnhancedInputComponent->BindAction(IA_MotherSkill, ETriggerEvent::Started,
 			this, &UPlayerComboComponent::UseSkill);
 	}
 }
@@ -440,16 +445,20 @@ void UPlayerComboComponent::HeavyAttack()
 /**
  * UseSkill — 释放技能事件
  *
- * TODO: 技能系统具体实现 (暂留空, 与原 BaseCharacter 行为一致)
+ * 【v119 大厂架构新增】母体加速技能 — 按 E 键触发
+ * 详见 UseSkill() 函数内部注释
  */
 void UPlayerComboComponent::UseSkill()
 {
-
-	// ==================================================================
-	// 【v40.6 P0】按需解析 Owner — 不依赖 BeginPlay 缓存
-	// ===================================================================
 	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
 	if (!OwnerCharacter)
+	{
+		return;
+	}
+
+	// 【v121.3 零兜底】拒绝在 CDO 上调用
+	// 根因: BP 在 HotReload 后错误地在 CDO 上调用此方法
+	if (OwnerCharacter->HasAnyFlags(RF_ClassDefaultObject))
 	{
 		return;
 	}
@@ -460,8 +469,55 @@ void UPlayerComboComponent::UseSkill()
 		return;
 	}
 
-	// TODO: 技能系统具体实现
-	// 这里可以扩展为技能槽系统, 支持多个技能
+	// ==================================================================
+	// 【v120 2026.08.03 大厂架构重构】母体加速技能 — UseSkill 按键触发
+	// 触发链:
+	//   1. 玩家按 IA_MotherSkill (E 键)
+	//   2. PlayerComboComponent::UseSkill()
+	//   3. 从 PlayerConfigAsset 读母体技能参数
+	//   4. MotherSkillComponent::ActivateSkill(SpeedMultiplier, Duration, Cooldown, CurrentSpeed)
+	//   5. 状态变更 → BaseCharacter 订阅 OnSkillStateChanged → 改 MaxWalkSpeed
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 真理源: DA_PlayerConfig → Config|Combat|Mother → MotherSkillSpeedMultiplier/Duration/Cooldown
+	//   - 与 BTTask_ActivateMotherSpeedBoost (AI 路径) 逻辑对称
+	//   - 只有母体 Pawn 才有 MotherSkillComponent, 非母体静默 no-op
+	// ==================================================================
+	if (UMotherSkillComponent* SkillComp = OwnerCharacter->ResolveMotherSkillComponent())
+	{
+		// 从 PlayerConfigAsset 读母体技能参数 (真理源)
+		float SpeedMultiplier = 2.0f;
+		float Duration = 2.0f;
+		float Cooldown = 10.0f;
+		// 【v121.3 修正】技能基础速度用 MotherMaxWalkSpeed (真理源), 不是当前 MaxWalkSpeed
+		// 原因: 母体基础速度由 MotherMaxWalkSpeed 决定, 技能应基于此基准加速
+		float BaseSpeed = OwnerCharacter->GetCharacterMovement()->MaxWalkSpeed;
+
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+		{
+			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+			{
+				SpeedMultiplier = PC->MotherSkillSpeedMultiplier;
+				Duration = PC->MotherSkillDurationSeconds;
+				Cooldown = PC->MotherSkillCooldownSeconds;
+				// 技能基础速度 = MotherMaxWalkSpeed (大厂原则 — 单一真理源)
+				BaseSpeed = PC->MotherMaxWalkSpeed;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[PlayerComboComponent::UseSkill] PlayerConfigAsset 为空. Pawn=%s 使用默认值."),
+					*OwnerCharacter->GetName());
+			}
+		}
+
+		SkillComp->ActivateSkill(SpeedMultiplier, Duration, Cooldown, BaseSpeed);
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent::UseSkill] 触发母体加速技能. Pawn=%s SpeedMul=%.1fx Duration=%.1fs Cooldown=%.1fs (真理源=PlayerConfigAsset)"),
+			*OwnerCharacter->GetName(), SpeedMultiplier, Duration, Cooldown);
+	}
+	// 非母体 Pawn (无 MotherSkillComponent): no-op, 静默跳过
 }
 
 

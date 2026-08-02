@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Systems/Lifecycle/RoomLifecycleSubsystem.h"
+#include "Systems/Airdrop/RoomAirdropSubsystem.h"  // 【v117】空投子系统回调
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomPlayerController.h"
@@ -375,8 +376,9 @@ void URoomLifecycleSubsystem::StartMotherMutationCountdown()
 		return;
 	}
 
-	// 委托给 GameState 写入 Replicated 字段
-	RoomGS->StartMotherMutationCountdown(MotherMutationDurationSeconds);
+		// 【生化模式】新一轮母体变异倒计时开始前，关闭上一轮空投状态。
+		RoomGS->ResetAirdropCountdown();
+		RoomGS->StartMotherMutationCountdown(MotherMutationDurationSeconds);
 
 	// 【v93.1 大厂架构】重置防重入标志 (新局开始时)
 	RoomGS->ResetMotherMutationHasFired();
@@ -454,6 +456,8 @@ void URoomLifecycleSubsystem::ResetMotherMutationCountdown()
 		return;
 	}
 
+	// 【生化模式】当前小局结束时关闭空投倒计时，下一小局母体变异结束后再解锁。
+	RoomGS->ResetAirdropCountdown();
 	RoomGS->ResetMotherMutationCountdown();
 
 	// 【v93.1 大厂架构】ClearTimer 防残留 (镜像 MatchTimerHandle)
@@ -466,5 +470,208 @@ void URoomLifecycleSubsystem::ResetMotherMutationCountdown()
 		{
 			World->GetTimerManager().ClearTimer(MotherMutationTimerHandle);
 		}
+
+		// 【v117 大厂架构新增】同步清理空投降临倒计时 Timer
+		//   - 模式切换 / 整场结束 → 必须清掉空投 Timer, 防止"幽灵降临"
+		//   - 同 v93.1 防残留逻辑
+		if (AirdropIntervalTimerHandle.IsValid())
+		{
+			World->GetTimerManager().ClearTimer(AirdropIntervalTimerHandle);
+		}
 	}
+}
+
+
+// ==========================================
+// 【生化模式】空投降临倒计时 — 单一调度入口
+// ==========================================
+//
+// 业务规则 (用户 2026.08.03 明确):
+//   - 每小局开局先走母体变异倒计时 (玩家 + AI 互相无敌)
+//   - 母体变异一结束, 立刻启动首轮空投倒计时
+//   - 空投实际降临完毕后, 由空投系统回调 NotifyAirdropArrivalCompleted 重新倒计时
+//   - 任何切换回合 / 模式切换 / GameMode 兜底, 都要把空投倒计时关掉
+//
+// 大厂原则 — 单一入口:
+//   - 启动入口: StartAirdropCountdown (母体变异倒计时 SetTimer 回调结束时调用)
+//   - 复用入口: NotifyAirdropArrivalCompleted (空投系统降临完毕时调用)
+//   - 重置入口: 已被 ResetMotherMutationCountdown + StartMotherMutationCountdown 镜像调用
+//
+// 大厂原则 — 零兜底:
+//   - 配错 AirdropIntervalSeconds <= 0 → 静默跳过 (用户决策 A: 业务可禁用)
+//   - 非生化模式 → 跳过 (镜像母体变异倒计时的模式守卫)
+//   - GameState 为空 → Log Error + return
+//   - 重复启动: ClearTimer 旧的再 SetTimer 新的 (镜像 v92 MotherMutationTimerHandle)
+
+/**
+ * URoomLifecycleSubsystem::StartAirdropCountdown
+ *
+ * 服务器内部入口 — 由母体变异倒计时到期时调用, 启动首轮空投倒计时
+ *
+ * 大厂原则 — 镜像 StartMotherMutationCountdown:
+ *   - 启动前先 Reset 上一轮空投状态 (避免 StartTime/Duration 残留)
+ *   - 启动后 SetTimer 到期, 由空投系统回调 NotifyAirdropArrivalCompleted 重新倒计时
+ *   - GameState 是数据源, Subsystem 是调度者, 不持有状态
+ */
+void URoomLifecycleSubsystem::StartAirdropCountdown()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] StartAirdropCountdown: World 为空, 拒绝启动空投倒计时."));
+		return;
+	}
+
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] StartAirdropCountdown: GameState 为空, 拒绝启动空投倒计时."));
+		return;
+	}
+
+	// 大厂原则 — 镜像 StartMotherMutationCountdown: 仅生化模式启动
+	if (RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomLifecycle] StartAirdropCountdown: 当前模式=%d, 非生化模式, 跳过启动空投倒计时."),
+			static_cast<int32>(RoomGS->CurrentMatchMode));
+		return;
+	}
+
+	// 大厂原则 — 用户决策 A: 配错 ≤ 0 静默跳过
+	if (AirdropIntervalSeconds <= 0.0f)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomLifecycle] StartAirdropCountdown: AirdropIntervalSeconds=%.2f <= 0, "
+			     "业务禁用空投倒计时, 跳过启动. (按用户决策 A 静默跳过)"),
+			AirdropIntervalSeconds);
+		return;
+	}
+
+	// 业务规则前置 — 母体变异倒计时未结束, 不允许启动空投倒计时
+	//   - 这是用户 2026.08.03 明确的业务规则
+	//   - 即使服务器内部误调, 也必须挡掉, 不允许"变异前就先有空投"
+	if (RoomGS->GetMotherMutationRemainingSeconds() > 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] StartAirdropCountdown: 母体变异倒计时仍剩余 %d 秒, 拒绝启动空投倒计时. "
+			     "【业务规则】空投倒计时必须在母体变异结束后才能启动. "
+			     "【修复】检查调用时机, 确认母体变异 SetTimer 已到期或已被 ResetMotherMutationCountdown."),
+			RoomGS->GetMotherMutationRemainingSeconds());
+		return;
+	}
+
+	// 启动 — 写入 GameState Replicated 字段, 引擎自动同步到所有客户端
+	RoomGS->StartAirdropCountdown(AirdropIntervalSeconds);
+
+	// 【v117 大厂架构新增】启动倒计时到期 Timer
+	// 大厂原则 — 镜像 v93.1 MotherMutationTimerHandle:
+	//   - Timer 到期 → OnAirdropIntervalExpired → AirdropSubsystem::SpawnAirdropAtAllPoints
+	//   - 这是"空投降临"业务事件, 不是 UI 事件
+	//   - 旧版 (上一轮 UI 接入) 漏接 Timer 回调, 倒计时永远不触发 Spawn — v117 修复
+	//   - 重复启动防御: ClearTimer 旧的再 SetTimer 新的 (同 v93.1 模式)
+	if (AirdropIntervalTimerHandle.IsValid())
+	{
+		World->GetTimerManager().ClearTimer(AirdropIntervalTimerHandle);
+	}
+
+	World->GetTimerManager().SetTimer(
+		AirdropIntervalTimerHandle,
+		this,
+		&URoomLifecycleSubsystem::OnAirdropIntervalExpired,
+		AirdropIntervalSeconds,
+		false); // 一次性, 不循环
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] StartAirdropCountdown: 空投降临倒计时已启动, Duration=%.2fs"),
+		AirdropIntervalSeconds);
+}
+
+
+// ==========================================
+// 【v117 大厂架构新增】空投降临倒计时到期回调
+// ==========================================
+
+/**
+ * URoomLifecycleSubsystem::OnAirdropIntervalExpired
+ *
+ * 业务规则 (用户 2026.08.03):
+ *   - 空投降临倒计时到期 = 服务器业务事件, 触发空投降临
+ *   - 调 AirdropSubsystem::SpawnAirdropAtAllPoints 销毁旧空投 + 生成新空投
+ *   - 然后调 NotifyAirdropArrivalCompleted 启动下一轮倒计时 (循环往复)
+ *
+ * 大厂原则 — 单一入口:
+ *   - 倒计时到期 = 唯一业务触发点 (客户端 UI 倒计时只是显示, 不触发业务)
+ *   - 业务调用链: OnAirdropIntervalExpired → SpawnAirdropAtAllPoints → NotifyAirdropArrivalCompleted
+ *   - 后者复用 StartAirdropCountdown 的全部校验 + 业务闸
+ *
+ * 大厂原则 — 镜像 v93.1 MotherMutationTimer 回调:
+ *   - 单一职责: 只负责"倒计时到期 → 触发业务"
+ *   - 不持有业务逻辑, 委托给 AirdropSubsystem
+ *
+ * 大厂原则 — 零兜底:
+ *   - World 为空 → Log Error + return (Timer 回调时 World 不应为空, 防御用)
+ *   - AirdropSubsystem 为空 → Log Error + return (没注入/没创建)
+ */
+void URoomLifecycleSubsystem::OnAirdropIntervalExpired()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] OnAirdropIntervalExpired: World 为空, 拒绝触发空投降临. 【防御】Timer 回调时 World 不应为空."));
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomLifecycle] OnAirdropIntervalExpired: 空投降临倒计时到期, 触发空投生成 + 清理旧空投."));
+
+	// 大厂原则 — 单一入口: 委托 AirdropSubsystem 处理 "销毁旧 + 生成新"
+	if (URoomAirdropSubsystem* AirdropSys = URoomAirdropSubsystem::Get(this))
+	{
+		const int32 SpawnedCount = AirdropSys->SpawnAirdropAtAllPoints();
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomLifecycle] OnAirdropIntervalExpired: 本轮共生成 %d 个空投, 现在启动下一轮倒计时."),
+			SpawnedCount);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] OnAirdropIntervalExpired: URoomAirdropSubsystem 不可用, 拒绝 Spawn. "
+			     "【修复】检查 ARoomGameMode::InjectSubsystemConfigs 或 WorldSubsystem 创建时机."));
+		return;
+	}
+
+	// 大厂原则 — 立即启动下一轮倒计时: 业务上"本轮空投降临"后立刻开始"下一轮倒计时"
+	//   - 复用 StartAirdropCountdown 的全部校验 (模式/配置/母体变异状态)
+	//   - 防止"降临完后没下一轮, 玩家永远吃不到补给"
+	NotifyAirdropArrivalCompleted();
+}
+
+
+/**
+ * URoomLifecycleSubsystem::NotifyAirdropArrivalCompleted
+ *
+ * 服务器公开入口 — "确认当前空投已降临完毕", 启动下一轮空投倒计时
+ *
+ * 大厂原则 — 镜像 StartAirdropCountdown:
+ *   - 业务上等同于"新一轮空投降临开始倒计时"
+ *   - 复用 StartAirdropCountdown 的全部校验 (模式/配置/母体变异状态守卫)
+ *   - 重复启动: StartAirdropCountdown 内部已 ClearTimer 防残留
+ *
+ * 大厂原则 — 入口:
+ *   - 业务方调用: 空投系统确认本次空投降临完毕 (v117 暂未接入, 未来可由空投管理器调用)
+ *   - 内部调用: OnAirdropIntervalExpired (倒计时到期时)
+ */
+void URoomLifecycleSubsystem::NotifyAirdropArrivalCompleted()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] NotifyAirdropArrivalCompleted: 收到空投降临完毕事件, 准备重启下一轮空投倒计时."));
+
+	// 大厂原则 — 单一入口: 复用 StartAirdropCountdown 的全部校验 + 业务闸
+	//   - 模式守卫 / AirdropIntervalSeconds 守卫 / 母体变异状态守卫 全部继承
+	StartAirdropCountdown();
 }

@@ -12,6 +12,8 @@
 // 引入在线子系统（用于创建/管理网络会话）
 #include "OnlineSubsystem.h"
 
+#include "Pickups/AirdropPickup.h"
+
 // 引入房间玩家控制器（用于类型转换）
 #include "Systems/RoomPlayerController.h"
 
@@ -369,6 +371,7 @@ void ARoomGameMode::InjectSubsystemConfigs()
 	if (LifeSys)
 	{
 		LifeSys->SetMotherMutationDuration(MotherMutationDurationSeconds);
+		LifeSys->SetAirdropInterval(AirdropIntervalSeconds);
 		LifeSys->SetTotalRounds(TotalRounds);
 		LifeSys->SetZombieMatchDuration(ZombieMatchDurationSeconds);
 
@@ -379,8 +382,8 @@ void ARoomGameMode::InjectSubsystemConfigs()
 		LifeSys->SetMotherSelectionPolicy(MotherSelectionPolicy);
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomGameMode] 注入 LifecycleSubsystem: MotherMutationDuration=%.2fs, TotalRounds=%d, ZombieMatchDuration=%ds, MotherMutationCount=%d, MotherSelectionPolicy=%d"),
-			MotherMutationDurationSeconds, TotalRounds, ZombieMatchDurationSeconds,
+			TEXT("[RoomGameMode] 注入 LifecycleSubsystem: MotherMutationDuration=%.2fs, AirdropInterval=%.2fs, TotalRounds=%d, ZombieMatchDuration=%ds, MotherMutationCount=%d, MotherSelectionPolicy=%d"),
+			MotherMutationDurationSeconds, AirdropIntervalSeconds, TotalRounds, ZombieMatchDurationSeconds,
 			MotherMutationCount, static_cast<int32>(MotherSelectionPolicy));
 	}
 	else

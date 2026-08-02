@@ -218,7 +218,57 @@ void UCharacterEvents::SetWeaponPanelVisibility(bool bIsVisible)
 	UE_LOG(LogTemp, Display,
 		TEXT("[CharacterEvents] SetWeaponPanelVisibility: bIsVisible=%d"),
 		bIsVisible ? 1 : 0);
-	OnWeaponPanelVisibilityChanged.Broadcast(bIsVisible);
+		OnWeaponPanelVisibilityChanged.Broadcast(bIsVisible);
+}
+
+
+// ==========================================
+// 【v119 2026.08.03】母体加速技能冷却事件广播
+// ==========================================
+
+/**
+ * UCharacterEvents::BroadcastMotherSkillCooldown 【v119 新增】
+ *
+ * 广播母体加速技能冷却状态 — 由 BaseCharacter 在订阅 MotherSkillComponent 事件时调用
+ *
+ * 大厂原则 - "事件 + 缓存"双轨制:
+ *   - 广播时同步写缓存 (CachedSkillCooldownRemaining / bCachedSkillIsActive)
+ *   - 新订阅者订阅成功后主动读缓存 → 触发一次"补发"
+ *
+ * 真理源: MotherSkillComponent (Replicated 字段, 服务器写入)
+ * 调用方: BaseCharacter::HandleMotherSkillStateChanged (订阅 MotherSkillComponent.OnSkillStateChanged)
+	 *
+	 * @param CDProgress 冷却进度 (0=就绪无遮罩, 1=冷却中全遮罩)
+	 * @param bSkillActive      是否正在加速中
+	 */
+void UCharacterEvents::BroadcastMotherSkillCooldown(float CDProgress, bool bSkillActive)
+{
+	CachedSkillCooldownRemaining = CDProgress;  // 复用字段存储 CDProgress
+	bCachedSkillIsActive = bSkillActive;
+
+	OnMotherSkillCooldownChanged.Broadcast(CDProgress, bSkillActive);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[CharacterEvents] BroadcastMotherSkillCooldown: CDProgress=%.2f bSkillActive=%d"),
+		CDProgress, bSkillActive ? 1 : 0);
+}
+
+
+/**
+ * UCharacterEvents::GetCachedMotherSkillCooldown 【v119 新增】
+ *
+ * 获取当前缓存的母体技能冷却状态 — 供 Bind-Snapshot 补发使用
+ *
+ * @param OutCooldownRemaining 输出: 冷却剩余秒数 (>0 = 冷却中, 0 = 就绪)
+ * @param OutbIsActive        输出: 是否正在加速中
+ * @return true=有缓存数据, false=从未广播过
+ */
+bool UCharacterEvents::GetCachedMotherSkillCooldown(float& OutCooldownRemaining, bool& OutbIsActive) const
+{
+	OutCooldownRemaining = CachedSkillCooldownRemaining;
+	OutbIsActive = bCachedSkillIsActive;
+	// 有缓存: 只要冷却剩余时间 >= 0 就算有效 (初始是 0)
+	return true;
 }
 
 

@@ -197,8 +197,13 @@ public:
 	void OnMotherMutationChanged(float StartTime, float Duration);
 
 	/**
-	 * 获取玩家状态 Widget（供其他类安全访问）
+	 * 【生化模式】空投降临倒计时同步回调
+	 *
+	 * 职责: 把 GameState 的权威时间戳转发给 MatchInfoWidget。
+	 * Widget 自身负责倒计时数字、Dirty Flag 与控件显隐。
 	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD")
+	void OnAirdropCountdownChanged(float StartTime, float Duration);
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
 	UPlayerStatusWidget* GetWidget_PlayerStatus() { return Widget_PlayerStatus; }
 
@@ -526,6 +531,18 @@ protected:
 	 */
 	UFUNCTION()
 	void OnInvincibilityChanged(bool bIsNowInvincible);
+
+	/**
+	 * 【v120 新增】母体加速技能冷却回调
+	 *
+	 * 订阅: CharacterEvents.OnMotherSkillCooldownChanged
+	 * 触发: MotherSkillComponent 技能状态/冷却变化
+	 *
+	 * @param CooldownRemaining 冷却剩余秒数
+	 * @param bSkillActive 技能是否激活中 (true=加速中)
+	 */
+	UFUNCTION()
+	void OnMotherSkillCooldownChanged(float CooldownRemaining, bool bSkillActive);
 
 private:
 	/**

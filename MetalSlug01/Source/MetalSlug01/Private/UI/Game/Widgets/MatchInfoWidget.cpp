@@ -77,6 +77,22 @@ bool UMatchInfoWidget::Initialize()
 			TEXT("[MatchInfoWidget] Initialize: Text_MotherMutationCountdown 为空! 请检查 Blueprint 中是否有名为 Text_MotherMutationCountdown 的 TextBlock 控件 (生化模式母体变异倒计时, v92 新增)."));
 	}
 
+	// 【生化模式】空投降临倒计时初始化 — 默认隐藏, 由服务器事件驱动
+	//   - 业务规则: 必须等当前小局母体变异倒计时结束才能显示
+	//   - 任何一次 Reset / 模式切换, 控件都要 Collapsed
+	if (Text_AirdropCountdown)
+	{
+		Text_AirdropCountdown->SetVisibility(ESlateVisibility::Collapsed);
+		Text_AirdropCountdown->SetText(FText::FromString(TEXT("空投降临：0秒")));
+		bIsAirdropCountdownActive = false;
+		LastRenderedAirdropSeconds = -1;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] Initialize: Text_AirdropCountdown 为空! 请检查 Blueprint 中是否有名为 Text_AirdropCountdown 的 TextBlock 控件 (生化模式空投降临倒计时)."));
+	}
+
 	return true;
 }
 
@@ -193,6 +209,68 @@ void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime
 			UE_LOG(LogTemp, Verbose,
 				TEXT("[MatchInfoWidget] 刷新母体变异倒计时: %d秒"),
 				MotherMutationSeconds);
+		}
+	}
+
+	// ==========================================
+	// 【生化模式】空投降临倒计时更新
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.03 明确):
+	//   - 控件在母体变异倒计时结束之前绝不能显示
+	//   - 母体变异一结束, 服务器会写入 AirdropCountdownStartTime/Duration
+	//   - 此时 NativeTick 每秒根据 GameState 计算剩余秒数并刷新
+	//
+	// 大厂原则:
+	//   - 单一真理源: AirdropCountdownStartTime/Duration (GameState Replicated)
+	//   - 客户端本地用 GetAirdropRemainingSeconds() 计算剩余秒数
+	//   - DirtyFlag + NativeTick, 与母体变异倒计时复用同一 Tick 钩子
+	//   - 0秒后自动隐藏 (不依赖服务器 Reset RPC, 镜像 v92 母体变异修复)
+	if (Text_AirdropCountdown && bIsAirdropCountdownActive && CachedGameState)
+	{
+		// 第一道闸: 母体变异倒计时仍在进行, 一律强制隐藏空投倒计时
+		// 这是用户明确要求的"业务规则", 不能让客户端在变母体前就显示空投数字
+		const int32 MotherMutationRemaining = CachedGameState->GetMotherMutationRemainingSeconds();
+		if (MotherMutationRemaining > 0)
+		{
+			if (Text_AirdropCountdown->GetVisibility() != ESlateVisibility::Collapsed)
+			{
+				Text_AirdropCountdown->SetVisibility(ESlateVisibility::Collapsed);
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[MatchInfoWidget] 母体变异倒计时仍剩余 %ds, 空投倒计时继续隐藏."),
+					MotherMutationRemaining);
+			}
+		}
+		else
+		{
+			// 第二道闸: 倒计时归零后正常显示 + 刷新数字
+			const int32 AirdropSeconds = CachedGameState->GetAirdropRemainingSeconds();
+
+			if (AirdropSeconds <= 0)
+			{
+				// 镜像母体变异倒计时的"0秒自动隐藏"修复
+				bIsAirdropCountdownActive = false;
+				Text_AirdropCountdown->SetVisibility(ESlateVisibility::Collapsed);
+				LastRenderedAirdropSeconds = 0;
+				UE_LOG(LogTemp, Log,
+					TEXT("[MatchInfoWidget] 空投倒计时归零, TextBlock 已自动隐藏 (等待服务器下一轮重启)."));
+			}
+			else if (AirdropSeconds != LastRenderedAirdropSeconds)
+			{
+				LastRenderedAirdropSeconds = AirdropSeconds;
+
+				const FString AirdropText = FString::Printf(TEXT("空投降临：%d秒"), AirdropSeconds);
+				Text_AirdropCountdown->SetText(FText::FromString(AirdropText));
+
+				if (Text_AirdropCountdown->GetVisibility() != ESlateVisibility::Visible)
+				{
+					Text_AirdropCountdown->SetVisibility(ESlateVisibility::Visible);
+				}
+
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[MatchInfoWidget] 刷新空投倒计时: %d秒"),
+					AirdropSeconds);
+			}
 		}
 	}
 }
@@ -327,7 +405,15 @@ void UMatchInfoWidget::SetVisibilityByMode(ERoomMatchMode Mode)
 		{
 			Text_RemainingRounds->SetVisibility(ESlateVisibility::Collapsed);
 		}
-		// Text_MotherMutationCountdown 由 UpdateMotherMutationCountdown 事件动态控制, 这里不强制改
+		// 【生化模式】母体变异阶段严禁显示空投倒计时。
+		if (Text_AirdropCountdown)
+		{
+			Text_AirdropCountdown->SetVisibility(ESlateVisibility::Collapsed);
+		}
+
+		// 切到非生化模式时同步清掉空投倒计时激活标志，避免下次回到生化模式时残留。
+		bIsAirdropCountdownActive = false;
+		LastRenderedAirdropSeconds = -1;
 	}
 	else if (Mode == ERoomMatchMode::Zombie)
 	{
@@ -340,6 +426,8 @@ void UMatchInfoWidget::SetVisibilityByMode(ERoomMatchMode Mode)
 			Text_RemainingRounds->SetVisibility(ESlateVisibility::Visible);
 		}
 		// Text_MotherMutationCountdown 由 UpdateMotherMutationCountdown 事件动态控制, 这里不强制改
+		// Text_AirdropCountdown 是否显示由 UpdateAirdropCountdown + NativeTick 决定：
+		// 母体变异倒计时仍在进行时绝不能显示，业务条件由 bIsAirdropCountdownActive 把守。
 	}
 	else
 	{
@@ -410,6 +498,57 @@ void UMatchInfoWidget::UpdateMotherMutationCountdown(float StartTime, float Dura
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[MatchInfoWidget] UpdateMotherMutationCountdown: 倒计时已启动 (StartTime=%.2f, Duration=%.2f), TextBlock 已显示."),
+		StartTime, Duration);
+}
+
+
+// ==========================================
+// 【生化模式】空投降临倒计时控制
+// ==========================================
+
+/**
+ * UMatchInfoWidget::UpdateAirdropCountdown
+ *
+ * 由 GameHUDWidget::OnAirdropCountdownChanged 转发 GameState.OnAirdropCountdownChanged 触发
+ *
+ * 大厂原则 — 与 UpdateMotherMutationCountdown 完全对称:
+ *   - StartTime/Duration <= 0 → 隐藏 TextBlock + 停 Tick
+ *   - StartTime/Duration > 0 → 激活 Tick (NativeTick 内还会做"母体变异未结束则继续隐藏"的业务闸)
+ *
+ * 业务约束 (用户 2026.08.03 明确):
+ *   - 服务器只在母体变异倒计时结束之后才会写入 AirdropCountdownStartTime/Duration
+ *   - 但客户端仍需自我防御: 若当前 GameState 仍有母体变异倒计时, 必须把空投控件继续隐藏
+ *   - 镜像 v92 母体变异"0秒自动隐藏"修复: 倒计时归零时 Widget 主动 Collapsed, 不依赖服务器 Reset RPC
+ */
+void UMatchInfoWidget::UpdateAirdropCountdown(float StartTime, float Duration)
+{
+	if (!Text_AirdropCountdown)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] UpdateAirdropCountdown: Text_AirdropCountdown 为空! 请检查 Blueprint 中是否有名为 Text_AirdropCountdown 的 TextBlock 控件."));
+		return;
+	}
+
+	// 情况 1: 服务器未启动空投倒计时 (StartTime/Duration = 0) → 隐藏 + 停 Tick
+	if (StartTime <= 0.0f || Duration <= 0.0f)
+	{
+		bIsAirdropCountdownActive = false;
+		Text_AirdropCountdown->SetVisibility(ESlateVisibility::Collapsed);
+		LastRenderedAirdropSeconds = -1;
+		UE_LOG(LogTemp, Log,
+			TEXT("[MatchInfoWidget] UpdateAirdropCountdown: 空投倒计时已关闭 (StartTime=%.2f, Duration=%.2f), TextBlock 已隐藏."),
+			StartTime, Duration);
+		return;
+	}
+
+	// 情况 2: 服务器启动空投倒计时
+	//   - 仅记录"激活"标志, 真正显示交给 NativeTick
+	//   - NativeTick 内会再次校验母体变异是否结束, 避免业务违规
+	bIsAirdropCountdownActive = true;
+	LastRenderedAirdropSeconds = -1; // 重置 DirtyFlag, 强制 NativeTick 立即刷新一次
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[MatchInfoWidget] UpdateAirdropCountdown: 空投倒计时已启动 (StartTime=%.2f, Duration=%.2f), 等待 NativeTick 解锁显示."),
 		StartTime, Duration);
 }
 

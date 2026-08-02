@@ -88,6 +88,7 @@
 #include "Combat/CharacterIconComponent.h"  // 头像/武器图标
 #include "Combat/MotherSpawnParticleComponent.h"  // 【v99.1 新增】母体出生粒子
 #include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称)
+#include "Combat/MotherSkillComponent.h"    // 【v119 新增】母体加速技能
 
 // ==========================================
 // 1. 构造函数
@@ -168,6 +169,13 @@ ABaseCharacter::ABaseCharacter()
 	//   - 不破坏刀战模式: 刀战没母体, 永远不触发
 	MotherSlowComponent = CreateDefaultSubobject<UMotherSlowComponent>(TEXT("MotherSlowComponent"));
 
+	// 【v121 大厂架构新增】母体加速技能组件
+	//   - 所有角色都挂载 (零架构分支), 非母体静默 no-op
+	//   - 职责: 技能状态数据权威 (bIsSkillActive, SkillCooldownEndTime) + 事件广播
+	//   - 触发: 玩家按 IA_MotherSkill → UseSkill → ActivateSkill
+	//   - 不破坏刀战模式: 刀战 AI 挂载但无 InputAction 绑定 → UseSkill 静默 no-op
+	MotherSkillComponent = CreateDefaultSubobject<UMotherSkillComponent>(TEXT("MotherSkillComponent"));
+
 	// ==========================================
 	// 【2026.07.12 P0 大厂重构 Phase 2】5 个业务组件 (BaseCharacter 拆分)
 	// ==========================================
@@ -210,8 +218,8 @@ ABaseCharacter::ABaseCharacter()
 	//   - bUseOwnerMesh 默认 false (StartMotherTrace 内置 true)
 	MotherTraceStrategy = CreateDefaultSubobject<UMeleeSwStrategy>(TEXT("MotherTraceStrategy"));
 
-	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p MotherSpawnParticle=%p MotherSpawnSound=%p KillSound=%p MotherLowHealthFlicker=%p"),
-		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get(), MotherSpawnParticle, MotherSpawnSound, KillSound, MotherLowHealthFlicker);
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p MotherSpawnParticle=%p MotherSpawnSound=%p KillSound=%p MotherLowHealthFlicker=%p MotherSlowComponent=%p MotherSkillComponent=%p"),
+		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get(), MotherSpawnParticle, MotherSpawnSound, KillSound, MotherLowHealthFlicker, MotherSlowComponent, MotherSkillComponent);
 
 	// ==========================================
 	// 角色模型设置
@@ -393,6 +401,16 @@ void ABaseCharacter::BeginPlay()
 	if (UMotherSlowComponent* SlowComponent = ResolveMotherSlowComponent())
 	{
 		SlowComponent->OnSlowStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleSlowStateChanged);
+	}
+
+	// 【v119 大厂架构新增】订阅 MotherSkillComponent.OnSkillStateChanged
+	//   - 触发源: BTTask_ActivateMotherSpeedBoost::ExecuteTask → ActivateSkill
+	//   - 表现: BaseCharacter 改 MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
+	//   - 服务器主动 Broadcast + 客户端 OnRep Broadcast = 双发保证 (与 MotherSlow 镜像)
+	//   - 不破坏刀战模式: 刀战 AI 没 MotherSkillComponent, 订阅失败 → Log Error (无害)
+	if (UMotherSkillComponent* SkillComp = ResolveMotherSkillComponent())
+	{
+		SkillComp->OnSkillStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleMotherSkillStateChanged);
 	}
 
 	// 【v100.1 大厂架构】订阅 HealthRegenComponent 回血状态变化
@@ -582,10 +600,13 @@ void ABaseCharacter::HandleSlowStateChanged()
 	}
 	else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(GetController()))
 	{
-		// AI 路径: 读 ConfigSO.MotherSlowSpeed
-		if (UAIBehaviorConfigSO* Config = const_cast<UAIBehaviorConfigSO*>(BaseAIC->GetConfig()))
+		// AI 路径: 读 PlayerConfigAsset.Spawn->PlayerConfigAsset (v120 统一)
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 		{
-			MotherSlowSpeedValue = Config->MotherSlowSpeed;
+			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+			{
+				MotherSlowSpeedValue = PC->MotherSlowSpeed;
+			}
 		}
 	}
 
@@ -680,6 +701,102 @@ void ABaseCharacter::HandleSlowStateChanged()
 		*GetName(), bIsSlowedNow ? 1 : 0, TargetSpeed,
 		bIsPlayerPath ? TEXT("PlayerConfig") : TEXT("ConfigSO"),
 		MotherSlowSpeedValue, Reason);
+}
+
+
+// ==========================================
+// 【v119 大厂架构新增】母体加速技能 — MaxWalkSpeed 修改
+// ==========================================
+
+void ABaseCharacter::HandleMotherSkillStateChanged()
+{
+	// ==========================================
+	// 【v119 大厂架构】母体加速技能激活/结束时改 MaxWalkSpeed
+	// ==========================================
+	//
+	// 触发链:
+	//   BTTask_ActivateMotherSpeedBoost → MotherSkillComponent::ActivateSkill
+	//     → OnSkillStateChanged.Broadcast → 本函数 (服务器 + 客户端)
+	//
+	// 大厂原则 - 与 HandleSlowStateChanged 完全对称:
+	//   - MotherSlowComponent: bIsSlowed=true → MaxWalkSpeed = SlowSpeed
+	//   - MotherSkillComponent: bIsSkillActive=true → MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
+	//
+	// 大厂原则 - 零跨边界:
+	//   - MotherSkillComponent 只管"技能状态" (bIsSkillActive, SpeedMultiplier)
+	//   - BaseCharacter 订阅事件后改 MaxWalkSpeed (Component 不知道 MovementComponent)
+	//
+	// 网络模型:
+	//   - 服务器: OnSkillStateChanged.Broadcast → 本函数执行 → 修改成功
+	//   - 客户端: OnRep_SkillActiveChanged.Broadcast → 本函数执行 → 同一份修改
+	//   - 双发保证 (与 MotherSlow 完全一致)
+
+	UMotherSkillComponent* SkillComp = ResolveMotherSkillComponent();
+	if (!SkillComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][HandleMotherSkillStateChanged] MotherSkillComponent 解析失败. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	if (!MoveComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][HandleMotherSkillStateChanged] CharacterMovement 为空. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	const bool bIsSkillActiveNow = SkillComp->IsSkillActive();
+
+	if (bIsSkillActiveNow)
+	{
+		// 加速激活: MaxWalkSpeed = 缓存原速度 × SpeedMultiplier
+		const float BaseSpeed = SkillComp->GetCachedBaseMaxWalkSpeed();
+		const float SpeedMul = SkillComp->GetCurrentSpeedMultiplier();
+		if (BaseSpeed <= 0.0f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][HandleMotherSkillStateChanged] 加速激活但 CachedBaseMaxWalkSpeed=%.1f (≤0, 未缓存). Pawn=%s. "
+				     "【v119 零兜底】检查 BTTask_ActivateMotherSpeedBoost 是否正确调用 ActivateSkill(CurrentMaxWalkSpeed)."),
+				BaseSpeed, *GetName());
+			return;
+		}
+
+		MoveComp->MaxWalkSpeed = BaseSpeed * SpeedMul;
+		MoveComp->MaxWalkSpeedCrouched = BaseSpeed * SpeedMul * 0.5f;
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][HandleMotherSkillStateChanged] ★ 加速激活: Pawn=%s MaxWalkSpeed=%.1f (Base=%.1f × Mul=%.2fx)"),
+			*GetName(), MoveComp->MaxWalkSpeed, BaseSpeed, SpeedMul);
+	}
+	else
+	{
+		// 加速结束: 还原到缓存原速度 (由 MotherSkillComponent 在激活时缓存)
+		const float BaseSpeed = SkillComp->GetCachedBaseMaxWalkSpeed();
+		if (BaseSpeed > 0.0f)
+		{
+			MoveComp->MaxWalkSpeed = BaseSpeed;
+			MoveComp->MaxWalkSpeedCrouched = BaseSpeed * 0.5f;
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[BaseCharacter][HandleMotherSkillStateChanged] ★ 加速结束还原: Pawn=%s MaxWalkSpeed=%.1f (CachedBase)"),
+				*GetName(), BaseSpeed);
+		}
+		else
+		{
+			// 缓存丢失 (可能是冷却到期自动清缓存) → 用 UE 默认值
+			MoveComp->MaxWalkSpeed = 600.0f;
+			MoveComp->MaxWalkSpeedCrouched = 300.0f;
+
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][HandleMotherSkillStateChanged] 加速结束但 CachedBaseMaxWalkSpeed=%.1f. Pawn=%s. "
+				     "用退化默认值 600.0. 【v119 防御型设计】"),
+				BaseSpeed, *GetName());
+		}
+	}
 }
 
 
@@ -1335,7 +1452,7 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		// 【v38】改用 ResolvePlayerCombo 通用 resolver (防 BP 子类覆写)
 		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
 		{
-			Combo->SetInputActions(LightAttackAction, HeavyAttackAction, UseSkillAction);
+			Combo->SetInputActions(LightAttackAction, HeavyAttackAction, IA_MotherSkill);
 			Combo->BindInputActions(EnhancedInputComponent);
 		}
 		else

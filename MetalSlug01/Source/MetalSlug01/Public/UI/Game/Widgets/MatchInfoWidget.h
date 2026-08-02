@@ -116,9 +116,11 @@ public:
 	void UpdateMotherMutationCountdown(float StartTime, float Duration);
 
 	/**
-	 * 添加攻方人数图标
-	 * 用途: 超过 MaxIconDisplayCount 后不再添加
+	 * 【生化模式】空投降临倒计时更新。
+	 * 由 GameHUDWidget 转发 GameState.OnAirdropCountdownChanged。
 	 */
+	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
+	void UpdateAirdropCountdown(float StartTime, float Duration);
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
 	void AddAttackerIcon(UTexture2D* Icon);
 
@@ -230,6 +232,13 @@ private:
 	UTextBlock* Text_MotherMutationCountdown;
 
 	/**
+	 * 空投降临倒计时文本。
+	 * 只有当前小局母体变异倒计时结束后才允许显示。
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UTextBlock* Text_AirdropCountdown;
+
+	/**
 	 * 最大图标显示数量
 	 * 超过后不再添加
 	 */
@@ -266,4 +275,15 @@ private:
 	 * NativeTick 检查此字段决定是否刷新 TextBlock
 	 */
 	bool bIsMotherMutationCountdownActive = false;
+
+	/**
+	 * 空投倒计时文本上一秒的值，用于 Dirty Flag 优化。
+	 */
+	int32 LastRenderedAirdropSeconds = -1;
+
+	/**
+	 * 空投倒计时状态是否已由服务器解锁。
+	 * 母体变异倒计时进行期间即使收到空投状态，也必须继续隐藏控件。
+	 */
+	bool bIsAirdropCountdownActive = false;
 };

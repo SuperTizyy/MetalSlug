@@ -156,6 +156,39 @@ public:
 	void StartReload();
 
 	// ==========================================
+	// 【v117 大厂架构新增】空投补给接口
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.03):
+	//   - 生化模式空投被人类吃掉时, 主武器所有弹药恢复全满
+	//   - 弹匣 = MagazineSize (DT 配置), 总弹药 = InitialReserveAmmo (DT 配置的初始值)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - MagazineSize 是 Replicated 真理源 (InitializeFromWeaponConfig 写入)
+	//   - InitialReserveAmmo 是 DT 行"满值"快照 (不复制, 服务器权威)
+	//   - ReserveAmmo 是运行时值 (Replicated, 玩家实际剩余)
+	//
+	// 大厂原则 — 弹药全满语义:
+	//   - 玩家打空后 ReserveAmmo=0 → 不能"恢复到 ReserveAmmo" (永远是 0)
+	//   - 必须从 InitialReserveAmmo (DT 行的初值) 恢复, 不是从 ReserveAmmo 衍生
+	//   - 这是大厂原则 — "满" 永远是配置真理源, 不是运行时衍生
+	//
+	// 大厂原则 — 弹药补给不是换弹:
+	//   - 强制清 bIsReloading (补给时不可能在换弹中, 但保险清掉, 防状态错乱)
+	//   - 强制 CurrentAmmo = MagazineSize (不管之前是 0 还是一半)
+	//   - 强制 ReserveAmmo = InitialReserveAmmo (不管之前是 0 还是一半)
+	//   - 广播 OnAmmoChanged (服务器本地, 客户端 OnRep 也会广播)
+	//
+	// 调用方: AAirdropPickup::Handle_OverlapBegin (v117)
+	//
+	// 零兜底:
+	//   - 未初始化 (InitializeFromWeaponConfig 没调) → Log Error + return
+	//   - 重复调用幂等 (强制写, 不重复写也无所谓, 不会有副作用)
+	//   - 不检查 bIsReloading (补给优先级最高, 覆盖换弹状态)
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Fire")
+	void Server_RefillAmmo();
+
+	// ==========================================
 	// 查询接口 (供 HUD / Controller 调用, BlueprintPure)
 	// ==========================================
 
@@ -214,6 +247,22 @@ protected:
 	 */
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
 	int32 ReserveAmmo = 120;
+
+	/**
+	 * 【v117 大厂架构新增】备用弹药初始值 (DT 配置的"满值")
+	 *
+	 * 大厂原则 — 单一真理源 + 防止循环依赖:
+	 *   - 初始化时由 InitializeFromWeaponConfig 写入, 后续不变
+	 *   - 空投 Server_RefillAmmo 把 ReserveAmmo 恢复到 InitialReserveAmmo
+	 *   - 不复制: 客户端不需要 (HUD 只显示当前 ReserveAmmo)
+	 *
+	 * 为什么需要:
+	 *   - 玩家打空全部弹药后 ReserveAmmo=0, 不能"恢复到 ReserveAmmo" (永远是 0)
+	 *   - 真理源必须是 DT 行的初始值, 而不是运行时变量
+	 *   - 这是 v117 大厂原则 — 弹药"全满"的语义必须从真理源拿, 不能从运行时衍生
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
+	int32 InitialReserveAmmo = 120;
 
 	/**
 	 * 射速 — 真理源: FWeaponInfo::FireRateRPM

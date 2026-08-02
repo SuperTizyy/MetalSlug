@@ -17,6 +17,7 @@ class UTextBlock;
 class UImage;
 class UHorizontalBox;
 class UTexture2D;
+class UMotherSkillComponent;
 
 
 /**
@@ -103,6 +104,47 @@ public:
 	void UpdateCharacterIcon(UTexture2D* Icon);
 
 	/**
+	 * 【v121.3 重构】自动从 MotherSkillComponent 获取冷却数据计算倒计时
+	 *
+	 * 冷却进度逻辑:
+	 *   - 冷却中: CDProgress 从 1.0 逐渐减小到 0.0
+	 *   - 冷却结束: CDProgress = 0.0 (无遮罩)
+	 *   - 冷却未开始: CDProgress = 0.0 (无遮罩)
+	 *
+	 * 实现:
+	 *   - 从 Character 获取 MotherSkillComponent
+	 *   - 读取 SkillCooldownEndTime 和 TotalCooldownDuration
+	 *   - 计算: CDProgress = RemainingTime / TotalDuration
+	 *   - 设置 CDProgress 参数到动态材质
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus|MotherSkill")
+	void UpdateMotherSkillCooldownProgress();
+
+	/**
+	 * 【v121 大厂架构新增】设置母体技能图标显隐
+	 *
+	 * @param bIsMother 是否为母体 (true=显示, false=隐藏)
+	 *
+	 * 显隐规则:
+	 *   - 母体 (bIsMother=true) → 显示技能图标
+	 *   - 非母体 (bIsMother=false) → 隐藏技能图标
+	 *
+	 * 调用方: UGameHUDWidget::OnMotherSkillCooldownChanged (由 CharacterEvents.OnMotherSkillCooldownChanged 触发)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "PlayerStatus|MotherSkill")
+	void SetMotherSkillIconVisibility(bool bIsMother);
+
+protected:
+	// ==========================================
+	// 【v121.3 新增】Tick 更新冷却进度
+	// ==========================================
+	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+
+	// ==========================================
+	// 2. 受保护的方法
+	// ==========================================
+
+	/**
 	 * 更新技能图标
 	 * @param SkillIndex 技能槽索引
 	 * @param Icon 图标贴图
@@ -118,13 +160,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void SetSkillCooldown(int32 SkillIndex, float CooldownPercent);
 
-	// ==========================================
-	// 2. AC 图标变色接口
-	// ==========================================
-
 	/**
-	 * 根据 AC 值查表得到对应颜色并应用
-	 * 分档: 0-25 红 / 26-50 橙 / 51-75 黄 / 76+ 蓝白
+	 * 【v119 大厂架构新增】更新母体加速技能冷却状态
+	 *
+	 * @param CooldownRemaining 冷却剩余秒数 (>0 = 冷却中, 0 = 就绪)
+	 * @param bIsActive         是否正在加速中
 	 */
 	UFUNCTION(BlueprintCallable, Category = "PlayerStatus")
 	void RefreshACIconColor(int32 CurrentAC);
@@ -208,6 +248,24 @@ private:
 	/** ACE 值文本（颜色随排名变化） */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* Text_ACEValue;
+
+	// ==========================================
+	// 【v119 大厂架构新增】母体加速技能冷却控件 (仅母体显示)
+	// ==========================================
+
+	/**
+	 * 母体加速技能图标 — 仅母体可见
+	 *
+	 * 显隐规则:
+	 *   - 母体 (bIsMother=true) → 显示
+	 *   - 非母体 (bIsMother=false) → 隐藏
+	 *
+	 * 冷却显示:
+	 *   - CooldownRemaining > 0 → 显示冷却倒计时 (Image 作为遮罩 + Text 显示秒数)
+	 *   - CooldownRemaining = 0 → 显示技能就绪 (无遮罩)
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UImage* Image_MotherSkillIcon;
 
 	// ==========================================
 	// 异步加载支持 (2026-07-01 新增)

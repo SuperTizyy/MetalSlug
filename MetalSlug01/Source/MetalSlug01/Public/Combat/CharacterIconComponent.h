@@ -357,6 +357,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Combat|Icon")
 	void SubscribeToActiveWeaponAmmo();
 
+	/**
+	 * 【v119 大厂架构新增, v120 更新】MotherSkillComponent 状态变化回调
+	 *
+	 * 订阅 MotherSkillComponent->OnSkillStateChanged (在 BeginPlay 中)
+	 *
+	 * 表现:
+	 *   - 从 MotherSkillComponent 拿冷却剩余时间
+	 *   - 从 PlayerConfigAsset 拿冷却总时长
+	 *   - 计算 CDProgress = CooldownRemaining / CooldownTotal
+	 *   - 推送到 CharacterEvents.BroadcastMotherSkillCooldown → HUD 显示冷却遮罩
+	 *
+	 * 大厂原则 - 零跨边界:
+	 *   - MotherSkillComponent 是数据权威 (bIsSkillActive, SkillCooldownEndTime)
+	 *   - PlayerConfigAsset 是冷却总时长权威
+	 *   - CharacterIconComponent 计算 CDProgress 后转发到 CharacterEvents
+	 *   - 不在 CharacterIconComponent 里直接写 HUD (保持职责单一)
+	 */
+	UFUNCTION()
+	void HandleMotherSkillStateChangedFromComponent();
+
 	// ==========================================
 	// UE 生命周期
 	// ==========================================

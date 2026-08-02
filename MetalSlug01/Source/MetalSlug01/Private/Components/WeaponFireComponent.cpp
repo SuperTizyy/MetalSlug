@@ -197,6 +197,11 @@ void UWeaponFireComponent::InitializeFromWeaponConfig(const FWeaponInfo& InWeapo
 	FireRateRPM = InWeaponConfig.FireRateRPM;
 	ReloadTimeSeconds = InWeaponConfig.ReloadTimeSeconds;
 
+	// 【v117 大厂架构新增】缓存"满值"快照 — 空投补给恢复时用
+	//   - 玩家打空后 ReserveAmmo=0, 补给时必须从这里拿
+	//   - 一次性写入, 后续不变 (DT 改了需要重启游戏, 这是用户决策)
+	InitialReserveAmmo = InWeaponConfig.ReserveAmmo;
+
 	// 缓存蒙太奇 (Replicated 自动同步到客户端 — v82 修复)
 	//   旧版 (v70-v81) 注释错误: "蒙太奇资源客户端直接从 BP 资产加载"
 	//   实际: FireMontageHip 来源于 DT_WeaponInfo, 不是 BP 子对象默认属性
@@ -643,6 +648,95 @@ void UWeaponFireComponent::MulticastPlayReloadMontage()
 		ReloadMontage ? *ReloadMontage->GetName() : TEXT("nullptr"));
 
 	Weapon->Multicast_PlayReloadMontage();
+}
+
+
+// ==========================================
+// 【v117 大厂架构新增】空投补给接口 — 服务器权威
+// ==========================================
+
+/**
+ * UWeaponFireComponent::Server_RefillAmmo
+ *
+ * 空投补给入口 — 玩家被空投吃掉时调用, 把主武器所有弹药恢复到"满"
+ *
+ * 业务规则 (用户 2026.08.03):
+ *   - CurrentAmmo = MagazineSize (弹匣满)
+ *   - ReserveAmmo = InitialReserveAmmo (总弹药满 — DT 行的初值)
+ *   - 强制清 bIsReloading (补给优先级最高)
+ *
+ * 大厂原则 — 真理源:
+ *   - MagazineSize: DT 行的弹匣容量 (Replicated 真理源)
+ *   - InitialReserveAmmo: DT 行的备用弹药初值 (服务器权威快照)
+ *   - 不从运行时 ReserveAmmo 派生"满值" — 玩家打空后永远是 0
+ *
+ * 大厂原则 — 零兜底:
+ *   - 未初始化 (bIsInitialized=false) → Log Error + return
+ *   - 服务器权威 (HasAuthority=false) → Log Error + return (客户端不调, 防御)
+ *   - 弹药已经是满的也允许调 (强制写, 幂等无副作用)
+ *
+ * 调用方:
+ *   - AAirdropPickup::Handle_OverlapBegin (v117, 唯一入口)
+ *
+ * 网络同步:
+ *   - CurrentAmmo Replicated → 客户端 OnRep_CurrentAmmo → 广播 OnAmmoChanged
+ *   - ReserveAmmo Replicated → 客户端读最新值 (没有 OnRep_, 但 OnRep_CurrentAmmo 触发时已经同步)
+ */
+void UWeaponFireComponent::Server_RefillAmmo()
+{
+	// 客户端拒绝 — 这是服务器权威方法
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] Server_RefillAmmo: 客户端调用非法 (HasAuthority=false). 仅服务器可执行空投补给."));
+		return;
+	}
+
+	// 零兜底: 未初始化拒绝 (InitializeFromWeaponConfig 没调 = DT 配错, 强制修复)
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] Server_RefillAmmo: WeaponRow=%s 未初始化 (InitializeFromWeaponConfig 没调). 拒绝补给. "
+			     "【修复】检查 WeaponAttachmentComponent::SpawnAndEquipWeapon 是否调用 InitializeFromWeaponConfig."),
+			*CachedWeaponRowName.ToString());
+		return;
+	}
+
+	// 零兜底: DT 配错 (InitialReserveAmmo < 0) → Error, 不能"补给 0 颗"
+	if (InitialReserveAmmo < 0 || MagazineSize <= 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] Server_RefillAmmo: WeaponRow=%s InitialReserveAmmo=%d 或 MagazineSize=%d 配置错. 拒绝补给. "
+			     "【修复】DT_WeaponInfo.ReserveAmmo 必须 >=0, MagazineSize 必须 >=1."),
+			*CachedWeaponRowName.ToString(), InitialReserveAmmo, MagazineSize);
+		return;
+	}
+
+	// 大厂原则 — 补给覆盖一切状态: 即使在换弹中也强制补给 (补给优先级 > 换弹)
+	bIsReloading = false;
+	if (ReloadTimerHandle.IsValid())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(ReloadTimerHandle);
+		OnReloadStateChanged.Broadcast(false); // 同步本地状态给 HUD
+	}
+
+	// 写入真理源 (Replicated 自动同步到客户端)
+	const int32 OldCurrentAmmo = CurrentAmmo;
+	const int32 OldReserveAmmo = ReserveAmmo;
+
+	CurrentAmmo = MagazineSize;
+	ReserveAmmo = InitialReserveAmmo;
+
+	// 服务器本地立即广播 (镜像 InitializeFromWeaponConfig 的做法, 让 HUD 立刻更新)
+	// 【v100 大厂架构 — 完整 3 参数】补给时也传 ReserveAmmo, 保证客户端拿到完整真理源
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponFireComponent] Server_RefillAmmo: WeaponRow=%s 弹药已全满! "
+		     "CurrentAmmo %d→%d / %d, ReserveAmmo %d→%d (InitialReserve=%d)"),
+		*CachedWeaponRowName.ToString(),
+		OldCurrentAmmo, CurrentAmmo, MagazineSize,
+		OldReserveAmmo, ReserveAmmo, InitialReserveAmmo);
 }
 
 

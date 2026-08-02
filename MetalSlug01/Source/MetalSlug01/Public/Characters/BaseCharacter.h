@@ -67,6 +67,7 @@ class UDissolveComponent;
 class UFootstepComponent;
 class UHealthRegenComponent;
 class UMotherSlowComponent;                    // 【v133.5 新增】母体被主武器击中后降速 (镜像 Invincibility 模式)
+class UMotherSkillComponent;                  // 【v119 新增】母体加速技能
 class UInvincibilityFlickerComponent;  // 【v40.8 新增】无敌期视觉闪烁
 class UMotherSpawnParticleComponent;   // 【v99.1 新增】母体出生粒子特效
 class UMotherSpawnSoundComponent;       // 【v99.3 新增】母体出生音效
@@ -94,6 +95,7 @@ class UAudioComponent;                   // 【v100.1 新增】回血音组件 (
 #include "Components/HealthRegenComponent.h"
 #include "Combat/InvincibilityFlickerComponent.h"  // 【v40.8 新增】
 #include "Combat/MotherSlowComponent.h"  // 【v133.5 新增】母体被主武器击中后降速
+#include "Combat/MotherSkillComponent.h" // 【v119 新增】母体加速技能
 #include "Combat/MotherSpawnParticleComponent.h"    // 【v99.1 新增】母体出生粒子
 #include "Combat/MotherSpawnSoundComponent.h"        // 【v99.3 新增】母体出生音效
 #include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
@@ -681,6 +683,21 @@ public:
 	UMotherSlowComponent* MotherSlowComponent;
 
 	/**
+	 * 【v119 大厂架构新增】母体加速技能组件
+	 *
+	 * 职责:
+	 *   - 订阅 MotherSkillComponent->OnSkillStateChanged
+	 *   - 加速激活时: MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
+	 *   - 加速结束时: 还原到 CachedBaseMaxWalkSpeed
+	 *
+	 * 大厂原则 - 与 MotherSlowComponent 完全对称:
+	 *   - MotherSlowComponent: 订阅 → 改 MaxWalkSpeed = SlowSpeed
+	 *   - MotherSkillComponent: 订阅 → 改 MaxWalkSpeed = BaseSpeed × SpeedMultiplier
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Mother")
+	UMotherSkillComponent* MotherSkillComponent;
+
+	/**
 	 * 【v101 大厂架构新增】母体残血虚弱闪烁组件 — 与 InvincibilityFlickerComponent 完全对称
 	 *
 	 * 职责:
@@ -1058,6 +1075,19 @@ public:
 	}
 
 	/**
+	 * 【v119 大厂架构新增】获取母体加速技能组件 (lazy resolve)
+	 *
+	 * 大厂原则 - 与 ResolveMotherSlowComponent 完全对称:
+	 *   - 走 ResolveComponent<T> 模板 (字段 → FindComponentByClass → Log Error)
+	 *   - 调用方拿到 nullptr 时已 Log Error, 不允许静默跳过
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	UMotherSkillComponent* ResolveMotherSkillComponent()
+	{
+		return ResolveComponent<UMotherSkillComponent>(MotherSkillComponent, TEXT("MotherSkillComponent"));
+	}
+
+	/**
 	 * 【2026.07.12 P0 大厂重构 Phase 2】角色头像/武器图标刷新组件 (Phase 2.5)
 	 * 职责: RefreshCharacterIcon/Client_RefreshCharacterIcon_Implementation/RetryRefreshCharacterIcon
 	 *       + RefreshWeaponIconOnHUD/GetCharacterAvatarFromTable
@@ -1409,13 +1439,27 @@ protected:
 	 *
 	 * 职责:
 	 *   - 读 Component.bIsSlowed
-	 *   - 真理源分流: 玩家读 PlayerConfig->MotherSlowSpeed, AI 读 ConfigSO->MotherSlowSpeed
+	 *   - 真理源统一: 玩家/AI 都读 PlayerConfigAsset->MotherSlowSpeed (v120 合并)
 	 *   - 改 MaxWalkSpeed (恢复 OldSpeed / 应用 SlowSpeed)
 	 *
 	 * @note 服务器/客户端都执行 (同一份视觉逻辑)
 	 */
 	UFUNCTION()
 	void HandleSlowStateChanged();
+
+	/**
+	 * 【v119 大厂架构新增】母体加速技能状态变化回调
+	 *
+	 * 订阅 MotherSkillComponent->OnSkillStateChanged
+	 *
+	 * 表现:
+	 *   - bIsSkillActive=true → MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
+	 *   - bIsSkillActive=false → 还原到 CachedBaseMaxWalkSpeed
+	 *
+	 * @note 服务器/客户端都执行 (同一份视觉逻辑)
+	 */
+	UFUNCTION()
+	void HandleMotherSkillStateChanged();
 
 	/**
 	 * 【2026-07-01 新增】本地执行死亡流程
@@ -1780,7 +1824,7 @@ protected:
 	 * 输入动作: 释放技能
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
-	UInputAction* UseSkillAction;
+	UInputAction* IA_MotherSkill;
 
 	/**
 	 * 【v51 大厂架构 — 生化模式】输入动作: 切换武器槽位 (Q 键)

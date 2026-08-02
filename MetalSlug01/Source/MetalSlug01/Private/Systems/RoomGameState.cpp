@@ -201,6 +201,10 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ARoomGameState, MotherMutationStartTime);
 	DOREPLIFETIME(ARoomGameState, MotherMutationDuration);
 
+	// 【生化模式】空投倒计时复制
+	DOREPLIFETIME(ARoomGameState, AirdropCountdownStartTime);
+	DOREPLIFETIME(ARoomGameState, AirdropCountdownDuration);
+
 	// 【v93.1 新增】母体变异触发标志 + 次数复制 (防重入层 2 + 业务统计)
 	// 大厂原则 — 镜像 v27 FactionTag: 没有 DOREPLIFETIME = 客户端永远是默认值 → 防重入失效
 	DOREPLIFETIME(ARoomGameState, MotherMutationHasFired);
@@ -908,4 +912,130 @@ int32 ARoomGameState::GetPendingAICountInFaction(FGameplayTag FactionTag) const
 	{
 		return Entry.FactionTag == FactionTag;
 	}).Num();
+}
+
+
+// ==========================================
+// 【生化模式】空投降临倒计时
+// ==========================================
+
+/**
+ * OnRep_AirdropCountdownState
+ *
+ * 客户端接到 AirdropCountdownStartTime/Duration 同步时的回调
+ * 触发 OnAirdropCountdownChanged 委托, Widget 收到事件后用 GetServerWorldTimeSeconds() 计算剩余秒数
+ *
+ * 大厂原则 — 镜像 OnRep_MotherMutationState:
+ *   - 不在 OnRep 内强制刷 UI (零兜底, 业务方自行决定)
+ *   - 只负责 Broadcast, UI 自己用 DirtyFlag + NativeTick 渲染
+ */
+void ARoomGameState::OnRep_AirdropCountdownState()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_AirdropCountdownState: 空投倒计时同步! StartTime=%.2f, Duration=%.2f"),
+		AirdropCountdownStartTime, AirdropCountdownDuration);
+
+	OnAirdropCountdownChanged.Broadcast(AirdropCountdownStartTime, AirdropCountdownDuration);
+}
+
+
+/**
+ * GetAirdropRemainingSeconds
+ *
+ * 计算空投倒计时剩余秒数
+ * 使用 GetServerWorldTimeSeconds() 自适应网络延迟
+ *
+ * 大厂原则 — 镜像 GetMotherMutationRemainingSeconds:
+ *   - 服务器未启动倒计时 (Duration <= 0) → 返回 0
+ *   - 倒计时已结束 → 返回 0 (不允许负数)
+ *
+ * @return 剩余秒数（最小为 0）
+ */
+int32 ARoomGameState::GetAirdropRemainingSeconds() const
+{
+	// 服务器未启动倒计时, 返回 0
+	if (AirdropCountdownDuration <= 0.0f || AirdropCountdownStartTime <= 0.0f)
+	{
+		return 0;
+	}
+
+	// 使用内置的获取服务器预估世界时间的方法, 自动消除客户端与服务器端的时间差
+	const float CurrentServerTime = GetServerWorldTimeSeconds();
+
+	// 计算倒计时结束时间戳 + 剩余秒数 (钳制到 0 以上)
+	const float EndTime = AirdropCountdownStartTime + AirdropCountdownDuration;
+	const int32 RemainingSeconds = FMath::Max(0, FMath::RoundToInt(EndTime - CurrentServerTime));
+	return RemainingSeconds;
+}
+
+
+/**
+ * StartAirdropCountdown (服务器专用)
+ *
+ * 启动空投倒计时
+ * 写入 AirdropCountdownStartTime/Duration, 引擎自动 Replicate 到所有客户端
+ * OnRep_AirdropCountdownState 会在客户端触发 OnAirdropCountdownChanged 广播
+ *
+ * 大厂原则 — 镜像 StartMotherMutationCountdown:
+ *   - Duration <= 0 → Log Error + return (强制业务方传有效值)
+ *   - 服务器只写权威字段, 客户端本地计算剩余秒数
+ *
+ * @param Duration 倒计时总秒数 (必须 > 0)
+ */
+void ARoomGameState::StartAirdropCountdown(float Duration)
+{
+	// 仅在服务器端执行
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] StartAirdropCountdown: 客户端调用非法, HasAuthority=false. 仅服务器可启动空投倒计时."));
+		return;
+	}
+
+	// 大厂原则 — 零兜底: Duration 必须 > 0
+	if (Duration <= 0.0f)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] StartAirdropCountdown: Duration=%.2f 必须 > 0, 拒绝启动. "
+			     "【修复】检查 LifecycleSubsystem 注入的 AirdropIntervalSeconds 配置."),
+			Duration);
+		return;
+	}
+
+	// 写入 Replicated 字段 (引擎自动复制)
+	AirdropCountdownStartTime = GetServerWorldTimeSeconds();
+	AirdropCountdownDuration = Duration;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 StartMotherMutationCountdown)
+	OnAirdropCountdownChanged.Broadcast(AirdropCountdownStartTime, AirdropCountdownDuration);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] StartAirdropCountdown: 空投降临倒计时已启动! StartTime=%.2f, Duration=%.2fs"),
+		AirdropCountdownStartTime, AirdropCountdownDuration);
+}
+
+
+/**
+ * ResetAirdropCountdown (服务器专用)
+ *
+ * 重置空投倒计时 (关闭倒计时)
+ * 写入 StartTime/Duration = 0, 客户端 GetAirdropRemainingSeconds() 自动返回 0
+ *
+ * 用途: 新小局开始前 / 当前小局结束时 / 模式切换时调用, 强制关闭倒计时
+ */
+void ARoomGameState::ResetAirdropCountdown()
+{
+	// 仅在服务器端执行
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	AirdropCountdownStartTime = 0.0f;
+	AirdropCountdownDuration = 0.0f;
+
+	// 服务器自身不会触发 OnRep, 手动广播
+	OnAirdropCountdownChanged.Broadcast(0.0f, 0.0f);
+
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] ResetAirdropCountdown: 空投倒计时已关闭."));
 }

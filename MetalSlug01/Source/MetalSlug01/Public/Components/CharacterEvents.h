@@ -27,11 +27,13 @@
 #include "CoreMinimal.h"
 #include "Data/Enums/CombatEnums.h" // EACERankType (ACE 排名颜色枚举)
 #include "Components/HealthComponent.h" // FOnInvincibilityChanged (无敌期事件)
-#include "CharacterEvents.generated.h"
 
 // 前向声明 (减少 include 依赖)
 class UTexture2D;
 class UImage;
+
+// 必须放在前向声明之后、DECLARE_* 宏之前
+#include "CharacterEvents.generated.h"
 
 // ----------------------------------------
 // 1. 角色头像事件
@@ -140,6 +142,28 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnWeaponAmmoInfoReady, int32, Cu
  */
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnWeaponPanelVisibilityChanged, bool);
 
+// ----------------------------------------
+// 10. 母体加速技能冷却事件 【v119 2026.08.03 新增】
+// ----------------------------------------
+/**
+ * 母体加速技能冷却状态变化 — 用于 HUD 显示技能冷却
+ *
+ * 业务规则 (用户 2026.08.03 明确):
+ *   - 母体专属技能, 只有母体角色才显示此控件
+ *   - 技能激活时 → 冷却开始
+ *   - 冷却期间 → 显示冷却倒计时
+ *   - 冷却结束 → 显示技能就绪
+ *
+ * 大厂原则 - 单一真理源:
+ *   - 真理源在 MotherSkillComponent (Replicated)
+ *   - CharacterIconComponent 计算 CDProgress
+ *   - CharacterEvents 作为事件总线, 转发冷却状态给 HUD
+ *
+ * @param CDProgress 冷却进度 (0=就绪无遮罩, 1=冷却中全遮罩)
+ * @param bIsActive  是否正在加速中
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMotherSkillCooldownChanged, float, CDProgress, bool, bSkillActive);
+
 
 // ==========================================
 // UCharacterEvents - 角色状态事件总线
@@ -235,6 +259,10 @@ public:
 	/** 武器面板显隐状态变化 【v105 新增 - 母体无武器时隐藏弹药 UI】 */
 	FOnWeaponPanelVisibilityChanged OnWeaponPanelVisibilityChanged;
 
+	/** 母体加速技能冷却状态变化 【v119 新增 - 母体专属技能冷却 HUD】 */
+	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|MotherSkill")
+	FOnMotherSkillCooldownChanged OnMotherSkillCooldownChanged;
+
 	// ==========================================
 	// 【2026-07-01 P0 新增】快照访问器 (订阅者主动拉取)
 	// ==========================================
@@ -323,6 +351,30 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|Weapon")
 	void SetWeaponPanelVisibility(bool bIsVisible);
 
+	/**
+	 * 【v119 新增】广播母体加速技能冷却状态
+	 *
+	 * 真理源: MotherSkillComponent (Replicated 字段, 服务器写入)
+	 * 调用方: BaseCharacter::HandleMotherSkillStateChanged (订阅 MotherSkillComponent.OnSkillStateChanged)
+	 *
+	 * @param CooldownRemaining 冷却剩余秒数 (>0 = 冷却中, 0 = 就绪)
+	 * @param bSkillActive    是否正在加速中
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|MotherSkill")
+	void BroadcastMotherSkillCooldown(float CooldownRemaining, bool bSkillActive);
+
+	/**
+	 * 【v119 新增】获取缓存的母体技能冷却状态
+	 *
+	 * 供 Bind-Snapshot 补发使用
+	 *
+	 * @param OutCooldownRemaining 输出: 冷却剩余秒数
+	 * @param OutbIsActive        输出: 是否正在加速中
+	 * @return true=有缓存数据
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|MotherSkill")
+	bool GetCachedMotherSkillCooldown(float& OutCooldownRemaining, bool& OutbIsActive) const;
+
 protected:
 	// ==========================================
 	// 内部: 复制配置 (RemoteRole=Skip, 事件在本地触发)
@@ -394,4 +446,13 @@ protected:
 	/** 缓存: 是否已有任何武器弹药广播 */
 	UPROPERTY()
 	bool bCachedWeaponAmmoValid = false;
+
+	/** 缓存: 最近一次母体技能冷却广播 - 冷却剩余秒数 (>0 = 冷却中, 0 = 就绪) 【v119 新增】 */
+	UPROPERTY()
+	float CachedSkillCooldownRemaining = 0.0f;
+
+	/** 缓存: 最近一次母体技能冷却广播 - 是否正在加速中 【v119 新增】 */
+	UPROPERTY()
+	bool bCachedSkillIsActive = false;
 };
+

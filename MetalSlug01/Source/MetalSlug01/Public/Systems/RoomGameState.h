@@ -71,6 +71,14 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTotalRoundsUpdated, int32, TotalR
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMotherMutationChanged, float, StartTime, float, Duration);
 
 /**
+ * 【生化模式】空投倒计时状态改变委托。
+ *
+ * 服务器只复制开始时间戳和倒计时总时长，客户端由 GameState 自行计算剩余秒数。
+ * 空投系统在实际降临完毕后，通过服务器事件入口重新启动下一轮倒计时。
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnAirdropCountdownChanged, float, StartTime, float, Duration);
+
+/**
  * @brief 模式切换委托（UI 据此隐藏/显示 Text_RemainingRounds）
  * @param NewMode 新模式
  */
@@ -367,6 +375,58 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Match|Mother")
 	int32 GetMotherMutationRemainingSeconds() const;
+
+	// ==========================================
+	// 【生化模式】空投降临倒计时
+	// ==========================================
+
+	/**
+	 * 空投倒计时开始时间戳（服务器权威世界时间）。
+	 * 倒计时尚未解锁或已被重置时为 0。
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AirdropCountdownState, BlueprintReadOnly, Category = "Room|Match|Airdrop")
+	float AirdropCountdownStartTime = 0.0f;
+
+	/**
+	 * 空投倒计时总时长（秒）。
+	 * 该字段由服务器在每次倒计时启动时写入并复制给客户端。
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AirdropCountdownState, BlueprintReadOnly, Category = "Room|Match|Airdrop")
+	float AirdropCountdownDuration = 0.0f;
+
+	/**
+	 * 空投倒计时复制回调。
+	 * 只广播状态变化，不在 GameState 内直接操作 UI。
+	 */
+	UFUNCTION()
+	void OnRep_AirdropCountdownState();
+
+	/**
+	 * UI 监听的空投倒计时状态委托。
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Match|Airdrop")
+	FOnAirdropCountdownChanged OnAirdropCountdownChanged;
+
+	/**
+	 * 计算空投倒计时剩余秒数。
+	 * 客户端使用服务器世界时间估算值，避免每秒复制倒计时数字。
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Match|Airdrop")
+	int32 GetAirdropRemainingSeconds() const;
+
+	/**
+	 * 服务器启动一轮空投倒计时。
+	 * 首次启动由母体变异倒计时结束触发，后续启动由空投降临完成事件触发。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Airdrop")
+	void StartAirdropCountdown(float Duration);
+
+	/**
+	 * 服务器关闭空投倒计时。
+	 * 新小局开始前、当前小局结束时以及模式切换时调用。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Match|Airdrop")
+	void ResetAirdropCountdown();
 
 	/**
 	 * 【服务器专用】启动母体变异倒计时

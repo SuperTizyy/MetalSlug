@@ -106,6 +106,38 @@ void URoomMotherMutationSubsystem::HandleCountdownExpired()
 		return;
 	}
 
+	// 【v117.4 大厂架构修复】RAII 守卫 — 不论后续 return 路径如何, 都必须:
+	//   1. 清空 GameState.MotherMutationStartTime/Duration (避免 UI 闸门挡空投倒计时)
+	//   2. 启动 Lifecycle->StartAirdropCountdown() (业务规则不变: 母体变异倒计时结束 = 启动空投)
+	// 根因:
+	//   - 旧版 (v117.3) 把这两行写在函数末尾
+	//   - 但 FilterCandidatesByPolicy 失败 / 候选空等 return 路径不会走到末尾
+	//   - 实际日志 (Session 2026.08.03): 候选 1 个玩家 + Policy=1(AIOnly) → FilteredCandidates=0 → return
+	//   - 母体变异字段不清空, UI 闸门永远挡空投倒计时, Text_AirdropCountdown 永远不显示
+	// 大厂原则 — RAII 收口:
+	//   - 这是 "母体变异倒计时结束" 业务的不可变事实 (invariant)
+	//   - 必须无论变异成功与否都执行
+	//   - 即使变异失败 (Filter 候选空), 游戏还要继续, 空投倒计时必须启动
+	// 大厂原则 — 顺序约束:
+	//   - 必须在 Lifecycle->StartAirdropCountdown() 之前 ResetMotherMutationCountdown
+	//   - 原因: Lifecycle 内部校验 "MotherMutationRemainingSeconds > 0 拒绝启动"
+	//   - 必须先 Reset 让字段归零, 才能通过校验
+	ARoomGameState* GuardGameState = World->GetGameState<ARoomGameState>();
+	if (GuardGameState)
+	{
+		GuardGameState->ResetMotherMutationCountdown();
+	}
+	if (Lifecycle)
+	{
+		Lifecycle->StartAirdropCountdown();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherMutation] HandleCountdownExpired: Lifecycle 未注入, 无法启动空投倒计时. "
+			     "【修复】检查 ARoomGameMode::InjectSubsystemConfigs."));
+	}
+
 	// 防御层 1: 单进程防重入
 	if (bMotherMutationFired_Local)
 	{
@@ -260,6 +292,11 @@ void URoomMotherMutationSubsystem::HandleCountdownExpired()
 	UE_LOG(LogTemp, Display,
 		TEXT("[MotherMutation] HandleCountdownExpired: 完成 (期望=%d, 实际变异成功=%d)"),
 		MotherCount, ActualMutated);
+
+	// 【v117.4 大厂架构修复】ResetMotherMutationCountdown + Lifecycle->StartAirdropCountdown
+	//   已在函数入口通过 RAII 守卫集中处理 (任何 return 路径都会执行)
+	//   - 这是 "母体变异倒计时结束" 业务的不可变事实, 不允许业务失败时跳过
+	//   - 镜像 HandleZombieRoundEnd 行为: 母体变异结束 → 启动下一轮业务 (空投倒计时)
 }
 
 

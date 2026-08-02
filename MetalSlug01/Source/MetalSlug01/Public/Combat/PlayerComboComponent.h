@@ -103,7 +103,7 @@ public:
 	/**
 	 * 【Phase 2.1 拆分关键】设置 Input Action 引用
 	 *
-	 * 拆分背景: Input Action (LightAttackAction/HeavyAttackAction/UseSkillAction) 原是 ABaseCharacter 的 UPROPERTY
+	 * 拆分背景: Input Action (LightAttackAction/HeavyAttackAction/IA_MotherSkill) 原是 ABaseCharacter 的 UPROPERTY
 	 *          拆分后, 由 ABaseCharacter::SetupPlayerInputComponent 调本方法注入, 而不是组件自己持有 (职责单一)
 	 *
 	 * 大厂原则:
@@ -113,12 +113,12 @@ public:
 	 *
 	 * @param InLightAttackAction  轻击 Action (可为 nullptr)
 	 * @param InHeavyAttackAction  重击 Action (可为 nullptr)
-	 * @param InUseSkillAction     技能 Action (可为 nullptr)
+	 * @param InIA_MotherSkill     技能 Action (可为 nullptr)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Player|Combo")
 	void SetInputActions(UInputAction* InLightAttackAction,
 	                     UInputAction* InHeavyAttackAction,
-	                     UInputAction* InUseSkillAction);
+	                     UInputAction* InIA_MotherSkill);
 
 	/**
 	 * 【Phase 2.1 拆分关键】绑定输入到 Enhanced Input Component
@@ -410,10 +410,10 @@ private:
 
 	/**
 	 * 技能 Input Action
-	 * 由 SetInputActions 注入, 来自 ABaseCharacter::UseSkillAction
+	 * 由 SetInputActions 注入, 来自 ABaseCharacter::IA_MotherSkill
 	 */
 	UPROPERTY(Transient)
-	TObjectPtr<UInputAction> UseSkillAction = nullptr;
+	TObjectPtr<UInputAction> IA_MotherSkill = nullptr;
 
 
 	// ==========================================

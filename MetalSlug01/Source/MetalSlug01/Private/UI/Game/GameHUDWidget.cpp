@@ -394,7 +394,8 @@ void UGameHUDWidget::OnChatMessageReadyFromWidget(const FString& PlayerName, con
  * 4. 进入结算 -> OnEnterSettlement
  * 5. 显示最终胜负 -> OnShowFinalSettlement
  * 6. 母体变异倒计时 -> OnMotherMutationChanged
- * 7. 立即同步一次
+ * 7. 空投降临倒计时 -> OnAirdropCountdownChanged
+ * 8. 立即同步一次
  * 失败: 0.5 秒重试，最多 5 次
  */
 void UGameHUDWidget::TryBindToGameState()
@@ -424,6 +425,11 @@ void UGameHUDWidget::TryBindToGameState()
 			// 单一真理源: GameState.OnRep_MotherMutationState 触发该委托
 			RoomGS->OnMotherMutationChanged.AddDynamic(this, &UGameHUDWidget::OnMotherMutationChanged);
 
+			// 【生化模式】空投降临倒计时同步 — 镜像母体变异倒计时的绑定路径
+			//   - 单一真理源: GameState.OnRep_AirdropCountdownState 触发该委托
+			//   - HUD 端只做事件路由, 不持有倒计时逻辑
+			RoomGS->OnAirdropCountdownChanged.AddDynamic(this, &UGameHUDWidget::OnAirdropCountdownChanged);
+
 			// 【v92 大厂架构重构】初始化时先刷一次 (总局数, 直接读 GameState.TotalRounds)
 			UpdateTotalRoundsText(RoomGS->TotalRounds);
 
@@ -434,6 +440,9 @@ void UGameHUDWidget::TryBindToGameState()
 			// 大厂原则 — 镜像 Bind-Snapshot 补发: 防止 HUD 订阅晚于服务器 Broadcast 事件
 			// 例如: 服务器已开始倒计时 → HUD 创建 → 直接读 GameState 当前字段 → 立即显示
 			OnMotherMutationChanged(RoomGS->MotherMutationStartTime, RoomGS->MotherMutationDuration);
+
+			// 【生化模式】空投倒计时同步: 镜像 Bind-Snapshot 补发, 防止 HUD 订阅晚于服务器 Broadcast 事件
+			OnAirdropCountdownChanged(RoomGS->AirdropCountdownStartTime, RoomGS->AirdropCountdownDuration);
 
 			UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] 成功绑定 GameState，AttackerKills=%d, DefenderKills=%d"),
 				RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
@@ -588,6 +597,34 @@ void UGameHUDWidget::OnMotherMutationChanged(float StartTime, float Duration)
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[GameHUDWidget] OnMotherMutationChanged: 转发母体变异倒计时到 MatchInfoWidget. StartTime=%.2f, Duration=%.2f"),
+		StartTime, Duration);
+}
+
+
+/**
+ * 【生化模式】空投降临倒计时同步回调 (转发壳)
+ *
+ * 单一真理源 — 由 GameState.OnRep_AirdropCountdownState 触发 OnAirdropCountdownChanged
+ * 职责: 把事件转发给 Widget_MatchInfo, 由 Widget 内部决定显示/隐藏 + NativeTick 刷新数字
+ *
+ * 大厂原则 — 镜像 OnMotherMutationChanged:
+ *   - GameHUDWidget 不持有倒计时逻辑, 只做事件路由
+ *   - Widget_MatchInfo 是唯一显示组件, 同时也是"母体变异未结束则继续隐藏"的业务闸
+ */
+void UGameHUDWidget::OnAirdropCountdownChanged(float StartTime, float Duration)
+{
+	if (!Widget_MatchInfo)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnAirdropCountdownChanged: Widget_MatchInfo 为空, 无法转发空投倒计时!"
+			     " 【修复】检查 WBP_GameHUDWidget 是否绑定了 Widget_MatchInfo (UMatchInfoWidget)."));
+		return;
+	}
+
+	Widget_MatchInfo->UpdateAirdropCountdown(StartTime, Duration);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] OnAirdropCountdownChanged: 转发空投倒计时到 MatchInfoWidget. StartTime=%.2f, Duration=%.2f"),
 		StartTime, Duration);
 }
 
@@ -1053,6 +1090,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 		// 【v105 新增】订阅武器面板显隐状态变化 - 母体无武器时隐藏弹药 UI
 		Events->OnWeaponPanelVisibilityChanged.AddUObject(this, &UGameHUDWidget::OnWeaponPanelVisibilityChanged);
 
+		// 【v120 新增】订阅母体加速技能冷却状态 - 控制 CDProgress 材质参数
+		Events->OnMotherSkillCooldownChanged.AddDynamic(this, &UGameHUDWidget::OnMotherSkillCooldownChanged);
+
 		CachedCharacterEvents = Events;
 
 		UE_LOG(LogTemp, Log,
@@ -1155,6 +1195,21 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 						}
 					}
 				}
+			}
+		}
+
+		// 【v121 大厂架构新增】母体技能图标显隐快照补发
+		// 根因: HUD 订阅成功时，CharacterIconComponent 可能还没有触发 OnMotherSkillCooldownChanged
+		//        → 非母体的技能图标可能一直显示
+		// 修复: HUD 订阅成功后主动设置技能图标显隐（非母体=隐藏，母体=显示）
+		{
+			const bool bIsMother = Character->bIsMother;
+			UE_LOG(LogTemp, Display,
+				TEXT("[GameHUDWidget][Bind-Snapshot] 母体技能图标初始化: bIsMother=%d"),
+				bIsMother ? 1 : 0);
+			if (Widget_PlayerStatus)
+			{
+				Widget_PlayerStatus->SetMotherSkillIconVisibility(bIsMother);
 			}
 		}
 
@@ -1308,6 +1363,9 @@ void UGameHUDWidget::UnbindFromCharacterEvents()
 		CachedCharacterEvents->OnWeaponAmmoInfoReady.RemoveDynamic(this, &UGameHUDWidget::OnWeaponAmmoInfoReady);
 		CachedCharacterEvents->OnInvincibilityChanged.RemoveDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
 		CachedCharacterEvents->OnWeaponPanelVisibilityChanged.RemoveAll(this);
+
+		// 【v120 新增】取消订阅母体加速技能冷却
+		CachedCharacterEvents->OnMotherSkillCooldownChanged.RemoveDynamic(this, &UGameHUDWidget::OnMotherSkillCooldownChanged);
 
 		CachedCharacterEvents = nullptr;
 		CharacterEventsRetryCount = 0;
@@ -1571,3 +1629,42 @@ void UGameHUDWidget::OnInvincibilityChanged(bool bIsNowInvincible)
 			*Widget_RespawnProgress->GetName());
 	}
 }
+
+void UGameHUDWidget::OnMotherSkillCooldownChanged(float CDProgress, bool bSkillActive)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] OnMotherSkillCooldownChanged: CDProgress=%.2f bSkillActive=%d"),
+		CDProgress, bSkillActive ? 1 : 0);
+
+	// 获取 PlayerStatusWidget (持有 Image_MotherSkillIcon)
+	if (!Widget_PlayerStatus)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnMotherSkillCooldownChanged: Widget_PlayerStatus 未绑定!"));
+		return;
+	}
+
+	// 【v121 大厂架构新增】从 CachedCharacterEvents 的 Owner 获取 bIsMother 状态
+	// CachedCharacterEvents 挂在 Pawn 上, Owner 就是 Character
+	bool bIsMother = false;
+	if (CachedCharacterEvents && CachedCharacterEvents->GetOwner())
+	{
+		if (ABaseCharacter* Character = Cast<ABaseCharacter>(CachedCharacterEvents->GetOwner()))
+		{
+			bIsMother = Character->bIsMother;
+		}
+	}
+
+	// 【v121 大厂架构】先设置显隐 (母体才显示)
+	Widget_PlayerStatus->SetMotherSkillIconVisibility(bIsMother);
+
+	// 如果是非母体, 不需要更新冷却进度 (技能图标已隐藏)
+	if (!bIsMother)
+	{
+		return;
+	}
+
+	// 【v121.3 重构】冷却进度由 PlayerStatusWidget 内部自动计算
+	Widget_PlayerStatus->UpdateMotherSkillCooldownProgress();
+}
+

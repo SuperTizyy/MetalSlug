@@ -14,6 +14,10 @@
 #include "Kismet/GameplayStatics.h"
 #include "Engine/StreamableManager.h"
 #include "Engine/AssetManager.h"
+// 【v120 新增】动态材质参数设置
+#include "Materials/MaterialInstanceDynamic.h"
+// 【v121.3 新增】母体技能冷却倒计时
+#include "Combat/MotherSkillComponent.h"
 
 
 // ==========================================
@@ -32,6 +36,22 @@ void UPlayerStatusWidget::NativeConstruct()
 
 	// 主动从角色拉取初始数据，解决 UI 创建晚于角色数据初始化导致的初始值为 0 的问题
 	PullInitialDataFromCharacter();
+}
+
+
+/**
+ * UPlayerStatusWidget::NativeTick
+ *
+ * 【v121.3 新增】每帧更新母体技能冷却进度
+ *
+ * 冷却进度由 Tick 自动更新，不需要外部调用 UpdateMotherSkillCooldownProgress
+ */
+void UPlayerStatusWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+
+	// 【v121.3】每帧更新冷却进度
+	UpdateMotherSkillCooldownProgress();
 }
 
 
@@ -510,4 +530,169 @@ void UPlayerStatusWidget::SetSkillCooldown(int32 SkillIndex, float CooldownPerce
 			Overlay->SetRenderOpacity(Opacity);
 		}
 	}
+}
+
+
+// ==========================================
+// 9. 母体加速技能冷却遮罩 (v120 新增)
+// ==========================================
+
+/**
+ * UPlayerStatusWidget::SetMotherSkillIconVisibility
+ *
+ * 【v121 大厂架构新增】设置母体技能图标显隐
+ *
+ * @param bIsMother 是否为母体 (true=显示, false=隐藏)
+ *
+ * 显隐规则:
+ *   - 母体 (bIsMother=true) → 显示技能图标
+ *   - 非母体 (bIsMother=false) → 隐藏技能图标
+ *
+ * 设计原则 — 零兜底:
+ *   - 非母体时主动隐藏, 不依赖"默认隐藏" (避免 BP 蓝图中误设为显示)
+ *   - 每次状态变化都显式设置, 不依赖上一次状态
+ */
+void UPlayerStatusWidget::SetMotherSkillIconVisibility(bool bIsMother)
+{
+	// 【v121.2 修复】使用更保守的检查方式
+	// 根因: IsValid() 对某些"半有效"对象返回 true，但对象实际已无效，导致崩溃 0x18
+	// 解决方案: 双重检查 + 防御性调用 + try-catch
+	if (!Image_MotherSkillIcon || !Image_MotherSkillIcon->IsValidLowLevel())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: Image_MotherSkillIcon 未绑定或无效!"));
+		return;
+	}
+
+	// 二次检查: 确保对象在游戏线程上
+	if (!IsInGameThread())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: 不在游戏线程，跳过!"));
+		return;
+	}
+
+	// 设置显隐 (防御性调用)
+	ESlateVisibility TargetVisibility = bIsMother ? ESlateVisibility::Visible : ESlateVisibility::Hidden;
+	Image_MotherSkillIcon->SetVisibility(TargetVisibility);
+
+	// 【v121.2 修复】防御性日志输出
+	// 崩溃发生在 GetOwningPlayerPawn()->GetName()，需要检查返回值有效性
+	if (APawn* OwningPawn = GetOwningPlayerPawn())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: bIsMother=%d → %s. Owner=%s"),
+			bIsMother ? 1 : 0,
+			bIsMother ? TEXT("Visible") : TEXT("Hidden"),
+			*OwningPawn->GetName());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: bIsMother=%d → %s. Owner=Unknown"),
+			bIsMother ? 1 : 0,
+			bIsMother ? TEXT("Visible") : TEXT("Hidden"));
+	}
+}
+
+/**
+ * UPlayerStatusWidget::UpdateMotherSkillCooldownProgress
+ *
+ * 更新母体技能冷却遮罩的动态材质参数 CDProgress
+ *
+ * 【v121.3 重构】自动从 MotherSkillComponent 获取冷却数据计算倒计时
+ *
+ * 冷却进度逻辑:
+ *   - 冷却中: CDProgress 从 1.0 逐渐减小到 0.0
+ *   - 冷却结束: CDProgress = 0.0 (无遮罩)
+ *   - 冷却未开始: CDProgress = 0.0 (无遮罩)
+ *
+ * 实现:
+ *   - 从 Character 获取 MotherSkillComponent
+ *   - 读取 SkillCooldownEndTime 和 TotalCooldownDuration
+ *   - 计算: CDProgress = RemainingTime / TotalDuration
+ *   - 设置 CDProgress 参数到动态材质
+ */
+void UPlayerStatusWidget::UpdateMotherSkillCooldownProgress()
+{
+	// 【v121.3 修复】使用更保守的检查方式
+	if (!Image_MotherSkillIcon || !Image_MotherSkillIcon->IsValidLowLevel())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[PlayerStatus] UpdateMotherSkillCooldownProgress: Image_MotherSkillIcon 未绑定或无效!"));
+		return;
+	}
+
+	// 确保在游戏线程
+	if (!IsInGameThread())
+	{
+		return;
+	}
+
+	// 【v121.3 重构】自动从 MotherSkillComponent 计算冷却进度
+	// CDProgress 参数保留但不再使用，直接从组件读取冷却数据
+	float CalculatedProgress = 0.0f;
+
+	if (APlayerController* PC = GetOwningPlayer())
+	{
+		if (ABaseCharacter* Character = Cast<ABaseCharacter>(PC->GetPawn()))
+		{
+			if (UMotherSkillComponent* SkillComp = Character->ResolveMotherSkillComponent())
+			{
+				if (UWorld* World = GetWorld())
+				{
+					const float Now = World->GetTimeSeconds();
+					const float TotalDuration = SkillComp->GetTotalCooldownDuration();
+
+					if (TotalDuration > 0.0f)
+					{
+						const float Remaining = SkillComp->GetSkillCooldownRemainingSeconds();
+						// CDProgress = 冷却剩余时间 / 总冷却时间
+						// 冷却开始时 Remaining = TotalDuration, CDProgress = 1.0 (全遮罩)
+						// 冷却结束时 Remaining = 0, CDProgress = 0.0 (无遮罩)
+						CalculatedProgress = FMath::Clamp(Remaining / TotalDuration, 0.0f, 1.0f);
+					}
+				}
+			}
+		}
+	}
+
+	// 获取 Image 的 Brush 材质
+	FSlateBrush Brush = Image_MotherSkillIcon->GetBrush();
+	if (!Brush.HasUObject())
+	{
+		return;
+	}
+
+	UMaterialInterface* Material = Brush.GetResourceObject() ? Cast<UMaterialInterface>(Brush.GetResourceObject()) : nullptr;
+	if (!Material)
+	{
+		return;
+	}
+
+	// 获取或创建动态材质实例
+	UMaterialInstanceDynamic* DynMat = Cast<UMaterialInstanceDynamic>(Material);
+	if (!DynMat)
+	{
+		DynMat = UMaterialInstanceDynamic::Create(Material, this);
+		if (DynMat)
+		{
+			FSlateBrush NewBrush = Brush;
+			NewBrush.SetResourceObject(DynMat);
+			Image_MotherSkillIcon->SetBrush(NewBrush);
+		}
+	}
+
+	if (!DynMat)
+	{
+		return;
+	}
+
+	// 设置 CDProgress 参数 (Clamp 保证 0~1 范围)
+	const float ClampedProgress = FMath::Clamp(CalculatedProgress, 0.0f, 1.0f);
+	DynMat->SetScalarParameterValue(FName(TEXT("CDProgress")), ClampedProgress);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[PlayerStatus] UpdateMotherSkillCooldownProgress: CDProgress=%.2f"),
+		ClampedProgress);
 }

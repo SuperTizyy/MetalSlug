@@ -50,6 +50,15 @@
 // 引入 CharacterEvents 事件总线组件 (广播 OnCharacterIconReady/OnWeaponIconReady)
 #include "Components/CharacterEvents.h"
 
+// 【v119 新增】引入母体加速技能组件
+#include "Combat/MotherSkillComponent.h"
+
+// 【v120 新增】引入 Spawn 子系统 (读取 PlayerConfigAsset 获取冷却总时长)
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
+
+// 【v120 新增】引入玩家配置资产 (读取 MotherSkillCooldownSeconds)
+#include "Data/Config/PlayerConfigAsset.h"
+
 // 引入贴图指针类型
 #include "Engine/Texture2D.h"
 
@@ -58,6 +67,8 @@
 
 // 【v105 大厂架构新增】引入 GameHUDWidget (Client_RefreshCharacterIcon RPC 携带 bIsMother 时直接控制 WeaponPanel 显隐)
 #include "UI/Game/GameHUDWidget.h"
+// 【v121 大厂架构新增】引入 PlayerStatusWidget (设置母体技能图标显隐)
+#include "UI/Game/Widgets/PlayerStatusWidget.h"
 
 // 引入 TimerManager (SetTimer / ClearTimer 用于重试机制)
 #include "TimerManager.h"
@@ -213,6 +224,19 @@ void UCharacterIconComponent::BeginPlay()
 				 "OnRep_CurrentWeapon 重新订阅 + OnWeaponAmmoChanged (开火实时)."),
 			*OwnerChar->GetName());
 	}
+
+	// 【v119 大厂架构新增】订阅 MotherSkillComponent → CharacterEvents 链路
+	//   - MotherSkillComponent.OnSkillStateChanged → 本组件回调
+	//   - 回调 → CharacterEvents.BroadcastMotherSkillCooldown → HUD 显示冷却
+	//   - 这与 CharacterIconComponent 职责一致 (处理图标/状态更新 → 推到 CharacterEvents → HUD)
+	//   - 不破坏刀战模式: 刀战没 MotherSkillComponent → 订阅失败 → Log Error (无害)
+	if (UMotherSkillComponent* SkillComp = OwnerChar->ResolveMotherSkillComponent())
+	{
+		// MotherSkillComponent 是 Replicated, 服务器写入后客户端能同步
+		// 这里只订阅广播链路: SkillComp.OnSkillStateChanged → BroadcastMotherSkillCooldown
+		SkillComp->OnSkillStateChanged.AddUniqueDynamic(
+			this, &UCharacterIconComponent::HandleMotherSkillStateChangedFromComponent);
+	}
 }
 
 
@@ -248,6 +272,73 @@ void UCharacterIconComponent::SubscribeToActiveWeaponAmmo()
 				*ActiveWeapon->GetName());
 		}
 	}
+}
+
+
+// ==========================================
+// 【v119 大厂架构新增】母体加速技能冷却状态 → CharacterEvents 广播
+// ==========================================
+
+void UCharacterIconComponent::HandleMotherSkillStateChangedFromComponent()
+{
+	// 从 MotherSkillComponent 拿冷却数据 → 推送到 CharacterEvents
+	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();
+	if (!OwnerChar)
+	{
+		return;
+	}
+
+	// 【v119】MotherSkillComponent 存在 → 拿数据
+	UMotherSkillComponent* SkillComp = OwnerChar->ResolveMotherSkillComponent();
+	if (!SkillComp)
+	{
+		// MotherSkillComponent 不存在 → 刀战路径, 不报错 (无害)
+		return;
+	}
+
+	// 【v119】从 CharacterEvents 拿事件总线
+	UCharacterEvents* EventsComp = OwnerChar->ResolveCharacterEvents();
+	if (!EventsComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[CharacterIconComponent][HandleMotherSkillStateChangedFromComponent] CharacterEvents 解析失败. Owner=%s"),
+			*OwnerChar->GetName());
+		return;
+	}
+
+	// 从 MotherSkillComponent 读冷却剩余时间 (服务器权威, 客户端 Replicated)
+	const float CooldownRemaining = SkillComp->GetSkillCooldownRemainingSeconds();
+	const bool bLocalSkillActive = SkillComp->IsSkillActive();
+
+	// 【v120 新增】计算 CDProgress (冷却进度 0~1)
+	// 冷却中: CDProgress = CooldownRemaining / CooldownTotal
+	// 冷却完毕: CDProgress = 0
+	float CDProgress = 0.0f;
+	if (CooldownRemaining > 0.0f)
+	{
+		// 从 PlayerConfigAsset 获取冷却总时长
+		if (UWorld* World = GetWorld())
+		{
+			if (URoomSpawnSubsystem* SpawnSys = World->GetSubsystem<URoomSpawnSubsystem>())
+			{
+				if (const UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+				{
+					const float CooldownTotal = PC->MotherSkillCooldownSeconds;
+					if (CooldownTotal > 0.0f)
+					{
+						CDProgress = FMath::Clamp(CooldownRemaining / CooldownTotal, 0.0f, 1.0f);
+					}
+				}
+			}
+		}
+	}
+
+	// 推送到 CharacterEvents → HUD (事件 + 缓存双轨制)
+	EventsComp->BroadcastMotherSkillCooldown(CDProgress, bLocalSkillActive);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[CharacterIconComponent][HandleMotherSkillStateChangedFromComponent] 推送技能冷却: CooldownRemaining=%.2f bSkillActive=%d Owner=%s"),
+		CooldownRemaining, bLocalSkillActive ? 1 : 0, *OwnerChar->GetName());
 }
 
 
@@ -511,6 +602,12 @@ void UCharacterIconComponent::Client_RefreshCharacterIcon_Implementation(const F
 	{
 		// 母体也保持 WeaponPanel 显示 (弹药 UI 由弹药 RPC 控制显示内容)
 		Owner->GameHUDWidget->SetWeaponPanelVisible(/*bIsVisible=*/ true);
+
+		// 【v121 大厂架构新增】设置母体技能图标显隐
+		if (UPlayerStatusWidget* PSWidget = Owner->GameHUDWidget->GetWidget_PlayerStatus())
+		{
+			PSWidget->SetMotherSkillIconVisibility(bInIsMother);
+		}
 	}
 
 	// ============================================================
