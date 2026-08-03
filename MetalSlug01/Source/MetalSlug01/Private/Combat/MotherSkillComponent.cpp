@@ -4,8 +4,19 @@
 #include "Combat/MotherSkillComponent.h"
 
 #include "Engine/World.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Particles/ParticleSystem.h"
+#include "Particles/ParticleSystemComponent.h"
+#include "Components/AudioComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
+
+#include "Characters/BaseCharacter.h"
+#include "Components/Image.h"
+#include "UI/MyGameHUD.h"
+#include "UI/Game/GameHUDWidget.h"
+#include "UI/Game/Widgets/PlayerStatusWidget.h"
 
 
 // ==========================================
@@ -33,7 +44,11 @@ void UMotherSkillComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(SkillTimerHandle);
+		World->GetTimerManager().ClearTimer(SkillParticleTimerHandle);
 	}
+
+	// 停止技能粒子（防御型清理）
+	StopSkillParticle();
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -129,14 +144,20 @@ void UMotherSkillComponent::ActivateSkill(float SpeedMultiplier, float Duration,
 
 	const float Now = World->GetTimeSeconds();
 
-	// 【v119 业务规则】冷却中 → 拒绝激活 (不是 bug, 是业务规则)
+	// 【v121.4 诊断】冷却检查 — 详细日志定位为何不能重激活
 	if (Now < SkillCooldownEndTime)
 	{
-		UE_LOG(LogTemp, Verbose,
-			TEXT("[MotherSkillComponent] ActivateSkill: 冷却中, 拒绝激活. Owner=%s Now=%.2f CooldownEndTime=%.2f"),
-			*OwnerActor->GetName(), Now, SkillCooldownEndTime);
+		// 【v121.4】改为 Display 级别，方便诊断
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherSkillComponent] ActivateSkill: ★冷却中拒绝激活. Owner=%s Now=%.2f CooldownEndTime=%.2f (剩余%.2fs)"),
+			*OwnerActor->GetName(), Now, SkillCooldownEndTime, SkillCooldownEndTime - Now);
 		return;
 	}
+
+	// 【v121.4 诊断】成功通过冷却检查
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherSkillComponent] ActivateSkill: 冷却检查通过. Owner=%s Now=%.2f CooldownEndTime=%.2f"),
+		*OwnerActor->GetName(), Now, SkillCooldownEndTime);
 
 	// ==========================================
 	// 【大厂原则 — 拒绝缩短】仅当新到期时间更晚才更新
@@ -145,9 +166,9 @@ void UMotherSkillComponent::ActivateSkill(float SpeedMultiplier, float Duration,
 
 	if (bIsSkillActive && NewActiveExpireTime <= SkillActiveExpiresAtWorldTime + KINDA_SMALL_NUMBER)
 	{
-		// 已经在加速中, 且新到期时间不更晚 → 拒绝缩短, 保留原状态
-		UE_LOG(LogTemp, Verbose,
-			TEXT("[MotherSkillComponent] ActivateSkill: 已在加速中且新到期时间 (%.2f) 不晚于原到期 (%.2f), 拒绝缩短. Owner=%s"),
+		// 【v121.4 诊断】已经在加速中, 且新到期时间不更晚 → 拒绝缩短, 保留原状态
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherSkillComponent] ActivateSkill: ★已在加速中且新到期时间 (%.2f) 不晚于原到期 (%.2f), 拒绝缩短. Owner=%s"),
 			NewActiveExpireTime, SkillActiveExpiresAtWorldTime, *OwnerActor->GetName());
 		return;
 	}
@@ -167,7 +188,8 @@ void UMotherSkillComponent::ActivateSkill(float SpeedMultiplier, float Duration,
 	// ==========================================
 	// 1. 写字段 (Replicated → 客户端 OnRep 自动同步)
 	SkillActiveExpiresAtWorldTime = NewActiveExpireTime;
-	SkillCooldownEndTime = Now + Cooldown; // 激活技能时立即开始冷却
+	// 【v121.5 修复】冷却时间改为技能生效结束后才开始计时
+	// 旧: 激活时立即开始冷却 → 新: 持续时间到期时才设置 SkillCooldownEndTime (见 ExpireSkillActive_Internal)
 	TotalCooldownDuration = Cooldown; // 保存总冷却时间用于 UI 倒计时
 
 	// 2. 幂等: 清旧 Timer
@@ -183,16 +205,34 @@ void UMotherSkillComponent::ActivateSkill(float SpeedMultiplier, float Duration,
 		false /* 不循环 */
 	);
 
+	// 【v121.5 修复】保存当前倍率到缓存 — 用于冷却条走完时可以再次激活时恢复速度
+	// 注意：这是上一次的倍率，不是本次的
+	CachedSpeedMultiplier = SpeedMultiplier;
+
 	// 4. 写 bIsSkillActive = true (触发 OnRep + 服务器主动 Broadcast)
 	const bool bWasActive = bIsSkillActive;
 	bIsSkillActive = true;
 
+	// 【v121.5 修复】服务器端也设置材质 bIsActive (ListenServer 上 OnRep 不会触发)
+	SetMaterialSkillActive(true);
+
+	// 【v121.6 新增】播放技能粒子特效
+	PlaySkillParticle();
+
+	// 【v121.7 新增】播放技能激活声音
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherSkillComponent] ActivateSkill: 准备播放技能声音. Owner=%s, SkillActivateSound=%s"),
+		*OwnerActor->GetName(),
+		SkillActivateSound ? *SkillActivateSound->GetName() : TEXT("NULL"));
+	PlaySkillSound();
+
 	// 5. 服务器主动 Broadcast (客户端 OnRep 也会 Broadcast — 双发保证)
-	OnSkillStateChanged.Broadcast();
+	// 【v121.4 新增】广播 bIsSkillActive 状态，UI/材质可订阅此事件设置 bIsActive
+	OnSkillActiveChanged.Broadcast(bIsSkillActive);
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[MotherSkillComponent] ActivateSkill: 已激活加速. Owner=%s SpeedMul=%.2fx Duration=%.2fs Cooldown=%.2fs (Now=%.2f, ExpireActive=%.2f, ExpireCD=%.2f)"),
-		*OwnerActor->GetName(), SpeedMultiplier, Duration, Cooldown, Now, NewActiveExpireTime, SkillCooldownEndTime);
+		TEXT("[MotherSkillComponent] ActivateSkill: 已激活加速. Owner=%s SpeedMul=%.2fx Duration=%.2fs Cooldown=%.2fs (Now=%.2f, ExpireActive=%.2f, Cooldown在Duration结束后才计时)"),
+		*OwnerActor->GetName(), SpeedMultiplier, Duration, Cooldown, Now, NewActiveExpireTime);
 }
 
 
@@ -225,7 +265,8 @@ void UMotherSkillComponent::DeactivateSkill()
 	CachedSpeedMultiplier = 1.0f;
 
 	// 服务器主动 Broadcast (客户端 OnRep 也会 — 双发保证)
-	OnSkillStateChanged.Broadcast();
+	// 【v121.4 新增】广播 bIsSkillActive 状态，UI/材质可订阅此事件设置 bIsActive
+	OnSkillActiveChanged.Broadcast(bIsSkillActive);
 
 	UE_LOG(LogTemp, Display,
 		TEXT("[MotherSkillComponent] DeactivateSkill: 已停用加速. Owner=%s"),
@@ -278,35 +319,327 @@ float UMotherSkillComponent::GetSkillCooldownRemainingSeconds() const
 
 void UMotherSkillComponent::ExpireSkillActive_Internal()
 {
-	// 服务器端: 停止加速状态 (不清冷却时间)
-	// 注意: 不清 SkillCooldownEndTime — 那是技能冷却, 不是加速持续
+	// 【v121.5 修复】技能持续时间到期，停止加速 + 开始冷却计时
+	// 注意: 冷却时间现在是在生效结束后才开始计时 (不是激活时立即开始)
 	AActor* OwnerActor = GetOwner();
 	if (!OwnerActor || !OwnerActor->HasAuthority())
 	{
 		return;
 	}
 
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	const float Now = World->GetTimeSeconds();
+
 	bIsSkillActive = false;
 	SkillActiveExpiresAtWorldTime = 0.0f;
-	// 【v121.3 修复】不清 CachedBaseMaxWalkSpeed — 用于恢复原始速度
-	// CachedSpeedMultiplier 也保留 (可能被其他系统查询)
-	CachedSpeedMultiplier = 1.0f;
+	// 【v121.5 修复】现在开始冷却计时 (技能生效结束后才计时)
+	// CooldownEndTime = Now + TotalCooldownDuration (TotalCooldownDuration 在 ActivateSkill 时已设置)
+	SkillCooldownEndTime = Now + TotalCooldownDuration;
+	// 【v121.5 修复】不清 CachedSpeedMultiplier — 用于冷却条走完时可以再次激活
+	// 注意：这里不清 CachedBaseMaxWalkSpeed — 用于恢复原始速度
+
+	// 【v121.5 修复】服务器端也设置材质 bIsActive (ListenServer 上 OnRep 不会触发)
+	SetMaterialSkillActive(false);
+
+	// 【v121.6 新增】停止技能粒子特效
+	StopSkillParticle();
 
 	// 服务器主动 Broadcast (客户端 OnRep 也会 — 双发保证)
-	OnSkillStateChanged.Broadcast();
+	// 【v121.4 新增】广播 bIsSkillActive 状态，UI/材质可订阅此事件设置 bIsActive
+	OnSkillActiveChanged.Broadcast(false);
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[MotherSkillComponent] ExpireSkillActive_Internal: 技能持续时间到期, 停止加速. Owner=%s"),
-		*OwnerActor->GetName());
+		TEXT("[MotherSkillComponent] ExpireSkillActive_Internal: 技能持续时间到期, 开始冷却计时. Owner=%s Now=%.2f CooldownEndTime=%.2f (Duration=%.2fs)"),
+		*OwnerActor->GetName(), Now, SkillCooldownEndTime, TotalCooldownDuration);
 }
 
 void UMotherSkillComponent::OnRep_SkillActiveChanged()
 {
-	// 客户端收到复制值变化 → Broadcast 给所有订阅方
-	OnSkillStateChanged.Broadcast();
-
-	UE_LOG(LogTemp, Verbose,
+	// 【v121.5 修复】添加 Display 日志确认 OnRep 被触发
+	UE_LOG(LogTemp, Display,
 		TEXT("[MotherSkillComponent] OnRep_SkillActiveChanged: bIsSkillActive=%d Owner=%s"),
 		bIsSkillActive ? 1 : 0,
 		GetOwner() ? *GetOwner()->GetName() : TEXT("NULL"));
+
+	// 客户端收到复制值变化 → Broadcast 给所有订阅方
+	// 【v121.5 新增】直接设置材质 bIsActive 参数
+	// 触发场景:
+	//   - bIsSkillActive=true: 技能激活 → 材质 bIsActive=1
+	//   - bIsSkillActive=false: 技能结束 → 材质 bIsActive=0
+	SetMaterialSkillActive(bIsSkillActive);
+
+	// 【v121.4 新增】广播 bIsSkillActive 状态，UI/材质可订阅此事件设置 bIsActive
+	OnSkillActiveChanged.Broadcast(bIsSkillActive);
+}
+
+void UMotherSkillComponent::SetMaterialSkillActive(bool bInIsActive)
+{
+	// 【v121.5 新增】C++ 直接设置材质 bIsActive 参数
+	// 触发场景:
+	//   - bInIsActive=true: 技能激活 → 材质 bIsActive=1
+	//   - bInIsActive=false: 技能结束 → 材质 bIsActive=0
+
+	// 1. 获取 Owner Character
+	ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetOwner());
+	if (!OwnerChar)
+	{
+		return;
+	}
+
+	// 2. 通过 PlayerController 获取 HUD → GameHUDWidget → PlayerStatusWidget → Image_MotherSkillIcon
+	APlayerController* PC = Cast<APlayerController>(OwnerChar->GetController());
+	if (!PC)
+	{
+		// 非玩家角色 (AI) 没有 HUD, 跳过
+		return;
+	}
+
+	AMyGameHUD* HUD = Cast<AMyGameHUD>(PC->GetHUD());
+	if (!HUD)
+	{
+		return;
+	}
+
+	UGameHUDWidget* HUDWidget = HUD->GetGameHUDWidget();
+	if (!HUDWidget)
+	{
+		return;
+	}
+
+	UPlayerStatusWidget* StatusWidget = HUDWidget->GetWidget_PlayerStatus();
+	if (!StatusWidget)
+	{
+		return;
+	}
+
+	// 3. 获取 Image_MotherSkillIcon
+	UImage* SkillIcon = StatusWidget->GetMotherSkillIcon();
+	if (!SkillIcon)
+	{
+		return;
+	}
+
+	// 4. 获取或创建动态材质
+	FSlateBrush Brush = SkillIcon->GetBrush();
+	if (!Brush.HasUObject())
+	{
+		return;
+	}
+
+	UMaterialInterface* Material = Brush.GetResourceObject() ? Cast<UMaterialInterface>(Brush.GetResourceObject()) : nullptr;
+	if (!Material)
+	{
+		return;
+	}
+
+	UMaterialInstanceDynamic* DynMat = Cast<UMaterialInstanceDynamic>(Material);
+	if (!DynMat)
+	{
+		// 材质还不是动态材质，创建并应用
+		DynMat = UMaterialInstanceDynamic::Create(Material, this);
+		if (DynMat)
+		{
+			FSlateBrush NewBrush = Brush;
+			NewBrush.SetResourceObject(DynMat);
+			SkillIcon->SetBrush(NewBrush);
+		}
+	}
+
+	if (!DynMat)
+	{
+		return;
+	}
+
+	// 5. 设置 bIsActive 参数
+	const float ActiveValue = bInIsActive ? 1.0f : 0.0f;
+	DynMat->SetScalarParameterValue(FName(TEXT("bIsActive")), ActiveValue);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[MotherSkillComponent] SetMaterialSkillActive: bIsActive=%.0f Owner=%s"),
+		ActiveValue,
+		*OwnerChar->GetName());
+}
+
+
+// ==========================================
+// 【v121.6 新增】技能粒子特效
+// ==========================================
+
+void UMotherSkillComponent::PlaySkillParticle()
+{
+	AActor* OwnerActor = GetOwner();
+	if (!OwnerActor)
+	{
+		return;
+	}
+
+	// 幂等: 已有活动粒子，拒绝再次播放
+	if (bIsSkillParticleActive)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherSkillComponent] PlaySkillParticle: 已有活动粒子，拒绝重复播放. Owner=%s"),
+			*OwnerActor->GetName());
+		return;
+	}
+
+	// 检查粒子资产是否配置
+	if (!SkillParticleSystem)
+	{
+		// 粒子资产未配置时静默跳过（BP 可能没配）
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 获取母体 Mesh
+	USkeletalMeshComponent* MeshComp = OwnerActor->FindComponentByClass<USkeletalMeshComponent>();
+	if (!MeshComp)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MotherSkillComponent] PlaySkillParticle: 找不到 SkeletalMeshComponent. Owner=%s"),
+			*OwnerActor->GetName());
+		return;
+	}
+
+	// 使用 SpawnEmitterAttached 创建并附着粒子（参考 MotherSpawnParticleComponent）
+	// bAutoDestroy=false: 生命周期由 Timer 控制
+	// bAutoActivate=true: 立即播放
+	UParticleSystemComponent* SpawnedPSC = UGameplayStatics::SpawnEmitterAttached(
+		SkillParticleSystem,
+		MeshComp,
+		SkillParticleAttachSocket,
+		SkillParticleRelativeLocation,           // 相对位置偏移
+		SkillParticleRelativeRotation,           // 相对旋转偏移
+		EAttachLocation::SnapToTarget,           // 锁定到目标原点
+		true                                     // bAutoDestroy: false（由 Timer 控制销毁）
+	);
+
+	if (!SpawnedPSC)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherSkillComponent] PlaySkillParticle: SpawnEmitterAttached 返回 null. "
+				 "Owner=%s, Particle=%s, Socket=%s."),
+			*OwnerActor->GetName(),
+			*GetNameSafe(SkillParticleSystem),
+			*SkillParticleAttachSocket.ToString());
+		return;
+	}
+
+	// 设置相对缩放（SpawnEmitterAttached 不支持直接设缩放，需要生成后设置）
+	SpawnedPSC->SetRelativeScale3D(SkillParticleRelativeScale);
+
+	// 保存引用
+	ActiveSkillParticleComponent = SpawnedPSC;
+	bIsSkillParticleActive = true;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherSkillComponent] PlaySkillParticle: 已播放技能粒子. Owner=%s Socket=%s"),
+		*OwnerActor->GetName(),
+		*SkillParticleAttachSocket.ToString());
+}
+
+void UMotherSkillComponent::StopSkillParticle()
+{
+	// 幂等: 无活动粒子时 no-op
+	if (!bIsSkillParticleActive || !ActiveSkillParticleComponent)
+	{
+		return;
+	}
+
+	AActor* OwnerActor = GetOwner();
+
+	// 停止播放
+	ActiveSkillParticleComponent->Deactivate();
+
+	// 销毁组件
+	ActiveSkillParticleComponent->DestroyComponent();
+
+	// 清空引用
+	ActiveSkillParticleComponent = nullptr;
+	bIsSkillParticleActive = false;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherSkillComponent] StopSkillParticle: 已停止技能粒子. Owner=%s"),
+		OwnerActor ? *OwnerActor->GetName() : TEXT("NULL"));
+}
+
+void UMotherSkillComponent::HandleSkillParticleLifetimeExpired()
+{
+	// 由技能持续时间 Timer 触发，与 ExpireSkillActive_Internal 共用同一个 Duration Timer
+	// 这里不需要额外处理，因为技能结束时 ExpireSkillActive_Internal 会调用 StopSkillParticle
+}
+
+void UMotherSkillComponent::PlaySkillSound()
+{
+	// ===== 校验层: Sound =====
+	if (!SkillActivateSound)
+	{
+		// BP 可能没配置声音，业务禁用声音不算错
+		return;
+	}
+
+	AActor* OwnerActor = GetOwner();
+	if (!OwnerActor)
+	{
+		return;
+	}
+
+	USkeletalMeshComponent* BodyMesh = OwnerActor->FindComponentByClass<USkeletalMeshComponent>();
+	if (!BodyMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherSkillComponent][v121.7] PlaySkillSound: GetMesh() 为空! "
+				 "Owner=%s. 【零兜底】检查 BP 是否有 SkeletalMeshComponent."),
+			*OwnerActor->GetName());
+		return;
+	}
+
+	// 已存在时先 Destroy 再 Spawn (避免残留)
+	if (ActiveSkillAudioComponent)
+	{
+		ActiveSkillAudioComponent->Stop();
+		ActiveSkillAudioComponent->DestroyComponent();
+		ActiveSkillAudioComponent = nullptr;
+	}
+
+	// 附身到 Mesh, 自动播放, 播放完毕自动销毁
+	ActiveSkillAudioComponent = UGameplayStatics::SpawnSoundAttached(
+		SkillActivateSound,
+		BodyMesh,
+		NAME_None,                          // 附着到根 Socket
+		FVector::ZeroVector,                // 相对位置偏移
+		FRotator::ZeroRotator,             // 相对旋转偏移
+		EAttachLocation::KeepRelativeOffset, // 保持相对偏移
+		true,                               // bStopWhenGameends: 游戏结束时停止
+		1.0f,                               // VolumeMultiplier
+		1.0f,                               // PitchMultiplier
+		0.0f,                               // StartTime
+		nullptr,                             // AttenuationSettings
+		nullptr,                             // ConcurrencySettings
+		true                                // bAutoDestroy: 播放完毕自动销毁
+	);
+
+	if (!ActiveSkillAudioComponent)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherSkillComponent][v121.7] PlaySkillSound: SpawnSoundAttached 失败. "
+				 "Owner=%s, Sound=%s. 【零兜底】检查 Sound 资产是否损坏."),
+			*OwnerActor->GetName(),
+			*SkillActivateSound->GetName());
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherSkillComponent][v121.7] PlaySkillSound: 已播放技能声音. Owner=%s, Sound=%s"),
+		*OwnerActor->GetName(),
+		*SkillActivateSound->GetName());
 }

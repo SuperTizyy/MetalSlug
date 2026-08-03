@@ -612,6 +612,69 @@ public:
 	 */
 	void PlayEquipSoundForSlot(EWeaponSlotType NewSlot);
 
+	// ==========================================
+	// 【v200 大厂架构新增】丢弃武器到地面
+	// ==========================================
+
+	/**
+	 * 【v200 大厂架构 P0】将主武器丢弃到地面
+	 *
+	 * 调用方: ABaseCharacter::Server_DropPrimaryWeapon (玩家按 G 键 RPC)
+	 *
+	 * 流程:
+	 *   1. 校验: 必须是服务器 + 手里有主武器
+	 *   2. 脱挂武器与角色 (DetachFromActor)
+	 *   3. 调用 WeaponDropComponent->StartDroppedState (启动掉落状态)
+	 *   4. 设置当前武器为 null
+	 *
+	 * 大厂原则 - 单一职责:
+	 *   - 本方法只负责"把武器从手上放到地上", 不负责捡起
+	 *   - 捡起由 Server_TryPickupWeapon 负责
+	 *
+	 * @return true=丢弃成功, false=失败
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapon")
+	bool Server_DropPrimaryWeapon();
+
+	/**
+	 * 【v200 大厂架构 P0】捡起地面上的武器
+	 *
+	 * 调用方: ABaseCharacter::Server_TryPickupWeapon (玩家走到掉落武器上)
+	 *
+	 * 流程:
+	 *   1. 校验: 必须是服务器 + 没有主武器 + 目标武器在掉落状态
+	 *   2. 调用 WeaponDropComponent->CancelDroppedState (恢复弹药 + 停物理)
+	 *   3. 装备武器到主槽位
+	 *   4. 广播事件
+	 *
+	 * @param WeaponToPickup 要捡起的武器
+	 * @return true=捡起成功, false=失败
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapon")
+	bool Server_TryPickupWeapon(ABaseWeapon* WeaponToPickup);
+
+	/**
+	 * 【v200.2 大厂架构 — 零兜底】获取 Primary 槽位的武器
+	 *
+	 * 旧版 GetPrimaryWeapon() 返回 CurrentWeapon — 这是错误的!
+	 *   CurrentWeapon 是"激活的武器"(任意槽位), 不是"主武器槽位的武器"
+	 *   玩家丢弃主武器 → 槽位切到 Melee → CurrentWeapon = BP_Weapon_Knife_C_0 (近战)
+	 *   此时 GetPrimaryWeapon() 返回 BP_Weapon_Knife_C_0 → WeaponDropComponent::OnOverlapBegin
+	 *   第 380-388 行检查 "已有主武器" → 拒绝捡起
+	 *   玩家永远无法捡起地上的主武器
+	 *
+	 * 修复: GetPrimaryWeapon() 改读 WeaponsInSlot[0] (Primary 槽位真理源)
+	 *   - 大厂原则 - 单一真理源: WeaponsInSlot[] 是槽位的唯一权威
+	 *   - 丢弃时 WeaponsInSlot[0] = nullptr → 玩家可捡
+	 *   - 捡起后 WeaponsInSlot[0] = WeaponToPickup → 槽位被占用
+	 *   - 武器切换不影响 WeaponsInSlot[], 只影响 CurrentWeapon/CurrentWeaponSlot
+	 */
+	UFUNCTION(BlueprintPure, Category = "Combat|Weapon")
+	ABaseWeapon* GetPrimaryWeapon() const
+	{
+		return GetWeaponInSlot(EWeaponSlotType::Primary);
+	}
+
 protected:
 	// ==========================================
 	// UE 生命周期
@@ -669,6 +732,29 @@ protected:
 	 * @return true = 已挂载 (跳过重复 Attach), false = 未挂载 (需要补挂)
 	 */
 	bool IsWeaponAttachedToSocket(ABaseWeapon* Weapon, ABaseCharacter* Owner) const;
+
+	/**
+	 * 【v200.2.15 / v200.2.16 / v200.2.17 大厂架构】强制重置武器 Mesh 子组件的 RelativeTransform 为 identity.
+	 *
+	 *   根因: BP_Weapon_*.uasset 的 WeaponSkeletalMesh/WeaponStaticMesh 组件在蓝图里设了非零的
+	 *         RelativeLocation/Rotation/Scale, 导致 attach 后武器 WorldTransform 被 Mesh.RelativeTransform
+	 *         又叠加一次 → 武器位置/旋转严重错位.
+	 *
+	 *   大厂原则 (单一真理源):
+	 *     - 武器 Mesh 在 socket 下的位置由 DT 的 Actor RelativeLocation/Rotation/Scale 唯一控制
+	 *     - Mesh 组件自己的 RelativeTransform 必须强制为 0/identity (不依赖 BP 蓝图配对)
+	 *
+	 *   【v200.2.17 白名单】跳过 Magazine 子组件 (弹夹)
+	 *     - 弹夹是武器的子组件 (命名包含 "Magazine" 如 "MagazineSkeletalMesh")
+	 *     - BP 里配了具体的相对武器 Mesh 的位置 (弹夹在枪的左侧/底部)
+	 *     - 清零它会导致弹夹不在枪上 → 破坏换弹动画
+	 *     - 跳过规则: 与 ABaseWeapon::ResolveMagazineSkeletalMesh 识别规则完全一致 (名字包含 "Magazine")
+	 *
+	 *   调用时机:
+	 *     - Spawn 后 (v200.2.15): SpawnActor 之后立即调用 (防御运行时生成的武器)
+	 *     - Attach 前 (v200.2.16): ApplyAttachmentRuntime 入口 (防御关卡预放武器 + 捡起场景)
+	 */
+	static void ResetWeaponMeshRelativeTransforms(ABaseWeapon* Weapon);
 
 	/**
 	 * 【v78 大厂架构】数组索引 → 槽位类型

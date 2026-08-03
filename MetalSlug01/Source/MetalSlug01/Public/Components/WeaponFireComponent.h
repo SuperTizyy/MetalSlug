@@ -208,6 +208,49 @@ public:
 	bool IsFiring() const { return bIsFiring; }
 
 	// ==========================================
+	// 【v200 大厂架构新增】弹药快照 — 供 WeaponDropComponent 掉落/捡起使用
+	// ==========================================
+
+	/**
+	 * 【v200 大厂架构新增】获取弹药快照 (掉落武器时保存)
+	 *
+	 * 调用方: UWeaponDropComponent::SaveAmmoSnapshot
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 返回当前弹药数据的只读快照
+	 *   - WeaponDropComponent 用此快照保存掉落时刻的弹药
+	 *
+	 * @return 当前弹药快照 (CurrentAmmo, ReserveAmmo, MagazineSize)
+	 */
+	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
+	void GetAmmoSnapshotForDrop(int32& OutCurrentAmmo, int32& OutReserveAmmo, int32& OutMagazineSize) const
+	{
+		OutCurrentAmmo = CurrentAmmo;
+		OutReserveAmmo = ReserveAmmo;
+		OutMagazineSize = MagazineSize;
+	}
+
+	/**
+	 * 【v200 大厂架构新增】从快照恢复弹药 (捡起武器时调用)
+	 *
+	 * 调用方: UWeaponDropComponent::RestoreAmmoSnapshot
+	 *
+	 * 业务场景:
+	 *   - 武器从掉落状态被捡起时, 恢复掉落时刻的弹药数据
+	 *   - 弹药快照保存在 WeaponDropComponent 中
+	 *
+	 * 大厂原则 — 服务器权威:
+	 *   - 仅服务器可调用 (HasAuthority 检查)
+	 *   - 客户端调用会被拒绝 + Log Warning
+	 *
+	 * @param InCurrentAmmo 弹匣内子弹数
+	 * @param InReserveAmmo 备用弹药数
+	 * @return true=成功恢复, false=被拒绝 (权限不足)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Fire")
+	bool RestoreAmmoFromSnapshot(int32 InCurrentAmmo, int32 InReserveAmmo);
+
+	// ==========================================
 	// 蒙太奇查询 (供 ABaseWeapon::Multicast_PlayXxxMontage_Implementation 调用)
 	// ==========================================
 	//

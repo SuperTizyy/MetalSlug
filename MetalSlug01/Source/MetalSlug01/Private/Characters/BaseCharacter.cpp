@@ -403,14 +403,14 @@ void ABaseCharacter::BeginPlay()
 		SlowComponent->OnSlowStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleSlowStateChanged);
 	}
 
-	// 【v119 大厂架构新增】订阅 MotherSkillComponent.OnSkillStateChanged
+	// 【v119 大厂架构新增】订阅 MotherSkillComponent.OnSkillActiveChanged
 	//   - 触发源: BTTask_ActivateMotherSpeedBoost::ExecuteTask → ActivateSkill
 	//   - 表现: BaseCharacter 改 MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
 	//   - 服务器主动 Broadcast + 客户端 OnRep Broadcast = 双发保证 (与 MotherSlow 镜像)
 	//   - 不破坏刀战模式: 刀战 AI 没 MotherSkillComponent, 订阅失败 → Log Error (无害)
 	if (UMotherSkillComponent* SkillComp = ResolveMotherSkillComponent())
 	{
-		SkillComp->OnSkillStateChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleMotherSkillStateChanged);
+		SkillComp->OnSkillActiveChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleMotherSkillStateChanged);
 	}
 
 	// 【v100.1 大厂架构】订阅 HealthRegenComponent 回血状态变化
@@ -708,7 +708,7 @@ void ABaseCharacter::HandleSlowStateChanged()
 // 【v119 大厂架构新增】母体加速技能 — MaxWalkSpeed 修改
 // ==========================================
 
-void ABaseCharacter::HandleMotherSkillStateChanged()
+void ABaseCharacter::HandleMotherSkillStateChanged(bool bIsNowActive)
 {
 	// ==========================================
 	// 【v119 大厂架构】母体加速技能激活/结束时改 MaxWalkSpeed
@@ -1491,6 +1491,10 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		if (SwitchToMeleeAction)
 		{
 			EnhancedInputComponent->BindAction(SwitchToMeleeAction, ETriggerEvent::Triggered, this, &ABaseCharacter::OnSwitchToMeleePressed);
+		}
+		if (DropWeaponAction)
+		{
+			EnhancedInputComponent->BindAction(DropWeaponAction, ETriggerEvent::Started, this, &ABaseCharacter::OnDropWeaponPressed);
 		}
 
 		// 【v60.x 大厂架构 — FPS枪战】绑定开火/换弹输入
@@ -4728,4 +4732,107 @@ void ABaseCharacter::Client_StopRegenSound_Implementation()
 	ActiveRegenAudioComponent->Stop();
 	ActiveRegenAudioComponent->DestroyComponent();
 	ActiveRegenAudioComponent = nullptr;
+}
+
+// ==========================================
+// 【v200 大厂架构新增】丢弃主武器
+// ==========================================
+
+/**
+ * OnDropWeaponPressed — 丢弃武器输入回调
+ */
+void ABaseCharacter::OnDropWeaponPressed(const FInputActionValue& Value)
+{
+	if (IsDead())
+	{
+		return;
+	}
+
+	if (!IsPlayerControlled())
+	{
+		return;
+	}
+
+	Server_DropPrimaryWeapon();
+}
+
+/**
+ * Server_DropPrimaryWeapon_Implementation — 丢弃主武器 RPC 实现
+ */
+void ABaseCharacter::Server_DropPrimaryWeapon_Implementation()
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Server_DropPrimaryWeapon: ENTER. Pawn=%s"),
+		*GetName());
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_DropPrimaryWeapon: WeaponAttach 组件未找到. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 检查当前武器槽位
+	EWeaponSlotType CurrentSlot = WeaponAttachComp->GetCurrentWeaponSlot();
+	ABaseWeapon* CurrentWeaponBefore = WeaponAttachComp->GetCurrentWeapon();
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Server_DropPrimaryWeapon: 当前槽位=%s, 当前武器=%s"),
+		LexToString(CurrentSlot),
+		CurrentWeaponBefore ? *CurrentWeaponBefore->GetName() : TEXT("None"));
+
+	// 【v200 大厂架构】调用 WeaponAttachmentComponent 的丢弃方法
+	// 注意: WeaponAttachmentComponent::Server_DropPrimaryWeapon 内部已经处理了:
+	// 1. 先切换到近战武器 (Server_SwitchToWeaponSlot)
+	// 2. 再丢弃主武器
+	// 3. 清空 WeaponsInSlot[Primary]
+	const bool bDropped = WeaponAttachComp->Server_DropPrimaryWeapon();
+	if (!bDropped)
+	{
+		// WeaponAttachmentComponent 内部已经有详细的错误日志
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Server_DropPrimaryWeapon: WeaponAttachComp->Server_DropPrimaryWeapon 返回 false. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	// 检查丢弃后的武器状态
+	ABaseWeapon* CurrentWeaponAfter = WeaponAttachComp->GetCurrentWeapon();
+	EWeaponSlotType CurrentSlotAfter = WeaponAttachComp->GetCurrentWeaponSlot();
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Server_DropPrimaryWeapon: 丢弃完成. 当前武器=%s, 当前槽位=%s"),
+		CurrentWeaponAfter ? *CurrentWeaponAfter->GetName() : TEXT("None"),
+		LexToString(CurrentSlotAfter));
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Server_DropPrimaryWeapon: 丢弃成功. Pawn=%s"),
+		*GetName());
+}
+
+/**
+ * Server_TryPickupWeapon_Implementation — 捡起武器 RPC 实现
+ */
+void ABaseCharacter::Server_TryPickupWeapon_Implementation(ABaseWeapon* WeaponToPickup)
+{
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] Server_TryPickupWeapon: WeaponAttach 组件未找到. Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	const bool bPickedUp = WeaponAttachComp->Server_TryPickupWeapon(WeaponToPickup);
+	if (!bPickedUp)
+	{
+		// WeaponAttachmentComponent 内部已经有详细的错误日志
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Server_TryPickupWeapon: 捡起成功. Pawn=%s, Weapon=%s"),
+		*GetName(),
+		WeaponToPickup ? *WeaponToPickup->GetName() : TEXT("None"));
 }

@@ -776,3 +776,54 @@ ABaseWeapon* UWeaponFireComponent::ResolveOwnerWeapon() const
 
 	return Weapon;
 }
+
+// ==========================================
+// 【v200 大厂架构新增】弹药快照恢复
+// ==========================================
+bool UWeaponFireComponent::RestoreAmmoFromSnapshot(int32 InCurrentAmmo, int32 InReserveAmmo)
+{
+	ABaseWeapon* Weapon = ResolveOwnerWeapon();
+
+	// 服务器权威检查
+	if (!Weapon || !Weapon->HasAuthority())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponFireComponent] RestoreAmmoFromSnapshot: 客户端调用非法或 Owner 无效, 拒绝恢复弹药."));
+		return false;
+	}
+
+	// 校验数据合理性
+	if (InCurrentAmmo < 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponFireComponent] RestoreAmmoFromSnapshot: InCurrentAmmo < 0 (%d), 修正为 0."),
+			InCurrentAmmo);
+		InCurrentAmmo = 0;
+	}
+
+	if (InReserveAmmo < 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponFireComponent] RestoreAmmoFromSnapshot: InReserveAmmo < 0 (%d), 修正为 0."),
+			InReserveAmmo);
+		InReserveAmmo = 0;
+	}
+
+	// 恢复弹药数据 (Replicated 自动同步到客户端)
+	const int32 OldCurrentAmmo = CurrentAmmo;
+	const int32 OldReserveAmmo = ReserveAmmo;
+
+	CurrentAmmo = InCurrentAmmo;
+	ReserveAmmo = InReserveAmmo;
+
+	// 广播变更
+	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponFireComponent] RestoreAmmoFromSnapshot: 武器 '%s' 弹药已恢复. CurrentAmmo %d→%d, ReserveAmmo %d→%d."),
+		*Weapon->GetName(),
+		OldCurrentAmmo, CurrentAmmo,
+		OldReserveAmmo, ReserveAmmo);
+
+	return true;
+}

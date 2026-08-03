@@ -62,9 +62,9 @@ class ABaseCharacter;
  *
  * 订阅方:
  *   - BaseCharacter: 订阅 → 改 MaxWalkSpeed = CachedBaseMaxWalkSpeed × SpeedMultiplier
- *   - UI: 订阅 → 显示技能冷却状态 (可选)
+ *   - UI / 材质: 订阅 → 显示技能激活状态 (bIsActive)
  */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnSkillStateChanged);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnSkillActiveChanged, bool, bIsNowActive);
 
 
 /**
@@ -100,9 +100,13 @@ public:
 	 *   - 服务器: ActivateSkill / DeactivateSkill 主动 Broadcast (服务器跑一次)
 	 *   - 客户端: OnRep_SkillActiveChanged 自动 Broadcast (每客户端一次)
 	 *   - 服务器自己不会进 OnRep (服务器已主动 Broadcast) — 不会重复触发
+	 *
+	 * 使用场景:
+	 *   - BaseCharacter 订阅 → 改 MaxWalkSpeed
+	 *   - UI/材质 订阅 → 设置技能激活状态 (bIsActive)
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "MotherSkill")
-	FOnSkillStateChanged OnSkillStateChanged;
+	FOnSkillActiveChanged OnSkillActiveChanged;
 
 	// ==========================================
 	// 公开 API (真理源写入入口)
@@ -213,6 +217,23 @@ protected:
 	void OnRep_SkillActiveChanged();
 
 	// ==========================================
+	// 内部辅助 — 材质参数设置
+	// ==========================================
+
+	/**
+	 * 【v121.5 新增】设置技能图标材质的 bIsActive 参数
+	 *
+	 * @param bIsActive true=激活中, false=未激活
+	 *
+	 * 实现:
+	 *   1. 获取 Owner Character
+	 *   2. 获取 Character 的 PlayerStatusWidget (HUD)
+	 *   3. 获取 Image_MotherSkillIcon 的动态材质
+	 *   4. 设置 bIsActive 参数
+	 */
+	void SetMaterialSkillActive(bool bIsActive);
+
+	// ==========================================
 	// 字段 (Replicated 状态机)
 	// ==========================================
 
@@ -258,4 +279,135 @@ protected:
 	/** 缓存的"速度倍率" — 激活时记录, 退出时用 */
 	UPROPERTY(Transient)
 	float CachedSpeedMultiplier = 1.0f;
+
+	// ==========================================
+	// 技能粒子特效 — 配置项 (由 BP_MuTi 配置)
+	// ==========================================
+
+	/**
+	 * 【v121.6 新增】母体技能粒子特效资产
+	 *
+	 * 必须在 BP_MuTi 上配置, 其他 BP 不需要
+	 * 必须为 Cascade UParticleSystem*
+	 *
+	 * 触发场景:
+	 *   - 技能激活时: 自动播放
+	 *   - 技能结束时: 自动停止
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Particle")
+	TObjectPtr<UParticleSystem> SkillParticleSystem;
+
+	/**
+	 * 【v121.6 新增】技能粒子附着 Socket 名
+	 *
+	 * 默认 NAME_None 表示附着到 Mesh 组件原点
+	 * 若母体骨架上有专用 Socket, 可填此名
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Particle")
+	FName SkillParticleAttachSocket = NAME_None;
+
+	/**
+	 * 【v121.6 新增】技能粒子相对位置偏移
+	 *
+	 * 相对于附着点(Socket 或 Mesh 原点)的本地空间偏移
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Particle")
+	FVector SkillParticleRelativeLocation = FVector::ZeroVector;
+
+	/**
+	 * 【v121.6 新增】技能粒子相对旋转偏移
+	 *
+	 * 相对于附着点(Socket 或 Mesh 原点)的本地空间旋转
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Particle")
+	FRotator SkillParticleRelativeRotation = FRotator::ZeroRotator;
+
+	/**
+	 * 【v121.6 新增】技能粒子相对缩放
+	 *
+	 * 相对于附着点(Socket 或 Mesh 原点)的缩放比例
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Particle")
+	FVector SkillParticleRelativeScale = FVector(1.0f, 1.0f, 1.0f);
+
+	// ==========================================
+	// 技能声音 — 配置项 (由 BP_MuTi 配置)
+	// ==========================================
+
+	/**
+	 * 【v121.7 新增】母体技能激活时播放的声音
+	 *
+	 * 触发场景: ActivateSkill 成功时自动播放
+	 *
+	 * 必须为 Cue 或 SoundWave 资产
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotherSkill|Sound")
+	TObjectPtr<USoundBase> SkillActivateSound;
+
+private:
+	/**
+	 * 【v121.6 新增】播放技能粒子特效
+	 *
+	 * 触发场景: ActivateSkill 成功时调用
+	 *
+	 * 幂等: 已有活动粒子时拒绝再次播放
+	 */
+	void PlaySkillParticle();
+
+	/**
+	 * 【v121.6 新增】停止技能粒子特效
+	 *
+	 * 触发场景: ExpireSkillActive_Internal 时调用
+	 *
+	 * 幂等: 无活动粒子时 no-op
+	 */
+	void StopSkillParticle();
+
+	/**
+	 * 技能粒子 Timer 到期回调 — 停止并销毁粒子组件
+	 */
+	UFUNCTION()
+	void HandleSkillParticleLifetimeExpired();
+
+	/**
+	 * 技能粒子组件 — 当前正在播放的粒子
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UParticleSystemComponent> ActiveSkillParticleComponent;
+
+	/**
+	 * 技能粒子生命周期 Timer 句柄
+	 */
+	FTimerHandle SkillParticleTimerHandle;
+
+	/**
+	 * 技能粒子是否活动标志
+	 */
+	bool bIsSkillParticleActive = false;
+
+	// ==========================================
+	// 声音播放 — 私有方法
+	// ==========================================
+
+	/**
+	 * 【v121.7 新增】播放技能激活声音
+	 *
+	 * 触发场景: ActivateSkill 成功时调用
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - Sound=nullptr → Log Warning + return (BP 可能没配置)
+	 *   - GetMesh() 为空 → Log Error + return (BP 配错)
+	 *   - SpawnSoundAttached 失败 → Log Error + return (引擎异常)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - ActiveSkillAudioComponent 是本组件唯一缓存
+	 *   - 已存在时先 Destroy 再 Spawn (避免残留)
+	 */
+	void PlaySkillSound();
+
+	/**
+	 * 技能声音组件 — 当前正在播放的声音
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UAudioComponent> ActiveSkillAudioComponent;
 };

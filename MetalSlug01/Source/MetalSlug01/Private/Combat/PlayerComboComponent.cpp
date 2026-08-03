@@ -502,6 +502,14 @@ void UPlayerComboComponent::UseSkill()
 				Cooldown = PC->MotherSkillCooldownSeconds;
 				// 技能基础速度 = MotherMaxWalkSpeed (大厂原则 — 单一真理源)
 				BaseSpeed = PC->MotherMaxWalkSpeed;
+
+				// 【v121.5 诊断】配置异常警告
+				if (SpeedMultiplier > 10.0f)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[PlayerComboComponent::UseSkill] MotherSkillSpeedMultiplier 配置异常=%.2f (>10.0). 【修复】在 DA_PlayerConfigAsset 中调整 MotherSkillSpeedMultiplier 为合理值 (如 2.0)"),
+						SpeedMultiplier);
+				}
 			}
 			else
 			{

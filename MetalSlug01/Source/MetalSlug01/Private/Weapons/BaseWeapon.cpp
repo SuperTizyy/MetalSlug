@@ -163,6 +163,41 @@ void ABaseWeapon::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// 【v200.2.9 大厂架构 P0 修复】WeaponFireComponent BPGC/CDO 漂移修复
+	//   根因: BP 蓝图 (BP_Weapon_AK47.uasset) 在 Components 面板里删除了 C++ 默认创建的
+	//         WeaponFireComponent 然后手动重新加了一个, UE 会创建一个 BPGC_ARCH 的新实例
+	//         而不是继承 C++ 的 CDO 实例 → 字段 WeaponFireComponent 是 BPGC 的 Component
+	//         → Component.GetOwner() 返回 BPGC 的 CDO, 不是真实实例 BP_Weapon_AK47_C_0
+	//         → StartFire / PerformSingleShot 内部 GetWorld() / GetOwner() 全错
+	//   修复: BeginPlay 检查 WeaponFireComponent.Owner 是否是自己, 不是则查找真实 Component
+	//         并把字段重新指向真实实例 (运行时修复, 让真实 Weapon 也能开火)
+	if (WeaponFireComponent && WeaponFireComponent->GetOwner() != this)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[v200.2.9] ABaseWeapon::BeginPlay: BPGC 漂移检测 — Weapon=%s WeaponFireComponent.Owner=%s (不是 this). "
+			     "正在查找真实 Component..."),
+			*GetName(),
+			*GetNameSafe(WeaponFireComponent->GetOwner()));
+
+		// 在自己身上查找 UWeaponFireComponent
+		UWeaponFireComponent* RealFireComp = FindComponentByClass<UWeaponFireComponent>();
+		if (RealFireComp && RealFireComp != WeaponFireComponent)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[v200.2.9] ABaseWeapon::BeginPlay: 找到真实 WeaponFireComponent=%s, 替换 BPGC 字段."),
+				*RealFireComp->GetName());
+			WeaponFireComponent = RealFireComp;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[v200.2.9] ABaseWeapon::BeginPlay: BPGC 漂移无法修复 — Weapon=%s 没找到真实 WeaponFireComponent. "
+				     "【用户手动修复】打开 BP_Weapon_%s.uasset → Components 面板 → 删除 BPGC 自己加的 WeaponFireComponent → 保存."),
+				*GetName(),
+				*GetName());
+		}
+	}
+
 	// 强制禁用武器 Actor 物理碰撞 (含所有组件 — Mesh + MagazineSkeletal + ...)
 	//   - SetActorEnableCollision(false) 影响整个 Actor 的所有 primitive 组件
 	//   - 武器 mesh 不应阻挡任何东西 (角色/SpringArm/物理对象)

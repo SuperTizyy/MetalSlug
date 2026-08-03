@@ -226,15 +226,15 @@ void UCharacterIconComponent::BeginPlay()
 	}
 
 	// 【v119 大厂架构新增】订阅 MotherSkillComponent → CharacterEvents 链路
-	//   - MotherSkillComponent.OnSkillStateChanged → 本组件回调
+	//   - MotherSkillComponent.OnSkillActiveChanged → 本组件回调
 	//   - 回调 → CharacterEvents.BroadcastMotherSkillCooldown → HUD 显示冷却
 	//   - 这与 CharacterIconComponent 职责一致 (处理图标/状态更新 → 推到 CharacterEvents → HUD)
 	//   - 不破坏刀战模式: 刀战没 MotherSkillComponent → 订阅失败 → Log Error (无害)
 	if (UMotherSkillComponent* SkillComp = OwnerChar->ResolveMotherSkillComponent())
 	{
 		// MotherSkillComponent 是 Replicated, 服务器写入后客户端能同步
-		// 这里只订阅广播链路: SkillComp.OnSkillStateChanged → BroadcastMotherSkillCooldown
-		SkillComp->OnSkillStateChanged.AddUniqueDynamic(
+		// 这里只订阅广播链路: SkillComp.OnSkillActiveChanged → BroadcastMotherSkillCooldown
+		SkillComp->OnSkillActiveChanged.AddUniqueDynamic(
 			this, &UCharacterIconComponent::HandleMotherSkillStateChangedFromComponent);
 	}
 }
@@ -279,7 +279,7 @@ void UCharacterIconComponent::SubscribeToActiveWeaponAmmo()
 // 【v119 大厂架构新增】母体加速技能冷却状态 → CharacterEvents 广播
 // ==========================================
 
-void UCharacterIconComponent::HandleMotherSkillStateChangedFromComponent()
+void UCharacterIconComponent::HandleMotherSkillStateChangedFromComponent(bool bIsNowActive)
 {
 	// 从 MotherSkillComponent 拿冷却数据 → 推送到 CharacterEvents
 	ABaseCharacter* OwnerChar = ResolveOwnerCharacter();

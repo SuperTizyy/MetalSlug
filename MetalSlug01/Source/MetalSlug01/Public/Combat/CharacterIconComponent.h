@@ -375,7 +375,7 @@ public:
 	 *   - 不在 CharacterIconComponent 里直接写 HUD (保持职责单一)
 	 */
 	UFUNCTION()
-	void HandleMotherSkillStateChangedFromComponent();
+	void HandleMotherSkillStateChangedFromComponent(bool bIsNowActive);
 
 	// ==========================================
 	// UE 生命周期

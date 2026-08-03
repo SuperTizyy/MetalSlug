@@ -1221,7 +1221,33 @@ protected:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_RequestSwitchToSlot(EWeaponSlotType TargetSlot);
 
+	// ==========================================
+	// 【v200 大厂架构新增】丢弃主武器
+	// ==========================================
 
+	/**
+	 * 【v200 大厂架构 P0】丢弃主武器 RPC
+	 *
+	 * 调用方: 玩家按 G 键 InputAction → ABaseCharacter::OnDropWeaponPressed
+	 *
+	 * 流程:
+	 *   1. 客户端发送 RPC
+	 *   2. 服务器校验: 有主武器?
+	 *   3. 服务器调用 WeaponAttachmentComponent->Server_DropPrimaryWeapon
+	 *   4. 服务器自动切换到近战武器
+	 *
+	 * 大厂原则 - 服务器权威:
+	 *   - 只有服务器能丢弃武器
+	 *   - 客户端只能发起请求
+	 *
+	 * 大厂原则 - 单一职责:
+	 *   - 丢弃逻辑委托给 WeaponAttachmentComponent
+	 *   - 切换到近战委托给 WeaponAttachmentComponent::Server_SwitchToWeaponSlot
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_DropPrimaryWeapon();
+
+protected:
 	// ==========================================
 	// 能量系统 (网络同步)
 	// 【2026-06-15 重构】: 能量数据已下沉到 EnergyComponent
@@ -1239,6 +1265,14 @@ protected:
 	bool ConsumeEnergy(float Amount);
 
 public:
+	/**
+	 * 【v200 大厂架构 P0】捡起武器 RPC (移到 public 供 WeaponDropComponent 调用)
+	 *
+	 * 调用方: UWeaponDropComponent::OnOverlapBegin 检测玩家走进掉落武器范围
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_TryPickupWeapon(ABaseWeapon* WeaponToPickup);
+
 	/**
 	 * 获取当前血量 (供 UI 直接访问)
 	 * 【2026-06-15 重构】: 委托给 HealthComponent
@@ -1459,7 +1493,7 @@ protected:
 	 * @note 服务器/客户端都执行 (同一份视觉逻辑)
 	 */
 	UFUNCTION()
-	void HandleMotherSkillStateChanged();
+	void HandleMotherSkillStateChanged(bool bIsNowActive);
 
 	/**
 	 * 【2026-07-01 新增】本地执行死亡流程
@@ -1863,6 +1897,13 @@ protected:
 	UInputAction* SwitchToMeleeAction;
 
 	/**
+	 * 【v200 大厂架构新增】丢弃武器输入 (G 键, Started 事件)
+	 * 玩家按 G 键 → Started → OnDropWeaponPressed → Server_DropPrimaryWeapon RPC
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	UInputAction* DropWeaponAction;
+
+	/**
 	 * 开火输入 (左键, Triggered 事件)
 	 * v60 — 玩家枪械射击
 	 * 玩家按 → Triggered → OnFirePressed (一直按住一直触发)
@@ -1919,6 +1960,14 @@ protected:
 	 * - Started (按下瞬间): 路由到 CurrentWeapon->Server_StartReload
 	 */
 	void OnReloadPressed(const FInputActionValue& Value);
+
+	/**
+	 * 【v200 大厂架构新增】丢弃武器输入回调
+	 *
+	 * - Started (按下瞬间): 路由到 Server_DropPrimaryWeapon RPC
+	 * - 丢弃后自动切换到近战武器
+	 */
+	void OnDropWeaponPressed(const FInputActionValue& Value);
 
 
 	// ==========================================

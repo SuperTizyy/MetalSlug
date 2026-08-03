@@ -201,6 +201,15 @@ protected:
 	 */
 	void PullInitialDataFromCharacter();
 
+public:
+	// ==========================================
+	// 4. 公开访问器 (给 MotherSkillComponent 等外部系统使用)
+	// ==========================================
+
+	/** 【v121.5 新增】获取母体技能图标控件，供 C++ 直接设置材质参数 */
+	UFUNCTION(BlueprintCallable, Category = "MotherSkill")
+	UImage* GetMotherSkillIcon() { return Image_MotherSkillIcon; }
+
 private:
 	// ==========================================
 	// 4. UI 组件

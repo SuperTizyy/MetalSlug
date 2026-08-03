@@ -54,6 +54,9 @@
 // 包含 GameHUDWidget 以访问 UpdateWeaponIconFromID
 #include "UI/Game/GameHUDWidget.h"
 
+// 【v200 大厂架构新增】掉落武器组件
+#include "Components/WeaponDropComponent.h"
+
 // 【v54 大厂架构重构 — UAIProfileAsset 已删除】这里不再 include Data/AI/AIProfileAsset.h
 // 关卡预放 AI 走 ConfigSO (DA_AIBehaviorConfig_*.uasset)
 // 数据流: AMeleeAIController::SetupMeleeAI 末尾 → SetMeleeConfig(UAIBehaviorConfigSO*)
@@ -152,6 +155,54 @@ UWeaponAttachmentComponent::UWeaponAttachmentComponent()
 // ==========================================
 // 1. 静态工具函数
 // ==========================================
+
+// 【v200.2.15 / v200.2.16 / v200.2.17 大厂架构 — Mesh 组件 transform 单一真理源】
+//   根因: BP_Weapon_*.uasset 在 Components 面板设了 WeaponSkeletalMesh/WeaponStaticMesh 的
+//         RelativeLocation/Rotation/Scale (美术/策划用来"摆姿势" 武器 Mesh 或"丢武器在地上时的坐标")
+//         → SpawnActor 后, Mesh 组件有非零 transform
+//         → AttachToComponent 后, 武器 WorldTransform = Socket × Actor.Relative × Mesh.Relative
+//         → Mesh.Relative 又叠加一次, 武器在世界位置完全错位
+//   大厂原则: 武器 Mesh 在 socket 下的位置由 DT 的 Actor RelativeLocation 唯一控制
+//             Mesh 组件自己的 RelativeTransform 必须强制为 0/identity
+//   【v200.2.17 大厂架构 — 关键白名单】只 Reset "主武器 Mesh", 不碰 MagazineSkeletalMesh 弹夹组件
+//     根因(2026.08.04 用户反馈): "弹夹不正常, MagazineSkeletal 别把位置清0"
+//     弹夹是武器的子组件, BP 里配了具体的相对武器 Mesh 的位置 (弹夹在枪的左侧/底部)
+//     清零它会导致弹夹位置错位 → 弹夹不在枪上
+//     解决: 用组件名包含 "Magazine" 来识别弹夹, 跳过它们
+//   修复时机:
+//     - Spawn 时 (v200.2.15): SpawnActor 之后立即 Reset, 防御运行时生成的武器
+//     - Attach 时 (v200.2.16): ApplyAttachmentRuntime 入口强制 Reset, 防御关卡预放武器 + 捡起场景
+//     - 跳过 Magazine (v200.2.17): 白名单识别弹夹组件, 不清零
+//   多防御: 不依赖 BP 蓝图配对 (防御 BP 配错) 也不破坏弹夹位置 (防御误清)
+void UWeaponAttachmentComponent::ResetWeaponMeshRelativeTransforms(ABaseWeapon* Weapon)
+{
+	if (!Weapon) return;
+	TArray<UMeshComponent*> MeshComps;
+	Weapon->GetComponents<UMeshComponent*>(MeshComps);
+	int32 ResetCount = 0;
+	int32 SkippedMagazineCount = 0;
+	for (UMeshComponent* MeshComp : MeshComps)
+	{
+		if (!MeshComp) continue;
+		// 【v200.2.17 白名单】跳过 Magazine 子组件 (弹夹) — 不清零
+		//   与 ABaseWeapon::ResolveMagazineSkeletalMesh 用相同的命名规则 (名字包含 "Magazine")
+		//   保证 ResetWeaponMeshRelativeTransforms 与现有 MagDetach/MagAttach 链路识别一致
+		//   弹夹是武器子组件, BP 里配了具体的相对武器 Mesh 的位置 (弹夹在枪的左侧/底部)
+		//   清零它会导致弹夹不在枪上
+		if (MeshComp->GetName().Contains(TEXT("Magazine")))
+		{
+			++SkippedMagazineCount;
+			continue;
+		}
+		MeshComp->SetRelativeLocation(FVector::ZeroVector);
+		MeshComp->SetRelativeRotation(FRotator::ZeroRotator);
+		MeshComp->SetRelativeScale3D(FVector(1.0f));
+		++ResetCount;
+	}
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[v200.2.17] ResetWeaponMeshRelativeTransforms: Weapon=%s Reset=%d SkippedMagazine=%d (name 含 'Magazine' 的组件保留 BP 配的 transform)"),
+		*Weapon->GetName(), ResetCount, SkippedMagazineCount);
+}
 
 // 【v77 大厂架构】检查武器是否已挂载到 Socket
 //   原理: UE AttachToComponent 后, Actor 的 RootComponent 会记录挂载的 Socket 名
@@ -448,24 +499,79 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 	const FName SocketName = ActiveSlotAttachment.SocketName;
 	const FVector RelativeLocation = ActiveSlotAttachment.RelativeLocation;
 	const FRotator RelativeRotation = ActiveSlotAttachment.RelativeRotation;
-	const FVector RelativeScale = ActiveSlotAttachment.RelativeScale3D;
+	const FVector RelativeScale3D = ActiveSlotAttachment.RelativeScale3D;
+
+	// 【v200.2.11 大厂架构 P0 修复】Attach 前强制清零物理引擎残留 transform
+	//   根因(v200.2.10 验证): 丢枪→SetSimulatePhysics→捡起后, Component 仍有"物理漂移"的 WorldRot
+	//         → SnapToTargetNotIncludingScale 只同步 Location 不一定同步 Rotation
+	//         → SetActorRelativeRotation 是在已有 (漂移) WorldRot 基础上叠加 LocalRot
+	//         → 最终旋转完全错位
+	//   验证证据 (Session1.log 3964 vs 4060):
+	//     正常 Spawn: Attach 后 Rot=P=-1.50 Y=174.93 R=1.29 (← socket rotation)
+	//     捡起:       Attach 后 Rot=P=6.83 Y=-115.63 R=-54.46 (← 物理漂移 + 错误)
+	//   修复: Attach 前显式 Reset Component World Transform 到 (0,0,0,identity)
+	//         让 SnapToTargetNotIncludingScale 完整接管 (Location + Rotation 都 snap 到 socket)
+	USceneComponent* WeaponRoot = Weapon->GetRootComponent();
+	if (WeaponRoot)
+	{
+		WeaponRoot->SetWorldLocationAndRotation(FVector::ZeroVector, FRotator::ZeroRotator);
+	}
+
+	// 【v200.2.16 大厂架构 — 关键修复】Attach 前强制 Reset 所有 Mesh 子组件的 RelativeTransform 为 identity
+	//   根因(2026.08.04 验证): BP_Weapon_*.uasset 里 WeaponSkeletalMesh/WeaponStaticMesh 组件配了非零 RelativeTransform
+	//         是"丢武器在地上时的坐标" — 但当武器 attach 到 socket 时, Mesh 子组件应该跟着 RootComponent 走
+	//         残留的 Mesh.RelativeTransform → 武器 Mesh 内部又叠加一次偏移 → attach 后位置完全错位
+	//   修复: Attach 前显式 SetRelativeTransform(identity) 到所有 Mesh 子组件
+	//   与 v200.2.15 (Spawn 时 Reset) 不同: 这里是 attach 前的兜底, 覆盖捡起场景
+	//   (v200.2.15 在 Spawn 时跑, 但关卡预放的武器不在 Spawn 时跑 — 这里兜底)
+	ResetWeaponMeshRelativeTransforms(Weapon);
 
 	// Step 1: Attach (使用 SnapToTargetNotIncludingScale, 与服务器一致)
+	//   SnapToTargetNotIncludingScale 规则: 把 Actor 的 World Location/Rotation 替换为目标 socket 的 World Location/Rotation
+	//   现在 Component 已经在 (0,0,0,identity), 所以 attach 后 World = socket World
 	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
 	Weapon->AttachToComponent(Owner->GetMesh(), AttachmentRules, SocketName);
 
 	// Step 2: 强制应用相对偏移 (v57 零兜底修复 — 不允许 IsNearlyZero 跳过)
 	Weapon->SetActorRelativeLocation(RelativeLocation);
 	Weapon->SetActorRelativeRotation(RelativeRotation);
-	Weapon->SetActorRelativeScale3D(RelativeScale);
+	Weapon->SetActorRelativeScale3D(RelativeScale3D);
 
-	UE_LOG(LogTemp, Log,
-		TEXT("[WeaponAttachment] ApplyAttachmentRuntime: 应用成功 — Weapon=%s Socket=%s Loc=%s Rot=%s Scale=%s"),
+	// 【v200.2.12 大厂架构 P0 诊断】打印 socket world location + 武器 attach 后的 RelativeLocation + WorldLoc
+	//   验证: 1) SetActorRelativeLocation 是否真的生效;
+	//         2) Final WorldLoc - Socket WorldLoc 是否 == RelativeLocation
+	const FVector SocketWorldLoc = Owner->GetMesh()->GetSocketLocation(SocketName);
+	const FRotator SocketWorldRot = Owner->GetMesh()->GetSocketRotation(SocketName);
+	FVector WeaponRelativeLocAfter = FVector::ZeroVector;
+	if (USceneComponent* WeaponRootForDiag = Weapon->GetRootComponent())
+	{
+		WeaponRelativeLocAfter = WeaponRootForDiag->GetRelativeLocation();
+	}
+	const FVector WeaponWorldLocFinal = Weapon->GetActorLocation();
+	const FRotator WeaponWorldRotFinal = Weapon->GetActorRotation();
+	const FRotator ExpectedWorldRot = (SocketWorldRot + RelativeRotation).GetNormalized();
+	const FVector ExpectedWorldLoc = SocketWorldLoc + SocketWorldRot.RotateVector(RelativeLocation);
+	const FVector WorldLocDiff = WeaponWorldLocFinal - ExpectedWorldLoc;
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.2.14 终极诊断] ApplyAttachmentRuntime: 完成 Weapon=%s Socket=%s\n"
+		     "  SocketWorldLoc=%s SocketWorldRot=%s\n"
+		     "  DT.RelativeLocation=%s DT.RelativeRotation=%s\n"
+		     "  WeaponRelativeLocAfter=%s WeaponWorldLocFinal=%s WeaponWorldRotFinal=%s\n"
+		     "  期望(已旋转) WorldLoc=%s WorldRot=%s\n"
+		     "  Diff Loc=%s Diff Rot=%s"),
 		*Weapon->GetName(),
 		*SocketName.ToString(),
-		*RelativeLocation.ToString(),
-		*RelativeRotation.ToString(),
-		*RelativeScale.ToString());
+		*SocketWorldLoc.ToCompactString(),
+		*SocketWorldRot.ToCompactString(),
+		*RelativeLocation.ToCompactString(),
+		*RelativeRotation.ToCompactString(),
+		*WeaponRelativeLocAfter.ToCompactString(),
+		*WeaponWorldLocFinal.ToCompactString(),
+		*WeaponWorldRotFinal.ToCompactString(),
+		*ExpectedWorldLoc.ToCompactString(),
+		*ExpectedWorldRot.ToCompactString(),
+		*WorldLocDiff.ToCompactString(),
+		*(WeaponWorldRotFinal - ExpectedWorldRot).ToCompactString());
 }
 
 
@@ -570,6 +676,9 @@ void UWeaponAttachmentComponent::EquipWeapon(TSubclassOf<ABaseWeapon> WeaponClas
 
 	if (CurrentWeapon)
 	{
+		// 【v200.2.15 大厂架构】重置 Mesh 子组件 RelativeTransform 为 identity
+		ResetWeaponMeshRelativeTransforms(CurrentWeapon);
+
 		// 焊接到第三人称全身模型的 "WeaponSocket_L" 插槽
 		CurrentWeapon->AttachToComponent(
 			Owner->GetMesh(),
@@ -783,6 +892,11 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 			TEXT("[WeaponAttachment] SpawnAndEquipWeapon: SpawnActor 失败."));
 		return;
 	}
+
+	// 【v200.2.15 大厂架构】Spawn 后立即重置 Mesh 子组件 RelativeTransform 为 identity
+	//   防御 BP 蓝图里 WeaponSkeletalMesh/WeaponStaticMesh 组件被配了非零 RelativeTransform
+	//   详见 ResetWeaponMeshRelativeTransforms 注释
+	ResetWeaponMeshRelativeTransforms(NewWeapon);
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[WeaponAttachment] SpawnAndEquipWeapon: 武器生成成功: %s"), *NewWeapon->GetName());
@@ -1475,8 +1589,29 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	// 1. 隐藏旧槽位武器 (保留 Spawn, 仅不可见 — 防切换 GC 抖动)
 	if (OldWeapon && OldWeapon != TargetWeapon)
 	{
-		OldWeapon->SetActorHiddenInGame(true);
-		OldWeapon->SetActorEnableCollision(false);
+		// 【v200.1 大厂架构关键修复】如果旧武器已处于掉落状态 (已 Detach + 物理模拟), 不要再隐藏
+		//   根因: 玩家按 G 丢弃主武器时, 流程是:
+		//     1. Server_DropPrimaryWeapon → StartDroppedState(主武器) — 主武器脱离角色 + 启用物理模拟
+		//     2. Server_SwitchToWeaponSlot(Melee) → 这里如果 SetActorHiddenInGame(true), 主武器又被隐藏
+		//   后果: 主武器确实进入了物理模拟但看不见 — 用户反馈"丢不掉枪"
+		//   修复: 检查 WeaponDropComponent.bIsDropped, 如果为 true 说明已经在掉落流程, 不要再隐藏
+		bool bIsOldWeaponDropping = false;
+		if (UWeaponDropComponent* OldDropComp = OldWeapon->FindComponentByClass<UWeaponDropComponent>())
+		{
+			bIsOldWeaponDropping = OldDropComp->IsDropped();
+		}
+
+		if (bIsOldWeaponDropping)
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: 旧武器 '%s' 已处于掉落状态, 跳过 SetActorHiddenInGame (保留物理模拟可见). Pawn=%s"),
+				*OldWeapon->GetName(), *Owner->GetName());
+		}
+		else
+		{
+			OldWeapon->SetActorHiddenInGame(true);
+			OldWeapon->SetActorEnableCollision(false);
+		}
 	}
 
 	// 2. 显示新槽位武器
@@ -1563,10 +1698,13 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 			ActiveSlotAttachment.RelativeScale3D = TargetSlotConfig->RelativeScale;
 			ActiveSlotAttachment.bIsValid = true;
 
-			UE_LOG(LogTemp, Log,
-				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: 刷新 ActiveSlotAttachment — Slot=%s Socket=%s"),
-				LexToString(TargetSlot),
-				*TargetSlotConfig->SocketName.ToString());
+			// 【v200.2.13】打印 DT 配置的完整信息, 用于诊断 Position offset 不匹配问题
+			UE_LOG(LogTemp, Display,
+				TEXT("[v200.2.13 诊断] Server_SwitchToWeaponSlot: DT 配置 (Loc=%s Rot=%s) Socket=%s Slot=%s"),
+				*TargetSlotConfig->RelativeLocation.ToCompactString(),
+				*TargetSlotConfig->RelativeRotation.ToCompactString(),
+				*TargetSlotConfig->SocketName.ToString(),
+				LexToString(TargetSlot));
 		}
 		else
 		{
@@ -1580,6 +1718,19 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 				*TargetWeapon->GetClass()->GetName());
 		}
 	}
+
+	// 【v200.2.8 大厂架构 P0 修复】服务器自己也要 ApplyAttachmentRuntime!
+	//   根因: OnRep_CurrentWeaponSlot 只在远端客户端触发, 服务器自己写字段不会触发 OnRep
+	//         → Listen Server (房主) 上 Server_SwitchToWeaponSlot 写完字段后, 武器没被 Attach 到角色
+	//         → 用户看到"手上没武器, 但在地上"
+	//   修复: 服务器主动调 ApplyAttachmentRuntime(TargetWeapon), 让 Listen Server 也能正确挂载
+	//   客户端: 仍然走 OnRep_CurrentWeaponSlot → ApplyAttachmentRuntime 路径 (无副作用, ApplyAttachmentRuntime 是幂等的)
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.2.8 诊断] Server_SwitchToWeaponSlot: 服务器端主动 ApplyAttachmentRuntime (Listen Server 不走 OnRep) — TargetWeapon=%s, ActiveSlotAttachment.bIsValid=%d, Socket=%s"),
+		*TargetWeapon->GetName(),
+		ActiveSlotAttachment.bIsValid ? 1 : 0,
+		*ActiveSlotAttachment.SocketName.ToString());
+	ApplyAttachmentRuntime(TargetWeapon);
 
 	// 【v58 大厂架构诊断】切换后检查武器是否真的可见
 	//   排查 "切过去了但看不到" 的根因: Hidden / 位置 / Attach 失败
@@ -1667,8 +1818,25 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot
 	// 隐藏旧槽位武器
 	if (ABaseWeapon* OldWeapon = GetWeaponInSlot(OldSlot))
 	{
-		OldWeapon->SetActorHiddenInGame(true);
-		OldWeapon->SetActorEnableCollision(ECollisionEnabled::NoCollision);
+		// 【v200.1 大厂架构关键修复】客户端镜像: 如果旧武器已处于掉落状态, 不要再隐藏
+		//   服务器切槽位时会跳过隐藏, 客户端 OnRep 也必须一致 — 否则客户端会把正在掉落的武器隐藏
+		bool bIsOldWeaponDropping = false;
+		if (UWeaponDropComponent* OldDropComp = OldWeapon->FindComponentByClass<UWeaponDropComponent>())
+		{
+			bIsOldWeaponDropping = OldDropComp->IsDropped();
+		}
+
+		if (bIsOldWeaponDropping)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: 旧武器 '%s' 已处于掉落状态, 跳过隐藏 (保留物理模拟可见). Pawn=%s"),
+				*OldWeapon->GetName(), *Owner->GetName());
+		}
+		else
+		{
+			OldWeapon->SetActorHiddenInGame(true);
+			OldWeapon->SetActorEnableCollision(ECollisionEnabled::NoCollision);
+		}
 	}
 
 	// 显示新槽位武器 — 优先使用 WeaponState.ActiveWeapon（真理源）
@@ -1703,6 +1871,12 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot
 	// 【v81 大厂架构 — 客户端武器姿态修复】槽位切换后必须应用新槽位的挂载偏移
 	//   服务器 Server_SwitchToWeaponSlot 末尾已写入 ActiveSlotAttachment (新槽位)
 	//   客户端 OnRep 触发 → 应用服务器配置的新槽位偏移
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.2.8 诊断] OnRep_CurrentWeaponSlot: ApplyAttachmentRuntime 前 — WeaponState.ActiveWeapon=%s, ActiveSlot=%s, ActiveSlotAttachment.bIsValid=%d, Socket=%s"),
+		*GetNameSafe(WeaponState.ActiveWeapon),
+		LexToString(WeaponState.ActiveSlot),
+		ActiveSlotAttachment.bIsValid ? 1 : 0,
+		*ActiveSlotAttachment.SocketName.ToString());
 	ApplyAttachmentRuntime(WeaponState.ActiveWeapon);
 
 	UE_LOG(LogTemp, Log,
@@ -2076,6 +2250,10 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 			*WeaponClass->GetName(), LexToString(Slot));
 		return nullptr;
 	}
+
+	// 【v200.2.15 大厂架构】Spawn 后立即重置 Mesh 子组件 RelativeTransform 为 identity
+	//   防御 BP 蓝图里 WeaponSkeletalMesh/WeaponStaticMesh 组件被配了非零 RelativeTransform
+	ResetWeaponMeshRelativeTransforms(NewWeapon);
 
 	// ============================================================
 	// 【v61.2 核心修复】火控配置必须先于 MeshType 校验执行
@@ -2533,4 +2711,252 @@ void UWeaponAttachmentComponent::InitializeWeaponFireConfigFromClass(ABaseWeapon
 			TEXT("[WeaponAttachment] InitializeWeaponFireConfigFromClass: WeaponRow=%s AttackRange=%.0fcm MuzzleOffset=%.0fcm (策划配置)"),
 			*FoundRowName.ToString(), NewWeapon->AttackRange, NewWeapon->MuzzleOffset);
 	}
+}
+
+// ==========================================
+// 【v200 大厂架构新增】丢弃主武器到地面
+// ==========================================
+bool UWeaponAttachmentComponent::Server_DropPrimaryWeapon()
+{
+	// 服务器权威校验
+	ABaseCharacter* OwnerChar = GetOwnerCharacterChecked(this);
+	if (!OwnerChar)
+	{
+		return false;
+	}
+
+	if (!OwnerChar->HasAuthority())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 客户端调用, 拒绝. Pawn=%s"),
+			*OwnerChar->GetName());
+		return false;
+	}
+
+	// 检查是否有主武器
+	if (!CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 手里没有主武器, 忽略. Pawn=%s, CurrentSlot=%s"),
+			*OwnerChar->GetName(),
+			LexToString(CurrentWeaponSlot));
+		return false;
+	}
+
+	// 【v200 大厂架构关键检查】必须确保是主武器槽位
+	// 丢弃功能只对主武器有效，不能丢弃副武器或近战武器
+	if (CurrentWeaponSlot != EWeaponSlotType::Primary)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 当前槽位不是 Primary (%s), 拒绝丢弃. Pawn=%s"),
+			LexToString(CurrentWeaponSlot),
+			*OwnerChar->GetName());
+		return false;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 开始丢弃. Pawn=%s, Weapon=%s, Slot=%s"),
+		*OwnerChar->GetName(),
+		*CurrentWeapon->GetName(),
+		LexToString(CurrentWeaponSlot));
+
+	// 【v200 大厂架构关键修复】先保存要丢弃的主武器引用，避免后续切换武器时丢失
+	ABaseWeapon* PrimaryWeaponToDrop = CurrentWeapon;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 保存主武器引用 PrimaryWeaponToDrop=%s"),
+		*PrimaryWeaponToDrop->GetName());
+
+	// 【v200 大厂架构关键修复】先检查主武器是否有 WeaponDropComponent，避免后续浪费切换
+	UWeaponDropComponent* PrimaryDropComp = PrimaryWeaponToDrop->FindComponentByClass<UWeaponDropComponent>();
+	if (!PrimaryDropComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 主武器 '%s' 没有 WeaponDropComponent! 修复: 在武器蓝图 (如 BP_Weapon_AK47) 的 Components 面板中添加 WeaponDropComponent 子对象."),
+			*PrimaryWeaponToDrop->GetName());
+		return false;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 主武器 '%s' 有 WeaponDropComponent. PrimaryDropComp=%s"),
+		*PrimaryWeaponToDrop->GetName(),
+		*PrimaryDropComp->GetName());
+
+	// 【v200 大厂架构关键】先让主武器进入掉落状态（脱离角色 + 物理模拟 + 可见）
+	// 顺序关键:
+	//   1. 先 StartDroppedState — 主武器脱离角色 + 启用物理模拟（玩家能看到武器在空中飞）
+	//   2. 再切换槽位到近战 — 此时主武器已经 Detach，SetActorHiddenInGame(true) 只对挂在角色身上的武器有效
+	//   旧顺序问题: 先切换到近战 → 主武器被 SetActorHiddenInGame(true) → 再 StartDroppedState 也无法取消隐藏
+	PrimaryDropComp->StartDroppedState(OwnerChar);
+
+	// 检查掉落是否成功 (通过 bIsDropped 状态)
+	if (!PrimaryDropComp->IsDropped())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: StartDroppedState 失败! WeaponDropComponent::bIsDropped 仍为 false. Pawn=%s, Weapon=%s"),
+			*OwnerChar->GetName(),
+			*PrimaryWeaponToDrop->GetName());
+		return false;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 主武器 '%s' 已进入掉落状态 (物理模拟可见). Pawn=%s"),
+		*PrimaryWeaponToDrop->GetName(),
+		*OwnerChar->GetName());
+
+	// 【v200 大厂架构关键】再切换到近战武器，让玩家空手后自动拿起近战
+	// 原因: OnRep_CurrentWeaponSlot 检测到 ActiveSlot=None 会拒绝操作，导致客户端不隐藏主武器
+	// 所以必须先切换到近战 (ActiveSlot=Melee)，让客户端正确隐藏主武器（指武器槽位 UI）
+	if (HasWeaponInSlot(EWeaponSlotType::Melee))
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 切换到近战武器. Pawn=%s"),
+			*OwnerChar->GetName());
+		Server_SwitchToWeaponSlot(EWeaponSlotType::Melee);
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 切换近战后, CurrentWeapon=%s (已变成近战)"),
+			CurrentWeapon ? *CurrentWeapon->GetName() : TEXT("None"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 近战槽位没有武器，无法自动切换. Pawn=%s"),
+			*OwnerChar->GetName());
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 掉落状态已激活, 主武器 '%s' 已在地上, 当前槽位=%s."),
+		*PrimaryWeaponToDrop->GetName(),
+		LexToString(CurrentWeaponSlot));
+
+	// 【v200 大厂架构关键修复】丢弃成功后，清空主武器槽位状态
+	// 注意: 不需要清空 WeaponState.ActiveSlot，因为已经切换到 Melee 了
+	// 只需要清空 WeaponsInSlot[Primary] 和 CurrentWeapon 缓存
+
+	// 1. 清空 WeaponsInSlot[Primary] — 玩家不能再切换回这把武器
+	if (WeaponsInSlot.IsValidIndex(0))
+	{
+		WeaponsInSlot[0] = nullptr;
+		UE_LOG(LogTemp, Display,
+			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: WeaponsInSlot[Primary] 已清空."));
+	}
+
+	// 2. 清空 CurrentWeapon — 缓存视图同步
+	// 注意: CurrentWeapon 已经被 Server_SwitchToWeaponSlot 改为近战武器，要用 PrimaryWeaponToDrop
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: CurrentWeapon 已清空 (主武器 '%s' 已在地上)."),
+		*PrimaryWeaponToDrop->GetName());
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 丢弃完成. Pawn=%s, 主武器 '%s' 已在地上, 当前槽位=%s."),
+		*OwnerChar->GetName(),
+		*PrimaryWeaponToDrop->GetName(),
+		LexToString(CurrentWeaponSlot));
+
+	return true;
+}
+
+// ==========================================
+// 【v200 大厂架构新增】捡起地面上的武器
+// ==========================================
+bool UWeaponAttachmentComponent::Server_TryPickupWeapon(ABaseWeapon* WeaponToPickup)
+{
+	// 服务器权威校验
+	ABaseCharacter* OwnerChar = GetOwnerCharacterChecked(this);
+	if (!OwnerChar)
+	{
+		return false;
+	}
+
+	if (!OwnerChar->HasAuthority())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 客户端调用, 拒绝. Pawn=%s"),
+			*OwnerChar->GetName());
+		return false;
+	}
+
+	// 检查武器有效性
+	if (!WeaponToPickup)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: WeaponToPickup 为空, 忽略."));
+		return false;
+	}
+
+	// 检查手里是否已有主武器
+	// 【v200.2.7 致命根因修复】必须检查 GetWeaponInSlot(Primary) 而不是 CurrentWeapon!
+	//   根因: CurrentWeapon 是"激活的武器"(任意槽位), 不是"主武器槽位的武器"
+	//   玩家丢主武器 → 切 Melee → CurrentWeapon = Knife → 旧版误判"已有主武器"
+	//   实际 WeaponsInSlot[Primary] 槽位是空的 → 应该允许捡起
+	//   大厂原则 - 单一真理源: 槽位状态由 WeaponsInSlot[Slot] 单一权威
+	ABaseWeapon* CurrentPrimaryWeapon = GetWeaponInSlot(EWeaponSlotType::Primary);
+	if (CurrentPrimaryWeapon)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: Pawn=%s Primary 槽位已有武器 '%s', 忽略捡起."),
+			*OwnerChar->GetName(),
+			*CurrentPrimaryWeapon->GetName());
+		return false;
+	}
+
+	// 获取 WeaponDropComponent 并验证武器在掉落状态
+	UWeaponDropComponent* DropComp = WeaponToPickup->FindComponentByClass<UWeaponDropComponent>();
+	if (!DropComp)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 没有 WeaponDropComponent, 可能不是掉落武器."),
+			*WeaponToPickup->GetName());
+		return false;
+	}
+
+	if (!DropComp->IsDropped())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 不在掉落状态, 忽略."),
+			*WeaponToPickup->GetName());
+		return false;
+	}
+
+	// 取消掉落状态 (会恢复弹药并停止物理)
+	const bool bCanceled = DropComp->CancelDroppedState(OwnerChar);
+	if (!bCanceled)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] Server_TryPickupWeapon: CancelDroppedState 失败, 武器 '%s'."),
+			*WeaponToPickup->GetName());
+		return false;
+	}
+
+	// 【v200.2 大厂架构关键修复】把武器放回主武器槽位 + 切回 Primary 槽位
+	//   根因: 玩家丢弃主武器时, WeaponsInSlot[Primary] 已被清空, 槽位也切到了 Melee
+	//   旧版 Server_TryPickupWeapon 只调 AttachToComponent, 没把武器放回 WeaponsInSlot[Primary]
+	//   → GetWeaponInSlot(Primary) 永远返回 null → 玩家再按 Q 切回 Primary 槽位失败
+	//   → 玩家捡起武器后, 武器 mesh 短暂出现(因为 AttachToComponent), 但立刻被 Server_SwitchToWeaponSlot 检测隐藏
+	//   修复:
+	//     1. 把 WeaponToPickup 放回 WeaponsInSlot[Primary]
+	//     2. 调用 Server_SwitchToWeaponSlot(Primary) 切回主武器槽位
+	//     3. ActiveSlotAttachment 也写回 Primary 的挂载配置
+	WeaponsInSlot[0] = WeaponToPickup;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 已放回 WeaponsInSlot[Primary]. Pawn=%s"),
+		*WeaponToPickup->GetName(),
+		*OwnerChar->GetName());
+
+	// 【v200.2 大厂架构】自动切回 Primary 槽位 — 业务规则 (用户反馈 2026.08.04):
+	//   "玩家捡起主武器, 需要自动切换到主武器"
+	//   - 玩家丢弃主武器时槽位切到 Melee, 捡起后必须自动切回 Primary, 否则玩家拿的是近战武器
+	//   - 旧版没切回, 玩家手上还是近战 → 业务错误
+	//   修复: 显式调 Server_SwitchToWeaponSlot(Primary), 让客户端 OnRep 看到 ActiveSlot=Primary 正确显示主武器
+	// 【v200.2.1 修复】Server_SwitchToWeaponSlot 返回 void, 不再用 bool 包装
+	Server_SwitchToWeaponSlot(EWeaponSlotType::Primary);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment] Server_TryPickupWeapon: Pawn=%s 捡起主武器 '%s' 成功 (已自动切回 Primary 槽位)."),
+		*OwnerChar->GetName(),
+		*WeaponToPickup->GetName());
+
+	return true;
 }
