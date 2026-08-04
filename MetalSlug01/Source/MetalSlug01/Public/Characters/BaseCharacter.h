@@ -1969,6 +1969,40 @@ protected:
 	 */
 	void OnDropWeaponPressed(const FInputActionValue& Value);
 
+	// ==========================================
+	// 5. 武器射击/换弹 Server RPC (v200.3.3 Owning Connection 修复)
+	//
+	// 根因: 旧版 Weapon->Server_StartFire 在捡枪场景失败
+	//   - 客户端调 Weapon->Server_StartFire RPC
+	//   - Weapon 是"别人的枪" (Owner=扔枪的玩家)
+	//   - UE NetDriver: "No owning connection for actor" → RPC 被丢弃
+	//   - 解决: 在 Character Actor 上声明 RPC (Character 的 owning connection 是客户端)
+	// ==========================================
+public:
+	/** Server_StartFire — 服务器开始开火 (枪械)
+	 *  v200.3.3 修复: 在 Character Actor 上声明, 用 Character 的 owning connection
+	 */
+	UFUNCTION(Server, Reliable)
+	void Server_StartFire(const FVector_NetQuantize& ClientRayOrigin,
+		const FVector_NetQuantizeNormal& ClientRayDirection);
+
+	/** Server_StartFire_Validate — 验证函数 */
+	bool Server_StartFire_Validate(const FVector_NetQuantize& ClientRayOrigin,
+		const FVector_NetQuantizeNormal& ClientRayDirection);
+
+	/** Server_StopFire — 服务器停止开火 */
+	UFUNCTION(Server, Reliable)
+	void Server_StopFire();
+
+	/** Server_StopFire_Validate — 验证函数 */
+	bool Server_StopFire_Validate();
+
+	/** Server_StartReload — 服务器开始换弹 */
+	UFUNCTION(Server, Reliable)
+	void Server_StartReload();
+
+	/** Server_StartReload_Validate — 验证函数 */
+	bool Server_StartReload_Validate();
 
 	// ==========================================
 	// 4. 武器与自动连斩系统核心变量

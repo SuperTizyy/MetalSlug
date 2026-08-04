@@ -53,17 +53,29 @@ void UWeaponDropComponent::BeginPlay()
 	Super::BeginPlay();
 
 	// 注册 Overlap 事件
-	// Owner Weapon 必须有 StaticMeshComponent 或 SkeletalMeshComponent 才能注册
+	//   Owner Weapon 必须有 StaticMeshComponent 或 SkeletalMeshComponent 才能注册
+	//   【v200.2.18 大厂原则 — 零兜底】Component 必须挂在 ABaseWeapon 上, 否则 Log Error (Component 配错)
 	if (ABaseWeapon* OwnerWeapon = ResolveOwnerWeapon())
 	{
 		if (UPrimitiveComponent* MeshComp = Cast<UPrimitiveComponent>(OwnerWeapon->GetMeshComponent()))
 		{
 			MeshComp->OnComponentBeginOverlap.AddDynamic(this, &UWeaponDropComponent::OnOverlapBegin);
 		}
+		else
+		{
+			// 【v200.2.18 零兜底】OwnerWeapon 找到了但没 MeshComponent → Component 配错, 必须 Error
+			UE_LOG(LogTemp, Error,
+				TEXT("[v200.2.18][WeaponDropComponent] BeginPlay: OwnerWeapon='%s' 找到, 但没有 MeshComponent. "
+				     "Overlap 永远触发不了. 【修复】检查 BP_Weapon_Xxx 蓝图是否包含 StaticMeshComponent 或 SkeletalMeshComponent."),
+				*OwnerWeapon->GetName());
+		}
 	}
 	else
 	{
-		// Owner 无效不是错误, 因为可能在 Spawn 前就调用 BeginPlay
+		// 【v200.2.18 零兜底】ResolveOwnerWeapon 失败 → Component 没挂在 ABaseWeapon 上
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.2.18][WeaponDropComponent] BeginPlay: ResolveOwnerWeapon 失败 — Component 没挂在 ABaseWeapon 上. "
+			     "【修复】Component 必须挂在 ABaseWeapon 子类 (BP_Weapon_AK47 等) 的 Components 面板."));
 	}
 }
 
@@ -140,11 +152,23 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		*MeshComp->GetName(),
 		*OwnerWeapon->GetActorLocation().ToString());
 
+	// 【v200.3 Epic 官方】捕获初始掉落位置 (必须在物理设置之前!)
+	//   原因: SetSimulatePhysics 后 GetActorLocation 可能返回碰撞后的位置
+	//   → 需要掉落开始时的世界坐标，传给 Multicast_DropWeapon
+	const FVector SpawnLocation = OwnerWeapon->GetActorLocation();
+	const FRotator SpawnRotation = OwnerWeapon->GetActorRotation();
+
 	// 【v200 大厂架构关键】先从角色上分离武器
 	// 如果武器仍然附加在角色上，设置 SimulatePhysics 可能无效
+	// 【v200.3 Epic 官方方案】服务器调 DetachFromActor, 客户端也通过 Multicast 调
+	//   服务器 DetachFromActor: 正常执行 (不需要 RPC 同步)
+	//   客户端 DetachFromActor: 必须通过 Multicast 执行 (Epic 官方)
+	//     原因: 服务器 DetachFromActor 不会自动复制到客户端
+	//     → 客户端仍认为武器附加在角色上 → 武器悬空
+	//     → Epic: "The only way to get around this is to use an RPC or OnRep to call DetachFromActor on the client."
 	OwnerWeapon->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponDropComponent] StartDroppedState: 武器 '%s' 已从角色分离."),
+		TEXT("[WeaponDropComponent] StartDroppedState: 武器 '%s' 已从角色分离 (服务器端 Detach — 客户端通过 Multicast 同步)."),
 		*OwnerWeapon->GetName());
 
 	// 7. 保存碰撞预设并切换到 PhysicsOnly
@@ -171,24 +195,29 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 	//     - Pawn: Overlap (玩家走过去触发拾取, 不被推开)
 	//     - PhysicsBody: Overlap (不与其他动态物体互推)
 	//     - Visibility: Block (玩家射线检测仍能命中武器 mesh)
+	// 【v200.3.11 修复】设置 ObjectType 为 WorldDynamic
+	//   原因: 武器在地上是"世界动态物体", 不是 "PhysicsBody"
+	//   WorldDynamic 与其他 WorldDynamic 物体正确互动
+	MeshComp->SetCollisionObjectType(ECC_WorldDynamic);
+
 	MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-	MeshComp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);
-	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);         // 关键: 不再 Block 玩家
+	MeshComp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);    // 阻挡地面
+	MeshComp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);   // 与其他世界动态物体阻挡
+	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);         // 玩家 overlap 触发拾取
 	MeshComp->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);
-	MeshComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
-	MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
-	MeshComp->SetCollisionResponseToChannel(ECC_Destructible, ECR_Ignore);
+	MeshComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);     // 射线检测命中
+	MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);        // 忽略相机
+	MeshComp->SetCollisionResponseToChannel(ECC_Destructible, ECR_Ignore);  // 忽略可破坏物
 	MeshComp->SetCollisionResponseToChannel(ECC_Vehicle, ECR_Overlap);
 
-	// 【v200.2.6 致命根因修复】必须显式设 SetGenerateOverlapEvents(true)!
+	// 【v200.3.6 致命根因修复】必须显式设 SetGenerateOverlapEvents!
 	//   根因: UE 物理模拟的 SkeletalMesh 默认 bGenerateOverlapEvents=false
-	//         玩家走到距离 52cm(< PickupRadius 250cm)也没触发 OnComponentBeginOverlap
-	//         因为 SkeletalMesh 物理 Body 不向 Component 层报告 overlap, 只报告 hit
-	//   修复: 显式开启 + SetNotifyRigidBodyCollision(true) 让物理 body 也通知 overlap
+	//         玩家走近武器也不会触发 OnComponentBeginOverlap
+	//   修复: 显式开启 GenerateOverlapEvents，让物理 body 也通知 overlap
 	//         这是 UE 大厂拾取系统标配 (Lyra / Paragon 都这么做)
 	MeshComp->SetGenerateOverlapEvents(true);
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponDropComponent] StartDroppedState: 武器 '%s' 已开启 GenerateOverlapEvents (UE 大厂拾取标配 — 否则物理 mesh 不触发 overlap 事件)"),
+		TEXT("[v200.3.6][WeaponDropComponent] StartDroppedState: 已开启 GenerateOverlapEvents. Weapon=%s"),
 		*OwnerWeapon->GetName());
 
 	UE_LOG(LogTemp, Display,
@@ -260,11 +289,15 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		1.0f,
 		true);
 
-	// 8. 启用物理模拟
-	// 【v200.2.2 修复】在 SetSimulatePhysics 调用前强制 RecreatePhysicsState
-	//   根因: UE 5.6 SkeletalMesh 的物理状态是 lazy 创建的 — 在调用 SetSimulatePhysics 时如果还没创建
-	//         会失败. RecreatePhysicsState 强制立即创建
-	//         这是 PIE warning "形体被设置为模拟物理，但"启用碰撞"不兼容" 的常见根因
+	// 8. 【v200.3.10 关键修复 — 时序重构】
+	// 旧版问题: Multicast 在物理启动之后才调用, 客户端收到旧位置
+	// 新版顺序: 准备好参数 → 服务器启动物理 + 速度 → Multicast (客户端 Detach + SetLocation)
+	//   - 客户端 Multicast 时, 服务器已经把武器推到正确物理位置
+	//   - 客户端收到 SpawnLocation (服务器启动物理时的位置), 然后 ReplicateMovement 同步后续
+	//
+	// 【v200.2.2 保留】在 SetSimulatePhysics 调用前强制 RecreatePhysicsState
+	//   - UE 5.6 SkeletalMesh 物理状态 lazy 创建, RecreatePhysicsState 强制创建
+	//   - 修复 PIE warning "形体被设置为模拟物理，但'启用碰撞'不兼容"
 	if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
 	{
 		SkelMesh->RecreatePhysicsState();
@@ -272,7 +305,7 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 
 	MeshComp->SetSimulatePhysics(true);
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponDropComponent] StartDroppedState: 武器 '%s' SetSimulatePhysics(true) 已调用 (强制 RecreatePhysicsState 后)"),
+		TEXT("[WeaponDropComponent] StartDroppedState: 武器 '%s' SetSimulatePhysics(true) 已调用."),
 		*OwnerWeapon->GetName());
 
 	// 【v200.2.2 修复】物理激活后再次强制覆盖 Actor 级别 collision
@@ -320,6 +353,21 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 	// 12. 设置掉落状态
 	bIsDropped = true;
 
+	// 【v200.3.10 关键修复 — 时序重构】
+	// 根因: 之前 Multicast 在物理启动后才调用, 客户端收到旧 SpawnLocation
+	// 修复: 服务器先启动物理 + 设置速度 → Multicast (客户端 Detach + SetLocation)
+	//   - 客户端收到 SpawnLocation (服务器启动物理时的位置)
+	//   - 然后 ReplicateMovement 接管后续物理位置同步
+	//   - 不传 velocity (服务器物理已设置, ReplicateMovement 会自动同步)
+	if (OwnerWeapon)
+	{
+		OwnerWeapon->Multicast_DropWeapon(
+			FVector_NetQuantize(SpawnLocation),
+			SpawnRotation,
+			FVector::ZeroVector,    // 不传 velocity
+			FVector::ZeroVector);   // 不传 angular velocity
+	}
+
 	// 13. 启动生命周期计时器
 	if (UWorld* World = GetWorld())
 	{
@@ -345,6 +393,25 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 
 // ==========================================
 // 取消掉落状态 (捡起)
+// 【v200.3.6 大厂架构重构 — 完整重写】
+//
+// 根因分析 (基于 UE 官方论坛拾取标准):
+//   1. UE 要求: Overlap 触发后，必须通过服务器 RPC 处理所有数据修改
+//   2. UE 要求: 拾取时必须正确关闭碰撞，否则玩家会"穿过"武器
+//   3. UE 要求: Attach 前必须确保武器在世界位置正确，然后建立父子关系
+//   4. UE 要求: 停止物理后，必须同步 Physics Body Transform 到 Component
+//
+// 完整时序:
+//   1. 玩家 Overlap → 客户端调 Server_TryPickupWeapon RPC
+//   2. 服务器 CancelDroppedState:
+//      a. SetSimulatePhysics(false) — 停止物理
+//      b. RecreatePhysicsState — 同步物理 body 到组件
+//      c. SetCollisionEnabled(NoCollision) — 关闭碰撞
+//      d. SetActorEnableCollision(false) — 关闭 Actor 碰撞
+//   3. 服务器 HandleTryPickupWeapon:
+//      a. WeaponsInSlot[Primary] = WeaponToPickup
+//      b. Server_SwitchToWeaponSlot(Primary)
+//         → ApplyAttachmentRuntime: Attach + SetRelativeTransform
 // ==========================================
 bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 {
@@ -353,7 +420,7 @@ bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 	if (!OwnerWeapon)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponDropComponent] CancelDroppedState: Owner Weapon 无效."));
+			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: Owner Weapon 无效."));
 		return false;
 	}
 
@@ -361,21 +428,12 @@ bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 	if (!bIsDropped)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponDropComponent] CancelDroppedState: 武器 '%s' 不在掉落状态, 忽略."),
+			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: 武器 '%s' 不在掉落状态, 忽略."),
 			*OwnerWeapon->GetName());
 		return false;
 	}
 
-	// 3. 弹药快照校验
-	if (!AmmoSnapshot.bIsValid)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponDropComponent] CancelDroppedState: 武器 '%s' 的弹药快照无效, 无法恢复. Pickup 失败."),
-			*OwnerWeapon->GetName());
-		return false;
-	}
-
-	// 4. 停止生命周期计时器
+	// 3. 停止生命周期计时器
 	if (UWorld* World = GetWorld())
 	{
 		if (LifetimeTimerHandle.IsValid())
@@ -384,7 +442,6 @@ bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 			LifetimeTimerHandle.Invalidate();
 		}
 
-		// 【v200.2.5】清理诊断 Tick 计时器
 		if (DropPositionTimerHandle.IsValid())
 		{
 			World->GetTimerManager().ClearTimer(DropPositionTimerHandle);
@@ -392,58 +449,65 @@ bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 		}
 	}
 
-	// 5. 获取 Mesh 组件并恢复物理状态
+	// 4. 获取 Mesh 组件
 	UPrimitiveComponent* MeshComp = Cast<UPrimitiveComponent>(OwnerWeapon->GetMeshComponent());
-	if (MeshComp)
+	if (!MeshComp)
 	{
-		// 【v200.2.10 大厂架构 P0 修复】SetSimulatePhysics 前打印物理 Body 状态, 排查 transform 残留
-		const FVector WorldLocBeforeStopPhysics = OwnerWeapon->GetActorLocation();
-		UE_LOG(LogTemp, Display,
-			TEXT("[v200.2.10 诊断] CancelDroppedState: 停止物理前 Weapon='%s' WorldLoc=%s IsSimulatingPhysics=%d"),
-			*OwnerWeapon->GetName(),
-			*WorldLocBeforeStopPhysics.ToCompactString(),
-			MeshComp->IsSimulatingPhysics() ? 1 : 0);
-
-		// 停止物理模拟
-		MeshComp->SetSimulatePhysics(false);
-
-		// 【v200.2.10 关键修复】物理停止后强制同步物理 Body 的 transform
-		//   根因: SkeletalMesh 在物理模拟期间, Mesh 的物理 Body (BodyInstance) 与 Component 分离
-		//         → SetSimulatePhysics(false) 只停止模拟, 不把物理 Body 的 transform 同步回 Component
-		//         → Mesh 渲染 transform 仍停留在地面位置, 但 Component 已经 attach 到 socket
-		//         → 用户看到"武器 attach 到 socket 但 mesh 视觉上不在 socket 上"
-		//   修复: 物理停止后, 强制 ResetBodyTransform + UpdateBodyToBones
-		//         让物理 Body 跟随 Component 的新 transform
-		MeshComp->RecreatePhysicsState();
-
-		const FVector WorldLocAfterRecreate = OwnerWeapon->GetActorLocation();
-		UE_LOG(LogTemp, Display,
-			TEXT("[v200.2.10 诊断] CancelDroppedState: RecreatePhysicsState 后 Weapon='%s' WorldLoc=%s (期望接近 Picker 位置)"),
-			*OwnerWeapon->GetName(),
-			*WorldLocAfterRecreate.ToCompactString());
-
-		// 【v200.2 大厂架构关键修复】恢复装饰武器状态 — NoCollision + Ignore
-		//   与 ABaseWeapon::BeginPlay 完全对称: 武器被捡起后回到"挂在角色身上不阻挡任何东西"的状态
-		//   旧版用 PreviousCollisionProfile = "Custom", 但 Custom 也被 BeginPlay 设为 NoCollision, 不一致
-		//   修复: 显式设 NoCollision + Ignore + SetActorEnableCollision(false), 与 BeginPlay 完全一致
-		MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-		MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
-		OwnerWeapon->SetActorEnableCollision(false);
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: MeshComponent 为空, Weapon=%s."),
+			*OwnerWeapon->GetName());
+		return false;
 	}
 
-	// 6. 恢复弹药快照
+	// 5. 【v200.3.6 关键修复】先关闭碰撞，再停止物理
+	//    根因: 如果先停止物理，武器可能会因为碰撞响应而继续移动
+	//    然后 Attach 时位置已经变了，导致 attach 到错误位置
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState Step 1: 关闭碰撞. Weapon=%s"),
+		*OwnerWeapon->GetName());
+
+	// 关闭 Mesh 碰撞
+	MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+
+	// 关闭 Actor 碰撞
+	OwnerWeapon->SetActorEnableCollision(false);
+
+	// 6. 停止物理模拟
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState Step 2: 停止物理. Weapon=%s"),
+		*OwnerWeapon->GetName());
+
+	if (MeshComp->IsSimulatingPhysics())
+	{
+		MeshComp->SetSimulatePhysics(false);
+
+		// 【v200.3.6 关键】停止物理后必须 RecreatePhysicsState
+		// 否则 SkeletalMesh 的 Physics Body Transform 不会同步到 Component
+		if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
+		{
+			SkelMesh->RecreatePhysicsState();
+		}
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: RecreatePhysicsState 完成. Weapon=%s Location=%s"),
+			*OwnerWeapon->GetName(),
+			*OwnerWeapon->GetActorLocation().ToCompactString());
+	}
+
+	// 7. 恢复弹药快照
 	RestoreAmmoSnapshot();
 
-	// 7. 清理掉落状态
+	// 8. 清理掉落状态
 	bIsDropped = false;
 	DropInstigator.Reset();
-	AmmoSnapshot = FAmmoSnapshot(); // 重置
+	AmmoSnapshot = FAmmoSnapshot();
 
-	// 8. 广播事件
+	// 9. 广播事件
 	OnDroppedWeaponPickedUp.Broadcast(OwnerWeapon, Picker);
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponDropComponent] CancelDroppedState: 武器 '%s' 被 '%s' 捡起."),
+		TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: 武器 '%s' 被 '%s' 捡起. 物理已停止, 碰撞已关闭."),
 		*OwnerWeapon->GetName(),
 		Picker ? *Picker->GetName() : TEXT("None"));
 
@@ -465,20 +529,121 @@ FString UWeaponDropComponent::GetDroppedWeaponName() const
 // ==========================================
 // Overlap 回调
 // ==========================================
+/**
+ * 【v200.2.18 大厂架构 P0 修复 — 远程客户端拾取链路】
+ *
+ * 旧版反模式 (v200 之前):
+ *   - OnOverlapBegin 内部: if (!HasAuthority()) return;
+ *   - 假设: 服务器 (ListenServer) 上 host 玩家的 overlap 触发 → 服务器直接处理
+ *   - 致命问题: 远程客户端 (NetMode = Client) 走到武器上
+ *     → 客户端 overlap 触发 → HasAuthority()=false → 静默 return
+ *     → 没有 RPC 触发 → 服务器不知道客户端想捡
+ *     → 用户看到"客户端捡不起来"
+ *
+ * 新架构 (v200.2.18 — 单一 RPC 链路 + 零兜底):
+ *   - 客户端也能 fire overlap (UE 自动 — 客户端 Mesh 也注册了 OnComponentBeginOverlap)
+ *   - OnOverlapBegin 入口不守卫 HasAuthority(), 让所有端都跑
+ *   - 检测当前是不是客户端 (HasAuthority()=false)
+ *   - 客户端路径: 调 OverlappingChar->Server_TryPickupWeapon (这是 ABaseCharacter 的真 RPC)
+ *   - 服务器路径: 直接在本地处理拾取
+ *
+ * 大厂原则 (单一 RPC 入口):
+ *   - Server_TryPickupWeapon 是 ABaseCharacter 的 UFUNCTION(Server, Reliable)
+ *   - 客户端调用 → 自动 RPC 到服务器
+ *   - 服务器接收 → 执行 Server_TryPickupWeapon_Implementation → 取消掉落 + attach
+ *   - 无论客户端还是服务器, 同一个 RPC 入口, 单一真理源
+ *
+ * 零兜底:
+ *   - 客户端调 Server_TryPickupWeapon 必须成功 RPC (UE 引擎保证, 网络异常会 log)
+ *   - 服务器检测到重叠后必须成功取消掉落状态 (CancelDroppedState 内部 Log)
+ *   - 任何环节失败 → Log Error, 不静默跳过
+ */
 void UWeaponDropComponent::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
                                        UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
                                        bool bFromSweep, const FHitResult& Hit)
 {
-	// 仅服务器处理捡起
 	AActor* OwnerActor = GetOwner();
-	if (!OwnerActor || !OwnerActor->HasAuthority())
+	if (!OwnerActor)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.6][WeaponDropComponent] OnOverlapBegin: OwnerActor 为空."));
 		return;
 	}
+
+	// 【v200.3.6 详细诊断】打印 Overlap 信息
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.3.6][WeaponDropComponent] OnOverlapBegin: OverlappedComp=%s OtherActor=%s OtherComp=%s OtherBodyIndex=%d bFromSweep=%d"),
+		*OverlappedComp->GetName(),
+		*OtherActor->GetName(),
+		OtherComp ? *OtherComp->GetName() : TEXT("None"),
+		OtherBodyIndex,
+		bFromSweep ? 1 : 0);
+
+	// 【v200.3.6 详细诊断】打印武器状态
+	ABaseWeapon* WeaponActor = Cast<ABaseWeapon>(OwnerActor);
+	if (WeaponActor)
+	{
+		UPrimitiveComponent* MeshComp = Cast<UPrimitiveComponent>(WeaponActor->GetMeshComponent());
+		if (MeshComp)
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[v200.3.6][WeaponDropComponent] OnOverlapBegin: 武器状态 — bIsDropped=%d IsSimulatingPhysics=%d CollisionEnabled=%d GenerateOverlapEvents=%d PawnResponse=%d"),
+				bIsDropped ? 1 : 0,
+				MeshComp->IsSimulatingPhysics() ? 1 : 0,
+				static_cast<int32>(MeshComp->GetCollisionEnabled()),
+				MeshComp->GetGenerateOverlapEvents() ? 1 : 0,
+				static_cast<int32>(MeshComp->GetCollisionResponseToChannel(ECC_Pawn)));
+		}
+	}
+
+	// 【v200.3.6】客户端路径 — 调 RPC 让服务器处理
+	if (!OwnerActor->HasAuthority())
+	{
+		// 客户端路径 — 检查前置条件后调 RPC
+		ABaseCharacter* OverlappingCharClient = Cast<ABaseCharacter>(OtherActor);
+		if (!OverlappingCharClient)
+		{
+			return; // 非角色 (子弹/抛出的物体), 正常过滤, 不算兜底
+		}
+
+		// 客户端只检查"是不是活着的玩家" — 不需要检查 bIsDropped (客户端 bIsDropped 永远 false, 不是错误)
+		if (!OverlappingCharClient->IsPlayerControlled() || OverlappingCharClient->IsDead())
+		{
+			return; // 正常过滤
+		}
+
+		// 【v200.2.18 大厂架构 — 客户端拾取 RPC 链路】
+		// 调 ABaseCharacter 的 Server_TryPickupWeapon (UFUNCTION Server Reliable)
+		// 单一入口, 客户端 → RPC → 服务器 → 取消掉落 + attach
+		ABaseWeapon* WeaponToPickup = Cast<ABaseWeapon>(OwnerActor);
+		if (WeaponToPickup)
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[v200.2.18][WeaponDropComponent] OnOverlapBegin: 客户端触发拾取 RPC — Char=%s Weapon=%s. "
+				     "客户端调 ABaseCharacter::Server_TryPickupWeapon (UFUNCTION Server Reliable) → 服务器处理取消掉落 + attach."),
+				*OverlappingCharClient->GetName(),
+				*WeaponToPickup->GetName());
+
+			OverlappingCharClient->Server_TryPickupWeapon(WeaponToPickup);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[v200.2.18][WeaponDropComponent] OnOverlapBegin: OwnerActor 不是 ABaseWeapon, 拒绝拾取 RPC. Owner=%s."),
+				*OwnerActor->GetName());
+		}
+		return; // 客户端处理完, 不跑服务器路径
+	}
+
+	// ============================================
+	// 服务器路径 (HasAuthority = true) — 直接本地处理
+	// ============================================
 
 	// 检查是否在掉落状态
 	if (!bIsDropped)
 	{
+		// 服务器 bIsDropped=false 是合理的 (CancelDroppedState 已重置)
+		// 正常业务过滤, 不算兜底
 		return;
 	}
 
@@ -486,32 +651,37 @@ void UWeaponDropComponent::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, A
 	ABaseCharacter* OverlappingChar = Cast<ABaseCharacter>(OtherActor);
 	if (!OverlappingChar)
 	{
-		return;
+		return; // 非角色 (子弹/抛出的物体), 正常业务过滤
 	}
 
 	// 检查是否是活着的玩家 (AI 不捡武器)
 	if (!OverlappingChar->IsPlayerControlled())
 	{
-		return;
+		return; // AI 不捡武器, 正常业务过滤
 	}
 
 	// 检查是否死亡
 	if (OverlappingChar->IsDead())
 	{
-		return;
+		return; // 死亡角色不能捡武器, 正常业务过滤
 	}
 
 	// 检查是否已经有主武器
 	UWeaponAttachmentComponent* WeaponAttach = OverlappingChar->ResolveWeaponAttach();
 	if (!WeaponAttach)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.2.18][WeaponDropComponent] OnOverlapBegin: 角色 '%s' 找不到 WeaponAttach 组件, 拒绝捡起. "
+			     "【修复】检查 %s 的 Components 面板是否包含 WeaponAttachmentComponent."),
+			*OverlappingChar->GetName(),
+			*OverlappingChar->GetName());
 		return;
 	}
 
 	ABaseWeapon* CurrentPrimaryWeapon = WeaponAttach->GetPrimaryWeapon();
 	if (CurrentPrimaryWeapon)
 	{
-		// 已经有主武器, 不捡起
+		// 已经有主武器, 不捡起 (正常业务规则)
 		UE_LOG(LogTemp, Display,
 			TEXT("[WeaponDropComponent] OnOverlapBegin: 角色 '%s' 已有主武器 '%s' (Primary 槽位), 不捡起掉落武器 '%s'."),
 			*OverlappingChar->GetName(),
@@ -536,12 +706,19 @@ void UWeaponDropComponent::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, A
 		*OverlappingChar->GetName(),
 		*GetDroppedWeaponName());
 
-	// 【v200 大厂架构 P0】服务器权威捡起
-	// 直接在这里调用服务器的捡起 RPC，因为我们在 HasAuthority() 检查后
+	// 【v200 大厂架构 P0】服务器权威捡起 — 直接本地调 (已经是服务器进程)
 	ABaseWeapon* WeaponToPickup = Cast<ABaseWeapon>(GetOwner());
 	if (WeaponToPickup)
 	{
+		// 服务器直接调 Server_TryPickupWeapon (即使同进程也是 RPC, UE 走本地路径)
+		// 单一入口, 与客户端链路统一
 		OverlappingChar->Server_TryPickupWeapon(WeaponToPickup);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.2.18][WeaponDropComponent] OnOverlapBegin: 服务器路径 OwnerActor 不是 ABaseWeapon, 拒绝处理. Owner=%s."),
+			*OwnerActor->GetName());
 	}
 }
 

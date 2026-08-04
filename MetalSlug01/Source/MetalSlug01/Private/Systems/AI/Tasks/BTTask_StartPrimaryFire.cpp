@@ -1,22 +1,29 @@
 // Copyright (c) 2026.
 //
-// 【v109 2026.07.30 生化模式 AI 大厂镜像方案】BTTask — 主武器开火
+// 【v200.3.3 Owning Connection 修复】BTTask — 主武器开火
 //
 // 职责:
-//   - 调 CurrentWeapon->Server_StartFire (Actor RPC,镜像玩家 IA_Fire 链路)
+//   - 调 SelfPawn->Server_StartFire (Character RPC, Owning Connection 正确)
 //
 // 大厂原则 — 与玩家 BP_BaseCharacter 镜像:
-//   - 玩家: IA_Fire → BaseCharacter::OnFirePressed → Weapon->Server_StartFire (RPC 序列化射线)
-//   - AI  :  BT → GetAimRayFromCrosshairOrEyes (AI 路径 IsLocallyControlled=false)
-//            → Weapon->Server_StartFire (BT 就在 Server 跑,RPC 本地直执行)
-//   - 两条路径最终都汇聚到 ABaseWeapon::Server_StartFire_Implementation → WeaponFireComponent::StartFire
-//   - 单一入口,玩家/AI 调用栈完全一致 — 这才是真正的"AI 镜像玩家" 的大厂级实现
+//   - 玩家: IA_Fire → BaseCharacter::OnFirePressed → Character->Server_StartFire (RPC 序列化射线)
+//   - AI  :  BT → ComputeFireRayTowardsTarget → SelfPawn->Server_StartFire (BT 在 Server 跑,RPC 本地直执行)
+//   - 两条路径最终都汇聚到 WeaponFireComponent::StartFire
+//
+// 【v200.3.3 关键修复】为什么用 SelfPawn->Server_StartFire 而不是 Weapon->Server_StartFire:
+//   - 旧版 (v109-v200.3.2): Weapon->Server_StartFire
+//     → 玩家捡"别人的枪"时, Weapon Owner=扔枪的玩家
+//     → UE NetDriver: "No owning connection for actor" → RPC 被丢弃
+//   - 新版 (v200.3.3): SelfPawn->Server_StartFire
+//     → Character 的 owning connection 是玩家自己
+//     → RPC 一定成功 → 服务器 WeaponFireComponent::StartFire 正常执行
 //
 // 历史 (按时间累积):
 //   - v107: BT 显式算 (Target-Self) 方向 + Self.Location 起点 → 起点不对(脚底)
 //   - v108: 改传 ZeroVector 让 Strategy 内部算 → Strategy 嵌套 if/else 死代码,从未真正跑
 //   - v109: 用 BaseCharacter::GetAimRayFromCrosshairOrEyes 算射线 + Weapon->Server_StartFire
 //           → AI 跟玩家走完全相同的管线(只是"算射线" 的人不同)
+//   - v200.3.3: 改用 SelfPawn->Server_StartFire → 修复捡枪射击问题
 //
 // 配套:
 //   - BTTask_StopPrimaryFire (同模块, 用于全自动武器的循环停火)
@@ -53,7 +60,7 @@ FString UBTTask_StartPrimaryFire::GetStaticDescription() const
 			*TargetActorKey.SelectedKeyName.ToString());
 
 	return FString::Printf(TEXT(
-		"调 CurrentWeapon->Server_StartFire (镜像玩家 IA_Fire)\n"
+		"调 SelfPawn->Server_StartFire (Character RPC — Owning Connection 修复)\n"
 		"射线起点 = Weapon Mesh Muzzle Socket\n"
 		"射线方向算法:\n"
 		"  - %s\n"
@@ -160,32 +167,17 @@ EBTNodeResult::Type UBTTask_StartPrimaryFire::ExecuteTask(
 	}
 
 	// ===========================================
-	// 【v109 大厂镜像方案 P0 关键修复】
-	// 调 Weapon->StartFire — 跟玩家 IA_Fire 走完全相同的 RPC 入口
-	//   - 玩家: Weapon->Server_StartFire (RPC 序列化射线传给服务器) → 收 RPC
-	//           → Server_StartFire_Implementation → WeaponFireComponent->StartFire
-	//   - AI  :  Weapon->Server_StartFire 直接本地执行 (UE Server RPC 在 HasAuthority
-	//           Actor 上直接调 Implementation, 不走网络跳跃 — BT 就在 Server 跑)
-	//           → Server_StartFire_Implementation → WeaponFireComponent->StartFire
+	// 【v200.3.3 修复】调 SelfPawn->Server_StartFire, 不是 Weapon->Server_StartFire
 	//
-	// 大厂原则 — 镜像玩家 100% (单一调用入口):
-	//   - 玩家/AI 都调同一个 ABaseWeapon::Server_StartFire
-	//   - 玩家走 RPC 序列化 (客户端 → 服务器)
-	//   - AI 走本地直接调 (服务器进程内, BT 就在 Server)
-	//   - 最终都汇聚到 WeaponFireComponent::StartFire (有 HasAuthority 守卫)
-	//
-	// 大厂原则 — 为什么不用 WeaponFireComponent->StartFire 直调:
-	//   - WeaponFireComponent::StartFire 第 261 行明确拒绝客户端调用
-	//   - 但"客户端拒绝"  → "AI 也不允许" 是反模式 (AI 在 Server 跑, 合法 Authority)
-	//   - 为了保留"统一入口" 大厂原则, 走 ABaseWeapon::Server_StartFire 这条路
-	//   - 这才是真正的"AI 镜像玩家": 同一函数, 不同 RPC 路径, 最终同一目标
-	// ===========================================
-	Weapon->Server_StartFire(ClientRayOrigin, ClientRayDirection);
+	// 玩家/AI 都走 Character->Server_StartFire (Character 有 owning connection)
+	// 最终都汇聚到 WeaponFireComponent::StartFire
+	SelfPawn->Server_StartFire(
+		FVector_NetQuantize(ClientRayOrigin),
+		FVector_NetQuantizeNormal(ClientRayDirection));
 
 	UE_LOG(LogBehaviorTree, Display,
-		TEXT("[BTTask_StartPrimaryFire] 【v109 镜像方案】AIC='%s' Server_StartFire 已调. "
-		     "Weapon='%s' RayOrigin=%s RayDir=%s "
-		     "(同玩家路径走 GetAimRayFromCrosshairOrEyes + Server_StartFire)"),
+		TEXT("[BTTask_StartPrimaryFire] 【v200.3.3】AIC='%s' Server_StartFire 已调. "
+		     "Weapon='%s' RayOrigin=%s RayDir=%s"),
 		*AIC->GetName(),
 		*Weapon->GetName(),
 		*ClientRayOrigin.ToCompactString(),

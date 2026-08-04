@@ -87,6 +87,38 @@ ABaseWeapon::ABaseWeapon()
 	//   - SetReplicateMovement(true) → 客户端能跟着武器 Attach 到角色 Socket 移动
 	SetReplicateMovement(true);
 
+	// 【v200.2.18 大厂架构 — 物理同步关键参数】
+	//   根因: 武器掉落后, 服务器 SetSimulatePhysics(true) 物理引擎接管 transform
+	//         默认 NetUpdateFrequency=10Hz 对物理下落太低, 客户端看到"卡顿/悬空"
+	//         → 显式设 NetUpdateFrequency=30Hz (物理下落平滑但带宽可接受)
+	//         → MinNetUpdateFrequency=2Hz (避免 relevancy 切回时太突兀)
+	//   大厂原则 (与 AirdropPickup 一致 — 单一真理源 = NetUpdateFrequency = 30Hz):
+	//     - 武器掉落物理同步标准频率
+	//     - 带宽: 30Hz × 1 武器 × ~64B = ~2KB/s (一台 PC 几乎可忽略)
+	//     - 客户端看到的是服务器物理引擎 1/3 的采样, 完全够看清下落过程
+	SetNetUpdateFrequency(30.0f);
+	SetMinNetUpdateFrequency(2.0f);
+
+	// 【v200.2.18 大厂架构 — Relevancy】
+	//   根因: 默认 Actor relevancy 由 NetCullDistanceSquared 决定 (225m 视距)
+	//         玩家走远后武器可能 relevancy=false → 客户端看到武器"消失"
+	//         → bAlwaysRelevant=true 让武器始终在所有客户端 relevancy 列表里
+	//   大厂原则 (武器掉落物理需要):
+	//     - 武器在地上等捡起, 任何走到附近的玩家都能看到/捡起
+	//     - 不需要 relevancy 剔除 (武器是低数量级对象, 带宽可控)
+	bAlwaysRelevant = true;
+
+	// 【v200.2.18 大厂架构 — RootComponent 真理源】
+	//   根因(v200.2.18 验证): C++ 完全没设 RootComponent, 完全依赖 BP 蓝图配置
+	//         如果 BP 没显式设 RootComponent (常见情况), UE 会用第一个注册 Component 作 Root
+	//         → 物理模拟、Attach、Movement Replication 都基于错误的 RootComponent → 客户端悬空
+	//   大厂原则 — 单一真理源 (与 AirdropPickup 一致):
+	//     - AirdropPickup 在 C++ 构造函数设 RootComponent = StaticMeshComponent
+	//     - BaseWeapon 不设 RootComponent = 反模式 (依赖 BP 配置 = 不确定性)
+	//   修复策略 (大厂双轨):
+	//     1. C++ 默认值: 不强制设 RootComponent (因为武器可能是 StaticMesh 或 SkeletalMesh, 类型未知)
+	//     2. BeginPlay 时检查并修复: 如果 RootComponent 不是 PrimitiveComponent, 自动用第一个 MeshComponent
+	//        这是防御式编程 — 即使 BP 没配对, 运行时也能保证物理同步正常
 	WeaponDissolveComponent = CreateDefaultSubobject<UWeaponDissolveComponent>(TEXT("WeaponDissolveComponent"));
 }
 
@@ -130,6 +162,13 @@ void ABaseWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifet
 	//   - 修复: UPROPERTY(Replicated) + DOREPLIFETIME → 客户端能拿到正确的 LightAttackMontages / HeavyAttackMontage
 	DOREPLIFETIME(ABaseWeapon, LightAttackMontages);
 	DOREPLIFETIME(ABaseWeapon, HeavyAttackMontage);
+
+	// 【v200.2.20 大厂架构 — WeaponFireComponent 字段指针复制】
+	//   根因: WeaponFireComponent 子组件本身 Replicated (SetIsReplicatedByDefault), 但字段指针不同步
+	//         → 客户端 Weapon->WeaponFireComponent 永远 null → 客户端开火 RPC 失败
+	//   修复: UPROPERTY(Replicated) + DOREPLIFETIME → UE 自动同步字段指针给客户端
+	//   大厂原则 (单一真理源): 字段指针就是单一真理源, 不需要 BeginPlay 用 FindComponentByClass 兜底
+	DOREPLIFETIME(ABaseWeapon, WeaponFireComponent);
 }
 
 
@@ -163,36 +202,58 @@ void ABaseWeapon::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 【v200.2.9 大厂架构 P0 修复】WeaponFireComponent BPGC/CDO 漂移修复
-	//   根因: BP 蓝图 (BP_Weapon_AK47.uasset) 在 Components 面板里删除了 C++ 默认创建的
-	//         WeaponFireComponent 然后手动重新加了一个, UE 会创建一个 BPGC_ARCH 的新实例
-	//         而不是继承 C++ 的 CDO 实例 → 字段 WeaponFireComponent 是 BPGC 的 Component
-	//         → Component.GetOwner() 返回 BPGC 的 CDO, 不是真实实例 BP_Weapon_AK47_C_0
-	//         → StartFire / PerformSingleShot 内部 GetWorld() / GetOwner() 全错
-	//   修复: BeginPlay 检查 WeaponFireComponent.Owner 是否是自己, 不是则查找真实 Component
-	//         并把字段重新指向真实实例 (运行时修复, 让真实 Weapon 也能开火)
-	if (WeaponFireComponent && WeaponFireComponent->GetOwner() != this)
+	// 【v200.2.20 大厂架构 P0 — WeaponFireComponent 字段复制链修复】
+	//   根因 (v200.2.9 修复没覆盖的关键场景):
+	//     - WeaponFireComponent 字段是 TObjectPtr<>, 没有 Replicated 标记
+	//     - 服务器 attach 武器到客户端时, 子组件本身被复制 (Actor 默认复制子组件)
+	//     - 但客户端 Actor 的 WeaponFireComponent 字段指针**永远 nullptr**
+	//     - 因为字段指针不在复制链, UE 不会同步字段值
+	//     - 服务端 Spawn 出来的武器, 客户端字段 = null
+	//   表现:
+	//     - 玩家自己 spawn 的枪 (服务器本地): 客户端字段 = 有效 (因为 spawn 同步创建)
+	//     - 玩家捡起别人扔的枪: 服务器 attach 枪 → 客户端字段还是 null → 无法开火
+	//   修复 (v200.2.20):
+	//     - BeginPlay 在两端都执行 (服务器 + 客户端), 在两端都用 FindComponentByClass 重新找子组件
+	//     - 如果字段为 null 或 Owner 不对, 用 FindComponentByClass 找并替换字段
+	//     - 这是 UE 标准做法: 组件复制 ≠ 字段指针复制, 必须 FindComponentByClass
+	if (!WeaponFireComponent || WeaponFireComponent->GetOwner() != this)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[v200.2.9] ABaseWeapon::BeginPlay: BPGC 漂移检测 — Weapon=%s WeaponFireComponent.Owner=%s (不是 this). "
-			     "正在查找真实 Component..."),
-			*GetName(),
-			*GetNameSafe(WeaponFireComponent->GetOwner()));
-
-		// 在自己身上查找 UWeaponFireComponent
-		UWeaponFireComponent* RealFireComp = FindComponentByClass<UWeaponFireComponent>();
-		if (RealFireComp && RealFireComp != WeaponFireComponent)
+		// 【v200.2.9 保留】BPGC 漂移修复 (旧版触发条件)
+		if (WeaponFireComponent)
 		{
 			UE_LOG(LogTemp, Warning,
-				TEXT("[v200.2.9] ABaseWeapon::BeginPlay: 找到真实 WeaponFireComponent=%s, 替换 BPGC 字段."),
-				*RealFireComp->GetName());
-			WeaponFireComponent = RealFireComp;
+				TEXT("[v200.2.9] ABaseWeapon::BeginPlay: BPGC 漂移检测 — Weapon=%s WeaponFireComponent.Owner=%s (不是 this). "
+				     "正在查找真实 Component..."),
+				*GetName(),
+				*GetNameSafe(WeaponFireComponent->GetOwner()));
 		}
 		else
 		{
+			// 【v200.2.20 新增】字段为 null (典型场景: 客户端捡别人扔的枪, 子组件被复制但字段指针没同步)
+			UE_LOG(LogTemp, Display,
+				TEXT("[v200.2.20] ABaseWeapon::BeginPlay: WeaponFireComponent 字段为 null — 修复组件复制链断. "
+				     "Weapon=%s. 客户端捡别人扔的枪场景会出现此情况."),
+				*GetName());
+		}
+
+		// 在自己身上查找 UWeaponFireComponent (无论字段是 null 还是 BPGC 漂移, 都用同一修复路径)
+		UWeaponFireComponent* RealFireComp = FindComponentByClass<UWeaponFireComponent>();
+		if (RealFireComp)
+		{
+			if (RealFireComp != WeaponFireComponent)
+			{
+				UE_LOG(LogTemp, Display,
+					TEXT("[v200.2.20] ABaseWeapon::BeginPlay: 找到真实 WeaponFireComponent=%s, 替换字段 (修复字段为 null / BPGC 漂移)."),
+					*RealFireComp->GetName());
+				WeaponFireComponent = RealFireComp;
+			}
+		}
+		else
+		{
+			// 【v200.2.20 零兜底】没找到子组件 → 武器没有开火能力 → 必须 Error
 			UE_LOG(LogTemp, Error,
-				TEXT("[v200.2.9] ABaseWeapon::BeginPlay: BPGC 漂移无法修复 — Weapon=%s 没找到真实 WeaponFireComponent. "
-				     "【用户手动修复】打开 BP_Weapon_%s.uasset → Components 面板 → 删除 BPGC 自己加的 WeaponFireComponent → 保存."),
+				TEXT("[v200.2.20] ABaseWeapon::BeginPlay: WeaponFireComponent 字段为 null 且找不到子组件. "
+				     "Weapon=%s. 修复: 检查 BP_Weapon_%s 是否包含 UWeaponFireComponent 子对象."),
 				*GetName(),
 				*GetName());
 		}
@@ -203,6 +264,43 @@ void ABaseWeapon::BeginPlay()
 	//   - 武器 mesh 不应阻挡任何东西 (角色/SpringArm/物理对象)
 	//   - 这是"装饰 Actor"的标准做法 (与 Projectile Actor 相反 — 子弹需要物理碰撞)
 	SetActorEnableCollision(false);
+
+	// 【v200.2.18 大厂架构 P0 — RootComponent 兜底修复 (防御式 + 零兜底)】
+	//   根因: C++ 构造函数没设 RootComponent (武器可能是 StaticMesh 或 SkeletalMesh, 类型未知)
+	//         完全依赖 BP 蓝图配置 → BP 配错 → RootComponent=null 或不是 PrimitiveComponent
+	//         → UE 物理同步、Attach、Movement Replication 全失败 → 客户端悬空
+	//   大厂原则 (单一真理源 — RootComponent 必须能物理模拟):
+	//     - RootComponent 必须是 USceneComponent 派生, 且能挂物理 Body (PrimitiveComponent)
+	//     - 否则 ReplicateMovement/AttachToComponent/物理模拟 全部失效
+	//   修复策略:
+	//     1. BeginPlay 入口立即检查 RootComponent
+	//     2. 如果 RootComponent 是 nullptr 或不是 PrimitiveComponent, 立即用第一个 MeshComponent 当 Root
+	//     3. 找不到 MeshComponent → Log Error (零兜底, 不允许"没 RootComponent 也继续")
+	//     4. 修复成功 → Log Warning (告诉开发者 BP 应该手动设, 这是兜底)
+	USceneComponent* CurrentRoot = GetRootComponent();
+	if (!CurrentRoot || !CurrentRoot->IsA<UPrimitiveComponent>())
+	{
+		// 尝试用主武器 Mesh 作为 Root
+		if (UMeshComponent* WeaponMesh = GetMeshComponent())
+		{
+			SetRootComponent(WeaponMesh);
+			UE_LOG(LogTemp, Warning,
+				TEXT("[v200.2.18] ABaseWeapon::BeginPlay: RootComponent 兜底修复 — Weapon=%s 之前 RootComponent=%s (类型不对/为空), "
+				     "已自动用 MeshComponent=%s 作为 RootComponent. "
+				     "【最佳实践】在 BP 蓝图手动设 Mesh 为 RootComponent (避免每次启动都走兜底)."),
+				*GetName(),
+				CurrentRoot ? *CurrentRoot->GetName() : TEXT("nullptr"),
+				*WeaponMesh->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[v200.2.18] ABaseWeapon::BeginPlay: RootComponent 兜底失败 — Weapon=%s 没 RootComponent 且没 MeshComponent. "
+				     "物理同步、Attach、Movement Replication 全部失效. "
+				     "【零兜底】必须修复 BP 蓝图: 添加 StaticMeshComponent 或 SkeletalMeshComponent 子对象, 设为 RootComponent."),
+				*GetName());
+		}
+	}
 
 	// 双保险: 单独对 Mesh 组件设 ECollisionEnabled::NoCollision
 	//   - 某些 BP 的 Actor 可能有多个 Mesh (主 mesh + 弹匣 mesh + ...)
@@ -829,6 +927,50 @@ UMeshComponent* ABaseWeapon::GetMeshComponent() const
 	return nullptr;
 }
 
+
+/**
+ * 【v200.2.19 大厂架构 — 单一真理源】GetAttachedCharacter — 获取挂载武器的角色
+ *
+ * 旧版反模式:
+ *   - 所有 RPC Implementation 用 GetOwner() 拿角色
+ *   - UE 5.6 Owner 字段不是 Replicated → 客户端永远 null → 找角色失败 → 静默 return
+ *   - 客户端捡起武器后无法开火 (问题 2)
+ *   - 同一个 Action 5+ 处写 GetOwner() GetOwner() GetOwner() — 重复架构
+ *
+ * 新版 (v200.2.19) 大厂原则:
+ *   - 集中到一个函数 GetAttachedCharacter()
+ *   - 用 GetAttachParentActor() (Attach 关系是 Replicated, UE 5.6 默认同步 AttachParent)
+ *   - 调用方统一用这个函数, 不再直接写 GetOwner() / GetAttachParentActor()
+ *
+ * 零兜底:
+ *   - 武器没 attach (在地上) → return nullptr (调用方检查)
+ *   - AttachParent 不是 ABaseCharacter → return nullptr (配置错误, 大厂应该 Log Error 但调用方决定)
+ */
+ABaseCharacter* ABaseWeapon::GetAttachedCharacter() const
+{
+	// 【v200.2.19 单一真理源】Attach 关系是 Replicated, 用 GetAttachParentActor() 拿
+	//   - 客户端 attach 武器后 AttachParentActor = ABaseCharacter (正确)
+	//   - 客户端没 attach (武器在地上) → AttachParentActor = null (合理)
+	//   - 客户端 OnRep 刚触发 → AttachParentActor 可能瞬时 null (短暂, 重试)
+	AActor* AttachParent = GetAttachParentActor();
+	if (!AttachParent)
+	{
+		// 武器在地上或瞬时未挂 → 正常状态, 不 Log Error
+		return nullptr;
+	}
+
+	ABaseCharacter* Char = Cast<ABaseCharacter>(AttachParent);
+	if (!Char)
+	{
+		// 零兜底: AttachParent 不是 ABaseCharacter (配置错, 武器挂到非角色 Actor)
+		//   - 此处不 Log Error, 调用方有责任检查返回 null
+		//   - Log Error 会重复 (多个 RPC 入口都调到)
+		return nullptr;
+	}
+
+	return Char;
+}
+
 /**
  * StartDamageTrace — 启动伤害追踪
  *
@@ -947,20 +1089,38 @@ void ABaseWeapon::StopDamageTrace()
  */
 void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
 {
-	// 【v72 大厂架构修复】RPC 在 Weapon 上，但动画要播在角色骨骼网格体上
-	//   - 旧 (v70): no-op → 射击/换弹动画永远不播
-	//   - 新 (v72): 获取 Owner (角色) 的骨骼网格体，播放蒙太奇
-	USkeletalMeshComponent* CharMesh = nullptr;
-	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetOwner()))
+	// 【v200.2.19 大厂架构 — 单一真理源】修复问题 2
+	//   旧版 (v200.2.18 之前) 一个致命问题:
+	//     GetOwner() 客户端永远 null (Owner 字段不是 Replicated) → 找不到 CharMesh → 静默 return
+	//     → 客户端"捡起武器后无法开火" — 因为 Owner 永远 null
+	//   新版 (v200.2.19):
+	//     用 GetAttachedCharacter() (单一真理源) 替代 GetOwner()
+	//     - GetAttachedCharacter 内部用 GetAttachParentActor() (Attach 关系是 Replicated)
+	//     - 客户端 attach 武器后 AttachParentActor = 角色 (正确) → 找到 CharMesh → 播动画
+	//
+	//   服务器本地进程守卫 (撤销 v200.2.19 草稿的 HasAuthority + IsLocallyControlled → return):
+	//     - PerformSingleShot 内部不直接 Montage_Play, 只调 MulticastPlayFireMontage → Multicast_PlayFireMontage_Implementation
+	//     - 服务器本地 Implementation **必须** 播动画 — 这是 host 玩家看到自己开火的唯一路径
+	//     - 跳过守卫 = host 玩家看不到自己开火动画 → 业务错误
+	//     - 撤销这个守卫, 服务器本地继续播动画
+
+	// 【v200.2.19 单一真理源】用 GetAttachedCharacter() 替代 GetOwner() / GetAttachParentActor()
+	ABaseCharacter* Char = GetAttachedCharacter();
+	if (!Char)
 	{
-		CharMesh = Char->GetMesh();
+		// 大厂原则: 武器在地上 (没 attach) → 客户端 Implementation 拿不到角色 → 静默 return
+		// 不 Log Error — 这是正常状态 (武器 dropped, 等玩家捡起)
+		// 但如果是"挂载中突然拿不到" → 可能是 Attach 关系未同步, 下一帧会自动恢复
+		return;
 	}
+
+	USkeletalMeshComponent* CharMesh = Char->GetMesh();
 	if (!CharMesh)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: Owner 不是 ABaseCharacter 或 Mesh 为空! Weapon=%s Owner=%s. 修复: 检查武器挂载链路."),
-			*GetName(),
-			GetOwner() ? *GetOwner()->GetName() : TEXT("nullptr"));
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayFireMontage_Implementation: CharMesh 为空! "
+			     "Weapon=%s Char=%s. 修复: 检查角色 BP 的 Mesh 是否为 SkeletalMesh."),
+			*GetName(), *Char->GetName());
 		return;
 	}
 
@@ -968,7 +1128,7 @@ void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
 	if (!AnimInst)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: AnimInstance 为空! Weapon=%s CharMesh=%s. 修复: 检查角色 BP 的 Mesh 是否为 SkeletalMesh."),
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayFireMontage_Implementation: AnimInstance 为空! Weapon=%s CharMesh=%s. 修复: 检查角色 BP 的 Mesh 是否为 SkeletalMesh."),
 			*GetName(), *CharMesh->GetName());
 		return;
 	}
@@ -982,7 +1142,7 @@ void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
 	if (!FireMontage)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: FireMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 FireMontage_Ironsights 必须配置 Anim_Fire_Rifle_Ironsights_Montage."),
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayFireMontage_Implementation: FireMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 FireMontage_Ironsights 必须配置 Anim_Fire_Rifle_Ironsights_Montage."),
 			*GetName());
 		return;
 	}
@@ -990,7 +1150,7 @@ void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
 	// 播放射击蒙太奇（非重叠模式）
 	AnimInst->Montage_Play(FireMontage, 1.0f, EMontagePlayReturnType::MontageLength, 0.0f, false);
 	UE_LOG(LogTemp, Log,
-		TEXT("[BaseWeapon] Multicast_PlayFireMontage_Implementation: 武器=%s 播放射击蒙太奇=%s"),
+		TEXT("[BaseWeapon][v200.2.19] Multicast_PlayFireMontage_Implementation: 武器=%s 播放射击蒙太奇=%s"),
 		*GetName(), *FireMontage->GetName());
 }
 
@@ -1001,17 +1161,22 @@ void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
  */
 void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 {
-	USkeletalMeshComponent* CharMesh = nullptr;
-	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetOwner()))
+	// 【v200.2.19 大厂架构 — 单一真理源】同 Multicast_PlayFireMontage
+	//   - 用 GetAttachedCharacter() (单一真理源) 替代 GetOwner()
+	//   - 服务器本地继续跑 (没守卫) — 这是换弹动画在 host 玩家屏幕上的唯一路径
+	ABaseCharacter* Char = GetAttachedCharacter();
+	if (!Char)
 	{
-		CharMesh = Char->GetMesh();
+		// 同 FireMontage: 武器在地上/瞬时未挂载 → 静默 return
+		return;
 	}
+
+	USkeletalMeshComponent* CharMesh = Char->GetMesh();
 	if (!CharMesh)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: Owner 不是 ABaseCharacter 或 Mesh 为空! Weapon=%s Owner=%s."),
-			*GetName(),
-			GetOwner() ? *GetOwner()->GetName() : TEXT("nullptr"));
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayReloadMontage_Implementation: CharMesh 为空. Weapon=%s Char=%s."),
+			*GetName(), *Char->GetName());
 		return;
 	}
 
@@ -1019,7 +1184,7 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 	if (!AnimInst)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: AnimInstance 为空! Weapon=%s."),
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayReloadMontage_Implementation: AnimInstance 为空! Weapon=%s."),
 			*GetName());
 		return;
 	}
@@ -1033,14 +1198,14 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 	if (!ReloadMontage)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: ReloadMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 ReloadMontage_Ironsights 必须配置 Anim_Reload_Rifle_Ironsights_Montage."),
+			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayReloadMontage_Implementation: ReloadMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 ReloadMontage_Ironsights 必须配置 Anim_Reload_Rifle_Ironsights_Montage."),
 			*GetName());
 		return;
 	}
 
 	AnimInst->Montage_Play(ReloadMontage, 1.0f, EMontagePlayReturnType::MontageLength, 0.0f, false);
 	UE_LOG(LogTemp, Log,
-		TEXT("[BaseWeapon] Multicast_PlayReloadMontage_Implementation: 武器=%s 播放换弹蒙太奇=%s"),
+		TEXT("[BaseWeapon][v200.2.19] Multicast_PlayReloadMontage_Implementation: 武器=%s 播放换弹蒙太奇=%s"),
 		*GetName(), *ReloadMontage->GetName());
 }
 
@@ -1065,14 +1230,13 @@ void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc,
 	// 跳过服务器本地进程 — 服务器自己已经画过 (EDrawDebugTrace::ForDuration), 不重复
 	//   - 服务器本地 = HasAuthority=true (是服务器进程) + Owner Pawn IsLocallyControlled=true (这是本地玩家)
 	//   - 远端客户端 = HasAuthority=false (是客户端进程) → 不跳过, 画视觉线
+	// 【v200.2.19 大厂架构 — 单一真理源】用 GetAttachedCharacter() 替代 GetOwner() (修复问题 2)
 	if (HasAuthority())
 	{
-		if (const APawn* OwnerPawn = Cast<APawn>(GetOwner()))
+		ABaseCharacter* Char = GetAttachedCharacter();
+		if (Char && Char->IsLocallyControlled())
 		{
-			if (OwnerPawn->IsLocallyControlled())
-			{
-				return;
-			}
+			return;
 		}
 	}
 
@@ -1112,15 +1276,123 @@ void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc,
 
 
 /**
- * Server_StartFire — 服务器开始开火 (枪械)
+ * 【v200.2.20 大厂架构 — 撤销 v200.2.18 的错误做法, 但保留物理同步 Multicast】
  *
- * v82 大厂架构修复 — 客户端射线参数:
- *   - 旧 (v70-v81) 反模式: Server_StartFire 无参数, 服务器 WeaponFireComponent::StartFire()
- *     → 内部用 PC->GetViewportSize/Deproject → 服务器对远端玩家 PC 失败 → trace 永远失败
- *   - 新 (v82): 客户端玩家路径 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
- *     → 服务器用客户端射线做权威 trace (防作弊)
- *     → 兼容 AI 路径: 传零向量 = AI fallback (Strategy 内部用 BaseAimRotation)
+ * v200.2.18 错误:
+ *   - 直接调 SetSimulatePhysics(true) → 客户端 Mesh 单独模拟, RootComponent 走 ReplicateMovement
+ *   - 两个 transform 冲突 → Mesh 视觉错乱 / 消失
+ *
+ * v200.2.20 修复 (本版本):
+ *   - 先检查 RootComponent 是否是 Mesh → 不是则 SetRootComponent(Mesh) 强制修复
+ *   - 然后才 SetSimulatePhysics(true) → Mesh = RootComponent = 物理 Body, 完美对齐
+ *   - 客户端镜像服务器物理状态, ReplicateMovement 同步物理 transform
+ *
+ * 调用方: WeaponDropComponent::StartDroppedState (服务器)
+ *
+ * 大厂原则 — 零兜底:
+ *   - 客户端没 MeshComponent → Log Error + return
+ *   - Mesh 不是 RootComponent → 强制 SetRootComponent 修复 (不允许跳过)
+ *   - 服务器本地: HasAuthority() + GetAttachParentActor() != null (已 attach) → return (已经在玩家手上不需要物理)
  */
+// ==========================================
+// 掉落物理同步 (v200.3.4 完整重构)
+// ==========================================
+
+void ABaseWeapon::Multicast_DropWeapon_Implementation(FVector_NetQuantize NewLocation, FRotator NewRotation,
+	FVector LaunchVelocity, FVector LaunchAngularVelocity)
+{
+	// 【v200.3.7 大厂架构修复 — 客户端物理下落终极方案】
+	//
+	// 根因分析:
+	//   1. 服务器端 StartDroppedState: SetSimulatePhysics(true) + SetPhysicsLinearVelocity
+	//   2. 服务器端 Multicast_DropWeapon: 客户端收到了位置同步
+	//   3. 【致命错误】客户端在 Multicast 中调用 SetSimulatePhysics(true)
+	//      → 与 ReplicateMovement 冲突 → 武器悬空
+	//
+	// 正确时序:
+	//   1. 服务器 StartDroppedState: SetSimulatePhysics(true) + 速度
+	//   2. 服务器 Multicast_DropWeapon: 客户端只接收位置同步（不启动物理）
+	//   3. 客户端: ReplicateMovement 自动同步服务器物理引擎的位置
+	//   4. 客户端不需要 SetSimulatePhysics
+
+	if (!GetRootComponent())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.7][BaseWeapon] Multicast_DropWeapon: RootComponent 为空! Weapon=%s."),
+			*GetName());
+		return;
+	}
+
+	// 【v200.3.9 修复】客户端需要设置位置，但让 ReplicateMovement 同步物理
+	// 1. DetachFromActor (清除 AttachParent)
+	if (GetAttachParentActor())
+	{
+		DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+	}
+
+	// 2. 设置掉落位置 (接收服务器的权威位置)
+	// 注意: SetActorLocationAndRotation 不会阻止 ReplicateMovement 同步后续物理位置
+	SetActorLocationAndRotation(NewLocation, NewRotation, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// 3. 获取 Mesh Component
+	UPrimitiveComponent* MeshComp = Cast<UPrimitiveComponent>(GetMeshComponent());
+	if (!MeshComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.9][BaseWeapon] Multicast_DropWeapon: MeshComponent 为空! Weapon=%s."),
+			*GetName());
+		return;
+	}
+
+	// 4. 设置碰撞为 QueryAndPhysics (客户端不启动物理，ReplicateMovement 会同步物理位置)
+	MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+	// 【v200.3.11 修复】设置 ObjectType 为 WorldDynamic
+	//   原因: 武器在地上是"世界动态物体", 不是 "PhysicsBody" (物理模拟中的物体)
+	//   WorldDynamic 与其他 WorldDynamic 物体 (其他掉落物) 正确互动
+	MeshComp->SetCollisionObjectType(ECC_WorldDynamic);
+
+	// 【v200.3.8 修复】不用预设碰撞，改用自定义碰撞
+	// 与服务器端 StartDroppedState 保持一致：
+	//   - WorldStatic: Block (武器落地，不能穿地)
+	//   - Pawn: Overlap (玩家走过去触发拾取)
+	//   - PhysicsBody: Overlap (不与其他动态物体互推)
+	//   - Visibility: Block (玩家射线检测能命中武器)
+	//   - Camera/其他: Ignore
+
+	// 初始化为忽略所有通道
+	MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+
+	// 关键通道配置
+	MeshComp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);    // 阻挡地面
+	MeshComp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);   // 与其他世界动态物体阻挡
+	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);         // 玩家 overlap 触发拾取
+	MeshComp->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);   // 物理体 overlap
+	MeshComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);     // 射线检测命中
+	MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);         // 忽略相机
+	MeshComp->SetCollisionResponseToChannel(ECC_Destructible, ECR_Ignore);   // 忽略可破坏物
+
+	// 开启 GenerateOverlapEvents，确保 overlap 事件能触发
+	MeshComp->SetGenerateOverlapEvents(true);
+
+	// 【v200.3.8 关键】客户端不设置物理！服务器已设置，ReplicateMovement 自动同步
+	// 如果客户端也设置 SetSimulatePhysics，会和 ReplicateMovement 冲突导致悬空
+}
+
+	// 调用方: WeaponDropComponent::CancelDroppedState (服务器)
+	// 【v200.2.21 大厂架构 — 撤销 v200.2.20 错误】客户端物理状态关闭
+	// v200.2.20 错误: 客户端 SetSimulatePhysics(false) — 但客户端本来就没启用物理, no-op
+	// v200.2.21 修复: 物理状态由 ReplicateMovement 自动同步, 不需要 UI 同步 RPC
+	//   - 服务器 CancelDroppedState: SetSimulatePhysics(false) + AttachToComponent
+	//   - 客户端: ReplicateMovement 收到 attach transform, 自动恢复物理状态 (false)
+
+// Server_StartFire — 服务器开始开火 (枪械)
+// v82 大厂架构修复 — 客户端射线参数:
+//   - 旧 (v70-v81) 反模式: Server_StartFire 无参数, 服务器 WeaponFireComponent::StartFire()
+//     → 内部用 PC->GetViewportSize/Deproject → 服务器对远端玩家 PC 失败 → trace 永远失败
+//   - 新 (v82): 客户端玩家路径 OnFirePressed 用 HUD Crosshair 算出射线 → RPC 传给服务器
+//     → 服务器用客户端射线做权威 trace (防作弊)
+//     → 兼容 AI 路径: 传零向量 = AI fallback (Strategy 内部用 BaseAimRotation)
 void ABaseWeapon::Server_StartFire_Implementation(const FVector_NetQuantize& ClientRayOrigin, const FVector_NetQuantizeNormal& ClientRayDirection)
 {
 	// 【v85.1 诊断】入口 Log — 确认 RPC 是否被调用

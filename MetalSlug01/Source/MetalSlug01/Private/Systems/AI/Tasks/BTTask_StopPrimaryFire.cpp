@@ -70,15 +70,12 @@ EBTNodeResult::Type UBTTask_StopPrimaryFire::ExecuteTask(
 	}
 
 	// ===========================================
-	// 【v109 大厂镜像方案】
-	// 走 Weapon->Server_StopFire RPC, 跟玩家路径完全一致
-	//   - 玩家: Weapon->Server_StopFire (RPC) → Server_StopFire_Implementation → FireComp->StopFire
-	//   - AI  :  Weapon->Server_StopFire (BT 在 Server 跑,直接本地执行 Implementation)
-	// ===========================================
-	Weapon->Server_StopFire();
+	// 【v200.3.3 修复】走 SelfPawn->Server_StopFire (Character RPC)
+	// 玩家/AI 都走 Character->Server_StopFire (Character 有 owning connection)
+	SelfPawn->Server_StopFire();
 
 	UE_LOG(LogBehaviorTree, Display,
-		TEXT("[BTTask_StopPrimaryFire] 【v109 镜像方案】AIC='%s' Server_StopFire 已调. Weapon='%s'"),
+		TEXT("[BTTask_StopPrimaryFire] 【v200.3.3】AIC='%s' Server_StopFire 已调. Weapon='%s'"),
 		*AIC->GetName(),
 		*Weapon->GetName());
 

@@ -89,15 +89,12 @@ EBTNodeResult::Type UBTTask_ReloadPrimaryWeapon::ExecuteTask(
 	}
 
 	// ===========================================
-	// 【v109 大厂镜像方案】
-	// 走 Weapon->Server_StartReload RPC, 跟玩家路径完全一致
-	//   - 玩家: Weapon->Server_StartReload (RPC) → Server_StartReload_Implementation → FireComp->StartReload
-	//   - AI  :  Weapon->Server_StartReload (BT 在 Server 跑,直接本地执行 Implementation)
-	// ===========================================
-	Weapon->Server_StartReload();
+	// 【v200.3.3 修复】走 SelfPawn->Server_StartReload (Character RPC)
+	// 玩家/AI 都走 Character->Server_StartReload (Character 有 owning connection)
+	SelfPawn->Server_StartReload();
 
 	UE_LOG(LogBehaviorTree, Display,
-		TEXT("[BTTask_ReloadPrimaryWeapon] 【v109 镜像方案】AIC='%s' Server_StartReload 已调. Weapon='%s'"),
+		TEXT("[BTTask_ReloadPrimaryWeapon] 【v200.3.3】AIC='%s' Server_StartReload 已调. Weapon='%s'"),
 		*AIC->GetName(),
 		*Weapon->GetName());
 

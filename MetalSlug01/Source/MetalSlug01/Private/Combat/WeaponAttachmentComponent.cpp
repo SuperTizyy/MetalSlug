@@ -501,29 +501,27 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 	const FRotator RelativeRotation = ActiveSlotAttachment.RelativeRotation;
 	const FVector RelativeScale3D = ActiveSlotAttachment.RelativeScale3D;
 
-	// 【v200.2.11 大厂架构 P0 修复】Attach 前强制清零物理引擎残留 transform
-	//   根因(v200.2.10 验证): 丢枪→SetSimulatePhysics→捡起后, Component 仍有"物理漂移"的 WorldRot
-	//         → SnapToTargetNotIncludingScale 只同步 Location 不一定同步 Rotation
-	//         → SetActorRelativeRotation 是在已有 (漂移) WorldRot 基础上叠加 LocalRot
-	//         → 最终旋转完全错位
-	//   验证证据 (Session1.log 3964 vs 4060):
-	//     正常 Spawn: Attach 后 Rot=P=-1.50 Y=174.93 R=1.29 (← socket rotation)
-	//     捡起:       Attach 后 Rot=P=6.83 Y=-115.63 R=-54.46 (← 物理漂移 + 错误)
-	//   修复: Attach 前显式 Reset Component World Transform 到 (0,0,0,identity)
-	//         让 SnapToTargetNotIncludingScale 完整接管 (Location + Rotation 都 snap 到 socket)
+	// 【v200.2.11 大厂架构 P0 修复】Attach 前获取 socket 世界坐标并直接设置武器位置
+	//   根因(v200.2.10 验证): 旧版 SetWorldLocationAndRotation(ZeroVector) 把武器扔到原点
+	//         → 再 AttachToComponent 时如果 Snap 不生效 → 武器卡在原点
+	//   修复: 先获取目标 socket 的世界坐标，直接 SetWorldLocation 到 socket 位置
+	//         确保 attach 前武器已经在正确位置，attach 只是建立父子关系
 	USceneComponent* WeaponRoot = Weapon->GetRootComponent();
 	if (WeaponRoot)
 	{
-		WeaponRoot->SetWorldLocationAndRotation(FVector::ZeroVector, FRotator::ZeroRotator);
+		// 获取目标 socket 的世界坐标
+		const FVector SocketWorldLocation = Owner->GetMesh()->GetSocketLocation(SocketName);
+		const FRotator SocketWorldRotation = Owner->GetMesh()->GetSocketRotation(SocketName);
+		
+		// 直接设置到 socket 位置（不是原点！）
+		WeaponRoot->SetWorldLocationAndRotation(SocketWorldLocation, SocketWorldRotation);
 	}
 
 	// 【v200.2.16 大厂架构 — 关键修复】Attach 前强制 Reset 所有 Mesh 子组件的 RelativeTransform 为 identity
-	//   根因(2026.08.04 验证): BP_Weapon_*.uasset 里 WeaponSkeletalMesh/WeaponStaticMesh 组件配了非零 RelativeTransform
+	//   根因: BP_Weapon_*.uasset 里 WeaponSkeletalMesh/WeaponStaticMesh 组件配了非零 RelativeTransform
 	//         是"丢武器在地上时的坐标" — 但当武器 attach 到 socket 时, Mesh 子组件应该跟着 RootComponent 走
 	//         残留的 Mesh.RelativeTransform → 武器 Mesh 内部又叠加一次偏移 → attach 后位置完全错位
 	//   修复: Attach 前显式 SetRelativeTransform(identity) 到所有 Mesh 子组件
-	//   与 v200.2.15 (Spawn 时 Reset) 不同: 这里是 attach 前的兜底, 覆盖捡起场景
-	//   (v200.2.15 在 Spawn 时跑, 但关卡预放的武器不在 Spawn 时跑 — 这里兜底)
 	ResetWeaponMeshRelativeTransforms(Weapon);
 
 	// Step 1: Attach (使用 SnapToTargetNotIncludingScale, 与服务器一致)
@@ -2714,9 +2712,9 @@ void UWeaponAttachmentComponent::InitializeWeaponFireConfigFromClass(ABaseWeapon
 }
 
 // ==========================================
-// 【v200 大厂架构新增】丢弃主武器到地面
+// 【v200.2.18 大厂架构重命名】丢弃主武器到地面 (业务逻辑处理器, 非 RPC)
 // ==========================================
-bool UWeaponAttachmentComponent::Server_DropPrimaryWeapon()
+bool UWeaponAttachmentComponent::HandleDropPrimaryWeapon()
 {
 	// 服务器权威校验
 	ABaseCharacter* OwnerChar = GetOwnerCharacterChecked(this);
@@ -2727,8 +2725,12 @@ bool UWeaponAttachmentComponent::Server_DropPrimaryWeapon()
 
 	if (!OwnerChar->HasAuthority())
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_DropPrimaryWeapon: 客户端调用, 拒绝. Pawn=%s"),
+		// 【v200.2.18 大厂原则 — 零兜底】客户端调用 HandleDropPrimaryWeapon 直接 Log Error + return
+		//   旧版只 Warning + return, 是反模式 — 客户端永远调不到是配置错误
+		//   客户端必须通过 ABaseCharacter::Server_DropPrimaryWeapon RPC → 服务器调 HandleDropPrimaryWeapon
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.2.18][WeaponAttachment] HandleDropPrimaryWeapon: 客户端调用被拒绝. "
+			     "Pawn=%s. 【修复】客户端必须调 ABaseCharacter::Server_DropPrimaryWeapon (UFUNCTION Server Reliable) → 服务器进程内调用 HandleDropPrimaryWeapon."),
 			*OwnerChar->GetName());
 		return false;
 	}
@@ -2858,21 +2860,25 @@ bool UWeaponAttachmentComponent::Server_DropPrimaryWeapon()
 }
 
 // ==========================================
-// 【v200 大厂架构新增】捡起地面上的武器
+// 【v200.2.18 大厂架构重命名】捡起地面上的武器 (业务逻辑处理器, 非 RPC)
 // ==========================================
-bool UWeaponAttachmentComponent::Server_TryPickupWeapon(ABaseWeapon* WeaponToPickup)
+bool UWeaponAttachmentComponent::HandleTryPickupWeapon(ABaseWeapon* WeaponToPickup)
 {
 	// 服务器权威校验
 	ABaseCharacter* OwnerChar = GetOwnerCharacterChecked(this);
 	if (!OwnerChar)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: Owner 无效."));
 		return false;
 	}
 
+	// 【v200.3.6 大厂原则】HasAuthority 检查必须保留，防止客户端直接调用
 	if (!OwnerChar->HasAuthority())
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 客户端调用, 拒绝. Pawn=%s"),
+		UE_LOG(LogTemp, Error,
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: 客户端调用被拒绝. "
+			     "Pawn=%s. 必须通过 ABaseCharacter::Server_TryPickupWeapon RPC 调用."),
 			*OwnerChar->GetName());
 		return false;
 	}
@@ -2881,21 +2887,21 @@ bool UWeaponAttachmentComponent::Server_TryPickupWeapon(ABaseWeapon* WeaponToPic
 	if (!WeaponToPickup)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: WeaponToPickup 为空, 忽略."));
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: WeaponToPickup 为空."));
 		return false;
 	}
 
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: 开始处理. Pawn=%s, Weapon=%s"),
+		*OwnerChar->GetName(),
+		*WeaponToPickup->GetName());
+
 	// 检查手里是否已有主武器
-	// 【v200.2.7 致命根因修复】必须检查 GetWeaponInSlot(Primary) 而不是 CurrentWeapon!
-	//   根因: CurrentWeapon 是"激活的武器"(任意槽位), 不是"主武器槽位的武器"
-	//   玩家丢主武器 → 切 Melee → CurrentWeapon = Knife → 旧版误判"已有主武器"
-	//   实际 WeaponsInSlot[Primary] 槽位是空的 → 应该允许捡起
-	//   大厂原则 - 单一真理源: 槽位状态由 WeaponsInSlot[Slot] 单一权威
 	ABaseWeapon* CurrentPrimaryWeapon = GetWeaponInSlot(EWeaponSlotType::Primary);
 	if (CurrentPrimaryWeapon)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: Pawn=%s Primary 槽位已有武器 '%s', 忽略捡起."),
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: Pawn=%s Primary 槽位已有武器 '%s', 忽略捡起."),
 			*OwnerChar->GetName(),
 			*CurrentPrimaryWeapon->GetName());
 		return false;
@@ -2906,7 +2912,7 @@ bool UWeaponAttachmentComponent::Server_TryPickupWeapon(ABaseWeapon* WeaponToPic
 	if (!DropComp)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 没有 WeaponDropComponent, 可能不是掉落武器."),
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: 武器 '%s' 没有 WeaponDropComponent."),
 			*WeaponToPickup->GetName());
 		return false;
 	}
@@ -2914,47 +2920,34 @@ bool UWeaponAttachmentComponent::Server_TryPickupWeapon(ABaseWeapon* WeaponToPic
 	if (!DropComp->IsDropped())
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 不在掉落状态, 忽略."),
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: 武器 '%s' 不在掉落状态."),
 			*WeaponToPickup->GetName());
 		return false;
 	}
 
-	// 取消掉落状态 (会恢复弹药并停止物理)
+	// 取消掉落状态
 	const bool bCanceled = DropComp->CancelDroppedState(OwnerChar);
 	if (!bCanceled)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponAttachment] Server_TryPickupWeapon: CancelDroppedState 失败, 武器 '%s'."),
+			TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: CancelDroppedState 失败, 武器 '%s'."),
 			*WeaponToPickup->GetName());
 		return false;
 	}
 
-	// 【v200.2 大厂架构关键修复】把武器放回主武器槽位 + 切回 Primary 槽位
-	//   根因: 玩家丢弃主武器时, WeaponsInSlot[Primary] 已被清空, 槽位也切到了 Melee
-	//   旧版 Server_TryPickupWeapon 只调 AttachToComponent, 没把武器放回 WeaponsInSlot[Primary]
-	//   → GetWeaponInSlot(Primary) 永远返回 null → 玩家再按 Q 切回 Primary 槽位失败
-	//   → 玩家捡起武器后, 武器 mesh 短暂出现(因为 AttachToComponent), 但立刻被 Server_SwitchToWeaponSlot 检测隐藏
-	//   修复:
-	//     1. 把 WeaponToPickup 放回 WeaponsInSlot[Primary]
-	//     2. 调用 Server_SwitchToWeaponSlot(Primary) 切回主武器槽位
-	//     3. ActiveSlotAttachment 也写回 Primary 的挂载配置
+	// 【v200.3.6 大厂架构】把武器放回主武器槽位 + 切回 Primary 槽位
 	WeaponsInSlot[0] = WeaponToPickup;
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponAttachment] Server_TryPickupWeapon: 武器 '%s' 已放回 WeaponsInSlot[Primary]. Pawn=%s"),
+		TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: 武器 '%s' 已放回 WeaponsInSlot[Primary]. Pawn=%s"),
 		*WeaponToPickup->GetName(),
 		*OwnerChar->GetName());
 
-	// 【v200.2 大厂架构】自动切回 Primary 槽位 — 业务规则 (用户反馈 2026.08.04):
-	//   "玩家捡起主武器, 需要自动切换到主武器"
-	//   - 玩家丢弃主武器时槽位切到 Melee, 捡起后必须自动切回 Primary, 否则玩家拿的是近战武器
-	//   - 旧版没切回, 玩家手上还是近战 → 业务错误
-	//   修复: 显式调 Server_SwitchToWeaponSlot(Primary), 让客户端 OnRep 看到 ActiveSlot=Primary 正确显示主武器
-	// 【v200.2.1 修复】Server_SwitchToWeaponSlot 返回 void, 不再用 bool 包装
+	// 【v200.3.6 大厂架构】自动切回 Primary 槽位
 	Server_SwitchToWeaponSlot(EWeaponSlotType::Primary);
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponAttachment] Server_TryPickupWeapon: Pawn=%s 捡起主武器 '%s' 成功 (已自动切回 Primary 槽位)."),
+		TEXT("[v200.3.6][WeaponAttachment] HandleTryPickupWeapon: Pawn=%s 捡起主武器 '%s' 成功 (已自动切回 Primary 槽位)."),
 		*OwnerChar->GetName(),
 		*WeaponToPickup->GetName());
 

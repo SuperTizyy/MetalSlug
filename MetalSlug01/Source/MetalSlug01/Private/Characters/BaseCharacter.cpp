@@ -4302,25 +4302,17 @@ void ABaseCharacter::OnFirePressed(const FInputActionValue& /*Value*/)
 	}
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 客户端射线: Origin=%s Direction=%s → 调 Server_StartFire."),
+		TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 客户端射线: Origin=%s Direction=%s → 调 Server_StartFire (Character RPC — Owning Connection 修复)."),
 		*GetName(),
 		*ClientRayOrigin.ToCompactString(),
 		*ClientRayDirection.ToCompactString());
 
-	// ============================================================
-	// 【v85.1 大厂架构 — 主武器射线视觉】
-	//
-	// 完整流程:
-	//   OnFirePressed → Server_StartFire RPC (携带客户端射线参数)
-	//     → URangedLineStrategy::PerformSingleShot (服务器权威 trace)
-	//       → 服务器本地: EDrawDebugTrace::ForDuration (红/绿线, 5分钟持久)
-	//       → Multicast_PlayFireTraceVisual → 所有客户端画红/绿线 (0.5s 短留)
-	//
-	// 颜色规则:
-	//   - 命中 (Hit) = 绿色
-	//   - 未命中 (Miss) = 红色
-	// ============================================================
-	CurrentWeapon->Server_StartFire(FVector_NetQuantize(ClientRayOrigin), FVector_NetQuantizeNormal(ClientRayDirection));
+	// 【v200.3.3 P0 修复】调 Character->Server_StartFire, 不是 Weapon->Server_StartFire
+	//   - 旧版: Weapon->Server_StartFire RPC
+	//     → Weapon 是"别人的枪" → "No owning connection" → RPC 丢弃
+	//   - 新版: Character->Server_StartFire RPC
+	//     → Character 有 owning connection (玩家自己的 Pawn) → RPC 成功
+	Server_StartFire(FVector_NetQuantize(ClientRayOrigin), FVector_NetQuantizeNormal(ClientRayDirection));
 }
 
 
@@ -4353,7 +4345,127 @@ void ABaseCharacter::OnFireReleased(const FInputActionValue& /*Value*/)
 	}
 
 	// 转发 (全自动模式下, 服务器会停 Tick 节流)
+	// 【v200.3.3 P0 修复】调 Character->Server_StopFire, 不是 Weapon->Server_StopFire
+	Server_StopFire();
+}
+
+
+// ============================================================
+// 【v200.3.3 Server RPC 实现 — 修复捡枪射击问题】
+//
+// 根因: 旧版调 CurrentWeapon->Server_StartFire
+//   - Weapon 是"别人的枪" (捡的别人的枪)
+//   - UE NetDriver: "No owning connection for actor" → RPC 被丢弃
+//   - 解决: 调 Character->Server_StartFire (Character 有 owning connection)
+//
+// 大厂原则:
+//   - Character 持有 owning connection, Weapon 不持有
+//   - 射击逻辑仍在 WeaponFireComponent::StartFire (保持单一职责)
+// ============================================================
+
+void ABaseCharacter::Server_StartFire_Implementation(
+	const FVector_NetQuantize& ClientRayOrigin,
+	const FVector_NetQuantizeNormal& ClientRayDirection)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter::Server_StartFire] 非服务器调用! Pawn=%s."),
+			*GetName());
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::Server_StartFire] Pawn=%s Weapon=%s Origin=%s Dir=%s."),
+		*GetName(),
+		*CurrentWeapon->GetName(),
+		*ClientRayOrigin.ToCompactString(),
+		*ClientRayDirection.ToCompactString());
+
+	CurrentWeapon->Server_StartFire(ClientRayOrigin, ClientRayDirection);
+}
+
+bool ABaseCharacter::Server_StartFire_Validate(
+	const FVector_NetQuantize& /*ClientRayOrigin*/,
+	const FVector_NetQuantizeNormal& /*ClientRayDirection*/)
+{
+	return true;
+}
+
+void ABaseCharacter::Server_StopFire_Implementation()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::Server_StopFire] Pawn=%s Weapon=%s."),
+		*GetName(),
+		*CurrentWeapon->GetName());
+
 	CurrentWeapon->Server_StopFire();
+}
+
+bool ABaseCharacter::Server_StopFire_Validate()
+{
+	return true;
+}
+
+void ABaseCharacter::Server_StartReload_Implementation()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		return;
+	}
+
+	ABaseWeapon* CurrentWeapon = WeaponAttachComp->GetCurrentWeapon();
+	if (!CurrentWeapon)
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter::Server_StartReload] Pawn=%s Weapon=%s."),
+		*GetName(),
+		*CurrentWeapon->GetName());
+
+	CurrentWeapon->Server_StartReload();
+}
+
+bool ABaseCharacter::Server_StartReload_Validate()
+{
+	return true;
 }
 
 
@@ -4376,7 +4488,8 @@ void ABaseCharacter::OnReloadPressed(const FInputActionValue& /*Value*/)
 	}
 
 	// 转发 (服务器会校验弹药/换弹中, 拒绝 + Log Verbose)
-	CurrentWeapon->Server_StartReload();
+	// 【v200.3.3 P0 修复】调 Character->Server_StartReload, 不是 Weapon->Server_StartReload
+	Server_StartReload();
 }
 
 
@@ -4787,7 +4900,9 @@ void ABaseCharacter::Server_DropPrimaryWeapon_Implementation()
 	// 1. 先切换到近战武器 (Server_SwitchToWeaponSlot)
 	// 2. 再丢弃主武器
 	// 3. 清空 WeaponsInSlot[Primary]
-	const bool bDropped = WeaponAttachComp->Server_DropPrimaryWeapon();
+	// 【v200.2.18 大厂架构重命名】WeaponAttachComp->HandleDropPrimaryWeapon (业务处理器, 非 RPC)
+	//   旧版命名 Server_DropPrimaryWeapon 像 RPC 但实际不是, 命名误导
+	const bool bDropped = WeaponAttachComp->HandleDropPrimaryWeapon();
 	if (!bDropped)
 	{
 		// WeaponAttachmentComponent 内部已经有详细的错误日志
@@ -4824,7 +4939,8 @@ void ABaseCharacter::Server_TryPickupWeapon_Implementation(ABaseWeapon* WeaponTo
 		return;
 	}
 
-	const bool bPickedUp = WeaponAttachComp->Server_TryPickupWeapon(WeaponToPickup);
+	// 【v200.2.18 大厂架构重命名】WeaponAttachComp->HandleTryPickupWeapon (业务处理器, 非 RPC)
+	const bool bPickedUp = WeaponAttachComp->HandleTryPickupWeapon(WeaponToPickup);
 	if (!bPickedUp)
 	{
 		// WeaponAttachmentComponent 内部已经有详细的错误日志

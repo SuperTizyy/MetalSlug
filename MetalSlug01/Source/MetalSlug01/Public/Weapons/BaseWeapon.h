@@ -436,6 +436,30 @@ public:
 	UMeshComponent* GetMeshComponent() const;
 
 	/**
+	 * GetAttachedCharacter — 获取挂载武器的 ABaseCharacter (单一真理源)
+	 *
+	 * 调用方: RPC Implementation (Multicast_PlayFireMontage / Multicast_PlayReloadMontage / Multicast_PlayFireTraceVisual)
+	 *         等任何需要"角色"上下文的 RPC
+	 *
+	 * 【v200.2.19 大厂架构 P0】修复问题 2:
+	 *   - 旧版所有 RPC 都用 GetOwner() 拿角色
+	 *   - UE 5.6 Owner 字段不是 Replicated → 客户端永远 null → 找不到角色 → 静默 return
+	 *   - 结果: 客户端捡起武器后无法开火, 客户端也看不到任何动画
+	 *   - 修复: 用 GetAttachParentActor() (Attach 关系是 Replicated)
+	 *   - 集中封装: 调用方统一用 GetAttachedCharacter(), 不直接写 GetOwner() 或 GetAttachParentActor()
+	 *
+	 * 大厂原则 (单一真理源):
+	 *   - "从武器拿角色" 是分布式一致性关键
+	 *   - 集中到一个函数, 避免 5+ 处实现略有不同
+	 *
+	 * 零兜底:
+	 *   - 武器没 attach 到任何角色 → return nullptr (调用方检查)
+	 *   - AttachParent 不是 ABaseCharacter → return nullptr (调用方检查, 一般是配置错误)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Components")
+	ABaseCharacter* GetAttachedCharacter() const;
+
+	/**
 	 * BeginPlay — UE 生命周期 (大厂架构 v83+ 客户端武器可用性)
 	 *
 	 * 调用方: UE 引擎 (Actor 初始化完成后)
@@ -484,13 +508,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Combat")
 	void StopDamageTrace();
 
-	/**
+/**
 	 * Multicast_PlayFireMontage — 多播播放开火蒙太奇
 	 *
 	 * 调用方: WeaponFireComponent::MulticastPlayFireMontage
 	 *
 	 * v70 保守修复: 旧版是 Weapon RPC, 新版 Strategy 内.
 	 * 这里做 no-op stub (蒙太奇播放由 WeaponFireComponent::PerformSingleShot 内部处理).
+	 *
+	 * 【v200.2.19 大厂架构】服务器本地进程守卫 (修复问题 3)
+	 *   旧版 (v200.2.18 之前) 没有守卫 → 服务器本地进程也跑 Multicast_PlayFireMontage
+	 *   → 服务器本地角色动画 + 客户端角色动画 = 重复触发 (host 玩家看到自己"开火"两次)
+	 *   新版: 实现内加守卫 — HasAuthority() + IsLocallyControlled → return (跳过服务器本地进程)
+	 *   与 Multicast_PlayFireTraceVisual_Implementation 守卫模式完全一致
 	 */
 	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Animation")
 	void Multicast_PlayFireMontage();
@@ -504,6 +534,36 @@ public:
 	 */
 	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Animation")
 	void Multicast_PlayReloadMontage();
+
+	/**
+	 * 【v200.3 Epic 官方终极方案 — Detach 必须走 RPC】
+	 *
+	 * Epic 论坛 (SupportiveEntity 2022-08) 明确指出:
+	 *   "If you call detach using KeepWorld, the client-side child will be positioned at
+	 *   it's server-side detach world position multiplied by 2"
+	 *   "The only way to get around this is to use an RPC or OnRep to call DetachFromActor on the client."
+	 *
+	 * 根因 (Epic 官方):
+	 *   服务器调 DetachFromActor(KeepWorld) → 不会自动复制到客户端
+	 *   → 客户端仍认为武器附加在角色上 (AttachParent != nullptr)
+	 *   → 物理引擎在"附加坐标系"内处理，而不是世界坐标
+	 *   → 武器"悬空"在附加坐标系的 (0,0,0) 偏移
+	 *
+	 * v200.2.21 错误做法 (本版本撤销):
+	 *   - 只强制 Location，没在客户端调 DetachFromActor
+	 *   - 客户端 AttachParent 仍是角色 → SetActorLocation 应用到附加坐标系
+	 *   - 结果: 武器在角色手的位置悬空，不是世界坐标的掉落点
+	 *
+	 * v200.3 正确做法 (Epic 官方):
+	 *   1. 服务器 StartDroppedState: 不调 DetachFromActor (只做物理)
+	 *   2. Multicast_DropWeapon: 在所有客户端调 DetachFromActor + SetActorLocation + SetSimulatePhysics
+	 *   3. 客户端: DetachFromActor(KeepWorld) → 清除 AttachParent → 后续 Location 在世界坐标生效
+	 *
+	 * 调用方: WeaponDropComponent::StartDroppedState (服务器, 末尾)
+	 */
+	UFUNCTION(NetMulticast, Unreliable, Category = "Weapon|Drop")
+	void Multicast_DropWeapon(FVector_NetQuantize NewLocation, FRotator NewRotation,
+		FVector LaunchVelocity, FVector LaunchAngularVelocity);
 
 	/**
 	 * Multicast_PlayFireTraceVisual — 客户端同步显示服务器 trace 视觉
@@ -653,7 +713,19 @@ public:
 	 * v70 保守修复: 旧版有此字段, 新版 Strategy 在组件内.
 	 * 这里声明以便其他文件引用.
 	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	// 【v200.2.20 大厂架构 — 字段复制链修复】
+	//   旧版 (v200.2.9 及之前): UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+	//     - 字段指针不复制 (字段没有 Replicated 标记)
+	//     - 客户端 Weapon->WeaponFireComponent 永远 null
+	//     - 必须依赖 BeginPlay 用 FindComponentByClass 兜底 (但这是反模式 — 依赖 BeginPlay 时序)
+	//   新版 (v200.2.20): UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Components")
+	//     - UE 自动同步字段指针
+	//     - 客户端 Weapon->WeaponFireComponent = 服务器字段值 (同步保证)
+	//     - 不依赖 BeginPlay 时序 (组件在 InitializeComponent 之前就有字段值)
+	//   大厂原则 (单一真理源):
+	//     - 字段指针 = 单一真理源, 不需要 FindComponentByClass 兜底
+	//     - 子组件本身仍 SetIsReplicatedByDefault(true), 复制 Component 数据 (Ammo 等 UPROPERTY Replicated)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Components")
 	TObjectPtr<class UWeaponFireComponent> WeaponFireComponent;
 
 	/**

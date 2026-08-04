@@ -617,41 +617,49 @@ public:
 	// ==========================================
 
 	/**
-	 * 【v200 大厂架构 P0】将主武器丢弃到地面
+	 * 【v200.2.18 大厂架构 — 重命名】将主武器丢弃到地面
 	 *
-	 * 调用方: ABaseCharacter::Server_DropPrimaryWeapon (玩家按 G 键 RPC)
+	 * 旧版命名问题 (v200):
+	 *   - "Server_DropPrimaryWeapon" 名字像 RPC (UE 大厂规范: Server_* 必须配 UFUNCTION(Server))
+	 *   - 实际是普通 C++ 函数, 只在服务器进程内部被 ABaseCharacter::Server_DropPrimaryWeapon_Implementation 调用
+	 *   - 命名误导 → 未来如果有人在客户端调用, 会静默失败, 根因不可见
 	 *
-	 * 流程:
-	 *   1. 校验: 必须是服务器 + 手里有主武器
-	 *   2. 脱挂武器与角色 (DetachFromActor)
-	 *   3. 调用 WeaponDropComponent->StartDroppedState (启动掉落状态)
-	 *   4. 设置当前武器为 null
+	 * 新版 (v200.2.18) — 大厂原则 (零命名误导):
+	 *   - 重命名 HandleDropPrimaryWeapon (Handle 前缀 = 业务逻辑处理器, 非 RPC)
+	 *   - 与 HandleTryPickupWeapon 对称, 单一真理源命名约定
 	 *
-	 * 大厂原则 - 单一职责:
-	 *   - 本方法只负责"把武器从手上放到地上", 不负责捡起
-	 *   - 捡起由 Server_TryPickupWeapon 负责
+	 * 职责:
+	 *   - 校验: 必须是服务器 + 手里有主武器
+	 *   - 脱挂武器与角色 (DetachFromActor)
+	 *   - 调用 WeaponDropComponent->StartDroppedState (启动掉落状态 + 物理)
+	 *   - 设置当前武器为 null
+	 *
+	 * 调用方: ABaseCharacter::Server_DropPrimaryWeapon_Implementation (服务器进程内部)
 	 *
 	 * @return true=丢弃成功, false=失败
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Weapon")
-	bool Server_DropPrimaryWeapon();
+	bool HandleDropPrimaryWeapon();
 
 	/**
-	 * 【v200 大厂架构 P0】捡起地面上的武器
+	 * 【v200.2.18 大厂架构 — 重命名】捡起地面上的武器
 	 *
-	 * 调用方: ABaseCharacter::Server_TryPickupWeapon (玩家走到掉落武器上)
+	 * 旧版命名问题: 同上 ("Server_TryPickupWeapon" 名字像 RPC 但不是)
+	 * 新版: 重命名 HandleTryPickupWeapon
 	 *
-	 * 流程:
-	 *   1. 校验: 必须是服务器 + 没有主武器 + 目标武器在掉落状态
-	 *   2. 调用 WeaponDropComponent->CancelDroppedState (恢复弹药 + 停物理)
-	 *   3. 装备武器到主槽位
-	 *   4. 广播事件
+	 * 职责:
+	 *   - 校验: 必须是服务器 + 没有主武器 + 目标武器在掉落状态
+	 *   - 调用 WeaponDropComponent->CancelDroppedState (恢复弹药 + 停物理 + Multicast 客户端)
+	 *   - 装备武器到主槽位
+	 *   - 广播事件
+	 *
+	 * 调用方: ABaseCharacter::Server_TryPickupWeapon_Implementation (服务器进程内部)
 	 *
 	 * @param WeaponToPickup 要捡起的武器
 	 * @return true=捡起成功, false=失败
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Combat|Weapon")
-	bool Server_TryPickupWeapon(ABaseWeapon* WeaponToPickup);
+	bool HandleTryPickupWeapon(ABaseWeapon* WeaponToPickup);
 
 	/**
 	 * 【v200.2 大厂架构 — 零兜底】获取 Primary 槽位的武器
