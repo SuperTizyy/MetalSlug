@@ -26,6 +26,11 @@
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
 #include "Components/HealthComponent.h"
+// 【v134 大厂架构新增】音效查表 (Zombie 模式小局结束音效, 全体客户端播同一音效)
+#include "Data/Enums/RoomEnums.h"
+#include "Sound/SoundBase.h"
+#include "Kismet/GameplayStatics.h"
+#include "GameFramework/PlayerState.h"
 
 
 // ==========================================
@@ -415,8 +420,27 @@ void UGameHUDWidget::TryBindToGameState()
 			// 绑定事件: 当 GameState 的队伍击杀统计变化时，刷新 MatchInfoWidget 上的 Text_AttackerCount / Text_DefenderCount
 			RoomGS->OnTeamKillCountUpdated.AddDynamic(this, &UGameHUDWidget::UpdateTeamKillCountsText);
 
+			// 【v134 大厂架构新增】绑定事件: 小局胜局数变化时, 刷新 Text_AttackerCount / Text_DefenderCount 显示
+			//   - 单一真理源: RoomGS->OnWinStatsUpdated (GameState.AddRoundWinToFaction 触发)
+			//   - 与 OnTeamKillCountUpdated 镜像, 但语义不同: 击杀数 vs 胜局数
+			//   - 大厂原则 — 零重复架构: 复用 UpdateTeamKillCountsText (因为它就是把 int32 写到 TextBlock)
+			//   - 不破坏刀战模式: 刀战使用旧 MulticastRefreshKillCount 链路, 该绑定无影响
+			//   - 模式分支由 MatchInfoWidget::OnWinStatsChanged 内部按 CurrentMatchMode 决定显示
+			RoomGS->OnWinStatsUpdated.AddDynamic(this, &UGameHUDWidget::UpdateTeamWinCountsText);
+
+			// 【v134 大厂架构新增】绑定事件: 小局音效 RPC 收到时, 查 GameMode 音效 + 播放
+			//   - 单一真理源: RoomGS->OnZombieRoundSoundReceived (MulticastPlayZombieRoundSound 触发)
+			//   - 客户端本机查 GameMode 缓存的 USoundBase (UE 5.6 UObject 不跨 RPC)
+			//   - 业务规则 (用户 2026.08.06 明确): 全体客户端播同一音效, 不按 ClientFactionTag 分发
+			//     - 人类赢 → 全体播 ZombieHumanWinSound
+			//     - 母体赢 → 全体播 ZombieMotherWinSound
+			RoomGS->OnZombieRoundSoundReceived.AddDynamic(this, &UGameHUDWidget::OnZombieRoundSoundReceived);
+
 			// 绑定事件: 进入结算状态（倒计时归零时触发）
 			RoomGS->OnEnterSettlement.AddDynamic(this, &UGameHUDWidget::OnEnterSettlement);
+
+			// 【v201 大厂架构新增】绑定事件: 短暂显示小局结果（不进入结算页面）
+			RoomGS->OnZombieRoundBriefResult.AddDynamic(this, &UGameHUDWidget::OnShowZombieRoundBriefResult);
 
 			// 绑定事件: 显示最终胜负（延迟 3 秒后触发）
 			RoomGS->OnShowFinalSettlement.AddDynamic(this, &UGameHUDWidget::OnShowFinalSettlement);
@@ -560,9 +584,110 @@ void UGameHUDWidget::UpdateTeamKillCountsText(int32 AttackerKills, int32 Defende
 	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] 刷新队伍击杀数: 攻方=%d, 守方=%d"), AttackerKills, DefenderKills);
 }
 
+
+/**
+ * UGameHUDWidget::UpdateTeamWinCountsText (v134 大厂架构新增)
+ *
+ * 业务规则 (用户 2026.08.06 明确):
+ *   - 生化模式每小局结束时, Text_AttackerCount / Text_DefenderCount 显示 累加胜局数
+ *   - 数据源: ARoomGameState::AttackerWins / DefenderWins (通过 OnWinStatsUpdated 推送)
+ *
+ * 大厂原则 — 镜像 UpdateTeamKillCountsText:
+ *   - 参数 (AttackerWins, DefenderWins) 由 GameState.OnWinStatsUpdated 推送
+ *   - 转发到 MatchInfoWidget 决定显示
+ *   - 语义不同但调用路径一致 (零重复架构)
+ *
+ * 大厂原则 — 零兜底:
+ *   - Widget_MatchInfo 为空 → Log Error + return (防御层)
+ */
+void UGameHUDWidget::UpdateTeamWinCountsText(int32 AttackerWins, int32 DefenderWins)
+{
+	if (!Widget_MatchInfo)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] UpdateTeamWinCountsText: Widget_MatchInfo 为空, 无法刷新小局胜局数! "
+			     "【修复】检查 BP 资产 WBP_GameHUD 是否有 Widget_MatchInfo (Type=UMatchInfoWidget)."));
+		return;
+	}
+
+	Widget_MatchInfo->UpdateAttackerCount(AttackerWins);
+	Widget_MatchInfo->UpdateDefenderCount(DefenderWins);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] 刷新小局胜局数 (生化模式): AttackerWins=%d, DefenderWins=%d"),
+		AttackerWins, DefenderWins);
+}
+
+
+/**
+ * UGameHUDWidget::OnZombieRoundSoundReceived (v134 大厂架构新增, Multicast RPC 回调)
+ *
+ * 业务规则 (用户 2026.08.06 明确):
+ *   - 每小局结束, 服务器 Multicast 推 RoundWinner 到所有客户端
+ *   - 全体客户端播同一个音效 (不按 ClientFactionTag 分发, 业务简化)
+ *   - 客户端本机查 GameMode 配置的 USoundBase → 播放
+ *
+ * 大厂原则 — 单一职责:
+ *   - 本函数只负责 "查 GameMode USoundBase → 播放"
+ *   - RoundWinner → USoundBase 查表走 GameMode.ResolveZombieRoundEndSound (配置真理源)
+ *
+ * 大厂原则 — 零兜底:
+ *   - GameMode 为空 → Log Error + return (防御层)
+ *   - USoundBase 解析为 null → Log Error + 不播放 (音效缺失不应静默吞掉)
+ *
+ * 不破坏刀战模式:
+ *   - 刀战永不调 MulticastPlayZombieRoundSound, 本回调永不触发
+ */
+void UGameHUDWidget::OnZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 收到小局音效 RPC, InRoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: World 为空, 无法播放小局音效."));
+		return;
+	}
+
+	ARoomGameMode* GM = Cast<ARoomGameMode>(World->GetAuthGameMode());
+	if (!GM)
+	{
+		// 纯客户端 (dedicated server 等) 不会有 GM, 这里只 Log Warning
+		// 这种情况不应该发生 (Multicast 应在 listen server + 所有客户端收到)
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: AuthGameMode 非 ARoomGameMode (可能在专用服务器). 跳过."));
+		return;
+	}
+
+	// 业务规则 (用户 2026.08.06 明确): 全体客户端播同一个音效, 不按 ClientFactionTag 分发
+	//   - 早一版本按 (RoundWinner × ClientFactionTag) 4 种组合分发, 已被业务简化
+	//   - 单一真理源: GameMode.ResolveZombieRoundEndSound(InRoundWinner) → 2 路分支 (Human/Mother)
+	USoundBase* SoundToPlay = GM->ResolveZombieRoundEndSound(InRoundWinner);
+	if (!SoundToPlay)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: GameMode.ResolveZombieRoundEndSound 返回 null. "
+			     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|ZombieRound 配对应的 ZombieHumanWinSound / ZombieMotherWinSound. "
+			     "【业务后果】本小局音效未播放, 业务不阻塞."));
+		return;
+	}
+
+	// 客户端本机播放 (零重复架构 — 不走 Multicast RPC, 因为已在 _Implementation 内)
+	UGameplayStatics::PlaySound2D(this, SoundToPlay);
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 已播放小局音效 (全体). InRoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+}
+
 /** 根据游戏模式切换 Text_RemainingRounds 的可见性 */
 void UGameHUDWidget::OnMatchModeChangedForHUD(ERoomMatchMode NewMode)
 {
+	// 【v200.2 大厂架构新增】缓存当前模式，供 OnEnterSettlement 判断显示文本
+	CachedMatchMode = NewMode;
+
 	if (Widget_MatchInfo)
 	{
 		Widget_MatchInfo->SetVisibilityByMode(NewMode);
@@ -876,16 +1001,19 @@ bool UGameHUDWidget::GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutW
  * UGameHUDWidget::OnEnterSettlement
  *
  * 进入结算状态（倒计时归零时由 GameState 广播触发）
+ * 【v200.2 大厂架构重构】: 根据模式区分显示
+ *   - 生化模式: RoundWinner=Human→"人类胜利", Mother→"幽灵胜利", None→"平局"
+ *   - 刀战模式: 暂不显示胜负文本（用户尚未规定内容）
+ *
  * 1. 暂存当局击杀数
- * 2. 隐藏 MatchInfo
- * 3. 隐藏准星
- * 4. 显示游戏结束文本（3 秒后由 OnShowFinalSettlement 隐藏）
- * 5. 隐藏返回大厅按钮
- * 6. 隐藏计分板
+ * 2. 隐藏 MatchInfo + 准星
+ * 3. 根据模式显示对应胜负文本（仅生化模式）
+ * 4. 隐藏返回大厅按钮 + 计分板（等 OnShowFinalSettlement）
  */
-void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills)
+void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills, EZombieRoundWinner RoundWinner)
 {
-	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnEnterSettlement: 攻方=%d, 守方=%d"), AttackerKills, DefenderKills);
+	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnEnterSettlement: 攻方=%d, 守方=%d, RoundWinner=%d, Mode=%d"),
+		AttackerKills, DefenderKills, static_cast<int32>(RoundWinner), static_cast<int32>(CachedMatchMode));
 
 	// 暂存当局击杀数，供 3 秒后 OnShowFinalSettlement 使用
 	LastAttackerKills = AttackerKills;
@@ -900,10 +1028,33 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills)
 	// 隐藏准星
 	HideCrosshair();
 
-	// 显示游戏结束文本（3 秒后由 OnShowFinalSettlement 隐藏）
+	// 【v200.2 大厂架构新增 P0】根据模式显示对应胜负文本
 	if (Text_GameOver)
 	{
 		Text_GameOver->SetVisibility(ESlateVisibility::Visible);
+
+		if (CachedMatchMode == ERoomMatchMode::Zombie)
+		{
+			// 生化模式: 根据 RoundWinner 显示对应文本
+			switch (RoundWinner)
+			{
+			case EZombieRoundWinner::Human:
+				Text_GameOver->SetText(FText::FromString(TEXT("人类胜利")));
+				break;
+			case EZombieRoundWinner::Mother:
+				Text_GameOver->SetText(FText::FromString(TEXT("幽灵胜利")));
+				break;
+			case EZombieRoundWinner::None:
+			default:
+				Text_GameOver->SetText(FText::FromString(TEXT("平局")));
+				break;
+			}
+		}
+		else
+		{
+			// 刀战模式: 暂不显示胜负文本（用户尚未规定内容）
+			Text_GameOver->SetText(FText::FromString(TEXT("")));
+		}
 	}
 
 	// 隐藏返回大厅按钮（等最终结果展示后再显示）
@@ -917,6 +1068,52 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills)
 	{
 		Widget_Scoreboard->SetVisibility(ESlateVisibility::Collapsed);
 	}
+}
+
+
+/**
+ * UGameHUDWidget::OnShowZombieRoundBriefResult
+ *
+ * 【v201 大厂架构新增】短暂显示小局结果
+ *
+ * 业务场景:
+ *   - 每小局结束时短暂显示"人类胜利"或"母体胜利"
+ *   - 显示 3 秒后自动隐藏
+ *   - 不进入结算页面，继续下一小局
+ */
+void UGameHUDWidget::OnShowZombieRoundBriefResult(EZombieRoundWinner RoundWinner)
+{
+	UE_LOG(LogTemp, Log, TEXT("[GameHUD] 【v201】OnShowZombieRoundBriefResult: RoundWinner=%d"),
+		static_cast<int32>(RoundWinner));
+
+	// 使用 Text_GameOver 显示小局结果
+	if (Text_GameOver)
+	{
+		Text_GameOver->SetVisibility(ESlateVisibility::Visible);
+
+		switch (RoundWinner)
+		{
+		case EZombieRoundWinner::Human:
+			Text_GameOver->SetText(FText::FromString(TEXT("人类胜利")));
+			break;
+		case EZombieRoundWinner::Mother:
+			Text_GameOver->SetText(FText::FromString(TEXT("母体胜利")));
+			break;
+		default:
+			Text_GameOver->SetText(FText::FromString(TEXT("平局")));
+			break;
+		}
+	}
+
+	// 3 秒后自动隐藏
+	FTimerHandle Handle;
+	GetWorld()->GetTimerManager().SetTimer(Handle, [this]()
+	{
+		if (Text_GameOver)
+		{
+			Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}, 3.0f, false);
 }
 
 
@@ -1086,6 +1283,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 
 		// 【2026.07.14 新增】订阅无敌期状态变化 - 控制复活进度条显示/隐藏
 		Events->OnInvincibilityChanged.AddDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
+
+		// 【v201.6 大厂架构新增】订阅移动锁定状态变化 - 控制复活进度条显示移动锁定倒计时
+		Events->OnRespawnMovementLockedChanged.AddDynamic(this, &UGameHUDWidget::OnRespawnMovementLockedChanged);
 
 		// 【v105 新增】订阅武器面板显隐状态变化 - 母体无武器时隐藏弹药 UI
 		Events->OnWeaponPanelVisibilityChanged.AddUObject(this, &UGameHUDWidget::OnWeaponPanelVisibilityChanged);
@@ -1362,6 +1562,10 @@ void UGameHUDWidget::UnbindFromCharacterEvents()
 		CachedCharacterEvents->OnWeaponIconReady.RemoveDynamic(this,     &UGameHUDWidget::OnWeaponIconReady);
 		CachedCharacterEvents->OnWeaponAmmoInfoReady.RemoveDynamic(this, &UGameHUDWidget::OnWeaponAmmoInfoReady);
 		CachedCharacterEvents->OnInvincibilityChanged.RemoveDynamic(this, &UGameHUDWidget::OnInvincibilityChanged);
+
+		// 【v201.6 大厂架构新增】取消订阅移动锁定状态变化
+		CachedCharacterEvents->OnRespawnMovementLockedChanged.RemoveDynamic(this, &UGameHUDWidget::OnRespawnMovementLockedChanged);
+
 		CachedCharacterEvents->OnWeaponPanelVisibilityChanged.RemoveAll(this);
 
 		// 【v120 新增】取消订阅母体加速技能冷却
@@ -1629,6 +1833,50 @@ void UGameHUDWidget::OnInvincibilityChanged(bool bIsNowInvincible)
 			*Widget_RespawnProgress->GetName());
 	}
 }
+
+
+/**
+ * UGameHUDWidget::OnRespawnMovementLockedChanged 【v201.6 大厂架构新增】
+ *
+ * 移动锁定状态变化回调 - 控制复活进度条显示移动锁定倒计时
+ *
+ * 订阅: CharacterEvents.OnRespawnMovementLockedChanged
+ * 触发: HealthComponent 移动锁定状态变化
+ *
+ * @param bIsLocked true=进入锁定(显示倒计时), false=退出锁定(隐藏倒计时)
+ * @param Duration 锁定时长(秒)
+ */
+void UGameHUDWidget::OnRespawnMovementLockedChanged(bool bIsLocked, float Duration)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] OnRespawnMovementLockedChanged: bIsLocked=%d Duration=%.2f"),
+		bIsLocked ? 1 : 0, Duration);
+
+	if (!Widget_RespawnProgress)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnRespawnMovementLockedChanged: Widget_RespawnProgress 未绑定!"));
+		return;
+	}
+
+	if (bIsLocked)
+	{
+		// 进入移动锁定 - 显示移动锁定倒计时
+		Widget_RespawnProgress->ShowMovementLock(Duration);
+		UE_LOG(LogTemp, Display,
+			TEXT("[GameHUDWidget] OnRespawnMovementLockedChanged: 进入移动锁定, 显示移动锁定倒计时 Duration=%.2fs. Widget=%s"),
+			Duration, *Widget_RespawnProgress->GetName());
+	}
+	else
+	{
+		// 退出移动锁定 - 隐藏移动锁定倒计时
+		Widget_RespawnProgress->HideMovementLock();
+		UE_LOG(LogTemp, Display,
+			TEXT("[GameHUDWidget] OnRespawnMovementLockedChanged: 退出移动锁定, 隐藏移动锁定倒计时。 Widget=%s"),
+			*Widget_RespawnProgress->GetName());
+	}
+}
+
 
 void UGameHUDWidget::OnMotherSkillCooldownChanged(float CDProgress, bool bSkillActive)
 {

@@ -270,6 +270,39 @@ void ARoomGameMode::InitGameState()
 	UE_LOG(LogTemp, Log,
 		TEXT("[RoomGameMode] InitGameState: URL ?Mode=%s → GS->SetCurrentMatchMode(%s) 成功."),
 		*ModeStr, ParsedMode == ERoomMatchMode::Melee ? TEXT("Melee") : TEXT("Zombie"));
+
+	// ==========================================
+	// 【v201.12 大厂架构修复】补注入 GS 字段 (TotalRounds / ZombieMatchDuration 等)
+	// ==========================================
+	//
+	// 根因 (v201.11 之前):
+	//   - InitGame 时 GS 尚未创建 → LifeSys->SetTotalRounds(GetGameState === null) → Log Error + 拒绝写入
+	//   - 日志证据: "[RoomLifecycle] SetTotalRounds: GameState 为空, 拒绝注入." (4 次)
+	//   - 结果: GS.TotalRounds 永远 = GameState.h 默认值 5, 策划在 GM_RoomGameMode 改 TotalRounds=10 → 无效
+	//   - 用户反馈 (2026.08.06): "GM_RoomGameMode 的 TotalRounds 我设置了, 但是生化模式进游戏的总局数还是不按照 GM_RoomGameMode 的 TotalRounds 设置来"
+	//
+	// 修复:
+	//   - InitGameState 末尾 (GS 已创建) → 显式调 GS->SetTotalRounds / SetZombieMatchDuration
+	//   - 这是在 GS 创建后唯一安全的注入时机
+	//
+	// 大厂原则:
+	//   - 单一真理源: GM.TotalRounds 是策划配置, GS.TotalRounds 是运行时, 数据单向流 (GM → GS)
+	//   - 零兜底: < 1 已经 GameState 校验过 (ClampMin=1), 这里直接写入
+	//   - 显式优于隐式: 命名明确指出"补注入" 而非"重新注入"
+	if (URoomLifecycleSubsystem* LifeSys = URoomLifecycleSubsystem::Get(this))
+	{
+		LifeSys->SetTotalRounds(TotalRounds);
+		LifeSys->SetZombieMatchDuration(ZombieMatchDurationSeconds);
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameMode] 【v201.12】InitGameState 补注入: GS 已创建, "
+				 "SetTotalRounds=%d, SetZombieMatchDuration=%ds."),
+			TotalRounds, ZombieMatchDurationSeconds);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] InitGameState: URoomLifecycleSubsystem 不可用, 跳过 TotalRounds 补注入."));
+	}
 }
 
 /**
@@ -1047,5 +1080,75 @@ bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
 // ==========================================
 // 8. 数据驱动兜底 (2026-07-03 重构)
 // ==========================================
+
+
+// ==========================================
+// 【v134 大厂架构新增】生化小局结算音效查表 — 单一入口
+// ==========================================
+//
+// 业务规则 (用户 2026.08.06):
+//   - 根据本局赢家 (Human/Mother) + 客户端阵营 (Offense=母体 / Defense=人类), 选 4 个音效之一
+//   - 不在 GameHUDWidget 写 4 个 if 重复架构 — 集中决策在 GameMode
+//   - 任何参数无效 / 资产为空 → 返回 nullptr + Log Error, 调用方拒绝播放 + 流程继续
+//
+// 大厂原则 — 零兜底:
+//   - RoundWinner == None → 返回 nullptr (胜负未定, 不允许基于未定播放)
+//   - ClientFactionTag 无效 (非 Offense/Defense) → 返回 nullptr
+//   - 4 个音效任一为空 → 返回 nullptr (策划配置错, Log Error 告知)
+//
+// 不破坏刀战模式:
+//   - GameHUDWidget 仅在 Bio 模式 + RoundWinner 已写时调本函数
+//   - 刀战永远不调, 4 个字段刀战模式 0 影响
+//
+// 调用方:
+//   - UGameHUDWidget::OnRep_RoundWinner (客户端缓存 + OnEnterSettlement 时调用)
+USoundBase* ARoomGameMode::ResolveZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const
+{
+	// 防御层 1: RoundWinner 必须合法
+	if (InRoundWinner == EZombieRoundWinner::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=None (尚未结算), 拒绝查表. "
+			     "【根因】调用方在胜负未定时触发了音效查表. 修复: 确保 OnRep_RoundWinner 已收到 Human/Mother 后才查."));
+		return nullptr;
+	}
+
+	// 业务查表: 根据赢家返回对应音效 (全体客户端播同一个, 不区分 ClientFaction)
+	// 大厂原则 — 零重复架构: 全体播同一个音效, 不按 ClientFactionTag 分发 (用户 2026.08.06 业务简化)
+	USoundBase* SelectedSound = nullptr;
+	const TCHAR* SlotName = nullptr;
+
+	switch (InRoundWinner)
+	{
+	case EZombieRoundWinner::Human:
+		SelectedSound = ZombieHumanWinSound;
+		SlotName = TEXT("ZombieHumanWinSound");
+		break;
+
+	case EZombieRoundWinner::Mother:
+		SelectedSound = ZombieMotherWinSound;
+		SlotName = TEXT("ZombieMotherWinSound");
+		break;
+
+	default:
+		// 理论上防御层 1 已挡住, 这里仅兜底类型 (UEnum 未穷尽警告)
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=%d 未识别, 拒绝查表. "
+			     "【修复】检查 EZombieRoundWinner 枚举定义."),
+			static_cast<int32>(InRoundWinner));
+		return nullptr;
+	}
+
+	if (!SelectedSound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: 音效资产为空 (Winner=%d, Slot=%s). "
+			     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|ZombieRound 配对应字段. "
+			     "【业务后果】音效缺失, 不卡住胜负流程 — Text_RoundCountdown 仍正常显示."),
+			static_cast<int32>(InRoundWinner), SlotName);
+	}
+
+	return SelectedSound;
+}
 
 

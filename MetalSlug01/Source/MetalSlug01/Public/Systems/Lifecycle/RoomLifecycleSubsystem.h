@@ -142,7 +142,33 @@ public:
 	bool HandleZombieRoundEnd();
 
 	// ==========================================
-	// 【v92 大厂架构新增】生化模式母体变异倒计时调度
+	// 【v134 大厂架构新增】生化小局结算统一入口 (单一真理源)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.06):
+	//   - 倒计时结束 (Zombie OnMatchTimerTick 检测) → FinishZombieRound
+	//   - 提前结束 (场上无存活人类, 每秒 Tick 检测) → FinishZombieRound
+	//   - 两路入口统一走 FinishZombieRound → GameState.SetRoundWinner + 累加胜局数 + 触发下一局
+	//
+	// 大厂原则 — 单一入口:
+	//   - FinishZombieRound 是"本小局结束"业务唯一入口
+	//   - 调用方: HandleMatchTimeOut (倒计时结束) + TickZombieRound (提前结束)
+	//   - 内部: GameState.SetRoundWinner + GameState.AttackerWins/DefenderWins++ + Broadcast OnEnterSettlement
+	//   - 镜像 MulticastEnterSettlement 已存在的 RPC, **不新建 RPC** (零重复架构)
+	//
+	// 大厂原则 — 零兜底:
+	//   - 非生化模式调用 → Log Error + return (强制修复调用方)
+	//   - RoundWinner 已为 Human/Mother (重复调用) → 幂等 return (防双发)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式永不调本函数
+	//
+	// @return true = 本局已结束并写入胜负, false = 业务被拒绝
+	UFUNCTION(BlueprintCallable, Category = "Room|Lifecycle")
+	bool FinishZombieRound();
+
+	// ==========================================
+	// 【v134 大厂架构新增】生化模式母体变异倒计时调度
 	// ==========================================
 	//
 	// 业务规则:
@@ -236,6 +262,15 @@ public:
 	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的
 	 */
 	void OnAirdropIntervalExpired();
+
+	/**
+	 * 【v201.4 大厂架构新增】小局短暂结果显示后延迟回调
+	 *
+	 * 业务规则: 非最后一局时, FinishZombieRound 显示3秒短暂提示
+	 *           3秒后本函数被Timer调用 → StartNextZombieRound 开始下一小局
+	 */
+	void OnRoundTransitionTimerExpired();
+
 	void SetMotherMutationCount(int32 InCount)
 	{
 		CachedMotherMutationCount = FMath::Max(1, InCount);
@@ -310,6 +345,15 @@ protected:
 	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的
 	 */
 	FTimerHandle AirdropIntervalTimerHandle;
+
+	/**
+	 * 【v201.4 大厂架构新增】小局短暂结果显示后延迟开始下一小局Timer句柄
+	 *
+	 * 业务规则: 非最后一局时, MulticastShowZombieRoundBriefResult 显示3秒提示
+	 *           3秒后自动隐藏 → 然后 StartNextZombieRound 开始下一小局
+	 *           这个Timer确保短暂结果提示完全显示后再开始下一小局
+	 */
+	FTimerHandle RoundTransitionTimerHandle;
 
 	/**
 	 * 是否已经广播过 OnBattleStarted (幂等保护)

@@ -120,6 +120,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	void InitializeFromConfig(UAIBehaviorConfigSO* InConfig, UBehaviorTree* BehaviorTreeOverride = nullptr);
 
+	/**
+	 * 【v201.10 大厂架构新增】重启 BT + 清空 Blackboard
+	 *
+	 * 业务场景: RestartZombieRoundPlayers (每小局开始前)
+	 *   - 旧 (v201.9 之前): BT 在第二小局仍持有第一小局的 BB 数据 (TargetActor/CooldownEndTime 等)
+	 *   - 用户反馈: "AI 在每小局开始前应该先清理所有黑板键的数据再启动"
+	 *   - 修复: 停 BT → 清空所有 BB Key → 重启 BT (让 BT Service 重新派生)
+	 *
+	 * 调用方: URoomSpawnSubsystem::RestartZombieRoundPlayers 末尾
+	 *
+	 * 大厂原则:
+	 *   - 单一入口: 所有"重启 BT"需求都走这一处 (避免散落)
+	 *   - 零兜底: BT/BB 为空 → Log Warning + return (不静默跳过)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	void RestartBehaviorTreeAndClearBlackboard();
+
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	void SetDifficultyTier(EAIDifficultyTier NewTier);
 

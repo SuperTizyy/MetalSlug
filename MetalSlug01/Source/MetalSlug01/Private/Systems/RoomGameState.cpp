@@ -6,6 +6,8 @@
 // 引入本类头文件
 #include "Systems/RoomGameState.h"
 
+#include "Systems/RoomGameMode.h"  // 【v201.13】ARoomGameMode::TotalRounds
+
 // 引入 Net/UnrealNetwork.h（DOREPLIFETIME 宏的来源）
 #include "Net/UnrealNetwork.h"
 
@@ -18,6 +20,13 @@
 // 引入角色基类（用于 GetAC/GetIsDead 等）
 #include "Characters/BaseCharacter.h"
 #include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
+
+// 【v134 大厂架构新增】HasAliveHumanOnField 需要枚举 AI Controller
+#include "Systems/BaseAIController.h"
+// 【v134】TActorIterator (枚举 AI Controller 上的 Pawn)
+#include "EngineUtils.h"
+// 【v134】APlayerController (遍历本地玩家)
+#include "GameFramework/PlayerController.h"
 
 
 // ==========================================
@@ -209,6 +218,10 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 大厂原则 — 镜像 v27 FactionTag: 没有 DOREPLIFETIME = 客户端永远是默认值 → 防重入失效
 	DOREPLIFETIME(ARoomGameState, MotherMutationHasFired);
 	DOREPLIFETIME(ARoomGameState, MotherMutationCount);
+
+	// 【v134 大厂架构新增】小局赢家复制 (RoundWinner)
+	// 大厂原则 — 镜像 AttackerWins / DefenderWins: Replicated → OnRep 触发客户端 UI / 音效查表
+	DOREPLIFETIME(ARoomGameState, RoundWinner);
 }
 
 
@@ -368,6 +381,43 @@ void ARoomGameState::SetCurrentMatchMode(ERoomMatchMode NewMode)
 	UE_LOG(LogTemp, Log,
 		TEXT("[RoomGameState] SetCurrentMatchMode: 房间模式已设置! CurrentMatchMode=%d"),
 		static_cast<int32>(CurrentMatchMode));
+
+	// ==========================================
+	// 【v201.13 大厂架构新增】设置模式时自动补注入 GM 的 TotalRounds / ZombieMatchDuration
+	// ==========================================
+	//
+	// 根因 (v201.12 之前):
+	//   - 测试模式 (skip-login) 不走 InitGameState → InitGameState 末尾的补注入不生效
+	//   - GameFlowSubsystem::BootToLogin 测试分支直接调 GS->SetCurrentMatchMode(Mode)
+	//   - 结果: GS.CurrentMatchMode=Zombie, 但 GS.TotalRounds 还是默认值 5
+	//   - 用户反馈 (2026.08.06): "TotalRounds 我设置了, 生化模式进游戏的总局数还是不按照设置来"
+	//
+	// 修复:
+	//   - 任何路径调 SetCurrentMatchMode → GS 内部自动从 GM 读 TotalRounds 并写入
+	//   - 涵盖: 正式路径 InitGameState (兜底)、测试路径 GameFlowSubsystem (主用)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - GM.TotalRounds 是策划配置真理源
+	//   - GS.TotalRounds 是运行时真理源
+	//   - SetCurrentMatchMode 是 GS 公开 API 的唯一入口, 在此注入最合适
+	if (CurrentMatchMode == ERoomMatchMode::Zombie)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (ARoomGameMode* GM = World->GetAuthGameMode<ARoomGameMode>())
+			{
+				const int32 GMTotalRounds = GM->TotalRounds;
+				if (GMTotalRounds >= 1 && TotalRounds != GMTotalRounds)
+				{
+					UE_LOG(LogTemp, Log,
+						TEXT("[RoomGameState] 【v201.13】SetCurrentMatchMode(Zombie) 联动注入 TotalRounds: GM.TotalRounds=%d → GS.TotalRounds=%d. "
+							 "(测试模式跳过 InitGameState, 这里兜底)"),
+						TotalRounds, GMTotalRounds);
+					SetTotalRounds(GMTotalRounds);
+				}
+			}
+		}
+	}
 }
 
 
@@ -724,6 +774,62 @@ void ARoomGameState::OnRep_WinStats()
 }
 
 
+/**
+ * AddRoundWinToFaction (服务器专用)
+ *
+ * 大厂原则 — 镜像 SetRoundWinner:
+ *   - 仅服务器可调用 (HasAuthority 校验)
+ *   - 客户端调用 → Log Error + return
+ *   - 写入字段后 UE 引擎自动 Replicate 触发 OnRep_WinStats → 推所有客户端
+ *   - 业务上无"服务器手动 Broadcast" 的需要 (与 SetRoundWinner 不同), UE 5.6 引擎保证 Replicate
+ *
+ * 大厂原则 — 零兜底:
+ *   - FactionTag 非 Offense/Defense → Log Error + 拒绝累加
+ *   - HasAuthority=false → Log Error + return
+ *
+ * 调用方 (单一入口):
+ *   - URoomLifecycleSubsystem::FinishZombieRound
+ *
+ * @param WinnerFactionTag 胜出方阵营 (Faction.Offense = 母体赢, Faction.Defense = 人类赢)
+ */
+void ARoomGameState::AddRoundWinToFaction(FGameplayTag WinnerFactionTag)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] AddRoundWinToFaction: 客户端调用非法, HasAuthority=false. 仅服务器可累加胜局数."));
+		return;
+	}
+
+	if (WinnerFactionTag == FFactionTags::Offense())
+	{
+		AttackerWins++;
+		// 服务器自身不会触发 OnRep_WinStats, 手动 Broadcast 以同步房主本地 UI
+		OnWinStatsUpdated.Broadcast(AttackerWins, DefenderWins);
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameState] AddRoundWinToFaction: 母体赢 (Offense), AttackerWins++ → %d. 客户端 OnRep_WinStats 即将触发."),
+			AttackerWins);
+	}
+	else if (WinnerFactionTag == FFactionTags::Defense())
+	{
+		DefenderWins++;
+		// 服务器自身不会触发 OnRep_WinStats, 手动 Broadcast 以同步房主本地 UI
+		OnWinStatsUpdated.Broadcast(AttackerWins, DefenderWins);
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomGameState] AddRoundWinToFaction: 人类赢 (Defense), DefenderWins++ → %d. 客户端 OnRep_WinStats 即将触发."),
+			DefenderWins);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] AddRoundWinToFaction: WinnerFactionTag='%s' 非 Offense/Defense, 拒绝累加. "
+			     "【修复】调用方必须传 Faction.Offense (母体赢) 或 Faction.Defense (人类赢). "
+			     "【业务后果】本小局胜局数未累加, UI 显示会不一致."),
+			*WinnerFactionTag.ToString());
+	}
+}
+
+
 // ==========================================
 // 8. 结算系统
 // ==========================================
@@ -744,6 +850,9 @@ void ARoomGameState::TriggerSettlement()
 		return;
 	}
 
+	// 【v200.1 大厂架构新增】先构建 RoundWinner，后面广播时用
+	EZombieRoundWinner LocalRoundWinner = EZombieRoundWinner::None;
+
 	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] TriggerSettlement: 倒计时结束，开始结算！AttackerKills=%d, DefenderKills=%d"),
 		AttackerTotalKills, DefenderTotalKills);
 
@@ -751,31 +860,30 @@ void ARoomGameState::TriggerSettlement()
 	if (AttackerTotalKills > DefenderTotalKills)
 	{
 		AttackerWins++;
+		LocalRoundWinner = EZombieRoundWinner::Mother; // 攻方胜=幽灵赢（刀战语义复用）
 		UE_LOG(LogTemp, Log, TEXT("[RoomGameState] 攻方获胜！AttackerWins=%d"), AttackerWins);
 	}
 	else if (DefenderTotalKills > AttackerTotalKills)
 	{
 		DefenderWins++;
+		LocalRoundWinner = EZombieRoundWinner::Human; // 守方胜=人类赢（刀战语义复用）
 		UE_LOG(LogTemp, Log, TEXT("[RoomGameState] 守方获胜！DefenderWins=%d"), DefenderWins);
 	}
 	else
 	{
+		LocalRoundWinner = EZombieRoundWinner::None; // 平局
 		UE_LOG(LogTemp, Log, TEXT("[RoomGameState] 当局平局，双方均不得分。"));
 	}
 
-	// 步骤 2: 立刻广播"进入结算状态"事件，让所有客户端显示比分面板
+	// 步骤 2: 立刻广播"进入结算状态"事件，让所有客户端显示比分面板 + 对应胜负文本
 	// 【网络架构修复】: 使用 NetMulticast 替代原有的直接 Broadcast
 	// 原因: 纯客户端进程的 OnEnterSettlement.Broadcast() 不会触发，导致 Text_GameOver 不显示
-	MulticastEnterSettlement(AttackerTotalKills, DefenderTotalKills);
+	// 【v200.1 新增】: 增加 RoundWinner 参数，用于显示"人类胜利"或"幽灵胜利"文本
+	MulticastEnterSettlement(AttackerTotalKills, DefenderTotalKills, LocalRoundWinner);
 
-	// 步骤 3: 通过 World Timer 延迟3秒，然后广播"显示最终结果"事件
-	UWorld* World = GetWorld();
-	if (World)
-	{
-		// 先清除可能存在的旧定时器（防止重复触发）
-		World->GetTimerManager().ClearTimer(SettlementTimerHandle);
-		World->GetTimerManager().SetTimer(SettlementTimerHandle, this, &ARoomGameState::BroadcastFinalSettlement, 3.0f, false);
-	}
+	// 【v200.2 大厂架构重构】步骤 3: 延迟3秒后广播"显示最终结果"事件
+	//   - 复用 ScheduleFinalSettlement 方法（与生化 FinishZombieRound 路径一致）
+	ScheduleFinalSettlement(3.0f);
 }
 
 
@@ -792,6 +900,22 @@ void ARoomGameState::BroadcastFinalSettlement()
 	// 原问题: 在 Listen Server 中，纯客户端进程的 HasAuthority() 返回 false，导致 OnShowFinalSettlement 从未广播给房主以外的玩家
 	// 解决方案: NetMulticast RPC 在服务器端调用时，引擎自动将函数调用复制到所有连接的客户端
 	MulticastShowFinalSettlement(AttackerWins, DefenderWins);
+}
+
+
+/**
+ * ScheduleFinalSettlement
+ *
+ * 【v200.2 大厂架构新增】设置结算定时器（供 LifecycleSubsystem 调用）
+ * 统一管理 SettlementTimerHandle，避免外部直接访问 private 字段
+ */
+void ARoomGameState::ScheduleFinalSettlement(float DelaySeconds)
+{
+	if (UWorld* MyWorld = GetWorld())
+	{
+		MyWorld->GetTimerManager().ClearTimer(SettlementTimerHandle);
+		MyWorld->GetTimerManager().SetTimer(SettlementTimerHandle, this, &ARoomGameState::BroadcastFinalSettlement, DelaySeconds, false);
+	}
 }
 
 
@@ -815,14 +939,33 @@ void ARoomGameState::MulticastShowFinalSettlement_Implementation(int32 InAttacke
  *
  * NetMulticast 实现: 广播进入结算事件
  * 所有客户端均会执行此函数，触发 OnEnterSettlement 委托
- * 让 UI 显示 Text_GameOver
+ * 让 UI 显示 Text_GameOver + 对应胜负文本
+ *
+ * 【v200.1 大厂架构重构】: 增加 RoundWinner 参数，用于显示"人类胜利"或"幽灵胜利"
+ * — 刀战复用 EZombieRoundWinner: Attacker胜=Mother, Defender胜=Human
  */
-void ARoomGameState::MulticastEnterSettlement_Implementation(int32 InAttackerKills, int32 InDefenderKills)
+void ARoomGameState::MulticastEnterSettlement_Implementation(int32 InAttackerKills, int32 InDefenderKills, EZombieRoundWinner InRoundWinner)
 {
-	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] MulticastEnterSettlement: 攻方=%d, 守方=%d"), InAttackerKills, InDefenderKills);
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] MulticastEnterSettlement: 攻方=%d, 守方=%d, RoundWinner=%d"),
+		InAttackerKills, InDefenderKills, static_cast<int32>(InRoundWinner));
 
-	// 广播进入结算事件，让所有客户端显示 Text_GameOver
-	OnEnterSettlement.Broadcast(InAttackerKills, InDefenderKills);
+	// 广播进入结算事件，让所有客户端显示 Text_GameOver + 对应胜负文本
+	OnEnterSettlement.Broadcast(InAttackerKills, InDefenderKills, InRoundWinner);
+}
+
+
+/**
+ * MulticastShowZombieRoundBriefResult_Implementation
+ *
+ * 【v201 大厂架构新增】短暂显示小局结果
+ */
+void ARoomGameState::MulticastShowZombieRoundBriefResult_Implementation(EZombieRoundWinner InRoundWinner)
+{
+	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] 【v201】MulticastShowZombieRoundBriefResult: RoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+
+	// 广播短暂显示结果事件，UI 层订阅后显示胜负文本
+	OnZombieRoundBriefResult.Broadcast(InRoundWinner);
 }
 
 
@@ -1038,4 +1181,338 @@ void ARoomGameState::ResetAirdropCountdown()
 	OnAirdropCountdownChanged.Broadcast(0.0f, 0.0f);
 
 	UE_LOG(LogTemp, Log, TEXT("[RoomGameState] ResetAirdropCountdown: 空投倒计时已关闭."));
+}
+
+
+// ==========================================
+// 【v134 大厂架构新增】生化小局赢家 (RoundWinner) — 单一真理源
+// ==========================================
+//
+// 业务规则 (用户 2026.08.06):
+//   - 服务器 URoomLifecycleSubsystem::FinishZombieRound 在每小局结束时写入 RoundWinner
+//   - 客户端 OnRep_RoundWinner → Broadcast OnRoundWinnerUpdated
+//   - UGameHUDWidget 缓存 + OnEnterSettlement 触发时查 GameMode 音效 + 播放
+//
+// 大厂原则 — 镜像 SetTotalRounds / SetCurrentMatchMode:
+//   - 服务器写入字段后手动 Broadcast (自身 OnRep 不触发)
+//   - 客户端 OnRep 自动 Broadcast (UE 引擎机制保证)
+//
+// 大厂原则 — 零兜底:
+//   - InWinner == None → 拒绝写入 (强制调用方传 Human/Mother, 防止"还没结算就清空")
+//   - 客户端调用 → Log Error + return
+//
+// 不破坏刀战模式:
+//   - 刀战永不调用本函数, 字段保持 None, UI 不订阅
+
+/**
+ * OnRep_RoundWinner (客户端)
+ *
+ * 客户端接到 RoundWinner 同步时的回调
+ * 触发 OnRoundWinnerUpdated 委托, UI 据此缓存字段 + 准备查音效
+ *
+ * 大厂原则 — 镜像 OnRep_WinStats:
+ *   - 不在 OnRep 内强制播放音效 (避免双发)
+ *   - 只负责 Broadcast, 音效播放由 GameHUDWidget 在 OnEnterSettlement 触发时统一调度
+ */
+void ARoomGameState::OnRep_RoundWinner()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_RoundWinner: 小局赢家同步! RoundWinner=%d"),
+		static_cast<int32>(RoundWinner));
+
+	OnRoundWinnerUpdated.Broadcast(RoundWinner);
+}
+
+
+/**
+ * SetRoundWinner (服务器专用)
+ *
+ * 大厂原则 — 显式优于隐式 (镜像 SetTotalRounds / SetCurrentMatchMode):
+ *   - 仅服务器可调用 (HasAuthority 校验)
+ *   - InWinner == None → Log Error + 拒绝写入 (强制修复调用方)
+ *   - 服务器写入字段后立即手动 Broadcast (自身 OnRep 不触发)
+ *
+ * 调用方:
+ *   - URoomLifecycleSubsystem::FinishZombieRound (本小局结束唯一入口)
+ *
+ * @param InWinner 小局赢家 (必须为 Human 或 Mother, 不允许 None)
+ */
+void ARoomGameState::SetRoundWinner(EZombieRoundWinner InWinner)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetRoundWinner: 客户端调用非法, HasAuthority=false. 仅服务器可设置小局赢家."));
+		return;
+	}
+
+	if (InWinner == EZombieRoundWinner::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetRoundWinner: InWinner=None 拒绝写入. "
+			     "【修复】调用方必须传 Human/Mother, 不允许传 None. "
+			     "【业务后果】如需重置请改调 ResetRoundWinner 入口."));
+		return;
+	}
+
+	RoundWinner = InWinner;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 OnRep_HostPlayerName 等其他字段)
+	OnRoundWinnerUpdated.Broadcast(RoundWinner);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] SetRoundWinner: 小局赢家已设置! RoundWinner=%d"),
+		static_cast<int32>(RoundWinner));
+}
+
+
+/**
+ * ResetRoundWinner (服务器专用)
+ *
+ * 大厂原则 — 镜像 ResetMotherMutationHasFired / ResetAirdropCountdown:
+ *   - 仅服务器可调用 (HasAuthority 校验)
+ *   - 调用方: URoomLifecycleSubsystem::StartNextZombieRound / StartMotherMutationCountdown
+ *   - 新小局开始时清零, 让 UI / 音效缓存不再受旧胜负干扰
+ *
+ * 与 SetRoundWinner(None) 的区别:
+ *   - SetRoundWinner(None) 强制拒绝 (零兜底 — 显式优于隐式)
+ *   - ResetRoundWinner 是专门的"清零入口", 调用方语义明确
+ */
+void ARoomGameState::ResetRoundWinner()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] ResetRoundWinner: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	RoundWinner = EZombieRoundWinner::None;
+
+	// 服务器自身不会触发 OnRep, 手动广播
+	OnRoundWinnerUpdated.Broadcast(RoundWinner);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] ResetRoundWinner: 小局赢家已重置为 None (新小局开始)."));
+}
+
+
+/**
+ * HasAliveHumanOnField (服务器查询) — v134 v4 大厂重构 (返回 EHASResult 替代 bool)
+ *
+ * 业务规则:
+ *   - 遍历所有 Controller (PlayerController + AIController), 检查它们 Possess 的 Pawn:
+ *     - FactionTag == Faction.Defense (人类阵营)
+ *     - IsDead() == false (活着)
+ *   - 任一满足 → 返回 EHASResult::HasAliveHuman (有人类活着)
+ *   - 没找到 Defense 活着的 Pawn, 但场上还有其他 Pawn (Offense 或 配置错) → 返回 EHASResult::NoAliveHuman (无人存活)
+ *   - 场上 0 个 Pawn → 返回 EHASResult::NoData (业务上不可能, 配置错或时序未到)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 唯一"人验收者"判定入口, URoomLifecycleSubsystem 调本函数决定 FinishZombieRound(Human/Mother)
+ *
+ * 大厂原则 — 零兜底 (v134 v4 修复 — "一进游戏就播母体赢音效" bug):
+ *   - 旧版 (bool) 兜底: 0 存活 Pawn → return false → LifecycleSubsystem 解释为 "Mother 赢" → 错误播母体赢音效
+ *   - 新版 (enum) 显式: 0 存活 Pawn → 返回 NoData → LifecycleSubsystem 必须跳过本 Tick 结算
+ *   - 触发链修复: 1s 间隔 MatchTimerTick 在 MatchStartDelay (3s) Spawn 完成前触发
+ *     → HasAliveHumanOnField 看到 0 Pawn → 返回 false → FinishZombieRound → Mother 赢音效播放
+ *     → 现在返回 NoData → LifecycleSubsystem 跳过本 Tick → 不再错误触发
+ *
+ * 不破坏刀战模式:
+ *   - 刀战模式永不调本函数, 但本函数本身对所有模式都可调 (返回 NoData 也无害)
+ */
+EHASResult ARoomGameState::HasAliveHumanOnField() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] HasAliveHumanOnField: World 为空, 拒绝判定. "
+			     "【修复】本函数仅应在服务器 GameMode/Tick 调用, 检查调用方."));
+		return EHASResult::NoData;
+	}
+
+	int32 AliveHumanCount = 0;
+	int32 AliveMotherCount = 0;
+	int32 AliveOtherCount = 0;
+
+	// 路径 A: 遍历 PlayerArray (真人玩家) — 真理源 PlayerArray
+	for (APlayerState* PS : PlayerArray)
+	{
+		ARoomPlayerState* RoomPS = Cast<ARoomPlayerState>(PS);
+		if (!RoomPS)
+		{
+			continue;
+		}
+
+		APawn* Pawn = RoomPS->GetPawn();
+		if (!Pawn)
+		{
+			// 玩家死亡时 Pawn 已被 Destroy, 跳过 (死亡流程已清理)
+			continue;
+		}
+
+		ABaseCharacter* BaseChar = Cast<ABaseCharacter>(Pawn);
+		if (!BaseChar || BaseChar->IsDead())
+		{
+			continue;
+		}
+
+		const FGameplayTag PawnFactionTag = BaseChar->GetFactionTag();
+		if (!PawnFactionTag.IsValid())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] HasAliveHumanOnField: 玩家 Pawn='%s' FactionTag 为空, 跳过 (不计入). "
+				     "【根因】SyncFactionTagFromController 没正确同步. 检查 PossessedBy 链路."),
+				*Pawn->GetName());
+			continue;
+		}
+
+		if (PawnFactionTag == FFactionTags::Defense())
+		{
+			AliveHumanCount++;
+		}
+		else if (PawnFactionTag == FFactionTags::Offense())
+		{
+			AliveMotherCount++;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] HasAliveHumanOnField: 玩家 Pawn='%s' FactionTag='%s' 既非 Defense 也非 Offense, 跳过. "
+				     "【修复】Pawn.FactionTag 必须是 Offense/Defense 之一."),
+				*Pawn->GetName(), *PawnFactionTag.ToString());
+			AliveOtherCount++;
+		}
+	}
+
+	// 路径 B: 遍历 AI Controller (关卡预放 AI + 大厅入队 AI)
+	//   - 镜像 v40.3 SpawnSubsystem 的 AI 处理, 用 TActorIterator
+	for (TActorIterator<ABaseAIController> It(const_cast<UWorld*>(World)); It; ++It)
+	{
+		ABaseAIController* AIC = *It;
+		if (!AIC)
+		{
+			continue;
+		}
+
+		APawn* AIPawn = AIC->GetPawn();
+		if (!AIPawn)
+		{
+			continue;
+		}
+
+		ABaseCharacter* BaseChar = Cast<ABaseCharacter>(AIPawn);
+		if (!BaseChar || BaseChar->IsDead())
+		{
+			continue;
+		}
+
+		const FGameplayTag PawnFactionTag = BaseChar->GetFactionTag();
+		if (!PawnFactionTag.IsValid())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] HasAliveHumanOnField: AI Pawn='%s' FactionTag 为空, 跳过 (不计入). "
+				     "【根因】Cach[ed]FactionTag 写入链路丢失. 检查 v26/v40.3 的 CachedFactionTag 时序."),
+				*AIPawn->GetName());
+			continue;
+		}
+
+		if (PawnFactionTag == FFactionTags::Defense())
+		{
+			AliveHumanCount++;
+		}
+		else if (PawnFactionTag == FFactionTags::Offense())
+		{
+			AliveMotherCount++;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] HasAliveHumanOnField: AI Pawn='%s' FactionTag='%s' 既非 Defense 也非 Offense, 跳过. "
+				     "【修复】Pawn.FactionTag 必须是 Offense/Defense 之一."),
+				*AIPawn->GetName(), *PawnFactionTag.ToString());
+			AliveOtherCount++;
+		}
+	}
+
+	// 大厂原则 — 零兜底 (v134 v4 修复):
+	//   - 没找到任何 Pawn (AliveHuman + AliveMother + AliveOther == 0) → 返回 NoData
+	//   - 业务上不可能 (开局一定有玩家或 AI, 配置错或时序竞速)
+	//   - 不允许静默返回 false (被 LifecycleSubsystem 错误解释为 "Mother 赢" → 错误播母体赢音效)
+	//   - 调用方收到 NoData 必须跳过本 Tick 结算, 修复 "一进游戏就播母体赢音效" bug
+	if (AliveHumanCount == 0 && AliveMotherCount == 0 && AliveOtherCount == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameState] HasAliveHumanOnField: 场上没有任何 存活 Pawn (无玩家 + 无 AI) → 返回 NoData (跳过本 Tick). "
+			     "【根因】业务上不可能 — 开局至少会有 Player / 关卡预放 AI. "
+			     "【可能时序】MatchTimerTick 间隔 1s, 在 MatchStartDelay (默认 3s) Spawn 完成前触发. "
+			     "【修复】检查 Spawn 链路是否异常崩溃, 或调用方是否在错误时机调用本函数."));
+		return EHASResult::NoData;
+	}
+
+	// 业务判定: 有人类活着 → HasAliveHuman; 否则 NoAliveHuman
+	const EHASResult Result = (AliveHumanCount > 0) ? EHASResult::HasAliveHuman : EHASResult::NoAliveHuman;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomGameState] HasAliveHumanOnField: 存活统计 Human=%d Mother=%d Other=%d → 返回 %s"),
+		AliveHumanCount, AliveMotherCount, AliveOtherCount,
+		Result == EHASResult::HasAliveHuman ? TEXT("HasAliveHuman (人类赢)") : TEXT("NoAliveHuman (母体赢)"));
+
+	return Result;
+}
+
+
+/**
+ * MulticastPlayZombieRoundSound (NetMulticast, 服务器 → 所有客户端)
+ *
+ * 业务规则 (用户 2026.08.06 明确):
+ *   - 每小局结束, 服务器推 1 次 RPC 到所有客户端
+ *   - 客户端 Implementation 回调 UGameHUDWidget 查 GameMode 配置的 USoundBase + 播放
+ *
+ * 大厂原则 — RPC 纯数据:
+ *   - 仅传 RoundWinner (枚举), 不传 USoundBase* (UE 5.6 UObject 跨网络限制)
+ *   - 客户端 Implementation 内部查 GameMode 配置
+ *
+ * 大厂原则 — 镜像 MulticastEnterSettlement:
+ *   - 服务器自身不会触发 _Implementation, 手动 Broadcast 以同步房主本地 UI
+ *
+ * 大厂原则 — 零兜底:
+ *   - _Implementation 内 USoundBase 为空 → Log Error + 跳过 (不让音效缺失卡住业务)
+ *   - 客户端不查 GameMode → Log Error, 强制修复 BP 资产配置
+ *
+ * 调用方:
+ *   - URoomLifecycleSubsystem::FinishZombieRound (本小局结束唯一入口)
+ */
+void ARoomGameState::MulticastPlayZombieRoundSound_Implementation(EZombieRoundWinner InRoundWinner)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] MulticastPlayZombieRoundSound_Implementation: 客户端/服务器收到音效 RPC, InRoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+
+	// UE 5.6 行为: NetMulticast Reliable 在 Listen Server 上服务器自身也会触发 _Implementation
+	//   - 服务器调 MulticastPlayZombieRoundSound → 所有连接客户端 + 服务器自身都跑 _Implementation
+	//   - 因此不需要单独"服务器手动 Broadcast",与 MulticastEnterSettlement 镜像
+	HandleZombieRoundSoundReceived(InRoundWinner);
+}
+
+
+/**
+ * HandleZombieRoundSoundReceived (服务器调用 + 客户端 _Implementation 调用)
+ *
+ * 职责拆分:
+ *   - 接收 RoundWinner, Broadcast OnZombieRoundSoundReceived
+ *   - UGameHUDWidget 订阅后, 查 GameMode USoundBase + 播放
+ *
+ * 大厂原则 — 单一职责:
+ *   - 不在本函数内查 GameMode (避免耦合, GameMode 查表在 UGameHUDWidget 完成)
+ *   - 仅 Broadcast, 音效查表/播放由 UI 层负责
+ */
+void ARoomGameState::HandleZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] HandleZombieRoundSoundReceived: Broadcast OnZombieRoundSoundReceived, InRoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+
+	OnZombieRoundSoundReceived.Broadcast(InRoundWinner);
 }

@@ -147,6 +147,41 @@ public:
 	void UpdateTeamKillCountsText(int32 AttackerKills, int32 DefenderKills);
 
 	/**
+	 * 【v134 大厂架构新增】更新小局胜局数显示
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 生化模式每小局结束时, Text_AttackerCount / Text_DefenderCount 显示 累加胜局数
+	 *   - 与 UpdateTeamKillCountsText (击杀数) 是独立数据源, 通过不同委托触发
+	 *
+	 * 大厂原则 — 镜像 UpdateTeamKillCountsText:
+	 *   - 数据从参数读取 (GameState.OnWinStatsUpdated 推送 AttackerWins/DefenderWins)
+	 *   - 转发到 MatchInfoWidget 决定显示
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战使用旧 MulticastRefreshKillCount 链路, 本函数绑定 OnWinStatsUpdated 仅在 Zombie 模式被触发
+	 */
+	void UpdateTeamWinCountsText(int32 AttackerWins, int32 DefenderWins);
+
+	/**
+	 * 【v134 大厂架构新增】生化小局音效接收回调 (Multicast RPC 触发)
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 每小局结束, 服务器 Multicast 推 RoundWinner 到所有客户端
+	 *   - 客户端本机查 GameMode 配置的 USoundBase → 播放
+	 *   - 客户端阵营 (FactionTag) 决定播 win 还是 lose 音效
+	 *
+	 * 大厂原则 — 单一职责:
+	 *   - 本函数只负责 "查 GameMode USoundBase → 播放"
+	 *   - 不解析 RoundWinner → Faction 映射 (镜像 ResolveZombieRoundEndSound)
+	 *   - GameMode.ResloveZombieRoundEndSound(RoundWinner, ClientFactionTag) 是配置真理源
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战永不调 MulticastPlayZombieRoundSound, 本回调永不触发
+	 */
+	UFUNCTION()
+	void OnZombieRoundSoundReceived(EZombieRoundWinner RoundWinner);
+
+	/**
 	 * 更新 AC 值（Assists / 助攻）
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")
@@ -354,7 +389,20 @@ public:
 	 * 3. 显示游戏结束文本
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD|Settlement")
-	void OnEnterSettlement(int32 AttackerKills, int32 DefenderKills);
+	void OnEnterSettlement(int32 AttackerKills, int32 DefenderKills, EZombieRoundWinner RoundWinner);
+
+	/**
+	 * 【v201 大厂架构新增】短暂显示小局结果（不进入结算页面）
+	 *
+	 * 业务场景:
+	 *   - 每小局结束时短暂显示"人类胜利"或"母体胜利"
+	 *   - 显示 3 秒后自动隐藏
+	 *   - 不进入结算页面，继续下一小局
+	 *
+	 * @param RoundWinner 本小局赢家
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GameHUD|Settlement")
+	void OnShowZombieRoundBriefResult(EZombieRoundWinner RoundWinner);
 
 	/**
 	 * 显示最终胜负结果（由 GameState 广播触发，延迟 3 秒后调用）
@@ -533,6 +581,18 @@ protected:
 	void OnInvincibilityChanged(bool bIsNowInvincible);
 
 	/**
+	 * 【v201.6 大厂架构新增】移动锁定回调 - 显示移动锁定倒计时
+	 *
+	 * 订阅: CharacterEvents.OnRespawnMovementLockedChanged
+	 * 触发: HealthComponent 移动锁定状态变化
+	 *
+	 * @param bIsLocked true=进入锁定, false=退出锁定
+	 * @param Duration 锁定时长(秒)
+	 */
+	UFUNCTION()
+	void OnRespawnMovementLockedChanged(bool bIsLocked, float Duration);
+
+	/**
 	 * 【v120 新增】母体加速技能冷却回调
 	 *
 	 * 订阅: CharacterEvents.OnMotherSkillCooldownChanged
@@ -550,6 +610,9 @@ private:
 	 */
 	int32 LastAttackerKills = 0;
 	int32 LastDefenderKills = 0;
+
+	/** 【v200.2 大厂架构新增】缓存当前游戏模式，用于 OnEnterSettlement 判断显示 */
+	ERoomMatchMode CachedMatchMode = ERoomMatchMode::None;
 
 	// ==========================================
 	// CharacterEvents 订阅状态 (2026-07-01 新增)

@@ -124,6 +124,21 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RespawnProgress")
 	bool IsShowingProgress() const { return bIsShowing; }
 
+	/**
+	 * 【v201.6 大厂架构新增】显示移动锁定倒计时
+	 * 调用时机: UGameHUDWidget::OnMovementLockChanged(true) 时调用
+	 * 与 Show() 的区别：Show() 用于无敌期，ShowMovementLock() 用于移动锁定
+	 */
+	UFUNCTION(BlueprintCallable, Category = "RespawnProgress")
+	void ShowMovementLock(float DurationSeconds);
+
+	/**
+	 * 【v201.6 大厂架构新增】隐藏移动锁定倒计时
+	 * 调用时机: UGameHUDWidget::OnMovementLockChanged(false) 时调用
+	 */
+	UFUNCTION(BlueprintCallable, Category = "RespawnProgress")
+	void HideMovementLock();
+
 private:
 	// ==========================================
 	// 3. 内部辅助
@@ -148,6 +163,12 @@ private:
 	 */
 	void UpdateProgress(float RemainingSeconds, float TotalDuration);
 
+	/**
+	 * 【v201.6 大厂架构新增】更新移动锁定进度条和倒计时文字
+	 * 注意：不带参数，直接使用成员变量 bListeningToMovementLock / RecordedTotalDuration / MovementLockRemainingSeconds
+	 */
+	void UpdateMovementLockProgress();
+
 protected:
 	// ==========================================
 	// 4. UI 组件绑定 (BindWidget)
@@ -171,4 +192,10 @@ private:
 
 	/** 记录激活时的总时长（秒） */
 	float RecordedTotalDuration = 3.0f;
+
+	/** 【v201.6 大厂架构新增】当前是否监听移动锁定（区别于无敌期） */
+	bool bListeningToMovementLock = false;
+
+	/** 【v201.6 大厂架构新增】剩余锁定时长（毫秒，用于精确倒计时） */
+	float MovementLockRemainingSeconds = 0.0f;
 };

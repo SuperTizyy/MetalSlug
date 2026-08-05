@@ -11,6 +11,9 @@
 // 引入 UE 原生 AGameModeBase 类（基类）
 #include "GameFramework/GameModeBase.h"
 
+// 引入 USoundBase 完整定义 (v134 大厂架构新增 — 生化小局结算音效 UPROPERTY 字段)
+#include "Sound/SoundBase.h"
+
 // 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 // 改造: 改为精确子表头
 #include "Data/Enums/RoomEnums.h"
@@ -107,6 +110,28 @@ public:
 	//   - 只用于 ScanPlayerStarts 兼容旧版 PlayerStart 配置
 	//   - 后续 v30 计划删除 (给用户足够迁移窗口)
 	static const FName TAG_Faction_Defense;
+
+	/**
+	 * 【v201 大厂架构新增】生化模式人类专用复活点 Tag
+	 *
+	 * 背景:
+	 *   - 生化模式需要人类在专属复活点出生，不是 Offense/Defense 阵营复活点
+	 *   - 用户在场景中添加 PlayerStart，Tag 设为 "Faction_HumanSurvivor"
+	 *
+	 * 命名:
+	 *   - "HumanSurvivor" 表示生化模式中的人类幸存者
+	 *   - 与 Offense/Defense 正交（阵营 vs 角色类型）
+	 *
+	 * 用法:
+	 *   - 在 UE 编辑器里打开每个生化专用 PlayerStart, Details 面板 → Player Start Tag
+	 *   - 填 "Faction_HumanSurvivor"
+	 *   - GameMode 启动时按 Tag 自动分类到 HumanSurvivorSpawnPoints
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 地图未配置 HumanSurvivor 复活点 → Log Error + 拒绝复活
+	 *   - 不允许 fallback 到 Offense/Defense 复活点
+	 */
+	static const FName TAG_Faction_HumanSurvivor;
 
 	/**
 	 * 构造函数: 在 GameMode 被加载时调用
@@ -794,23 +819,99 @@ public:
 	int32 MeleeMatchDurationSeconds = 600;
 
 	/**
-	 * 生化模式每局比赛时长（秒），在此可配置任意值
+	 * 生化模式每小局比赛时长（秒），在此可配置任意值
 	 * 例如 60=1分钟、120=2分钟、180=3分钟
 	 *
 	 * 单一真理源 — UI 的 Text_RoundCountdown 直接用此值:
-	 *   - ServerStartMatchTimer (Zombie 模式) 写入 GameState.MatchEndTime = Now + 此值
+	 *   - StartMatchTimer (Zombie 模式) 写入 GameState.MatchEndTime = Now + 此值
 	 *   - UI Widget 通过 GetMatchRemainingSeconds() 计算剩余秒数
 	 *
 	 * 大厂原则 — 对称设计:
-	 *   - MeleeMatchDurationSeconds (刀战每局时长) + ZombieMatchDurationSeconds (生化每局时长)
+	 *   - MeleeMatchDurationSeconds (刀战每局时长) + ZombieMatchDurationSeconds (生化每小局时长)
 	 *   - 两模式都有独立的倒计时, UI 镜像显示
+	 *
+	 * 大厂原则 — 零下限 (用户 2026.08.06 明确):
+	 *   - 旧版 ClampMin="30" 是"静默改 BP 配置"反模式,让策划想测 < 30s 测不了
+	 *   - 现在无下限 (>= 1 即可, <= 0 表示禁用本小局倒计时, 由 LifecycleSubsystem 拒绝启动并 Log Error)
+	 *   - 业务方必须配合法值, 否则 LifecycleSubsystem 拒绝启动倒计时
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match",
-		meta = (ClampMin = "30", ClampMax = "3600"))
+		meta = (ClampMin = "1", ClampMax = "3600"))
 	int32 ZombieMatchDurationSeconds = 120;
 
+	// ==========================================
+	// 【v134 大厂架构新增】生化模式小局结算音效 — 配置单一真理源
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.06 明确):
+	//   - 每小局结束 (倒计时结束 / 提前结束), 根据本局赢家 + 客户端角色阵营, 给每个玩家播放:
+	//     - 人类赢 + 客户端是 人类阵营 (Defense) → HumanWinSound
+	//     - 人类赢 + 客户端是 母体 (Offense)   → HumanLoseSound
+	//     - 母体赢 + 客户端是 人类阵营 (Defense) → MotherLoseSound
+	//     - 母体赢 + 客户端是 母体 (Offense)   → MotherWinSound
+	//   - 每个客户端只播放自己阵营对应的音效
+	//   - 资产 null → Log Error, 流程继续 (音效缺失不让胜负逻辑卡住)
+	//
+	// 大厂原则 — 单一真理源 + 零重复架构:
+	//   - 这 4 个字段是音效资产的唯一来源, 不在 DA / BP / Widget 重复
+	//   - URoomLifecycleSubsystem 调 GameState.MulticastPlayZombieRoundSound → 所有客户端同步播放
+	//   - 大厂原则 — UE 5.6 Multicast RPC 纯数据: 仅传 RoundWinner 枚举, 不传 USoundBase*
+	//
+	// 大厂原则 — 不破坏刀战模式:
+	//   - 2 个字段仅在 Bio 模式下使用, 刀战完全不触发
+	//   - 策划在 GM_RoomGameMode BP Class Defaults 配 (默认 null, 业务可禁用)
+
 	/**
-	 * 【生化模式】空投降临间隔（秒）
+	 * 生化模式: 人类阵营赢得本小局时, 所有客户端 (人类 + 母体) 统一播放的音效
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 全体播同一个音效, 不按客户端阵营分发
+	 *   - 较早版本按 (RoundWinner × ClientFactionTag) 4 种组合分发, 已被业务简化
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|ZombieRound",
+		meta = (DisplayName = "Zombie Human Win Sound (全玩家播放, 人类赢时)"))
+	TObjectPtr<USoundBase> ZombieHumanWinSound = nullptr;
+
+	/**
+	 * 生化模式: 母体阵营赢得本小局时, 所有客户端 (人类 + 母体) 统一播放的音效
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 全体播同一个音效, 不按客户端阵营分发
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|ZombieRound",
+		meta = (DisplayName = "Zombie Mother Win Sound (全玩家播放, 母体赢时)"))
+	TObjectPtr<USoundBase> ZombieMotherWinSound = nullptr;
+
+	// ==========================================
+	// 【v134 大厂架构新增】生化为零参数查表 (供 GameHUDWidget 在 OnRep_RoundWinner 时调用)
+	// ==========================================
+	//
+	// 大厂原则 — 不再写"4 个 if 写满" 反模式 (集中查表):
+	//   - GameMode 提供 ResolveZombieRoundEndSound(RoundWinner) 单一入口
+	//   - 调用方只调一个函数, 2 个字段配置决策全在 GameMode 内
+	//   - 零重复: GameHUDWidget / BP 蓝图 / 子类 都不能绕过此函数读字段
+	//
+	// 业务规则 (用户 2026.08.06 明确):
+	//   - 全体客户端播同一个音效 (不按 ClientFaction 分发)
+	//
+	// 业务规则 (零兜底):
+	//   - RoundWinner == None → 返回 nullptr (调用方拒绝播放 + Log Error, 不静默)
+	//   - 任何分支缺资产 → 返回 nullptr (调用方 Log Error)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战永不调 ResolveZombieRoundEndSound (RoundWinner 只在 Bio 模式写入)
+
+	/**
+	 * @brief 根据本局赢家, 返回所有客户端应统一播放的音效资产指针 (单一入口)
+	 *
+	 * @param InRoundWinner 本局赢家 (Human / Mother)
+	 * @return 对应 USoundBase* (null 表示无效, 调用方拒绝播放 + Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "MetalSlug|Match|ZombieRound")
+	class USoundBase* ResolveZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const;
+
+	/**
+	 * 生化模式: 空投降临间隔（秒）
 	 *
 	 * 业务规则:
 	 *   - 每小局母体变异倒计时结束后，才开始首轮空投倒计时

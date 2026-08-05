@@ -32,6 +32,15 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHealthChanged, float, NewHealth);
 //     但 OnRep 不会广播, 仅本机 OnRep_InvincibilityChanged 内部 Broadcast (每机器一次)
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnInvincibilityChanged, bool, bIsNowInvincible);
 
+// 【v201.5 大厂架构新增】复活移动锁定状态变更事件
+//
+// 业务规则: 复活后 N 秒内无法移动 (N = RespawnDelaySeconds)
+//           玩家和 AI 都走这个机制 (通用)
+//
+// 订阅方:
+//   - ABaseCharacter::OnRespawnMovementLockedChanged: 收到事件后修改 MaxWalkSpeed
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRespawnMovementLockedChanged, bool, bIsLocked, float, Duration);
+
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UHealthComponent : public UActorComponent
 {
@@ -319,4 +328,59 @@ protected:
 
 	/** 服务器端 Timer 句柄, 用于到期自动清无敌 */
 	FTimerHandle InvincibilityTimerHandle;
+
+	/** 复活移动锁定是否激活 */
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Health|Respawn")
+	bool bIsRespawnMovementLocked = false;
+
+	/** 复活移动锁定到期时刻 (World 时间, 秒) */
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Health|Respawn")
+	float RespawnMovementLockedUntilTime = 0.0f;
+
+	/** 复活移动锁定总时长 (秒) */
+	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Health|Respawn")
+	float RespawnMovementLockedTotalDuration = 0.0f;
+
+	/** 服务器端 Timer 句柄, 用于到期自动解除移动锁定 */
+	FTimerHandle RespawnMovementLockedTimerHandle;
+
+public:
+	/** 复活移动锁定状态变更事件 */
+	FOnRespawnMovementLockedChanged OnRespawnMovementLockedChanged;
+
+	/**
+	 * 【v201.5 大厂架构新增】激活复活移动锁定
+	 *
+	 * 业务规则: 复活后 N 秒内无法移动 (N = RespawnDelaySeconds)
+	 *           玩家和 AI 都走这个机制 (通用)
+	 *
+	 * 调用方 (集中调度):
+	 *   - RoomSpawnSubsystem::HandlePlayerRequestSpawn 末尾
+	 *   - RoomSpawnSubsystem::SpawnAIInternal 末尾
+	 *   - RoomSpawnSubsystem::MutatePawnToMother 末尾
+	 *
+	 * 副作用:
+	 *   - 设 RespawnMovementLockedUntilTime = World->GetTimeSeconds() + Duration
+	 *   - SetTimer 到期 → OnRespawnMovementTimerExpired → Broadcast OnRespawnMovementLockedChanged(false)
+	 *   - 立即 Broadcast OnRespawnMovementLockedChanged(true)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Health|Respawn")
+	void ActivateRespawnMovementLock(float DurationSeconds);
+
+	/**
+	 * 【v201.5 大厂架构新增】复活移动锁定到期回调 (服务器内部)
+	 */
+	void OnRespawnMovementTimerExpired();
+
+	/**
+	 * 【v201.5 大厂架构新增】获取复活移动锁定剩余秒数
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Health|Respawn")
+	float GetRespawnMovementLockedRemainingSeconds() const;
+
+	/**
+	 * 【v201.5 大厂架构新增】是否当前处于复活移动锁定状态
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Health|Respawn")
+	bool IsRespawnMovementLocked() const;
 };

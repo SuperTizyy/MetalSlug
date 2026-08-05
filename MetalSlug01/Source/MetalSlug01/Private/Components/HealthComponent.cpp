@@ -47,6 +47,9 @@ void UHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	DOREPLIFETIME(UHealthComponent, bIsInvincible);
 	DOREPLIFETIME(UHealthComponent, InvincibilityExpiresAtWorldTime);
 	DOREPLIFETIME(UHealthComponent, InvincibilityTotalDuration);
+	DOREPLIFETIME(UHealthComponent, bIsRespawnMovementLocked);
+	DOREPLIFETIME(UHealthComponent, RespawnMovementLockedUntilTime);
+	DOREPLIFETIME(UHealthComponent, RespawnMovementLockedTotalDuration);
 }
 
 
@@ -417,4 +420,99 @@ void UHealthComponent::OnRep_InvincibilityChanged()
 		bIsInvincible ? 1 : 0, *GetNameSafe(GetOwner()));
 
 	OnInvincibilityChanged.Broadcast(bIsInvincible);
+}
+
+// ==========================================
+// 复活移动锁定 (v201.5)
+// ==========================================
+
+void UHealthComponent::ActivateRespawnMovementLock(float DurationSeconds)
+{
+	// 服务器权威检查
+	if (!GetOwner() || !GetOwner()->HasAuthority())
+	{
+		return;
+	}
+
+	if (DurationSeconds <= 0.0f)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[HealthComponent] ActivateRespawnMovementLock: Duration=%.2f <= 0, 跳过激活移动锁定."),
+			DurationSeconds);
+		return;
+	}
+
+	// 清理旧Timer防残留
+	GetWorld()->GetTimerManager().ClearTimer(RespawnMovementLockedTimerHandle);
+
+	// 设置锁定状态
+	bIsRespawnMovementLocked = true;
+	RespawnMovementLockedTotalDuration = DurationSeconds;
+	RespawnMovementLockedUntilTime = GetWorld()->GetTimeSeconds() + DurationSeconds;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[HealthComponent] ActivateRespawnMovementLock: Owner=%s Duration=%.1fs Until=%.2f"),
+		*GetNameSafe(GetOwner()), DurationSeconds, RespawnMovementLockedUntilTime);
+
+	// 立即广播
+	OnRespawnMovementLockedChanged.Broadcast(true, DurationSeconds);
+
+	// 设置到期Timer
+	GetWorld()->GetTimerManager().SetTimer(
+		RespawnMovementLockedTimerHandle,
+		this,
+		&UHealthComponent::OnRespawnMovementTimerExpired,
+		DurationSeconds,
+		false);
+}
+
+void UHealthComponent::OnRespawnMovementTimerExpired()
+{
+	// 清除锁定状态
+	bIsRespawnMovementLocked = false;
+	RespawnMovementLockedUntilTime = 0.0f;
+	RespawnMovementLockedTotalDuration = 0.0f;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[HealthComponent] OnRespawnMovementTimerExpired: Owner=%s 移动锁定解除"),
+		*GetNameSafe(GetOwner()));
+
+	// 广播
+	OnRespawnMovementLockedChanged.Broadcast(false, 0.0f);
+}
+
+float UHealthComponent::GetRespawnMovementLockedRemainingSeconds() const
+{
+	if (!bIsRespawnMovementLocked || RespawnMovementLockedUntilTime <= 0.0f)
+	{
+		return 0.0f;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return 0.0f;
+	}
+
+	const float Now = World->GetTimeSeconds();
+	const float Remaining = RespawnMovementLockedUntilTime - Now;
+	return FMath::Max(0.0f, Remaining);
+}
+
+bool UHealthComponent::IsRespawnMovementLocked() const
+{
+	// 用精确时间判断，确保边界情况下正确
+	if (!bIsRespawnMovementLocked)
+	{
+		return false;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	const float Now = World->GetTimeSeconds();
+	return Now < RespawnMovementLockedUntilTime;
 }

@@ -988,7 +988,9 @@ void UCombatDeathComponent::Multicast_Die_Implementation()
 		{
 			if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(MyController))
 			{
-				PC->StartRespawnTimer(RespawnDelaySeconds);
+				// 【v201.5 大厂架构修改】复活立即发生（Delay=0）
+				// 移动限制改由复活后的移动锁定机制处理（Duration=RespawnDelaySeconds）
+				PC->StartRespawnTimer(0.0f);
 			}
 		}
 	}

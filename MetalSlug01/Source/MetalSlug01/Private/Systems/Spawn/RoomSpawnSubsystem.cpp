@@ -22,6 +22,8 @@
 #include "Components/EnergyComponent.h"
 #include "Components/HealthRegenComponent.h"
 #include "AIController.h"  // 【v54 修复】AAIController 完整类型 - SpawnActor<AAIController> 需要
+#include "BehaviorTree/BlackboardComponent.h" // 【v201.10】BB Key 清空 (RestartZombieRoundPlayers)
+#include "BehaviorTree/BehaviorTreeComponent.h" // 【v201.10】BT 停止 (RestartZombieRoundPlayers)
 #include "Engine/World.h"
 #include "EngineUtils.h" // TActorIterator
 #include "GameFramework/PlayerStart.h"
@@ -297,6 +299,50 @@ void URoomSpawnSubsystem::ApplyAICharacterConfigToCharacter(ABaseCharacter* Char
 			*Character->GetName(),
 			Character->bIsMother ? TEXT("MotherMaxHealth") : TEXT("MaxHealth"));
 	}
+
+	// ==========================================
+	// 【v201.9 2026.08.06 大厂架构修复】移动速度配置 (AI 路径)
+	// ==========================================
+	//
+	// 根因 (v201.8 之前): ApplyAICharacterConfigToCharacter 只设 MaxHealth, 不设 MaxWalkSpeed
+	//   - AI Spawn 后 MaxWalkSpeed 默认为 0 (CharacterMovementComponent 默认值)
+	//   - 用户反馈: "第二小局 AI 母体变成 a 字型的人类, 而且不动"
+	//   - 根因链: RestartZombieRoundPlayers → 销毁母体 BP → 重新生成 AI 人类 BP → ApplyAICharacterConfig 没设速度 → MaxWalkSpeed=0 → AI 永远静止
+	//
+	// 修复: AI 路径必须也调用 MaxWalkSpeed 配置 (与玩家路径 ApplyCharacterConfigToCharacter 对称)
+	// 真理源: PlayerConfigAsset (玩家/AI 共用)
+	if (UCharacterMovementComponent* MoveComp = Character->GetCharacterMovement())
+	{
+		const float EffectiveWalkSpeed = Character->bIsMother
+			? PlayerConfigAsset->MotherMaxWalkSpeed
+			: PlayerConfigAsset->MaxWalkSpeed;
+
+		// 【零兜底】配错 <= 0 → 显式 Error, 不静默
+		if (EffectiveWalkSpeed <= 0.f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfig: %sMaxWalkSpeed=%.1f (<=0, 配错). "
+					 "AI=%s (bIsMother=%d) 无法移动. 【修复】DA_PlayerConfig → Config|Movement → %s 设置 > 0."),
+				Character->bIsMother ? TEXT("Mother") : TEXT(""),
+				EffectiveWalkSpeed,
+				*Character->GetName(),
+				Character->bIsMother ? 1 : 0,
+				Character->bIsMother ? TEXT("MotherMaxWalkSpeed") : TEXT("MaxWalkSpeed"));
+		}
+		else
+		{
+			MoveComp->MaxWalkSpeed = EffectiveWalkSpeed;
+			MoveComp->MaxWalkSpeedCrouched = EffectiveWalkSpeed * 0.5f;
+
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomSpawnSubsystem] ApplyAICharacterConfig: bIsMother=%d, MaxWalkSpeed=%.1f CrouchedSpeed=%.1f (AI=%s, 真理源=%s)"),
+				Character->bIsMother ? 1 : 0,
+				EffectiveWalkSpeed,
+				EffectiveWalkSpeed * 0.5f,
+				*Character->GetName(),
+				Character->bIsMother ? TEXT("MotherMaxWalkSpeed") : TEXT("MaxWalkSpeed"));
+		}
+	}
 }
 
 // ==========================================
@@ -323,6 +369,7 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	AttackSpawnPoints.Reset();
 	DefenseSpawnPoints.Reset();
 	MotherSpawnPoints.Reset(); // 【v104 新增】清空母体复活点
+	HumanSurvivorSpawnPoints.Reset(); // 【v201 新增】清空人类幸存者复活点
 
 	UWorld* World = GetWorld();
 	if (!World)
@@ -344,6 +391,11 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	{
 		TAG_Faction_Mother = FName(TEXT("Faction_Mother"));
 	}
+	// 【v201 大厂架构新增】人类幸存者复活点 TAG
+	if (TAG_Faction_HumanSurvivor.IsNone())
+	{
+		TAG_Faction_HumanSurvivor = FName(TEXT("Faction_HumanSurvivor"));
+	}
 
 	// 兼容旧 TAG
 	const FName LegacyTag_Attack = FName(TEXT("Faction_Attack"));
@@ -352,6 +404,7 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	int32 MatchedFaction = 0;
 	int32 LegacyMatched = 0;
 	int32 MotherMatched = 0; // 【v104 新增】
+	int32 HumanSurvivorMatched = 0; // 【v201 新增】
 	int32 ErrorSkipped = 0;
 
 	for (TActorIterator<APlayerStart> It(World); It; ++It)
@@ -373,6 +426,17 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 			MotherSpawnPoints.Add(PS);
 			++MotherMatched;
 			continue; // 母体点不归入攻守方阵营
+		}
+
+		// 【v201 大厂架构新增】生化模式人类专用复活点分支
+		if (PlayerStartTag == TAG_Faction_HumanSurvivor)
+		{
+			HumanSurvivorSpawnPoints.Add(PS);
+			++HumanSurvivorMatched;
+			UE_LOG(LogTemp, Log,
+				TEXT("[Spawn] 【v201】扫描到生化模式人类复活点: '%s'"),
+				*StartName);
+			continue; // 人类幸存者点不归入攻守方阵营
 		}
 
 		if (PlayerStartTag == TAG_Faction_Offense)
@@ -400,34 +464,37 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 			// 零兜底: 没 tag / 不匹配 → 显式 Log Error, 跳过
 			++ErrorSkipped;
 			UE_LOG(LogTemp, Error,
-				TEXT("[Spawn] PlayerStart '%s' 没有阵营 Tag (期望 '%s' / '%s' / '%s'). "
+				TEXT("[Spawn] PlayerStart '%s' 没有阵营 Tag (期望 '%s' / '%s' / '%s' / '%s'). "
 				     "【拒绝默认归类 - 大厂原则】此点不会分配给任何阵营."
-				     " 修复: 在编辑器 Details → Player Start Tag 配 Faction_Offense / Faction_Defense / Faction_Mother."),
+				     " 修复: 在编辑器 Details → Player Start Tag 配 Faction_Offense / Faction_Defense / Faction_Mother / Faction_HumanSurvivor."),
 				*StartName,
 				*TAG_Faction_Offense.ToString(),
 				*TAG_Faction_Defense.ToString(),
-				*TAG_Faction_Mother.ToString());
+				*TAG_Faction_Mother.ToString(),
+				*TAG_Faction_HumanSurvivor.ToString());
 		}
 	}
 
 	bSpawnPointsScanned = true;
 
 	// 【v104 新增】日志输出母体复活点统计
+	// 【v201 大厂架构新增】日志输出人类幸存者复活点统计
 	if (MotherSpawnPoints.Num() == 0)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 错误跳过 %d. "
-			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=0 【警告】母体点缺失!"),
-			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, ErrorSkipped,
-			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num());
+			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 人类幸存者点 %d, 错误跳过 %d. "
+			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=0 【警告】母体点缺失!"
+			     " HumanSurvivorSpawnPoints=%d"),
+			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, HumanSurvivorMatched, ErrorSkipped,
+			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num(), HumanSurvivorSpawnPoints.Num());
 	}
 	else
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 错误跳过 %d. "
-			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=%d"),
-			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, ErrorSkipped,
-			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num(), MotherSpawnPoints.Num());
+			TEXT("[Spawn] ScanPlayerStarts 完成: 总 %d, 匹配阵营 %d, 旧 TAG %d, 母体点 %d, 人类幸存者点 %d, 错误跳过 %d. "
+			     "AttackSpawnPoints=%d, DefenseSpawnPoints=%d, MotherSpawnPoints=%d, HumanSurvivorSpawnPoints=%d"),
+			TotalFound, MatchedFaction, LegacyMatched, MotherMatched, HumanSurvivorMatched, ErrorSkipped,
+			AttackSpawnPoints.Num(), DefenseSpawnPoints.Num(), MotherSpawnPoints.Num(), HumanSurvivorSpawnPoints.Num());
 	}
 }
 
@@ -485,6 +552,506 @@ AActor* URoomSpawnSubsystem::GetAvailableSpawnPointForFaction(FGameplayTag Playe
 		FactionSpawns->Num());
 	return nullptr;
 }
+
+
+// ==========================================
+// 【v201 大厂架构新增】生化模式人类专用复活点
+// ==========================================
+
+/**
+ * GetAvailableHumanSurvivorSpawnPoint
+ *
+ * 【v201 大厂架构新增】获取生化模式人类专用复活点
+ */
+AActor* URoomSpawnSubsystem::GetAvailableHumanSurvivorSpawnPoint(AController* OccupancyOwner)
+{
+	// 确保复活点已扫描
+	ScanAndCachePlayerStarts(false);
+
+	// 【v201】人类幸存者复活点为空 → Log Error + return nullptr
+	if (HumanSurvivorSpawnPoints.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v201】GetAvailableHumanSurvivorSpawnPoint: HumanSurvivorSpawnPoints 为空!"
+			     " 生化模式人类玩家无法复活."
+			     " 修复: 在地图中添加 PlayerStart, Tag 设为 'Faction_HumanSurvivor'."));
+		return nullptr;
+	}
+
+	// 遍历人类幸存者复活点，找一个未占用的
+	for (APlayerStart* SpawnPoint : HumanSurvivorSpawnPoints)
+	{
+		if (SpawnPoint && !OccupiedSpawnPoints.Contains(SpawnPoint))
+		{
+			// 标记为已占用
+			OccupiedSpawnPoints.Add(SpawnPoint);
+			if (OccupancyOwner)
+			{
+				OccupiedSpawnByController.Add(OccupancyOwner, SpawnPoint);
+			}
+			return SpawnPoint;
+		}
+	}
+
+	// 【v201】所有人类幸存者复活点都被占用 → Log Error + return nullptr
+	UE_LOG(LogTemp, Error,
+		TEXT("[Spawn] 【v201】GetAvailableHumanSurvivorSpawnPoint: 全部 %d 个人类幸存者复活点都被占用. "
+		     "生化模式人类玩家无法复活."),
+		HumanSurvivorSpawnPoints.Num());
+	return nullptr;
+}
+
+
+/**
+ * RestartZombieRoundPlayers
+ *
+ * 【v201.1 大厂架构新增】小局结束后重新分配所有玩家和 AI 到 HumanSurvivor 复活点
+ *   - 所有玩家变成人类 (bIsMother=false, 阵营=Defense)
+ *   - 所有 AI 变成人类 (CachedIsMother=false, 阵营=Defense)
+ *
+ * 【v201.7 大厂架构重构】母体变人类 = 销毁母体 Pawn + 重新生成人类 Pawn
+ *   - 玩家: 查 PS.SelectedCharID → DT_CharacterInfo → 销毁母体 BP → 重新生成人类 BP
+ *   - AI: 读 BaseAIC.GetCachedAIPawnClass() → 销毁母体 BP → 重新生成人类 BP
+ *   - 单一真理源: AIC 复用, SetCachedIsMother(false) + SetCachedFactionTag(Defense)
+ *   - 激活移动锁定 + 无敌期闪烁 + 出生音效 (镜像玩家)
+ */
+void URoomSpawnSubsystem::RestartZombieRoundPlayers()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v201.1】RestartZombieRoundPlayers: 开始重新分配所有玩家和 AI 到 HumanSurvivor 复活点."));
+
+	// 确保复活点已扫描
+	ScanAndCachePlayerStarts(false);
+
+	// 【v201.1】人类幸存者复活点为空 → Log Error + return
+	if (HumanSurvivorSpawnPoints.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v201.1】RestartZombieRoundPlayers: HumanSurvivorSpawnPoints 为空!"));
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	int32 PlayerAssignedCount = 0;
+	int32 AIAssignedCount = 0;
+
+	// ===== Step 1: 处理所有玩家 =====
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (APlayerController* PC = It->Get())
+		{
+			if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+			{
+				// 【v201.1 修复】所有玩家都要变成人类，不只是 Defense 阵营的
+				// 设置阵营为 Defense (人类阵营)
+				PS->CurrentFactionTag = FFactionTags::Defense();
+
+				// 设置 bIsMother = false (变成人类)
+				PS->bIsMother = false;
+
+				// 释放旧的复活点占用
+				ReleaseSpawnPointByController(PC);
+
+				// 分配新的 HumanSurvivor 复活点
+				AActor* NewSpawnPoint = GetAvailableHumanSurvivorSpawnPoint(PC);
+				if (NewSpawnPoint)
+				{
+					FVector SpawnLoc = NewSpawnPoint->GetActorLocation();
+					FRotator SpawnRot = NewSpawnPoint->GetActorRotation();
+
+					if (APawn* Pawn = PC->GetPawn())
+					{
+						if (!Pawn->IsPendingKillPending() && Pawn->GetLifeSpan() <= 0.0f)
+						{
+							// 传送到新位置
+							Pawn->SetActorLocationAndRotation(SpawnLoc, SpawnRot);
+
+							// 如果当前是母体 Pawn，需要改成人类 Pawn
+							if (ABaseCharacter* Char = Cast<ABaseCharacter>(Pawn))
+							{
+								// 【v201.8 修复】双判断: bIsMother 标志 OR Pawn Class 是 BP_MuTi 派生都触发
+								const bool bNeedsDemutation = Char->bIsMother ||
+									Char->GetClass()->GetName().Contains(TEXT("MuTi"));
+
+								if (bNeedsDemutation)
+								{
+									// 【v201.7 大厂架构修复】母体变人类 = 销毁母体 Pawn + 重新生成人类 Pawn
+									// 根因: 单纯改 bIsMother=false 不会改变 Pawn 的外观/Class — 母体 BP 还在身上
+									// 修复: 读取 CharID (从 PS.CurrentCharID) → SpawnAIInternal 风格用人类 BP 重新生成
+									UE_LOG(LogTemp, Log,
+										TEXT("[Spawn] 【v201.7】玩家 Pawn '%s' 是母体, 将销毁并重新生成人类 Pawn."),
+										*Char->GetName());
+
+									// 读取人类 CharID (从 PlayerState)
+									FString HumanCharID = PS->GetSelectedCharacterID().IsEmpty() ? TEXT("JS001") : PS->GetSelectedCharacterID();
+									FString HumanWeaponID = PS->GetSelectedWeapon1ID();
+
+									// 记录旧 Pawn 位置供 fallback
+									const FVector FallbackLoc = SpawnLoc;
+									const FRotator FallbackRot = SpawnRot;
+
+									// 销毁旧 Pawn (UnPossess + Destroy)
+									PC->UnPossess();
+									Char->Destroy();
+
+									// 用人类 BP 重新生成 — 查 DT_CharacterInfo
+									ABaseCharacter* NewHumanPawn = nullptr;
+									if (CharacterDataTable)
+									{
+										static const FString CharCtx(TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.DemutatePlayer"));
+										if (FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(FName(*HumanCharID), CharCtx))
+										{
+											UClass* LoadedClass = Info->CharacterBlueprint.LoadSynchronous();
+											if (LoadedClass)
+											{
+												FActorSpawnParameters SpawnParams;
+												SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+												NewHumanPawn = World->SpawnActor<ABaseCharacter>(LoadedClass, FTransform(FallbackRot, FallbackLoc), SpawnParams);
+											}
+										}
+									}
+
+									if (NewHumanPawn)
+									{
+										// 写 SpawnLoadout
+										NewHumanPawn->SetSpawnLoadout(HumanCharID, HumanWeaponID);
+
+										// 同步阵营 = Defense (人类)
+										NewHumanPawn->FactionTag = FFactionTags::Defense();
+										NewHumanPawn->bIsMother = false;
+										NewHumanPawn->bIsHuman = true;
+										NewHumanPawn->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
+
+										// Possess
+										PC->Possess(NewHumanPawn);
+
+										// 武器 Spawn — 字符串→强类型 (走 ResolveWeaponClassFromID 单一入口)
+										if (!HumanWeaponID.IsEmpty())
+										{
+											if (TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(HumanWeaponID))
+											{
+												NewHumanPawn->RequestWeaponSpawn(WeaponClass);
+											}
+										}
+
+										// 激活移动锁定 + 无敌期闪烁
+										NewHumanPawn->ActivateSpawnInvincibility();
+										if (UHealthComponent* HC = NewHumanPawn->ResolveHealthComponent())
+										{
+											HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+										}
+
+										// 播放出生音效
+										NewHumanPawn->Multicast_PlaySpawnSound();
+
+										// 刷新头像
+										NewHumanPawn->RefreshCharacterIcon();
+
+										UE_LOG(LogTemp, Log,
+											TEXT("[Spawn] 【v201.7】玩家已从母体变为人类: NewPawn='%s' CharID='%s'."),
+											*NewHumanPawn->GetName(), *HumanCharID);
+									}
+									else
+									{
+										UE_LOG(LogTemp, Error,
+											TEXT("[Spawn] 【v201.7】玩家从母体变人类失败: CharID='%s' 找不到对应 Pawn Class."),
+											*HumanCharID);
+									}
+								}
+								else
+								{
+									// 已经是人类, 仅同步状态
+									Char->FactionTag = FFactionTags::Defense();
+									Char->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
+
+									// 【v201.6 大厂架构新增】小局开始时激活移动锁定 + 无敌期闪烁
+									Char->ActivateSpawnInvincibility();
+									if (UHealthComponent* HC = Char->ResolveHealthComponent())
+									{
+										HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+									}
+									Char->Multicast_PlaySpawnSound();
+								}
+
+								UE_LOG(LogTemp, Log,
+									TEXT("[Spawn] 【v201.7】玩家 '%s' 已被分配到 HumanSurvivor 复活点, bIsMother=false."),
+									*PC->GetName());
+							}
+
+							++PlayerAssignedCount;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// ===== Step 2: 处理所有 AI =====
+	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	{
+		ABaseCharacter* AIChar = *It;
+		if (!AIChar)
+		{
+			continue;
+		}
+
+		// 只处理 AI Pawn (有 AIController 的)
+		AController* AIC = Cast<AController>(AIChar->GetOwner());
+		if (!AIC || AIC->IsPlayerController())
+		{
+			continue;
+		}
+
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+		{
+			// 释放旧的复活点占用
+			ReleaseSpawnPointByController(BaseAIC);
+
+			// 分配新的 HumanSurvivor 复活点
+			AActor* NewSpawnPoint = GetAvailableHumanSurvivorSpawnPoint(BaseAIC);
+			if (!NewSpawnPoint)
+			{
+				continue;
+			}
+
+			FVector SpawnLoc = NewSpawnPoint->GetActorLocation();
+			FRotator SpawnRot = NewSpawnPoint->GetActorRotation();
+
+			// 【v201.7 大厂架构新增】母体 AI 变人类 = 销毁母体 Pawn + 重新生成人类 Pawn
+			// 根因: 单纯改 bIsMother=false 不会改变 Pawn 的外观/Class — 母体 BP 还在身上
+			// 修复: 读取 CachedAIPawnClass → 查 DT_CharacterInfo → 重新生成人类 Pawn + AIController 复用
+			//
+			// 【v201.8 修复】双判断: bIsMother 标志 OR Pawn Class 是 BP_MuTi 派生都触发
+			// 根因: TActorIterator 遍历拿到 Pawn 时, bIsMother 标志可能在某些情况下被旧逻辑改为 false (旧 v201.1 仅改标志不销毁)
+			// 但实际 Class 还是 BP_MuTi (母体 BP), 必须销毁重生才能变人类外观
+			const bool bNeedsDemutation = AIChar->bIsMother ||
+				AIChar->GetClass()->GetName().Contains(TEXT("MuTi"));
+
+			if (bNeedsDemutation)
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[Spawn] 【v201.8】AI Pawn '%s' (Class=%s, bIsMother=%d) 需要变人类, 将销毁并重新生成."),
+					*AIChar->GetName(), *AIChar->GetClass()->GetName(), AIChar->bIsMother ? 1 : 0);
+
+				// 读取 AI 原始人类 CharID (从 AIC 缓存)
+				TSubclassOf<ABaseCharacter> CachedHumanClass = BaseAIC->GetCachedAIPawnClass();
+
+				// 【v201.11 大厂架构修复】从 AIC 缓存读武器 ID (真理源)
+				//   - 旧 (v201.10): AIChar->GetSpawnWeaponID() — 读的是**旧母体 Pawn** 的字段, 母体 BP 没配武器 → 永远空
+				//   - 用户反馈 (2026.08.06): "AI 母体变人类后没有武器"
+				//   - 根因链: 母体 Pawn (BP_MuTi_C) 没 SetSpawnLoadout → 字段空 → 新生成的人类 Pawn 也没武器
+				//   - 修复: 从 AIC 缓存读 CachedWeaponID (与 CachedAIPawnClass 同源)
+				FString HumanWeaponID = BaseAIC->GetCachedWeaponID();
+				if (HumanWeaponID.IsEmpty())
+				{
+					// 【兜底】如果 AIC 缓存空, 才回退到旧 Pawn 字段 (兼容老路径)
+					HumanWeaponID = AIChar->GetSpawnWeaponID();
+					UE_LOG(LogTemp, Warning,
+						TEXT("[Spawn] 【v201.11】AIC CachedWeaponID 为空, 回退到旧 Pawn 字段 (Pawn=%s, WeaponID='%s'). "
+							 "【修复】检查 AIC 初始化时是否调 SetCachedWeaponID."),
+						*AIChar->GetName(), *HumanWeaponID);
+				}
+
+				// 记录旧 Pawn 位置供 fallback
+				const FVector FallbackLoc = SpawnLoc;
+				const FRotator FallbackRot = SpawnRot;
+
+				// 销毁旧 Pawn (UnPossess + Destroy)
+				BaseAIC->UnPossess();
+				AIChar->Destroy();
+
+				// 用人类 BP 重新生成 — 多级 fallback (优先级 A>B>C>D)
+				//   A. BaseAIC.GetCachedAIPawnClass() — 关卡预放 AI 路径已写入
+				//   B. BaseAIC.GetCachedCharacterInfoRowName() — 从 RowName 查 DT_CharacterInfo
+				//   C. AIChar 旧 Class 名(如果不是 MuTi) → 备用
+				//   D. 实在找不到 → Log Error, 旧 Pawn 已销毁将无法复活 (零兜底)
+				ABaseCharacter* NewHumanPawn = nullptr;
+				UClass* LoadClass = nullptr;
+
+				if (CachedHumanClass)
+				{
+					LoadClass = CachedHumanClass.Get();
+				}
+				else if (CharacterDataTable)
+				{
+					// Fallback B: 查 CharacterDataTable — 用 AI Profile 行名
+					static const FString CharCtx(TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.AI.Demutate"));
+					TArray<FName> RowNames = CharacterDataTable->GetRowNames();
+					for (const FName& RowName : RowNames)
+					{
+						if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(RowName, CharCtx))
+						{
+							if (!Row->CharacterBlueprint.IsNull())
+							{
+								UClass* BlueprintClass = Row->CharacterBlueprint.LoadSynchronous();
+								if (BlueprintClass && !BlueprintClass->GetName().Contains(TEXT("MuTi")))
+								{
+									LoadClass = BlueprintClass;
+									UE_LOG(LogTemp, Log,
+										TEXT("[Spawn] 【v201.8】AI 母体变人类: 通过 DT_CharacterInfo Row='%s' → Class=%s (Fallback B 命中)."),
+										*RowName.ToString(), *BlueprintClass->GetName());
+									break;
+								}
+							}
+						}
+					}
+				}
+
+				if (LoadClass)
+				{
+					FActorSpawnParameters SpawnParams;
+					SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+					NewHumanPawn = World->SpawnActor<ABaseCharacter>(LoadClass, FTransform(FallbackRot, FallbackLoc), SpawnParams);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Spawn] 【v201.8】AI 母体变人类失败: CachedAIPawnClass 为空 + DT_CharacterInfo 也找不到非 MuTi 的 BP. "
+							 "Controller='%s', 旧 Pawn='%s' 已被销毁, AIController 当前无 Pawn."),
+						*BaseAIC->GetName(), *AIChar->GetName());
+				}
+
+			if (NewHumanPawn)
+			{
+				// 【v201.8】写 SpawnLoadout — 这里的 CharID 必须用 AI 的原始 CharacterID
+				// 根因: AI Profile 里的 CharacterRowName (例如 SWAT_AI_C) 才能生成正确的人类 BP
+				NewHumanPawn->SetSpawnLoadout(TEXT(""), HumanWeaponID);
+
+					// 同步阵营 = Defense (人类)
+					NewHumanPawn->FactionTag = FFactionTags::Defense();
+					NewHumanPawn->bIsMother = false;
+					NewHumanPawn->bIsHuman = true;
+					NewHumanPawn->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
+
+					// Possess + 状态清零
+					BaseAIC->Possess(NewHumanPawn);
+					BaseAIC->SetCachedIsMother(false);
+					BaseAIC->SetCachedFactionTag(FFactionTags::Defense());
+
+					// 武器 Spawn — 字符串→强类型 (走 ResolveWeaponClassFromID 单一入口)
+					if (!HumanWeaponID.IsEmpty())
+					{
+						if (TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(HumanWeaponID))
+						{
+							NewHumanPawn->RequestWeaponSpawn(WeaponClass);
+						}
+					}
+
+					// 【v201.9 大厂架构新增】应用 AI Config (MaxWalkSpeed/血量等)
+					// 根因: 销毁母体 BP → 重新生成人类 BP 后, MaxWalkSpeed=0 → AI 不动
+					// 修复: 调 ApplyAICharacterConfigToCharacter 设置 MaxWalkSpeed (从 PlayerConfigAsset 读)
+					ApplyAICharacterConfigToCharacter(NewHumanPawn);
+
+					// 激活移动锁定 + 无敌期闪烁
+					NewHumanPawn->ActivateSpawnInvincibility();
+					if (UHealthComponent* HC = NewHumanPawn->ResolveHealthComponent())
+					{
+						HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+					}
+
+					// 播放出生音效
+					NewHumanPawn->Multicast_PlaySpawnSound();
+
+					// 刷新头像
+					NewHumanPawn->RefreshCharacterIcon();
+
+					UE_LOG(LogTemp, Log,
+						TEXT("[Spawn] 【v201.7】AI 已从母体变为人类: NewPawn='%s'."),
+						*NewHumanPawn->GetName());
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Spawn] 【v201.7】AI 从母体变人类失败: CachedAIPawnClass 为空, Controller='%s'."),
+						*BaseAIC->GetName());
+				}
+			}
+			else
+			{
+				// 已经是人类, 仅同步状态 + 传送
+				AIChar->FactionTag = FFactionTags::Defense();
+				AIChar->bIsMother = false;
+				AIChar->bIsHuman = true;
+				BaseAIC->SetCachedIsMother(false);
+				BaseAIC->SetCachedFactionTag(FFactionTags::Defense());
+				AIChar->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
+
+				if (!AIChar->IsPendingKillPending() && AIChar->GetLifeSpan() <= 0.0f)
+				{
+					AIChar->SetActorLocationAndRotation(SpawnLoc, SpawnRot);
+					++AIAssignedCount;
+
+					// 激活移动锁定 + 无敌期闪烁
+					AIChar->ActivateSpawnInvincibility();
+					if (UHealthComponent* HC = AIChar->ResolveHealthComponent())
+					{
+						HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+					}
+
+					// 播放出生音效
+					AIChar->Multicast_PlaySpawnSound();
+
+					UE_LOG(LogTemp, Log,
+						TEXT("[Spawn] 【v201.7】AI '%s' 已被分配到 HumanSurvivor 复活点, bIsMother=false."),
+						*AIChar->GetName());
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v201.1】RestartZombieRoundPlayers: 完成. 玩家=%d, AI=%d 共分配到 HumanSurvivor 复活点."),
+		PlayerAssignedCount, AIAssignedCount);
+
+	// ==========================================
+	// 【v201.10.2 大厂架构修复】小局开始前清空 AI 黑板键 + 重启 BT
+	// ==========================================
+	//
+	// 用户原话 (2026.08.06): "AI 在每小局开始前应该先清理所有黑板键的数据再启动"
+	//
+	// 【v201.10.2 修复】遍历方式错误
+	//   - 旧 (v201.10.1): World->GetPlayerControllerIterator() 只返回 PlayerController, 永远遍历不到 AIC
+	//   - 日志证据: "已重启 0 个 AI 的 BT + 清空 BB" → 循环走空
+	//   - 修复: 改用 TActorIterator<ABaseCharacter> 遍历所有 Pawn → 拿 Controller → 过滤 AIC
+	//
+	// 根因 (v201.9 之前):
+	//   - BT 在第二小局仍持有第一小局的 BB 数据 (TargetActor/CooldownEndTime/HealthPercent 等)
+	//   - BT Service 0.1s 后才重新派生 — AI 在 0.1s 内不动 + 数据延迟
+	//
+	// 修复:
+	//   - 遍历所有 AI Pawn → 拿其 AIC → 调 RestartBehaviorTreeAndClearBlackboard
+	//   - 该函数停 BT → 清空 BB → 重启 BT (单一入口, 大厂原则)
+	//
+	// 调用顺序: 在玩家/AI 位置分配 + Config 应用 + 移动锁定激活后调用
+	//   - 这样 BT 重启后能立即读到新数据 (TargetActor/CooldownEndTime 重新派生)
+	int32 AIRestartCount = 0;
+	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	{
+		ABaseCharacter* AIChar = *It;
+		if (!AIChar || !AIChar->HasAuthority())
+		{
+			continue;
+		}
+
+		// 只对 AI Pawn 操作 (跳过玩家 Pawn)
+		ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIChar->GetController());
+		if (BaseAIC)
+		{
+			BaseAIC->RestartBehaviorTreeAndClearBlackboard();
+			++AIRestartCount;
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v201.10.2】RestartZombieRoundPlayers: 已重启 %d 个 AI 的 BT + 清空 BB."),
+		AIRestartCount);
+}
+
 
 // ==========================================
 // 【v56 新增】关卡预放 AI 阵营缓存
@@ -1465,12 +2032,38 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 					UE_LOG(LogTemp, Log,
 						TEXT("[RoomSpawn] SpawnAIInternal 激活 AI 无敌期: AI=%s, Duration=%.2fs (统一入口=BaseAIController.GetSpawnInvincibilitySeconds)"),
 						*AIPawn->GetName(), InvSeconds);
+
+					// 【v201.6 大厂架构新增】播放 AI 出生音效
+					AIPawn->Multicast_PlaySpawnSound();
 				}
 				else
 				{
 					UE_LOG(LogTemp, Log,
 						TEXT("[RoomSpawn] SpawnAIInternal: AI=%s 的 PlayerConfigAsset.SpawnInvincibilitySeconds <= 0, 跳过无敌期激活"),
 						*AIPawn->GetName());
+				}
+
+				// 【v201.5 大厂架构新增】激活 AI 复活移动锁定
+				//   - 从 PlayerConfigAsset 读取 RespawnDelaySeconds (与玩家路径共用同一个真理源)
+				//   - 玩家和 AI 共用同一个机制
+				if (UHealthComponent* HC = AIPawn->ResolveHealthComponent())
+				{
+					// 读 PlayerConfigAsset.RespawnDelaySeconds (真理源)
+					float AIRespawnDelaySeconds = 3.0f; // 默认值
+					if (PlayerConfigAsset)
+					{
+						AIRespawnDelaySeconds = PlayerConfigAsset->RespawnDelaySeconds;
+					}
+					else
+					{
+						UE_LOG(LogTemp, Warning,
+							TEXT("[RoomSpawn] SpawnAIInternal: PlayerConfigAsset 为空, 使用默认值 RespawnDelaySeconds=%.1f"),
+							AIRespawnDelaySeconds);
+					}
+					HC->ActivateRespawnMovementLock(AIRespawnDelaySeconds);
+					UE_LOG(LogTemp, Log,
+						TEXT("[RoomSpawn] SpawnAIInternal 激活 AI 移动锁定: AI=%s, Duration=%.2fs (真理源=PlayerConfigAsset.RespawnDelaySeconds)"),
+						*AIPawn->GetName(), AIRespawnDelaySeconds);
 				}
 			}
 		}
@@ -1868,20 +2461,45 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	ScanAndCachePlayerStarts(false);
 	FVector SpawnLoc = FVector::ZeroVector;
 	FRotator SpawnRot = FRotator::ZeroRotator;
+
+	// 获取当前模式和阵营
+	UWorld* World = GetWorld();
+	ARoomGameState* RoomGS = World ? World->GetGameState<ARoomGameState>() : nullptr;
 	FGameplayTag PlayerFactionTag = FFactionTags::Offense();
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
 		PlayerFactionTag = PS->CurrentFactionTag;
 	}
 
-	AActor* AssignedSpawnPoint = GetAvailableSpawnPointForFaction(PlayerFactionTag, true, PlayerToSpawn);
-	if (!AssignedSpawnPoint)
+	AActor* AssignedSpawnPoint = nullptr;
+
+	// 【v201 大厂架构新增】生化模式人类专用复活点分支
+	//   - 生化模式 + Defense 阵营 (人类) → 走 HumanSurvivorSpawnPoints
+	//   - 其他情况 → 走 GetAvailableSpawnPointForFaction (Offense/Defense 阵营复活点)
+	if (RoomGS && RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie && FFactionTags::IsDefense(PlayerFactionTag))
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] HandlePlayerRequestSpawn: 阵营 '%s' 出生点分配失败. "
-			     "【v31.1 零兜底】不调 FindPlayerStart 兜底."),
-			*PlayerFactionTag.ToString());
-		return;
+		// 生化模式人类玩家 → 使用 HumanSurvivor 复活点
+		AssignedSpawnPoint = GetAvailableHumanSurvivorSpawnPoint(PlayerToSpawn);
+		if (!AssignedSpawnPoint)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 生化模式人类玩家 '%s' 无法分配 HumanSurvivor 复活点."),
+				*PlayerToSpawn->GetName());
+			return;
+		}
+	}
+	else
+	{
+		// 其他情况 → 走正常阵营复活点
+		AssignedSpawnPoint = GetAvailableSpawnPointForFaction(PlayerFactionTag, true, PlayerToSpawn);
+		if (!AssignedSpawnPoint)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 阵营 '%s' 出生点分配失败. "
+				     "【v31.1 零兜底】不调 FindPlayerStart 兜底."),
+				*PlayerFactionTag.ToString());
+			return;
+		}
 	}
 
 	SpawnLoc = AssignedSpawnPoint->GetActorLocation();
@@ -2015,6 +2633,18 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	if (ABaseCharacter* PlayerChar = Cast<ABaseCharacter>(PlayerToSpawn->GetPawn()))
 	{
 		PlayerChar->ActivateSpawnInvincibility();
+
+		// 【v201.5 大厂架构新增】激活复活移动锁定
+		//   - 复活后 N 秒内无法移动 (N = RespawnDelaySeconds)
+		//   - 与无敌期并行，独立机制
+		if (UHealthComponent* HC = PlayerChar->ResolveHealthComponent())
+		{
+			HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+		}
+
+		// 【v201.6 大厂架构新增】播放出生音效
+		//   - 所有玩家出生时都播放
+		PlayerChar->Multicast_PlaySpawnSound();
 	}
 }
 
@@ -3518,6 +4148,36 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 			}
 		}
 	}
+
+	// 【v201.5 大厂架构新增】激活母体复活移动锁定
+	//   - 母体复活后 N 秒内无法移动 (N = RespawnDelaySeconds)
+	//   - 从 PlayerConfigAsset 读取 (与玩家/AI 共用同一个真理源)
+	//   - 玩家和 AI 共用同一个机制
+	// 【v201.6 大厂架构新增】同时激活无敌闪烁
+	NewMotherPawn->ActivateSpawnInvincibility();
+
+	if (UHealthComponent* HC = NewMotherPawn->ResolveHealthComponent())
+	{
+		// 读 PlayerConfigAsset.RespawnDelaySeconds (真理源)
+		float MotherRespawnDelaySeconds = 3.0f; // 默认值
+		if (PlayerConfigAsset)
+		{
+			MotherRespawnDelaySeconds = PlayerConfigAsset->RespawnDelaySeconds;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[MotherMutation] MutatePawnToMother: PlayerConfigAsset 为空, 使用默认值 RespawnDelaySeconds=%.1f"),
+				MotherRespawnDelaySeconds);
+		}
+		HC->ActivateRespawnMovementLock(MotherRespawnDelaySeconds);
+		UE_LOG(LogTemp, Log,
+			TEXT("[MotherMutation] MutatePawnToMother: 激活母体移动锁定 Duration=%.1fs Pawn=%s (真理源=PlayerConfigAsset.RespawnDelaySeconds)"),
+			MotherRespawnDelaySeconds, *NewMotherPawn->GetName());
+	}
+
+	// 【v201.6 大厂架构新增】播放母体出生音效
+	NewMotherPawn->Multicast_PlaySpawnSound();
 
 	return true;
 }

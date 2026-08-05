@@ -241,6 +241,41 @@ public:
 	AActor* GetAvailableSpawnPointForFaction(FGameplayTag PlayerFactionTag, bool bRemoveOccupied = true, AController* OccupancyOwner = nullptr);
 
 	/**
+	 * 【v201 大厂架构新增】获取生化模式人类专用复活点
+	 *
+	 * 背景:
+	 *   - 生化模式人类玩家需要从 HumanSurvivorSpawnPoints 中分配
+	 *   - 不能用 GetAvailableSpawnPointForFaction，因为它走 Offense/Defense 阵营复活点
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - HumanSurvivorSpawnPoints 为空 → Log Error + return nullptr
+	 *   - 所有点都被占用 → Log Error + return nullptr
+	 *
+	 * @param OccupancyOwner 占用者 Controller (用于释放时精准定位)
+	 * @return 可用的 HumanSurvivor 复活点，如果找不到则返回 nullptr
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	AActor* GetAvailableHumanSurvivorSpawnPoint(AController* OccupancyOwner);
+
+	/**
+	 * 【v201 大厂架构新增】小局结束后重新分配所有人类玩家到 HumanSurvivor 复活点
+	 *
+	 * 业务场景:
+	 *   - 生化模式小局结束
+	 *   - 所有存活人类玩家需要重新分配到新的 HumanSurvivor 复活点
+	 *   - 死亡玩家在复活时自动走新复活点
+	 *
+	 * 调用链:
+	 *   - URoomLifecycleSubsystem::StartNextZombieRound 末尾调用
+	 *
+	 * 大厂原则 — 集中调度:
+	 *   - 单一入口管理所有人类玩家的复活点重分配
+	 *   - 不破坏刀战模式（刀战不走本函数）
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	void RestartZombieRoundPlayers();
+
+	/**
 	 * @brief 【v39 新增】按 Controller 释放出生点 (集中调度精准释放)
 	 *
 	 * 大厂原则:
@@ -489,6 +524,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Room|Spawn")
 	FName TAG_Faction_Mother;
 
+	/**
+	 * 【v201 大厂架构新增】生化模式人类专用复活点 TAG
+	 *
+	 * 背景:
+	 *   - 生化模式人类玩家需要专属复活点，不是 Offense/Defense 阵营复活点
+	 *   - 用户在场景中添加 PlayerStart，Tag 设为 "Faction_HumanSurvivor"
+	 *
+	 * 来源: ScanAndCachePlayerStarts 扫描 PlayerStartTag=Faction_HumanSurvivor 的 PlayerStart
+	 * 用途: 生化模式人类玩家复活时从 HumanSurvivorSpawnPoints 中随机选取
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 生化模式人类复活必须走 HumanSurvivorSpawnPoints
+	 *   - 不允许 fallback 到 Offense/Defense 复活点
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Room|Spawn")
+	FName TAG_Faction_HumanSurvivor;
+
 	// ==========================================
 	// 转换辅助方法 (public 让 RoomGameMode 委派入口可调)
 	// ==========================================
@@ -538,6 +590,21 @@ protected:
 	 */
 	UPROPERTY()
 	TArray<APlayerStart*> MotherSpawnPoints;
+
+	/**
+	 * 【v201 大厂架构新增】生化模式人类专用复活点数组
+	 *
+	 * 大厂原则 — 职责分层:
+	 *   - 与 AttackSpawnPoints / DefenseSpawnPoints / MotherSpawnPoints 同级管理
+	 *   - 生化模式人类玩家专用的复活点，不与其他阵营共享
+	 *   - 小局结束后玩家重新随机分配到这些点
+	 *
+	 * 用途:
+	 *   - GetAvailableSpawnPointForFaction 生化模式分支读取
+	 *   - RestartZombieRoundPlayers 分配新复活点
+	 */
+	UPROPERTY()
+	TArray<APlayerStart*> HumanSurvivorSpawnPoints;
 
 	UPROPERTY()
 	TSet<APlayerStart*> OccupiedSpawnPoints;

@@ -5,8 +5,12 @@
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomPlayerController.h"
+#include "Systems/Spawn/RoomSpawnSubsystem.h"  // 【v201】RestartZombieRoundPlayers
 #include "Systems/Mother/RoomMotherMutationSubsystem.h"
 #include "Enums/CoreEnums.h"
+// 【v134 大厂架构修复】FFactionTags::Offense/Defense 静态方法 (cpp 必须显式 include, 不依赖 transitive)
+#include "Data/Faction/FactionTags.h"
+#include "Data/Enums/RoomEnums.h" // EZombieRoundWinner 枚举
 #include "TimerManager.h"
 #include "Engine/World.h"
 #include "GameFramework/GameStateBase.h"
@@ -200,8 +204,21 @@ void URoomLifecycleSubsystem::StartMatchTimer()
 	//   - Zombie 模式: 用 ZombieMatchDurationSeconds 写入 MatchEndTime
 	//   - 其他模式 (None 等): 显式 Error + return, 不静默跳过
 	//   - 不允许: "Zombie 模式 MatchEndTime 保持 0 让 Widget 隐式不显示" 的兜底
+	//
+	// 大厂原则 — v134 零下限修复:
+	//   - 旧版 ClampMin=30 是反模式 (静默篡改策划配置), 已删除
+	//   - 新版: ZombieMatchDurationSeconds <= 0 拒绝启动 + Log Error (强制修复 BP 配置)
+	//   - 镜像 Melee 模式, 也加防御层 (尽管 Melee 仍 ClampMin=30, 防御性检查不亏)
 	if (RoomGS->CurrentMatchMode == ERoomMatchMode::Melee)
 	{
+		if (MatchDurationSeconds <= 0.0f)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomLifecycle] StartMatchTimer: Melee MatchDurationSeconds=%.2f <= 0, 拒绝启动. "
+				     "【修复】检查 GameMode.MeleeMatchDurationSeconds 配置 (ClampMin=30)."),
+				MatchDurationSeconds);
+			return;
+		}
 		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + MatchDurationSeconds;
 		UE_LOG(LogTemp, Log,
 			TEXT("[RoomLifecycle] StartMatchTimer: Melee 模式, MatchEndTime=%.2f (Now+%.2fs)"),
@@ -209,6 +226,18 @@ void URoomLifecycleSubsystem::StartMatchTimer()
 	}
 	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
 	{
+		// 【v134 大厂原则 — 零下限修复】ZombieMatchDurationSeconds <= 0 拒绝启动
+		//   旧版 ClampMin=30 是反模式 — 已删除, 现在策划可任意配置
+		//   配错 <= 0 → 拒绝启动 + Log Error, 强制修复 BP 配置
+		if (ZombieMatchDurationSeconds <= 0)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomLifecycle] StartMatchTimer: Zombie ZombieMatchDurationSeconds=%d <= 0, 拒绝启动. "
+				     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match → ZombieMatchDurationSeconds 配 > 0 的值. "
+				     "【业务后果】倒计时永不开始, 本小局无胜负判定."),
+				ZombieMatchDurationSeconds);
+			return;
+		}
 		RoomGS->MatchEndTime = GetWorld()->GetTimeSeconds() + ZombieMatchDurationSeconds;
 		UE_LOG(LogTemp, Log,
 			TEXT("[RoomLifecycle] StartMatchTimer: Zombie 模式, MatchEndTime=%.2f (Now+%ds)"),
@@ -235,6 +264,10 @@ void URoomLifecycleSubsystem::OnMatchTimerTick()
 		return;
 	}
 
+	// 大厂原则 — 镜像 v92 模式守卫:
+	//   - Melee 模式: 检测倒计时归零 → HandleMatchTimeOut (走 TriggerSettlement 旧路径)
+	//   - Zombie 模式: 检测倒计时归零 → FinishZombieRound (新路径, 走 HasAliveHumanOnField 判定)
+	//   - 【v134 P0 修复】Zombie 模式原本缺失 OnMatchTimerTick Zombie 分支, 倒计时永远不触发 — 已修复
 	if (RoomGS->CurrentMatchMode == ERoomMatchMode::Melee)
 	{
 		if (GetWorld()->GetTimeSeconds() >= RoomGS->MatchEndTime)
@@ -242,6 +275,63 @@ void URoomLifecycleSubsystem::OnMatchTimerTick()
 			GetWorld()->GetTimerManager().ClearTimer(MatchTimerHandle);
 			HandleMatchTimeOut();
 		}
+	}
+	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
+	{
+		// 【v134 P0 修复】生物化模式倒计时到期 + 提前结束 (人验收者) 共用 Tick 路径
+		//
+		// 大厂原则 — 零重复架构:
+		//   - 单个 Timer Tick 内同时检查"倒计时归零" + "人验收者"
+		//   - 任一满足 → 调 FinishZombieRound 收尾
+		//   - 两个检查独立, 不互斥 (理论上同帧同时为真 = 倒计时结束时人类刚死 → 互不影响)
+		//
+		// 大厂原则 — 幂等:
+		//   - FinishZombieRound 内部会拒绝 RoundWinner 已写的情况
+		//   - 同一 Tick 内两次调用只有第一次生效
+		bool bNeedFinishRound = false;
+
+		// 路径 A: 倒计时归零
+		if (GetWorld()->GetTimeSeconds() >= RoomGS->MatchEndTime)
+		{
+			bNeedFinishRound = true;
+			UE_LOG(LogTemp, Display,
+				TEXT("[RoomLifecycle] OnMatchTimerTick: 生化模式倒计时归零 (剩余秒数 = %.2fs), 触发本小局结束."),
+				FMath::Max(0.0f, RoomGS->MatchEndTime - GetWorld()->GetTimeSeconds()));
+		}
+
+		// 路径 B: 场上无存活人类 (提前结束)
+		//   - 即使倒计时没到, 无人存活也立即结束本小局
+		//   - 用户 2026.08.06 明确: "如没剩余人类了, 就算 Text_RoundCountdown 没倒计时结束也要提前结束此小局"
+		//   - 【v134 v4 修复】HasAliveHumanOnField 返回 EHASResult:
+		//     * HasAliveHuman / NoAliveHuman → 触发 finish
+		//     * NoData (0 Pawn) → 跳过本 Tick (修复"一进游戏就播母体赢音效" bug)
+		const EHASResult HASResult = RoomGS->HasAliveHumanOnField();
+		if (HASResult == EHASResult::NoAliveHuman)
+		{
+			bNeedFinishRound = true;
+			UE_LOG(LogTemp, Display,
+				TEXT("[RoomLifecycle] OnMatchTimerTick: 生化模式场上无存活人类 (倒计时未结束), 触发本小局提前结束 → Mother 赢."));
+		}
+		else if (HASResult == EHASResult::NoData)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[RoomLifecycle] OnMatchTimerTick: 生化模式场上 0 Pawn (Spawn 未完成或异常), 跳过本 Tick 结算. "
+				     "【业务后果】不触发本小局结束, 等待下一 Tick 再次检查."));
+		}
+		// EHASResult::HasAliveHuman → 不触发 finish (正常游戏中)
+
+		if (bNeedFinishRound)
+		{
+			GetWorld()->GetTimerManager().ClearTimer(MatchTimerHandle);
+			HandleZombieRoundEnd();
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] OnMatchTimerTick: CurrentMatchMode=%d 未识别, 拒绝处理 Tick. "
+			     "【修复】检查 GameMode CurrentMatchMode 是否被合法赋值."),
+			static_cast<int32>(RoomGS->CurrentMatchMode));
 	}
 }
 
@@ -266,8 +356,150 @@ void URoomLifecycleSubsystem::HandleMatchTimeOut()
 	}
 	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
 	{
+		// 【v201.3 大厂架构修复】生化模式走 HandleZombieRoundEnd 统一入口
+		//   - 旧版直接调 FinishZombieRound, 跳过了 StartNextZombieRound
+		//   - 新版 HandleZombieRoundEnd 是"本小局结束"业务唯一入口
+		//     内含 FinishZombieRound 统一结算 + StartNextZombieRound 开始下一小局
+		//   - 调用方 (OnMatchTimerTick) 在调用前已 ClearTimer, 这里无需重复
 		HandleZombieRoundEnd();
 	}
+}
+
+/**
+ * 【v134 大厂架构重构】FinishZombieRound — 生化小局结算统一入口
+ *
+ * 业务规则 (用户 2026.08.06 明确):
+ *   - 倒计时结束 → FinishZombieRound 触发
+ *   - 提前结束 (无存活人类) → FinishZombieRound 触发
+ *   - 业务唯一入口: 写 RoundWinner + 累加胜局数 + 广播 OnEnterSettlement (复用现有 Multicast)
+ *
+ * 大厂原则 — 单一入口 (零重复架构):
+ *   - FinishZombieRound 是"本小局结束"业务唯一入口
+ *   - 调用方: HandleMatchTimeOut (倒计时结束) + OnMatchTimerTick (提前结束 — Tick 检测无存活人类)
+ *   - 内部流程:
+ *     1. 校验模式 (Zombie) + 幂等 (RoundWinner 已为 Human/Mother 时跳过)
+ *     2. 调 GameState.HasAliveHumanOnField 判定胜负
+ *     3. GameState.SetRoundWinner(Human 或 Mother)
+ *     4. 累加胜局数 (DefenderWins++ / AttackerWins++)
+ *     5. 调 GameState.MulticastEnterSettlement 广播进入结算 (复用现有 RPC, **零新建**)
+ *
+ * 大厂原则 — 零兜底:
+ *   - 非生化模式 → Log Error + return false
+ *   - World/GameState 为空 → Log Error + return false
+ *   - 幂等 (RoundWinner 已写) → return true (不算错)
+ *
+ * 不破坏刀战模式:
+ *   - 刀战永不调用本函数, 字段保持 None
+ */
+bool URoomLifecycleSubsystem::FinishZombieRound()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishZombieRound: World 为空, 拒绝结算."));
+		return false;
+	}
+
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishZombieRound: GameState 为空, 拒绝结算. "
+			     "【修复】检查 PerformGameStart 调用顺序 (GameState 必须已存在)."));
+		return false;
+	}
+
+	// 大厂原则 — 模式守卫 (镜像 StartMotherMutationCountdown):
+	//   - 本函数仅在生化模式调用, 刀战模式 Log Error + return
+	if (RoomGS->CurrentMatchMode != ERoomMatchMode::Zombie)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishZombieRound: 当前模式=%d, 非生化模式, 拒绝结算. "
+			     "【修复】FinishZombieRound 仅由 Zombie 模式 Tick / Timeout 触发."),
+			static_cast<int32>(RoomGS->CurrentMatchMode));
+		return false;
+	}
+
+	// 大厂原则 — 幂等防御 (镜像 MotherMutationHasFired):
+	//   - RoundWinner 已为 Human/Mother → 不重复结算 (防止双发, 双发会重复累加胜局数)
+	if (RoomGS->RoundWinner != EZombieRoundWinner::None)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomLifecycle] FinishZombieRound: RoundWinner 已为 %d, 幂等跳过 (本小局已结算). "
+			     "【根因】OnMatchTimerTick 同帧内路径 A + 路径 B 同时触发, 第二次调用被挡."),
+			static_cast<int32>(RoomGS->RoundWinner));
+		return true;
+	}
+
+	// 步骤 1: 胜负判定 (单一真理源 — GameState.HasAliveHumanOnField)
+	//   - 【v134 v4 修复】返回 EHASResult 而非 bool, 修复 "一进游戏就播母体赢音效" bug
+	//   - NoData (0 Pawn) → 显式拒绝结算 (业务上不可能, 必配置错或时序未到)
+	const EHASResult HASResult = RoomGS->HasAliveHumanOnField();
+	if (HASResult == EHASResult::NoData)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishZombieRound: HasAliveHumanOnField 返回 NoData (场上 0 Pawn), 拒绝结算. "
+			     "【根因】业务上不可能 — FinishZombieRound 应当只在 Tick 中检测到 NoAliveHuman 时调用, 或倒计时归零时调用. "
+			     "【可能时序】当前模式下场上还没 Spawn 完成 → 推迟到下一 Tick. "
+			     "【修复】检查调用方 (OnMatchTimerTick / 倒计时归零 / 其他入口) 是否在 Spawn 完成前触发."));
+		return false;
+	}
+	const EZombieRoundWinner NewWinner = (HASResult == EHASResult::HasAliveHuman)
+		? EZombieRoundWinner::Human
+		: EZombieRoundWinner::Mother;
+
+	// 步骤 2: 写入 RoundWinner (Replicated → OnRep 推所有客户端)
+	RoomGS->SetRoundWinner(NewWinner);
+
+	// 步骤 3: 累加胜局数 (单一真理源 — GameState.AddRoundWinToFaction)
+	//   - Human 赢 → Defense (人类) → DefenderWins++
+	//   - Mother 赢 → Offense (母体) → AttackerWins++
+	//   - 内部触发 OnRep_WinStats → 所有客户端 UI 刷新 (Text_AttackerCount / Text_DefenderCount 显示源)
+	//   - **不调** MulticastEnterSettlement: 它会隐藏 MatchInfo, 违反"每小局显示得分"业务
+	//   - **不调** MulticastShowFinalSettlement: 它是全局结算才用, 非小局结束
+	//   - 现有 OnWinStatsUpdated 委托链路已存在 UI 订阅 (GameHUDWidget::UpdateTeamKillCountsText)
+	//     → 累加后 UI 自动刷新 (镜像 MulticastRefreshKillCount 调用方式)
+	const FGameplayTag WinnerFaction = (NewWinner == EZombieRoundWinner::Human)
+		? FFactionTags::Defense()
+		: FFactionTags::Offense();
+	RoomGS->AddRoundWinToFaction(WinnerFaction);
+
+	// 步骤 4: 广播音效 (新增 MulticastPlayZombieRoundSound — 由 GameHUDWidget 订阅)
+	//   - 大厂原则 — 零重复架构: 不重用 OnEnterSettlement RPC (它会隐藏 UI)
+	//   - 单独建一条 RPC 链路, 专用于"小局结束音效", 客户端 OnRep 查 GameMode 音效表 + 播放
+	//   - 因为 UObject* 不能跨 RPC (UE 5.6), 仅传枚举 + FactionTag, 客户端查 USoundBase*
+	RoomGS->MulticastPlayZombieRoundSound(NewWinner);
+	//   - 已绑定: UGameHUDWidget::OnZombieRoundSoundReceived (Multicast RPC 触发 → 查 GameMode 音效 + 播放)
+
+	// 【v201 大厂架构修复】只有最后一局才进入结算页面
+	//   - 非最后一局: 短暂显示胜负文本 (3秒), 然后延迟开始下一小局
+	//   - 最后一局: 进入全局结算页面
+	if (RoomGS->CurrentRound <= 1)
+	{
+		// 最后一局: 广播进入结算页面
+		RoomGS->MulticastEnterSettlement(RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills, NewWinner);
+		RoomGS->ScheduleFinalSettlement(3.0f);
+	}
+	else
+	{
+		// 非最后一局: 短暂显示小局结果 (3秒后自动隐藏), 不进入结算页面
+		RoomGS->MulticastShowZombieRoundBriefResult(NewWinner);
+
+		// 【v201.4 大厂架构新增】短暂结果显示需要3秒，等待后开始下一小局
+		//   - 先清理旧的Timer防残留
+		//   - 3秒延迟确保玩家能看到小局结果提示
+		GetWorld()->GetTimerManager().ClearTimer(RoundTransitionTimerHandle);
+		GetWorld()->GetTimerManager().SetTimer(RoundTransitionTimerHandle, this,
+			&URoomLifecycleSubsystem::OnRoundTransitionTimerExpired, 3.0f, false);
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] FinishZombieRound: 生化本小局结算完成. RoundWinner=%d, AttackerWins=%d, DefenderWins=%d. %s"),
+		static_cast<int32>(NewWinner), RoomGS->AttackerWins, RoomGS->DefenderWins,
+		(RoomGS->CurrentRound <= 1) ? TEXT("最后一局, 进入全局结算.") : TEXT("还有下一局, 短暂显示结果后进入下一小局."));
+
+	return true;
 }
 
 bool URoomLifecycleSubsystem::HandleZombieRoundEnd()
@@ -278,8 +510,19 @@ bool URoomLifecycleSubsystem::HandleZombieRoundEnd()
 		return false;
 	}
 
+	// 【v134 大厂架构重构】HandleZombieRoundEnd 现在只判断"是否还有下一回合"
+	//   - 胜负判定 + RoundWinner 写入 + 胜局数累加 + Multicast 全部走 FinishZombieRound 单一入口
+	//   - 旧版 HandleZombieRoundEnd 自己算胜负 = 重复架构 — 已废弃
+	//
+	// 大厂原则 — 零重复架构:
+	//   - 调用方 (RoomGameMode 委托 / 外部 BP 触发) → HandleZombieRoundEnd 入口
+	//   - 内部: 先调 FinishZombieRound (统一结算) → 然后判断 CurrentRound <= 1 (决定下一局)
+	//   - 单一真理源: FinishZombieRound 是"本小局结束"业务唯一入口
+	const bool bHasMoreRounds = FinishZombieRound();
+
 	if (RoomGS->CurrentRound <= 1)
 	{
+		// 最后一局: 清理资源和关闭母体变异倒计时
 		UE_LOG(LogTemp, Log, TEXT("生化模式全部 %d 回合结束, 准备进入全局结算..."), RoomGS->TotalRounds);
 		// 【v92 大厂架构】全部回合结束, 关闭母体变异倒计时
 		ResetMotherMutationCountdown();
@@ -287,10 +530,14 @@ bool URoomLifecycleSubsystem::HandleZombieRoundEnd()
 		return false; // 没有下一回合
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("第 %d/%d 回合结束"), RoomGS->TotalRounds - RoomGS->CurrentRound, RoomGS->TotalRounds);
-	// 【v92 大厂架构】本局结束, 关闭倒计时 (下一局由 StartNextZombieRound 重新启动)
+	// 【v201.4 大厂架构修复】非最后一局: 短暂结果显示已由 FinishZombieRound 末尾设置Timer
+	//   - Timer 3秒后调用 OnRoundTransitionTimerExpired → StartNextZombieRound
+	//   - 这里只关闭母体变异倒计时
+	UE_LOG(LogTemp, Log, TEXT("第 %d/%d 回合结束, 短暂结果显示中..."),
+		RoomGS->TotalRounds - RoomGS->CurrentRound, RoomGS->TotalRounds);
 	ResetMotherMutationCountdown();
-	return true; // 还有下一回合, 调用方应调 StartNextZombieRound
+
+	return true; // 下一回合由Timer触发
 }
 
 bool URoomLifecycleSubsystem::StartNextZombieRound()
@@ -301,11 +548,24 @@ bool URoomLifecycleSubsystem::StartNextZombieRound()
 		return false;
 	}
 
+	// 【v134 大厂架构修复】调 ResetRoundWinner 确保下一局开始时 RoundWinner = None
+	//   - 幂等防御: RoundWinner = None → 本局未开, 避免 OnRep_RoundWinner 触发非法结算
+	//   - 影像: 复制到客户端, UGameHUDWidget 订阅的 OnRoundWinnerUpdated 不会混乱
+	RoomGS->ResetRoundWinner();
+
 	RoomGS->CurrentRound--;
 	UE_LOG(LogTemp, Log, TEXT("第 %d/%d 回合开始"), RoomGS->TotalRounds - RoomGS->CurrentRound + 1, RoomGS->TotalRounds);
 
 	// 重新启动比赛计时器 (使用与首局相同的 ZombieMatchDurationSeconds, 重置 MatchEndTime)
 	StartMatchTimer();
+
+	// 【v201 大厂架构新增】小局结束后重新分配所有人类玩家到 HumanSurvivor 复活点
+	//   - 必须在 StartMatchTimer 之后调用 (确保计时器重新开始)
+	//   - 必须在 StartMotherMutationCountdown 之前调用 (确保新回合开始时玩家在新位置)
+	if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+	{
+		SpawnSys->RestartZombieRoundPlayers();
+	}
 
 	// 【v108 大厂架构】新回合开始, 重启母体变异倒计时
 	// 重置母体账本 (跨回合累积 Bug 修复: AliveMotherCount=120)
@@ -649,6 +909,46 @@ void URoomLifecycleSubsystem::OnAirdropIntervalExpired()
 	//   - 复用 StartAirdropCountdown 的全部校验 (模式/配置/母体变异状态)
 	//   - 防止"降临完后没下一轮, 玩家永远吃不到补给"
 	NotifyAirdropArrivalCompleted();
+}
+
+/**
+ * 【v201.4 大厂架构新增】小局短暂结果显示后延迟回调
+ *
+ * 业务规则: 非最后一局时, FinishZombieRound 显示3秒短暂提示
+ *           3秒后本函数被Timer调用 → StartNextZombieRound 开始下一小局
+ */
+void URoomLifecycleSubsystem::OnRoundTransitionTimerExpired()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] OnRoundTransitionTimerExpired: World 为空, 拒绝开始下一小局. 【防御】Timer 回调时 World 不应为空."));
+		return;
+	}
+
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] OnRoundTransitionTimerExpired: GameState 为空, 拒绝开始下一小局."));
+		return;
+	}
+
+	// 额外安全检查: CurrentRound <= 1 说明已经是最后一局或已结束
+	if (RoomGS->CurrentRound <= 1)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomLifecycle] OnRoundTransitionTimerExpired: CurrentRound=%d <= 1, 已是最后一局或已结束, 不再开始下一小局."),
+			RoomGS->CurrentRound);
+		return;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] OnRoundTransitionTimerExpired: 短暂结果显示完毕, 开始第 %d/%d 回合."),
+		RoomGS->TotalRounds - RoomGS->CurrentRound + 1, RoomGS->TotalRounds);
+
+	StartNextZombieRound();
 }
 
 

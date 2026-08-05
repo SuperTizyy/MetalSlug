@@ -3814,3 +3814,108 @@ Owner->SetLifeSpan(0.1f);
 
 ---
 
+## 18. v201.6 (2026.08.06) 所有模式复活移动锁定 + 无敌闪烁 + 出生音效统一
+
+### 业务需求 (用户 2026.08.06)
+
+```
+1. 生化模式：每小局玩家出生（AI+玩家）都需要 RespawnDelaySeconds 和显示复活时间，和出生角色身上闪烁的功能。
+2. 所有模式玩家每次出生都需要播放出生音效
+```
+
+### 核心架构决策
+
+| 功能 | 实现方式 | 触发点 |
+|---|---|---|
+| **复活移动锁定** | `HealthComponent::ActivateRespawnMovementLock` → `OnRespawnMovementLockedChanged` → HUD 显示倒计时 | 所有出生路径 |
+| **无敌闪烁** | `ActivateSpawnInvincibility` → `OnInvincibilityChanged` → `FlickerComponent` 驱动材质参数 | 所有出生路径 |
+| **出生音效** | `Multicast_PlaySpawnSound` → `SpawnSoundComponent::PlaySpawnSound` | 所有出生路径 |
+| **HUD 倒计时** | `RespawnProgressWidget` 订阅 `OnRespawnMovementLockedChanged` | GameHUDWidget |
+
+### 所有出生路径统一激活
+
+| 出生场景 | 移动锁定 | 无敌闪烁 | 出生音效 |
+|---------|---------|---------|---------|
+| 玩家开局 | ✓ | ✓ | ✓ |
+| AI 开局 | ✓ | ✓ | ✓ |
+| 玩家复活 | ✓ | ✓ | ✓ |
+| AI 复活 | ✓ | ✓ | ✓ |
+| 母体复活 | ✓ | ✓ | ✓ |
+| 生化小局开始 | ✓ | ✓ | ✓ |
+
+### 关键文件清单 (v201.6)
+
+```
+新增:
++ MetalSlug01/Source/MetalSlug01/Public/Components/SpawnSoundComponent.h
++ MetalSlug01/Source/MetalSlug01/Private/Components/SpawnSoundComponent.cpp
+
+修改:
+~ MetalSlug01/Source/MetalSlug01/Public/UI/Game/Widgets/RespawnProgressWidget.h
+ + ShowMovementLock / HideMovementLock 方法
+ + bListeningToMovementLock / MovementLockRemainingSeconds 状态字段
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/Widgets/RespawnProgressWidget.cpp
+ + ShowMovementLock / HideMovementLock / UpdateMovementLockProgress 实现
+ ~ NativeTick: 添加移动锁定倒计时处理
+
+~ MetalSlug01/Source/MetalSlug01/Public/UI/Game/GameHUDWidget.h
+ + OnRespawnMovementLockedChanged 回调声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Game/GameHUDWidget.cpp
+ + 订阅 CharacterEvents.OnRespawnMovementLockedChanged
+ + OnRespawnMovementLockedChanged 实现
+
+~ MetalSlug01/Source/MetalSlug01/Public/Components/CharacterEvents.h
+ + OnRespawnMovementLockedChanged 事件声明
+ + BroadcastRespawnMovementLockChanged 转发方法
+
+~ MetalSlug01/Source/MetalSlug01/Private/Components/CharacterEvents.cpp
+ + BroadcastRespawnMovementLockChanged 实现
+
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + SpawnSoundComponent 子对象
+ + ResolveSpawnSoundComponent lazy resolve
+ + Multicast_PlaySpawnSound RPC 声明
+ + HandleHealthComponentRespawnMovementLockChanged 回调声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ + SpawnSoundComponent 创建
+ + HandleHealthComponentRespawnMovementLockChanged 实现
+ + Multicast_PlaySpawnSound_Implementation 实现
+
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/Spawn/RoomSpawnSubsystem.cpp
+ + HandlePlayerRequestSpawn: 添加 Multicast_PlaySpawnSound 调用
+ + SpawnAIInternal: 添加 Multicast_PlaySpawnSound 调用
+ + MutatePawnToMother: 添加 ActivateSpawnInvincibility + Multicast_PlaySpawnSound 调用
+ + RestartZombieRoundPlayers: 添加玩家/AI 的移动锁定 + 无敌闪烁 + 出生音效
+```
+
+### UE 编辑器配置
+
+1. **出生音效资产** (可选):
+   - 在角色 BP (BP_SWAT_C / BP_GruntAI) → Components → SpawnSoundComponent
+   - Details → Spawn Sound 字段 → 拖入 USoundBase 资产
+
+2. **复活延迟时间**:
+   - `GM_RoomGameMode` → Class Defaults → Respawn Delay Seconds
+
+3. **无敌闪烁材质**:
+   - 角色身体材质需要 `FlickerAmount` 标量参数
+
+### 待用户验证 (v201.6)
+
+1. UE 5.6 编辑器编译无错
+2. PIE 中:
+ - 玩家出生 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+ - AI 出生 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+ - 玩家复活 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+ - AI 复活 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+ - 母体复活 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+ - 生化小局开始 → 移动锁定 + 无敌闪烁 + 出生音效 ✓
+3. HUD 显示移动锁定倒计时正确
+4. 无敌闪烁在复活后持续可见
+5. 出生音效在所有出生场景播放
+
+---
+

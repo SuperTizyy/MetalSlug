@@ -15,6 +15,12 @@
 //   CS:GO / Apex / PUBG / Fortnite: 子弹从枪口射出，方向对准星
 //   你的 v60.16: 完全一致
 //
+// 【vXXX P0 关键修复 — 玩家路径适用所有端玩家】
+//   - 旧版 v109 用 IsLocalController() 判定 → 只有 ListenServer 自己玩家走公式
+//   - 远端客户端玩家(普通客户端玩家)被错判到 "AI 路径" → 起点 = 相机位置 ≠ 武器位置
+//   - 新版 vXXX 用 Cast<APlayerController> 类型判定 → 任何端玩家都走公式
+//   - 与 v110 GetAimRayFromCrosshairOrEyes 的"类型判定 SSOT" 完全一致
+//
 // 【设计动机 — 生化模式枪械核心】
 //   旧 BaseWeapon.cpp Tick() 写死 BoxTrace → 枪械需要 LineTrace
 //   抽出后所有"用枪的算法"集中本类，BaseWeapon 0 算法

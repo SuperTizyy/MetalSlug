@@ -9,6 +9,7 @@
 #include "Components/Image.h"
 #include "Kismet/GameplayStatics.h"
 #include "Systems/RoomGameState.h"
+#include "Data/Enums/RoomEnums.h" // 【v134 大厂架构修复】显式 include, 不依赖 transitive (v40.5.1 教训)
 
 
 // ==========================================
@@ -122,6 +123,13 @@ void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime
 		if (CachedGameState)
 		{
 			CachedGameState->OnTeamKillCountUpdated.AddDynamic(this, &UMatchInfoWidget::OnTeamKillCountChanged);
+
+			// 【v134 大厂架构新增】绑定事件: 小局胜局数 (GameState.AddRoundWinToFaction 触发)
+			//   - 单一真理源: RoomGS->OnWinStatsUpdated
+			//   - 与 OnTeamKillCountUpdated 镜像, 但语义不同: 击杀数 vs 胜局数
+			//   - 大厂原则 — 显式优于隐式: 模式分支由本 Widget 内部按 CurrentMatchMode 决定显示谁
+			//   - 不破坏刀战模式: 刀战永不调 AddRoundWinToFaction, 该绑定无影响
+			CachedGameState->OnWinStatsUpdated.AddDynamic(this, &UMatchInfoWidget::OnWinStatsChanged);
 
 			// 【修复】: 绑定后立即读取 GameState 上的最新值（而非使用本地的旧值）
 			// 解决 OnRep_TeamKillCount 在绑定之前就触发、绑定时值为旧数据的问题
@@ -300,6 +308,51 @@ void UMatchInfoWidget::OnTeamKillCountChanged(int32 AttackerKills, int32 Defende
 		UE_LOG(LogTemp, Log, TEXT("[MatchInfoWidget] OnTeamKillCountChanged: 直接读取 GameState -> 攻方=%d, 守方=%d"),
 			CachedGameState->AttackerTotalKills, CachedGameState->DefenderTotalKills);
 	}
+}
+
+
+/**
+ * UMatchInfoWidget::OnWinStatsChanged (v134 大厂架构新增)
+ *
+ * 业务规则 (用户 2026.08.06 明确):
+ *   - 生化模式每小局结束时, AttackerWins / DefenderWins 累加 → 显示在 Text_AttackerCount / Text_DefenderCount
+ *
+ * 大厂原则 — 镜像 OnTeamKillCountChanged:
+ *   - 直接读 CachedGameState (OnRep 触发时参数可能滞后, 镜像 KillCount 修复)
+ *
+ * 大厂原则 — 模式分支 (大厂原则 — 显式优于隐式):
+ *   - Zombie 模式: 显示 AttackerWins / DefenderWins (小局胜局数, 新业务)
+ *   - Melee 模式: 不刷新 (本回调永不触发, 但防御性跳过避免脏数据)
+ *
+ * 大厂原则 — 零兜底:
+ *   - CachedGameState 为空 → Log Error + return (无法读 GameState, 配置错必须暴露)
+ */
+void UMatchInfoWidget::OnWinStatsChanged(int32 AttackerWins, int32 DefenderWins)
+{
+	if (!CachedGameState)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] OnWinStatsChanged: CachedGameState 为空, 无法刷新小局胜局数! "
+			     "【修复】检查 NativeTick 绑定 GameState 链路是否被阻断."));
+		return;
+	}
+
+	// 大厂原则 — 模式分支: 仅 Zombie 模式刷新 Text
+	//   - Melee 模式下本回调永不触发, 但防御性跳过避免未来误连
+	if (CachedGameState->CurrentMatchMode != ERoomMatchMode::Zombie)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[MatchInfoWidget] OnWinStatsChanged: 当前模式=%d, 非 Zombie, 跳过刷新 (按业务规则)."),
+			static_cast<int32>(CachedGameState->CurrentMatchMode));
+		return;
+	}
+
+	// 直接读 GameState (与 OnTeamKillCountChanged 镜像修复路径)
+	UpdateAttackerCount(CachedGameState->AttackerWins);
+	UpdateDefenderCount(CachedGameState->DefenderWins);
+	UE_LOG(LogTemp, Log,
+		TEXT("[MatchInfoWidget] OnWinStatsChanged: 刷新小局胜局数 (Zombie) -> AttackerWins=%d, DefenderWins=%d"),
+		CachedGameState->AttackerWins, CachedGameState->DefenderWins);
 }
 
 

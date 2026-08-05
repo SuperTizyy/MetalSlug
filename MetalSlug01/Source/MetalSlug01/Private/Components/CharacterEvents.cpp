@@ -272,6 +272,29 @@ bool UCharacterEvents::GetCachedMotherSkillCooldown(float& OutCooldownRemaining,
 }
 
 
+// ==========================================
+// 【v201.6 大厂架构新增】复活移动锁定事件转发
+// ==========================================
+
+/**
+ * UCharacterEvents::BroadcastRespawnMovementLockChanged
+ *
+ * 转发复活移动锁定状态变化 - 用于 HUD 显示移动锁定倒计时
+ * 由 BaseCharacter 在 BeginPlay 中订阅 HealthComponent 的 OnRespawnMovementLockedChanged 时调用
+ *
+ * @param bIsLocked true=进入锁定(显示倒计时), false=退出锁定(隐藏倒计时)
+ * @param Duration 锁定时长(秒)
+ */
+void UCharacterEvents::BroadcastRespawnMovementLockChanged(bool bIsLocked, float Duration)
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[CharacterEvents] BroadcastRespawnMovementLockChanged: bIsLocked=%d Duration=%.2f"),
+		bIsLocked ? 1 : 0, Duration);
+
+	OnRespawnMovementLockedChanged.Broadcast(bIsLocked, Duration);
+}
+
+
 /**
  * UCharacterEvents::SetCachedACValue
  */

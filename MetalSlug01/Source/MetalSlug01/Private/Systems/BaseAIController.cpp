@@ -991,6 +991,82 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 	}
 }
 
+
+// ==========================================
+// 【v201.10 大厂架构新增】RestartBehaviorTreeAndClearBlackboard
+// ==========================================
+//
+// 业务场景: RestartZombieRoundPlayers (每小局开始前)
+//   - 旧 (v201.9 之前): BT 在第二小局仍持有第一小局的 BB 数据 (TargetActor/CooldownEndTime/HealthPercent 等)
+//     → 旧 BT 数据污染, BT Service 0.1s 后才重新派生 — AI 0.1s 不动 + 数据延迟
+//   - 用户反馈 (2026.08.06): "AI 在每小局开始前应该先清理所有黑板键的数据再启动"
+//   - 修复: 停 BT → 清空所有 BB Key → 重启 BT (让 BT Service 立即重新派生, 0 延迟)
+//
+// 大厂原则:
+//   - 单一入口: 所有"重启 BT + 清空 BB"需求都走这一处
+//   - 零兜底: BT/BB 为空 → Log Warning (不静默跳过, 强制策划修复)
+//   - BT 重启 vs BB 清空: 顺序必须先停 BT 再清 BB, 否则 BT 还在跑会读到清空的 BB Key 报错
+void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
+{
+	UE_LOG(LogBaseAI, Warning,
+		TEXT("[%s] 【v201.10】RestartBehaviorTreeAndClearBlackboard ENTER: "
+			 "重启 BT + 清空 Blackboard (小局开始时使用)."),
+		*GetName());
+
+	// Step 1: 停 BT (如果正在运行)
+	if (UBehaviorTreeComponent* BTComp = Cast<UBehaviorTreeComponent>(BrainComponent))
+	{
+		if (BTComp->IsRunning())
+		{
+			UE_LOG(LogBaseAI, Log,
+				TEXT("[%s] 【v201.10】停 BT (Running=1)."), *GetName());
+			BTComp->StopTree(EBTStopMode::Safe);
+		}
+	}
+	else
+	{
+		UE_LOG(LogBaseAI, Warning,
+			TEXT("[%s] 【v201.10】BrainComponent 不是 BehaviorTreeComponent (Class=%s). "
+				 "跳过停 BT 步骤, 但仍尝试清空 BB."),
+			*GetName(), BrainComponent ? *BrainComponent->GetClass()->GetName() : TEXT("null"));
+	}
+
+	// Step 2: 清空 BB 所有 Key (关键: 必须在停 BT 之后)
+	// 【v201.10.1 UE 5.6 API 修复】UE 5.6 删除了 ClearValues() 和 GetKeysCount()
+	//   - 旧: BB->ClearValues() / BB->GetKeysCount()
+	//   - 新: GetBlackboardAsset()->GetKeys() 遍历 → 每个 Key 调 ClearValue(FName)
+	if (UBlackboardComponent* BB = GetBlackboardComponent())
+	{
+		int32 ClearedCount = 0;
+		if (const UBlackboardData* BBData = BB->GetBlackboardAsset())
+		{
+			for (const FBlackboardEntry& Entry : BBData->GetKeys())
+			{
+				BB->ClearValue(Entry.EntryName);
+				++ClearedCount;
+			}
+		}
+		UE_LOG(LogBaseAI, Log,
+			TEXT("[%s] 【v201.10.1】清空 Blackboard 全部 Key (数量=%d, 数据全部重置)."),
+			*GetName(), ClearedCount);
+	}
+	else
+	{
+		UE_LOG(LogBaseAI, Warning,
+			TEXT("[%s] 【v201.10.1】BlackboardComponent 为空! "
+				 "无法清空 Key — BT Service 重启后会用上一次的值. "
+				 "【修复】检查 AIC 初始化时 UseBlackboard 是否成功."),
+			*GetName());
+	}
+
+	// Step 3: 重启 BT (走 TryStartBehaviorTreeOrWaitForBattleStart 自动判断是否需要等 OnBattleStarted)
+	TryStartBehaviorTreeOrWaitForBattleStart();
+	UE_LOG(LogBaseAI, Warning,
+		TEXT("[%s] 【v201.10】RestartBehaviorTreeAndClearBlackboard DONE: BT 已重启, BB 已清空, "
+			 "BT Service 0.1s 后重新派生 (清空立即生效, 派生延迟极短)."),
+		*GetName());
+}
+
 // StartBehaviorTreeFromConfigInternal：从 Profile 启动行为树，加载行为树资源并运行
 void ABaseAIController::StartBehaviorTreeFromConfigInternal()
 {

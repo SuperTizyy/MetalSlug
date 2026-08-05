@@ -85,6 +85,18 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnAirdropCountdownChanged, float, 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchModeChanged, ERoomMatchMode, NewMode);
 
 /**
+ * 【v134 大厂架构新增】生化小局赢家变化委托 (RoundWinner 字段同步)
+ *
+ * 单一真理源:
+ *   - 服务器 URoomLifecycleSubsystem::FinishZombieRound(Writer) 写入 RoundWinner
+ *   - 客户端 OnRep_RoundWinner → Broadcast OnRoundWinnerUpdated
+ *   - UGameHUDWidget 缓存字段, OnEnterSettlement 触发时根据 ClientFactionTag 查表播音效
+ *
+ * 不传声音: 音效查表是 GameMode 配置 (USoundBase*), 不是 Replicated 字段 (UE 不复制 UObject 指针)
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoundWinnerUpdated, EZombieRoundWinner, NewWinner);
+
+/**
  * @brief 双方击杀人数变化委托
  * @param AttackerKills 攻方击杀数
  * @param DefenderKills 守方击杀数
@@ -95,8 +107,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnTeamKillCountUpdated, int32, Att
  * @brief 进入结算状态委托（倒计时归零时触发，3秒延迟后显示最终结果）
  * @param AttackerKills 攻方当局击杀数
  * @param DefenderKills 守方当局击杀数
+ * @param RoundWinner 本局赢家 (Human=人类胜利, Mother=幽灵胜利, None=平局)
+ *                         — 刀战复用 EZombieRoundWinner: Attacker胜=Mother, Defender胜=Human
  */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnEnterSettlementDelegate, int32, AttackerKills, int32, DefenderKills);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnEnterSettlementDelegate, int32, AttackerKills, int32, DefenderKills, EZombieRoundWinner, RoundWinner);
 
 /**
  * @brief 显示最终结算委托（3秒延迟后触发，显示哪方获胜及总比分）
@@ -633,6 +647,30 @@ public:
 	FOnTeamKillCountUpdated OnWinStatsUpdated;
 
 	/**
+	 * 【v134 大厂架构新增】服务器专用: 累加胜局数 (单一真理源入口)
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 母体赢 → AttackerWins++
+	 *   - 人类赢 → DefenderWins++
+	 *
+	 * 大厂原则 — 镜像 SetRoundWinner:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - 客户端调用 → Log Error + return
+	 *   - 写入后 UE 引擎自动 Replicate 触发 OnRep_WinStats → 所有客户端 UI 刷新
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - FactionTag 非 Offense/Defense → Log Error + 拒绝累加
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishZombieRound (本小局结束唯一入口)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战使用 TriggerSettlement 旧链路 (比较击杀数), 本 API 仅用于 Zombie 模式
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie")
+	void AddRoundWinToFaction(FGameplayTag WinnerFactionTag);
+
+	/**
 	 * 进入结算状态的广播事件（触发 UI 显示比分面板，3秒后显示最终结果）
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement")
@@ -651,12 +689,190 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Room|Settlement")
 	void TriggerSettlement();
 
-private:
+	// ==========================================
+	// 【v134 大厂架构新增】生化模式小局赢家 (单一真理源)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.06 明确):
+	//   - 每小局结束时, 服务器写入本字段 (Replicated)
+	//   - 客户端 OnRep_RoundWinner → Broadcast OnRoundWinnerUpdated
+	//   - UGameHUDWidget 缓存字段 + OnEnterSettlement 触发时查 GameMode 音效 + 播放
+	//
+	// 大厂原则 — 单一真理源 + 零兜底:
+	//   - 不允许其他类创建自定义"哪边赢"判定 — 全部走 URoomLifecycleSubsystem::FinishZombieRound → SetRoundWinner
+	//   - 服务器手动 Broadcast (自身 OnRep 不触发), 客户端 OnRep 自动 Broadcast
+	//   - SetRoundWinner 调用方: URoomLifecycleSubsystem::FinishZombieRound (本小局结束唯一入口)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战永不写 RoundWinner (业务上不适用), 字段保持 None, UI 不订阅
+
 	/**
+	 * 本小局赢家 (Replicated)
+	 *   - None: 尚未结算 / 非生化模式
+	 *   - Human: 至少还有一个 人类阵营 (Defense) 且 存活 的 Pawn (玩家 + AI 都算)
+	 *   - Mother: 所有人类都死了 → 母体赢
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_RoundWinner, BlueprintReadOnly, Category = "Room|Settlement|Zombie")
+	EZombieRoundWinner RoundWinner = EZombieRoundWinner::None;
+
+	/**
+	 * RoundWinner 复制回调 (客户端) — 触发 OnRoundWinnerUpdated 广播
+	 * 大厂原则 — UE 5.6 OnRep: 必须用 UFUNCTION() 标记
+	 */
+	UFUNCTION()
+	void OnRep_RoundWinner();
+
+	/**
+	 * UI 监听的委托: RoundWinner 变化时刷新 UI 音效缓存 / 胜负展示
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
+	FOnRoundWinnerUpdated OnRoundWinnerUpdated;
+
+	/**
+	 * 【v134 大厂架构新增】服务器专用: 推送生化小局音效到所有客户端
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 每小局结束时, 服务器调本函数
+	 *   - 所有客户端 (包括房主) 收到后, UGameHUDWidget 订阅端查 GameMode 配置的 USoundBase + 播放
+	 *
+	 * 大厂原则 — RPC 纯数据 (UE 5.6 UObject 指针跨网络限制):
+	 *   - 不传 USoundBase* (跨 RPC 会被 UE 引擎 GC 风险毁掉)
+	 *   - 仅传 RoundWinner (枚举) — 客户端查 GameMode 缓存的 USoundBase
+	 *
+	 * 大厂原则 — 单一真理源 + 零兜底:
+	 *   - 客户端 Implementation 内: USoundBase 为空 → Log Error + 跳过 (不让音效缺失卡住业务)
+	 *   - 客户端不查 GameMode → 走 Log Error, 强制修复 BP 资产配置
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishZombieRound (本小局结束唯一入口)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战永不调本函数, RPC 永远不发
+	 *
+	 * @param InRoundWinner 本小局赢家 (必须为 Human 或 Mother, 不允许 None)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastPlayZombieRoundSound(EZombieRoundWinner InRoundWinner);
+
+	/**
+	 * 客户端拿到小局音效 RPC 时的回调 (由 _Implementation 内部 Broadcast)
+	 */
+	void HandleZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner);
+
+	/**
+	 * UI 监听的小局音效广播委托 (Multicast RPC 收到后推送)
+	 *
+	 * 大厂原则 — 公开层级 (v134 v2 修复):
+	 *   - 必须 UPROPERTY(BlueprintAssignable) 在 public 区, 否则 UE 5.6 生成 AddDynamic 不可访问
+	 *   - 镜像 OnRoundWinnerUpdated (line 727) 公开层级
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
+	FOnRoundWinnerUpdated OnZombieRoundSoundReceived;
+
+	/**
+	 * 【v201 大厂架构新增】短暂显示小局结果委托
+	 *   - MulticastShowZombieRoundBriefResult RPC 触发
+	 *   - UI 层订阅后显示胜负文本，3 秒后自动隐藏
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
+	FOnRoundWinnerUpdated OnZombieRoundBriefResult;
+
+	/**
+	 * 【v200.2 大厂架构修复】从 private 移到这里，允许 LifecycleSubsystem 调用
 	 * 延迟3秒后广播最终结算（供内部 Timer 调用）
 	 */
 	UFUNCTION()
 	void BroadcastFinalSettlement();
+
+	/**
+	 * 【v200.2 大厂架构新增】设置结算定时器（供 LifecycleSubsystem 调用）
+	 * 统一管理 SettlementTimerHandle，避免外部直接访问 private 字段
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement")
+	void ScheduleFinalSettlement(float DelaySeconds = 3.0f);
+
+	/**
+	 * 【v200.2 大厂架构修复】从 private 移到这里，允许 LifecycleSubsystem 调用
+	 * 【网络架构修复 v200.1】: NetMulticast 确保所有客户端都能收到进入结算通知（显示 Text_GameOver）
+	 * 【新增】: 增加 RoundWinner 参数，用于显示"人类胜利"或"幽灵胜利"文本
+	 *
+	 * @param InAttackerKills 攻方当局击杀数
+	 * @param InDefenderKills 守方当局击杀数
+	 * @param InRoundWinner 本局赢家 (EZombieRoundWinner::Human=人类胜利, Mother=幽灵胜利, None=平局)
+	 *                          — 刀战复用 EZombieRoundWinner: Attacker胜=Mother, Defender胜=Human
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastEnterSettlement(int32 InAttackerKills, int32 InDefenderKills, EZombieRoundWinner InRoundWinner);
+
+	/**
+	 * 【v201 大厂架构新增】短暂显示小局结果（不进入结算页面）
+	 *
+	 * 业务场景:
+	 *   - 每小局结束时显示"人类胜利"或"母体胜利"
+	 *   - 显示 3 秒后自动隐藏
+	 *   - 不进入结算页面，继续下一小局
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishZombieRound (非最后一局时调用)
+	 *
+	 * @param InRoundWinner 本小局赢家 (EZombieRoundWinner::Human=人类胜利, Mother=母体胜利)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastShowZombieRoundBriefResult(EZombieRoundWinner InRoundWinner);
+
+	/**
+	 * 服务器专用: 设置本小局赢家 (大厂原则 — 显式优于隐式)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - InWinner 必须为 Human 或 Mother, 不允许传 None (大厂原则 — 显式优于隐式, 拒绝静默清空)
+	 *   - 服务器写入字段后立即手动 Broadcast (镜像 SetTotalRounds 等其他字段)
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishZombieRound (服务器本小局结束唯一入口)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie")
+	void SetRoundWinner(EZombieRoundWinner InWinner);
+
+	/**
+	 * 服务器专用: 重置 RoundWinner 为 None (新小局开始 / 模式切换)
+	 *
+	 * 大厂原则 — 镜像 ResetMotherMutationHasFired:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - 调用方: URoomLifecycleSubsystem::StartNextZombieRound / StartMotherMutationCountdown
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie")
+	void ResetRoundWinner();
+
+	/**
+	 * 服务器查询: 当前场上 人类存活判定 结果 (大厂架构 — enum 替代 bool, 修复 v134 v3 兜底 bug)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 唯一"人验收者"判定入口, URoomLifecycleSubsystem 调本函数决定 FinishZombieRound(Human/Mother)
+	 *   - 判定逻辑: 遍历 World->GetAuthGameMode->PlayerArray (玩家) + ABaseAIController 下的 Pawn (AI) →
+	 *                筛选 FactionTag == Defense 且 IsDead=false 的 Pawn
+	 *
+	 * 大厂原则 — 零兜底 (v134 v4 修复 — "一进游戏就播母体赢音效" bug):
+	 *   - 旧版返回 bool, 0 存活 Pawn 时返回 false, 被 LifecycleSubsystem 错误解释为"母体赢"
+	 *   - 触发链: 1s 间隔 MatchTimerTick 在 MatchStartDelay (3s) Spawn 完成前触发
+	 *     → HasAliveHumanOnField 看到 0 Pawn → 返回 false → FinishZombieRound → Mother 赢音效播放
+	 *   - 新版返回 enum:
+	 *     - EHASResult::HasAliveHuman: 至少有 1 个 Defense + 活着的 Pawn
+	 *     - EHASResult::NoAliveHuman: 没有 Defense + 活着的 Pawn (但有其他 Pawn)
+	 *     - EHASResult::NoData: 场上 0 Pawn (无玩家 + 无 AI, 业务上不可能, 配置错或时序未到)
+	 *   - 调用方收到 NoData 必须跳过本 Tick 结算, 不允许走 finish 路径
+	 *
+	 * 失败诊断:
+	 *   - 找到 Pawn 但 FactionTag 为空 → Log Error + 跳过 (不计入, 防止空阵营当人类)
+	 *   - NoData 时 Log Warning (业务上罕见, 时序竞速 或 Spawn 异常)
+	 *
+	 * 不破坏刀战模式:
+	 *   - 刀战模式永不调本函数, 但本函数本身对所有模式都可调 (返回 NoData 也无害)
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Settlement|Zombie")
+	EHASResult HasAliveHumanOnField() const;
+
+private:
 
 	/**
 	 * 【网络架构修复】: NetMulticast 确保包括房主在内的所有客户端都能收到最终结算广播
@@ -664,12 +880,6 @@ private:
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void MulticastShowFinalSettlement(int32 InAttackerWins, int32 InDefenderWins);
-
-	/**
-	 * 【网络架构修复】: NetMulticast 确保所有客户端都能收到进入结算通知（显示 Text_GameOver）
-	 */
-	UFUNCTION(NetMulticast, Reliable)
-	void MulticastEnterSettlement(int32 InAttackerKills, int32 InDefenderKills);
 
 	/**
 	 * 结算定时器句柄（持久化，避免局部变量在延迟期间失效）

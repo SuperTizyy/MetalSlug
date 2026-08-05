@@ -47,6 +47,8 @@
 // 【P0 2026.07.06】OnAIAttackMontageEnded 需要通知 AIController 解锁
 // 引入 BaseAIController.h 以便 Cast<ABaseAIController>
 #include "Systems/BaseAIController.h"
+// 【v201.5 大厂架构新增】OnRespawnMovementLockedChanged 需要 AIRuntimeConfigComponent::GetScaledMovement()
+#include "Systems/AI/AIRuntimeConfigComponent.h"
 #include "UI/MyGameHUD.h"
 #include "UI/Game/GameHUDWidget.h"
 #include "Systems/Core/RoomPlayerState.h"
@@ -204,6 +206,9 @@ ABaseCharacter::ABaseCharacter()
 	//   - 实际触发由 Multicast_PlayMutationFX 统一分发, 不走 OnRep
 	MotherSpawnSound = CreateDefaultSubobject<UMotherSpawnSoundComponent>(TEXT("MotherSpawnSound"));
 
+	// 【v201.6 大厂架构新增】通用出生音效组件 — 所有角色都挂载
+	SpawnSoundComponent = CreateDefaultSubobject<USpawnSoundComponent>(TEXT("SpawnSoundComponent"));
+
 	// 【v100 大厂架构新增】击杀音效组件 — 通用
 	//   - 所有角色都挂载(零架构分支), 无论玩家 / AI / Mother / 普通角色
 	//   - 触发由 Multicast_NotifyKill 统一分发 — 复用现有 RPC(零新建)
@@ -218,8 +223,8 @@ ABaseCharacter::ABaseCharacter()
 	//   - bUseOwnerMesh 默认 false (StartMotherTrace 内置 true)
 	MotherTraceStrategy = CreateDefaultSubobject<UMeleeSwStrategy>(TEXT("MotherTraceStrategy"));
 
-	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p MotherSpawnParticle=%p MotherSpawnSound=%p KillSound=%p MotherLowHealthFlicker=%p MotherSlowComponent=%p MotherSkillComponent=%p"),
-		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get(), MotherSpawnParticle, MotherSpawnSound, KillSound, MotherLowHealthFlicker, MotherSlowComponent, MotherSkillComponent);
+	UE_LOG(LogTemp, Log, TEXT("[ABaseCharacter] 构造函数 EXIT: this=%p Class=%s WeaponAttach=%p PlayerCombo=%p AIAttack=%p CombatDeath=%p CharacterIcon=%p HealthComp=%p MotherTraceStrategy=%p MotherSpawnParticle=%p MotherSpawnSound=%p KillSound=%p MotherLowHealthFlicker=%p MotherSlowComponent=%p MotherSkillComponent=%p SpawnSound=%p"),
+		this, *GetClass()->GetName(), WeaponAttach, PlayerCombo, AIAttack, CombatDeath, CharacterIcon, HealthComponent, MotherTraceStrategy.Get(), MotherSpawnParticle, MotherSpawnSound, KillSound, MotherLowHealthFlicker, MotherSlowComponent, MotherSkillComponent, SpawnSoundComponent);
 
 	// ==========================================
 	// 角色模型设置
@@ -381,6 +386,14 @@ void ABaseCharacter::BeginPlay()
 		// 【2026.07.14 新增】订阅无敌期变化事件
 		// 用于驱动 UI 层显示复活进度条
 		HC->OnInvincibilityChanged.AddUniqueDynamic(this, &ABaseCharacter::OnHealthComponentInvincibilityChanged);
+
+		// 【v201.5 大厂架构新增】订阅复活移动锁定变化事件
+		// 用于复活后 N 秒内锁定移动 (N = RespawnDelaySeconds)
+		HC->OnRespawnMovementLockedChanged.AddUniqueDynamic(this, &ABaseCharacter::OnRespawnMovementLockedChanged);
+
+		// 【v201.6 大厂架构新增】订阅 HealthComponent 移动锁定事件并转发到 CharacterEvents
+		// 用于 HUD 显示移动锁定倒计时
+		HC->OnRespawnMovementLockedChanged.AddUniqueDynamic(this, &ABaseCharacter::HandleHealthComponentRespawnMovementLockChanged);
 	}
 
 	// 【2026-07-01 新增】: CharacterEvents 初始化检查
@@ -528,6 +541,83 @@ void ABaseCharacter::OnHealthComponentInvincibilityChanged(bool bIsNowInvincible
 	UE_LOG(LogTemp, Display,
 		TEXT("[BaseCharacter][OnHealthComponentInvincibilityChanged] ★ 无敌期变化: Pawn=%s bIsNowInvincible=%d"),
 		*GetName(), bIsNowInvincible ? 1 : 0);
+}
+
+/**
+ * ABaseCharacter::OnRespawnMovementLockedChanged 【v201.5 大厂架构新增】
+ *
+ * HealthComponent 复活移动锁定状态变化回调
+ * 职责:
+ *   - bIsLocked=true → MaxWalkSpeed=0 (锁定移动)
+ *   - bIsLocked=false → 恢复配置速度 (解锁移动)
+ *
+ * 业务规则:
+ *   - 复活后 N 秒内无法移动 (N = RespawnDelaySeconds)
+ *   - 玩家和 AI 都走这个机制 (通用)
+ */
+void ABaseCharacter::OnRespawnMovementLockedChanged(bool bIsLocked, float Duration)
+{
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	if (!MoveComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] MovementComponent 为空! Pawn=%s"),
+			*GetName());
+		return;
+	}
+
+	if (bIsLocked)
+	{
+		// 锁定移动: MaxWalkSpeed=0
+		MoveComp->MaxWalkSpeed = 0.0f;
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] ★ 锁定移动: Pawn=%s Duration=%.1fs"),
+			*GetName(), Duration);
+	}
+	else
+	{
+		// 解锁移动: 恢复配置速度
+		float TargetSpeed = 600.0f; // 默认人类速度
+
+		// AI 路径: 从 ABaseAIController::GetRuntimeConfig()->GetScaledMovement() 读速度
+		if (ABaseAIController* AICC = Cast<ABaseAIController>(GetController()))
+		{
+			if (UAIRuntimeConfigComponent* RuntimeConfig = AICC->GetRuntimeConfig())
+			{
+				const FAIMovementParams MovementParams = RuntimeConfig->GetScaledMovement();
+				TargetSpeed = AICC->GetCachedIsMother() ? MovementParams.MotherWalkSpeed : MovementParams.WalkSpeed;
+			}
+		}
+
+		MoveComp->MaxWalkSpeed = TargetSpeed;
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] ★ 解锁移动: Pawn=%s TargetSpeed=%.1f"),
+			*GetName(), TargetSpeed);
+	}
+}
+
+
+/**
+ * ABaseCharacter::HandleHealthComponentRespawnMovementLockChanged 【v201.6 大厂架构新增】
+ *
+ * HealthComponent 复活移动锁定事件回调 - 转发到 CharacterEvents 用于 HUD 显示倒计时
+ *
+ * @param bIsLocked true=进入锁定, false=退出锁定
+ * @param Duration 锁定时长(秒)
+ */
+void ABaseCharacter::HandleHealthComponentRespawnMovementLockChanged(bool bIsLocked, float Duration)
+{
+	// 转发到 CharacterEvents 供 HUD 订阅
+	if (UCharacterEvents* Events = ResolveCharacterEvents())
+	{
+		Events->BroadcastRespawnMovementLockChanged(bIsLocked, Duration);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] HandleHealthComponentRespawnMovementLockChanged: CharacterEvents 未找到! Pawn=%s"),
+			*GetName());
+	}
 }
 
 
@@ -1943,13 +2033,50 @@ bool ABaseCharacter::Server_ReportMotherAttackHit_Validate(AActor* HitActor)
 
 bool ABaseCharacter::StartMotherTrace(bool bIsHeavy)
 {
-	// 零兜底 — Strategy 必非空 (构造函数 CreateDefaultSubobject 已创建)
+	// ============================================================
+	// 【v135.1 大厂架构修复 P1】MotherTraceStrategy lazy resolve
+	// ============================================================
+	// 业务背景 (Session1.log 2026.08.06):
+	//   BP_MuTi 构造时 MotherTraceStrategy 有值 (构造函数 EXIT log 显示有效指针)
+	//   但运行时 StartMotherTrace 读到的 MotherTraceStrategy 为 null
+	//   根因: BP archetype nullify — BP 子类实例化时清空 C++ 默认字段
+	//
+	// 修复:
+	//   - 字段有效 → 直接用 (fast path)
+	//   - 字段为 null → 用 TObjectIterator 跨 actor 查找 (UMeleeSwStrategy 是 UObject, 不是 ActorComponent)
+	//   - 找不到 → Log Error 强制修复 BP 配置
+	//   - 找到 → 修复字段 (后续 fast path 命中)
+	// ============================================================
 	if (!MotherTraceStrategy)
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 为空 — 拒绝启动. "
-			     "【v93.2 零兜底】构造函数应已创建该字段. 检查 BP 子类是否覆盖了 C++ 默认值."));
-		return false;
+		UMeleeSwStrategy* Found = nullptr;
+		for (TObjectIterator<UMeleeSwStrategy> It; It && !Found; ++It)
+		{
+			if (It->GetOuter() == this)
+			{
+				Found = *It;
+			}
+		}
+
+		if (Found)
+		{
+			MotherTraceStrategy = Found;
+			UE_LOG(LogTemp, Warning,
+				TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 字段为 null, "
+				     "TObjectIterator 找到组件 [%s]. Pawn=%s. "
+				     "【v135.1 修复】BP 蓝图组件面板存在重复/未连接的 MeleeSwStrategy 子对象遮蔽了 C++ 默认值. "
+				     "建议: 打开 BP_MuTi → Components 面板 → 删除 MeleeSwStrategy 子对象, 让 C++ 构造函数创建的生效."),
+				*Found->GetName(), *GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 为空 — 拒绝启动. Pawn=%s. "
+				     "【v135.1 修复】TObjectIterator 也找不到 MeleeSwStrategy 子对象. "
+				     "检查 BP_MuTi 蓝图的 MeleeSwStrategy 字段是否被错误配置."),
+				*GetName());
+			return false;
+		}
 	}
 
 	// 模式校验 — 大厂原则: 母体 trace 只在生化模式有效, 刀战模式不调用 (但防御性 Log 仍保留)
@@ -1974,13 +2101,29 @@ bool ABaseCharacter::StartMotherTrace(bool bIsHeavy)
 
 void ABaseCharacter::StopMotherTrace()
 {
-	// 零兜底 — Strategy 必非空
+	// 【v135.1 大厂架构修复 P1】MotherTraceStrategy lazy resolve (与 StartMotherTrace 同模式)
 	if (!MotherTraceStrategy)
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[BaseCharacter] StopMotherTrace: MotherTraceStrategy 为空 — 拒绝停止. "
-			     "【v93.2 零兜底】构造函数应已创建该字段."));
-		return;
+		UMeleeSwStrategy* Found = nullptr;
+		for (TObjectIterator<UMeleeSwStrategy> It; It && !Found; ++It)
+		{
+			if (It->GetOuter() == this)
+			{
+				Found = *It;
+			}
+		}
+
+		if (Found)
+		{
+			MotherTraceStrategy = Found;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter] StopMotherTrace: MotherTraceStrategy 为空 — 拒绝停止. Pawn=%s."),
+				*GetName());
+			return;
+		}
 	}
 
 	// 委托 Strategy 处理 (幂等 — 内部 TraceState=Idle 时 no-op)
@@ -4223,6 +4366,39 @@ void ABaseCharacter::OnFirePressed(const FInputActionValue& /*Value*/)
 		return;
 	}
 
+	// ============================================================
+	// 【v135 大厂架构修复 P0】母体玩家左键 — 阶段 0 早返回
+	// ============================================================
+	//
+	// 业务规则 (用户 2026.08.06 明确):
+	//   玩家母体按左键需要射线检测(爪击感染)
+	//   母体没有武器 → GetCurrentWeapon()==nullptr → 旧版 OnFirePressed 直接 return
+	//   → ExecuteMotherAttackSequence 从未被调用 → StartMotherTrace 从未被调用 → 射线丢失
+	//
+	// 修复:
+	//   - 母体 (bIsMother=true) 在武器检查之前分支
+	//   - 直接调 PlayerComboComponent->ExecuteMotherAttackSequence()
+	//   - ExecuteMotherAttackSequence 内部播 MotherAttackMontage
+	//   - ANS_MeleeTraceState::NotifyBegin 自动触发 StartMotherTrace (母体射线检测)
+	//   - 与玩家武器路径完全对称, 不重复代码
+	//
+	// 不破坏刀战/枪战模式:
+	//   - 刀战/枪战 AI bIsMother=false → 走下面武器路径, 不受影响
+	// ============================================================
+	if (bIsMother)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 是母体 → 走母体攻击路径."),
+			*GetName());
+
+		if (UPlayerComboComponent* Combo = ResolvePlayerCombo())
+		{
+			Combo->ExecuteMotherAttackSequence();
+		}
+		// else: ResolvePlayerCombo 内部已 Log Error
+		return;
+	}
+
 	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
 	if (!WeaponAttachComp)
 	{
@@ -4627,6 +4803,34 @@ void ABaseCharacter::Multicast_PlayMutationFX_Implementation(const FString& Targ
 	}
 
 	OnMotherStatusChanged.Broadcast(TargetName);
+}
+
+
+/**
+ * ABaseCharacter::Multicast_PlaySpawnSound_Implementation 【v201.6 大厂架构新增】
+ *
+ * 出生音效 RPC 实现 — 所有客户端在本地播放出生音效
+ *
+ * @note 这是一个 NetMulticast RPC，服务器和所有客户端都会执行
+ */
+void ABaseCharacter::Multicast_PlaySpawnSound_Implementation()
+{
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] Multicast_PlaySpawnSound: Owner='%s', HasAuthority=%d"),
+		*GetName(), HasAuthority() ? 1 : 0);
+
+	// 触发通用出生音效组件
+	if (USpawnSoundComponent* SpawnSound = ResolveSpawnSoundComponent())
+	{
+		SpawnSound->PlaySpawnSound();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] Multicast_PlaySpawnSound: 找不到 SpawnSoundComponent 组件(Owner=%s). "
+				 "可选功能，跳过."),
+			*GetName());
+	}
 }
 
 

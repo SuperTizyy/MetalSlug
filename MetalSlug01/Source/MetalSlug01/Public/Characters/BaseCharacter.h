@@ -74,6 +74,7 @@ class UMotherSpawnSoundComponent;       // 【v99.3 新增】母体出生音效
 class UMotherLowHealthFlickerComponent; // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
 class UKillSoundComponent;              // 【v100 新增】击杀音效 (通用, 所有模式都触发)
 class UAudioComponent;                   // 【v100.1 新增】回血音组件 (服务器 RPC 创建, 客户端本地缓存)
+class USpawnSoundComponent;              // 【v201.6 新增】通用出生音效
 
 // 【v38 修复】模板函数 ResolveComponent<T> 调用 FindComponentByClass<T>(), 需要完整类型
 // UE 的 FindComponentByClass 是模板, 内部涉及 StaticClass(), 必须看到完整类型定义
@@ -100,6 +101,7 @@ class UAudioComponent;                   // 【v100.1 新增】回血音组件 (
 #include "Combat/MotherSpawnSoundComponent.h"        // 【v99.3 新增】母体出生音效
 #include "Combat/MotherLowHealthFlickerComponent.h"  // 【v101 新增】母体残血虚弱闪烁 (与 InvincibilityFlickerComponent 完全对称, 阈值触发的虚肉闪烁)
 #include "Combat/KillSoundComponent.h"               // 【v100 新增】击杀音效
+#include "Components/SpawnSoundComponent.h"             // 【v201.6 新增】通用出生音效
 
 // 引入 DataTable 行结构体（引擎 FindRow 模板需要）
 #include "Data/Tables/WeaponTableRow.h"
@@ -475,6 +477,19 @@ public:
 	 */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_PlayMutationFX(const FString& TargetName);
+
+	/**
+	 * 【v201.6 大厂架构新增】出生音效 RPC
+	 *
+	 * 服务器在角色出生/复活时调用 → 所有客户端播放出生音效
+	 *
+	 * 触发场景:
+	 *   - 玩家出生 (HandlePlayerRequestSpawn)
+	 *   - AI 出生 (SpawnAIInternal)
+	 *   - 小局开始时玩家传送 (RestartZombieRoundPlayers)
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlaySpawnSound();
 	//   迁移: 旧调用点 ARoomGameMode::SpawnAIInternal 改用 FFactionTags::AttitudeBetween / IsSameSide
 
 	/**
@@ -782,6 +797,19 @@ public:
 	UMotherSpawnSoundComponent* ResolveMotherSpawnSound()
 	{
 		return ResolveComponent<UMotherSpawnSoundComponent>(MotherSpawnSound, TEXT("MotherSpawnSound"));
+	}
+
+	/** 【v201.6 大厂架构新增】通用出生音效组件 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components|Spawn")
+	USpawnSoundComponent* SpawnSoundComponent;
+
+	/**
+	 * 【v201.6 大厂架构新增】Lazy resolve SpawnSoundComponent
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat")
+	USpawnSoundComponent* ResolveSpawnSoundComponent()
+	{
+		return ResolveComponent<USpawnSoundComponent>(SpawnSoundComponent, TEXT("SpawnSoundComponent"));
 	}
 
 	/**
@@ -1462,6 +1490,35 @@ protected:
 	 */
 	UFUNCTION()
 	void OnHealthComponentInvincibilityChanged(bool bIsNowInvincible);
+
+	/**
+	 * 【v201.5 大厂架构新增】HealthComponent 复活移动锁定变化回调
+	 *
+	 * 触发场景:
+	 *   - 服务器: HealthComponent::ActivateRespawnMovementLock → 立即 Broadcast(true)
+	 *   - 服务器: HealthComponent::OnRespawnMovementTimerExpired → Broadcast(false)
+	 *   - 客户端: DOREPLIFETIME 同步 → 收到复制值后自动更新
+	 *
+	 * 职责:
+	 *   - bIsLocked=true → MaxWalkSpeed=0 (锁定移动)
+	 *   - bIsLocked=false → 恢复配置速度 (解锁移动)
+	 */
+	UFUNCTION()
+	void OnRespawnMovementLockedChanged(bool bIsLocked, float Duration);
+
+	/**
+	 * 【v201.6 大厂架构新增】HealthComponent 移动锁定事件回调 - 转发到 CharacterEvents
+	 *
+	 * 触发场景:
+	 *   - 服务器: HealthComponent::ActivateRespawnMovementLock → Broadcast(bIsLocked=true)
+	 *   - 服务器: HealthComponent::OnRespawnMovementTimerExpired → Broadcast(bIsLocked=false)
+	 *   - 客户端: 同上 (通过 HealthComponent 复制)
+	 *
+	 * 职责:
+	 *   - 转发事件到 CharacterEvents 供 HUD 订阅显示倒计时
+	 */
+	UFUNCTION()
+	void HandleHealthComponentRespawnMovementLockChanged(bool bIsLocked, float Duration);
 
 	/**
 	 * 【v133.5 大厂架构新增】MotherSlowComponent 状态变化回调

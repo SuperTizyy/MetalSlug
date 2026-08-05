@@ -534,6 +534,37 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	// ============================================================
 	UObject* TraceContext = bUseOwnerMesh ? static_cast<UObject*>(OwnerChar) : static_cast<UObject*>(Weapon);
 	TArray<FHitResult> HitResults;
+
+	// ============================================================
+	// 【v135.2 大厂架构 P0 修复】母体路径调试绘制
+	//
+	// 根因 (Session1.log 2026.08.06):
+	//   母体路径 TickDetection 被 BaseCharacter::TickComponent 调用时 Weapon=nullptr
+	//   导致 `if (Weapon && Weapon->HasAuthority())` 永远 false
+	//   → DebugDrawMode=None → 射线检测完全不显示
+	//
+	// 修复:
+	//   - 母体路径: 用 OwnerChar->HasAuthority() 判断 (OwnerChar 是 ABaseCharacter, 永远非空)
+	//   - 刀战路径: 用 Weapon->HasAuthority() (原有逻辑)
+	// ============================================================
+	EDrawDebugTrace::Type DebugDrawMode = EDrawDebugTrace::None;
+	if (bUseOwnerMesh)
+	{
+		// 【母体路径】OwnerChar 永远非空 (TickDetection 入口已校验 ActiveOwner)
+		if (OwnerChar && OwnerChar->HasAuthority())
+		{
+			DebugDrawMode = EDrawDebugTrace::ForDuration;
+		}
+	}
+	else
+	{
+		// 【刀战路径】原有逻辑
+		if (Weapon && Weapon->HasAuthority())
+		{
+			DebugDrawMode = EDrawDebugTrace::ForDuration;
+		}
+	}
+
 	const bool bHit = UKismetSystemLibrary::BoxTraceMulti(
 		TraceContext,
 		LastMid,
@@ -543,7 +574,7 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		UEngineTypes::ConvertToTraceType(ECC_Visibility),
 		false,
 		ValidIgnoreActors,
-		EDrawDebugTrace::ForDuration,
+		DebugDrawMode,             // 【v149 P0】分端差异化: 服务器画, 客户端不画
 		HitResults,
 		true,
 		FLinearColor::Red,        // TraceColor: 未命中颜色
@@ -588,20 +619,31 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		//   Phase 2 fallback 在下方处理, BoxTrace 命中物品不算"命中"
 	}
 
-	// 【v100.2 诊断】BoxTrace 命中但无 Pawn — 极简 1s 去重 (避免日志 spam)
-	if (bHit && !SelectedTargetActor && HitResults.Num() > 0)
+	// 【v135.2 大厂架构诊断增强】TickDetection 结果显式 Log (Display 级别)
+	//   - 如果没命中: 说明攻击方向没有物体
+	//   - 如果命中但无 Pawn: 说明命中的是地形/物品
+	//   - 如果有 Pawn: Server_ReportMotherAttackHit 会触发后续日志
+	if (!bHit)
 	{
-		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
-		static double LastNoPawnLogTime = 0.0;
-		if (Now - LastNoPawnLogTime > 1.0)
-		{
-			LastNoPawnLogTime = Now;
-			UE_LOG(LogTemp, Verbose,
-				TEXT("[UMeleeSwStrategy::TickDetection] BoxTrace 命中 %d 个物体但没有 Pawn (第 1 个: %s). "
-				     "【v100.2 0 兜底】非 Pawn 命中不发 RPC, 进入 Phase 2 fallback 路径."),
-				HitResults.Num(),
-				HitResults[0].GetActor() ? *HitResults[0].GetActor()->GetName() : TEXT("(null)"));
-		}
+		UE_LOG(LogTemp, Display,
+			TEXT("[UMeleeSwStrategy::TickDetection] ★ 母体 BoxTrace 未命中任何物体 (Owner=%s). "
+			     "【v135.2 诊断】这是母体射线没命中的常见原因 — 攻击方向没有东西, 或目标超出范围."),
+			*GetName());
+	}
+	else if (!SelectedTargetActor)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[UMeleeSwStrategy::TickDetection] ★ 母体 BoxTrace 命中 %d 个物体但没有 Pawn (第 1 个: %s). "
+			     "【v135.2 诊断】命中了地形/物品但不是角色."),
+			HitResults.Num(),
+			HitResults[0].GetActor() ? *HitResults[0].GetActor()->GetName() : TEXT("(null)"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[UMeleeSwStrategy::TickDetection] 母体 Tick 结果: Owner=%s 命中目标=%s. "
+			     "【v135.2 诊断】命中有效, 应触发 Server_ReportMotherAttackHit."),
+			*GetName(), *SelectedTargetActor->GetName());
 	}
 
 // 【v97.0.2 大厂架构 P0 修复 — Phase 2 Pawn 路径搜索】
@@ -765,6 +807,52 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			HitResult.ImpactPoint,
 			HitResult.BoneName);
 
+		// ============================================================
+		// 【v149 大厂架构 P0 修复】服务器权威 trace 视觉同步
+		//
+		// 根因:
+		//   客户端主武器射线起点 ≠ 监听服务器主武器射线起点
+		//   旧版: TickDetection 在所有进程 (服务器+本地玩家控制 Pawn 的客户端) 都跑
+		//          EDrawDebugTrace::ForDuration, 用本进程 Mesh->GetSocketLocation()
+		//   - 监听服务器 (host 玩家): mesh 骨骼是权威物理位置, 起点准确
+		//   - 远端客户端看同一个玩家: mesh 骨骼是 UE 复制滞后帧, 起点偏 (典型 5~30cm 漂移)
+		//   - 客户端玩家自己看自己: mesh 骨骼是本地物理位置, 也准确
+		//   问题集中在"普通客户端看 host 玩家 (或看另一个客户端玩家) 的近战 trace"
+		//
+		// 大厂原则 (真理源唯一):
+		//   - 服务器的 TickDetection 拿到的 LastMid/CurrentMid 是当前 Tick 服务器进程的物理精确值
+		//   - 服务器命中时通过 Multicast_PlayFireTraceVisual (已有, v83 大厂架构) 把权威
+		//     (StartLoc=LastMid, EndLoc=CurrentMid, bHit=true, HitLoc=ImpactPoint) 推给所有客户端
+		//   - 客户端 Implementation 内 v200.2.19 守卫 (HasAuthority() + IsLocallyControlled → return)
+		//     已经保证了服务器本地 (host 玩家自己) 不会重复画, 远端客户端会画
+		//   - 本地玩家控制 Pawn 的客户端: 服务器通过 Multicast 推过来的也是它本进程的
+		//     (因为它调 RPC, 服务器 Implementation 拿到的是服务器自己的 LastMid/CurrentMid, 不是客户端的)
+		//     - 这就是用户要的: "客户端主武器射线起点和监听服务器主武器起点一样" — 服务器为准
+		//
+		// 大厂原则 (复用现有 RPC, 不新增):
+		//   - Multicast_PlayFireTraceVisual 签名 (StartLoc, EndLoc, bHit, HitLoc) 完全够用
+		//   - 不新增 Multicast, 不新增参数, 不破坏现有调用方 (URangedLineStrategy 枪械路径)
+		//   - 枪械走 ClientRayOrigin → EndLoc, 近战走 LastMid → CurrentMid, 接口对称
+		//
+		// 大厂原则 (零兜底 — 服务器权威 RPC):
+		//   - 只有服务器命中才调 Multicast, 客户端命中不调 (客户端会发 Server_ReportHit 让服务器再 trace)
+		//   - 重复扣血防护仍由 BaseWeapon::Tick 守卫 (HasAuthority + IsLocallyControlled) 保证
+		//     同一帧不会两端都触发命中 RPC
+		// ============================================================
+		if (Weapon && Weapon->HasAuthority())
+		{
+			// 服务器命中: 推权威 trace 视觉给所有客户端
+			//   LastMid/CurrentMid 是第 490/491 行算出来的 box 中心线两端 (跨帧缝合路径)
+			//   HitLoc 用 HitResult.ImpactPoint (命中点 = BoxTrace 实际撞上的位置)
+			const FVector BoxLineStart = LastMid;
+			const FVector BoxLineEnd = CurrentMid;
+			Weapon->Multicast_PlayFireTraceVisual(
+				BoxLineStart,
+				BoxLineEnd,
+				/*bHit=*/true,
+				HitResult.ImpactPoint);
+		}
+
 		// 【v93.2 母体复用】命中 RPC 路径决策
 		//   - bUseOwnerMesh=false: Weapon->Server_ReportHit (刀战路径, 走武器伤害字段)
 		//   - bUseOwnerMesh=true:  Owner->Server_ReportMotherAttackHit (生化母体路径, 命中变母体)
@@ -884,6 +972,24 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			*AttackerName,
 			*TargetName,
 			*BoneName);
+	}
+
+	// ============================================================
+	// 【v149 大厂架构 P0 修复 — 未命中分支】服务器权威 trace 视觉同步
+	//
+	// 命中分支在上方已经处理 (bHit=true), 这里处理 bHit=false 的未命中帧
+	// - 服务器 TickDetection 跑 BoxTraceMulti → bHit=false (没命中任何物体)
+	// - 也需要把权威 (LastMid → CurrentMid) 推给客户端画视觉
+	// - 否则远端客户端会"挥刀看不见刀气" (因 Tick 跳过, 没 EDrawDebugTrace)
+	// ============================================================
+	if (!bHit && Weapon && Weapon->HasAuthority())
+	{
+		// 服务器未命中: 推权威 trace 视觉给所有客户端 (红线, 因为 bHit=false)
+		Weapon->Multicast_PlayFireTraceVisual(
+			LastMid,
+			CurrentMid,
+			/*bHit=*/false,
+			FVector::ZeroVector); // HitLoc 在 bHit=false 时无意义
 	}
 
 	// 当前帧结算完毕 → 存入记忆, 变成下一帧的"上一帧"

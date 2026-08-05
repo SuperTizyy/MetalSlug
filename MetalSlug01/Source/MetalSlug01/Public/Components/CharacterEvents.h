@@ -252,6 +252,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Invincibility")
 	FOnInvincibilityChanged OnInvincibilityChanged;
 
+	/** 【v201.6 大厂架构新增】复活移动锁定状态变化 - 显示移动锁定倒计时用 */
+	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|MovementLock")
+	FOnRespawnMovementLockedChanged OnRespawnMovementLockedChanged;
+
 	/** 武器弹药信息就绪 【v84 大厂架构新增 - 武器面板 TextBlock 显示弹药】 */
 	UPROPERTY(BlueprintAssignable, Category = "CharacterEvents|Weapon")
 	FOnWeaponAmmoInfoReady OnWeaponAmmoInfoReady;
@@ -362,6 +366,13 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|MotherSkill")
 	void BroadcastMotherSkillCooldown(float CooldownRemaining, bool bSkillActive);
+
+	/**
+	 * 【v201.6 大厂架构新增】转发复活移动锁定状态变化
+	 * 由 BaseCharacter 在 BeginPlay 中订阅 HealthComponent 的 OnRespawnMovementLockedChanged 时调用
+	 */
+	UFUNCTION(BlueprintCallable, Category = "CharacterEvents|MovementLock")
+	void BroadcastRespawnMovementLockChanged(bool bIsLocked, float Duration);
 
 	/**
 	 * 【v119 新增】获取缓存的母体技能冷却状态

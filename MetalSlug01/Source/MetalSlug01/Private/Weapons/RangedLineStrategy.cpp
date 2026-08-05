@@ -142,33 +142,38 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	}
 
 	// ===========================================
-	// 步骤 2: 决定射线起点和方向 — v109 大厂镜像方案
+	// 步骤 2: 决定射线起点和方向 — vXXX 大厂类型判定 SSOT
 	// ===========================================
 	//
-	// 【v109 大厂架构 P0 修复 — 玩家/AI 完全镜像】
+	// 【vXXX 大厂架构 P0 修复 — 类型判定替代网络身份判定】
 	//
 	//   旧版历史 (按时间累积的反模式):
 	//     - v60.3-v107: 外层 Cast<APlayerController> 守卫,直接拒绝 AI (AI 永远打不出射线)
 	//     - v85.4:     修玩家路径(加 TAL+枪口偏移算武器起点)
 	//     - v108:      加 AI 分支(用 ZeroVector 区分 AI → Strategy 内部算 Muzzle+朝向)
 	//                   ⚠️ v108 修改不完整 — 嵌套了第二层 if/else,使所有 AI 分支变成死代码
-	//     - v109:      重写整个步骤 2,彻底消除死代码
+	//     - v109:      重写整个步骤 2,IsLocalController() 判定 → 远端玩家错判
+	//     - vXXX: 用 Cast<APlayerController> 替代 IsLocalController() → 任何端玩家走公式
 	//
-	//   v109 终极修复 — "算射线" 关注点统一在 ABaseCharacter::GetAimRayFromCrosshairOrEyes:
-	//     - 玩家: IA_Fire → GetAimRayFromCrosshairOrEyes (本地玩家读 HUD Crosshair) → Server_StartFire RPC (传射线)
-	//     - AI  :  BT → GetAimRayFromCrosshairOrEyes (IsLocallyControlled=false → Muzzle Socket + BaseAimRotation)
-	//             → Weapon->StartFire (服务器本地直接调,不走 RPC,因为 BT 就在 Server 跑)
+	//   vXXX 终极修复 — "算射线" 关注点统一在 ABaseCharacter::GetAimRayFromCrosshairOrEyes:
+	//     - 玩家: IA_Fire → GetAimRayFromCrosshairOrEyes 玩家路径 (本地 HUD Crosshair deproject)
+	//             → 输出 ClientRayOrigin = 相机位置, ClientRayDirection = 准星方向
+	//             → Server_StartFire RPC (传射线) → 服务器走"玩家路径" 公式 +TAL+MuzzleOffset 算武器起点
+	//     - AI  :  BT → GetAimRayFromCrosshairOrEyes AI 路径 (Muzzle Socket + BaseAimRotation)
+	//             → 输出 ClientRayOrigin = Muzzle 位置, ClientRayDirection = BT 控制朝向
+	//             → 服务器走"非玩家路径" 直接用入参 (镜像玩家)
 	//
 	//   Strategy 不再做任何"算射线" 工作 — 完全信任入参射线(零冗余)
 	//
 	//   单一真理源 — 大厂原则:
 	//     - "用什么射线打谁" 的真理源 = ABaseCharacter::GetAimRayFromCrosshairOrEyes
 	//     - Strategy 只是把射线投射出去 + 命中过滤 + Server_ReportHit RPC 转发
+	//     - "我是玩家还是 AI" 真理源 = InstigatorController 类型 (APlayerController vs AAIController)
 	//
 	//   大厂原则 — 镜像玩家 + 零兜底:
-	//     - 玩家/AI 都从同一 API 拿射线(对称设计 — 这才是"AI 镜像玩家" 的大厂级实现)
+	//     - 玩家(任何端)/AI 都从同一 API 拿射线(对称设计 — 这才是"AI 镜像玩家" 的大厂级实现)
 	//     - 玩家路径特殊性: 传进来的是相机位置 → 服务器需要 + Forward × (TAL + MuzzleOffset) 反推武器起点
-	//     - AI 路径特殊性: 传进来的就是 Muzzle Socket 位置 → 直接用
+	//     - 非玩家路径特殊性: 传进来的就是 Muzzle Socket 位置 → 直接用
 	// ===========================================
 
 	FVector RayDirection;
@@ -197,14 +202,34 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		return false;
 	}
 
-	// 步骤 2c: 玩家/AI 区分 — bIsLocalPlayerFire=true 走玩家路径 (相机+TAL+MuzzleOffset),
-	//                                       false 走 AI 路径 (直接用入参射线 — Muzzle+朝向)
+	// 步骤 2c: 玩家/AI 分流 — bIsPlayerPath=true 走玩家路径 (相机+TAL+MuzzleOffset),
+	//                                      false 走非玩家路径 (直接用入参射线 — 已算好的武器起点)
+	//
+	// 【vXXX P0 关键修复 — 类型判定 SSOT, 与 v110 GetAimRayFromCrosshairOrEyes 对齐】
+	//   旧版 (v109) 反模式: 用 InstigatorPC->IsLocalController() 判定
+	//     - ListenServer 自己玩家: IsLocalController()=true → 走"玩家路径" (相机+TAL+MuzzleOffset 公式) ✓
+	//     - 普通客户端玩家(远端): InstigatorPC 是远端 PC, IsLocalController()=false
+	//       → Strategy 把它当 AI,直接用入参 ClientRayOrigin 当武器起点 ✗
+	//       → 客户端传的 ClientRayOrigin = 相机位置 (v82 GetAimRayFromCrosshairOrEyes 玩家路径)
+	//       → 结果: 远端玩家射线起点 = 相机位置, 不在武器上,子弹从相机射出 → 玩家身上没射线
+	//
+	//   新版 (vXXX) 大厂标准: 用 Controller 类型判定 (Cast<APlayerController>)
+	//     - 任何端玩家) 的 Instigator = APlayerController 派生 → 走"玩家路径" 公式
+	//     - AI)               的 Instigator = AAIController 派生 → 走"非玩家路径" 直传
+	//     - 这是 UE 引擎硬约束 — Instigator 类型 = Pawn 类型,不会变 (与 v110 GetAimRayFromCrosshairOrEyes 完全一致)
+	//
+	//   大厂原则 — 类型判定 > 网络身份判定 (与 v110 同步):
+	//     - "我是谁" = Instigator 类型 (静态, 永不改变)
+	//     - "我在哪跑" = IsLocalController (动态, 与网络拓扑有关)
+	//     - "我要走哪条公式" = 我是谁 (玩家要相机公式, AI 直传 Muzzle)
 	APlayerController* InstigatorPC = WeaponOwner ? Cast<APlayerController>(WeaponOwner->GetInstigatorController()) : nullptr;
-	const bool bIsLocalPlayerFire = (InstigatorPC != nullptr) && InstigatorPC->IsLocalController();
+	const bool bIsPlayerPath = (InstigatorPC != nullptr);
 
-	if (bIsLocalPlayerFire)
+	if (bIsPlayerPath)
 	{
 		// 玩家路径 (v60.16 公式): RayOrigin = ClientRayOrigin + RayDirection × (TAL + MuzzleOffset)
+		//   - ClientRayOrigin = 相机位置 (GetAimRayFromCrosshairOrEyes 玩家路径 v82 输出)
+		//   - 适用于 ListenServer 自己玩家 + 普通客户端玩家(远端) — 任何端玩家都走这条
 		ACharacter* CharacterOwner = Cast<ACharacter>(WeaponOwner);
 		if (!CharacterOwner)
 		{
@@ -231,7 +256,7 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		RayOrigin = ClientRayOrigin + RayDirection * TotalOffset;
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 玩家路径】Weapon=%s CameraLoc=%s TAL=%.1f MuzzleOffset=%.1f TotalOffset=%.1f RayOrigin=%s RayDir=%s"),
+			TEXT("[URangedLineStrategy::PerformSingleShot] 【玩家路径】Weapon=%s CameraLoc=%s TAL=%.1f MuzzleOffset=%.1f TotalOffset=%.1f RayOrigin=%s RayDir=%s"),
 			*Weapon->GetName(),
 			*ClientRayOrigin.ToCompactString(),
 			TargetArmLength,
@@ -242,14 +267,14 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	}
 	else
 	{
-		// AI 路径 (v109 大厂镜像): RayOrigin = ClientRayOrigin (GetAimRayFromCrosshairOrEyes AI 路径已算好)
-		//   - ClientRayOrigin = Muzzle Socket 世界位置
+		// 非玩家路径 (v109 大厂镜像): RayOrigin = ClientRayOrigin (GetAimRayFromCrosshairOrEyes 非玩家路径已算好)
+		//   - ClientRayOrigin = Muzzle Socket 世界位置 (GetAimRayFromCrosshairOrEyes AI 路径 v109 输出)
 		//   - ClientRayDirection = Character 朝向 (BaseAimRotation, BT 已控制 AI 面朝目标)
 		//   - 这才是"AI 跟玩家走完全相同的 Strategy" 的大厂镜像方案
 		RayOrigin = ClientRayOrigin;
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[URangedLineStrategy::PerformSingleShot] 【v109 AI 路径镜像】Weapon=%s Owner=%s RayOrigin=%s RayDir=%s "
+			TEXT("[URangedLineStrategy::PerformSingleShot] 【非玩家路径镜像】Weapon=%s Owner=%s RayOrigin=%s RayDir=%s "
 			     "(前置已通过 GetAimRayFromCrosshairOrEyes AI 分支算出)"),
 			*Weapon->GetName(),
 			WeaponOwner ? *WeaponOwner->GetName() : TEXT("<null>"),

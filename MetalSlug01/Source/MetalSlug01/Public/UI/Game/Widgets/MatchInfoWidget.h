@@ -159,6 +159,25 @@ protected:
 	UFUNCTION()
 	void OnTeamKillCountChanged(int32 AttackerKills, int32 DefenderKills);
 
+	/**
+	 * 【v134 大厂架构新增】小局胜局数变化回调 (GameState.OnWinStatsUpdated 推送)
+	 *
+	 * 业务规则 (用户 2026.08.06 明确):
+	 *   - 生化模式每小局结束时, AttackerWins / DefenderWins 累加 → 推到 UI 显示
+	 *   - 与 OnTeamKillCountChanged (击杀数) 是独立数据源, 模式分支决定显示谁
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 本函数内部按 CurrentMatchMode 决定显示:
+	 *     - Zombie 模式: 用 AttackerWins/DefenderWins (新业务: 小局胜局数)
+	 *     - Melee 模式: 不刷新 (本回调永不触发, OnTeamKillCountChanged 接管)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - CachedGameState 为空 → Log Error + return
+	 *   - Text_AttackerCount/Text_DefenderCount 为空 → 走 UpdateXxxCount 内部 Log Error (零重复)
+	 */
+	UFUNCTION()
+	void OnWinStatsChanged(int32 AttackerWins, int32 DefenderWins);
+
 	// ==========================================
 	// 4. 风格配置（蓝图可编辑）
 	// ==========================================

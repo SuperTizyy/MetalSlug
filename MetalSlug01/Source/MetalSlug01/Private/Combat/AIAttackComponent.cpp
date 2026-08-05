@@ -46,6 +46,7 @@
 
 // 引入 AI 攻击蒙太奇解析器 (职责链, v32 零兜底)
 #include "Combat/AIAttackMontageResolver.h"
+#include "Systems/AI/AIBehaviorTypes.h"  // AIBlackboardKeyNames::CooldownEndTime
 
 // 引入 SkeletalMeshComponent / UAnimInstance (绑 OnMontageEnded)
 #include "Components/SkeletalMeshComponent.h"
@@ -375,7 +376,110 @@ bool UAIAttackComponent::OnAIRequestAttack_WithOptions(ABaseCharacter* InOwnerCh
 	}
 
 	// ============================================================
-	// 阶段 1: 死了不能打 / 没武器不能打
+	// 【v134 大厂架构修复 P0】母体分支 — 阶段 0 早返回
+	// ============================================================
+	//
+	// 业务规则 (用户 2026.08.06 明确):
+	//   母体 (bIsMother=true) 没有武器, 但需要射线检测(爪击感染)
+	//   母体射线走 ANS_MeleeTraceState → StartMotherTrace/StopMotherTrace (零武器依赖)
+	//
+	// 根因链 (bug "母体的射线检测没了"):
+	//   - 旧版: 阶段 1 检查 GetCurrentWeapon() == nullptr → return false
+	//   - 母体 GetCurrentWeapon() 永远为 nullptr → 永远 return false
+	//   - 动画不播放 → StartMotherTrace 从未被调用 → 射线检测丢失
+	//
+	// 大厂原则 — 零兜底:
+	//   - 母体检查必须在"武器检查"之前, 防止"母体被当成无武器 AI"
+	//   - 母体分支只做两件事: (1) 播放 MotherAttackMontage (2) 写 BB.CooldownEndTime
+	//   - 蒙太奇动画上的 ANS_MeleeTraceState 区间自动触发 StartMotherTrace (ANS 层负责)
+	//   - 蒙太奇结束自动触发 StopMotherTrace (ANS 层负责)
+	//
+	// 不破坏刀战模式:
+	//   - 刀战 AI (bIsMother=false) 走下面武器路径, 不受影响
+	//
+	// 调用链 (母体路径):
+	//   OnAIRequestAttack_WithOptions
+	//   └─ 阶段 0: 母体分支
+	//       ├─ 播 MotherAttackMontage (玩家/AI 通用, Multicast_PlayAttackAnim 已处理)
+	//       ├─ 调 Server_PlayAttackAnim (服务器走 _Implementation → Multicast 给其他客户端)
+	//       └─ 写 BB.CooldownEndTime (服务器权威)
+	//   └─ ANS_MeleeTraceState::NotifyBegin
+	//       └─ StartMotherTrace() (自动触发, 不在 OnAIRequestAttack_WithOptions 内)
+	// ============================================================
+	if (OwnerCharacter->bIsMother)
+	{
+		// 母体使用专属攻击蒙太奇 (通过 Multicast_PlayAttackAnim 播放)
+		// 这里只做基础守卫 + 写 BB.CooldownEndTime
+
+		// 母体死亡守卫
+		if (OwnerCharacter->IsDead())
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: 母体=%s 已死亡, 跳过"),
+				*OwnerCharacter->GetName());
+			return false;
+		}
+
+		// 母体不需要武器, 但需要能播放动画
+		// MotherAttackMontage 未配由 Multicast_PlayAttackAnim 处理, 这里不重复报错
+		if (!OwnerCharacter->GetMotherAttackMontage())
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: 母体=%s MotherAttackMontage 未配置, 跳过. "
+				     "【修复】BP_MuTi ClassDefaults → Combat → Mother Attack Montage 必填."),
+				*OwnerCharacter->GetName());
+			return false;
+		}
+
+		// 服务器端: Multicast_PlayAttackAnim 广播动画到所有客户端
+		//   - AI 在服务器执行 (IsLocallyControlled=true) → 自身跳过播放
+		//   - Multicast 协议确保所有远端客户端播放母体动画
+		//   - 与非母体路径的 Server_PlayAttackAnim_Implementation → Multicast 链路镜像
+		OwnerCharacter->Multicast_PlayAttackAnim(false, /*ComboIndex=*/0);
+
+		// SetAttackerIsAI: 命中时走 MotherTraceStrategy → Server_ReportMotherAttackHit
+		OwnerCharacter->SetAttackerIsAI(true);
+
+		// 标记攻击中 (防打断)
+		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+		{
+			BaseAIC->SetCurrentlyAttacking(true);
+		}
+
+		// 写 BB.CooldownEndTime (服务器权威, 与非母体路径镜像)
+		if (UWorld* World = OwnerCharacter->GetWorld())
+		{
+			float AttackInterval = 1.2f;  // 默认冷却
+
+			// 从 AIController 拿策划配置的 AttackInterval
+			if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(OwnerCharacter->GetController()))
+			{
+				const float EffectiveInterval = BaseAIC->GetEffectiveAttackInterval();
+				if (EffectiveInterval > 0.f)
+				{
+					AttackInterval = EffectiveInterval;
+				}
+			}
+
+			if (AAIController* AIC = Cast<AAIController>(OwnerCharacter->GetController()))
+			{
+				if (UBlackboardComponent* BB = AIC->GetBlackboardComponent())
+				{
+					const float CurrentTime = World->GetTimeSeconds();
+					const float CooldownEndTime = CurrentTime + AttackInterval;
+					BB->SetValueAsFloat(FName(AIBlackboardKeyNames::CooldownEndTime), CooldownEndTime);
+					UE_LOG(LogTemp, Display,
+						TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: 母体=%s 攻击发起, CooldownEndTime=%.2f (Interval=%.2f)"),
+						*OwnerCharacter->GetName(), CooldownEndTime, AttackInterval);
+				}
+			}
+		}
+
+		return true; // 成功
+	}
+
+	// ============================================================
+	// 阶段 1: 死了不能打 / 没武器不能打 (非母体路径)
 	// ============================================================
 	if (OwnerCharacter->IsDead())
 	{
