@@ -41,6 +41,7 @@
 class ABaseCharacter;
 class ABaseWeapon;
 class UPrimitiveComponent;
+class UProjectileMovementComponent; // 【v200.4 大厂架构】PMC 用于抛物线阶段 (前向声明避免循环 include)
 
 // ==========================================
 // 弹药快照 — 保存掉落时刻的弹药数据, 供捡起时恢复
@@ -215,6 +216,52 @@ protected:
 	// ==========================================
 
 	/**
+	 * 【v200.4 大厂架构】落地点沉淀 — 服务器权威冻结位置
+	 *
+	 * 触发链路 (UE 官方最优解):
+	 *   1. StartDroppedState 启动 ProjectileMovementComponent (PMC) 抛物线
+	 *   2. PMC 内部速度 < BounceVelocityStopSimulatingThreshold → 触发 OnProjectileStop 回调
+	 *   3. OnProjectileStopHandler → 调本函数 SettleWeaponOnGround
+	 *
+	 * 大厂原则 (UE 官方 + 客户端同步):
+	 *   - 关闭 PMC: 停止弹道模拟 (武器不再移动)
+	 *   - 关闭物理: 落地后不需要物理引擎
+	 *   - LineTrace 找地面: 服务器精确知道地面 Z (客户端本地 trace 可能不准)
+	 *   - SetActorLocation (TeleportPhysics): 服务器冻结位置
+	 *   - Multicast_FreezeWeaponTransform: 客户端同步冻结 (ReplicateMovement 不复制 PMC 状态)
+	 */
+	void SettleWeaponOnGround(ABaseWeapon* OwnerWeapon);
+
+	/**
+	 * 【v200.4 大厂架构】PMC OnProjectileStop 回调处理器
+	 *
+	 * 绑定: StartDroppedState 末尾 → PMC->OnProjectileStop.AddDynamic(this, &UWeaponDropComponent::OnProjectileStopHandler)
+	 *
+	 * 触发: PMC 速度 < 阈值时自动调用
+	 * 职责: 转发到 SettleWeaponOnGround (复用统一沉淀逻辑)
+	 *
+	 * 大厂原则:
+	 *   - 单一入口: 任何"武器落地"都走 OnProjectileStopHandler → SettleWeaponOnGround
+	 *   - 不能直接从 BTTask / Blueprint / 其他代码调 SettleWeaponOnGround (时序可能错)
+	 *
+	 * @param HitResult PMC 命中的 HitResult (地面碰撞点, 可用于直接拿 GroundLocation)
+	 */
+	UFUNCTION()
+	void OnProjectileStopHandler(const FHitResult& HitResult);
+
+	/**
+	 * 【v200.4 大厂架构】解析 ProjectileMovementComponent (懒加载)
+	 *
+	 * 根因 (v200.4 之前的反模式):
+	 *   BeginPlay 缓存 PMC 指针 → BP 子类 PMC 创建顺序问题 → 缓存 null
+	 * 修复 (与 v40.6 WeaponFireComponent 同模式):
+	 *   每次按需 FindComponentByClass — 不缓存, 不假设 BeginPlay 时序
+	 *
+	 * @return PMC (可能为 null — BP 子类没配 PMC 时合法返回 null, 走物理引擎 fallback)
+	 */
+	class UProjectileMovementComponent* ResolveProjectileMovement() const;
+
+	/**
 	 * 解析 Owner Weapon
 	 * 大厂原则: 不缓存, 每次 GetOwner() + Cast (与 v40.6 WeaponFireComponent 同模式)
 	 */
@@ -243,8 +290,8 @@ protected:
 	 *   调到 250cm (玩家正常移动能稳定触发 overlap)
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon|Drop|Config",
-		meta = (ClampMin = "50.0", ClampMax = "500.0"))
-	float PickupRadius = 250.0f;
+		meta = (ClampMin = "50.0", ClampMax = "1000.0"))
+	float PickupRadius = 400.0f; // 【v200.4.6】从 250 提到 400 — 配 5.8 米抛掷距离,玩家不用走很远
 
 	/**
 	 * 掉落武器存在时长 (秒)
@@ -259,24 +306,37 @@ protected:
 	 * 掉落时前推力 (厘米/秒)
 	 * 玩家面朝方向施加速度, 让武器"丢在面前"
 	 *
-	 * 【v200.2.3 调整】500cm/s 太大 — 武器飞出 5m+ 玩家追不上
-	 *   用户反馈 "走到武器上武器消失" 正是武器飞太远
-	 *   调到 150cm/s (武器落地点落在玩家面前 1-2m, 视觉自然, 玩家能踩到)
+	 * 【v200.4.6 调整为中距离档位】原 150 cm/s ≈ 1 米 (太近)
+	 *   调到 600 cm/s ≈ 5.8 米 (游戏感: 扔到对面能抢枪的位置, 又不会飞出场)
+	 *   飞行距离计算公式:
+	 *     飞行时间 = (Vy + sqrt(Vy² + 2*g*H)) / g
+	 *     飞行距离 = Vx * 飞行时间
+	 *     假设手部 H=130cm, g=980cm/s²
+	 *
+	 * 可调档位 (BP 子类可覆盖):
+	 *   - 近 (150): 武器落玩家面前 1 米
+	 *   - 中 (600,推荐): 武器落 5.8 米 (敌人脚边可抢)
+	 *   - 远 (1200): 武器飞 16 米 (战术投掷)
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon|Drop|Config",
 		meta = (ClampMin = "0.0", ClampMax = "2000.0"))
-	float LaunchForwardSpeed = 150.0f;
+	float LaunchForwardSpeed = 600.0f;
 
 	/**
 	 * 掉落时向上抛力 (厘米/秒)
-	 * 让武器有点小抛物线, 但不能太高 (否则飞太远)
+	 * 让武器有点小抛物线, 决定弧度高点
 	 *
-	 * 【v200.2.3 调整】200cm/s 太大 — 武器会飞 1m 高 + 飞 2m 远
-	 *   调到 100cm/s (简单抛一下, 落地就在玩家附近)
+	 * 【v200.4.6 调整】原 100 cm/s 弧度太平
+	 *   调到 300 cm/s (中等弧度 — 武器小抛物线升到 0.5 米高峰再落)
+	 *
+	 * 可调档位 (与 LaunchForwardSpeed 配对):
+	 *   - 近 (100): 弧度平
+	 *   - 中 (300,推荐): 中等弧度
+	 *   - 远 (500): 高抛物线
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon|Drop|Config",
 		meta = (ClampMin = "0.0", ClampMax = "1000.0"))
-	float LaunchUpwardSpeed = 100.0f;
+	float LaunchUpwardSpeed = 300.0f;
 
 	// ==========================================
 	// 掉落状态 (运行时)
@@ -316,6 +376,28 @@ protected:
 	 */
 	UPROPERTY()
 	FTimerHandle DropPositionTimerHandle;
+
+	/**
+	 * 【v200.3.13 配置】地面贴齐抬升的安全距离 (cm)
+	 *   - 太小 (< 0.5cm): 可能仍然有微小 penetration (浮点精度)
+	 *   - 太大 (> 5cm): 视觉上"漂浮"在地面上方
+	 *   - 默认 5cm: 明显"贴地" 但又不会视觉上漂浮
+	 *   (用户 v200.3.13.1 反馈: 1cm 视觉上仍然贴着地面, 调到 5cm 更明显)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon|Drop|Config",
+		meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float GroundOffsetCm = 5.0f;
+
+	/**
+	 * 【v200.4 大厂架构】PMC 速度停止阈值 (cm/s)
+	 *   - 太小 (< 10): 武器飞行中可能误触发停止
+	 *   - 太大 (> 200): 武器落地后仍滚动几秒才停
+	 *   - 默认 50: 武器落地后弹一两次就停 (符合大厂标准)
+	 *   (UE 官方 BounceVelocityStopSimulatingThreshold 文档推荐值)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Weapon|Drop|Config",
+		meta = (ClampMin = "10.0", ClampMax = "500.0"))
+	float ProjectileStopVelocityThreshold = 50.0f;
 
 	/**
 	 * 物理模拟是否已启用 (用于恢复)

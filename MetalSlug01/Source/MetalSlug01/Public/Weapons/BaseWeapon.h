@@ -566,6 +566,30 @@ public:
 		FVector LaunchVelocity, FVector LaunchAngularVelocity);
 
 	/**
+	 * 【v200.4 大厂架构 — UE 官方最优解】Multicast 冻结武器 Transform
+	 *
+	 * 调用场景:
+	 *   武器落地后, 服务器 PMC->OnProjectileStop 回调触发 → 服务器调用本 Multicast
+	 *   → 所有客户端立即停止本地 PMC + 关闭物理 + 把武器 SetActorLocation 到精确贴齐位置
+	 *
+	 * 根因 (v200.3.13 缺陷):
+	 *   旧版用 0.5s SettleTimer + 服务器单边 SetActorLocation + 持续 simulate physics
+	 *   → 服务器位置持续抖动 → 客户端 ReplicateMovement 插值累积误差 → 客户端陷地
+	 *
+	 * v200.4 修复:
+	 *   服务器落地后立即关闭 PMC + 关闭物理 + 冻结位置 → 服务器位置永远不变
+	 *   → 客户端 Multicast 收到冻结位置 → 客户端也关闭 PMC + 关闭物理 + SetActorLocation
+	 *   → 客户端位置永远不变 → 不会再陷地
+	 *
+	 * 关键 (大厂原则):
+	 *   - 服务器和客户端状态必须完全一致 (ReplicateMovement 不复制 PMC 状态)
+	 *   - 所以 Multicast 是必须的 (不能依赖 UE 自动同步)
+	 *   - Multicast 用 Reliable: 落地冻结是一次性事件, 不能丢
+	 */
+	UFUNCTION(NetMulticast, Reliable, Category = "Weapon|Drop")
+	void Multicast_FreezeWeaponTransform(FVector_NetQuantize FinalLocation, FRotator FinalRotation);
+
+	/**
 	 * Multicast_PlayFireTraceVisual — 客户端同步显示服务器 trace 视觉
 	 *
 	 * 调用方: URangedLineStrategy::PerformSingleShot (服务器权威 trace 完后)

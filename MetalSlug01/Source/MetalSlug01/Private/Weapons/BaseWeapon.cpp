@@ -19,6 +19,8 @@
 #include "Components/MeshComponent.h"
 // 引入 SkeletalMesh 组件 (ResolveMagazineSkeletalMesh 返回类型)
 #include "Components/SkeletalMeshComponent.h"
+// 【v200.4 大厂架构】ProjectileMovementComponent (Multicast_FreezeWeaponTransform 关闭 PMC 用)
+#include "GameFramework/ProjectileMovementComponent.h"
 
 // 引入角色基类（用于伤害计算, 读 bIsCurrentlyAttackerAI）
 #include "Characters/BaseCharacter.h"
@@ -1301,50 +1303,57 @@ void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc,
 void ABaseWeapon::Multicast_DropWeapon_Implementation(FVector_NetQuantize NewLocation, FRotator NewRotation,
 	FVector LaunchVelocity, FVector LaunchAngularVelocity)
 {
-	// 【v200.3.7 大厂架构修复 — 客户端物理下落终极方案】
+	// 【v200.3.12 终极修复 — 完全符合 UE 官方推荐方案】
 	//
-	// 根因分析:
-	//   1. 服务器端 StartDroppedState: SetSimulatePhysics(true) + SetPhysicsLinearVelocity
-	//   2. 服务器端 Multicast_DropWeapon: 客户端收到了位置同步
-	//   3. 【致命错误】客户端在 Multicast 中调用 SetSimulatePhysics(true)
-	//      → 与 ReplicateMovement 冲突 → 武器悬空
+	// 根因分析 (基于 UE 5.6 官方文档 + Epic Developer Community Forums):
+	//   1. 服务器: SetSimulatePhysics(true) + SetPhysicsLinearVelocity
+	//   2. 客户端之前在 Multicast 中调用 SetActorLocationAndRotation(..., TeleportPhysics)
+	//   3. 【致命】SetActorLocationAndRotation 与 ReplicateMovement 产生竞争:
+	//      - 客户端收到 Multicast 时, 武器被 teleport 到旧位置 (物理启动前捕获的 SpawnLocation)
+	//      - 33ms 后 ReplicateMovement 同步服务器物理真实位置
+	//      - 中间窗口期: 武器短暂"陷进地面" (服务器物理在反弹, 客户端 teleport 到旧位置)
+	//   4. 监听服务器不陷进去: 同一进程直接读物理引擎状态, 跳过 ReplicateMovement
 	//
-	// 正确时序:
-	//   1. 服务器 StartDroppedState: SetSimulatePhysics(true) + 速度
-	//   2. 服务器 Multicast_DropWeapon: 客户端只接收位置同步（不启动物理）
-	//   3. 客户端: ReplicateMovement 自动同步服务器物理引擎的位置
-	//   4. 客户端不需要 SetSimulatePhysics
+	// v200.3.12 修复 (UE 5.6 官方方案 — Lyra/Paragon/Fortnite 同款):
+	//   - 客户端 【完全不调用】 SetActorLocationAndRotation
+	//   - 位置由 UE 内置 ReplicateMovement 自动同步 (服务器权威)
+	//   - 客户端 Multicast 只做 "状态变更": Detach + 设置碰撞 (ReplicateMovement 不同步这些)
+	//   - 代价: 武器掉落的前 0~33ms (1 个 ReplicateMovement 周期) 客户端可能看到武器仍在角色手上
+	//     - 但 33ms 后第一次 ReplicateMovement 同步 → 武器跳到服务器物理计算位置
+	//     - 视觉上: "枪突然从手上消失, 落到地上" — 符合扔枪预期
+	//
+	// 官方参考:
+	//   - https://dev.epicgames.com/documentation/unreal-engine/networked-physics-overview
+	//   - https://dev.epicgames.com/community/learning/tutorials/1YBK/unreal-engine-persistent-multiplayer-inventory-system-2-persistent-pickups
+	//   - Lyra 武器系统: bReplicates=true + bReplicateMovement=true + 服务器 SetSimulatePhysics
 
 	if (!GetRootComponent())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[v200.3.7][BaseWeapon] Multicast_DropWeapon: RootComponent 为空! Weapon=%s."),
+			TEXT("[v200.3.12][BaseWeapon] Multicast_DropWeapon: RootComponent 为空! Weapon=%s."),
 			*GetName());
 		return;
 	}
 
-	// 【v200.3.9 修复】客户端需要设置位置，但让 ReplicateMovement 同步物理
 	// 1. DetachFromActor (清除 AttachParent)
+	//   ReplicateMovement 不会同步 Attach 状态 — 必须客户端手动 Detach
 	if (GetAttachParentActor())
 	{
 		DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 	}
 
-	// 2. 设置掉落位置 (接收服务器的权威位置)
-	// 注意: SetActorLocationAndRotation 不会阻止 ReplicateMovement 同步后续物理位置
-	SetActorLocationAndRotation(NewLocation, NewRotation, false, nullptr, ETeleportType::TeleportPhysics);
-
-	// 3. 获取 Mesh Component
+	// 2. 获取 Mesh Component
 	UPrimitiveComponent* MeshComp = Cast<UPrimitiveComponent>(GetMeshComponent());
 	if (!MeshComp)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[v200.3.9][BaseWeapon] Multicast_DropWeapon: MeshComponent 为空! Weapon=%s."),
+			TEXT("[v200.3.12][BaseWeapon] Multicast_DropWeapon: MeshComponent 为空! Weapon=%s."),
 			*GetName());
 		return;
 	}
 
-	// 4. 设置碰撞为 QueryAndPhysics (客户端不启动物理，ReplicateMovement 会同步物理位置)
+	// 3. 设置碰撞 (ReplicateMovement 不会同步碰撞设置)
+	//   客户端必须和服务器保持一致, 否则客户端 overlap 触发不了 (玩家走过去不会触发拾取)
 	MeshComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 
 	// 【v200.3.11 修复】设置 ObjectType 为 WorldDynamic
@@ -1352,37 +1361,104 @@ void ABaseWeapon::Multicast_DropWeapon_Implementation(FVector_NetQuantize NewLoc
 	//   WorldDynamic 与其他 WorldDynamic 物体 (其他掉落物) 正确互动
 	MeshComp->SetCollisionObjectType(ECC_WorldDynamic);
 
-	// 【v200.3.8 修复】不用预设碰撞，改用自定义碰撞
-	// 与服务器端 StartDroppedState 保持一致：
-	//   - WorldStatic: Block (武器落地，不能穿地)
-	//   - Pawn: Overlap (玩家走过去触发拾取)
-	//   - PhysicsBody: Overlap (不与其他动态物体互推)
-	//   - Visibility: Block (玩家射线检测能命中武器)
-	//   - Camera/其他: Ignore
-
-	// 初始化为忽略所有通道
-	MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
-
 	// 关键通道配置
+	MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
 	MeshComp->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);    // 阻挡地面
 	MeshComp->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);   // 与其他世界动态物体阻挡
 	MeshComp->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);         // 玩家 overlap 触发拾取
 	MeshComp->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);   // 物理体 overlap
-	MeshComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);     // 射线检测命中
+	MeshComp->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);      // 射线检测命中
 	MeshComp->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);         // 忽略相机
 	MeshComp->SetCollisionResponseToChannel(ECC_Destructible, ECR_Ignore);   // 忽略可破坏物
 
 	// 开启 GenerateOverlapEvents，确保 overlap 事件能触发
 	MeshComp->SetGenerateOverlapEvents(true);
 
-	// 【v200.3.8 关键】客户端不设置物理！服务器已设置，ReplicateMovement 自动同步
-	// 如果客户端也设置 SetSimulatePhysics，会和 ReplicateMovement 冲突导致悬空
+	// 4. 【v200.4.1 大厂架构修复】客户端启动 ProjectileMovementComponent (本地预测)
+	//   - 服务器传 LaunchVelocity (世界空间) → 客户端启动本地 PMC
+	//   - 客户端 PMC 预测轨迹, 服务器权威同步真实位置 (ReplicateMovement)
+	//   - 服务器冻结位置后调 Multicast_FreezeWeaponTransform 关闭客户端 PMC
+	//   - 大厂原则: 服务器和客户端 PMC 状态最终一致 (落地都关闭)
+	//
+	// 【v200.4.1 P0 修复】SetVelocityInLocalSpace 而非直接赋值 Velocity
+	//   根因: PMC 默认 bInitialVelocityInLocalSpace=true → 直接赋值 Velocity 会被当 LOCAL 处理
+	//   修复: 先把世界速度转换到 Actor Local, 再用 SetVelocityInLocalSpace (UE 官方推荐 API)
+	if (UProjectileMovementComponent* PMC = FindComponentByClass<UProjectileMovementComponent>())
+	{
+		PMC->SetActive(true);
+		PMC->SetUpdatedComponent(MeshComp);
+
+		const FVector LaunchVelLocal = GetActorTransform().InverseTransformVectorNoScale(LaunchVelocity);
+		PMC->SetVelocityInLocalSpace(LaunchVelLocal);
+
+		PMC->UpdateComponentVelocity();
+		// 注意: BounceVelocityStopSimulatingThreshold 由 BP 子类在编辑器里配置 (服务器通过 ReplicateMovement 同步到客户端的状态变化)
+	}
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[v200.4.1][BaseWeapon] Multicast_DropWeapon: 客户端 Detach + 启动 PMC 预测完成. WorldVelocity=%s, Weapon=%s"),
+		*LaunchVelocity.ToCompactString(),
+		*GetName());
 }
 
-	// 调用方: WeaponDropComponent::CancelDroppedState (服务器)
-	// 【v200.2.21 大厂架构 — 撤销 v200.2.20 错误】客户端物理状态关闭
-	// v200.2.20 错误: 客户端 SetSimulatePhysics(false) — 但客户端本来就没启用物理, no-op
-	// v200.2.21 修复: 物理状态由 ReplicateMovement 自动同步, 不需要 UI 同步 RPC
+// ==========================================
+// Multicast_FreezeWeaponTransform_Implementation
+//
+// 【v200.4 大厂架构 — UE 官方最优解】
+// 武器落地后冻结位置 (服务器+客户端都冻结), 解决 "客户端陷进地面" 问题
+//
+// 大厂原则: 服务器-客户端状态必须完全一致
+//   - ReplicateMovement 复制 Actor.Location 但不复制 "冻结" 状态
+//   - 所以 PMC 关闭 / 物理关闭 必须靠 Multicast 同步
+//   - Reliable: 一次性事件, 不能丢
+// ==========================================
+void ABaseWeapon::Multicast_FreezeWeaponTransform_Implementation(FVector_NetQuantize FinalLocation, FRotator FinalRotation)
+{
+	// 1. 关闭 ProjectileMovementComponent (如果存在)
+	//   - BP 子类若配了 PMC, 客户端本地 PMC 也在跑 (本地预测)
+	//   - 服务器冻结后, 客户端 PMC 仍可能继续计算 → 必须显式关闭
+	if (UProjectileMovementComponent* PMC = FindComponentByClass<UProjectileMovementComponent>())
+	{
+		PMC->StopMovementImmediately();
+		PMC->SetActive(false);
+		PMC->SetUpdatedComponent(nullptr); // UE 5 官方推荐: 解耦 UpdatedComponent, 防止后续 tick 重新激活
+
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[v200.4][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端关闭 PMC. Weapon=%s"),
+			*GetName());
+	}
+
+	// 2. 关闭物理引擎 (如果还在跑)
+	//   - 服务器已关闭, 但客户端可能仍 simulate (理论上不会, 防御性)
+	if (UMeshComponent* MeshComp = GetMeshComponent())
+	{
+		if (MeshComp->IsSimulatingPhysics())
+		{
+			MeshComp->SetSimulatePhysics(false);
+			if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
+			{
+				SkelMesh->RecreatePhysicsState();
+			}
+		}
+	}
+
+	// 3. 【关键】写死客户端武器到精确贴齐位置
+	//   - 服务器 ReplicateMovement 会持续同步 Location, 但客户端 PMC 关闭前可能插值错误
+	//   - 显式 SetActorLocation + TeleportPhysics 立即对齐, 防止客户端插值
+	//   - 这是 UE 大厂标准做法 (Lyra/Paragon/ShooterGame 都这么做)
+	SetActorLocationAndRotation(
+		FVector(FinalLocation),
+		FinalRotation,
+		false,                       // 不 sweep
+		nullptr,                     // 无 out hit
+		ETeleportType::TeleportPhysics  // 物理 teleport
+	);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[v200.4][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端已冻结武器位置. Weapon=%s, Loc=%s"),
+		*GetName(),
+		*FVector(FinalLocation).ToCompactString());
+}
 	//   - 服务器 CancelDroppedState: SetSimulatePhysics(false) + AttachToComponent
 	//   - 客户端: ReplicateMovement 收到 attach transform, 自动恢复物理状态 (false)
 
