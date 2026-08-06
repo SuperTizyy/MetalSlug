@@ -581,6 +581,16 @@ void UGameHUDWidget::UpdateTeamKillCountsText(int32 AttackerKills, int32 Defende
 	Widget_MatchInfo->UpdateAttackerCount(AttackerKills);
 	Widget_MatchInfo->UpdateDefenderCount(DefenderKills);
 
+	// 【v202.0 大厂架构新增】队伍击杀统计变化时, 同时触发 ScoreboardWidget 刷新
+	// 大厂原则 — 单一事件源: OnTeamKillCountUpdated 是队伍击杀的真理源广播
+	//   - MatchInfo 收: 数字显示
+	//   - Scoreboard 收: 排名/KDA 重排
+	// 注意: 重复架构 vs Tick 拉取的取舍 — 用户明确要求走 RPC, 走事件最直接
+	if (Widget_Scoreboard && Widget_Scoreboard->GetVisibility() == ESlateVisibility::Visible)
+	{
+		Widget_Scoreboard->RefreshScoreboard();
+	}
+
 	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] 刷新队伍击杀数: 攻方=%d, 守方=%d"), AttackerKills, DefenderKills);
 }
 
@@ -652,34 +662,33 @@ void UGameHUDWidget::OnZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner
 		return;
 	}
 
-	ARoomGameMode* GM = Cast<ARoomGameMode>(World->GetAuthGameMode());
-	if (!GM)
+	// 【v210.2 大厂架构重构】直接用 RoomGS 查音效 (GameState 在所有机器都存在)
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
 	{
-		// 纯客户端 (dedicated server 等) 不会有 GM, 这里只 Log Warning
-		// 这种情况不应该发生 (Multicast 应在 listen server + 所有客户端收到)
-		UE_LOG(LogTemp, Warning,
-			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: AuthGameMode 非 ARoomGameMode (可能在专用服务器). 跳过."));
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: RoomGameState 为空, 无法播放小局音效."));
 		return;
 	}
 
-	// 业务规则 (用户 2026.08.06 明确): 全体客户端播同一个音效, 不按 ClientFactionTag 分发
-	//   - 早一版本按 (RoundWinner × ClientFactionTag) 4 种组合分发, 已被业务简化
-	//   - 单一真理源: GameMode.ResolveZombieRoundEndSound(InRoundWinner) → 2 路分支 (Human/Mother)
-	USoundBase* SoundToPlay = GM->ResolveZombieRoundEndSound(InRoundWinner);
+	// 【v210.2 大厂架构重构】用 RoomGS->GetZombieRoundEndSound() 替代 GM->ResolveZombieRoundEndSound()
+	//   - 服务器初始化时 CacheZombieRoundSounds() 已缓存音效到 GameState
+	//   - GameState.Replicate 字段自动复制到所有客户端
+	USoundBase* SoundToPlay = RoomGS->GetZombieRoundEndSound(InRoundWinner);
 	if (!SoundToPlay)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: GameMode.ResolveZombieRoundEndSound 返回 null. "
+			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: RoomGS.GetZombieRoundEndSound 返回 null. "
 			     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|ZombieRound 配对应的 ZombieHumanWinSound / ZombieMotherWinSound. "
 			     "【业务后果】本小局音效未播放, 业务不阻塞."));
 		return;
 	}
 
-	// 客户端本机播放 (零重复架构 — 不走 Multicast RPC, 因为已在 _Implementation 内)
+	// 客户端本机播放
 	UGameplayStatics::PlaySound2D(this, SoundToPlay);
 	UE_LOG(LogTemp, Log,
-		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 已播放小局音效 (全体). InRoundWinner=%d"),
-		static_cast<int32>(InRoundWinner));
+		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 已播放小局音效 (全体). InRoundWinner=%d, Sound=%s"),
+		static_cast<int32>(InRoundWinner), *SoundToPlay->GetName());
 }
 
 /** 根据游戏模式切换 Text_RemainingRounds 的可见性 */
@@ -1729,8 +1738,10 @@ void UGameHUDWidget::OnWeaponAmmoInfoReady(int32 CurrentMag, int32 MagazineSize,
 	// 弹药信息中 ReserveAmmo=0 且 MagazineSize=1 的是近战武器标志
 	const bool bIsMelee = (MagazineSize == 1 && ReserveAmmo == 0);
 
-	UE_LOG(LogTemp, Log,
-		TEXT("[GameHUDWidget] OnWeaponAmmoInfoReady: CurrentMag=%d, MagazineSize=%d, ReserveAmmo=%d, bIsMelee=%d"),
+	// 【v208.6 增强日志】★ 标记让用户一眼能看到弹药 RPC 是否收到
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] ★ OnWeaponAmmoInfoReady: CurrentMag=%d, MagazineSize=%d, ReserveAmmo=%d, bIsMelee=%d. "
+		     "【v208.6】如果日志消失 = RPC 没收到，检查 Server_RefillAmmo 是否被调用."),
 		CurrentMag, MagazineSize, ReserveAmmo, bIsMelee ? 1 : 0);
 
 	Widget_WeaponPanel->UpdateWeaponAmmoText(CurrentMag, MagazineSize, ReserveAmmo, bIsMelee);

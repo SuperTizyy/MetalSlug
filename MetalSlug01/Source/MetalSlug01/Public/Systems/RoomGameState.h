@@ -7,6 +7,7 @@
 // ==========================================
 // UE 引擎核心最小化头文件
 #include "CoreMinimal.h"
+#include "Sound/SoundBase.h"
 
 // 引入 UE 原生 AGameStateBase 类（基类）
 #include "GameFramework/GameStateBase.h"
@@ -776,6 +777,44 @@ public:
 	 */
 	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
 	FOnRoundWinnerUpdated OnZombieRoundBriefResult;
+
+	// 【v210.2 大厂架构重构】音效资产缓存 (解决客户端无 AuthGameMode 问题)
+	//   - 根因: 客户端 World->GetAuthGameMode() 返回 nullptr
+	//   - 修复: 服务器在初始化时缓存音效资产到 GameState (GameState 在所有机器都存在)
+	//   - GameState.Replicate 字段会自动复制到所有客户端
+	//   - 客户端可以直接访问, 无需查 GameMode
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Settlement|Zombie|Sound")
+	USoundBase* CachedZombieHumanWinSound;
+
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Settlement|Zombie|Sound")
+	USoundBase* CachedZombieMotherWinSound;
+
+	/**
+	 * 【v210.2 大厂架构重构】获取小局结束音效 (客户端/服务器通用)
+	 *
+	 * 大厂原则 — 单一体真理源:
+	 *   - 音效资产从 GameState 缓存读取 (GameState 在所有机器都存在)
+	 *   - 替代旧的 GameMode.ResolveZombieRoundEndSound (客户端无 AuthGameMode)
+	 *
+	 * @param InRoundWinner 本小局赢家
+	 * @return 对应音效资产 (Human → CachedZombieHumanWinSound, Mother → CachedZombieMotherWinSound)
+	 */
+	UFUNCTION(BlueprintPure, Category = "Room|Settlement|Zombie|Sound")
+	USoundBase* GetZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const;
+
+	/**
+	 * 【v210.2 大厂架构重构】服务器初始化时缓存音效资产 (供 Replicate)
+	 *
+	 * 大厂原则 — 服务器权威:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - 从 GameMode 复制音效资产到 GameState 缓存字段
+	 *   - 引擎自动 Replicate 到所有客户端
+	 *
+	 * @param InHumanSound 人类胜利音效
+	 * @param InMotherSound 母体胜利音效
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie|Sound")
+	void CacheZombieRoundSounds(USoundBase* InHumanSound, USoundBase* InMotherSound);
 
 	/**
 	 * 【v200.2 大厂架构修复】从 private 移到这里，允许 LifecycleSubsystem 调用

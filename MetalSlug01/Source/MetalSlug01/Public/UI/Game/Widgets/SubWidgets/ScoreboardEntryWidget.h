@@ -61,7 +61,7 @@ public:
 
 	/**
 	 * 设置击杀/死亡/助攻数据
-	 * 格式: "Kills / Deaths / Assists"
+	 * 格式: "击杀 / 死亡 / 助攻"
 	 * 颜色: K/D >= 2 绿 / >= 1 白 / < 1 红
 	 */
 	UFUNCTION(BlueprintCallable, Category = "ScoreboardEntry")

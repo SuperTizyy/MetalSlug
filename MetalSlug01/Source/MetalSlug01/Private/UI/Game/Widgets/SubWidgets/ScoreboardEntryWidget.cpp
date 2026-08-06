@@ -103,6 +103,11 @@ void UScoreboardEntryWidget::SetScore(int32 InScore)
  *   K/D >= 1.0  白色 (持平)
  *   K/D <  1.0  红色 (需要努力)
  * 防御性: Deaths=0 时 KDRatio 直接用 Kills
+ *
+ * 大厂原则 — 业务约束:
+ *   - 母体击杀/死亡直接走 ARoomPlayerState::RoomKills/Deaths (单一真理源, 不开新字段)
+ *   - PerformKillSettlement 内按 Killer/Victim 身份分发到母体/非母体的 RoomKills/RoomDeaths
+ *   - Text_KDA 只需要展示现有 K/D/A 三列, 不污染业务字段
  */
 void UScoreboardEntryWidget::SetKDA(int32 Kills, int32 Deaths, int32 Assists)
 {

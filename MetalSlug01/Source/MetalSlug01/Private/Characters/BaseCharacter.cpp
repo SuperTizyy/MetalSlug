@@ -3407,10 +3407,23 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 	}
 
 	// 大厂准备 Victim 姓名 (一次性读取, 复用)
+	// 【v206 大厂重构】双轨制: 优先 PS (玩家), 否则 AIC Name (AI)
+	//   旧版只读 PS, AI 永远是 "Unknown" — 与 BuildAISnapshotFromController 不一致
 	FString VictimName = TEXT("Unknown");
 	if (ARoomPlayerState* VictimPS = Victim->GetRoomPlayerState())
 	{
 		VictimName = VictimPS->GetPlayerName();
+	}
+	else if (ABaseAIController* VictimAIC = Cast<ABaseAIController>(Victim->GetController()))
+	{
+		VictimName = VictimAIC->GetName();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] GrantAssistsToEligiblePlayers: Victim '%s' 既无 PS 也无 AIC. "
+			     "VictimName 强制 Unknown."),
+			*Victim->GetName());
 	}
 
 	// 遍历受害者的最后攻击者记录
@@ -3442,28 +3455,144 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 			continue;
 		}
 
-		ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState();
-		if (!AssistantPS)
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[BaseCharacter] 助攻者 '%s' 没有 ARoomPlayerState, 跳过加分."),
-				*AssistantChar->GetName());
-			continue;
-		}
+		// 【v206 大厂重构】走统一入口 ApplyAssistScore, 玩家/AI 双轨制
+		//   旧版 (v22-v202): 只调 PS->AddAssistScore, AI 助攻者没 PS → 跳过 → AIAssists 永远 0
+		//   现在 ApplyAssistScore 内部统一处理 PS/AIC, 调用方零重复
+		ABaseCharacter::ApplyAssistScore(AssistantChar);
 
-		// 服务器侧助攻加分 (单一真理源: AddAssistScore 内部 HasAuthority 守卫, 客户端不会重复)
-		AssistantPS->AddAssistScore();
+		// 【v206 大厂重构】AssistantName 也走双轨制 — AI 用 Controller Name, 玩家用 PS Name
+		//   旧版用 AssistantPS->GetPlayerName(), AI 没 PS → 编译错
+		//   新版单一真理源: 优先 PS, 否则 AIC GetName() (与 BuildAISnapshotFromController 一致)
+		FString AssistantName;
+		if (ARoomPlayerState* AssistantPS = AssistantChar->GetRoomPlayerState())
+		{
+			AssistantName = AssistantPS->GetPlayerName();
+		}
+		else if (ABaseAIController* AssistantAIC = Cast<ABaseAIController>(AssistantChar->GetController()))
+		{
+			AssistantName = AssistantAIC->GetName();
+		}
+		else
+		{
+			// 零兜底: 既不是玩家也不是 AI — 与 ApplyAssistScore 内部报错保持一致
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter] GrantAssistsToEligiblePlayers: Assistant '%s' 既无 PS 也无 AIC. "
+				     "AssistantName 强制 Unknown (这不应该发生 — ApplyAssistScore 应已 Log Error)."),
+				*AssistantChar->GetName());
+			AssistantName = TEXT("Unknown");
+		}
 
 		// 广播助攻信息给所有客户端 — 纯数据 RPC, 不传 Actor*
 		// 【v40.9】助攻者的 KillFeed 显示由 bIsKillerPlayer 决定（主击杀者是否为玩家）
 		// 【v100】助攻不计入连杀 → StreakType=None → KillSoundComponent 收到 None 不播音
 		//     （助攻只显示图标,不刷"二连杀"音效 — 与 KillStreakWidget 业务一致）
-		const FString AssistantName = AssistantPS->GetPlayerName();
 		AssistantChar->Multicast_NotifyKill(AssistantName, VictimName, KillMethod, /*bIsAssist=*/true, bIsKillerPlayer, EKillStreakType::None, /*KillSoundAsset=*/nullptr);
 	}
 
 	// 清理时间戳 (Victim 已死, 历史不再需要)
 	Victim->LastHitTimestamps.Empty();
+}
+
+
+// ==========================================
+// 【v206 大厂架构 — KDA 累加统一入口】
+// ==========================================
+//
+// 单一真理源 (大厂原则):
+//   - 这三个函数是项目内唯一累加 KDA 数字的入口
+//   - 调用方 (CombatDeathComponent / GrantAssistsToEligiblePlayers) 不再写 PS/AIC 双分支
+//   - 未来扩展 (例如新角色类型) 只需改这 3 处, 不污染调用方
+//
+// 走 RPC (大厂原则):
+//   - ARoomPlayerState::AddDeath/AddKillScore/AddAssistScore 内部已走 Replicated + OnRep
+//   - ABaseAIController::AddDeath/AddKillScore/AddAssistScore 内部已走 Replicated + OnRep
+//   - 本函数只是统一封装, 不再额外加 RPC 包装 (大厂原则 - 零重复架构)
+
+bool ABaseCharacter::ApplyDeathScore(ABaseCharacter* Victim)
+{
+	// 零兜底: 入参校验 — 大厂原则 (不抛异常, 不静默吞)
+	if (!Victim)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] ApplyDeathScore: Victim 为 null. 拒绝累加 (调用方必须先校验)."));
+		return false;
+	}
+
+	// 玩家路径 — 优先尝试 PlayerState (与项目其他路径一致: 先 PS, 再 AIC)
+	if (ARoomPlayerState* PS = Victim->GetRoomPlayerState())
+	{
+		PS->AddDeath();
+		PS->ServerResetKillStreak(); // 死亡时清零连杀 — 与原 PerformKillSettlement 行为镜像
+		return true;
+	}
+
+	// AI 路径 — AIC 必有 (AIController 是 AI Pawn 的真理所有者)
+	if (ABaseAIController* AIC = Cast<ABaseAIController>(Victim->GetController()))
+	{
+		AIC->AddDeath();
+		return true;
+	}
+
+	// 零兜底: 既不是玩家也不是 AI — 配置错误, 必须显式报错
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseCharacter] ApplyDeathScore: Victim '%s' 既无 ARoomPlayerState 也无 ABaseAIController. "
+		     "拒绝累加. 修复: 检查 BP Pawn 配置 — AI 必须有 ABaseAIController, 玩家必须有 ARoomPlayerState."),
+		*Victim->GetName());
+	return false;
+}
+
+bool ABaseCharacter::ApplyKillScore(ABaseCharacter* Killer)
+{
+	if (!Killer)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] ApplyKillScore: Killer 为 null. 拒绝累加."));
+		return false;
+	}
+
+	if (ARoomPlayerState* PS = Killer->GetRoomPlayerState())
+	{
+		PS->AddKillScore();
+		return true;
+	}
+
+	if (ABaseAIController* AIC = Cast<ABaseAIController>(Killer->GetController()))
+	{
+		AIC->AddKillScore();
+		return true;
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseCharacter] ApplyKillScore: Killer '%s' 既无 PS 也无 AIC. 拒绝累加."),
+		*Killer->GetName());
+	return false;
+}
+
+bool ABaseCharacter::ApplyAssistScore(ABaseCharacter* Assistant)
+{
+	if (!Assistant)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] ApplyAssistScore: Assistant 为 null. 拒绝累加."));
+		return false;
+	}
+
+	if (ARoomPlayerState* PS = Assistant->GetRoomPlayerState())
+	{
+		PS->AddAssistScore();
+		return true;
+	}
+
+	if (ABaseAIController* AIC = Cast<ABaseAIController>(Assistant->GetController()))
+	{
+		AIC->AddAssistScore();
+		return true;
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[BaseCharacter] ApplyAssistScore: Assistant '%s' 既无 PS 也无 AIC. 拒绝累加."),
+		*Assistant->GetName());
+	return false;
 }
 
 

@@ -1385,6 +1385,57 @@ public:
 	static void GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABaseCharacter* Killer,
 	                                          EKillMethod KillMethod, bool bIsKillerPlayer);
 
+	// ==========================================
+	// 【v206 大厂架构 — KDA 累加统一入口 (玩家/AI 双轨制)】
+	// ==========================================
+	//
+	// 单一职责:
+	//   - 输入: 一个 ABaseCharacter (Victim/Killer/Assistant 都用同一组)
+	//   - 自动判定: 优先读 PlayerState (玩家), 否则读 AIController (AI)
+	//   - 调用对应 AddDeath/AddKillScore/AddAssistScore,内部已经走 RPC 链路
+	//
+	// 解决的历史 bug (v22-v202):
+	//   - 旧版 CombatDeathComponent 只对玩家调 PS->AddDeath, AI 永远不 +1
+	//   - 旧版 GrantAssistsToEligiblePlayers 只对玩家 PS 调 AddAssistScore, AI 助攻永远不 +1
+	//   - 旧版 PerformKillSettlement Killer 路径只调 PS->AddKillScore, AI 击杀永远不 +1
+	//
+	// 大厂原则:
+	//   - 单一真理源: KDA 累加入口只有这一组,任何调用方都走它
+	//   - 零兜底: 既无 PS 也无 AIC → Log Error,不允许静默吞掉
+	//   - 走 RPC: 内部调用的 PS/AIC 函数都已实现 Replicated + OnRep + Broadcast
+	//   - 不重复: 玩家/AI 两条路径统一封装, 调用方不重复写 if/else
+	//
+	// 调用方:
+	//   - UCombatDeathComponent::PerformKillSettlement (Victim + Killer)
+	//   - ABaseCharacter::GrantAssistsToEligiblePlayers (Assistant 循环)
+	//
+	// 注意: 静态方法,无 this 依赖 — 与 GrantAssistsToEligiblePlayers 设计一致
+	// ==========================================
+
+	/**
+	 * 给被击杀者累加死亡数 (服务器专用, 内部方法都自带 HasAuthority 守卫)
+	 * @param Victim 被击杀角色 (玩家/AI 都接受)
+	 * @return 是否成功累加 (false = 既不是玩家也不是 AI,配置错误)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard|KDA", meta = (DevelopmentOnly))
+	static bool ApplyDeathScore(ABaseCharacter* Victim);
+
+	/**
+	 * 给击杀者累加击杀分 (服务器专用)
+	 * @param Killer 击杀者 (玩家/AI 都接受)
+	 * @return 是否成功累加
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard|KDA", meta = (DevelopmentOnly))
+	static bool ApplyKillScore(ABaseCharacter* Killer);
+
+	/**
+	 * 给助攻者累加助攻分 (服务器专用)
+	 * @param Assistant 助攻者 (玩家/AI 都接受)
+	 * @return 是否成功累加
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Scoreboard|KDA", meta = (DevelopmentOnly))
+	static bool ApplyAssistScore(ABaseCharacter* Assistant);
+
 	/**
 	 * 当受到伤害时，通知可能的助攻者（供武器系统调用）
 	 * @param Victim 受害者
@@ -2610,6 +2661,25 @@ protected:
 
 
 	// ==========================================
+	// ==========================================
+	// 客户端 RPC — 武器/弹药同步 (v208.5 大厂架构修复)
+	// ==========================================
+public:
+	/**
+	 * 客户端 RPC — 接收武器弹药数据 (服务器查好 CurrentAmmo/MagazineSize/ReserveAmmo 直接 RPC 推给客户端)
+	 *
+	 * 【v85.3 P0 新增】镜像 Client_RefreshWeaponIcon
+	 *
+	 * 服务器调 (Server_SpawnAllWeapons / Server_SwitchToWeaponSlot 末尾)
+	 *   → Owner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
+	 * 客户端收到 → 转发到 CharacterIconComponent::Client_RefreshWeaponAmmo_Implementation
+	 *
+	 * 【v208.5 大厂架构修复】移到 public 区段, 供 WeaponFireComponent::Server_RefillAmmo 调用
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_RefreshWeaponAmmo(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo);
+
+	// ==========================================
 	// AC/ACE系统 (类似CS中的得分系统)
 	// ==========================================
 public:
@@ -2720,28 +2790,6 @@ protected:
 	 */
 	UFUNCTION(Client, Reliable)
 	void Client_RefreshWeaponIcon(const FString& InWeaponID, class UTexture2D* Icon);
-
-	/**
-	 * 客户端 RPC — 接收武器弹药数据 (服务器查好 CurrentAmmo/MagazineSize/ReserveAmmo 直接 RPC 推给客户端)
-	 *
-	 * 【v85.3 P0 新增】镜像 Client_RefreshWeaponIcon
-	 *
-	 * 服务器调 (Server_SpawnAllWeapons / Server_SwitchToWeaponSlot 末尾)
-	 *   → Owner->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo)
-	 * 客户端收到 → 转发到 CharacterIconComponent::Client_RefreshWeaponAmmo_Implementation
-	 *
-	 * 大厂原则 - RPC 必须在 Actor 上:
-	 *   - UFUNCTION(Client, Reliable) 必须在 Actor 上, 不能在 Component 上
-	 *   - 服务器本地 (ListenServer) 自动走本地 Implementation 调用, 不走 RPC 序列化
-	 *   - 远端客户端的 Pawn 走 RPC 序列化, 收到后调 Implementation
-	 *
-	 * 镜像对称原则 (v40.1/v40.2 已落地, v85.3 弹药链路必须同样走 RPC):
-	 *   - 武器图标真理源 = 服务器查 DT_WeaponInfo, RPC 推 Icon
-	 *   - 武器弹药真理源 = 服务器读 WeaponFireComponent.CurrentAmmo/MagazineSize/ReserveAmmo, RPC 推数据
-	 *   - 客户端不"自己读武器组件再广播" (因为 CurrentWeapon 还没复制过来时, 读到默认值 1/1, HUD 显示错误)
-	 */
-	UFUNCTION(Client, Reliable)
-	void Client_RefreshWeaponAmmo(int32 CurrentAmmo, int32 MagazineSize, int32 ReserveAmmo);
 
 	/**
 	 * HUD 未就绪时的延迟重试回调

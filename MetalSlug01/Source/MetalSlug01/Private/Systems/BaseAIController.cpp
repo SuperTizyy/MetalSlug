@@ -47,6 +47,8 @@
 #include "Kismet/GameplayStatics.h"
 // 引入房间游戏模式，用于订阅 OnBattleStarted 委托
 #include "Systems/RoomGameMode.h"
+// 【v208 重构】不再需要 RoomGameState.h — AddTeamKill 已上移到 PerformKillSettlement 集中调度
+// #include "Systems/RoomGameState.h"  // 【v202.1】旧版需要 AddTeamKill 完整类型
 // 【v120 重构】AI 复活无敌期从 PlayerConfigAsset 读取 (玩家/AI 共用)
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Data/Config/PlayerConfigAsset.h"
@@ -68,6 +70,8 @@
 #include "Navigation/PathFollowingComponent.h"
 // 【2026.07.13 v40.6 反扎堆账本】引入 TargetingSubsystem 头文件（感知丢失时释放账本）
 #include "Systems/Targeting/RoomTargetingSubsystem.h"
+// 【v202.0 大厂架构】网络复制支持 (ReplicatedUsing 字段)
+#include "Net/UnrealNetwork.h"
 
 // 定义本文件的静态日志分类，所有 UE_LOG 使用此分类输出，方便在日志中过滤
 DEFINE_LOG_CATEGORY_STATIC(LogBaseAI, Log, All);
@@ -90,6 +94,15 @@ ABaseAIController::ABaseAIController()
 	PrimaryActorTick.bCanEverTick = true;
 	// 设置 Actor 生成时 Tick 默认启用，无需外部手动开启
 	PrimaryActorTick.bStartWithTickEnabled = true;
+
+	// 【v202.0 大厂架构 — 启用 AIC 网络复制】
+	// AAIController 默认 bReplicates=false (与 PlayerController 不同), 这里必须显式开启
+	// 否则 AIScore/AIKills/AIDeaths/AIAssists ReplicatedUsing 字段永远不会被同步到客户端
+	bReplicates = true;
+	// 【v202.1 修复】UE 5.6 弃用 NetUpdateFrequency 直接赋值, 改用 SetNetUpdateFrequency()
+	// 大厂原则: 跟随引擎迁移, 不写即将失效的 API
+	// 网络复制频率: 客户端只需要最终值, 不需要高频更新 (减少带宽)
+	SetNetUpdateFrequency(10.0f);
 }
 
 
@@ -503,10 +516,190 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 	//   - BT 启动后第一次 Tick 时写入 WanderHome = Pawn.Location
 	//   - 单一真理源: Pawn 出生点
 	//
-	// 大厂原则 — 时序责任分层:
-	//   OnPossess: 负责 Pawn 级状态 (阵营缓存, RuntimeConfig 实例化)
-	//   RunBehaviorTree: 负责 BT 实例化 + BB 实例化
-	//   BTService_InitWanderHome: 负责 BT 级 BB Key 初始化 (WanderHome)
+// 大厂原则 — 时序责任分层:
+//   OnPossess: 负责 Pawn 级状态 (阵营缓存, RuntimeConfig 实例化)
+//   RunBehaviorTree: 负责 BT 实例化 + BB 实例化
+//   BTService_InitWanderHome: 负责 BT 级 BB Key 初始化 (WanderHome)
+}
+
+
+// ==========================================
+// 【v202.0 大厂架构 — AI 计分板镜像字段 RPC 链路】
+// ==========================================
+//
+// 用户反馈 (2026.08.07):
+//   "WBP_ScoreboardWidget 需要显示 AI 信息, 走 RPC 链路, 不能有兜底"
+//
+// 链路 (走 ReplicatedUsing 自动 RPC, 与 ARoomPlayerState 对称):
+//   CombatDeathComponent::PerformKillSettlement()
+//     ↓ 检测 Killer 是 AIC 还是 PlayerController
+//   Killer IS AIC → AIC->AddKillScore()
+//     ↓ 服务器: 修改 AIScore/AIKills Replicated 字段
+//   引擎自动 Replicate 到所有客户端 (UE 5.6 网络复制)
+//     ↓
+//   客户端: OnRep_AIScoreboardData() 自动触发
+//     ↓ Broadcast OnAIScoreboardDataChanged
+//   ScoreboardWidget 通过 URoomStateService 间接读取 AI 计数并刷新 UI
+//
+// 大厂原则 — 与 ARoomPlayerState 完全对称:
+//   - 真人: ARoomPlayerState::AddKillScore() → 现有 Replicated 链路
+//   - AI:   ABaseAIController::AddKillScore() → 本次新增 Replicated 链路
+//   - 单一真理源: 每个 Pawn 一种, 不混合
+//
+// 不允许重复架构 (用户硬性要求):
+//   - 本类实现与 ARoomPlayerState 同名同语义, 调用方切换用 IsA<ABaseAIController>
+//   - 旧路径 (v202.0 之前) 走 `Killer->GetRoomPlayerState()` 永远 nullptr → 计数完全没累加
+//   - 新路径拆 AI/Player 两条, 各走对应真理源
+
+// v202.0 P0: 启用 AIC 网络复制 — 4 个 KDA 字段注册到 DOREPLIFETIME
+void ABaseAIController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	// 【v202.0 大厂架构】AI 计分板字段 Replicated 注册
+	// 这 4 个字段是客户端显示 AI 计分数据的唯一真理源 (没有 PlayerState 兜底)
+	// 字段本身已用 ReplicatedUsing 修饰, 这里只 DOREPLIFETIME 注册即可
+	DOREPLIFETIME(ABaseAIController, AIScore);
+	DOREPLIFETIME(ABaseAIController, AIKills);
+	DOREPLIFETIME(ABaseAIController, AIDeaths);
+	DOREPLIFETIME(ABaseAIController, AIAssists);
+}
+
+// v202.0 P0: 客户端 OnRep — 镜像 ARoomPlayerState::OnRep_ScoreboardData
+void ABaseAIController::OnRep_AIScoreboardData()
+{
+	// 服务器自身不触发 OnRep (UE 标准行为), 只客户端触发
+	// ListenServer 的服务器+客户端身份: 服务器侧修改字段后, 引擎也会触发 OnRep (UE 5.6 行为)
+	// 镜像 ARoomPlayerState: Broadcast 不带参数, 订阅方自己拉完整快照
+
+	UE_LOG(LogBaseAI, Verbose,
+		TEXT("[BaseAIController] OnRep_AIScoreboardData: AI='%s' Score=%d Kills=%d Deaths=%d Assists=%d (RPC 同步到)"),
+		*GetName(), AIScore, AIKills, AIDeaths, AIAssists);
+
+	OnAIScoreboardDataChanged.Broadcast();
+}
+
+// v202.0 P0: AI 击杀得分 (服务器专用, 镜像 ARoomPlayerState::AddKillScore)
+//
+// 【v208 大厂架构重构 — AddTeamKill 调用上移到 PerformKillSettlement】
+//   历史 (v22-v202):
+//     - AddKillScore 内部直接调 AddTeamKill(CachedFactionTag)
+//     - 但 GameState 的 AttackerKills/DefenderKills 业务语义是"被击杀阵营累计"
+//     - 用 Killer (AI) 阵营 = 完全错位 (AI 母体击杀玩家 → AttackerKills+1 看似对,
+//       但 Killer 是 AI 母体(Offense)击杀玩家(Defense)时: Victim=Defense,
+//       应累加 DefenderKills+1, 用 Killer(Offense)累加 AttackerKills 也对 — 这是巧合)
+//     - 真实错位 case: AI 人类(Defense)击杀 AI 母体(Offense):
+//       Killer=Defense → AddTeamKill(Defense) → DefenderKills+1 ❌
+//       应: Victim=Offense → AddTeamKill(Offense) → AttackerKills+1 ✓
+//
+//   新 (v208):
+//     - AddKillScore 只管 Score/Kills (单个 Killer 的分数)
+//     - AddTeamKill 上移到 CombatDeathComponent::PerformKillSettlement 集中调度
+//     - PerformKillSettlement 同时持有 Killer + Victim, 自然知道 Victim 阵营
+//     - 大厂原则 — 集中调度: GameState 团队击杀的累加入口只有 PerformKillSettlement 一处
+//
+// 【v202.0 P0】服务器自身也手动 Broadcast (镜像 ARoomPlayerState 模式 + 兜底 OnRep 不触发)
+//   ListenServer: 服务器+客户端同身份, OnRep 可能不触发, 手动 Broadcast 保证本地 UI 更新
+//   Dedicated Server: 不需要 (自己没 UI)
+void ABaseAIController::AddKillScore()
+{
+	// 大厂原则 — 显式优于隐式: 客户端永远不能调用此函数
+	if (!HasAuthority())
+	{
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[BaseAIController] AddKillScore: 客户端调用非法, HasAuthority=false. "
+			     "【修复】只能在服务器调 (CombatDeathComponent::PerformKillSettlement)"));
+		return;
+	}
+
+	AIKills += 1;
+	AIScore += KillScoreValue;
+
+	// 【v208 P0 重构】删除 AddTeamKill 调用 — 上移到 PerformKillSettlement 集中调度
+	//   业务语义: GameState 的 AttackerKills/DefenderKills = 被击杀阵营累计击杀数
+	//   本函数无 Victim 上下文,无法正确派发阵营 — 上移到同时持有 Killer+Victim 的 PerformKillSettlement
+	//   大厂原则 — 单一真理源: GameState 团队击杀累加入口只有 PerformKillSettlement 一处
+
+	// 【v202.0 P0】保留 ListenServer 本地 Broadcast (AI 计分板 UI 同步)
+	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
+	{
+		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	UE_LOG(LogBaseAI, Verbose,
+		TEXT("[BaseAIController] AddKillScore: AI='%s' NewAIScore=%d NewAIKills=%d (Replicated 字段已修改, 引擎自动同步)"),
+		*GetName(), AIScore, AIKills);
+}
+
+// v202.0 P0: AI 助攻得分 (服务器专用, 镜像 ARoomPlayerState::AddAssistScore)
+void ABaseAIController::AddAssistScore()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[BaseAIController] AddAssistScore: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	AIAssists += 1;
+	AIScore += AssistScoreValue;
+
+	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
+	{
+		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	UE_LOG(LogBaseAI, Verbose,
+		TEXT("[BaseAIController] AddAssistScore: AI='%s' NewAIScore=%d NewAIAssists=%d"),
+		*GetName(), AIScore, AIAssists);
+}
+
+// v202.0 P0: AI 死亡计数 (服务器专用, 镜像 ARoomPlayerState::AddDeath)
+void ABaseAIController::AddDeath()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[BaseAIController] AddDeath: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	AIDeaths += 1;
+
+	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
+	{
+		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	UE_LOG(LogBaseAI, Verbose,
+		TEXT("[BaseAIController] AddDeath: AI='%s' NewAIDeaths=%d"),
+		*GetName(), AIDeaths);
+}
+
+// v202.0 P0: AI 每小局重置计分数据 (服务器专用, 镜像 ARoomPlayerState::ResetScoreboardStats)
+// 调用方: URoomLifecycleSubsystem::StartNextZombieRound (每小局开始时)
+void ABaseAIController::ResetScoreboardStats()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogBaseAI, Error,
+			TEXT("[BaseAIController] ResetScoreboardStats: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	AIScore = 0;
+	AIKills = 0;
+	AIDeaths = 0;
+	AIAssists = 0;
+
+	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
+	{
+		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	UE_LOG(LogBaseAI, Log,
+		TEXT("[BaseAIController] ResetScoreboardStats: AI='%s' 计分板已重置 (Score=0 Kills=0 Deaths=0 Assists=0)"),
+		*GetName());
 }
 
 // BeginDestroy：当 Actor 即将被销毁时调用

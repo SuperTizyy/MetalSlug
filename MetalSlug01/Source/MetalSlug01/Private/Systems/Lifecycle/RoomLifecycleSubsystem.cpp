@@ -421,7 +421,12 @@ bool URoomLifecycleSubsystem::FinishZombieRound()
 		return false;
 	}
 
-	// 大厂原则 — 幂等防御 (镜像 MotherMutationHasFired):
+	// 【v210.1 大厂架构增强日志】诊断第二小局及后续小局音效问题
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] FinishZombieRound: 小局结算入口检查. RoundWinner=%d (期望 None), CurrentRound=%d"),
+		static_cast<int32>(RoomGS->RoundWinner), RoomGS->CurrentRound);
+
+	// 幂等防御
 	//   - RoundWinner 已为 Human/Mother → 不重复结算 (防止双发, 双发会重复累加胜局数)
 	if (RoomGS->RoundWinner != EZombieRoundWinner::None)
 	{

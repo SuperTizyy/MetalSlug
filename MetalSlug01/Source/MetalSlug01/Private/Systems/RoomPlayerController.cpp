@@ -69,6 +69,10 @@
 // 引入在线会话接口（用于创建/销毁/搜索 Session）
 #include "Interfaces/OnlineSessionInterface.h"
 
+// 【v202.0 大厂架构新增】遍历场景中所有 AI Controller (ResetScoreboardStats 镜像链路需要)
+#include "EngineUtils.h"
+#include "Systems/BaseAIController.h"
+
 // 引入房间 PlayerState（用于读写玩家个人数据）
 #include "Systems/Core/RoomPlayerState.h"
 
@@ -1129,7 +1133,16 @@ void ARoomPlayerController::ResetAllPlayerScoreboardStats()
 		return;
 	}
 
-	// 遍历所有玩家控制器
+	// ==========================================
+	// 【v202.0 大厂架构重构 — AI 也走这条链路】
+	// 旧 (v201.x): 只重置真人 PS — AI 数据永远累计, 跨小局不重置 (违反业务规则)
+	// 新 (v202.0):
+	//   - 真人: PS->ResetScoreboardStats() (已有)
+	//   - AI:   AIC->ResetScoreboardStats() (新增, 与玩家镜像)
+	// 大厂原则 — 单一真理源: 重置入口只能有一处 (此函数), 不允许散落
+	// ==========================================
+
+	// 1. 重置真人 PS
 	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
 	{
 		ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get());
@@ -1141,6 +1154,22 @@ void ARoomPlayerController::ResetAllPlayerScoreboardStats()
 			}
 		}
 	}
+
+	// 2. 重置 AI (TActorIterator, 大厂原则 — 不维护账本)
+	int32 AIResetCount = 0;
+	for (TActorIterator<ABaseAIController> It(GetWorld()); It; ++It)
+	{
+		ABaseAIController* BaseAIC = *It;
+		if (BaseAIC)
+		{
+			BaseAIC->ResetScoreboardStats();
+			++AIResetCount;
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomPlayerController] ServerResetAllPlayersScoreboard: 已重置所有人+AI 计分数据 (AI 重置数=%d)"),
+		AIResetCount);
 }
 
 

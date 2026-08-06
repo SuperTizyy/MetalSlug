@@ -57,6 +57,7 @@
 //       → 玩家复活时 GetAvailableSpawnPointForFaction 看到全部 5 个出生点被占用 → 返回 nullptr → 拒绝 Spawn → 玩家不复活
 // 修复: 在 ExecuteDeathLocal 中调 ReleaseSpawnPoint (集中调度, 唯一释放入口)
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
+#include "Systems/RoomGameState.h"  // 【v208 修复】ARoomGameState 完整类型 (PerformKillSettlement 调 AddTeamKill)
 
 // 【2026.07.13 v40.6 反扎堆账本】包含 TargetingSubsystem 以调 ReleaseTarget
 // 根因: AI 死亡时账本 AIHuntingMap 不释放 → 其他 AI 反扎堆评分时把"已死 AI 锁定的目标"也算进去
@@ -387,6 +388,31 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 		if (Owner->HasAuthority())
 		{
 			PerformKillSettlement(ActualApplied, EventInstigator, DamageCauser);
+
+			// 【v116.5 大厂架构 — AIController 解耦统一调度】
+			//   必须在 PerformKillSettlement 之后调 UnPossess (因为 PerformKillSettlement 内部
+			//   通过 Owner->GetController() 拿 AIC → 调 AIC->AddDeath() 累加 KDA)
+			//   必须在 Pawn 销毁之前调 UnPossess (防止 Pawn 销毁触发 AIC 自动销毁, v116 修复)
+			//   必须由本函数 (TakeDamage) 统一调度 (不在 Die() 内, 因为 Die() 是 HealthComponent
+			//   事件驱动同步触发, 时序早于 PerformKillSettlement)
+			// 跳过 APlayerController (玩家路径不破坏, 与 v116 设计一致)
+			if (AController* Ctrl = Owner->GetController())
+			{
+				if (Ctrl->IsA<AAIController>())
+				{
+					Ctrl->UnPossess();
+					UE_LOG(LogTemp, Display,
+						TEXT("[CombatDeathComponent] TakeDamage: 【v116.5】已 UnPossess AIController '%s', "
+						     "时机在 PerformKillSettlement 之后 + Pawn 销毁之前 (AIC.AddDeath 已能正确调用)."),
+						*Ctrl->GetName());
+				}
+				else
+				{
+					UE_LOG(LogTemp, Verbose,
+						TEXT("[CombatDeathComponent] TakeDamage: 【v116.5】Controller '%s' 非 AI 类型, 跳过 UnPossess (玩家路径不破坏)."),
+						*Ctrl->GetName());
+				}
+			}
 		}
 
 		// 注: Die() 由 HealthComponent::OnDeath 事件触发 (BaseCharacter 订阅)
@@ -634,7 +660,7 @@ void UCombatDeathComponent::Die()
 		TEXT("[CombatDeathComponent] Die: 延迟销毁 Pawn: %s (SetLifeSpan 0.1f 让 Replication 推送)"),
 		*Owner->GetName());
 
-	// 【v116 P0 修复 — AIController 解耦】在 SetLifeSpan 之前显式 UnPossess
+	// 【v116 P0 修复 — AIController 解耦 (v116.5 重构版)】
 	// 根因 (Session1.log 2026.07.31 line 113-117):
 	//   - AIC_AI_SWAT_AI_3 / AIC_AI_SWAT_AI_5 死亡后 117ms 即被 UE 自动销毁 (Reason=0 Destroyed, Pawn=NULL)
 	//   - Timer 设置的是 3s 后复活 → Timer 触发时 AIC 早已不存在 → 复活失败
@@ -646,32 +672,37 @@ void UCombatDeathComponent::Die()
 	//   - 在 SetLifeSpan 之前主动 UnPossess,让 AIController 不再引用死亡 Pawn
 	//   - Pawn 销毁时不会触发任何 AIController 销毁链 → AIController 继续存活到 Timer 触发
 	//   - Timer 触发后 MutatePawnToMother 内部 Controller->Possess(NewMotherPawn) 重新绑定
+	//
+	// 【v116.5 大厂架构重构 — 时序调整】
+	// 根因 (Session1.log 2026.08.07 line 4572-4589):
+	//   - v116 的 UnPossess 在 Die() 内 SetLifeSpan 之前执行
+	//   - 但 Die() 是 HealthComponent::ApplyDamage → OnDeath.Broadcast 同步触发的
+	//   - PerformKillSettlement 在 TakeDamage 末尾 (HC->ApplyDamage 返回之后) 才执行
+	//   - 时序链: HC->ApplyDamage → OnDeath.Broadcast → Die() [UnPossess + SetLifeSpan] → 返回 → PerformKillSettlement
+	//   - 后果: PerformKillSettlement 调用 ApplyDeathScore(Victim) 时, Owner.GetController() 返回 null
+	//   - ApplyDeathScore 误判为"既无 PS 也无 AIC", 拒绝累加 → AIDeaths 永远 0
+	//
+	// 大厂原则 — 集中调度 (v116.5 修复):
+	//   - UnPossess 必须发生在 PerformKillSettlement 之后, 但仍在 Pawn 销毁之前
+	//   - 时序: HC->ApplyDamage → Die() [Multicast_Die + ExecuteDeathLocal + SetLifeSpan] → 返回 → TakeDamage 末尾 PerformKillSettlement → TakeDamage 末尾统一调 UnPossess
+	//   - 本 Die() 函数不再调 UnPossess (避免时序竞争), 由 TakeDamage 末尾统一调度
+	//
 	// 不破坏玩家路径:
 	//   - 玩家死亡由 Multicast_Die_Implementation 中 PC->StartRespawnTimer 处理
-	//   - 本函数只对 AAIController UnPossess, 跳过 APlayerController (避免破坏 PlayerState 链路)
+	//   - UnPossess 只对 AAIController 执行, 跳过 APlayerController (避免破坏 PlayerState 链路)
 	// 不破坏刀战模式:
 	//   - 刀战模式 AI 死亡 → AIController 复用 → SpawnAIInternal 重新 Possess 新 Pawn
 	//   - 如果 AIC 被销毁,SpawnAIInternal 走"重建 Controller" 分支 (已实现)
-	if (AController* Ctrl = Owner->GetController())
-	{
-		if (Ctrl->IsA<AAIController>())
-		{
-			Ctrl->UnPossess();
-			UE_LOG(LogTemp, Display,
-				TEXT("[CombatDeathComponent] Die: 【v116】已 UnPossess AIController '%s', 让 AIC 与死亡 Pawn 解耦, 防止 Pawn 销毁触发 AIC 自动销毁."),
-				*Ctrl->GetName());
-		}
-		else
-		{
-			UE_LOG(LogTemp, Verbose,
-				TEXT("[CombatDeathComponent] Die: 【v116】Controller '%s' 非 AI 类型, 跳过 UnPossess (玩家路径不破坏)."),
-				*Ctrl->GetName());
-		}
-	}
+	//
+	// 注意: 旧版 v116 在 Die() 内调 UnPossess, 但因 Die() 同步链优先于 PerformKillSettlement, 导致 AIC.AddDeath 永远不被调用
+	// 新版: UnPossess 由 TakeDamage 末尾统一调度 (见 CombatDeathComponent::TakeDamage line 387+)
 	Owner->SetLifeSpan(0.1f);
 
 	// 【v115.7 大厂架构诊断】在 Pawn SetLifeSpan 之后检查 Controller 状态
 	// 如果 Controller 在这里已经被销毁，说明有其他代码路径在触发 Destroy
+	// 【v116.5 大厂架构重构】UnPossess 已移到 TakeDamage 末尾 (PerformKillSettlement 之后)
+	//   本 Die() 函数不再调 UnPossess — SetLifeSpan 后 Controller 应该仍然有效 (HasAuthority)
+	//   直到 TakeDamage 末尾统一调度才 UnPossess
 	if (AController* Ctrl = Owner->GetController())
 	{
 		if (!Ctrl->IsValidLowLevel())
@@ -680,11 +711,19 @@ void UCombatDeathComponent::Die()
 				TEXT("[CombatDeathComponent] Die: 【v115.7-严重】SetLifeSpan 后 Controller 已失效! Pawn=%s Ctrl=%s"),
 				*Owner->GetName(), *Ctrl->GetName());
 		}
+		else
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[CombatDeathComponent] Die: 【v116.5 验证】SetLifeSpan 后 Controller 仍有效 (Pawn='%s' Ctrl='%s'). "
+				     "UnPossess 将在 TakeDamage 末尾统一调度, 保证 PerformKillSettlement 能正确调 AIC.AddDeath."),
+				*Owner->GetName(), *Ctrl->GetName());
+		}
 	}
 	else
 	{
-		UE_LOG(LogTemp, Display,
-			TEXT("[CombatDeathComponent] Die: 【v116 验证】SetLifeSpan 后 Controller 已为 NULL (Pawn='%s'), 这是 v116 修复的预期行为 — UnPossess 解耦成功."),
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CombatDeathComponent] Die: 【v116.5-异常】SetLifeSpan 后 Controller 已为 NULL (Pawn='%s'). "
+			     "预期应该仍有效 — UnPossess 在 TakeDamage 末尾. 如出现此警告, 检查是否有其他代码路径提前 UnPossess."),
 			*Owner->GetName());
 	}
 }
@@ -1340,7 +1379,9 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 		KillMethod = Weapon->GetLastKillMethod();
 	}
 
-	// 2. 击杀者姓名 (服务器本地读 PlayerState)
+	// 2. 击杀者姓名 (服务器本地读)
+	// 【v206 大厂重构】双轨制: 优先 PS (玩家), 否则 AIC Name (AI)
+	//   旧版只读 PS, AI Killer 永远是 "Unknown" — 误导日志"玩家 Spawn 链路没生成 PS" 也是错的
 	FString KillerName = TEXT("Unknown");
 	AController* DamageInstigatorController = EventInstigator;
 	ABaseCharacter* KillerCharacter = DamageInstigatorController
@@ -1351,12 +1392,17 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 		{
 			KillerName = KillerPS->GetPlayerName();
 		}
+		else if (ABaseAIController* KillerAIC = Cast<ABaseAIController>(DamageInstigatorController))
+		{
+			// AI 击杀者: 用 AIC Name (与 BuildAISnapshotFromController 真理源一致)
+			KillerName = KillerAIC->GetName();
+		}
 		else
 		{
-			// 大厂零兜底: Killer 有 Character 但没 PlayerState = 配置错
+			// 零兜底: Killer 有 Character 但既无 PS 也无 AIC = 配置错
 			UE_LOG(LogTemp, Error,
-				TEXT("[CombatDeathComponent] PerformKillSettlement: Killer '%s' 没有 ARoomPlayerState, "
-					 "击杀消息姓名显示为 Unknown. 根因: 玩家 Spawn 链路没生成 PS, 检查 Spawn/Respawn 链路."),
+				TEXT("[CombatDeathComponent] PerformKillSettlement: Killer '%s' 既无 PS 也无 AIC, "
+					 "击杀消息姓名显示为 Unknown. 根因: 检查 Controller 类型 — 玩家必须有 APlayerController+ARoomPlayerState, AI 必须有 ABaseAIController."),
 				*KillerCharacter->GetName());
 		}
 
@@ -1380,28 +1426,72 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 	}
 
 	// 3. 被击杀者姓名 (自己)
+	// 【v206 大厂重构】双轨制: 优先 PS (玩家), 否则 AIC Name (AI)
+	//   旧版只读 PS, AI 永远是 "Unknown" — 与 ApplyDeathScore 统一架构
+	//   删除 Log Error "死亡计数无法累加" — 误导: AI 是走 AIC.AddDeath, 不是"无法累加"
 	FString VictimName = TEXT("Unknown");
-	ARoomPlayerState* VictimPS = Owner->GetRoomPlayerState();
-	if (VictimPS)
+	if (ARoomPlayerState* VictimPS = Owner->GetRoomPlayerState())
 	{
 		VictimName = VictimPS->GetPlayerName();
-		// 【v31.6 大厂重构】服务器侧死亡计数
-		// 【v100】VictimPS->AddDeath() 已下移到下面"清零连杀"块中,避免重复调用
+	}
+	else if (ABaseAIController* VictimAIC = Cast<ABaseAIController>(Owner->GetController()))
+	{
+		VictimName = VictimAIC->GetName();
 	}
 	else
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[CombatDeathComponent] PerformKillSettlement: Victim '%s' 没有 ARoomPlayerState, "
-				 "死亡计数无法累加. 根因: 玩家 Spawn 链路没生成 PS."),
+		// 零兜底: 既不是玩家也不是 AI — 与 ApplyDeathScore 内部报错保持一致
+		UE_LOG(LogTemp, Warning,
+			TEXT("[CombatDeathComponent] PerformKillSettlement: Victim '%s' 既无 PS 也无 AIC. "
+			     "VictimName 强制 Unknown."),
 			*Owner->GetName());
 	}
 
 	// 【v31.6 大厂重构】服务器侧击杀计数
+	// 【v206 大厂重构】走统一入口 ApplyKillScore, 玩家/AI 双轨制
+	//   旧版 (v22-v202): 只调 PS->AddKillScore, AI Killer 没 PS → 跳过 → AIKills 永远 0
 	if (KillerCharacter)
 	{
-		if (ARoomPlayerState* KillerPS = KillerCharacter->GetRoomPlayerState())
+		ABaseCharacter::ApplyKillScore(KillerCharacter);
+	}
+
+	// ==========================================
+	// 【v208 大厂架构 — GameState 团队击杀累加集中调度】
+	//   业务规则: GameState 的 AttackerKills/DefenderKills = "被击杀者" 所属阵营的累计击杀数
+	//     - 玩家击杀 AI 母体(Offense) → AddTeamKill(Offense) → AttackerKills+1
+	//     - AI 人类击杀 AI 母体(Offense) → AddTeamKill(Offense) → AttackerKills+1
+	//     - AI 母体击杀 玩家(Defense) → AddTeamKill(Defense) → DefenderKills+1
+	//
+	//   历史 (v22-v202) 错位根因:
+	//     - ARoomPlayerState::AddKillScore / ABaseAIController::AddKillScore 内部用 Killer 阵营调 AddTeamKill
+	//     - Killer != Victim 阵营时 (如玩家杀 AI 母体), 累加完全错位
+	//
+	//   新 (v208) 集中调度:
+	//     - AddTeamKill 调用从 PS/AIC::AddKillScore 内部删除
+	//     - 唯一入口 = 本函数 PerformKillSettlement (同时持有 Killer+Victim, 知道 Victim 阵营)
+	//     - Victim 阵营从 Pawn->FactionTag 读 (与 Spawn 链路单一真理源)
+	//     - 大厂原则 — 集中调度: GameState 团队击杀累加只有这一处入口
+	// ==========================================
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 		{
-			KillerPS->AddKillScore();
+			const FGameplayTag VictimFactionTag = Owner->FactionTag;
+			if (FFactionTags::IsValidFaction(VictimFactionTag))
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[CombatDeathComponent] 【v208】PerformKillSettlement: GameState 团队击杀累加. Victim='%s' VictimFactionTag='%s'."),
+					*Owner->GetName(), *VictimFactionTag.ToString());
+				RoomGS->AddTeamKill(VictimFactionTag);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[CombatDeathComponent] 【v208】PerformKillSettlement: Victim '%s' 的 FactionTag='%s' 非有效阵营, 拒绝 AddTeamKill. "
+					     "【零兜底】检查 Spawn 链路是否写入 FactionTag, 或被母体变异步骤切错阵营. "
+					     "如不修, GameState 团队击杀数会少累加这一次."),
+					*Owner->GetName(), *VictimFactionTag.ToString());
+			}
 		}
 	}
 
@@ -1467,21 +1557,22 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[CombatDeathComponent][v100] PerformKillSettlement: Killer '%s' 没有 ARoomPlayerState, "
-					 "无法算 EKillStreakType. RPC 推送 None (音效会被 KillSoundComponent 拒绝)."),
+			// 【v206 大厂重构】这是 AI 击杀者的正常情况, 不是错误
+			//   AI 没有 PlayerState, 所以没有连杀系统 (大厂原则 - 不为零兜底造功能)
+			//   CalculatedStreakType 保持 None, KillSound 不播 — 与 v100 设计一致
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[CombatDeathComponent][v206] PerformKillSettlement: Killer '%s' 是 AI (无 PS). "
+					 "CalculatedStreakType 保持 None, KillSound 不播. (这是 v100 设计的预期行为)"),
 				*KillerCharacter->GetName());
 		}
 	}
 
 	// Victim 死亡 — 同步清零连杀 (避免下一回合继承)
-	// 【v100】复用函数级已有的 VictimPS (上面第 1132 行已获取),不重复声明避免 C4456
-	// 注: 上面 if/else 已经对 VictimPS==nullptr 做了 Log Error, 这里跳过二次
-	if (VictimPS)
-	{
-		VictimPS->AddDeath();
-		VictimPS->ServerResetKillStreak();
-	}
+	// 【v206 大厂重构】走统一入口 ApplyDeathScore, 玩家/AI 双轨制
+	//   旧版 (v22-v202): 只调 PS->AddDeath, AI 没 PS → 跳过 → AIDeaths 永远 0
+	//   新版: 自动判定 PS/AIC, 同时修 KDA 累加 + ServerResetKillStreak (避免重复调用)
+	// 注: ServerResetKillStreak 是玩家专属 (PS 字段), AI 没有连杀概念 — 由 ApplyDeathScore 内部 PS 分支处理
+	ABaseCharacter::ApplyDeathScore(Owner);
 
 	// 4. 广播击杀消息 (纯数据 RPC, 不会再 nullptr 崩溃)
 	// 【v40.9 P0 大厂架构】传入 bIsKillerPlayer — 只有玩家击杀才显示 KillFeed 图标

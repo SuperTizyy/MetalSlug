@@ -23,6 +23,7 @@
 
 #include "Components/WeaponFireComponent.h"
 
+#include "Characters/BaseCharacter.h"
 #include "Weapons/BaseWeapon.h"
 #include "Weapons/WeaponDamageStrategy.h"
 #include "Data/Tables/WeaponTableRow.h"
@@ -91,6 +92,27 @@ void UWeaponFireComponent::OnRep_CurrentAmmo()
 	// 客户端 OnRep_CurrentAmmo 触发时, ReserveAmmo 字段值也已 Replicated 同步到本地
 	// (服务器每次改 ReserveAmmo 都会触发一系列 Replicated 字段 Bunch 推送)
 	// → 直接读 this->ReserveAmmo 拿最新值, 不需要额外 OnRep_ReserveAmmo
+
+	// 【v208.8 大厂架构修复】bSuppressOnRepBroadcast 会被复制到客户端！
+	//
+	// 根因分析:
+	//   1. 服务器 Server_RefillAmmo 设置 bSuppressOnRepBroadcast = true
+	//   2. UE 网络复制将此标志复制到客户端（UPROPERTY() 默认复制）
+	//   3. 客户端 OnRep_CurrentAmmo 触发时，bSuppressOnRepBroadcast = true
+	//   4. v208.7 修复前: 检测到 true → return → 跳过广播 → HUD 不更新
+	//   5. 结果: 第一次吃补给箱正常（bSuppressOnRepBroadcast=false），后续不工作
+	//
+	// 修复方案:
+	//   - 检测到 bSuppressOnRepBroadcast = true 时，重置并继续广播
+	//   - 因为 Server_RefillAmmo 末尾已重置为 false，客户端收到时应该也是 false
+	//   - 但如果因网络延迟等原因客户端收到的是 true，我们仍然要广播
+	//   - 这是大厂原则：旗帜是防递归的，不是防广播的
+	if (bSuppressOnRepBroadcast)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponFireComponent] OnRep_CurrentAmmo: bSuppressOnRepBroadcast=true (从服务器复制). 重置并继续广播. 【v208.8 诊断】"));
+		bSuppressOnRepBroadcast = false;
+	}
 	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 }
 
@@ -724,19 +746,96 @@ void UWeaponFireComponent::Server_RefillAmmo()
 	const int32 OldCurrentAmmo = CurrentAmmo;
 	const int32 OldReserveAmmo = ReserveAmmo;
 
+	// 【v208.7 大厂架构修复】bSuppressOnRepBroadcast 重置时机修正
+	//
+	// 根因 (v208.4-v208.6 遗留):
+	//   1. Server_RefillAmmo 设置 bSuppressOnRepBroadcast = true
+	//   2. 写入 CurrentAmmo = MagazineSize
+	//   3. 如果值没变，UE 不触发 OnRep_CurrentAmmo
+	//   4. bSuppressOnRepBroadcast 永远保持 true
+	//   5. 后续 OnAmmoChanged.Broadcast 被 OnRep_CurrentAmmo 跳过
+	//   6. 结果：第一次吃补给箱正常，后续吃补给箱总子弹数不更新
+	//
+	// 修复方案:
+	//   - OnAmmoChanged.Broadcast 之后立即重置 bSuppressOnRepBroadcast
+	//   - 不依赖 OnRep_CurrentAmmo 来重置（因为 OnRep 可能不触发）
+	//   - 这是大厂原则：旗帜必须显式管理，不能依赖隐式行为
+	bSuppressOnRepBroadcast = true;
+
 	CurrentAmmo = MagazineSize;
 	ReserveAmmo = InitialReserveAmmo;
 
-	// 服务器本地立即广播 (镜像 InitializeFromWeaponConfig 的做法, 让 HUD 立刻更新)
-	// 【v100 大厂架构 — 完整 3 参数】补给时也传 ReserveAmmo, 保证客户端拿到完整真理源
+	// 【v208.4 关键修复】强制 Broadcast (不依赖值变化)
+	//   - UE 的 OnRep 只在值变化时触发, 如果之前已经是 MagazineSize, OnRep 不触发
+	//   - 空投场景: 玩家弹药已满 → CurrentAmmo=30=MagazineSize → OnRep 不触发 → HUD 不更新
+	//   - 强制广播保证每次补给都触发 HUD 更新 (无论弹药是否"看起来没变")
 	OnAmmoChanged.Broadcast(CurrentAmmo, MagazineSize, ReserveAmmo);
 
+	// 【v208.7 大厂架构修复】Broadcast 之后立即重置标志
+	//   - 不依赖 OnRep_CurrentAmmo（因为 OnRep 只在值变化时触发）
+	//   - 这是 v208.7 与 v208.4 的核心区别
+	bSuppressOnRepBroadcast = false;
+
+	// 【v208.5 大厂架构修复】必须调 Client_RefreshWeaponAmmo RPC 推送弹药数据给客户端
+	//
+	// 根因 (v208.4 遗留):
+	//   v208.4 只加了 OnAmmoChanged.Broadcast() — 这只在服务器本地触发 (ListenServer HUD 更新)
+	//   远端客户端的 HUD 订阅的是 CharacterIconComponent::OnWeaponAmmoChanged
+	//     → 这个回调只在 OnRep_CurrentAmmo 或 Client_RefreshWeaponAmmo RPC 时被触发
+	//   当 CurrentAmmo 值没变时:
+	//     → OnRep_CurrentAmmo 不触发 (UE 只在值变化时调用 OnRep)
+	//     → bSuppressOnRepBroadcast=true 阻止 OnAmmoChanged.Broadcast 触发 OnRep 递归
+	//     → 远端客户端: OnRep 不触发 + Client_RefreshWeaponAmmo 没调 → 弹匣和总子弹数都不更新
+	//
+	// 修复: 补给后显式调 Client_RefreshWeaponAmmo RPC — 完全不依赖 OnRep 值变化
+	//   - 走 ABaseCharacter::Client_RefreshWeaponAmmo (Actor 层 RPC)
+	//   - WeaponFireComponent → Weapon → Character → Client_RefreshWeaponAmmo RPC
+	//   - 客户端收到后: SetCachedWeaponAmmoInfo + OnWeaponAmmoInfoReady.Broadcast → HUD 更新
+	//
+	// 大厂原则 — 零兜底:
+	//   - GetOwner() 返回 nullptr → Log Error + return (Weapon 不存在是异常)
+	//   - GetAttachedCharacter() 返回 nullptr → Log Error + return (Character 不存在是异常)
+	//   - 这两个检查保证: 调 RPC 时 Owner 链必然完整
+	//
+	// 【v209.1 大厂架构修复】根因分析:
+	//   - GetOwner() 返回 Weapon Actor 自身 (WeaponFireComponent 挂在 Weapon 上)
+	//   - Cast<ABaseCharacter>(WeaponOwner) 永远失败 (Weapon 不是 Character)
+	//   - 日志显示: "Owner 不是 ABaseCharacter. Owner='BP_Weapon_AK47_C_1'"
+	//   - 修复: 用 ABaseWeapon::GetAttachedCharacter() 获取挂载的 Character
+	{
+		ABaseWeapon* Weapon = Cast<ABaseWeapon>(GetOwner());
+		if (!Weapon)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[WeaponFireComponent] Server_RefillAmmo: GetOwner() 返回非 ABaseWeapon. Weapon='%s'. 拒绝 RPC 推送."),
+				*GetName());
+		}
+		else if (ABaseCharacter* Character = Weapon->GetAttachedCharacter())
+		{
+			// 【v208.5 核心修复】RPC 推送给客户端 (弹匣+总子弹数都更新)
+			Character->Client_RefreshWeaponAmmo(CurrentAmmo, MagazineSize, ReserveAmmo);
+		}
+		else
+		{
+			// 可能是 AI 武器等非 Character Owner (AI 用的是 Melee, 没有 WeaponFireComponent, 这里理论上不会跑到)
+			UE_LOG(LogTemp, Warning,
+				TEXT("[WeaponFireComponent] Server_RefillAmmo: GetAttachedCharacter() 返回 nullptr. Weapon='%s'. 跳过 RPC 推送."),
+				*Weapon->GetName());
+		}
+	}
+
 	UE_LOG(LogTemp, Display,
-		TEXT("[WeaponFireComponent] Server_RefillAmmo: WeaponRow=%s 弹药已全满! "
-		     "CurrentAmmo %d→%d / %d, ReserveAmmo %d→%d (InitialReserve=%d)"),
+		TEXT("[WeaponFireComponent] ★ Server_RefillAmmo 弹药全满完成! "
+		     "WeaponRow=%s Weapon='%s' "
+		     "CurrentAmmo %d→%d / %d, ReserveAmmo %d→%d (InitialReserve=%d). "
+		     "【v210.2 增强日志】已调 Client_RefreshWeaponAmmo RPC. "
+		     "OldAmmo=(%d/%d) NewAmmo=(%d/%d)"),
 		*CachedWeaponRowName.ToString(),
+		*GetName(),
 		OldCurrentAmmo, CurrentAmmo, MagazineSize,
-		OldReserveAmmo, ReserveAmmo, InitialReserveAmmo);
+		OldReserveAmmo, ReserveAmmo, InitialReserveAmmo,
+		OldCurrentAmmo, OldReserveAmmo,
+		CurrentAmmo, ReserveAmmo);
 }
 
 

@@ -8,8 +8,8 @@
 // 【极其关键】: 必须包含此头文件才能使用 DOREPLIFETIME 宏
 #include "Net/UnrealNetwork.h"
 
-// 引入房间 GameState（用于 AddTeamKill 队伍击杀统计）
-#include "Systems/RoomGameState.h"
+// 【v208 重构】不再需要 RoomGameState.h — AddTeamKill 已上移到 PerformKillSettlement 集中调度
+// #include "Systems/RoomGameState.h"
 #include "Data/Faction/FactionTags.h" // 【2026.07.10 P0 重构】阵营集中定义
 #include "Data/Enums/CombatEnums.h"   // 【v100 新增】EKillStreakType (连杀真理源派生)
 #include "Data/Config/PlayerConfigAsset.h" // 【v100 新增】UPlayerConfigAsset (连杀超时秒数)
@@ -180,6 +180,25 @@ void ARoomPlayerState::OnRep_ScoreboardData()
  *
  * 服务器专用: 增加得分（+1 击杀 +20 分）
  * 同步更新 GameState 中的队伍击杀统计
+ *
+ * 【v208 大厂架构重构 — AddTeamKill 调用上移到 PerformKillSettlement】
+ *   历史 (v22-v202):
+ *     - AddKillScore 内部直接调 AddTeamKill(CurrentFactionTag)
+ *     - 但 GameState 的 AttackerKills/DefenderKills 业务语义是"被击杀阵营累计"
+ *     - 用 Killer 阵营 = 完全错位 (玩家击杀 AI 母体 → DefenderKills+1, 应是 AttackerKills+1)
+ *
+ *   新 (v208):
+ *     - AddKillScore 只管 Score/Kills (单个 Killer 的分数)
+ *     - AddTeamKill 上移到 CombatDeathComponent::PerformKillSettlement 集中调度
+ *     - PerformKillSettlement 同时持有 Killer + Victim, 自然知道 Victim 阵营
+ *     - 大厂原则 — 集中调度: GameState 团队击杀的累加入口只有 PerformKillSettlement 一处
+ *
+ * 【v202.0 大厂架构 — RPC 链路审计】
+ *   历史: 服务器手动调 OnRep_ScoreboardData() 触发 Broadcast
+ *     - 重复! 引擎在 Replicated 字段变更时会自动触发 OnRep_*
+ *     - ListenServer 也会被引擎触发 OnRep (UE 5.6 标准行为)
+ *     - 旧版造成 "服务器 Broadcast 一次 + OnRep 自动 Broadcast 一次" 重复
+ *   新 (v202.0): 删除手动调用, 依赖引擎自动 ReplicatedUsing 链路 (走真 RPC)
  */
 void ARoomPlayerState::AddKillScore()
 {
@@ -189,32 +208,11 @@ void ARoomPlayerState::AddKillScore()
 		RoomKills += 1;
 		RoomScore += KillScoreValue;
 
-		// 更新 GameState 中的队伍击杀统计
-		if (UWorld* World = GetWorld())
-		{
-			if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
-			{
-				UE_LOG(LogTemp, Log,
-					TEXT("[RoomPlayerState] AddKillScore: Player=%s, CurrentFactionTag=%s, Before: AttackerKills=%d, DefenderKills=%d"),
-					*GetPlayerName(), *CurrentFactionTag.ToString(),
-					RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
-				// 【2026.07.10 P0 重构】传递 FGameplayTag 给 GameState, 替代 ERoomTeam
-				RoomGS->AddTeamKill(CurrentFactionTag);
-				UE_LOG(LogTemp, Log, TEXT("[RoomPlayerState] AddKillScore: After: AttackerKills=%d, DefenderKills=%d"),
-					RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Error, TEXT("[RoomPlayerState] AddKillScore: RoomGameState 为空!"));
-			}
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("[RoomPlayerState] AddKillScore: World 为空!"));
-		}
-
-		// 通知所有客户端刷新
-		OnRep_ScoreboardData();
+		// 【v208 P0 重构】删除 AddTeamKill 调用 — 上移到 PerformKillSettlement 集中调度
+		//   业务语义: GameState 的 AttackerKills/DefenderKills = 被击杀阵营累计击杀数
+		//   本函数无 Victim 上下文,无法正确派发阵营 — 上移到同时持有 Killer+Victim 的 PerformKillSettlement
+		//   大厂原则 — 单一真理源: GameState 团队击杀累加入口只有 PerformKillSettlement 一处
+		//   旧版"服务器手动 OnRep" 也同步删除 — 依赖 ReplicatedUsing 引擎自动触发
 	}
 }
 
@@ -223,6 +221,8 @@ void ARoomPlayerState::AddKillScore()
  * AddAssistScore
  *
  * 服务器专用: 增加助攻得分（+1 助攻 +10 分）
+ *
+ * 【v202.0 大厂架构】RPC 链路审计: 依赖引擎自动 ReplicatedUsing, 不再手动 Broadcast
  */
 void ARoomPlayerState::AddAssistScore()
 {
@@ -232,8 +232,7 @@ void ARoomPlayerState::AddAssistScore()
 		RoomAssists += 1;
 		RoomScore += AssistScoreValue;
 
-		// 通知所有客户端刷新
-		OnRep_ScoreboardData();
+		// 【v202.0 大厂架构】删除冗余手动 Broadcast (理由见 AddKillScore 注释)
 	}
 }
 
@@ -242,6 +241,8 @@ void ARoomPlayerState::AddAssistScore()
  * AddDeath
  *
  * 服务器专用: 增加死亡次数
+ *
+ * 【v202.0 大厂架构】RPC 链路审计: 依赖引擎自动 ReplicatedUsing, 不再手动 Broadcast
  */
 void ARoomPlayerState::AddDeath()
 {
@@ -250,8 +251,7 @@ void ARoomPlayerState::AddDeath()
 	{
 		RoomDeaths += 1;
 
-		// 通知所有客户端刷新
-		OnRep_ScoreboardData();
+		// 【v202.0 大厂架构】删除冗余手动 Broadcast (理由见 AddKillScore 注释)
 	}
 }
 

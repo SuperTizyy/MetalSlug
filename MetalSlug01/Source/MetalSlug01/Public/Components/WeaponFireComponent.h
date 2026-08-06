@@ -331,6 +331,21 @@ protected:
 	int32 CurrentAmmo = 30;
 
 	/**
+	 * 【v208.4 大厂架构新增】防止 OnRep_CurrentAmmo 递归广播的标志
+	 *
+	 * 业务场景: Server_RefillAmmo 需要强制广播 OnAmmoChanged (因为值可能没变),
+	 *           但 OnAmmoChanged 回调里可能触发再次设置 CurrentAmmo,
+	 *           又触发 OnRep_CurrentAmmo → 无限递归
+	 *
+	 * 大厂原则 — 零递归:
+	 *   - Server_RefillAmmo 写入值前设 bSuppressOnRepBroadcast=true
+	 *   - OnRep_CurrentAmmo 检测到标志 → 跳过广播, 清除标志
+	 *   - 防止 Server_RefillAmmo → Broadcast → 某处回调 → 设置 CurrentAmmo → OnRep → 递归
+	 */
+	UPROPERTY()
+	bool bSuppressOnRepBroadcast = false;
+
+	/**
 	 * 是否在换弹中
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_IsReloading, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")

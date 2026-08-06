@@ -808,50 +808,46 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			HitResult.BoneName);
 
 		// ============================================================
-		// 【v149 大厂架构 P0 修复】服务器权威 trace 视觉同步
+		// 【v208.6 大厂架构 P0 修复】移除 HasAuthority() 检查
 		//
-		// 根因:
-		//   客户端主武器射线起点 ≠ 监听服务器主武器射线起点
-		//   旧版: TickDetection 在所有进程 (服务器+本地玩家控制 Pawn 的客户端) 都跑
-		//          EDrawDebugTrace::ForDuration, 用本进程 Mesh->GetSocketLocation()
-		//   - 监听服务器 (host 玩家): mesh 骨骼是权威物理位置, 起点准确
-		//   - 远端客户端看同一个玩家: mesh 骨骼是 UE 复制滞后帧, 起点偏 (典型 5~30cm 漂移)
-		//   - 客户端玩家自己看自己: mesh 骨骼是本地物理位置, 也准确
-		//   问题集中在"普通客户端看 host 玩家 (或看另一个客户端玩家) 的近战 trace"
+		// 根因 (用户 2026.08.07 反馈):
+		//   客户端近战射线检测不显示, 监听服务器正常
 		//
-		// 大厂原则 (真理源唯一):
-		//   - 服务器的 TickDetection 拿到的 LastMid/CurrentMid 是当前 Tick 服务器进程的物理精确值
-		//   - 服务器命中时通过 Multicast_PlayFireTraceVisual (已有, v83 大厂架构) 把权威
-		//     (StartLoc=LastMid, EndLoc=CurrentMid, bHit=true, HitLoc=ImpactPoint) 推给所有客户端
-		//   - 客户端 Implementation 内 v200.2.19 守卫 (HasAuthority() + IsLocallyControlled → return)
-		//     已经保证了服务器本地 (host 玩家自己) 不会重复画, 远端客户端会画
-		//   - 本地玩家控制 Pawn 的客户端: 服务器通过 Multicast 推过来的也是它本进程的
-		//     (因为它调 RPC, 服务器 Implementation 拿到的是服务器自己的 LastMid/CurrentMid, 不是客户端的)
-		//     - 这就是用户要的: "客户端主武器射线起点和监听服务器主武器起点一样" — 服务器为准
+		//   v208.5 的修复理解错误:
+		//     - v208.5 注释说 "HasAuthority() 守卫已从 Multicast_PlayFireTraceVisual_Implementation 移除"
+		//     - 但实际上第 850 行的 `if (Weapon && Weapon->HasAuthority())` 检查阻止了调用
+		//     - 服务器: Weapon->HasAuthority()=true → Multicast 被调用 → 所有客户端收到
+		//     - 客户端: Weapon->HasAuthority()=false → Multicast 不被调用 → 看不到线
 		//
-		// 大厂原则 (复用现有 RPC, 不新增):
-		//   - Multicast_PlayFireTraceVisual 签名 (StartLoc, EndLoc, bHit, HitLoc) 完全够用
-		//   - 不新增 Multicast, 不新增参数, 不破坏现有调用方 (URangedLineStrategy 枪械路径)
-		//   - 枪械走 ClientRayOrigin → EndLoc, 近战走 LastMid → CurrentMid, 接口对称
+		// 修复:
+		//   - 移除 `Weapon && Weapon->HasAuthority()` 检查
+		//   - 改为无条件调用 Multicast_PlayFireTraceVisual
+		//   - 理由: Multicast 是服务器→客户端的单向推送, 服务器调用后自动推送给所有客户端
+		//   - 客户端不需要有 Authority 也能接收 Multicast
 		//
-		// 大厂原则 (零兜底 — 服务器权威 RPC):
-		//   - 只有服务器命中才调 Multicast, 客户端命中不调 (客户端会发 Server_ReportHit 让服务器再 trace)
-		//   - 重复扣血防护仍由 BaseWeapon::Tick 守卫 (HasAuthority + IsLocallyControlled) 保证
-		//     同一帧不会两端都触发命中 RPC
+		//   大厂原则 - 零兜底:
+		//     - Weapon 是 nullptr → Log Error + return (这才是真正的错误情况)
+		//     - HasAuthority 检查应该只在需要服务器权威判断时使用, 这里不需要
 		// ============================================================
-		if (Weapon && Weapon->HasAuthority())
+		if (!Weapon)
 		{
-			// 服务器命中: 推权威 trace 视觉给所有客户端
-			//   LastMid/CurrentMid 是第 490/491 行算出来的 box 中心线两端 (跨帧缝合路径)
-			//   HitLoc 用 HitResult.ImpactPoint (命中点 = BoxTrace 实际撞上的位置)
-			const FVector BoxLineStart = LastMid;
-			const FVector BoxLineEnd = CurrentMid;
-			Weapon->Multicast_PlayFireTraceVisual(
-				BoxLineStart,
-				BoxLineEnd,
-				/*bHit=*/true,
-				HitResult.ImpactPoint);
+			UE_LOG(LogTemp, Error,
+				TEXT("[UMeleeSwStrategy::TickDetection] 命中分支: Weapon 为空 — 拒绝 Multicast_PlayFireTraceVisual. "
+				     "Owner='%s'. 【v208.6 零兜底】"),
+				OwnerChar ? *OwnerChar->GetName() : TEXT("<null>"));
+			return;
 		}
+
+		// 服务器命中: 推权威 trace 视觉给所有客户端
+		//   LastMid/CurrentMid 是第 490/491 行算出来的 box 中心线两端 (跨帧缝合路径)
+		//   HitLoc 用 HitResult.ImpactPoint (命中点 = BoxTrace 实际撞上的位置)
+		const FVector BoxLineStart = LastMid;
+		const FVector BoxLineEnd = CurrentMid;
+		Weapon->Multicast_PlayFireTraceVisual(
+			BoxLineStart,
+			BoxLineEnd,
+			/*bHit=*/true,
+			HitResult.ImpactPoint);
 
 		// 【v93.2 母体复用】命中 RPC 路径决策
 		//   - bUseOwnerMesh=false: Weapon->Server_ReportHit (刀战路径, 走武器伤害字段)
@@ -975,14 +971,21 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	}
 
 	// ============================================================
-	// 【v149 大厂架构 P0 修复 — 未命中分支】服务器权威 trace 视觉同步
+	// 【v208.6 大厂架构 P0 修复】移除 HasAuthority() 检查 (与命中分支一致)
 	//
-	// 命中分支在上方已经处理 (bHit=true), 这里处理 bHit=false 的未命中帧
-	// - 服务器 TickDetection 跑 BoxTraceMulti → bHit=false (没命中任何物体)
-	// - 也需要把权威 (LastMid → CurrentMid) 推给客户端画视觉
-	// - 否则远端客户端会"挥刀看不见刀气" (因 Tick 跳过, 没 EDrawDebugTrace)
+	// 修复: 移除 `Weapon && Weapon->HasAuthority()` 检查
+	//   - 理由: Multicast 是服务器→客户端单向推送, 客户端不需要 Authority
+	//   - 未命中分支也要同步, 否则客户端看不到"挥刀但没命中"的射线
 	// ============================================================
-	if (!bHit && Weapon && Weapon->HasAuthority())
+
+	// ★ 诊断日志 — 标记命中/未命中分支 Multicast 调用
+	UE_LOG(LogTemp, Display,
+		TEXT("[MeleeSwStrategy] ★ TickDetection 命中分支: 调 Multicast_PlayFireTraceVisual. "
+		     "Weapon=%s. "
+		     "【v208.6】如果客户端日志有这个 = Multicast 推送成功."),
+		Weapon ? *Weapon->GetName() : TEXT("<null>"));
+
+	if (!bHit && Weapon)
 	{
 		// 服务器未命中: 推权威 trace 视觉给所有客户端 (红线, 因为 bHit=false)
 		Weapon->Multicast_PlayFireTraceVisual(

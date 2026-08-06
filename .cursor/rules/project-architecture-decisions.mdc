@@ -3919,3 +3919,180 @@ Owner->SetLifeSpan(0.1f);
 
 ---
 
+
+## 21. v206 (2026.08.07) KDA 累加统一入口 — 玩家/AI 双轨制
+
+### 业务背景 (用户 2026.08.07 反馈)
+>  只剩一个问题 玩家是人类击杀了 AI 母体 被击杀的 AI 母体的信息里 Text_KDA 没显示死亡数 +1
+
+### 根因 (Layer 1 — KDA 累加无统一入口)
+
+CombatDeathComponent::PerformKillSettlement 三个路径 (Killer 击杀分/Victim 死亡分/Assistant 助攻分) 全部用同一个反模式:
+
+`cpp
+if (ARoomPlayerState* PS = Victim->GetRoomPlayerState())
+{
+ PS->AddDeath(); // ← 只有玩家走这条路
+}
+// else: 静默跳过 (AI 没 PS → AIDeaths 永远 0)
+`
+
+### 修复方案 (v206 — 大厂架构 — 单一真理源 + 玩家/AI 双轨制)
+
+新增 3 个静态 helper 到 ABaseCharacter:
+
+`cpp
+// Public/Characters/BaseCharacter.h
+static bool ApplyDeathScore(ABaseCharacter* Victim);
+static bool ApplyKillScore(ABaseCharacter* Killer);
+static bool ApplyAssistScore(ABaseCharacter* Assistant);
+`
+
+实现逻辑 (统一封装玩家/AI 双轨制):
+
+`cpp
+bool ABaseCharacter::ApplyDeathScore(ABaseCharacter* Victim)
+{
+ if (!Victim) { UE_LOG Error; return false; }
+
+ if (ARoomPlayerState* PS = Victim->GetRoomPlayerState())
+ {
+ PS->AddDeath();
+ PS->ServerResetKillStreak();
+ return true;
+ }
+
+ if (ABaseAIController* AIC = Cast<ABaseAIController>(Victim->GetController()))
+ {
+ AIC->AddDeath(); // ← 关键: AI 路径打通
+ return true;
+ }
+
+ // 零兜底: 既不是玩家也不是 AI — 配置错误
+ UE_LOG(LogTemp, Error, TEXT(既无 PS 也无 AIC. 修复: 检查 BP Pawn 配置.));
+ return false;
+}
+`
+
+### 改动清单 (v206)
+
+`
+~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
+ + 3 个静态方法声明 (ApplyDeathScore/ApplyKillScore/ApplyAssistScore)
+ + 大段注释解释 v22-v202 历史 bug 和大厂原则落地
+
+~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
+ + 3 个静态方法实现 (玩家/AI 双轨制)
+ ~ GrantAssistsToEligiblePlayers 改用 ApplyAssistScore (消除反模式)
+ ~ VictimName/AssistantName 改用双轨制 (消除反模式: AI 永远显示 Unknown)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
+ ~ PerformKillSettlement Killer 路径: ApplyKillScore
+ ~ PerformKillSettlement Victim 路径: ApplyDeathScore
+ ~ KillerName 改用双轨制
+ ~ 删除误导日志 死亡计数无法累加
+ ~ AI Killer 无 PS 错误日志 → Verbose (是预期,不是错误)
+`
+
+### 大厂原则对照 (v206)
+
+| 原则 | 修复前 | 修复后 |
+|---|---|---|
+| 单一真理源 | 3 处分散 if/else | 3 个 Apply*Score 统一入口 |
+| 零重复 | PS/AIC 双分支在 3 处重复 | 双轨制封装在 3 个 helper 内 |
+| 零兜底 | if (PS) ... else 静默跳过 | Log Error + return false 显式 |
+| 走 RPC | PS 直接调 AddDeath | 同 (PS/AIC 内部已走 RPC) |
+
+---
+
+## 22. v116.5 (2026.08.07) UnPossess 时序修复 — v116 副作用根因
+
+### v116 修复的副作用 (Layer 2 — 时序竞争)
+
+v116 (2026.07.31) 修复了 AIC 与死亡 Pawn 解耦, 但 UnPossess 放在 Die() 内 SetLifeSpan 之前.
+
+**完整时序链 (v116 修复后)**:
+
+`
+TakeDamage (CombatDeathComponent):
+ 1. HC->ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() 同步链:
+ - v116: UnPossess + SetLifeSpan(0.1f)
+ 2. ← HC->ApplyDamage 返回
+ 3. if (Owner->IsDead()) PerformKillSettlement  ← 此时 UnPossess 已发生!
+ 4. PerformKillSettlement → ApplyDeathScore(Victim) → Owner.GetController() = null
+ 5. ApplyDeathScore 误判既无 PS 也无 AIC, 拒绝累加 → AIDeaths 永远 0
+`
+
+**Session1.txt 2026.08.07 line 4572-4589 时序证据**:
+
+`
+11:282 [CombatDeathComponent] Die: 【v116】已 UnPossess AIController ''AIC_AI_SWAT_AI_4''
+11:282 [CombatDeathComponent] Die: 【v116 验证】SetLifeSpan 后 Controller 已为 NULL
+11:282 [BaseCharacter] GrantAssistsToEligiblePlayers: Victim 'BP_MuTi_C_0' 既无 PS 也无 AIC
+11:282 [CombatDeathComponent] PerformKillSettlement: Victim 'BP_MuTi_C_0' 既无 PS 也无 AIC
+11:282 [BaseCharacter] ApplyDeathScore: Victim 'BP_MuTi_C_0' 既无 ARoomPlayerState 也无 ABaseAIController
+`
+
+### 修复方案 (v116.5 — 大厂架构 — 集中调度)
+
+**核心思想**: UnPossess 必须发生在 PerformKillSettlement 之后, 但仍在 Pawn 销毁之前.
+
+**时序修复 (v116.5)**:
+
+`
+TakeDamage (CombatDeathComponent):
+ 1. HC->ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() 同步链:
+ - v116.5: Multicast_Die + ExecuteDeathLocal + SetLifeSpan(0.1f) (不调 UnPossess)
+ 2. ← HC->ApplyDamage 返回
+ 3. if (Owner->IsDead()) PerformKillSettlement  ← AIC 仍有效 ?
+ 4. ApplyKillScore + ApplyDeathScore → AIC.AddDeath ? 【修复关键】
+ 5. UnPossess AIC ← v116.5 新增 (v116 防 AIC 自动销毁)
+ ↓ (0.1s 后)
+Pawn 销毁 (此时 AIC 已 UnPossess, v116 修复有效)
+`
+
+### 改动清单 (v116.5)
+
+`
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
+ ~ Die(): 删除 UnPossess 代码块 (移到 TakeDamage 末尾)
+ ~ Die(): SetLifeSpan 后诊断日志改为 v116.5 版本
+ + TakeDamage: 在 PerformKillSettlement 之后 + Owner.HasAuthority() 守卫 + IsDead 分支内
+  调 UnPossess AIC (单一入口, 集中调度)
+`
+
+### 大厂原则对照 (v116.5)
+
+| 原则 | v116 | v116.5 |
+|---|---|---|
+| 单一真理源 | UnPossess 在 Die() 内 | UnPossess 由 TakeDamage 统一调度 |
+| 集中调度 | 分散 (Die + TakeDamage) | 集中 (TakeDamage 单一入口) |
+| 时序正确性 | UnPossess 在 PerformKillSettlement 之前 (错) | UnPossess 在 PerformKillSettlement 之后 (对) |
+| 零兜底 | (没有, 时序竞争) | UnPossess 后才走 Destroy 链 |
+| v116 修复效果保留 | AIC 不被自动销毁 | 同 (AIC 在 Pawn 销毁前已 UnPossess) |
+
+### 教训总结 (v206 + v116.5)
+
+1. **单一真理源永远是第一位**: 任何累加状态变更必须有唯一入口
+2. **时序竞争检测**: 任何事件驱动同步链必须考虑下游调用方能拿到的状态
+3. **修复新 bug 时, 必须回归审视旧修复**: v116 修复了 AIC 销毁, 但导致 PerformKillSettlement 拿不到 AIC
+4. **诊断日志是修复的前提**: 没有时序日志根本看不到 v116 的副作用
+5. **零兜底是双向的**: 既不能默认 PS=null 跳过, 也不能因为 UnPossess 静默吞掉 AIC.AddDeath
+
+### 联动关系 (v206 ? v116.5)
+
+- v206 修复 KDA 累加路径 (双轨制), 但被 v116 时序竞争阻断
+- v116.5 修复时序竞争, 让 v206 修复路径能正确执行
+- 两者必须**同时存在**才能修好 — 单独修一个都不行
+
+### 待用户验证 (v206 + v116.5)
+
+1. ? UE 5.6 编辑器编译 0 错 (用户验证)
+2. ? 玩家人类击杀 AI 母体 → AI 母体 Text_KDA 死亡数 +1 【用户已验证】
+3. 玩家人类击杀 AI 母体 → 玩家 Text_KDA 击杀数 +1 (一直没坏, 确认没破坏)
+4. AI 母体击杀玩家人类 → 玩家死亡 +1 + AI 母体击杀 +1
+5. AI 母体死亡后能复活 (v116.5 UnPossess 时机调整不影响 v116 防 AIC 自动销毁)
+6. 玩家死亡后能复活 (不动 PlayerController)
+
+### 用户反馈 (2026.08.07)
+> 成功了 记忆一下 改了那么长时间终于修复了

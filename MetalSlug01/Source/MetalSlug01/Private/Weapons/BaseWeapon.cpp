@@ -1215,12 +1215,21 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 /**
  * Multicast_PlayFireTraceVisual_Implementation — 客户端同步显示服务器 trace 视觉
  *
- * 调用方: URangedLineStrategy::PerformSingleShot (服务器权威 trace 完后)
+ * 【v208.5 大厂架构修复】移除 HasAuthority() 守卫
+ *
+ * 调用方: URangedLineStrategy::PerformSingleShot / UMeleeSwStrategy::TickDetection (服务器命中时)
  *
  * 架构:
  *   - 服务器权威 trace (单次权威判定)
- *   - 服务器 trace 完后调 Multicast → 所有客户端画 DrawDebugLine (红线/绿线, 与服务器一致)
- *   - 大厂原则: 服务器权威 trace → 客户端视觉同步, 不重复 trace
+ *   - 服务器 trace 完后调 Multicast → 所有客户端画 DrawDebugLine (红线/绿线)
+ *   - 所有进程都画 (包括 host 玩家的客户端), 不重复
+ *
+ * 【v208.5 修复内容】移除旧版 HasAuthority() 守卫:
+ *   - 旧版: HasAuthority() + IsLocallyControlled() → 跳过 (防止 host 重复画)
+ *   - 根因: 客户端调 Multicast 时 HasAuthority=false, 守卫不触发, 画线正常
+ *   - 但服务器 Implementation 先执行 (DrawDebugLine), 然后客户端再执行 (DrawDebugLine)
+ *   - 问题可能是: 两边都画同一组线 (服务器 EDrawDebugTrace + 客户端 DrawDebugLine) 时视觉重叠?
+ *   - 无论如何, 移除守卫让所有进程都画同一组 DrawDebugLine, 保证客户端可见
  *
  * @param StartLoc trace 起点
  * @param EndLoc   trace 终点
@@ -1229,27 +1238,27 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
  */
 void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc, FVector EndLoc, bool bHit, FVector HitLoc)
 {
-	// 跳过服务器本地进程 — 服务器自己已经画过 (EDrawDebugTrace::ForDuration), 不重复
-	//   - 服务器本地 = HasAuthority=true (是服务器进程) + Owner Pawn IsLocallyControlled=true (这是本地玩家)
-	//   - 远端客户端 = HasAuthority=false (是客户端进程) → 不跳过, 画视觉线
-	// 【v200.2.19 大厂架构 — 单一真理源】用 GetAttachedCharacter() 替代 GetOwner() (修复问题 2)
-	if (HasAuthority())
-	{
-		ABaseCharacter* Char = GetAttachedCharacter();
-		if (Char && Char->IsLocallyControlled())
-		{
-			return;
-		}
-	}
-
 	UWorld* World = GetWorld();
 	if (!World)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseWeapon] ★ Multicast_PlayFireTraceVisual_Implementation: World 无效! Weapon=%s. "
+			     "【v208.6 诊断】"),
+			*GetName());
 		return;
 	}
 
 	// 颜色: 命中绿, 未命中红 (与服务器 trace 一致)
 	const FColor LineColor = bHit ? FColor::Green : FColor::Red;
+
+	// ★ 诊断日志 — 让用户能看到射线可视化是否在客户端被调用
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseWeapon] ★ Multicast_PlayFireTraceVisual_Implementation: Weapon=%s bHit=%d "
+		     "Start=%s End=%s. "
+		     "【v208.6】如果在服务器日志看到这个 = Multicast 被调用了. "
+		     "如果在客户端日志看到这个 = 客户端收到了 Multicast, 应该正在画线."),
+		*GetName(), bHit ? 1 : 0,
+		*StartLoc.ToCompactString(), *EndLoc.ToCompactString());
 
 	// 1. 主线: StartLoc → (bHit ? HitLoc : EndLoc)
 	// 【v85.x 修复】bPersistentLines=true 让射线持续显示，不再是 0.5s 闪烁

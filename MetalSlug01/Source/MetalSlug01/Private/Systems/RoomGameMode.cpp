@@ -303,6 +303,20 @@ void ARoomGameMode::InitGameState()
 		UE_LOG(LogTemp, Warning,
 			TEXT("[RoomGameMode] InitGameState: URoomLifecycleSubsystem 不可用, 跳过 TotalRounds 补注入."));
 	}
+
+	// 【v210.2 大厂架构重构】缓存音效资产到 GameState (解决客户端无 AuthGameMode 问题)
+	//   - 根因: 客户端 World->GetAuthGameMode() 返回 nullptr, 无法查 GameMode 配置的音效
+	//   - 修复: 服务器在 GameState 创建后缓存音效资产, 引擎自动 Replicate 到所有客户端
+	//   - 客户端直接访问 GS->GetZombieRoundEndSound() (GameState 在所有机器都存在)
+	if (GS)
+	{
+		GS->CacheZombieRoundSounds(ZombieHumanWinSound, ZombieMotherWinSound);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomGameMode] InitGameState: GS 为空, 跳过音效资产缓存."));
+	}
 }
 
 /**

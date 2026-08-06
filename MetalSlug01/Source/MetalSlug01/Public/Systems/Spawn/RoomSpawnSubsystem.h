@@ -276,6 +276,16 @@ public:
 	void RestartZombieRoundPlayers();
 
 	/**
+	 * @brief 【v210 大厂架构新增】延迟弹药重置回调
+	 *
+	 * 用途:
+	 *   - RestartZombieRoundPlayers 末尾设置 0.1s 延迟 Timer
+	 *   - 确保武器完全 Attach 后再调用 Server_RefillAmmo
+	 *   - 避免 GetAttachedCharacter() 返回 nullptr 导致 RPC 推送失败
+	 */
+	void OnDelayedAmmoRefill();
+
+	/**
 	 * @brief 【v39 新增】按 Controller 释放出生点 (集中调度精准释放)
 	 *
 	 * 大厂原则:
@@ -608,6 +618,10 @@ protected:
 
 	UPROPERTY()
 	TSet<APlayerStart*> OccupiedSpawnPoints;
+
+	// 【v210 大厂架构新增】延迟弹药重置 Timer Handle
+	UPROPERTY()
+	FTimerHandle AmmoRefillTimerHandle;
 
 	UPROPERTY()
 	bool bSpawnPointsScanned = false;

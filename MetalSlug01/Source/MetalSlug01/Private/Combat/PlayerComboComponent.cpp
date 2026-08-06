@@ -1242,6 +1242,42 @@ void UPlayerComboComponent::Server_ReportMotherAttackHit_Implementation(AActor* 
 	}
 
 	// ============================================================
+	// 【v207 P0 修复】感染 KDA 累加 — 必须先于 MutateCharacterToMother (Pawn 销毁前)
+	// ============================================================
+	//
+	// 业务规则 (用户 2026.08.07 明确):
+	//   - AI 母体感染 AI 人类   → Killer=AI 母体 +1, Victim=AI 人类 死亡 +1
+	//   - AI 母体感染 玩家人类 → Killer=AI 母体 +1, Victim=玩家人类 死亡 +1
+	//   - 玩家母体感染 AI 人类 → Killer=玩家母体 +1, Victim=AI 人类 死亡 +1
+	//   - 玩家母体感染 玩家人类 → Killer=玩家母体 +1, Victim=玩家人类 死亡 +1
+	//
+	// 大厂原则 — 单一真理源 (v207):
+	//   - KDA 累加走 v206 静态助手 ApplyKillScore(Killer) + ApplyDeathScore(Victim)
+	//   - MutateCharacterToMother 不再重复实现 KDA (业务层只管"变母体", 不混职责)
+	//   - 真值源: PS.RoomKills (玩家) / AIC.AIKills (AI) — Replicated 自动同步
+	//   - UI 真理源: URoomStateService::BuildPlayerSnapshotFromPS / BuildAISnapshotFromController
+	//
+	// 时序关键 (v207):
+	//   - 必须 Pawn 还活着时累加 KDA — MutateCharacterToMother 内部会销毁 Victim Pawn
+	//   - 必须先于 MutateCharacterToMother — 否则 Victim->GetController() 可能拿到新母体 Pawn
+	//
+	// 大厂原则 — 走 RPC:
+	//   - AIC.AIKills / PS.RoomKills 是 UPROPERTY(Replicated) — 累加后引擎自动同步
+	//   - 客户端 OnRep_ScoreboardData / OnAIScoreboardData 自动 Broadcast
+	//   - UI Snap.Deaths/Kills 自动更新, Text_KDA 显示
+	// ============================================================
+	if (OwnerCharacter->HasAuthority())
+	{
+		const bool bKillerApplied = ABaseCharacter::ApplyKillScore(OwnerCharacter);
+		const bool bVictimApplied = ABaseCharacter::ApplyDeathScore(Victim);
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 【v207】感染 KDA 累加. Killer='%s' AppliedKiller=%d Victim='%s' AppliedVictim=%d."),
+			*OwnerCharacter->GetName(), bKillerApplied ? 1 : 0,
+			*Victim->GetName(), bVictimApplied ? 1 : 0);
+	}
+
+	// ============================================================
 	// 终极行为 — 大厂复用 (零重复架构)
 	// ============================================================
 	if (URoomMotherMutationSubsystem* MutSys = URoomMotherMutationSubsystem::Get(this))

@@ -8,8 +8,11 @@
 #include "Systems/RoomGameState.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/Core/RoomPlayerState.h"
+// 【v202.0 大厂架构新增】ABaseAIController 完整类型 (TActorIterator 需要)
+#include "Systems/BaseAIController.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"  // TActorIterator
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 // 【修复 C1083】项目内的 RoomService 在 Public/Systems/ 而非 Public/Services/
@@ -168,14 +171,46 @@ TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshotsInternal(FGameplay
     }
 
     // ==========================================
-    // 路径 2: AI 占位 (从 GameMode.PendingAIQueue) — 只在 bIncludeAI=true 时启用
+    // 路径 2: AI 占位 / 战斗阶段 AI 数据 — 只在 bIncludeAI=true 时启用
     // ==========================================
-    if (bIncludeAI && GM)
+    //
+    // 【v202.0 大厂架构重构 — 双数据源拆分】
+    //   历史 (v28-v201.x): 只读 GM->GetPendingAIInFaction → 大厅阶段有效, 战斗阶段为空
+    //     → ScoreboardWidget 战斗时永远不显示 AI 数据 (用户报告)
+    //   新 (v202.0):
+    //     - 大厅阶段 (PendingAIQueue 非空): 走 BuildAISnapshot(FPendingAIEntry) (RoomInsidePage 等)
+    //     - 战斗阶段 (PendingAIQueue 已清空, AIC 已 Spawn): 走 BuildAISnapshotFromController (ScoreboardWidget)
+    //     - 两者都允许同时返回: 极端情况下 PendingAIQueue 还有遗留且 AIC 也在
+    //
+    // 大厂原则:
+    //   - 不重复架构: AI 占位 (PendingAIQueue) 与 AI 战斗 (AIC) 是两个独立概念
+    //   - 单一真理源: 战斗阶段 AI 数据 = AIC.AIScore/AIKills/AIDeaths/AIAssists (Replicated)
+    //   - 零兜底: AIC 为 nullptr → 跳过 (不报错, 因为 PendingAIQueue 可能还有遗留)
+    if (bIncludeAI)
     {
-        const TArray<FPendingAIEntry> PendingAI = GM->GetPendingAIInFaction(FactionTag);
-        for (const FPendingAIEntry& Entry : PendingAI)
+        // 2.1 大厅阶段 AI 占位 (PendingAIQueue)
+        if (GM)
         {
-            Result.Add(BuildAISnapshot(Entry));
+            const TArray<FPendingAIEntry> PendingAI = GM->GetPendingAIInFaction(FactionTag);
+            for (const FPendingAIEntry& Entry : PendingAI)
+            {
+                Result.Add(BuildAISnapshot(Entry));
+            }
+        }
+
+        // 2.2 战斗阶段 AI 数据 (TActorIterator<AIC>)
+        // 大厂原则 — 数据驱动: 不维护账本 (容易漂移), 直接 GetAllActorsOfClass
+        //   - 极端 case: 关卡预放 AI 也包括在内 (它们的 AIC 也是 ABaseAIController 派生)
+        //   - 战斗死亡时 AIC 不被销毁 (v116 修复), 仍可读到
+        for (TActorIterator<ABaseAIController> It(World); It; ++It)
+        {
+            ABaseAIController* AIController = *It;
+            if (!AIController) continue;
+
+            // 阵营过滤: 只返回当前 FactionTag 的 AI
+            if (AIController->CachedFactionTag != FactionTag) continue;
+
+            Result.Add(BuildAISnapshotFromController(AIController));
         }
     }
 
@@ -203,18 +238,34 @@ TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshotsWithAI(FGameplayTa
  * 【2026.07.11 v28】内部辅助: 把一个 FPendingAIEntry 转成 FPlayerSnapshot
  * 大厂原则: 字段一一对应, 不在调用方各自拼凑
  *
+ * 【v202.0 大厂架构重构】字段来源拆 AI / 真人 双真理源:
+ *   - 历史 (v28-v201.x): Snapshot.Score/Kills/Deaths/Assists 永远 = 0 (没数据源)
+ *   - 新 (v202.0):
+ *     - 大厅阶段 (AI 还没 Spawn): 从 FPendingAIEntry 读, 默认 0 (AI 还没参加战斗)
+ *     - 战斗阶段 (AI 已 Spawn): 从 ABaseAIController 读 (新增 Replicated 字段)
+ *     - 真人不受此影响, 用 ARoomPlayerState (已有 Replicated 字段)
+ *
+ * 大厂原则 — 单一真理源: 真人 / AI 两条独立数据流, 不混合
+ *
  * @param Entry 来自 GM->PendingAIQueue 的一条 AI 占位
  * @return FPlayerSnapshot (bIsAI=true)
  */
 FPlayerSnapshot URoomStateService::BuildAISnapshot(const FPendingAIEntry& Entry)
 {
     FPlayerSnapshot Snap;
-    Snap.PlayerName          = Entry.DisplayName;
+    // 【v208 大厂架构重构 — AI PlayerName 单一真理源】
+    //   与 BuildAISnapshotFromController 对称: 永远带 "[AI] " 前缀
+    //   历史 (v202.0): Snap.PlayerName = Entry.DisplayName (无前缀) → 与 EntryWidget->GetPlayerName() 不一致
+    //   新 (v208): Snap.PlayerName = "[AI] " + DisplayName → 与 CreateEntryWidgetFromSnapshot 输出对齐
+    //   大厂原则 — 单一真理源: "[AI] " 前缀只在 BuildAISnapshot* 一处拼, 不在 UI 层重复
+    Snap.PlayerName          = FString::Printf(TEXT("[AI] %s"), *Entry.DisplayName);
     Snap.FactionTag          = Entry.FactionTag;
     Snap.bIsReady            = false; // AI 无准备概念
     Snap.bIsHost             = false; // AI 永远不是房主
     Snap.bIsAI               = true;  // 标记: AI 占位
     Snap.SequenceID          = Entry.SequenceID;
+    // 【v202.0】战斗阶段读 AIC.Replicated 字段; 大厅阶段 (AI 还没 Spawn) 默认 0
+    // 后续 PR: 改用 AIC.CachedAIScore/CachedAIKills 等同步 (但目前 Replicated 已够用)
     Snap.Score               = 0;
     Snap.Kills               = 0;
     Snap.Deaths              = 0;
@@ -222,6 +273,59 @@ FPlayerSnapshot URoomStateService::BuildAISnapshot(const FPendingAIEntry& Entry)
     Snap.SelectedCharacterID = Entry.CharacterInfoRowName.ToString();  // 【v49】替换原 CharacterRowName
     Snap.SelectedWeaponID1   = Entry.WeaponID;
     Snap.SelectedWeaponID2   = TEXT("");
+    return Snap;
+}
+
+/**
+ * 【v202.0 大厂架构新增】从 AIC 实时读取并构建 AI 计分快照
+ *
+ * 与 BuildAISnapshot (FPendingAIEntry) 不同: 本函数读运行时 Replicated 字段
+ *
+ * 用途:
+ *   - 战斗阶段 ScoreboardWidget 显示已 Spawn 的 AI 数据
+ *   - 不依赖 AIC 的 OnRep 事件 (UI 自己拉一次就够)
+ *
+ * 调用方:
+ *   - URoomStateService::GetFactionSnapshotsInternal (战斗阶段合并 AI)
+ *
+ * 大厂原则:
+ *   - 不缓存 (CachedFactionTag 等已是真理源, 拉一次足够)
+ *   - AIC 为 nullptr 时返回默认空 Snapshot (调用方聚合时跳过)
+ */
+FPlayerSnapshot URoomStateService::BuildAISnapshotFromController(ABaseAIController* AIController)
+{
+    FPlayerSnapshot Snap;
+    if (!AIController)
+    {
+        return Snap; // 默认空 (bIsAI=false, 需要调用方手动 set)
+    }
+
+    Snap.bIsAI               = true;
+    // 【v208 大厂架构重构 — AI PlayerName 单一真理源】
+    //   历史 (v202.0): Snap.PlayerName = AIC->GetName() (RawName, 如 "AIC_AI_SWAT_AI_3")
+    //     → UpdateOrCreateEntryFromSnapshot 中比较 Entry->GetPlayerName() == Snapshot.PlayerName
+    //     → 但 Entry->GetPlayerName() 是 "[AI] AIC_AI_SWAT_AI_3" (带前缀, CreateEntryWidgetFromSnapshot 拼接)
+    //     → 比较失败 → 每次 Refresh 找不到现有 Entry → 反复创建新 Widget
+    //     → 多个 AI Entry 在 VB 容器里堆积 + KDA 显示错位
+    //
+    //   新 (v208): Snap.PlayerName 直接含 "[AI] " 前缀 (数据源统一)
+    //     - BuildAISnapshotFromController 是单一真理源: AI 名字永远带前缀
+    //     - CreateEntryWidgetFromSnapshot 不再拼接前缀 (避免双前缀)
+    //     - 比较 Entry->GetPlayerName() == Snapshot.PlayerName 永远命中
+    //     - 大厂原则 — 单一真理源: "[AI] " 前缀只在 BuildAISnapshot 一处拼, 不在 UI 层重复
+    Snap.PlayerName          = FString::Printf(TEXT("[AI] %s"), *AIController->GetName()); // 大厂原则: 显示名 = AIC Name (Server authoritative) + AI 前缀
+    Snap.FactionTag          = AIController->CachedFactionTag; // 单一真理源: AIC 阵营缓存
+    Snap.bIsReady            = false;
+    Snap.bIsHost             = false;
+    Snap.SequenceID          = 0;
+
+    // 【v202.0 大厂架构】读 AIC 的 Replicated 字段
+    // 客户端调用时, 引擎已把服务器字段自动 Replicate 过来 (OnRep_AIScoreboardData 触发过)
+    // 0 是默认值 — 字段没同步过时表示 AI 还没击杀
+    Snap.Score               = AIController->AIScore;
+    Snap.Kills               = AIController->AIKills;
+    Snap.Deaths              = AIController->AIDeaths;
+    Snap.Assists             = AIController->AIAssists;
     return Snap;
 }
 

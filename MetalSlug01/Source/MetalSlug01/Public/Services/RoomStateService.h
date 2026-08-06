@@ -312,6 +312,20 @@ private:
     static FPlayerSnapshot BuildAISnapshot(const struct FPendingAIEntry& Entry);
 
     /**
+     * 【v202.0 大厂架构新增】从运行时 AIC 读取并构建 AI 计分快照
+     *
+     * 与 BuildAISnapshot (FPendingAIEntry) 不同: 本函数读 AIC 的 Replicated 字段
+     *   - 战斗阶段 AI 已 Spawn → 读 AIC.AIScore/AIKills/AIDeaths/AIAssists (Replicated)
+     *   - 大厅阶段 AIC 不存在 → 走 BuildAISnapshot(FPendingAIEntry) 路径
+     *
+     * 大厂原则 — 单一真理源: AIC.CachedFactionTag (运行时) 替代 FPendingAIEntry.FactionTag (配置期)
+     *
+     * @param AIController 已 Spawn 的 AI 控制器 (nullptr 时返回空 Snapshot)
+     * @return FPlayerSnapshot (bIsAI=true, 战斗阶段数据)
+     */
+    static FPlayerSnapshot BuildAISnapshotFromController(class ABaseAIController* AIController);
+
+    /**
      * 【2026.07.11 v29 大厂架构重构】内部统一查询 — 单一真理源分离
      *
      * 历史 (v28 错误做法):

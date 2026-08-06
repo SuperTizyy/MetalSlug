@@ -214,6 +214,10 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	DOREPLIFETIME(ARoomGameState, AirdropCountdownStartTime);
 	DOREPLIFETIME(ARoomGameState, AirdropCountdownDuration);
 
+	// 【v210.2 大厂架构重构】小局结束音效资产缓存复制 (解决客户端无 AuthGameMode 问题)
+	DOREPLIFETIME(ARoomGameState, CachedZombieHumanWinSound);
+	DOREPLIFETIME(ARoomGameState, CachedZombieMotherWinSound);
+
 	// 【v93.1 新增】母体变异触发标志 + 次数复制 (防重入层 2 + 业务统计)
 	// 大厂原则 — 镜像 v27 FactionTag: 没有 DOREPLIFETIME = 客户端永远是默认值 → 防重入失效
 	DOREPLIFETIME(ARoomGameState, MotherMutationHasFired);
@@ -1508,6 +1512,40 @@ void ARoomGameState::MulticastPlayZombieRoundSound_Implementation(EZombieRoundWi
  *   - 不在本函数内查 GameMode (避免耦合, GameMode 查表在 UGameHUDWidget 完成)
  *   - 仅 Broadcast, 音效查表/播放由 UI 层负责
  */
+USoundBase* ARoomGameState::GetZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const
+{
+	switch (InRoundWinner)
+	{
+	case EZombieRoundWinner::Human:
+		return CachedZombieHumanWinSound;
+	case EZombieRoundWinner::Mother:
+		return CachedZombieMotherWinSound;
+	default:
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] GetZombieRoundEndSound: RoundWinner=%d 无效, 返回 nullptr."),
+			static_cast<int32>(InRoundWinner));
+		return nullptr;
+	}
+}
+
+void ARoomGameState::CacheZombieRoundSounds(USoundBase* InHumanSound, USoundBase* InMotherSound)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] CacheZombieRoundSounds: 客户端调用非法, HasAuthority=false. 仅服务器可缓存音效."));
+		return;
+	}
+
+	CachedZombieHumanWinSound = InHumanSound;
+	CachedZombieMotherWinSound = InMotherSound;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] CacheZombieRoundSounds: 已缓存音效资产. HumanSound=%s, MotherSound=%s."),
+		InHumanSound ? *InHumanSound->GetName() : TEXT("nullptr"),
+		InMotherSound ? *InMotherSound->GetName() : TEXT("nullptr"));
+}
+
 void ARoomGameState::HandleZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner)
 {
 	UE_LOG(LogTemp, Log,

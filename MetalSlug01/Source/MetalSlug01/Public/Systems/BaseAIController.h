@@ -22,6 +22,8 @@
 #include "GenericTeamAgentInterface.h"
 #include "Systems/AI/AIBehaviorTypes.h"
 #include "Weapons/BaseWeapon.h"     // 【v54.4】GetDefaultWeaponClass 返回 TSoftClassPtr<ABaseWeapon> 需要完整类型
+// 【v202.1 修复】复用 FOnScoreboardDataChanged 类型 (ARoomPlayerState 已 DECLARE, 这里不再重复)
+#include "Systems/Core/RoomPlayerState.h"
 #include "BaseAIController.generated.h"
 
 // 前置声明
@@ -373,6 +375,118 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
 	void ClearCachedDeathTransform() { bHasCachedDeathTransform = false; }
 
+	// ==========================================
+	// 【v202.0 大厂架构 — AI 计分板镜像字段】
+	// ==========================================
+	//
+	// 业务背景 (用户反馈 2026.08.07):
+	//   "WBP_ScoreboardWidget 需要显示 AI 信息, 走 RPC 链路, 不能有兜底"
+	//
+	// 根因 (v202.0 之前):
+	//   - AI 没有 PlayerState → 服务器 CombatDeathComponent::PerformKillSettlement 末尾
+	//     Cast<ARoomPlayerState>(KillerPS) 返回 nullptr → AddKillScore 完全不调用
+	//   - AI 击杀/死亡/助攻数据从未累加 → ScoreboardWidget 永远不显示 AI 数据
+	//   - AIC 也没有 bReplicates / 没有 RPC 字段 → 客户端根本不可能读到 AI 计数
+	//
+	// 大厂架构 (v202.0 落地):
+	//   - 镜像 ARoomPlayerState 的 RoomScore/RoomKills/RoomDeaths/RoomAssists 字段
+	//   - ReplicatedUsing: 服务器写入 → 自动 Replicate 到所有客户端
+	//   - OnRep_AIScoreboardData: 客户端触发 → Broadcast OnAIScoreboardDataChanged 委托
+	//   - 三个 AddKill/Assist/Death 方法: 与 RoomPlayerState 同名同语义, 调用方无感
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 真人: ARoomPlayerState.* (已有, 不重复)
+	//   - AI:   ABaseAIController.* (本次新增, 不依赖 PlayerState)
+	//   - ScoreboardWidget 走 URoomStateService::BuildSnapshot统一读取两种字段
+	//
+	// 不破坏刀战模式:
+	//   - 刀战模式同样调用 AI AddKillScore, 字段有效
+	//
+	// 零兜底:
+	//   - 没有 PlayerState 的客户端调用 GetRoomPlayerState 返回 nullptr,但 AIC 的字段是 Replicated
+	//   - 所以"AI 数据"独立于 PlayerState,不被污染
+
+	/**
+	 * 【v202.0】AI 总得分镜像字段 (Replicated, 与 ARoomPlayerState::RoomScore 对称)
+	 * 服务器通过 AddKillScore/AddAssistScore 自动累加
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AIScoreboardData, BlueprintReadOnly, Category = "AI|Scoreboard")
+	int32 AIScore = 0;
+
+	/**
+	 * 【v202.0】AI 击杀数 (Replicated, 与 ARoomPlayerState::RoomKills 对称)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AIScoreboardData, BlueprintReadOnly, Category = "AI|Scoreboard")
+	int32 AIKills = 0;
+
+	/**
+	 * 【v202.0】AI 死亡数 (Replicated, 与 ARoomPlayerState::RoomDeaths 对称)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AIScoreboardData, BlueprintReadOnly, Category = "AI|Scoreboard")
+	int32 AIDeaths = 0;
+
+	/**
+	 * 【v202.0】AI 助攻数 (Replicated, 与 ARoomPlayerState::RoomAssists 对称)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_AIScoreboardData, BlueprintReadOnly, Category = "AI|Scoreboard")
+	int32 AIAssists = 0;
+
+	/**
+	 * 【v202.0】AI 击杀分值常量 — 与 ARoomPlayerState::KillScoreValue 对称 (20)
+	 * 真理源: 数据驱动, ConfigSO 配 (本常量作为兜底默认值)
+	 *
+	 * 大厂原则: AI 分数计算与玩家一致, 计分板排序统一
+	 */
+	static constexpr int32 KillScoreValue = 20;
+	static constexpr int32 AssistScoreValue = 10;
+
+	/**
+	 * 【v202.0】计分板数据变化通知 (客户端) — 镜像 ARoomPlayerState::OnRep_ScoreboardData
+	 * ReplicatedUsing 字段 (AIScore/AIKills/AIDeaths/AIAssists) 任一变化都触发
+	 */
+	UFUNCTION()
+	void OnRep_AIScoreboardData();
+
+	/**
+	 * 【v202.0】AI 计分板数据变化委托 (BlueprintAssignable, 对称 ARoomPlayerState)
+	 * 订阅方: UScoreboardWidget 通过 URoomStateService 间接订阅
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "AI|Scoreboard")
+	FOnScoreboardDataChanged OnAIScoreboardDataChanged;
+
+	/**
+	 * 【v202.0】服务器专用: 增加 AI 得分 (镜像 ARoomPlayerState::AddKillScore)
+	 * 调用方: UCombatDeathComponent::PerformKillSettlement 末尾, Killer 是 AIC 时调用
+	 *
+	 * 业务规则 (镜像玩家):
+	 *   - AI 击杀玩家/AI: AIScore += 20 (KillScoreValue)
+	 *   - 【v208 重构】AI 击杀后, GameState->AddTeamKill(VictimFactionTag) 由 PerformKillSettlement 集中调度
+	 *
+	 * 大厂原则 — 走 RPC:
+	 *   - 仅修改 Replicated 字段, 引擎自动 Replicate
+	 *   - 服务器自身不手动广播 (统一听引擎的 OnRep, 与 ARoomPlayerState 对称)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Scoreboard")
+	void AddKillScore();
+
+	/**
+	 * 【v202.0】服务器专用: 增加 AI 助攻得分 (镜像 ARoomPlayerState::AddAssistScore)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Scoreboard")
+	void AddAssistScore();
+
+	/**
+	 * 【v202.0】服务器专用: 增加 AI 死亡数 (镜像 ARoomPlayerState::AddDeath)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Scoreboard")
+	void AddDeath();
+
+	/**
+	 * 【v202.0】服务器专用: 重置 AI 计分数据 (每小局开始时调用, 镜像 ARoomPlayerState::ResetScoreboardStats)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "AI|Scoreboard")
+	void ResetScoreboardStats();
+
 	/**
 	 * 【v54.4 大厂架构】关卡预放 AI 默认 AIController Class
 	 *
@@ -459,6 +573,21 @@ protected:
 	virtual void BeginDestroy() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
+
+	/**
+	 * 【v202.0 大厂架构】GetLifetimeReplicatedProps
+	 * 启用 AIC 的 4 个 KDA 字段 Replicated (AIScore / AIKills / AIDeaths / AIAssists)
+	 *
+	 * 根因 (v202.0 之前):
+	 *   - AIC 没有 bReplicates / 没有 UPROPERTY(Replicated) → 客户端永远读不到 AI 计数
+	 *   - ScoreboardWidget 后续要走 URoomStateService 读快照, 无数据可读 → 根本显示不出来
+	 *
+	 * 修复 (v202.0):
+	 *   - 启用 UE 网络复制 (AIController 默认 bReplicates, 我们只声明字段即可)
+	 *   - DOREPLIFETIME 注册 4 个字段
+	 *   - OnRep 走 UE 标准的 ReplicatedUsing → 自动 RPC
+	 */
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI")
 	UAIPerceptionComponent* AIPerception;

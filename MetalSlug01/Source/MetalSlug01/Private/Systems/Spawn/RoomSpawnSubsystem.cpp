@@ -24,6 +24,7 @@
 #include "AIController.h"  // 【v54 修复】AAIController 完整类型 - SpawnActor<AAIController> 需要
 #include "BehaviorTree/BlackboardComponent.h" // 【v201.10】BB Key 清空 (RestartZombieRoundPlayers)
 #include "BehaviorTree/BehaviorTreeComponent.h" // 【v201.10】BT 停止 (RestartZombieRoundPlayers)
+#include "Components/WeaponFireComponent.h" // 【v208.5】每小局弹药还原
 #include "Engine/World.h"
 #include "EngineUtils.h" // TActorIterator
 #include "GameFramework/PlayerStart.h"
@@ -752,6 +753,17 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 										// 刷新头像
 										NewHumanPawn->RefreshCharacterIcon();
 
+										// 【v208.5 大厂架构新增】每小局弹药全满
+										//   业务规则: 每小局开始时玩家武器弹药恢复到全满状态
+										//   链路: NewHumanPawn 已 Possess + 武器已 Spawn
+										//   → FindComponentByClass 拿 WeaponFireComponent → Server_RefillAmmo()
+										//   → Server_RefillAmmo 内部调 Character->Client_RefreshWeaponAmmo RPC → 客户端 HUD 更新
+										//   零兜底: 武器没有 WeaponFireComponent (近战武器) → 静默跳过
+										if (UWeaponFireComponent* FireComp = NewHumanPawn->FindComponentByClass<UWeaponFireComponent>())
+										{
+											FireComp->Server_RefillAmmo();
+										}
+
 										UE_LOG(LogTemp, Log,
 											TEXT("[Spawn] 【v201.7】玩家已从母体变为人类: NewPawn='%s' CharID='%s'."),
 											*NewHumanPawn->GetName(), *HumanCharID);
@@ -776,6 +788,15 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 										HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
 									}
 									Char->Multicast_PlaySpawnSound();
+
+									// 【v208.6 大厂架构修复】每小局弹药全满 (玩家非母体路径)
+									//   根因: 旧代码只在"母体变人类"分支调用 Server_RefillAmmo
+									//         "已经是人类"分支漏掉了弹药重置
+									//   修复: 玩家人类路径也必须调用 Server_RefillAmmo
+									if (UWeaponFireComponent* FireComp = Char->FindComponentByClass<UWeaponFireComponent>())
+									{
+										FireComp->Server_RefillAmmo();
+									}
 								}
 
 								UE_LOG(LogTemp, Log,
@@ -960,6 +981,12 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 					// 刷新头像
 					NewHumanPawn->RefreshCharacterIcon();
 
+					// 【v208.5 大厂架构新增】每小局弹药全满 (AI 路径)
+					if (UWeaponFireComponent* FireComp = NewHumanPawn->FindComponentByClass<UWeaponFireComponent>())
+					{
+						FireComp->Server_RefillAmmo();
+					}
+
 					UE_LOG(LogTemp, Log,
 						TEXT("[Spawn] 【v201.7】AI 已从母体变为人类: NewPawn='%s'."),
 						*NewHumanPawn->GetName());
@@ -996,8 +1023,17 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 					// 播放出生音效
 					AIChar->Multicast_PlaySpawnSound();
 
+					// 【v208.6 大厂架构修复】每小局弹药全满 (AI 非母体路径)
+					//   根因: 旧代码只在"母体变人类"分支调用 Server_RefillAmmo
+					//         "已经是人类"分支漏掉了弹药重置
+					//   修复: AI 人类路径也必须调用 Server_RefillAmmo
+					if (UWeaponFireComponent* FireComp = AIChar->FindComponentByClass<UWeaponFireComponent>())
+					{
+						FireComp->Server_RefillAmmo();
+					}
+
 					UE_LOG(LogTemp, Log,
-						TEXT("[Spawn] 【v201.7】AI '%s' 已被分配到 HumanSurvivor 复活点, bIsMother=false."),
+						TEXT("[Spawn] 【v208.6】AI '%s' 已被分配到 HumanSurvivor 复活点, bIsMother=false."),
 						*AIChar->GetName());
 				}
 			}
@@ -1050,8 +1086,101 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 	UE_LOG(LogTemp, Log,
 		TEXT("[Spawn] 【v201.10.2】RestartZombieRoundPlayers: 已重启 %d 个 AI 的 BT + 清空 BB."),
 		AIRestartCount);
+
+	// ==========================================
+	// 【v210 大厂架构新增】延迟弹药重置 - 确保武器完全 Attach 后再推送 RPC
+	// ==========================================
+	//
+	// 根因分析:
+	//   - RestartZombieRoundPlayers 在武器 Spawn 后立即调用 Server_RefillAmmo
+	//   - 如果武器的 GetAttachedCharacter() 返回 nullptr (Attach 关系尚未完全建立)
+	//   - 则 Client_RefreshWeaponAmmo RPC 不会被调用 → 客户端弹药 UI 不更新
+	//
+	// 修复方案:
+	//   - 使用 0.1s 延迟 Timer, 确保武器完全 Attach 后再调用弹药重置
+	//   - 延迟回调遍历所有角色, 对有 WeaponFireComponent 的调用 Server_RefillAmmo
+	//
+	// 大厂原则 - 单一入口:
+	//   - 弹药重置入口统一在延迟回调中, 不分散在各分支
+	//   - 避免重复调用 (幂等由 Server_RefillAmmo 内部保证)
+	GetWorld()->GetTimerManager().SetTimer(
+		AmmoRefillTimerHandle,
+		this,
+		&URoomSpawnSubsystem::OnDelayedAmmoRefill,
+		0.1f,  // 0.1s 延迟, 确保武器完全 Attach
+		false);
 }
 
+void URoomSpawnSubsystem::OnDelayedAmmoRefill()
+{
+	// 【v210.2 大厂架构增强日志】确认回调是否被调用
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v210.2】OnDelayedAmmoRefill: 回调被调用, 开始延迟弹药重置, 确保武器完全 Attach."));
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[Spawn] 【v210】OnDelayedAmmoRefill: World 为空."));
+		return;
+	}
+
+	int32 RefillCount = 0;
+	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	{
+		ABaseCharacter* Char = *It;
+		if (!Char || !Char->HasAuthority())
+		{
+			continue;
+		}
+
+		// 只处理人类角色 (跳过母体)
+		if (Char->bIsMother)
+		{
+			continue;
+		}
+
+	// 【v210.3 大厂架构修复】根因: UWeaponFireComponent 挂在 Weapon 上，不是 Character 上
+	//   - 旧代码: Char->FindComponentByClass<UWeaponFireComponent>() 永远返回 nullptr
+	//   - 修复: 通过 WeaponAttachmentComponent->GetCurrentWeapon()->WeaponFireComponent 获取
+	//   - 注意: 只有装备的主武器有 WeaponFireComponent, 副武器是近战武器没有
+	if (UWeaponAttachmentComponent* WeaponAttach = Char->FindComponentByClass<UWeaponAttachmentComponent>())
+	{
+		if (ABaseWeapon* CurrentWeapon = WeaponAttach->GetCurrentWeapon())
+		{
+			if (UWeaponFireComponent* FireComp = CurrentWeapon->FindComponentByClass<UWeaponFireComponent>())
+			{
+				FireComp->Server_RefillAmmo();
+				++RefillCount;
+				UE_LOG(LogTemp, Log,
+					TEXT("[Spawn] 【v210.3】OnDelayedAmmoRefill: 已重置 '%s' 的弹药 (Weapon='%s')."),
+					*Char->GetName(), *CurrentWeapon->GetName());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[Spawn] 【v210.3】OnDelayedAmmoRefill: '%s' 的武器 '%s' 无 WeaponFireComponent (可能是近战武器)."),
+					*Char->GetName(), *CurrentWeapon->GetName());
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[Spawn] 【v210.3】OnDelayedAmmoRefill: '%s' 当前无装备武器."),
+				*Char->GetName());
+		}
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] 【v210.3】OnDelayedAmmoRefill: '%s' 无 WeaponAttachmentComponent."),
+			*Char->GetName());
+	}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v210.2】OnDelayedAmmoRefill: 完成. 共重置 %d 个角色的弹药."),
+		RefillCount);
+}
 
 // ==========================================
 // 【v56 新增】关卡预放 AI 阵营缓存
@@ -1753,15 +1882,45 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			// 根因: AI 复活时占用出生点但没记录 OccupancyOwner → ReleaseOccupiedSpawnPoint 找不到记录
 			//       → 出生点永远不释放 → 5 次后全部占用 → AI 无法复活
 			// 注意: AIC 此时还未声明，用 OptionalExistingController（复活时非空，首次 Spawn 时为空让系统分配）
-			AActor* SpawnPt = GetAvailableSpawnPointForFaction(DesiredFaction, true, OptionalExistingController);
-			if (!SpawnPt)
+			//
+			// 【v201 大厂架构 — 生化模式分支镜像玩家路径】
+			//   - 旧 (v201 之前): AI 走 GetAvailableSpawnPointForFaction (Offense/Defense 阵营复活点)
+			//     → 生化模式 AI 复活到 Faction_Defense 阵营点, 不在 Faction_HumanSurvivor 专用点
+			//     → 用户反馈: "生化模式里人类都应该随机复活在 Faction_HumanSurvivor 复活点上, 包括玩家和 ai"
+			//   - 新: 生化模式 + Defense 阵营 → 走 HumanSurvivorSpawnPoints (与玩家镜像)
+			//   - 大厂原则: AI/玩家/母体 在生化模式复活 = 同一逻辑 (单一真理源)
+			AActor* SpawnPt = nullptr;
+			UWorld* WorldForMode = GetWorld();
+			ARoomGameState* RoomGSForMode = WorldForMode ? WorldForMode->GetGameState<ARoomGameState>() : nullptr;
+			if (RoomGSForMode && RoomGSForMode->CurrentMatchMode == ERoomMatchMode::Zombie &&
+			    FFactionTags::IsDefense(DesiredFaction))
 			{
-				// 【v43 零兜底】出生点分配失败，禁止在 ZeroVector 生成（会导致碰撞失败）
-				UE_LOG(LogTemp, Error,
-					TEXT("[RoomSpawn] GetAvailableSpawnPointForFaction 返回 nullptr，出生点全部被占用。"
-						 " Faction=%s. 终止 Spawn。"),
-					*DesiredFaction.ToString());
-				return SpawnedCount; // 终止整个 Spawn 流程
+				// 生化模式人类 AI → 使用 HumanSurvivor 复活点
+				// OccupancyOwner 用 OptionalExistingController (复活时非空 = AI Controller; 首次 Spawn 为空 = 后续会让 AIC Possess)
+				// 零兜底: 没点 → Log Error + 终止 Spawn
+				SpawnPt = GetAvailableHumanSurvivorSpawnPoint(OptionalExistingController);
+				if (!SpawnPt)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[RoomSpawn] SpawnAIInternal: 生化模式人类 AI 复活点分配失败. "
+						     "HumanSurvivorSpawnPoints 全占用或未配. "
+						     "Faction='%s', Mode=Zombie. 【v201 零兜底】拒绝 Spawn."),
+						*DesiredFaction.ToString());
+					return SpawnedCount;
+				}
+			}
+			else
+			{
+				SpawnPt = GetAvailableSpawnPointForFaction(DesiredFaction, true, OptionalExistingController);
+				if (!SpawnPt)
+				{
+					// 【v43 零兜底】出生点分配失败，禁止在 ZeroVector 生成（会导致碰撞失败）
+					UE_LOG(LogTemp, Error,
+						TEXT("[RoomSpawn] GetAvailableSpawnPointForFaction 返回 nullptr，出生点全部被占用。"
+							 " Faction=%s. 终止 Spawn。"),
+						*DesiredFaction.ToString());
+					return SpawnedCount; // 终止整个 Spawn 流程
+				}
 			}
 			SpawnLoc = SpawnPt->GetActorLocation();
 			SpawnRot = SpawnPt->GetActorRotation();
@@ -1866,29 +2025,37 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		if (bGotModeRules)
 		{
 			// 【大厅 AI 路径】从 ModeRules.BehaviorTree 拿 BT
-			LobbyBehaviorTree = ModeRulesFound.BehaviorTree.Get();
-
-			// 【v56 修复】TSoftObjectPtr.Get() 可能返回 None (软引用未解析)
-			// Fallback 到 ConfigSO->LevelPlacedBehaviorTree
-			if (!LobbyBehaviorTree && Config)
+			//
+			// 【v208.3 大厂架构修复 — TSoftObjectPtr::IsNull() vs ::IsPending() vs ::Get() 的语义差异】
+			//
+			// Session1.txt line 183 日志证据:
+			//   BehaviorTree.IsNull()=0 (TSoftObjectPtr 对象本身有效)
+			//   BehaviorTree.Get()=None (引用的资产已删除或为 None)
+			//
+			// UE 5.6 TSoftObjectPtr 语义 (Engine/Source/Runtime/CoreUObject/Public/UObject/SoftObjectPtr.h):
+			//   IsNull()    : 软引用指向空(None) → true。BP 里拖 None 时返回 true。
+			//   IsPending() : 软引用未解析(异步加载中) → true。
+			//   Get()       : 返回 RawObjectPtr, 即使对象是 None 也返回非空指针(!!)
+			//                 上一版错误地用 !Get() 判断, 漏掉了 "IsNull=false 但引用的资产=None" 的情况
+			//   Get(-or- LoadSynchronous): 安全获取, 返回 nullptr 如果 None
+			//
+			// 本次修复: 用 IsNull() 严格判断 (同时覆盖"未设置"和"引用了已删除资产"两种错误)
+			// 大厂原则: 零兜底 — 配置错误必须立即报错, 不允许任何静默 fallback
+			if (ModeRulesFound.BehaviorTree.IsNull())
 			{
-				UE_LOG(LogTemp, Warning,
-					TEXT("[RoomSpawn] ModeRules.BehaviorTree.Get()=None, Fallback 到 ConfigSO->LevelPlacedBehaviorTree. Config=%s"),
-					*GetNameSafe(Config));
-				LobbyBehaviorTree = Config->LevelPlacedBehaviorTree.LoadSynchronous();
-			}
-
-			if (!LobbyBehaviorTree)
-			{
+				const TCHAR* ModeName = (Request.Mode == ERoomMatchMode::Zombie) ? TEXT("Zombie") : TEXT("Melee");
 				UE_LOG(LogTemp, Error,
-					TEXT("[RoomSpawn] SpawnAIInternal: 大厅 AI 路径, Mode=%d 的 ModeRules.BehaviorTree 为空且 ConfigSO->LevelPlacedBehaviorTree 也为空. "
-						 "【v56 零兜底】拒绝 Spawn. "
-						 "修复: 打开 GM_RoomGameMode → Class Defaults → ModeRulesByMode → Melee → BehaviorTree 拖入 BT_MeleeAI.uasset."),
-					static_cast<int32>(Request.Mode));
+					TEXT("[RoomSpawn] SpawnAIInternal: 大厅 AI 路径, Mode=%s 的 ModeRules.BehaviorTree 为空 (IsNull=1). "
+						 "【v208.3 零兜底】拒绝 Spawn. "
+						 "修复: 打开 BP_GM_RoomGameMode → Class Defaults → ModeRulesByMode → %s → BehaviorTree 拖入对应 BT."),
+					ModeName, ModeName);
 				AIPawn->Destroy();
 				if (!OptionalExistingController) AIC->Destroy();
 				continue;
 			}
+
+			// 【v208.3 修复】IsNull 检查通过后, 同步加载软引用获取实际 BT 指针
+			LobbyBehaviorTree = ModeRulesFound.BehaviorTree.LoadSynchronous();
 		}
 		// else: 关卡预放 AI 路径, LobbyBehaviorTree=nullptr → InitializeFromConfig 读 ConfigSO.LevelPlacedBehaviorTree
 
@@ -3715,11 +3882,11 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 					FAIModeRules ModeRulesFound;
 					if (RoomGM->GetModeRules(CurrentMode, ModeRulesFound))
 					{
-						UBehaviorTree* ZombieBT = ModeRulesFound.BehaviorTree.Get();
-						if (ZombieBT)
+						if (!ModeRulesFound.BehaviorTree.IsNull())
 						{
+							UBehaviorTree* ZombieBT = ModeRulesFound.BehaviorTree.Get();
 							UE_LOG(LogTemp, Display,
-								TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】重新启动 BT: Controller='%s' BT='%s' (来自 ModeRules[%d])."),
+								TEXT("[MotherMutation] MutatePawnToMother: 【v208.3】重新启动 BT: Controller='%s' BT='%s' (来自 ModeRules[%d])."),
 								*Controller->GetName(), *ZombieBT->GetName(), static_cast<int32>(CurrentMode));
 
 							// 重新初始化 AI 配置，传入正确的 BT
@@ -3731,38 +3898,42 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 							else
 							{
 								UE_LOG(LogTemp, Error,
-									TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】Config 为空, 无法重新启动 BT. Controller='%s'."),
+									TEXT("[MotherMutation] MutatePawnToMother: 【v208.3】Config 为空, 无法重新启动 BT. Controller='%s'."),
 									*Controller->GetName());
 							}
 						}
 						else
 						{
 							UE_LOG(LogTemp, Error,
-								TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】ModeRules.BehaviorTree 为空. CurrentMode=%d. "
-								     "【零兜底】生化模式必须配置 BehaviorTree. 修复: BP_GM_RoomGameMode → ModeRules → Zombie → BehaviorTree 拖入 BT_ZombieModeAI."),
+								TEXT("[MotherMutation] MutatePawnToMother: 【v208.3】ModeRules.BehaviorTree.IsNull()=1. CurrentMode=%d. "
+								     "【v208.3 零兜底】拒绝继续. 修复: BP_GM_RoomGameMode → ModeRulesByMode → Zombie → BehaviorTree 拖入 BT_ZombieModeAI."),
 								static_cast<int32>(CurrentMode));
+							return false;
 						}
 					}
 					else
 					{
 						UE_LOG(LogTemp, Error,
-							TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】GetModeRules 失败. CurrentMode=%d. "
-							     "【零兜底】拒绝重新启动 BT."),
+							TEXT("[MotherMutation] MutatePawnToMother: 【v208.2】GetModeRules 失败. CurrentMode=%d. "
+							     "【v208.2 零兜底】拒绝继续."),
 							static_cast<int32>(CurrentMode));
+						return false; // 【v208.2 修复】
 					}
 				}
 				else
 				{
 					UE_LOG(LogTemp, Error,
-						TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】RoomGameState 为空. Controller='%s'."),
+						TEXT("[MotherMutation] MutatePawnToMother: 【v208.2】RoomGameState 为空. Controller='%s'."),
 						*Controller->GetName());
+					return false; // 【v208.2 修复】
 				}
 			}
 			else
 			{
 				UE_LOG(LogTemp, Error,
-					TEXT("[MotherMutation] MutatePawnToMother: 【v111.3】RoomGameMode 为空. Controller='%s'."),
+					TEXT("[MotherMutation] MutatePawnToMother: 【v208.2】BaseAIController 为空. Controller='%s'."),
 					*Controller->GetName());
+				return false; // 【v208.2 修复】
 			}
 		}
 	}
