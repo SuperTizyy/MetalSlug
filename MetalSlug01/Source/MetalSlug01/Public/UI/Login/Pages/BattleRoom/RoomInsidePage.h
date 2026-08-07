@@ -808,6 +808,20 @@ private:
 	void SyncLoadoutToServer();
 
 	/**
+	 * 【v211 大厂架构修复 — Init 阶段默认填充 Secondary/Melee 临时选择】
+	 *
+	 * 业务流程:
+	 *   1. 遍历 DT_WeaponInfo, 每种 EWeaponMeshType 取第一行 RowName 作为业务默认
+	 *   2. 写入 TempSelectedWeaponsByType[T] (运行时缓存, 不持久化)
+	 *   3. 只有当 TMap 中原本为空时才填充 (零兜底: 不覆盖玩家已选)
+	 *
+	 * 零兜底保证:
+	 *   - DT_WeaponInfo 为空 / 没配某类型 → 警告 + 留空 (Spawn 阶段 v209 兜底拒绝)
+	 *   - 玩家已选过 TMap[T] → 不覆盖 (玩家选择优先)
+	 */
+	void InitializeTempSelectedWeaponsByDefault(UDataTable* InWeaponDataTable);
+
+	/**
 	 * 建立显示索引与真实 ID 的映射关系
 	 * 用途: 缓存角色 ID 列表，用于快速查找和索引
 	 */

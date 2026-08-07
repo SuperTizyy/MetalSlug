@@ -131,23 +131,15 @@ void UGameHUDWidget::NativeConstruct()
 		Widget_Chat->OnChatMessageReady.AddDynamic(this, &UGameHUDWidget::OnChatMessageReadyFromWidget);
 	}
 
-	// 初始化结算覆盖板为隐藏状态
-	if (Border_SettlementOverlay)
-	{
-		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Collapsed);
-	}
-
-	// 初始化游戏结束文本为隐藏状态
+	// 【v216 大厂架构回滚】Text_GameOver 仍在 GameHUDWidget 显示 (战斗内瞬时反馈)
+	// 大厂原则:
+	//   - Border_SettlementOverlay / Button_ReturnToLobby 仍迁移到 UScoreboardWidget (跨地图)
+	//   - Text_GameOver 留 GameHUDWidget: 战斗中显示 "人类胜利/幽灵胜利" 3 秒瞬时文本
+	//     → 切图后 GameHUDWidget 销毁, Text_GameOver 也不可见, 不需要跨地图
 	if (Text_GameOver)
 	{
+		// 默认隐藏, 战斗内进入结算时 (OnEnterSettlement) 才显示
 		Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
-	}
-
-	// 绑定返回大厅按钮
-	if (Button_ReturnToLobby)
-	{
-		Button_ReturnToLobby->OnClicked.AddDynamic(this, &UGameHUDWidget::OnReturnToLobbyClicked);
-		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
 	// 尝试绑定 GameState，成功则立即刷新；否则定时器重试（最多 5 次，每次间隔 0.5 秒）
@@ -430,10 +422,13 @@ void UGameHUDWidget::TryBindToGameState()
 
 			// 【v134 大厂架构新增】绑定事件: 小局音效 RPC 收到时, 查 GameMode 音效 + 播放
 			//   - 单一真理源: RoomGS->OnZombieRoundSoundReceived (MulticastPlayZombieRoundSound 触发)
-			//   - 客户端本机查 GameMode 缓存的 USoundBase (UE 5.6 UObject 不跨 RPC)
+			// 【v210.4 大厂架构重构】音效播放已上移到 RPC Implementation, 这里只做 UI 通知
+			//   - 旧 (v134 - v210.3): 客户端本机查 GameMode 缓存的 USoundBase + PlaySound2D
+			//   - 新 (v210.4): GS::PlayZombieRoundSoundFromPath_Implementation 已 PlaySound2D
+			//   - HUD 端 OnZombieRoundSoundReceived 仅留扩展点 (震屏 / 全屏闪烁等)
 			//   - 业务规则 (用户 2026.08.06 明确): 全体客户端播同一音效, 不按 ClientFactionTag 分发
-			//     - 人类赢 → 全体播 ZombieHumanWinSound
-			//     - 母体赢 → 全体播 ZombieMotherWinSound
+			//     - 人类赢 → 全体播 ZombieHumanWinSound (RPC 已发 FSoftObjectPath)
+			//     - 母体赢 → 全体播 ZombieMotherWinSound (RPC 已发 FSoftObjectPath)
 			RoomGS->OnZombieRoundSoundReceived.AddDynamic(this, &UGameHUDWidget::OnZombieRoundSoundReceived);
 
 			// 绑定事件: 进入结算状态（倒计时归零时触发）
@@ -630,20 +625,21 @@ void UGameHUDWidget::UpdateTeamWinCountsText(int32 AttackerWins, int32 DefenderW
 
 
 /**
- * UGameHUDWidget::OnZombieRoundSoundReceived (v134 大厂架构新增, Multicast RPC 回调)
+ * UGameHUDWidget::OnZombieRoundSoundReceived (Multicast RPC 回调, 仅做 UI 通知)
+ *
+ * 【v210.4 大厂架构重构 — RPC 内置播放, UI 端只做通知】
  *
  * 业务规则 (用户 2026.08.06 明确):
- *   - 每小局结束, 服务器 Multicast 推 RoundWinner 到所有客户端
- *   - 全体客户端播同一个音效 (不按 ClientFactionTag 分发, 业务简化)
- *   - 客户端本机查 GameMode 配置的 USoundBase → 播放
+ *   - 每小局结束, 服务器 Multicast 推 RoundWinner + SoundPath 到所有客户端
+ *   - 音效播放已在 RPC Implementation 内 (PlayZombieRoundSoundFromPath_Implementation) 完成
+ *   - 本回调只做 UI 反馈 (震屏 / 全屏闪烁等可扩展点)
  *
  * 大厂原则 — 单一职责:
- *   - 本函数只负责 "查 GameMode USoundBase → 播放"
- *   - RoundWinner → USoundBase 查表走 GameMode.ResolveZombieRoundEndSound (配置真理源)
+ *   - 本函数不再查 GameMode / GameState 音效 (音效已在 RPC 链路播放)
+ *   - 仅 Broadcast 通知 HUD 其他组件 (后续可扩展视觉反馈)
  *
  * 大厂原则 — 零兜底:
- *   - GameMode 为空 → Log Error + return (防御层)
- *   - USoundBase 解析为 null → Log Error + 不播放 (音效缺失不应静默吞掉)
+ *   - World 为空 → Log Error + return
  *
  * 不破坏刀战模式:
  *   - 刀战永不调 MulticastPlayZombieRoundSound, 本回调永不触发
@@ -651,44 +647,20 @@ void UGameHUDWidget::UpdateTeamWinCountsText(int32 AttackerWins, int32 DefenderW
 void UGameHUDWidget::OnZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner)
 {
 	UE_LOG(LogTemp, Log,
-		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 收到小局音效 RPC, InRoundWinner=%d"),
+		TEXT("[GameHUDWidget] 【v210.4】OnZombieRoundSoundReceived: 收到小局音效 RPC (音效已在 RPC 链路播放). InRoundWinner=%d"),
 		static_cast<int32>(InRoundWinner));
 
 	UWorld* World = GetWorld();
 	if (!World)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: World 为空, 无法播放小局音效."));
+			TEXT("[GameHUDWidget] 【v210.4】OnZombieRoundSoundReceived: World 为空, 跳过 UI 通知."));
 		return;
 	}
 
-	// 【v210.2 大厂架构重构】直接用 RoomGS 查音效 (GameState 在所有机器都存在)
-	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
-	if (!RoomGS)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: RoomGameState 为空, 无法播放小局音效."));
-		return;
-	}
-
-	// 【v210.2 大厂架构重构】用 RoomGS->GetZombieRoundEndSound() 替代 GM->ResolveZombieRoundEndSound()
-	//   - 服务器初始化时 CacheZombieRoundSounds() 已缓存音效到 GameState
-	//   - GameState.Replicate 字段自动复制到所有客户端
-	USoundBase* SoundToPlay = RoomGS->GetZombieRoundEndSound(InRoundWinner);
-	if (!SoundToPlay)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: RoomGS.GetZombieRoundEndSound 返回 null. "
-			     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|ZombieRound 配对应的 ZombieHumanWinSound / ZombieMotherWinSound. "
-			     "【业务后果】本小局音效未播放, 业务不阻塞."));
-		return;
-	}
-
-	// 客户端本机播放
-	UGameplayStatics::PlaySound2D(this, SoundToPlay);
-	UE_LOG(LogTemp, Log,
-		TEXT("[GameHUDWidget] OnZombieRoundSoundReceived: 已播放小局音效 (全体). InRoundWinner=%d, Sound=%s"),
-		static_cast<int32>(InRoundWinner), *SoundToPlay->GetName());
+	// 【v210.4】这里可以扩展 UI 反馈 (震屏 / 全屏闪烁), 当前只 Log 留扩展点
+	//   - 音效本身在 GS::PlayZombieRoundSoundFromPath_Implementation 里已 PlaySound2D
+	//   - 不在这里重复播放, 避免双声道叠加
 }
 
 /** 根据游戏模式切换 Text_RemainingRounds 的可见性 */
@@ -1016,8 +988,8 @@ bool UGameHUDWidget::GetCrosshairWorldRay(FVector& OutWorldOrigin, FVector& OutW
  *
  * 1. 暂存当局击杀数
  * 2. 隐藏 MatchInfo + 准星
- * 3. 根据模式显示对应胜负文本（仅生化模式）
- * 4. 隐藏返回大厅按钮 + 计分板（等 OnShowFinalSettlement）
+ * 3. 根据模式显示对应胜负文本（仅生化模式, 在 Text_GameOver 里)
+ * 4. 隐藏计分板（等 OnShowFinalSettlement 再展示, 跨地图后由 UScoreboardWidget 接管）
  */
 void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills, EZombieRoundWinner RoundWinner)
 {
@@ -1037,39 +1009,48 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills,
 	// 隐藏准星
 	HideCrosshair();
 
-	// 【v200.2 大厂架构新增 P0】根据模式显示对应胜负文本
+	// 【v216 大厂架构回滚】Text_GameOver 仍在 GameHUDWidget 显示 (战斗内瞬时反馈)
+	// 大厂原则 — 单一真理源 (按业务场景):
+	//   - Text_GameOver (战斗 HUD): 战斗内显示"当局胜负"瞬时文本 (3 秒后切图)
+	//   - UScoreboardWidget (跨地图): L_Login 上显示完整结算面板 (含 Border + Button + 玩家列表)
+	//   - 两者职责不同: Text_GameOver 是"瞬时反馈", ScoreboardWidget 是"完整结算"
+	// 战斗内进入结算:
+	//   - MulticastEnterSettlement 触发 → OnEnterSettlement → Text_GameOver 显示"人类胜利/幽灵胜利"
+	//   - 紧接着 OnShowZombieRoundBriefResult / OnShowFinalSettlement 可能进一步刷新文本
+	//   - OpenLevel 切图时 GameHUDWidget 销毁, Text_GameOver 也消失 (符合预期: 战斗内只看到瞬时反馈)
 	if (Text_GameOver)
 	{
-		Text_GameOver->SetVisibility(ESlateVisibility::Visible);
-
+		// 生化模式: 显示"人类胜利" / "幽灵胜利" / "平局"
+		// 刀战模式: 暂不显示
 		if (CachedMatchMode == ERoomMatchMode::Zombie)
 		{
-			// 生化模式: 根据 RoundWinner 显示对应文本
+			FString WinnerText;
 			switch (RoundWinner)
 			{
 			case EZombieRoundWinner::Human:
-				Text_GameOver->SetText(FText::FromString(TEXT("人类胜利")));
+				WinnerText = TEXT("人类胜利");
 				break;
 			case EZombieRoundWinner::Mother:
-				Text_GameOver->SetText(FText::FromString(TEXT("幽灵胜利")));
+				WinnerText = TEXT("幽灵胜利");
 				break;
-			case EZombieRoundWinner::None:
 			default:
-				Text_GameOver->SetText(FText::FromString(TEXT("平局")));
+				WinnerText = TEXT("平局");
 				break;
 			}
+			Text_GameOver->SetText(FText::FromString(WinnerText));
+			Text_GameOver->SetVisibility(ESlateVisibility::HitTestInvisible);
 		}
 		else
 		{
-			// 刀战模式: 暂不显示胜负文本（用户尚未规定内容）
-			Text_GameOver->SetText(FText::FromString(TEXT("")));
+			// 刀战模式: 隐藏 Text_GameOver (旧 v200.2 行为)
+			Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
 		}
 	}
-
-	// 隐藏返回大厅按钮（等最终结果展示后再显示）
-	if (Button_ReturnToLobby)
+	else
 	{
-		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Collapsed);
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GameHUDWidget] OnEnterSettlement: Text_GameOver 未绑定, 无法显示战斗内胜负瞬时反馈. "
+			     "【v216 警告】请检查 WBP_GameHUDWidget 是否包含同名 Text_GameOver 控件."));
 	}
 
 	// 隐藏计分板（3 秒结算动画期间不显示，等 OnShowFinalSettlement 再展示）
@@ -1089,40 +1070,49 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills,
  *   - 每小局结束时短暂显示"人类胜利"或"母体胜利"
  *   - 显示 3 秒后自动隐藏
  *   - 不进入结算页面，继续下一小局
+ *
+ * 【v216 大厂架构回滚】Text_GameOver 操作留在 GameHUDWidget:
+ *   - 大厂原则: 战斗内"小局胜负"瞬时反馈是战斗 HUD 职责, 归 GameHUDWidget
+ *   - UScoreboardWidget (跨地图) 只在完整结算时 (MulticastEnterSettlement 路径) 显示文本
  */
 void UGameHUDWidget::OnShowZombieRoundBriefResult(EZombieRoundWinner RoundWinner)
 {
 	UE_LOG(LogTemp, Log, TEXT("[GameHUD] 【v201】OnShowZombieRoundBriefResult: RoundWinner=%d"),
 		static_cast<int32>(RoundWinner));
 
-	// 使用 Text_GameOver 显示小局结果
+	// 【v216 大厂架构回滚】Text_GameOver 操作保留在 GameHUDWidget (战斗内瞬时反馈)
 	if (Text_GameOver)
 	{
-		Text_GameOver->SetVisibility(ESlateVisibility::Visible);
-
+		FString WinnerText;
 		switch (RoundWinner)
 		{
 		case EZombieRoundWinner::Human:
-			Text_GameOver->SetText(FText::FromString(TEXT("人类胜利")));
+			WinnerText = TEXT("人类胜利");
 			break;
 		case EZombieRoundWinner::Mother:
-			Text_GameOver->SetText(FText::FromString(TEXT("母体胜利")));
+			WinnerText = TEXT("幽灵胜利");
 			break;
 		default:
-			Text_GameOver->SetText(FText::FromString(TEXT("平局")));
+			WinnerText = TEXT("平局");
 			break;
 		}
-	}
+		Text_GameOver->SetText(FText::FromString(WinnerText));
+		Text_GameOver->SetVisibility(ESlateVisibility::HitTestInvisible);
 
-	// 3 秒后自动隐藏
-	FTimerHandle Handle;
-	GetWorld()->GetTimerManager().SetTimer(Handle, [this]()
-	{
-		if (Text_GameOver)
+		// 3 秒后自动隐藏 (与 ScheduleFinalSettlement 3 秒同步 — 2026.08.08 调回 3s)
+		if (UWorld* World = GetWorld())
 		{
-			Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
+			FTimerHandle HideTimer;
+			FTimerDelegate HideDelegate = FTimerDelegate::CreateWeakLambda(this, [this]()
+			{
+				if (Text_GameOver)
+				{
+					Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
+				}
+			});
+			World->GetTimerManager().SetTimer(HideTimer, HideDelegate, 3.0f, false);
 		}
-	}, 3.0f, false);
+	}
 }
 
 
@@ -1130,40 +1120,68 @@ void UGameHUDWidget::OnShowZombieRoundBriefResult(EZombieRoundWinner RoundWinner
  * UGameHUDWidget::OnShowFinalSettlement
  *
  * 显示最终胜负结果（延迟 3 秒后由 GameState 广播触发）
- * 1. 隐藏游戏结束文本
- * 2. 显示结算覆盖板
- * 3. 显示计分板 + 当局击杀数 + 最终胜负
- * 4. 显示返回大厅按钮
+ *
+ * 【v216 大厂架构重构】结算覆盖板 + 返回大厅按钮已迁移:
+ *   - 旧:
+ *     * 隐藏 Text_GameOver
+ *     * 显示 Border_SettlementOverlay
+ *     * 显示 Widget_Scoreboard + 调 ShowRoundSettlement + ShowFinalResult
+ *     * 显示 Button_ReturnToLobby
+ *   - 新 (v216 — 切图到 L_Login):
+ *     * 服务器 MulticastShowFinalSettlement_Implementation 写 USettlementSnapshotSubsystem.UpdateSnapshotWins
+ *     * UScoreboardWidget 在 L_Login 上 ApplySnapshot 时读快照 → 自己管 Border / Button 显示
+ *     * GameHUDWidget 完全不感知结算覆盖板, 单一职责: 战斗 HUD
+ *
+ * 保留职责:
+ *   - 隐藏 Text_GameOver (战斗内"瞬时反馈"结束, 即将切图)
+ *   - 隐藏 MatchInfo / 准星 (战斗 HUD 控件, 不属于结算)
+ *   - 隐藏 Widget_Scoreboard (切图后 GameHUDWidget 整个被销毁)
+ *
+ * @param AttackerWins 攻方胜局数 (来自 GameState 广播)
+ * @param DefenderWins 守方胜局数 (来自 GameState 广播)
+ *
+ * 大厂原则:
+ *   - 本函数不应该再直接操作任何结算控件 (Border/Button)
+ *   - Text_GameOver 是战斗内瞬时反馈 (MulticastEnterSettlement 时显示, 3 秒后隐藏)
+ *   - 应该做的是"让战斗 HUD 退出视野", 切图后的 L_Login 由 UScoreboardWidget 接管
  */
 void UGameHUDWidget::OnShowFinalSettlement(int32 AttackerWins, int32 DefenderWills)
 {
-	UE_LOG(LogTemp, Log, TEXT("[GameHUD] OnShowFinalSettlement: 攻方胜%d局, 守方胜%d局"), AttackerWins, DefenderWills);
+	UE_LOG(LogTemp, Log, TEXT("[GameHUD] 【v216】OnShowFinalSettlement: 攻方胜%d局, 守方胜%d局. "
+		"本函数仅负责战斗 HUD 退出视野, 结算覆盖板已迁移到 UScoreboardWidget (跨地图持久)."),
+		AttackerWins, DefenderWills);
 
-	// 隐藏游戏结束文本（3 秒显示时间已到）
+	// 【v216 大厂架构删除】Border_SettlementOverlay / Button_ReturnToLobby 操作已迁移
+	// 旧:
+	//   - Text_GameOver->SetVisibility(Collapsed)
+	//   - Border_SettlementOverlay->SetVisibility(Visible)
+	//   - Widget_Scoreboard->ShowRoundSettlement + ShowFinalResult
+	//   - Button_ReturnToLobby->SetVisibility(Visible)
+	// 新:
+	//   - UScoreboardWidget::ApplySnapshot 在 L_Login 上拉 USettlementSnapshotSubsystem 快照
+	//   - ApplySnapshot 内部完成: Border 显示 + 文本刷新 + Button 显示 + 绑定 OnReturnToLobbyClicked
+	//   - 本函数仅负责"战斗 HUD 退出视野"
+
+	// 【保留】隐藏战斗 HUD (不依赖切图, 旧切图前逻辑保留)
+	if (Widget_MatchInfo)
+	{
+		Widget_MatchInfo->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	HideCrosshair();
+
+	// 【v216 大厂架构回滚】Text_GameOver 隐藏:
+	//   - OnEnterSettlement 显示"人类胜利/幽灵胜利"瞬时文本
+	//   - OnShowFinalSettlement (3 秒后) 隐藏该文本 (即将切图到 L_Login)
+	// 大厂原则: Text_GameOver 是战斗内"瞬时反馈", 切图后 GameHUDWidget 销毁, 不需要跨地图
 	if (Text_GameOver)
 	{
 		Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
-	// 显示结算覆盖板（Border 覆盖整个屏幕）
-	if (Border_SettlementOverlay)
-	{
-		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Visible);
-	}
-
-	// 显示计分板 + 当局击杀数 + 最终胜负
-	if (Widget_Scoreboard)
-	{
-		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
-		Widget_Scoreboard->ShowRoundSettlement(LastAttackerKills, LastDefenderKills);
-		Widget_Scoreboard->ShowFinalResult(AttackerWins, DefenderWills);
-	}
-
-	// 显示返回大厅按钮
-	if (Button_ReturnToLobby)
-	{
-		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Visible);
-	}
+	// 【v216 大厂架构删除】Widget_Scoreboard 操作:
+	//   旧: 显示 Scoreboard + 调 ShowRoundSettlement(LastAttackerKills, LastDefenderKills) + ShowFinalResult(AttackerWins, DefenderWills)
+	//   新: UScoreboardWidget 在 L_Login 上通过 ApplySnapshot 拉 USettlementSnapshotSubsystem 一次性拿数据
+	//        GameHUDWidget 不再调 ShowRoundSettlement / ShowFinalResult (那两个函数 v217 也会重构成 ApplySnapshot 入口)
 }
 
 
@@ -1227,21 +1245,23 @@ void UGameHUDWidget::UpdateWeaponIconFromID(const FString& WeaponID)
 // ==========================================
 
 /**
- * UGameHUDWidget::OnReturnToLobbyClicked
+ * 【v216 大厂架构删除】OnReturnToLobbyClicked 已迁移到 UScoreboardWidget::OnReturnToLobbyClicked
  *
- * 返回大厅按钮点击
- * 流程: PC->LeaveRoom()
+ * 历史: 本函数调 PC->LeaveRoom() 让玩家退出房间关卡
+ * v216: UScoreboardWidget::Button_ReturnToLobby 走 RPC 链路
+ * v216.2 大厂架构重构: UScoreboardWidget 直接调 UGameFlowSubsystem::RequestStateOnNextLoad(MainLobby)
+ *   - 去除 RPC 链路 (Server_SettlementReturnToLobby / Client_OpenLobbyFromSettlement 已全部删除)
+ *   - 客户端本地操作, 不需要服务器往返
+ *   - GameFlowSubsystem 在 L_Login 上切到 MainLobby 状态, UIViewService ShowPanel(MainLobbyPanel)
+ *
+ * 大厂原则 — 0 兜底:
+ *   - 旧路径是"GameHUDWidget::OnReturnToLobbyClicked → PC->LeaveRoom → OpenLevel"
+ *   - v216 路径是"RPC → 状态机", 但跨地图后 PC 类型变化导致 Cast 失败 (按钮无反应)
+ *   - v216.2 路径是"客户端直接调 GameFlowSubsystem", 跨 PC 类型工作
+ *   - 旧路径强行同步切图 (无视其他客户端), 违反 Room 生命周期管理
+ *
+ * 函数实现已删除 (本函数以前在 .cpp 第 1235 行附近, 现有代码已删除)
  */
-void UGameHUDWidget::OnReturnToLobbyClicked()
-{
-	if (APlayerController* PC = GetOwningPlayer())
-	{
-		if (ARoomPlayerController* RoomPC = Cast<ARoomPlayerController>(PC))
-		{
-			RoomPC->LeaveRoom();
-		}
-	}
-}
 
 
 // ==========================================

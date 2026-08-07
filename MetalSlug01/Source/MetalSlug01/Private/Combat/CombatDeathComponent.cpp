@@ -288,7 +288,7 @@ void UCombatDeathComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
  *   6. IsDead → PerformKillSettlement
  */
 float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& DamageEvent,
-                                        AController* EventInstigator, AActor* DamageCauser)
+                                         AController* EventInstigator, AActor* DamageCauser)
 {
 	// 防御: Owner 无效 → return 0
 	ABaseCharacter* Owner = OwnerCharacter.Get();
@@ -296,6 +296,24 @@ float UCombatDeathComponent::TakeDamage(float DamageAmount, FDamageEvent const& 
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[CombatDeathComponent] TakeDamage: Owner 无效, 无法处理伤害."));
+		return 0.0f;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态拒绝扣血 (深度防御最终关卡)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: Server_ReportHit / Server_ReportAIAttackHit / Server_ReportMotherAttackHit
+	//     三个 RPC 入口都已加 IsInSettlement 检查, 但这是伤害路径的最终关卡
+	//     (即便上游全部漏掉, 这里也能挡住, 避免结算页面期间有 AI 死亡)
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (Owner->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[CombatDeathComponent] TakeDamage: Victim=%s 处于结算状态, 拒绝扣血 (深度防御最终关卡)."),
+			*Owner->GetName());
 		return 0.0f;
 	}
 

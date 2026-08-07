@@ -1,0 +1,65 @@
+# MetalSlug 架构记忆 — v219
+
+## 1. v219 (2026.08.09) — 客户端切换近战武器日志可观测性升级
+
+### 业务背景 (用户 Session1.txt 反馈)
+- "客户端每小局无法切换到近战武器"
+- 之前 v137 修复了 Q 键循环逻辑的主动补 Spawn, 但用户反馈问题持续
+
+### 根因分析
+- 多个关键日志使用 `Log` 级别, PIE / 客户端日志默认 Verbosity 经常过滤
+- 看不到 OnRep / Server_SwitchToWeaponSlot / EnsureSlotHasWeapon 入口日志
+- 排查时无法确认 "复制是否触发" "服务器切槽位是否执行" "补 Spawn 是否尝试"
+
+### v219 修复 (5 处日志升级 Log/Warning → Display)
+
+| # | 文件 | 函数 | 旧级别 | 新级别 | 原因 |
+|---|---|---|---|---|---|
+| 1 | `WeaponAttachmentComponent.cpp` | `OnRep_CurrentWeapon` | `Log` | `Display` | 客户端复制可见性 |
+| 2 | `WeaponAttachmentComponent.cpp` | `OnRep_CurrentWeaponSlot` | `Log` | `Display` | 客户端复制可见性 |
+| 3 | `WeaponAttachmentComponent.cpp` | `Server_SwitchToWeaponSlot` 入口 | `Log` | `Display` | 服务器切槽位入口可见性 |
+| 4 | `BaseCharacter.cpp` | `EnsureSlotHasWeapon_Server` "Melee 槽位空" | `Warning` | `Display` | 主动补 Spawn 触发可见性 |
+| 5 | `BaseCharacter.cpp` | `EnsureSlotHasWeapon_Server` 业务默认 (JZ001) | `Log` | `Display` | 业务默认使用可见性 |
+
+### 大厂原则 (v219 落地)
+- **可观测性优先**: 关键链路节点必须 `Display` 级别, 默认在控制台 + 文件日志都可见
+- **Verbose 不要用于关键链路**: Verbose 默认被过滤, 关键节点必须 Display
+- **单条 v219 调试入口**: `Server_SwitchToWeaponSlot` 入口带 `[v219]` 标识, 用户可一键 grep
+
+### 修复后用户验证步骤
+1. 重启 UE, 编译
+2. 启动 PIE, 进入任意对局
+3. 客户端按 3 (Melee) 或 Q (循环)
+4. 查看日志, 应该看到:
+   - `[BaseCharacter] EnsureSlotHasWeapon_Server: Melee 槽位空 — 触发主动补 Spawn` (如果 Melee 槽空)
+   - `[WeaponAttachment][v219] Server_SwitchToWeaponSlot ENTER` (服务器端)
+   - `[WeaponAttachment] OnRep_CurrentWeapon: Old=... New=...` (客户端)
+   - `[WeaponAttachment] OnRep_CurrentWeaponSlot: Pawn=... 旧=... 新=...` (客户端)
+5. 如果 OnRep 没触发 → 复制链路有 bug, 检查 WeaponState 字段
+6. 如果 OnRep 触发但服务器没切 → 服务器端 Server_SwitchToWeaponSlot 没收到 RPC, 检查 BP 蓝图 InputAction
+
+### v219 未改动的部分 (作为已知正确)
+- v137 Q 键循环逻辑 + 主动补 Spawn (修复 Q 键路径)
+- v60.6 智能默认 (Primary 失败 → 退到 Melee) — 这是 "主动恢复" 不是 "兜底", 保留
+- v78 WeaponState SSOT (单一复制链)
+- v200.2.8 Listen Server ApplyAttachmentRuntime (避免房主看不到武器)
+
+### 与 v219 同期的修复 (用户截图日志可对比)
+- v219 P0 (2026.08.09 早): 母体 Tick 守卫 (`if (bIsMother)` 守卫 Tick 调 ResolveMotherTraceStrategy)
+- v219 P1: Listen Server 武器 Attach 修复 (Server_SpawnAllWeapons 末尾 ApplyAttachmentRuntime)
+- v219 P2 (本次新增): 5 处日志 Log/Warning → Display
+
+## 2. 历史背景 (参考)
+
+### v137 (2026.08.09)
+- Q 键循环逻辑也支持主动补 Spawn (与 1/2/3 显式键路径对称)
+- 抽出 `EnsureSlotHasWeapon_Server` helper, 让 Q 键路径 / 1/2/3 键路径共用
+- "0 兜底 vs 主动恢复" 的设计权衡明确化
+
+### v78 (2026.08.x)
+- WeaponState SSOT (单一复制链)
+- 替代旧版独立复制 CurrentWeapon + CurrentWeaponSlot (时序不一致)
+
+### v60.6 (2026.08.x)
+- 槽位独立性 + 智能默认
+- Primary 失败 → 退到 Melee (玩家至少能用刀)

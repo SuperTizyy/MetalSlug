@@ -304,19 +304,12 @@ void ARoomGameMode::InitGameState()
 			TEXT("[RoomGameMode] InitGameState: URoomLifecycleSubsystem 不可用, 跳过 TotalRounds 补注入."));
 	}
 
-	// 【v210.2 大厂架构重构】缓存音效资产到 GameState (解决客户端无 AuthGameMode 问题)
-	//   - 根因: 客户端 World->GetAuthGameMode() 返回 nullptr, 无法查 GameMode 配置的音效
-	//   - 修复: 服务器在 GameState 创建后缓存音效资产, 引擎自动 Replicate 到所有客户端
-	//   - 客户端直接访问 GS->GetZombieRoundEndSound() (GameState 在所有机器都存在)
-	if (GS)
-	{
-		GS->CacheZombieRoundSounds(ZombieHumanWinSound, ZombieMotherWinSound);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[RoomGameMode] InitGameState: GS 为空, 跳过音效资产缓存."));
-	}
+	// 【v210.4 大厂架构重构 — 删除 CacheZombieRoundSounds】
+	//   旧 (v210.2 / v210.3): InitGameState 末尾调 GS->CacheZombieRoundSounds 把音效复制到 GS + Replicate
+	//   根因 (v210.4): InitGameState 有 4 处 early-return 跳过这段代码, 实际 0% 调用成功
+	//     即使注入成功, Replicated UObject* / TSoftObjectPtr 在 UE 5.6 中仍可能 GC 误删
+	//   新方案: 唯一真理源 = GameMode->ZombieHumanWinSound (策划唯一配置点)
+	//   音效通过 RPC FSoftObjectPath 跨网络传输, InitGameState 完全不参与
 }
 
 /**
@@ -1097,72 +1090,62 @@ bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
 
 
 // ==========================================
-// 【v134 大厂架构新增】生化小局结算音效查表 — 单一入口
+// 【v134 大厂架构新增 → v210.4 已废弃】生化小局结算音效查表
 // ==========================================
 //
-// 业务规则 (用户 2026.08.06):
-//   - 根据本局赢家 (Human/Mother) + 客户端阵营 (Offense=母体 / Defense=人类), 选 4 个音效之一
-//   - 不在 GameHUDWidget 写 4 个 if 重复架构 — 集中决策在 GameMode
-//   - 任何参数无效 / 资产为空 → 返回 nullptr + Log Error, 调用方拒绝播放 + 流程继续
+// 【v210.4 大厂架构重构 — 废弃 ResolveZombieRoundEndSound】
+//   旧 (v134 - v210.3): GM 提供 ResolveZombieRoundEndSound(RoundWinner) 集中决策
+//   根因: 客户端 World->GetAuthGameMode() 返回 nullptr, 此函数在客户端永远走 fallback 路径
+//   修复: 音效配置真理源保留在 GM, 但查表/播放上移到 RPC 链路 (服务器查 GM → FSoftObjectPath → 客户端 LoadSynchronous)
+//   调用方: 已无, v210.4 后 UI / Lifecycle 都不再调此函数
+//   保留函数体避免遗留调用编译错误, 但永远返回 nullptr (零兜底, 不允许 fallback)
 //
 // 大厂原则 — 零兜底:
 //   - RoundWinner == None → 返回 nullptr (胜负未定, 不允许基于未定播放)
-//   - ClientFactionTag 无效 (非 Offense/Defense) → 返回 nullptr
-//   - 4 个音效任一为空 → 返回 nullptr (策划配置错, Log Error 告知)
+//   - 音效资产为空 → 返回 nullptr (策划配置错, Log Error 告知)
 //
 // 不破坏刀战模式:
 //   - GameHUDWidget 仅在 Bio 模式 + RoundWinner 已写时调本函数
 //   - 刀战永远不调, 4 个字段刀战模式 0 影响
-//
-// 调用方:
-//   - UGameHUDWidget::OnRep_RoundWinner (客户端缓存 + OnEnterSettlement 时调用)
 USoundBase* ARoomGameMode::ResolveZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const
 {
-	// 防御层 1: RoundWinner 必须合法
+	// 【v210.4 大厂架构重构】此函数已废弃, 永远返回 nullptr, 强制走新路径 (RPC FSoftObjectPath)
+	UE_LOG(LogTemp, Error,
+		TEXT("[RoomGameMode] 【v210.4 废弃】ResolveZombieRoundEndSound: 已废弃, 客户端 GetAuthGameMode 返回 nullptr. "
+		     "【修复】调用方改为 RoomGS->MulticastPlayZombieRoundSound(NewWinner, FSoftObjectPath(Sound)). "
+		     "InRoundWinner=%d"),
+		static_cast<int32>(InRoundWinner));
+	return nullptr;
+
+	// 【v210.4 注释保留原实现供参考, 不执行】
+#if 0
 	if (InRoundWinner == EZombieRoundWinner::None)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=None (尚未结算), 拒绝查表. "
-			     "【根因】调用方在胜负未定时触发了音效查表. 修复: 确保 OnRep_RoundWinner 已收到 Human/Mother 后才查."));
+			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=None (尚未结算), 拒绝查表."));
 		return nullptr;
 	}
 
-	// 业务查表: 根据赢家返回对应音效 (全体客户端播同一个, 不区分 ClientFaction)
-	// 大厂原则 — 零重复架构: 全体播同一个音效, 不按 ClientFactionTag 分发 (用户 2026.08.06 业务简化)
 	USoundBase* SelectedSound = nullptr;
 	const TCHAR* SlotName = nullptr;
-
 	switch (InRoundWinner)
 	{
 	case EZombieRoundWinner::Human:
 		SelectedSound = ZombieHumanWinSound;
 		SlotName = TEXT("ZombieHumanWinSound");
 		break;
-
 	case EZombieRoundWinner::Mother:
 		SelectedSound = ZombieMotherWinSound;
 		SlotName = TEXT("ZombieMotherWinSound");
 		break;
-
 	default:
-		// 理论上防御层 1 已挡住, 这里仅兜底类型 (UEnum 未穷尽警告)
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=%d 未识别, 拒绝查表. "
-			     "【修复】检查 EZombieRoundWinner 枚举定义."),
+			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: RoundWinner=%d 未识别."),
 			static_cast<int32>(InRoundWinner));
 		return nullptr;
 	}
-
-	if (!SelectedSound)
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[RoomGameMode] ResolveZombieRoundEndSound: 音效资产为空 (Winner=%d, Slot=%s). "
-			     "【修复】在 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|ZombieRound 配对应字段. "
-			     "【业务后果】音效缺失, 不卡住胜负流程 — Text_RoundCountdown 仍正常显示."),
-			static_cast<int32>(InRoundWinner), SlotName);
-	}
-
 	return SelectedSound;
+#endif
 }
 
 

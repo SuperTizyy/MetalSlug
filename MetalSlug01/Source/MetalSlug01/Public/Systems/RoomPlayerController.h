@@ -15,6 +15,9 @@
 //   注意: 必须在 .generated.h **之前** include, 这是 UE 反射系统的硬规则
 #include "Systems/AI/AIBehaviorTypes.h"
 
+// 【v217 大厂架构新增】FFinalSettlementSnapshot 跨端 RPC 推送
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h"
+
 // UE 自动生成的头文件
 #include "RoomPlayerController.generated.h"
 
@@ -120,19 +123,20 @@ public:
 	bool bIsEscMenuOpen = false;
 
 	/**
-	 * 房主解散房间时的延迟退出定时器
-	 */
-	FTimerHandle HostLeaveTimer;
-
-	/**
 	 * 【大厂标准】退房流程订阅的 PostLoadMapWithWorld 全局委托句柄
 	 *
-	 * 用途: ExecuteLeaveRoom 主动 OpenLevel 后, 在新 World 上主动切到 MainLobby
-	 * 原因: TWeakObjectPtr<UWorld> 在 World 销毁后失效, 不能跨地图捕获
-	 *       必须用引擎全局委托, 引擎保证在新 World 上回调
+	 * 【v217 架构重构 - 已废弃】ExecuteLeaveRoom 不再订阅 PostLoadMapWithWorld
+	 *   - 旧逻辑: ExecuteLeaveRoom 主动 OpenLevel + PostLoadMapWithWorld Lambda 兜底切 MainLobby
+	 *   - 新逻辑: 委托给 URoomService::RequestLeaveRoom (单一入口, 已包含 OpenLevel + RequestStateOnNextLoad)
+	 *   - 字段保留 (不要删除, 避免破坏 EndPlay 的 Remove 调用), 但不再被赋值
+	 *
+	 * 历史:
+	 *   - 用途: ExecuteLeaveRoom 主动 OpenLevel 后, 在新 World 上主动切到 MainLobby
+	 *   - 原因: TWeakObjectPtr<UWorld> 在 World 销毁后失效, 不能跨地图捕获
+	 *   - 必须用引擎全局委托, 引擎保证在新 World 上回调
 	 *
 	 * 生命周期:
-	 *   - ExecuteLeaveRoom: AddLambda 时保存 handle
+	 *   - ExecuteLeaveRoom: AddLambda 时保存 handle — 【v217 已废弃, 不再赋值】
 	 *   - Lambda 内处理完毕: Remove + Reset
 	 *   - EndPlay: 兜底 Remove (防御 PC 在跳图前被销毁, 留下野指针)
 	 */
@@ -260,6 +264,51 @@ public:
 	// 等真有需求时再加
 
 	/**
+	 * 【v216 大厂架构新增】玩家在结算页面点"返回大厅"按钮
+	 *
+	 * 触发场景:
+	 *   - 玩家已在 L_Login 上 (从房间关卡切过来)
+	 *   - 看到 UScoreboardWidget (在 L_Login 上由 UIViewService 显示)
+	 *   - 点 Button_ReturnToLobby → UScoreboardWidget::OnReturnToLobbyClicked
+	 *
+	 * 【v216.2 大厂架构重构】整个 RPC 对已删除 (UFUNCTION 声明 + _Validate + _Implementation 全部移除)
+	 *   - 历史问题: RPC 链路假设 PC == ARoomPlayerController, 但跨地图后 PC == ALoginPlayerController
+	 *     → Cast 失败 → 按钮无反应
+	 *   - 修正方案: UScoreboardWidget::OnReturnToLobbyClicked 直接调
+	 *     UGameFlowSubsystem::RequestStateOnNextLoad(MainLobby), 不走 RPC
+	 *
+	 * 大厂架构 — 去除死代码原则:
+	 *   - UE RPC 要求 _Validate + _Implementation 配对存在 (UE 链接错误会阻止单独删除一半)
+	 *   - 既然所有调用方已移除, 整套 RPC 都成为死代码 → 全部删除
+	 *   - 不保留 stub 函数 (stub 函数本身也是死代码, 会触发 UE_DEPRECATED 警告)
+	 *
+	 * 大厂架构 — RPC 路径(历史, 已废弃):
+	 *   客户端: OnReturnToLobbyClicked
+	 *     ↓ Server_SettlementReturnToLobby
+	 *   服务器: 收到 RPC → 调 Client_OpenLobbyFromSettlement
+	 *     ↓ RequestStateOnNextLoad(EMatchState::MainLobby)
+	 *   GameFlowSubsystem: 切状态 → UIViewService ShowPanel(MainLobbyPanel)
+	 *
+	 * 不直接调 OpenLevel 原因:
+	 *   - 旧路径直接 OpenLevel 违反 Room 生命周期
+	 *   - 新路径走状态机, 客户端本地调 GameFlowSubsystem, 0 网络往返
+	 *
+	 * 大厂原则 — 0 兜底:
+	 *   - 必须在 SettlementPage 状态下调用 (客户端校验, 不在则拒绝)
+	 *   - 跨 PC 类型工作 (任何 PC 都能调 GameFlowSubsystem, 无 Cast 依赖)
+	 *
+	 * 0 兜底:
+	 *   - GameInstance 拿不到 → UScoreboardWidget 内部 Log Error + return
+	 *   - GameFlowSubsystem 拿不到 → UScoreboardWidget 内部 Log Error + return
+	 *   - 状态不是 SettlementPage → UScoreboardWidget 内部 Log Error + return
+	 *
+	 * 历史代码位置 (已删除):
+	 *   - UFUNCTION 声明: line ~290
+	 *   - _Validate: line ~647
+	 *   - _Implementation: line ~674 (调用了已删除的 Client_OpenLobbyFromSettlement)
+	 */
+
+	/**
 	 * 房主 → 客户端 的"账号登录结果"通知
 	 * @param bSuccess 是否成功注册到权威表
 	 * @param Reason 失败原因(空=成功)
@@ -335,6 +384,67 @@ public:
 	UFUNCTION(Client, Reliable)
 	void Client_TransitToMatchState(EMatchState NewState);
 
+	/**
+	 * 【v217 大厂架构新增】服务器推结算快照给单个客户端
+	 *
+	 * 根因 (v216.x):
+	 *   - MulticastEnterSettlement 的 NetMulticast 实现,客户端也会本地拉 URoomStateService 构造 Snapshot
+	 *   - 客户端的 AIC.CachedFactionTag 是空 (非 Replicated) → AI 永远被过滤掉
+	 *   - 用户报告: "客户端结算页面只显示玩家信息,不显示房间内AI信息"
+	 *
+	 * 修复 (v217):
+	 *   - 服务端是 AI 数据的唯一真理源 (CachedFactionTag 在服务器侧设置)
+	 *   - 服务端在 MulticastEnterSettlement (HasAuthority=true) 时拉数据 + 写本地 Snapshot
+	 *   - 然后遍历所有 PC 调本 RPC (Client_ReceiveSettlementSnapshot) 推给每个客户端
+	 *   - 客户端收到后调 USettlementSnapshotSubsystem::WriteSnapshot
+	 *
+	 * 大厂原则 — RPC 单一真理源:
+	 *   - Server 推 RPC 数据是 UE 5.x 标准网络模式 (NetMulticast 不带大对象, Client RPC 适合点对点大对象)
+	 *   - 客户端从不"自己拉",避免 AIC.CachedFactionTag 非 Replicated 导致的客户端空数据
+	 *   - 0 兜底: 客户端 GameInstance/Subsystem 拿不到 → Log Error + return, 不静默丢弃
+	 *
+	 * 时序 (v217):
+	 *   - t=0: Server MulticastEnterSettlement → 拉数据 + 写本地 Snapshot + 推本 RPC
+	 *   - t=0+: Client 收到 Client_ReceiveSettlementSnapshot → WriteSnapshot 到本地 Subsystem
+	 *   - t=3s: Server OpenLevel 切图到 L_Login
+	 *   - t=3s+: UScoreboardWidget 构造时 ConsumeSnapshot → ApplySnapshot (此时数据已完整)
+	 */
+	UFUNCTION(Client, Reliable)
+	void Client_ReceiveSettlementSnapshot(const FFinalSettlementSnapshot& InSnapshot);
+
+	/**
+	 * 【v216 大厂架构新增】服务器通知客户端"从结算页面打开主大厅"
+	 *
+	 * 触发场景:
+	 *   - 客户端发 Server_SettlementReturnToLobby RPC
+	 *   - 服务器收到后校验状态 (SettlementPage), 校验通过
+	 *   - 服务器调本 RPC 推回客户端
+	 *   - 客户端收到后 → RequestStateOnNextLoad(EMatchState::MainLobby)
+	 *   - GameFlowSubsystem 切状态 → UIViewService ShowPanel(MainLobbyPanel)
+	 *
+	 * 【v216.2 大厂架构重构】整个 RPC 已删除 (UFUNCTION 声明 + _Implementation 全部移除)
+	 *   - UScoreboardWidget::OnReturnToLobbyClicked 不再发 Server_SettlementReturnToLobby
+	 *   - 直接调 UGameFlowSubsystem::RequestStateOnNextLoad(MainLobby) 即可
+	 *   - 本 RPC 无任何调用方 (Server_SettlementReturnToLobby 自身也已删除)
+	 *
+	 * 大厂架构 — 去除死代码原则:
+	 *   - 既然无调用方, RPC 本身成为死代码 → 全部删除
+	 *   - 包含 UFUNCTION 声明 + _Implementation 全部清空
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 服务器权威决定: 客户端能否返回大厅
+	 *   - 客户端不私自 OpenLevel, 不私自切状态
+	 *   - 服务器统一调度 EMatchState 状态机, 保证 UI/逻辑一致
+	 *
+	 * 0 兜底:
+	 *   - 客户端已不在房间 (Host 解散 / 客户端断线) → 服务器不调本 RPC
+	 *   - 服务器决定不应直接 OpenLevel (走 EMatchState 状态机)
+	 *
+	 * 历史代码位置 (已删除):
+	 *   - UFUNCTION 声明: line ~405
+	 *   - _Implementation: line ~1519
+	 */
+
 	// ==========================================
 	// 退房系统
 	// ==========================================
@@ -404,6 +514,43 @@ public:
 	 */
 	UFUNCTION()
 	void OnFlowStateChanged(EMatchState NewState);
+
+	// ==========================================
+	// 结算状态监听 (v211)
+	// ==========================================
+
+	/**
+	 * 结算状态变化回调 (ARoomGameState::OnSettlementStateChanged 单入口)
+	 *
+	 * 【v211 大厂架构新增】让结算页面可以点击按钮
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - 一整局游戏完全结束进入结算页面时, 必须显示鼠标 + UIOnly 输入
+	 *     → 玩家才能点击结算页面的按钮 (返回大厅/再来一局 等)
+	 *   - 离开结算时, 恢复 GameOnly 输入 + 隐藏鼠标
+	 *
+	 * 单一真理源 (Single Source of Truth):
+	 *   - ARoomGameState::bInSettlement (Replicated, 服务器权威)
+	 *   - 服务器在 MulticastEnterSettlement 时 SetSettlementState(true)
+	 *   - 服务器在 ExecuteLeaveRoom 时 SetSettlementState(false)
+	 *   - 客户端 OnRep_bInSettlement + 服务器 Broadcast 都会触发本回调
+	 *
+	 * 触发时序 (无重复风险):
+	 *   - 服务器: MulticastEnterSettlement_Implementation → SetSettlementState(true)
+	 *     → OnSettlementStateChanged.Broadcast(true) → 本函数被调用
+	 *   - 客户端: MulticastEnterSettlement RPC → SetSettlementState(true)
+	 *     → 同样通过本函数回调
+	 *   - 可靠保证: 不会有漏触发或重复触发
+	 *
+	 * 架构优势:
+	 *   - 单一入口: RoomPlayerController 集中处理鼠标/输入模式切换
+	 *   - DRY: 任何结算相关 UI 切换都从本函数派生, 不再在多处散落
+	 *   - 0 兜底: 失败时 Log Error + return,不静默处理
+	 *
+	 * @param bInSettlement true=进入结算, false=离开结算
+	 */
+	UFUNCTION()
+	void HandleSettlementStateChanged(bool bInSettlement);
 
 	// ==========================================
 	// 复活系统

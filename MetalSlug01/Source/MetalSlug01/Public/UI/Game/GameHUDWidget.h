@@ -26,9 +26,11 @@ class UKillStreakWidget;
 class UScoreboardWidget;
 class UCrosshairWidget;
 class UEscMenuWidget;
-class UBorder;
-class UButton;
+// 【v216 大厂架构回滚】保留 TextBlock 引用 (Text_GameOver 留在 WBP_GameHUDWidget 里显示)
+// Border_SettlementOverlay / Button_ReturnToLobby 仍迁移到 UScoreboardWidget (跨地图结算页用)
 class UTextBlock;
+// class UBorder;  // 仍迁移
+// class UButton;  // 仍迁移
 
 
 /**
@@ -497,27 +499,35 @@ protected:
 	class UDataTable* KillStreakIconDataTable;
 
 	// ==========================================
-	// 6. 结算覆盖板
+	// 【v216 大厂架构迁移】6. 结算覆盖板 — 部分迁移到 UScoreboardWidget
+	// ==========================================
+	// 历史: GameHUDWidget 持有 Border_SettlementOverlay / Text_GameOver / Button_ReturnToLobby,
+	//       OnEnterSettlement / OnShowFinalSettlement / OnShowZombieRoundBriefResult 三个回调操作它们
+	// 新 (v216):
+	//   - Border_SettlementOverlay / Button_ReturnToLobby 已迁移到 UScoreboardWidget (跨地图结算页用)
+	//   - Text_GameOver 仍保留在 GameHUDWidget — 战斗内"当局胜负"瞬时文本反馈
+	//     (MulticastEnterSettlement 触发时, 玩家在战斗地图内看到 "人类胜利" / "幽灵胜利", 持续 3 秒)
+	//     → 切图后 GameHUDWidget 已销毁, Text_GameOver 也不可见, 不需要跨地图
+	//   - 跨地图的"完整结算面板"由 UScoreboardWidget 在 L_Login 上独立显示 (含 Border + 完整列表 + Button)
+	//   - 旧 (v209-v215) 的 OnEnterSettlement 处理: 设置 Text_GameOver 文本 + 显隐 → 恢复 (战斗内瞬时反馈)
+	//
+	// 迁移项 (2):
+	//   - UBorder* Border_SettlementOverlay → 已删除
+	//   - UButton* Button_ReturnToLobby + UFUNCTION() void OnReturnToLobbyClicked() → 已删除
+	// 保留项 (1):
+	//   - UTextBlock* Text_GameOver → 保留, OnEnterSettlement / OnShowZombieRoundBriefResult 控制其文本 + 显隐
 	// ==========================================
 
-	/** 结算覆盖板 Border（由 GameHUD 统一控制显示/隐藏） */
-	UPROPERTY(meta = (BindWidget))
-	UBorder* Border_SettlementOverlay;
-
-	/** 游戏结束文本（倒计时结束时显示） */
-	UPROPERTY(meta = (BindWidget))
-	UTextBlock* Text_GameOver;
-
-	/** 返回大厅按钮（最终结果展示后可见） */
-	UPROPERTY(meta = (BindWidget))
-	UButton* Button_ReturnToLobby;
-
 	/**
-	 * 返回大厅按钮点击回调
-	 * 流程: PC->LeaveRoom()
+	 * 当局胜负文本 (战斗内瞬时反馈)
+	 * BindWidgetOptional: WBP_GameHUDWidget 里同名 TextBlock 控件
+	 * 显示时机:
+	 *   - OnEnterSettlement: 显示 "人类胜利" / "幽灵胜利" / "平局"
+	 *   - OnShowZombieRoundBriefResult: 显示小局胜负 (3 秒后自动隐藏)
+	 * 跨地图: 不需要 (切图后 GameHUDWidget 销毁)
 	 */
-	UFUNCTION()
-	void OnReturnToLobbyClicked();
+	UPROPERTY(meta = (BindWidgetOptional))
+	class UTextBlock* Text_GameOver;
 
 	// ==========================================
 	// 7. CharacterEvents 订阅 (2026-07-01 新增 - 依赖倒置核心)

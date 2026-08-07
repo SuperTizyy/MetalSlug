@@ -1183,6 +1183,14 @@ void UGameFlowSubsystem::HandleSessionTerminated(EMatchState SuggestedState)
 	//   1. 防重入: 1 秒冷却, 避免 HostClosedConnection 双重回调 + OnSessionTerminated 双重触发
 	//   2. 抢先 OpenLevel(L_Login ?offline): 时序抢占 UE 引擎的 ?closed SetClientTravel
 	//   3. 触发 OnInterrupted.Broadcast(LANRoom): UIViewService 强制 ShowPanel
+	//
+	// 【v217 大厂架构修复 — 主动 Leave vs 网络失败 区分】:
+	//   - 主动 Leave Room: 玩家点 ReturnToLobby, URoomService::RequestLeaveRoom 已处理 UI 状态
+	//     → 这里再 OpenLevel 会导致循环切图(已 L_Login 上再切一次)
+	//   - 网络失败 (Host 关闭房间/断网): 这里必须 OpenLevel 抢占 SetClientTravel
+	//   - 区分依据: 当前地图是否已经是 L_Login
+	//     * 是 → 主动 Leave, 跳过 OpenLevel, 仅触发 OnInterrupted
+	//     * 否 → 网络失败, 完整三步走 (OpenLevel + RequestStateOnNextLoad + OnInterrupted)
 
 	static constexpr double CooldownSeconds = 1.0;
 	const double Now = FPlatformTime::Seconds();
@@ -1194,6 +1202,24 @@ void UGameFlowSubsystem::HandleSessionTerminated(EMatchState SuggestedState)
 		return;
 	}
 	LastNetworkFailureTimestamp = Now;
+
+	// 【v217】检测当前地图 — 已在 L_Login 上时跳过 OpenLevel
+	UWorld* World = GetWorld();
+	const FString CurrentLevel = World ? World->GetMapName() : TEXT("");
+	const bool bIsAlreadyInLobby = CurrentLevel.Contains(TEXT("L_Login"));
+
+	if (bIsAlreadyInLobby)
+	{
+		// 【v217 主动 Leave 路径】玩家点 ReturnToLobby, URoomService 已切好 UI 状态
+		// 这里仅触发 OnInterrupted 确保 UIViewService 也收到切页信号(防 bIsInInterrupted 状态错乱)
+		UE_LOG(LogGameFlow, Display,
+			TEXT("[GameFlow] 【v217】HandleSessionTerminated: 已在 L_Login 上, 跳过 OpenLevel (主动 Leave 路径)."));
+
+		// 注: URoomService::RequestLeaveRoom 已调 OnInterrupted.Broadcast(LANRoom), 这里
+		// 仍再 broadcast 一次 — UIViewService 的 bIsInInterrupted 会忽略重复(bIsInInterrupted 防重入)
+		OnInterrupted.Broadcast(EUIPanel::LANRoom);
+		return;
+	}
 
 	UE_LOG(LogGameFlow, Log,
 		TEXT("[GameFlow] HandleSessionTerminated: SuggestedState=%d, 抢先 OpenLevel + 触发 OnInterrupted(LANRoom)"),

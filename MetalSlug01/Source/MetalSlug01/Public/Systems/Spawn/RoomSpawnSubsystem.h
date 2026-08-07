@@ -119,6 +119,40 @@ public:
 	TSubclassOf<class ABaseWeapon> ResolveWeaponClassFromID(const FString& WeaponID) const;
 
 	/**
+	 * 【v209 / v212 大厂架构 — 默认武器兜底器】从 DT_WeaponInfo 取第 RowIndex 行的 RowName
+	 *
+	 * ⚠️ v212 状态: 此函数已**部分废弃** — 近战武器兜底已改用 FRoomLoadoutDefaults::MeleeDefaultRowName (JZ001)
+	 *   当前仍保留供: 主武器兜底 (玩家没存档 + DT 第 1 行 = 主武器默认)
+	 *
+	 * 业务背景 (用户 2026.08.08 / 2026.08.09):
+	 *   v209 (2026.08.08): "玩家主武器/近战武器, 在玩家没可以选择的状况下, 默认就第一把武器带入游戏"
+	 *     → RowIndex=0 (主武器默认) 保留
+	 *   v212 (2026.08.09): "玩家如果没选近战武器, 那就默认使用 DT_WeaponInfo 的 RowName=JZ001 的武器"
+	 *     → 近战武器改用 FRoomLoadoutDefaults::MeleeDefaultRowName (JZ001), 不再用 RowIndex=1
+	 *
+	 * 调用方:
+	 *   - HandlePlayerRequestSpawn: 主武器 Slot 1 为空时 → ResolveDefaultWeaponRowName(0) 兜底 (v209 保留)
+	 *   - HandlePlayerRequestSpawn: 近战武器 Slot 3 为空时 → 用 FRoomLoadoutDefaults::MeleeDefaultRowName (v212 重构)
+	 *   - UI RoomInsidePage (NativeConstruct): 主武器存档为空时 (历史兜底, 已存在)
+	 *
+	 * 大厂原则 (单一真理源 + 业务默认值 ≠ 配置兜底):
+	 *   - v209 真理源: DT_WeaponInfo 行序 (项目级, 策划改 DT 第 N 行 = 改默认武器)
+	 *   - v212 真理源: FRoomLoadoutDefaults (业务默认值显式声明, 不依赖 DT 行序)
+	 *   - 这是**业务默认** (玩家没选), 不是**配置兜底** (RowName 配错)
+	 *   - 兜底只发生在运行时 Spawn 链, **不写回 PS.SelectedWeaponID** (避免误导 UI 显示"已选")
+	 *
+	 * 不破坏 v54.3 零兜底原则:
+	 *   - v54.3 零兜底针对 "RowName 配错" (Log Error + return nullptr)
+	 *   - v209 / v212 默认兜底针对 "玩家没选武器" (Log Warning + return DT 第 N 行 / JZ001)
+	 *   - 两者场景不同, 不冲突
+	 *
+	 * @param RowIndex  DT_WeaponInfo 的行序号 (0 = 第 1 行 = 主武器默认; 1 = 已废弃, 用 FRoomLoadoutDefaults::MeleeDefaultRowName)
+	 * @return          兜底 RowName (非空); DT 为空/行数不足 → 返回空字符串
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	FString ResolveDefaultWeaponRowName(int32 RowIndex) const;
+
+	/**
 	 * 【v41 大厂架构】注入玩家角色战斗参数配置资产 (DA_PlayerConfig)
 	 *
 	 * 用途:

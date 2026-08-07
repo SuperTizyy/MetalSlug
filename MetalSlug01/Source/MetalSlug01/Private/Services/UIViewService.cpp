@@ -13,6 +13,10 @@
 #include "TimerManager.h"
 // 【修复 UE_LOG 编译错误】UEnum::GetValueAsString 在 UObject/Class.h
 #include "UObject/Class.h"
+// 【v216 大厂架构新增】结算面板 hook — 跨地图快照应用
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h"
+// 【v216】ScoreboardWidget::ApplySnapshot
+#include "UI/Game/Widgets/ScoreboardWidget.h"
 
 // ==========================================
 // Subsystem 生命周期
@@ -71,21 +75,42 @@ void UUIViewService::Initialize(FSubsystemCollectionBase& Collection)
 		//       不再添加 StateToPanelMap[EMatchState::InRoom]
 		//       RoomPC::OnFlowStateChanged(InRoom) 是唯一创建入口
 
-		// BattleHUD 面板配置 (战斗 HUD)
-		FPanelConfig BattleHUDConfig;
-		if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Game/WBP_GameHUDWidget.WBP_GameHUDWidget_C")))
-		{
-			BattleHUDConfig.WidgetClass = CLS;
-		}
+	// BattleHUD 面板配置 (战斗 HUD)
+	FPanelConfig BattleHUDConfig;
+	if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Game/WBP_GameHUDWidget.WBP_GameHUDWidget_C")))
+	{
+		BattleHUDConfig.WidgetClass = CLS;
+	}
 		BattleHUDConfig.bPreloadOnInit = false;
 		BattleHUDConfig.InputMode = EUIInputMode::GameAndUI;
 		PanelConfigs.Add(EUIPanel::BattleHUD, BattleHUDConfig);
+
+		// 【v216 大厂架构新增】结算面板配置 (跨地图, 在 L_Login 上独立显示)
+		// ==========================================
+		// 业务背景:
+		//   - 玩家在战斗地图内进入结算 → MulticastEnterSettlement 写快照 + OpenLevel(L_Login)
+		//   - 新地图加载完后 GameFlowSubsystem 切到 SettlementPage (RequestStateOnNextLoad 预约)
+		//   - UIViewService 收到 SettlementPage → 找 StateToPanelMap → ShowPanel(SettlementPanel)
+		//   - WBP_ScoreboardWidget::NativeConstruct 检测 SettlementPanel → ConsumeSnapshot → ApplySnapshot
+		//
+		// Widget 选择: WBP_ScoreboardWidget (与 BattleHUD 内的 Scoreboard 复用同一资产, v216 复用 ≠ 重复)
+		// ==========================================
+		FPanelConfig SettlementConfig;
+		if (UClass* CLS = LoadObject<UClass>(nullptr, TEXT("/Game/UI/Game/WBP_ScoreboardWidget.WBP_ScoreboardWidget_C")))
+		{
+			SettlementConfig.WidgetClass = CLS;
+		}
+		SettlementConfig.bPreloadOnInit = false;
+		SettlementConfig.InputMode = EUIInputMode::UIOnly;
+		PanelConfigs.Add(EUIPanel::SettlementPanel, SettlementConfig);
 
 		// 状态 → 面板映射
 		// 【大厂 P0 修复 2026.07.03】InRoom 不再映射到 RoomInside (由 RoomPC 接管)
 		StateToPanelMap.Add(EMatchState::Login, EUIPanel::Login);
 		StateToPanelMap.Add(EMatchState::MainMenu, EUIPanel::MainMenu);
 		StateToPanelMap.Add(EMatchState::MainLobby, EUIPanel::LANRoom);
+		// 【v216 大厂架构新增】SettlementPage → SettlementPanel (跨地图快照应用)
+		StateToPanelMap.Add(EMatchState::SettlementPage, EUIPanel::SettlementPanel);
 		// 故意不添加: InRoom → RoomInside (RoomPlayerController 负责创建)
 
 	// 订阅 GameFlow 状态变化
@@ -644,6 +669,63 @@ void UUIViewService::CreateAndShowPanel(EUIPanel Panel)
 		TEXT("[DEBUG-S4-E][CreateAndShowPanel-Show] Panel=%d Widget=%s IsInViewport=%d"),
 		(int32)Panel, *NewWidget->GetName(), NewWidget->IsInViewport() ? 1 : 0);
 	UE_LOG(LogUI, Log, TEXT("[UIViewService] 现场创建并显示面板: %d"), (int32)Panel);
+
+	// ==========================================
+	// 【v216 大厂架构新增】结算面板 hook: 应用跨地图快照
+	// ==========================================
+	// 大厂原则 — 单一真理源:
+	//   - USettlementSnapshotSubsystem (跨地图持久) 是 SettlementPanel 显示数据的唯一源头
+	//   - WBP_ScoreboardWidget::NativeConstruct 不会自动拉快照 (因为它在 L_Login 上创建,
+	//     不知道自己是 SettlementPanel 上下文)
+	//   - 必须由 UIViewService 在 ShowPanel(SettlementPanel) 时主动 ApplySnapshot
+	//
+	// 大厂原则 — 0 兜底:
+	//   - ConsumeSnapshot 返回 false → Log Error + 不静默 (让上层知道没拉到快照)
+	//   - Cast 失败 → Log Error + 仍 SetVisibility (避免 UI 永久空白)
+	// ==========================================
+	if (Panel == EUIPanel::SettlementPanel)
+	{
+		if (USettlementSnapshotSubsystem* SnapshotSub = USettlementSnapshotSubsystem::Get(this))
+		{
+			FFinalSettlementSnapshot PendingSnapshot;
+			if (SnapshotSub->ConsumeSnapshot(PendingSnapshot))
+			{
+				if (UScoreboardWidget* Scoreboard = Cast<UScoreboardWidget>(NewWidget))
+				{
+					Scoreboard->ApplySnapshot(PendingSnapshot);
+					UE_LOG(LogUI, Log,
+						TEXT("[UIViewService] 【v216】SettlementPanel: ApplySnapshot 成功. "
+						     "MatchMode=%d, AttackerEntries=%d, DefenderEntries=%d, RoundWinner=%d. "
+						     "Widget=%s"),
+						(int32)PendingSnapshot.MatchMode,
+						PendingSnapshot.AttackerEntries.Num(),
+						PendingSnapshot.DefenderEntries.Num(),
+						(int32)PendingSnapshot.RoundWinner,
+						*Scoreboard->GetName());
+				}
+				else
+				{
+					UE_LOG(LogUI, Error,
+						TEXT("[UIViewService] 【v216】SettlementPanel: Widget Cast<UScoreboardWidget> 失败 (WidgetClass=%s). "
+						     "请检查 PanelConfigs[EUIPanel::SettlementPanel].WidgetClass 是否正确绑定 WBP_ScoreboardWidget."),
+						*NewWidget->GetClass()->GetName());
+				}
+			}
+			else
+			{
+				UE_LOG(LogUI, Error,
+					TEXT("[UIViewService] 【v216】SettlementPanel: ConsumeSnapshot 失败 (没有待消费的快照). "
+					     "【v216 零兜底】调用顺序错误: 必须先 MulticastEnterSettlement → USettlementSnapshotSubsystem::WriteSnapshot, "
+					     "然后才能 ShowPanel(SettlementPanel) → ConsumeSnapshot."));
+			}
+		}
+		else
+		{
+			UE_LOG(LogUI, Error,
+				TEXT("[UIViewService] 【v216】SettlementPanel: USettlementSnapshotSubsystem 不可用. "
+				     "【v216 零兜底】修复: 检查 GameInstanceSubsystem 注册."));
+		}
+	}
 }
 
 void UUIViewService::InjectViewModelForPanel(EUIPanel Panel, UUserWidget* NewWidget)

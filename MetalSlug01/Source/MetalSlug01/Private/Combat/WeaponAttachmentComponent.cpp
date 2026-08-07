@@ -401,7 +401,10 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 	const bool bIsLocallyControlled = Owner->IsLocallyControlled();
 	const bool bIsAuthority = Owner->HasAuthority();
 
-	UE_LOG(LogTemp, Log,
+	// 【v219 大厂架构 — 可观测性升级】Log → Display, 默认在控制台和文件都可见
+	//   根因: 旧版 Log 级别, PIE / 客户端日志有时被默认 Verbosity 过滤掉, 看不见就不知道有没有触发
+	//   修复: 改为 Display, 让任何时候都能从日志看到 "Old/New/Local/Auth", 排查复制链路一目了然
+	UE_LOG(LogTemp, Display,
 		TEXT("[WeaponAttachment] OnRep_CurrentWeapon: Old=%s, New=%s, Local=%d, Auth=%d"),
 		*GetNameSafe(OldWeapon), *GetNameSafe(CurrentWeapon),
 		bIsLocallyControlled, bIsAuthority);
@@ -1525,8 +1528,11 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	//   - TargetSlot: 目标槽位
 	//   - 当前 CurrentWeaponSlot: 调用前状态 (用于对比)
 	//   - Owner Pawn 名: 用于过滤具体角色
-	UE_LOG(LogTemp, Log,
-		TEXT("[WeaponAttachment][v40.8] Server_SwitchToWeaponSlot ENTER. "
+	// 【v219 大厂架构 — 可观测性升级】Log → Display, 默认在控制台和文件都可见
+	//   根因: 旧版 Log 级别, 服务器端日志容易被默认 Verbosity 过滤, 排查 "BT 闪 / 切槽位没反应" 时看不到
+	//   修复: 改为 Display, 让任何时候都能看到 "Pawn/TargetSlot/CurrentSlot" 一目了然
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment][v219] Server_SwitchToWeaponSlot ENTER. "
 		     "Pawn=%s TargetSlot=%s 当前 CurrentWeaponSlot=%s. "
 		     "(若此调用非预期, 检查 BP 蓝图 BeginPlay / PossessedBy / InputAction 是否误触发了切槽位)"),
 		*Owner->GetName(), LexToString(TargetSlot), LexToString(CurrentWeaponSlot));
@@ -1877,7 +1883,10 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot
 		*ActiveSlotAttachment.SocketName.ToString());
 	ApplyAttachmentRuntime(WeaponState.ActiveWeapon);
 
-	UE_LOG(LogTemp, Log,
+	// 【v219 大厂架构 — 可观测性升级】Log → Display, 默认在控制台和文件都可见
+	//   根因: 旧版 Log 级别, PIE / 客户端日志有时被默认 Verbosity 过滤掉, 看不见就不知道有没有触发
+	//   修复: 改为 Display, 让任何时候都能从日志看到槽位是否变化 + 真理源 (WeaponState.ActiveWeapon)
+	UE_LOG(LogTemp, Display,
 		TEXT("[WeaponAttachment] OnRep_CurrentWeaponSlot: Pawn=%s 旧=%s 新=%s ActiveWeapon=%s"),
 		*Owner->GetName(),
 		LexToString(OldSlot),
@@ -2159,6 +2168,41 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 	{
 		W->SetActorHiddenInGame(CurrentWeaponSlot != EWeaponSlotType::Melee);
 		W->SetActorEnableCollision(ECollisionEnabled::NoCollision);
+	}
+
+	// 【v219 P0 终极修复 — Listen Server 武器 Attach】与 Server_SwitchToWeaponSlot 路径对称
+	// ============================================================
+	//
+	// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+	//   "几局客户端主武器上挂着近战武器, 但无法切换" — 玩家 Pawn 第一帧 Listen Server 武器没 Attach 到角色
+	//
+	// 根因 (大厂架构根因):
+	//   - SpawnAndConfigureWeaponInSlot 在每个武器生成后立刻 Attach 到角色 Mesh (line 2380-2430)
+	//   - 但**激活槽位的武器**还会被 OnRep_CurrentWeapon (客户端) / Server_SwitchToWeaponSlot (服务器) 重新 Attach
+	//   - OnRep_CurrentWeapon: 客户端收到 Replication → 调 ApplyAttachmentRuntime (line 1740)
+	//   - Server_SwitchToWeaponSlot: 主动 ApplyAttachmentRuntime (line 1731, v200.2.8 修复 Listen Server)
+	//
+	//   【问题路径】Server_SpawnAllWeapons 是"首次 Spawn" — 走完后直接设置 CurrentWeaponSlot/WeaponState
+	//     - 远端客户端: 之后会收到 OnRep → 走 OnRep_CurrentWeapon → ApplyAttachmentRuntime ✓
+	//     - Listen Server 自己: 写字段不会触发 OnRep → 武器没被 ApplyAttachmentRuntime (但 SpawnAndConfigureWeaponInSlot 已经 Attach 过)
+	//
+	//   【真正问题】SpawnAndConfigureWeaponInSlot 末尾 (line 2510) 有条件写 ActiveSlotAttachment:
+	//     - 只有当 "当前激活槽位 == 正在 Spawn 的 Slot" 才写 ActiveSlotAttachment
+	//     - 如果 SpawnAllWeapons 按顺序生成 Primary → Secondary → Melee, 只有 Primary 会写 ActiveSlotAttachment
+	//     - Secondary/Melee 即使生成成功也不会写 ActiveSlotAttachment (因为 Spawn 时 CurrentSlot 还是 Primary)
+	//
+	// 修复:
+	//   - 在 SpawnAllWeapons 末尾, 显式 ApplyAttachmentRuntime(SelectedDefault)
+	//   - 与 Server_SwitchToWeaponSlot 的 v200.2.8 修复对称 (Listen Server 也主动 Apply)
+	//   - OnRep_CurrentWeapon 路径仍然生效 (远端客户端走 Replication, 无副作用, ApplyAttachmentRuntime 是幂等的)
+	// ============================================================
+	if (SelectedDefault)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[WeaponAttachment][v219] Server_SpawnAllWeapons: 服务器端主动 ApplyAttachmentRuntime (Listen Server 不走 OnRep) "
+			     "— ActiveSlot=%s ActiveWeapon=%s Pawn=%s."),
+			LexToString(SelectedSlot), *SelectedDefault->GetName(), *Owner->GetName());
+		ApplyAttachmentRuntime(SelectedDefault);
 	}
 
 	UE_LOG(LogTemp, Log,
@@ -2516,9 +2560,31 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 	}
 	else
 	{
-		UE_LOG(LogTemp, Verbose,
-			TEXT("[WeaponAttachment] SpawnAndConfigureWeaponInSlot: Slot=%s 不是当前激活槽位 (=%s), 不写 ActiveSlotAttachment."),
-			LexToString(Slot), LexToString(CurrentWeaponSlot));
+		// 【v219 P0 终极修复 — 非激活槽位立即隐藏】
+		// ============================================================
+		//
+		// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+		//   "客户端主武器上挂着近战武器, 但无法切换" — Spawn 阶段非激活槽位武器立即可见
+		//
+		// 根因 (大厂架构根因):
+		//   - SpawnAndConfigureWeaponInSlot 末尾有条件写 ActiveSlotAttachment (只有 Slot == CurrentWeaponSlot 才写)
+		//   - "非激活槽位"分支只 Verbose Log, **没 SetActorHiddenInGame(true)**
+		//   - 武器 Attach 到角色 Mesh 后立即可见 → 玩家看到"主武器上还挂着副武器/近战武器"
+		//   - Server_SpawnAllWeapons 末尾 (line 2160) 会统一 SetActorHiddenInGame, 但:
+		//     - 客户端走 OnRep_CurrentWeapon (可能延迟 N 帧) 才看到隐藏状态
+		//     - Listen Server 写字段不触发 OnRep, 靠自己看
+		//
+		// 修复:
+		//   - 这里立刻 SetActorHiddenInGame(true), SpawnAllWeapons 末尾逻辑保留 (双保险)
+		//   - SetActorEnableCollision(NoCollision) 也立即应用 (与 v77 P0 修复对称)
+		//   - 与 Server_SpawnAllWeapons 末尾的逻辑**互不冲突** (都设 Hidden=true), 幂等
+		// ============================================================
+		NewWeapon->SetActorHiddenInGame(true);
+		NewWeapon->SetActorEnableCollision(ECollisionEnabled::NoCollision);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[WeaponAttachment][v219] SpawnAndConfigureWeaponInSlot: 非激活槽位立即隐藏 — Slot=%s (CurrentSlot=%s) Weapon=%s Pawn=%s"),
+			LexToString(Slot), LexToString(CurrentWeaponSlot), *NewWeapon->GetName(), *Owner->GetName());
 	}
 
 	return NewWeapon;

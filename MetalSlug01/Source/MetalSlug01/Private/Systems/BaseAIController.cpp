@@ -49,6 +49,8 @@
 #include "Systems/RoomGameMode.h"
 // 【v208 重构】不再需要 RoomGameState.h — AddTeamKill 已上移到 PerformKillSettlement 集中调度
 // #include "Systems/RoomGameState.h"  // 【v202.1】旧版需要 AddTeamKill 完整类型
+// 【v209】新增加入 RoomGameState 用于结算状态检测
+#include "Systems/RoomGameState.h"
 // 【v120 重构】AI 复活无敌期从 PlayerConfigAsset 读取 (玩家/AI 共用)
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Data/Config/PlayerConfigAsset.h"
@@ -72,6 +74,9 @@
 #include "Systems/Targeting/RoomTargetingSubsystem.h"
 // 【v202.0 大厂架构】网络复制支持 (ReplicatedUsing 字段)
 #include "Net/UnrealNetwork.h"
+
+// 【v215 大厂架构新增】URoomStateService — 用于 AI 计分板数据 OnRep 时主动通知 View
+#include "Services/RoomStateService.h"
 
 // 定义本文件的静态日志分类，所有 UE_LOG 使用此分类输出，方便在日志中过滤
 DEFINE_LOG_CATEGORY_STATIC(LogBaseAI, Log, All);
@@ -149,6 +154,23 @@ void ABaseAIController::Tick(float DeltaSeconds)
 {
 	// 调用父类 Tick，确保引擎基类的帧更新逻辑正常执行
 	Super::Tick(DeltaSeconds);
+
+	// 【v209/v210 大厂架构重构】结算状态守卫
+	// v210 重构: 改用 ABaseCharacter::IsInSettlement() 单一真理源 (替代 v209 重复的 3 层 if)
+	// 大厂原则 — DRY: 严禁在多处复制 `if (RoomGS->bInSettlement) return;`
+	if (ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(GetPawn()))
+	{
+		if (OwnerChar->IsInSettlement())
+		{
+			// 结算状态，停止 AI 移动 + 清空感知
+			if (UAIPerceptionComponent* Perception = GetAIPerceptionComponent())
+			{
+				Perception->SetDominantSense(NULL); // 清空感知，不触发新目标
+			}
+			StopMovement();
+			return;
+		}
+	}
 
 	// 【P0 2026.07.08 大厂架构重构 — BT 100% 接管】
 	// 历史: 原 TickChaseFallback (C++) + UpdateNearbyThreatByDistance (C++) 共同实现"距离决策+追玩家"
@@ -430,7 +452,8 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 			{
 				// RuntimeConfig 为空: 关卡预放 AI 在 SetupMeleeAI 调用之前触发 OnPossess
 				// SetupMeleeAI 末尾会重新设 WalkSpeed, 这里只做防御性 0 值覆盖
-				UE_LOG(LogBaseAI, Warning,
+				// 【v201.10.2 降级】Display 级别 — Warning 触发 UI 弹窗
+				UE_LOG(LogBaseAI, Display,
 					TEXT("[%s] OnPossess: RuntimeConfig 为空, 速度将在 SetupMeleeAI 末尾初始化"),
 					*GetName());
 				Move->MaxWalkSpeed = 0.f;
@@ -577,6 +600,15 @@ void ABaseAIController::OnRep_AIScoreboardData()
 		*GetName(), AIScore, AIKills, AIDeaths, AIAssists);
 
 	OnAIScoreboardDataChanged.Broadcast();
+
+	// 【v215 大厂架构新增】主动通知 RoomStateService 转发给 View
+	//   - 大厂原则 — 单一事件出口: AIC 自己最知道"分数变了"
+	//   - 替代旧版 0.5s Tick 拉取 (延迟高 + 浪费 CPU)
+	//   - 0 兜底: World 未初始化时 Get() 返回 nullptr, 不静默跳过 (RoomStateService 内部 Log Error)
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
+	}
 }
 
 // v202.0 P0: AI 击杀得分 (服务器专用, 镜像 ARoomPlayerState::AddKillScore)
@@ -626,6 +658,12 @@ void ABaseAIController::AddKillScore()
 		OnAIScoreboardDataChanged.Broadcast();
 	}
 
+	// 【v215 大厂架构新增】通知 RoomStateService 转发事件 (ListenServer 本地 UI 立即刷新)
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
+	}
+
 	UE_LOG(LogBaseAI, Verbose,
 		TEXT("[BaseAIController] AddKillScore: AI='%s' NewAIScore=%d NewAIKills=%d (Replicated 字段已修改, 引擎自动同步)"),
 		*GetName(), AIScore, AIKills);
@@ -649,6 +687,12 @@ void ABaseAIController::AddAssistScore()
 		OnAIScoreboardDataChanged.Broadcast();
 	}
 
+	// 【v215 大厂架构新增】通知 RoomStateService 转发事件
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
+	}
+
 	UE_LOG(LogBaseAI, Verbose,
 		TEXT("[BaseAIController] AddAssistScore: AI='%s' NewAIScore=%d NewAIAssists=%d"),
 		*GetName(), AIScore, AIAssists);
@@ -669,6 +713,12 @@ void ABaseAIController::AddDeath()
 	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
 	{
 		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	// 【v215 大厂架构新增】通知 RoomStateService 转发事件
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
 	}
 
 	UE_LOG(LogBaseAI, Verbose,
@@ -695,6 +745,12 @@ void ABaseAIController::ResetScoreboardStats()
 	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
 	{
 		OnAIScoreboardDataChanged.Broadcast();
+	}
+
+	// 【v215 大厂架构新增】通知 RoomStateService 转发事件
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
 	}
 
 	UE_LOG(LogBaseAI, Log,
@@ -880,7 +936,8 @@ void ABaseAIController::InitializeFromConfig(UAIBehaviorConfigSO* InConfig, UBeh
 // OnConfigLoaded：Config 已 Apply 后调用, 用于启动行为树和配置感知
 void ABaseAIController::OnConfigLoaded()
 {
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> OnConfigLoaded ENTERED (RuntimeConfig=%s GetConfig=%s)"),
+	// 【v201.10.2 降级】Display 级别 — Warning 触发 UI 弹窗
+	UE_LOG(LogBaseAI, Display, TEXT("[%s] >>> OnConfigLoaded ENTERED (RuntimeConfig=%s GetConfig=%s)"),
 		*GetName(),
 		*GetNameSafe(RuntimeConfig),
 		*GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr));
@@ -888,7 +945,7 @@ void ABaseAIController::OnConfigLoaded()
 	// 检查必要组件
 	if (!RuntimeConfig || !RuntimeConfig->GetConfig())
 	{
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] OnConfigLoaded: missing components, fallback RunLegacy"), *GetName());
+		UE_LOG(LogBaseAI, Error, TEXT("[%s] OnConfigLoaded: missing components (RuntimeConfig 或 GetConfig 为空), fallback RunLegacy"), *GetName());
 		RunLegacyBehaviorTree();
 		return;
 	}
@@ -1067,13 +1124,13 @@ void ABaseAIController::ConfigurePerceptionFromConfig()
 void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 {
 	// 0. 防御: GameMode 可能 nullptr (PIE 启动早期), 退化路径 = 立即启动 (原行为)
-	// 【P0 2026.07.08 调试用】Warning 级别 log
+	// 【P0 2026.07.08 调试用】Verbose 级别 log (v201.10.2 降级 — Warning 触发 UI 弹窗)
 	AGameModeBase* GMBase = UGameplayStatics::GetGameMode(this);
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> TryStartBehaviorTreeOrWaitForBattleStart ENTERED (GMBase=%s)"),
+	UE_LOG(LogBaseAI, Verbose, TEXT("[%s] >>> TryStartBehaviorTreeOrWaitForBattleStart ENTERED (GMBase=%s)"),
 		*GetName(), *GetNameSafe(GMBase));
 	if (!GMBase)
 	{
-		UE_LOG(LogBaseAI, Warning,
+		UE_LOG(LogBaseAI, Verbose,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: GameMode 为空, 立即启动 BT (原行为)"),
 			*GetName());
 		StartBehaviorTreeFromConfigInternal();
@@ -1095,12 +1152,12 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 	// 2. 检查 RoomGM 是否已经广播过 OnBattleStarted (战斗已开始)
 	//    - 是 → 立即启动 BT (AI 在战斗开始后才出生的情况)
 	//    - 否 → 订阅事件, 等待回调
-	// 【P0 2026.07.08 调试用】Warning 级别 log
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: RoomGM=%s bBattleStartedBroadcasted=%d"),
+	// 【P0 2026.07.08 调试用】Verbose 级别 log (v201.10.2 降级)
+	UE_LOG(LogBaseAI, Verbose, TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: RoomGM=%s bBattleStartedBroadcasted=%d"),
 		*GetName(), *GetNameSafe(RoomGM), RoomGM->bBattleStartedBroadcasted ? 1 : 0);
 	if (RoomGM->bBattleStartedBroadcasted)
 	{
-		UE_LOG(LogBaseAI, Warning,
+		UE_LOG(LogBaseAI, Verbose,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: GameMode 已 BattleInProgress, 立即启动 BT"),
 			*GetName());
 		StartBehaviorTreeFromConfigInternal();
@@ -1123,7 +1180,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 		// 【v113 修复】订阅前检查：如果战斗已开始（CurrentRoomState），直接启动 BT
 		if (RoomGM->CurrentRoomState == ERoomState::BattleInProgress)
 		{
-			UE_LOG(LogBaseAI, Warning,
+			UE_LOG(LogBaseAI, Display,
 				TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: 【v113修复】CurrentRoomState=InProgress，跳过订阅直接启动 BT"),
 				*GetName());
 			StartBehaviorTreeFromConfigInternal();
@@ -1152,7 +1209,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 				}
 			});
 
-		UE_LOG(LogBaseAI, Warning,
+		UE_LOG(LogBaseAI, Display,
 			TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: 已订阅 OnBattleStarted, 等待战斗开始"),
 			*GetName());
 	}
@@ -1169,7 +1226,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 			{
 				// 复活路径：Handle 已存在，但战斗已开始，需要立即启动 BT
 				// 旧代码缺陷：只检查 Handle 是否存在，存在就跳过，导致复活后 AI 不动
-				UE_LOG(LogBaseAI, Warning,
+				UE_LOG(LogBaseAI, Display,
 					TEXT("[%s] TryStartBehaviorTreeOrWaitForBattleStart: Handle 已存在但战斗已开始，复活路径立即启动 BT"),
 					*GetName());
 				StartBehaviorTreeFromConfigInternal();
@@ -1201,7 +1258,7 @@ void ABaseAIController::TryStartBehaviorTreeOrWaitForBattleStart()
 //   - BT 重启 vs BB 清空: 顺序必须先停 BT 再清 BB, 否则 BT 还在跑会读到清空的 BB Key 报错
 void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
 {
-	UE_LOG(LogBaseAI, Warning,
+	UE_LOG(LogBaseAI, Display,
 		TEXT("[%s] 【v201.10】RestartBehaviorTreeAndClearBlackboard ENTER: "
 			 "重启 BT + 清空 Blackboard (小局开始时使用)."),
 		*GetName());
@@ -1211,14 +1268,14 @@ void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
 	{
 		if (BTComp->IsRunning())
 		{
-			UE_LOG(LogBaseAI, Log,
+			UE_LOG(LogBaseAI, Verbose,
 				TEXT("[%s] 【v201.10】停 BT (Running=1)."), *GetName());
 			BTComp->StopTree(EBTStopMode::Safe);
 		}
 	}
 	else
 	{
-		UE_LOG(LogBaseAI, Warning,
+		UE_LOG(LogBaseAI, Display,
 			TEXT("[%s] 【v201.10】BrainComponent 不是 BehaviorTreeComponent (Class=%s). "
 				 "跳过停 BT 步骤, 但仍尝试清空 BB."),
 			*GetName(), BrainComponent ? *BrainComponent->GetClass()->GetName() : TEXT("null"));
@@ -1245,7 +1302,7 @@ void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
 	}
 	else
 	{
-		UE_LOG(LogBaseAI, Warning,
+		UE_LOG(LogBaseAI, Error,
 			TEXT("[%s] 【v201.10.1】BlackboardComponent 为空! "
 				 "无法清空 Key — BT Service 重启后会用上一次的值. "
 				 "【修复】检查 AIC 初始化时 UseBlackboard 是否成功."),
@@ -1254,7 +1311,7 @@ void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
 
 	// Step 3: 重启 BT (走 TryStartBehaviorTreeOrWaitForBattleStart 自动判断是否需要等 OnBattleStarted)
 	TryStartBehaviorTreeOrWaitForBattleStart();
-	UE_LOG(LogBaseAI, Warning,
+	UE_LOG(LogBaseAI, Display,
 		TEXT("[%s] 【v201.10】RestartBehaviorTreeAndClearBlackboard DONE: BT 已重启, BB 已清空, "
 			 "BT Service 0.1s 后重新派生 (清空立即生效, 派生延迟极短)."),
 		*GetName());
@@ -1263,20 +1320,20 @@ void ABaseAIController::RestartBehaviorTreeAndClearBlackboard()
 // StartBehaviorTreeFromConfigInternal：从 Profile 启动行为树，加载行为树资源并运行
 void ABaseAIController::StartBehaviorTreeFromConfigInternal()
 {
-	// 【P0 2026.07.08 调试用】Warning 级别 log, 强制显示
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] >>> StartBehaviorTreeFromConfigInternal ENTERED (RuntimeConfig=%s GetConfig=%s)"),
+	// 【P0 2026.07.08 调试用】Display 级别 log (v201.10.2 降级 — Warning 触发 UI 弹窗)
+	UE_LOG(LogBaseAI, Display, TEXT("[%s] >>> StartBehaviorTreeFromConfigInternal ENTERED (RuntimeConfig=%s GetConfig=%s)"),
 		*GetName(),
 		*GetNameSafe(RuntimeConfig),
 		*GetNameSafe(RuntimeConfig ? RuntimeConfig->GetConfig() : nullptr));
 
 	// 输出日志，提示进入函数
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromConfigInternal: enter"), *GetName());
+	UE_LOG(LogBaseAI, Display, TEXT("[%s] StartBehaviorTreeFromConfigInternal: enter"), *GetName());
 
 	// 检查运行时配置和配置资产是否有效
 	if (!RuntimeConfig || !RuntimeConfig->GetConfig())
 	{
 		// 如果配置无效，输出警告并返回
-		UE_LOG(LogBaseAI, Warning, TEXT("[%s] StartBehaviorTreeFromConfigInternal: no config"), *GetName());
+		UE_LOG(LogBaseAI, Error, TEXT("[%s] StartBehaviorTreeFromConfigInternal: no config (RuntimeConfig 或 GetConfig 为空)"), *GetName());
 		return;
 	}
 
@@ -1354,8 +1411,8 @@ void ABaseAIController::StartBehaviorTreeFromConfigInternal()
 	RunBehaviorTree(BT);
 	// 标记行为树已启动，避免重复启动
 	bBehaviorTreeStarted = true;
-	// 输出日志，记录行为树启动状态和黑板信息
-	UE_LOG(LogBaseAI, Warning, TEXT("[%s] RunBehaviorTree called, BB=%s BBAsset=%s"),
+	// 输出日志，记录行为树启动状态和黑板信息 (v201.10.2 降级 — Warning 触发 UI 弹窗)
+	UE_LOG(LogBaseAI, Display, TEXT("[%s] RunBehaviorTree called, BB=%s BBAsset=%s"),
 		*GetName(),
 		*GetNameSafe(GetBlackboardComponent()),
 		*GetNameSafe(BT->GetBlackboardAsset()));
@@ -1488,7 +1545,8 @@ void ABaseAIController::DiagnoseAndLogBootStatus() const
 	//       这里仅作为可观测性提示, 不当作 Error
 	if (TeamIdInt == 0)
 	{
-		UE_LOG(LogBaseAI, Warning,
+		// 【v201.10.2 降级】Display 级别 — Warning 触发 UI 弹窗 (TeamID=0 是预期配置, 非错误)
+		UE_LOG(LogBaseAI, Display,
 			TEXT("Diagnose: [%s] TeamID=0 = Offense 阵营 (攻方). 验证: 是否与 ModeRulesByMode[Mode].AttackTeamFaction 一致"),
 			*MyName);
 	}
@@ -1544,7 +1602,8 @@ float ABaseAIController::GetEffectiveAttackInterval() const
 	}
 
 	// 兜底 (RuntimeConfig 缺失时): 5.0s
-	UE_LOG(LogBaseAI, Warning,
+	// 【v201.10.2 降级】Error 级别 (真正异常, 不频繁 — 仅配置缺失时一次)
+	UE_LOG(LogBaseAI, Error,
 		TEXT("[%s] GetEffectiveAttackInterval: RuntimeConfig 缺失, 返回兜底 5s. 修复: 检查 RuntimeConfig 是否挂在 AIController"),
 		*GetName());
 	return 5.f;

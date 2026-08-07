@@ -471,11 +471,30 @@ bool URoomLifecycleSubsystem::FinishZombieRound()
 	RoomGS->AddRoundWinToFaction(WinnerFaction);
 
 	// 步骤 4: 广播音效 (新增 MulticastPlayZombieRoundSound — 由 GameHUDWidget 订阅)
-	//   - 大厂原则 — 零重复架构: 不重用 OnEnterSettlement RPC (它会隐藏 UI)
-	//   - 单独建一条 RPC 链路, 专用于"小局结束音效", 客户端 OnRep 查 GameMode 音效表 + 播放
-	//   - 因为 UObject* 不能跨 RPC (UE 5.6), 仅传枚举 + FactionTag, 客户端查 USoundBase*
-	RoomGS->MulticastPlayZombieRoundSound(NewWinner);
-	//   - 已绑定: UGameHUDWidget::OnZombieRoundSoundReceived (Multicast RPC 触发 → 查 GameMode 音效 + 播放)
+	//   - 大厂原则 — RPC 纯数据: 不重用 OnEnterSettlement RPC (它会隐藏 UI)
+	//   - 单独建一条 RPC 链路, 专用于"小局结束音效"
+	//   - 【v210.4 大厂架构重构】服务器从 GM 配置 (唯一真理源) 拿 USoundBase*, 转 FSoftObjectPath
+	//     → 服务器不缓存音效到 GS, InitGameState 不参与 (避免 4 处 early-return 跳过)
+	//     → 客户端 Implementation LoadSynchronous 加载 + PlaySound2D
+	{
+		// 【v210.4 大厂架构重构】复用外层 World (避免 C4456 声明隐藏)
+		//   - 服务器从 GM 配置 (唯一真理源) 拿 USoundBase*, 转 FSoftObjectPath
+		//   → 服务器不缓存音效到 GS, InitGameState 不参与 (避免 4 处 early-return 跳过)
+		//   → 客户端 Implementation LoadSynchronous 加载 + PlaySound2D
+		ARoomGameMode* GM = World->GetAuthGameMode<ARoomGameMode>();
+		USoundBase* SelectedSound = nullptr;
+		if (GM)
+		{
+			SelectedSound = (NewWinner == EZombieRoundWinner::Human)
+				? GM->ZombieHumanWinSound
+				: GM->ZombieMotherWinSound;
+		}
+		const FSoftObjectPath SoundPath = SelectedSound
+			? FSoftObjectPath(SelectedSound)
+			: FSoftObjectPath();
+		RoomGS->MulticastPlayZombieRoundSound(NewWinner, SoundPath);
+		//   - 已绑定: UGameHUDWidget::OnZombieRoundSoundReceived (Multicast RPC 触发 → 客户端 Implementation 加载并播放)
+	}
 
 	// 【v201 大厂架构修复】只有最后一局才进入结算页面
 	//   - 非最后一局: 短暂显示胜负文本 (3秒), 然后延迟开始下一小局
@@ -484,6 +503,7 @@ bool URoomLifecycleSubsystem::FinishZombieRound()
 	{
 		// 最后一局: 广播进入结算页面
 		RoomGS->MulticastEnterSettlement(RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills, NewWinner);
+		// 2026.08.08 调回 3s
 		RoomGS->ScheduleFinalSettlement(3.0f);
 	}
 	else

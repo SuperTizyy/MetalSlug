@@ -1,37 +1,69 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 【v202.0 大厂架构重构 — ScoreboardWidget】
+// 【v215 大厂架构重构 — ScoreboardWidget 终极版】
 // ==========================================
 //
-// 用户反馈 (2026.08.07):
-//   "WBP_ScoreboardWidget 需要显示 AI 信息, 走 RPC 链路, 不能有兜底"
+// 用户反馈 (2026.08.07) 三个 bug + 终极方案:
+//   Bug #1: WBP_ScoreboardEntryWidget 一闪一闪
+//   Bug #2: 房主点 ReturnToLobby, 强制所有客户端退出结算页
+//   Bug #3: 客户端结算页面不显示 AI 玩家信息
 //
-// 修复前 (v22-v201.x) 重复架构清单:
-//   1. 直接遍历 GS->PlayerArray → 永远不读 AI (用户报告)
-//   2. OnPlayerScoreChanged 死代码 (从来没人订阅)
-//   3. AddKillScore/AddAssistScore/AddDeath 3 处冗余服务器手动 Broadcast
-//   4. 数据源分裂: AI 没有 PlayerState → 计数永远没累加
-//   5. AIC 没有 bReplicates / 没有 Replicated 字段 → 客户端不可能读到 AI 计数
+// 终极修复 (大厂架构 v215):
 //
-// 修复后 (v202.0) 单一真理源:
-//   - View 数据源 = URoomStateService::GetFactionSnapshotsWithAI (CQRS 读取端)
-//   - 真人字段: ARoomPlayerState::RoomKills/RoomDeaths/RoomAssists/RoomScore (已有 Replicated)
-//   - AI 字段:   ABaseAIController::AIKills/AIDeaths/AIAssists/AIScore (本次新增 Replicated)
-//   - RPC 链路: ReplicatedUsing → 引擎自动 Replicate → 客户端 OnRep → UI 主动 Refresh
-//   - 同一 Snapshot 结构, 不同真理源 → 排序/排名/显示逻辑完全统一
+//   [事件流]  URoomStateService.OnPlayerSnapshotsChanged
+//                ↓ (Multicast Dynamic Delegate)
+//          UScoreboardWidget.HandlePlayerSnapshotsChanged
+//                ↓
+//          RefreshScoreboard (增量更新, 0 闪烁)
+//
+//   [冻结快照]  ShowFinalResult()  →  FreezeSnapshot()
+//                ↓ 一次性拉 URoomStateService → FrozenSnapshots
+//             后续刷新只读 FrozenSnapshots, 与房间连接完全解耦
+//
+//   [Tick 兜底] 5s 周期检查 (弱兜底, 不是主路径)
+//
+//   [Bug #2 修复] 不在 ScoreboardWidget 改 — 修复在 ARoomPlayerController::LeaveRoom()
+//                  房主退出时不再调 Client_ForceLeaveRoom, 各客户端独立
+//
+//   [0 兜底原则]
+//   - URoomStateService 拿不到 → Log Error + return, 不静默
+//   - Snapshot.PlayerName 为空 → Log Error + return, 不创建
+//   - Snapshot.FactionTag 无效 → Log Error + return, 不静默归类
+//   - ScoreboardEntryWidgetClass 未配 → Log Error + return, 不静默
+//   - FrozenSnapshot 时 URoomStateService 拿不到 → Log Error + 保留旧快照 + return
+//
+//   [增量更新原则] — 修复 Bug #1 闪烁
+//   - 永远不 ClearChildren()
+//   - 已存在的 entry 调 SetScore/SetKDA 更新, 不重建
+//   - 排名变化用 RemoveChild/InsertChild 增量重排
+//   - 已退出的玩家在 CachedLiveSnapshots 里查不到 → RemoveEntryById
 
 #include "UI/Game/Widgets/ScoreboardWidget.h"
 #include "UI/Game/Widgets/SubWidgets/ScoreboardEntryWidget.h"
 #include "Components/VerticalBox.h"
 #include "Components/TextBlock.h"
+// 【v216 大厂架构新增】Border + Button 绑定 (从 GameHUDWidget 迁移)
+#include "Components/Border.h"
+#include "Components/Button.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/PlayerController.h"
-// 【v202.1 修复】补完整类型 — GetLocalPlayerName 用 APlayerState, ShowRoundSettlement/ShowFinalResult 用 ARoomGameState
 #include "GameFramework/PlayerState.h"
 #include "Systems/RoomGameState.h"
 #include "Services/RoomStateService.h"
 #include "Data/Faction/FactionTags.h"
+// 【v216 大厂架构新增】结算快照子系统 (跨地图持久) + v216.2 重构后不再需要 RPC
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h"
+// 【v216.2 大厂架构重构】去除 RPC 链路, 客户端直接调 UGameFlowSubsystem
+//   - UGameFlowSubsystem 是 UGameInstanceSubsystem, 跨地图持久
+//   - 客户端本地操作即可, 无需服务器往返
+//   - 旧 RPC (Server_SettlementReturnToLobby / Client_OpenLobbyFromSettlement) 已全部删除 (RoomPlayerController.h)
+#include "Systems/GameFlowSubsystem.h"
+#include "Engine/GameInstance.h"
+#include "Enums/CoreEnums.h"
+#include "Engine/LocalPlayer.h"
+// 【v217 大厂架构 — 单一入口】调 URoomService::RequestLeaveRoom 销毁 Session + 切 UI 状态
+#include "Services/RoomService.h"
 
 // ==========================================
 // 【v203.0 大厂架构 — 阵营名映射 namespace】
@@ -152,9 +184,32 @@ bool UScoreboardWidget::Initialize()
 		return false;
 	}
 
+	// 【v216 大厂架构新增】Border/Button 初始化 (从 GameHUDWidget 迁移)
+	// 大厂原则 — BindWidget 失败必须 Log Error:
+	//   - Border_SettlementOverlay 未绑定 → 用户没在 BP 蓝图侧加 → 报错让用户修
+	//   - Button_ReturnToLobby 未绑定 → 同上
+	//
+	// 注: Initialize() 时 Widget 树还没构造完成, 此时访问 Border->GetChildrenCount 等是合法的
+	//     但 OnClicked.AddDynamic 在 Initialize() 调用过早就失效 (Widget tree 未挂载)
+	//     所以 OnClicked 绑定放在 NativeConstruct (Widget 树挂载后)
+
 	return true;
 }
 
+// ==========================================
+// 【v215 大厂架构重构 — NativeConstruct 事件订阅】
+// ==========================================
+// 大厂原则 — 事件优先于 Tick:
+//   历史 (v22-v213): 只靠 NativeTick 0.5s 拉取 (高 CPU 开销 + 闪烁)
+//   新 (v215):
+//     * 订阅 URoomStateService::OnPlayerSnapshotsChanged
+//     * 事件触发时 RefreshScoreboard (增量更新)
+//     * Tick 降级为 5s 弱兜底
+//
+// 【v215 Bug #3 修复】客户端显示 AI 信息:
+//   客户端早期 Tab 打开时可能错过早期 OnRep → 事件订阅保证不丢
+//
+// 【0 兜底】URoomStateService 拿不到 → Log Error, 不静默 (Tick 兜底会兜住)
 void UScoreboardWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
@@ -164,221 +219,459 @@ void UScoreboardWidget::NativeConstruct()
 	{
 		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Collapsed);
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] NativeConstruct: Text_Settlement_AttackerKills 未绑定 (BindWidget)!"));
+	}
 
 	if (Text_Settlement_DefenderKills)
 	{
 		Text_Settlement_DefenderKills->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] NativeConstruct: Text_Settlement_DefenderKills 未绑定 (BindWidget)!"));
 	}
 
 	if (Text_AttackerWinResult)
 	{
 		Text_AttackerWinResult->SetVisibility(ESlateVisibility::Collapsed);
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] NativeConstruct: Text_AttackerWinResult 未绑定 (BindWidget)!"));
+	}
 
 	if (Text_DefenderWinResult)
 	{
 		Text_DefenderWinResult->SetVisibility(ESlateVisibility::Collapsed);
 	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] NativeConstruct: Text_DefenderWinResult 未绑定 (BindWidget)!"));
+	}
 
-	// 【v202.0 大厂架构】延迟刷新: 等待服务器数据同步完成
-	// 大厂原则: 不再需要双 Refresh 路径 (旧版 0.5s timer 是为了 PS 同步延迟)
-	//   现在走快照路径, URoomStateService 内部处理 GS/GM 不存在的边界 case
-	FTimerHandle RefreshTimer;
-	GetWorld()->GetTimerManager().SetTimer(RefreshTimer, this, &UScoreboardWidget::RefreshScoreboard, 0.5f, false);
-
-	// 【v203.0 大厂架构新增】初始化模式缓存 + 阵营标题
-	//   - CachedMatchMode 来自 GS->CurrentMatchMode (Replicated)
-	//   - 模式缓存后, 后续 RefreshTeamTitles / ShowRoundSettlement / ShowFinalResult 直接读
-	//   - 不允许在多处各自查 GS, 单一真理源 = CachedMatchMode
+	// 【v215 大厂架构新增】初始化模式缓存 + 阵营标题
 	RefreshCachedMatchMode();
 	RefreshTeamTitles();
+
+	// 【v215 大厂架构新增】订阅 URoomStateService 事件
+	SubscribeScoreboardEvents();
+
+	// 【v215 大厂架构新增】初次拉取 (NativeConstruct 时拿一次, 避免等到第一次事件触发才显示)
+	RefreshScoreboard();
+
+	// 【v216 大厂架构新增】初始化 Border_SettlementOverlay + Button_ReturnToLobby
+	// 大厂原则 — BindWidget 失败 Log Error:
+	//   - 用户已手动在 WBP_ScoreboardWidget 加了这两个控件
+	//   - 如果没绑上, 说明 BP 重命名/删除了 → Log Error 强制修
+	if (Border_SettlementOverlay)
+	{
+		// 默认隐藏, 等 ApplySnapshot 拉快照后再显示
+		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] NativeConstruct: Border_SettlementOverlay 未绑定 (BindWidget)! "
+			     "请检查 WBP_ScoreboardWidget 蓝图是否添加了同名 Border 子控件, "
+			     "【v216 大厂架构】结算覆盖板已从 WBP_GameHUDWidget 迁移到此 Widget."));
+	}
+
+	if (Button_ReturnToLobby)
+	{
+		// 默认隐藏
+		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Collapsed);
+		// 绑定 OnClicked → OnReturnToLobbyClicked (客户端本地调 GameFlowSubsystem)
+		Button_ReturnToLobby->OnClicked.AddDynamic(this, &UScoreboardWidget::OnReturnToLobbyClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] NativeConstruct: Button_ReturnToLobby 未绑定 (BindWidget)! "
+			     "请检查 WBP_ScoreboardWidget 蓝图是否添加了同名 Button 子控件, "
+			     "【v216 大厂架构】返回大厅按钮已从 WBP_GameHUDWidget 迁移到此 Widget."));
+	}
 }
 
 // ==========================================
-// 【v202.0 大厂架构 — Tick 兜底轮询】
+// 【v215 大厂架构新增 — NativeDestruct 解绑】
+// 大厂原则 — 必须配对, 否则野指针:
+void UScoreboardWidget::NativeDestruct()
+{
+	// 【v216 大厂架构新增】解除 Button OnClicked 绑定
+	// 大厂原则 — 防野指针: Widget 销毁后 Button 还能回调到, 引发崩溃
+	if (Button_ReturnToLobby)
+	{
+		Button_ReturnToLobby->OnClicked.RemoveDynamic(this, &UScoreboardWidget::OnReturnToLobbyClicked);
+	}
+
+	UnsubscribeScoreboardEvents();
+	Super::NativeDestruct();
+}
+
 // ==========================================
-// 大厂原则 — 事件 + 拉取 双轨制 (镜像 GameHUDWidget::TickInvincibilityWatchdog):
-//   - 事件流: 用户主动 ShowScoreboard → RefreshScoreboard (及时)
-//   - 拉取流: 0.5s 周期主动拉快照, 兜底事件流丢失 (AI 数据可能错过 OnRep)
+// 【v215 大厂架构重构 — Tick 弱兜底 5s】
+// ==========================================
+// 大厂原则:
+//   - 主要刷新靠 OnPlayerSnapshotsChanged 事件
+//   - Tick 只用于兜底事件丢失 (5s 周期)
+//   - 修复闪烁: 不再 0.5s 高频拉取 (历史罪魁祸首)
 //
-// 性能影响:
-//   - 只在 widget 可见时执行 (Visibility 检查)
-//   - 0.5s 间隔 = 2Hz, 完全不影响性能 (单 URoomStateService::GetXxx 调用)
-//
-// 零重复架构:
-//   - 不订阅 PlayerState / AIC 的 OnRep 委托 (那种方案会导致 N 个订阅点)
-//   - 单点拉取: 快照已经聚合真人 + AI, 一次调用拿到全部
+// 【v217 大厂架构重构 — 冻结后跳过 Tick 兜底刷新】
+// 大厂原则 — 单一真理源 + 0 兜底:
+//   - 旧 (v215-v216): 5s TickFallback 无条件调 RefreshScoreboard
+//     → 冻结后 RefreshScoreboard 走 FrozenSnapshots → 内容虽然不变, 但每 5 秒做一次增量更新(增删改排序)
+//     → 用户感知: 排名列表"似乎"在抖动 (虽然内容相同, 但 entry 被反复 RemoveChild/InsertChild 触发重绘)
+//     → 用户报告: "结算页面的玩家排名列表,过一会就自动变化一下顺序"
+//   - 新 (v217): bIsFrozen=true 时 NativeTick 直接 return
+//     → 冻结后整个 Widget 完全静止, 不再有任何代码路径触发重新刷新
+//     → 等用户点击返回大厅 (UScoreboardWidget::OnReturnToLobbyClicked) → TransitToState(MainLobby)
+//     → UIViewService 关闭本 Widget,NativeTick 不再执行
+//     → 重新进入游戏后 (新地图加载) bIsFrozen=false, TickFallback 自动恢复
 void UScoreboardWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
 
-	// 大厂原则 — 性能优化: 只在 widget 可见时刷新 (隐藏时不浪费 CPU)
+	// 【v217 大厂架构重构】冻结后整个 Widget 完全静止
+	if (bIsFrozen)
+	{
+		return;
+	}
+
+	// 性能优化: 隐藏时不刷新
 	if (GetVisibility() == ESlateVisibility::Hidden ||
 	    GetVisibility() == ESlateVisibility::Collapsed)
 	{
 		return;
 	}
 
-	// 节流: 0.5s 拉一次
-	static float AccumulatedTime = 0.0f;
-	AccumulatedTime += InDeltaTime;
-	if (AccumulatedTime < 0.5f)
+	TickFallbackAccumulator += InDeltaTime;
+	if (TickFallbackAccumulator < 5.0f)
 	{
 		return;
 	}
-	AccumulatedTime = 0.0f;
+	TickFallbackAccumulator = 0.0f;
 
 	RefreshScoreboard();
 }
 
 // ==========================================
-// 1. 公共接口
+// 【v215 大厂架构新增 — 事件订阅 / 解绑】
 // ==========================================
-
-void UScoreboardWidget::RefreshScoreboard()
-{
-	// 清空现有数据
-	ClearScoreboard();
-
-	// 从 RoomStateService 获取最新数据 (真人 + AI 单一真理源)
-	RefreshFromRoomStateService();
-}
-
-/**
- * 【v202.0 大厂架构】从 URoomStateService 获取真人 + AI 数据并刷新 UI
- *
- * 数据流:
- *   URoomStateService::GetFactionSnapshotsWithAI(FactionTag)
- *     ↓ 真人 (PlayerArray) + AI 占位 (PendingAIQueue) + 战斗 AI (AIC Replicated 字段)
- *   单一 FPlayerSnapshot 列表 → UI 渲染
- *
- * 大厂原则:
- *   - View 不感知数据层 (CQRS 读取端隔离)
- *   - 真人 / AI 同一 Snapshot 结构 → 渲染逻辑统一
- */
-void UScoreboardWidget::RefreshFromRoomStateService()
+void UScoreboardWidget::SubscribeScoreboardEvents()
 {
 	URoomStateService* StateSvc = URoomStateService::Get(this);
 	if (!StateSvc)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[ScoreboardWidget] RefreshFromRoomStateService: URoomStateService 不可用 (World 还未初始化?), 跳过刷新"));
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] SubscribeScoreboardEvents: URoomStateService 不可用! "
+			     "【v215 零兜底】事件订阅失败, Tick 兜底仍工作, 但事件流丢失. 检查 World/Subsystem 初始化时序."));
 		return;
 	}
 
-	// 一次性获取两个阵营的快照 (真人 + AI 全部)
-	const TArray<FPlayerSnapshot> AttackerSnapshots = StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense());
-	const TArray<FPlayerSnapshot> DefenderSnapshots = StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense());
+	// 【v215 大厂架构】动态多播必须 AddDynamic (Function Name 方式)
+	StateSvc->OnPlayerSnapshotsChanged.AddDynamic(this, &UScoreboardWidget::HandlePlayerSnapshotsChanged);
 
-	// 记录本地玩家名 (用于高亮)
-	const FString LocalPlayerName = GetLocalPlayerName();
+	UE_LOG(LogTemp, Log,
+		TEXT("[ScoreboardWidget] SubscribeScoreboardEvents: 已订阅 URoomStateService::OnPlayerSnapshotsChanged."));
+}
+
+void UScoreboardWidget::UnsubscribeScoreboardEvents()
+{
+	URoomStateService* StateSvc = URoomStateService::Get(this);
+	if (!StateSvc)
+	{
+		// 【v215 0 兜底】Widget 销毁时 URoomStateService 可能已经销毁 (World 切换)
+		//   - 这种情况 PIE 重启常见
+		//   - 但解绑失败不致命, 后续事件触发会因为 Widget 已销毁而自然失效
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ScoreboardWidget] UnsubscribeScoreboardEvents: URoomStateService 已不可用, 解绑跳过 (Widget 销毁流程)."));
+		return;
+	}
+
+	StateSvc->OnPlayerSnapshotsChanged.RemoveDynamic(this, &UScoreboardWidget::HandlePlayerSnapshotsChanged);
+}
+
+// ==========================================
+// 【v215 大厂架构新增 — 事件回调】
+// 大厂原则: 事件回调只做"通知", 真实逻辑全部走 RefreshScoreboard 单一入口
+//
+// 【v217 大厂架构重构 — 冻结后跳过事件刷新】
+// 大厂原则 — 单一真理源 + 0 兜底:
+//   - 旧 (v215-v216): HandlePlayerSnapshotsChanged 永远调 RefreshScoreboard
+//     → Service 实时数据推过来就触发刷新 → 排名列表自动变顺序
+//     → 用户报告: "结算页面的玩家排名列表,过一会就自动变化一下顺序"
+//   - 新 (v217): bIsFrozen=true 时直接 return, 冻结后任何 Service 实时推送都不再响应
+//   - 注意: TickFallback (5s 兜底) 仍然会调 RefreshScoreboard (走 GetActiveSnapshots → FrozenSnapshots)
+//     → 冻结后 RefreshScoreboard 也只读 FrozenSnapshots, 不变
+void UScoreboardWidget::HandlePlayerSnapshotsChanged()
+{
+	// 【v217 大厂架构重构】冻结后跳过 Service 实时事件 — 排名列表冻结
+	if (bIsFrozen)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ScoreboardWidget] HandlePlayerSnapshotsChanged: bIsFrozen=true, 跳过 Service 实时事件刷新. "
+			     "排名列表已冻结, 等用户点击返回大厅后才会重新响应 Service 推送."));
+		return;
+	}
 
 	UE_LOG(LogTemp, Verbose,
-		TEXT("[ScoreboardWidget] RefreshFromRoomStateService: Attacker.Num=%d Defender.Num=%d LocalPlayer='%s'"),
-		AttackerSnapshots.Num(), DefenderSnapshots.Num(), *LocalPlayerName);
+		TEXT("[ScoreboardWidget] HandlePlayerSnapshotsChanged: 收到 URoomStateService 事件, 触发 RefreshScoreboard."));
 
-	// 攻方 → VB_AttackerTeam
-	for (const FPlayerSnapshot& Snap : AttackerSnapshots)
+	RefreshScoreboard();
+}
+
+// ==========================================
+// 1. 公共接口 — RefreshScoreboard 增量更新 (Bug #1 闪烁修复)
+// ==========================================
+// 【v215 大厂架构重构】
+//   历史 (v22-v213): ClearScoreboard() 全删全建 → 闪烁
+//   新 (v215):
+//     1. 拿最新快照 (冻结后只读 FrozenSnapshots)
+//     2. 按 SnapshotId 增量更新已有 entry
+//     3. 新玩家 CreateWidget + AddChild
+//     4. 已退出的玩家 RemoveChild (基于 CachedLiveSnapshots 对比)
+//     5. 排名变化用 RemoveChild/InsertChild 增量重排
+void UScoreboardWidget::RefreshScoreboard()
+{
+	// 1. 拿当前应使用的数据源 (冻结 vs 实时)
+	const TArray<FPlayerSnapshot>& ActiveSnapshots = GetActiveSnapshots();
+
+	// 2. 合并攻守两个阵营的快照 → 单一列表 (用 FactionTag 区分, 不区分容器)
+	const FString LocalPlayerName = GetLocalPlayerName();
+
+	// 3. 增量更新: 遍历最新快照, 更新/创建 entry
+	for (const FPlayerSnapshot& Snap : ActiveSnapshots)
 	{
-		const bool bIsLocal = (Snap.PlayerName == LocalPlayerName);
-		UpdateOrCreateEntryFromSnapshot(Snap, bIsLocal);
+		if (Snap.PlayerName.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] RefreshScoreboard: Snapshot.PlayerName 为空 (bIsAI=%d), 跳过. "
+					 "【v202.0 零兜底】PlayerName 必须是 DisplayName/PlayerName."),
+				Snap.bIsAI ? 1 : 0);
+			continue;
+		}
+
+		if (!FFactionTags::IsValidFaction(Snap.FactionTag))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] RefreshScoreboard: Snapshot.PlayerName='%s' FactionTag='%s' 无效, 跳过."),
+				*Snap.PlayerName, *Snap.FactionTag.ToString());
+			continue;
+		}
+
+		UpdateOrCreateEntryFromSnapshot(Snap, Snap.PlayerName == LocalPlayerName);
 	}
 
-	// 守方 → VB_DefenderTeam
-	for (const FPlayerSnapshot& Snap : DefenderSnapshots)
-	{
-		const bool bIsLocal = (Snap.PlayerName == LocalPlayerName);
-		UpdateOrCreateEntryFromSnapshot(Snap, bIsLocal);
-	}
+	// 4. 删除已退出的玩家 (CachedLiveSnapshots 中存在但 ActiveSnapshots 中不存在的)
+	RemoveStaleEntries(VB_AttackerTeam, ActiveSnapshots);
+	RemoveStaleEntries(VB_DefenderTeam, ActiveSnapshots);
 
-	// 排序并更新排名 (统一逻辑, 真人/AI 一视同仁)
+	// 5. 增量排序 + 排名刷新
 	SortEntriesByScore(VB_AttackerTeam);
 	SortEntriesByScore(VB_DefenderTeam);
 	UpdateAllRanks(VB_AttackerTeam);
 	UpdateAllRanks(VB_DefenderTeam);
+
+	// 【v215 大厂架构】注意: ActiveSnapshots 就是 CachedLiveSnapshots 本身 (GetActiveSnapshots 内部已写入),
+	//   这里不需要再次赋值 (自我赋值无意义)
+	//   下次 Refresh 时 RemoveStaleEntries 直接用 ActiveSnapshots 对比即可
+}
+
+// ==========================================
+// 【v215 大厂架构新增 — 增量删除已退玩家】
+// 大厂原则: 不缓存 entry 指针 (Widget 可能被外部清空), 每次动态查找
+void UScoreboardWidget::RemoveStaleEntries(UVerticalBox* VerticalBox, const TArray<FPlayerSnapshot>& ActiveSnapshots)
+{
+	if (!VerticalBox)
+	{
+		return;
+	}
+
+	// 倒序遍历, 删除时不影响索引
+	for (int32 i = VerticalBox->GetChildrenCount() - 1; i >= 0; i--)
+	{
+		UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(VerticalBox->GetChildAt(i));
+		if (!Entry)
+		{
+			continue;
+		}
+
+		const FString EntryName = Entry->GetPlayerName();
+		const bool bStillExists = ActiveSnapshots.ContainsByPredicate([&EntryName](const FPlayerSnapshot& Snap)
+		{
+			return Snap.PlayerName == EntryName;
+		});
+
+		if (!bStillExists)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[ScoreboardWidget] RemoveStaleEntries: 玩家 '%s' 已离开, 移除 entry."),
+				*EntryName);
+			VerticalBox->RemoveChildAt(i);
+		}
+	}
 }
 
 /**
- * 【v202.0 大厂架构】根据 FPlayerSnapshot 更新或创建条目
+ * 【v215 大厂架构】根据 FPlayerSnapshot 更新或创建条目 (增量更新, 不 Clear)
  *
  * 大厂原则:
  *   - View 只读 POJO 数据, 不感知 ARoomPlayerState / ABaseAIController
  *   - 真人 (bIsAI=false) 和 AI (bIsAI=true) 共用同一 Snapshot, 渲染统一
- *
- * 阵营判断: Snap.FactionTag == FFactionTags::Offense() → 攻方
- *           Snap.FactionTag == FFactionTags::Defense() → 守方
- *           其他: 大厂原则 — 显式 Log Error (不静默兜底)
+ *   - 已存在的 entry 调 SetScore/SetKDA/SetPlayerName, 不重建 → 修复闪烁
+ *   - 跨阵营转移 (Snap.FactionTag 变化): 先 RemoveChild 再 AddChild
  */
 void UScoreboardWidget::UpdateOrCreateEntryFromSnapshot(const FPlayerSnapshot& Snapshot, bool bIsLocalPlayer)
 {
 	if (Snapshot.PlayerName.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[ScoreboardWidget] UpdateOrCreateEntryFromSnapshot: Snapshot.PlayerName 为空 (bIsAI=%d). "
-				 "【v202.0 修复】FPlayerSnapshot.PlayerName 必须是 DisplayName (AI) 或 PlayerName (真人), "
-				 "不允许空字符串进入 UI 渲染."),
+			TEXT("[ScoreboardWidget] UpdateOrCreateEntryFromSnapshot: Snapshot.PlayerName 为空 (bIsAI=%d), 拒绝渲染."),
 			Snapshot.bIsAI ? 1 : 0);
 		return;
 	}
 
-	// 大厂原则 — 显式优于默认: 无效阵营 → Log Error + 跳过 (不允许静默归到某阵营)
 	if (!FFactionTags::IsValidFaction(Snapshot.FactionTag))
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[ScoreboardWidget] UpdateOrCreateEntryFromSnapshot: Snapshot.PlayerName='%s' (bIsAI=%d) "
-				 "的 FactionTag='%s' 不是 Offense/Defense 有效阵营, 跳过渲染."),
+				 "FactionTag='%s' 无效, 跳过."),
 			*Snapshot.PlayerName, Snapshot.bIsAI ? 1 : 0, *Snapshot.FactionTag.ToString());
 		return;
 	}
 
 	const bool bIsAttacker = (Snapshot.FactionTag == FFactionTags::Offense());
-
-	// 获取对应的 VerticalBox
 	UVerticalBox* TargetBox = bIsAttacker ? VB_AttackerTeam : VB_DefenderTeam;
 	UVerticalBox* WrongBox = bIsAttacker ? VB_DefenderTeam : VB_AttackerTeam;
 	if (!TargetBox)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] UpdateOrCreateEntryFromSnapshot: TargetBox 为 nullptr (阵营=%s)! "
+			     "【v215 零兜底】检查 WBP_ScoreboardWidget 是否绑定了 VB_AttackerTeam / VB_DefenderTeam."),
+			bIsAttacker ? TEXT("Attacker") : TEXT("Defender"));
 		return;
 	}
 
-	// 先在错误容器中查找并移除 (防止之前错分到对面容器)
+	const FString SnapshotId = MakeSnapshotId(Snapshot);
+
+	// 0. 跨阵营转移: 先在错误容器中查找并移除
 	if (WrongBox)
 	{
-		for (int32 i = WrongBox->GetChildrenCount() - 1; i >= 0; i--)
+		UScoreboardEntryWidget* Misplaced = FindEntryById(WrongBox, SnapshotId);
+		if (Misplaced)
 		{
-			UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(WrongBox->GetChildAt(i));
-			if (Entry && Entry->GetPlayerName() == Snapshot.PlayerName)
-			{
-				Entry->RemoveFromParent();
-				break;
-			}
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[ScoreboardWidget] UpdateOrCreateEntryFromSnapshot: 玩家 '%s' 跨阵营转移, 从错误容器移除."),
+				*Snapshot.PlayerName);
+			WrongBox->RemoveChild(Misplaced);
 		}
 	}
 
-	// 在正确容器中查找是否已存在
-	UScoreboardEntryWidget* ExistingEntry = nullptr;
-	for (int32 i = 0; i < TargetBox->GetChildrenCount(); i++)
-	{
-		UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(TargetBox->GetChildAt(i));
-		if (Entry && Entry->GetPlayerName() == Snapshot.PlayerName)
-		{
-			ExistingEntry = Entry;
-			break;
-		}
-	}
-
+	// 1. 在正确容器中查找已有 entry
+	UScoreboardEntryWidget* ExistingEntry = FindEntryById(TargetBox, SnapshotId);
 	if (ExistingEntry)
 	{
-		// 更新现有条目
+		// 增量更新 (不重建 → 修复闪烁)
+		ExistingEntry->SetPlayerName(Snapshot.PlayerName);
 		ExistingEntry->SetScore(Snapshot.Score);
 		ExistingEntry->SetKDA(Snapshot.Kills, Snapshot.Deaths, Snapshot.Assists);
 		ExistingEntry->SetIsCurrentPlayer(bIsLocalPlayer);
+		return;
+	}
+
+	// 2. 不存在 → 创建新 entry
+	CreateEntryWidgetFromSnapshot(Snapshot, bIsAttacker);
+}
+
+// ==========================================
+// 【v215 大厂架构新增 — 私有辅助函数实现】
+// ==========================================
+FString UScoreboardWidget::MakeSnapshotId(const FPlayerSnapshot& Snapshot)
+{
+	// 大厂原则 — SnapshotId 包含 bIsAI, 防止真人/AI 同名冲突 (虽然理论上不会)
+	return FString::Printf(TEXT("%s|%d"), *Snapshot.PlayerName, Snapshot.bIsAI ? 1 : 0);
+}
+
+UScoreboardEntryWidget* UScoreboardWidget::FindEntryById(UVerticalBox* VerticalBox, const FString& SnapshotId) const
+{
+	if (!VerticalBox)
+	{
+		return nullptr;
+	}
+
+	// SnapshotId 格式 = "PlayerName|bIsAI"
+	// 拆出 PlayerName 用于匹配 Entry->GetPlayerName()
+	FString TargetName;
+	int32 TargetIsAI = 0;
+	const FString Delimiter = TEXT("|");
+	int32 DelimPos = INDEX_NONE;
+	if (SnapshotId.FindChar(Delimiter[0], DelimPos))
+	{
+		TargetName = SnapshotId.Left(DelimPos);
+		const FString AIStr = SnapshotId.Mid(DelimPos + 1);
+		TargetIsAI = FCString::Atoi(*AIStr);
 	}
 	else
 	{
-		// 创建新条目
-		CreateEntryWidgetFromSnapshot(Snapshot, bIsAttacker);
+		// 【v215 0 兜底】格式不对 → 整个 id 当名字用
+		UE_LOG(LogTemp, Warning,
+			TEXT("[ScoreboardWidget] FindEntryById: SnapshotId='%s' 格式不对 (无 '|' 分隔符), 降级用整串当名字."),
+			*SnapshotId);
+		TargetName = SnapshotId;
 	}
+
+	(void)TargetIsAI; // 当前版本 bIsAI 不影响 Entry 匹配 (Entry 只存名字), 留作未来扩展
+
+	for (int32 i = 0; i < VerticalBox->GetChildrenCount(); i++)
+	{
+		UScoreboardEntryWidget* Entry = Cast<UScoreboardEntryWidget>(VerticalBox->GetChildAt(i));
+		if (Entry && Entry->GetPlayerName() == TargetName)
+		{
+			return Entry;
+		}
+	}
+	return nullptr;
+}
+
+void UScoreboardWidget::RemoveEntryById(UVerticalBox* VerticalBox, const FString& SnapshotId)
+{
+	UScoreboardEntryWidget* Entry = FindEntryById(VerticalBox, SnapshotId);
+	if (Entry && VerticalBox)
+	{
+		VerticalBox->RemoveChild(Entry);
+	}
+}
+
+TArray<FPlayerSnapshot>& UScoreboardWidget::GetActiveSnapshots()
+{
+	// 【v215 大厂架构 — 冻结 vs 实时切换】
+	//   冻结: 返回 FrozenSnapshots (已与 URoomStateService 解耦)
+	//   未冻结: 实时拉 URoomStateService, 写入 CachedLiveSnapshots, 返回引用
+	if (bIsFrozen)
+	{
+		return FrozenSnapshots;
+	}
+
+	// 未冻结: 实时拉
+	// 【v215 0 兜底】URoomStateService 拿不到 → 返回空数组 + Log Error
+	URoomStateService* StateSvc = URoomStateService::Get(this);
+	if (!StateSvc)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] GetActiveSnapshots: URoomStateService 不可用, 返回空数组. "
+			     "【v215 零兜底】事件流丢失, 需检查 World 切换时序."));
+		static TArray<FPlayerSnapshot> EmptySnapshots;
+		return EmptySnapshots;
+	}
+
+	// 合并两个阵营到一个 CachedLiveSnapshots
+	CachedLiveSnapshots.Empty();
+	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense()));
+	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense()));
+
+	return CachedLiveSnapshots;
 }
 
 UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const FPlayerSnapshot& Snapshot, bool bIsAttacker)
@@ -386,24 +679,26 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const F
 	if (Snapshot.PlayerName.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: Snapshot.PlayerName 为空, 拒绝创建. "
-				 "【v202.0 修复】UPlayerLabelWidget 数据源单一 (FPlayerSnapshot), 不允许空名字渲染."));
+			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: Snapshot.PlayerName 为空, 拒绝创建."));
 		return nullptr;
 	}
 
-	// 实时校验阵营归属 (防止 AI/真人跨阵营误判)
 	const bool bActualIsAttacker = (Snapshot.FactionTag == FFactionTags::Offense());
 	if (bActualIsAttacker != bIsAttacker)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: Snapshot '%s' (bIsAI=%d) 阵营不一致, 参数=%d 实际=%d, 已修正"),
-			*Snapshot.PlayerName, Snapshot.bIsAI ? 1 : 0, bIsAttacker, bActualIsAttacker);
+			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: Snapshot '%s' 阵营不一致, 参数=%d 实际=%d, 已修正"),
+			*Snapshot.PlayerName, bIsAttacker, bActualIsAttacker);
 		bIsAttacker = bActualIsAttacker;
 	}
 
 	UVerticalBox* TargetBox = bIsAttacker ? VB_AttackerTeam : VB_DefenderTeam;
 	if (!TargetBox)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: TargetBox 为 nullptr (阵营=%s)! "
+			     "【v215 零兜底】检查 WBP_ScoreboardWidget 是否绑定了 VB_AttackerTeam / VB_DefenderTeam."),
+			bIsAttacker ? TEXT("Attacker") : TEXT("Defender"));
 		return nullptr;
 	}
 
@@ -411,38 +706,26 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const F
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: ScoreboardEntryWidgetClass 未配置！请在 WBP_ScoreboardWidget 蓝图中设置. "
-				 "【v202.0 修复】不再静默 return, 显式 Log Error 强制修复 BP 配置."));
+				 "【v215 修复】不再静默 return, 显式 Log Error 强制修复 BP 配置."));
 		return nullptr;
 	}
 
 	UScoreboardEntryWidget* EntryWidget = CreateWidget<UScoreboardEntryWidget>(this, ScoreboardEntryWidgetClass);
 	if (!EntryWidget)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] CreateEntryWidgetFromSnapshot: CreateWidget 失败 (Class 配置错误或内存不足). "
+			     "【v215 零兜底】拒绝继续, 不返回空 entry."));
 		return nullptr;
 	}
 
 	// 【v208 大厂架构重构 — PlayerName 单一真理源】
-	//   历史 (v202.0): 在此处拼接 "[AI] " 前缀 → 与 UpdateOrCreateEntryFromSnapshot 中比较 Entry->GetPlayerName() == Snapshot.PlayerName 不一致
-	//     - Entry->GetPlayerName() = "[AI] AIC_AI_SWAT_AI_3" (有前缀)
-	//     - Snapshot.PlayerName = "AIC_AI_SWAT_AI_3" (无前缀)
-	//     - 比较失败 → 每次 Refresh 找不到现有 Entry → 反复创建新 Widget → AI entry 堆积
-	//
-	//   新 (v208): 拼接前缀的责任上移到 BuildAISnapshot / BuildAISnapshotFromController
-	//     - Snap.PlayerName 永远带 "[AI] " 前缀 (数据源统一)
-	//     - 本函数直接用 Snap.PlayerName, 不再拼接 (避免双前缀)
-	//     - 比较 Entry->GetPlayerName() == Snapshot.PlayerName 永远命中
-	//     - 大厂原则 — 单一真理源: "[AI] " 前缀只在 BuildAISnapshot* 一处拼
-	//
-	// 视觉差异仍由 bIsAI 字段驱动 (本函数不再做拼前缀, 真理源已就位)
+	//   BuildAISnapshot* 已统一加 "[AI] " 前缀, Entry 直接用 Snap.PlayerName
 	EntryWidget->SetPlayerName(Snapshot.PlayerName);
 	EntryWidget->SetScore(Snapshot.Score);
 	EntryWidget->SetKDA(Snapshot.Kills, Snapshot.Deaths, Snapshot.Assists);
 
 	const FString LocalPlayerName = GetLocalPlayerName();
-	// 【v208】注意: SetIsCurrentPlayer 仍直接比较 Snapshot.PlayerName vs LocalPlayerName
-	//   - 真人: Snap.PlayerName = "TestUser_E7B5" = LocalPlayerName → bIsLocal=true
-	//   - AI:   Snap.PlayerName = "[AI] AIC_AI_SWAT_AI_3" != LocalPlayerName → bIsLocal=false
-	//   - 大厂原则 — 视觉差异 = 字段驱动 (bIsAI), Snapshot 已含完整信息
 	EntryWidget->SetIsCurrentPlayer(Snapshot.PlayerName == LocalPlayerName);
 
 	TargetBox->AddChild(EntryWidget);
@@ -452,6 +735,10 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const F
 
 void UScoreboardWidget::ClearScoreboard()
 {
+	// 【v215 大厂架构重构】
+	//   历史 (v22-v213): RefreshScoreboard 开头调此函数, 触发闪烁
+	//   新 (v215): RefreshScoreboard 走增量更新, 此函数仅供外部明确重置时调用
+	//              (如切局/退出结算时)
 	if (VB_AttackerTeam)
 	{
 		VB_AttackerTeam->ClearChildren();
@@ -466,15 +753,6 @@ void UScoreboardWidget::ClearScoreboard()
 // ==========================================
 // 【v203.0 大厂架构新增】模式缓存 + 阵营标题刷新
 // ==========================================
-// 大厂原则 — 单一真理源:
-//   - CachedMatchMode 是 ScoreboardWidget 内唯一表示"当前模式"的字段
-//   - GS->CurrentMatchMode (Replicated) 是服务器真理源, 通过此函数单向同步到 CachedMatchMode
-//   - 模式变化时才更新 (避免无变化时重复读 GS)
-//
-// 为什么不是 Tick 每帧读 GS:
-//   - GS->CurrentMatchMode 一局不变 (开局 SetCurrentMatchMode 后不变), 没必每帧读
-//   - 模式切换 = 玩家点"开始游戏"后进入新局, 此时调 ShowRoundSettlement 时同步读一次即可
-// ==========================================
 void UScoreboardWidget::RefreshCachedMatchMode()
 {
 	UWorld* World = GetWorld();
@@ -487,7 +765,6 @@ void UScoreboardWidget::RefreshCachedMatchMode()
 	if (!RoomGS)
 	{
 		// 零兜底: GS 还没就绪时, CachedMatchMode 保持默认 Melee, 至少显示刀战文案
-		// 不空白 UI, 也不报错 (客户端首帧常见, NativeConstruct 时 GS 可能未到达)
 		return;
 	}
 
@@ -500,14 +777,6 @@ void UScoreboardWidget::RefreshCachedMatchMode()
 	}
 }
 
-/**
- * 【v203.0 大厂架构新增】根据当前模式刷新阵营标题 TextBlock
- *
- * 大厂原则:
- *   - 单一入口: 所有阵营标题文案走 namespace ScoreboardFactionNames, 不在 cpp 其他位置拼字符串
- *   - Text_AttackerTeamTitle / Text_DefenderTeamTitle 用 BindWidgetOptional (允许未绑, 不报错)
- *   - BindWidgetOptional: 旧 WBP 没这两个控件时编译不挂, 仅 Log Warning 提示
- */
 void UScoreboardWidget::RefreshTeamTitles()
 {
 	if (Text_AttackerTeamTitle)
@@ -516,10 +785,8 @@ void UScoreboardWidget::RefreshTeamTitles()
 	}
 	else
 	{
-		// BindWidgetOptional: 不强制要求绑定, 旧 WBP 没这控件时不报错, 仅 Verbose 日志
 		UE_LOG(LogTemp, Verbose,
-			TEXT("[ScoreboardWidget] RefreshTeamTitles: Text_AttackerTeamTitle 未绑定 (WBP 旧版本?), 跳过刷新. "
-			     "【v203.0 新增控件】如需显示阵营标题, 在 WBP_ScoreboardWidget 内加 Text_AttackerTeamTitle TextBlock."));
+			TEXT("[ScoreboardWidget] RefreshTeamTitles: Text_AttackerTeamTitle 未绑定 (WBP 旧版本?), 跳过刷新."));
 	}
 
 	if (Text_DefenderTeamTitle)
@@ -533,6 +800,24 @@ void UScoreboardWidget::RefreshTeamTitles()
 	}
 }
 
+// ==========================================
+// 【v215 大厂架构重构 — SortEntriesByScore 增量排序】
+// ==========================================
+// 大厂原则 — 不再 ClearChildren + 全部 AddChild:
+//   历史 (v22-v213): ClearChildren → AddChild 全删全建 → 闪烁
+//   新 (v215):
+//     1. 按得分降序排
+//     2. 用 RemoveChild + InsertChild 增量重排 (同一个 Widget 对象)
+//     3. 排名变化只影响位置, 不影响存在性
+//
+// 【v217 大厂架构重构 — SortEntriesByScore 走 FrozenSnapshots】
+// 大厂原则 — 单一真理源 + 0 兜底:
+//   - 旧 (v215-v216): SortEntriesByScore 直接调 URoomStateService::GetFactionSnapshotsWithAI 拉实时数据
+//     → 无论 bIsFrozen 标志, 实时数据可能变化 → 排名列表每秒重新排序
+//     → 用户报告: "结算页面的玩家排名列表,过一会就自动变化一下顺序"
+//   - 新 (v217): 走 GetActiveSnapshots() → 自动根据 bIsFrozen 选 FrozenSnapshots 或实时
+//     → 冻结后 (bIsFrozen=true) 永远用 FrozenSnapshots, 实时数据即使在变化也不影响排序
+//     → 未冻结时 (bIsFrozen=false) 仍走实时, 兼容游戏内 hero scoreboard
 void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 {
 	if (!VerticalBox)
@@ -540,25 +825,24 @@ void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 		return;
 	}
 
-	// 获取所有子控件
 	TArray<UWidget*> Children = VerticalBox->GetAllChildren();
 	if (Children.Num() == 0)
 	{
 		return;
 	}
 
-	// 收集条目数据 + 名字
-	// 大厂原则 — 简化: 现在数据都来自 Snapshot, 不再二次查 GameState
+	// 【v217 大厂架构重构】从 GetActiveSnapshots 拿数据 — 冻结后自动走 FrozenSnapshots
+	// 大厂原则 — 单一真理源: 整个 Widget 内部所有数据访问都走 GetActiveSnapshots
+	//   - 冻结后 (bIsFrozen=true): 返回 FrozenSnapshots (跨地图持久, 与房间连接解耦)
+	//   - 未冻结 (bIsFrozen=false): 返回 Service 实时数据 (游戏内 hero scoreboard 用)
+	const TArray<FPlayerSnapshot>& ActiveSnapshots = GetActiveSnapshots();
+
 	struct FEntrySortData
 	{
 		FString PlayerName;
 		int32 Score;
 		UScoreboardEntryWidget* Widget;
-		bool bBelongsToThisBox;
 	};
-
-	URoomStateService* StateSvc = URoomStateService::Get(this);
-	const FString LocalPlayerName = GetLocalPlayerName();
 
 	TArray<FEntrySortData> EntryList;
 	for (UWidget* Child : Children)
@@ -573,85 +857,48 @@ void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
 		Data.PlayerName = EntryWidget->GetPlayerName();
 		Data.Widget = EntryWidget;
 		Data.Score = 0;
-		Data.bBelongsToThisBox = false;
 
-	// 从 RoomStateService 快照查最新数据 (单一真理源)
-		if (StateSvc)
+		// 【v217 大厂架构重构】从 ActiveSnapshots 查得分 (而非直接调 Service)
+		// 不变量: 冻结后 ActiveSnapshots 内容永远不变 → 排序稳定 → 排名列表不抖
+		const FString& RawName = Data.PlayerName;
+		for (const FPlayerSnapshot& Snap : ActiveSnapshots)
 		{
-			// 攻/守两个阵营都查一遍, 找到匹配的
-			const TArray<FPlayerSnapshot> AttackerSnaps = StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense());
-			const TArray<FPlayerSnapshot> DefenderSnaps = StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense());
-
-			// 【v208 大厂架构重构 — PlayerName 单一真理源】
-			//   历史 (v202.0): Entry->GetPlayerName() 带 "[AI] " 前缀, Snapshot.PlayerName 不带 → 需要剥离
-			//   新 (v208): 双方都带 "[AI] " 前缀 (BuildAISnapshot* 已统一) → 直接比较
-			//   大厂原则 — 单一真理源: 不在前缀转换上各算各的
-			const FString& RawName = Data.PlayerName;
-
-			// 线性搜索两个阵营 (数据量小, O(N) 完全够)
-			for (const FPlayerSnapshot& Snap : AttackerSnaps)
+			if (Snap.PlayerName == RawName)
 			{
-				if (Snap.PlayerName == RawName)
-				{
-					Data.Score = Snap.Score;
-					Data.bBelongsToThisBox = (VerticalBox == VB_AttackerTeam);
-					break;
-				}
-			}
-			if (!Data.bBelongsToThisBox)
-			{
-				for (const FPlayerSnapshot& Snap : DefenderSnaps)
-				{
-					if (Snap.PlayerName == RawName)
-					{
-						Data.Score = Snap.Score;
-						Data.bBelongsToThisBox = (VerticalBox == VB_DefenderTeam);
-						break;
-					}
-				}
+				Data.Score = Snap.Score;
+				break;
 			}
 		}
 
 		EntryList.Add(Data);
 	}
 
-	// 清空当前容器
-	VerticalBox->ClearChildren();
-
-	// 按归属分类
-	TArray<FEntrySortData> BelongsList;
-	TArray<FEntrySortData> NotBelongsList;
-	for (const FEntrySortData& Data : EntryList)
-	{
-		if (Data.bBelongsToThisBox)
-		{
-			BelongsList.Add(Data);
-		}
-		else
-		{
-			NotBelongsList.Add(Data);
-		}
-	}
-
-	BelongsList.Sort([](const FEntrySortData& A, const FEntrySortData& B)
+	// 按得分降序
+	EntryList.Sort([](const FEntrySortData& A, const FEntrySortData& B)
 	{
 		return A.Score > B.Score;
 	});
 
-	// 重新添加属于当前容器的条目
-	for (const FEntrySortData& Data : BelongsList)
+	// 【v215 增量重排 — 关键修复闪烁】
+	//   RemoveChild 不销毁 Widget, 只是从容器移除 (Widget 对象存活)
+	//   InsertChild 在指定位置插入, 触发 Slate 重绘但不重建 Widget
+	for (int32 i = 0; i < EntryList.Num(); i++)
 	{
-		VerticalBox->AddChild(Data.Widget);
-	}
-
-	// 将不属于当前容器的条目移动到正确容器
-	for (const FEntrySortData& Data : NotBelongsList)
-	{
-		UVerticalBox* CorrectBox = (VerticalBox == VB_AttackerTeam) ? VB_DefenderTeam : VB_AttackerTeam;
-		if (CorrectBox && Data.Widget)
+		UWidget* Widget = EntryList[i].Widget;
+		if (!Widget)
 		{
-			CorrectBox->AddChild(Data.Widget);
+			continue;
 		}
+
+		// 检查当前位置是否已经正确 (避免不必要的重排)
+		if (VerticalBox->GetChildAt(i) == Widget)
+		{
+			continue;
+		}
+
+		// 增量重排: 从当前位置移除, 插入到新位置
+		VerticalBox->RemoveChild(Widget);
+		VerticalBox->InsertChildAt(i, Widget);
 	}
 }
 
@@ -678,10 +925,8 @@ void UScoreboardWidget::UpdateAllRanks(UVerticalBox* VerticalBox)
 
 FString UScoreboardWidget::GetLocalPlayerName() const
 {
-	// 获取当前玩家控制器
 	if (APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0))
 	{
-		// 获取玩家状态
 		if (APlayerState* PS = PC->GetPlayerState<APlayerState>())
 		{
 			return PS->GetPlayerName();
@@ -699,51 +944,32 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 {
 	bIsInSettlementState = true;
 
-	// 【v203.0 大厂架构】模式可能在 ShowRoundSettlement 调用时已变化 (切局时模式不变, 但缓存要刷新)
-	//   单一真理源: CachedMatchMode 必须与 GS->CurrentMatchMode 同步
 	RefreshCachedMatchMode();
 	RefreshTeamTitles();
 
-	// 强制从 GameState 获取最新数据 (避免参数传递链路中数据丢失或同步延迟)
-	// 【v203.0 大厂架构重构】根据模式读不同真理源:
-	//   - 刀战: AttackerTotalKills / DefenderTotalKills (当局击杀数, 用户要求"攻方阵营击杀总数")
-	//   - 生化: AttackerWins / DefenderWins (赢的小局数, 用户要求"母体阵营赢得对局数")
-	//   - 大厂原则: 模式分支显式 (if/else), 不兜底 — 模式 = None 时 Log Error + 用刀战路径
 	UWorld* World = GetWorld();
 	ARoomGameState* RoomGS = World ? World->GetGameState<ARoomGameState>() : nullptr;
 
-	int32 AttackerDisplayValue = AttackerKills; // 刀战用击杀数
+	int32 AttackerDisplayValue = AttackerKills;
 	int32 DefenderDisplayValue = DefenderKills;
 
 	if (RoomGS)
 	{
 		if (CachedMatchMode == ERoomMatchMode::Zombie)
 		{
-			// 生化模式: 显示"赢的小局次数" (用户业务规则 2026.08.07)
 			AttackerDisplayValue = RoomGS->AttackerWins;
 			DefenderDisplayValue = RoomGS->DefenderWins;
-			UE_LOG(LogTemp, Log,
-				TEXT("[ScoreboardWidget] ShowRoundSettlement[Zombie]: 从 GS 读取赢局数, 母体=%d, 人类=%d"),
-				AttackerDisplayValue, DefenderDisplayValue);
 		}
 		else if (CachedMatchMode == ERoomMatchMode::Melee)
 		{
-			// 刀战模式: 显示"当局击杀总数"
 			AttackerDisplayValue = RoomGS->AttackerTotalKills;
 			DefenderDisplayValue = RoomGS->DefenderTotalKills;
-			UE_LOG(LogTemp, Log,
-				TEXT("[ScoreboardWidget] ShowRoundSettlement[Melee]: 从 GS 读取击杀数, 攻方=%d, 守方=%d"),
-				AttackerDisplayValue, DefenderDisplayValue);
 		}
 		else // None / 异常
 		{
-			// 【v203.0 零兜底】模式未知 → Log Error + 用刀战路径 (确保 UI 始终显示数字, 不空白)
-			//   这是大厂原则 - 不允许静默跳过, 也不允许 UI 空白
-			//   默认走刀战 = 假定最常见模式, 至少给玩家看个数字
 			UE_LOG(LogTemp, Error,
 				TEXT("[ScoreboardWidget] ShowRoundSettlement: CachedMatchMode='None' 异常状态! "
-				     "【v203.0 零兜底】默认走刀战路径 (AttackerTotalKills/DefenderTotalKills). "
-				     "如需生化模式显示赢局数, 检查 GS->CurrentMatchMode 同步时序."));
+				     "【v203.0 零兜底】默认走刀战路径."));
 			AttackerDisplayValue = RoomGS->AttackerTotalKills;
 			DefenderDisplayValue = RoomGS->DefenderTotalKills;
 		}
@@ -755,10 +981,8 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 			AttackerKills, DefenderKills);
 	}
 
-	// 结算时强制刷新一遍玩家列表的队伍归属 (防止 CurrentFactionTag 同步延迟导致玩家被错分到对面容器)
 	RefreshScoreboard();
 
-	// 刷新当局击杀数 / 赢局数显示 (文案按模式分支)
 	if (Text_Settlement_AttackerKills)
 	{
 		const FString Label = (CachedMatchMode == ERoomMatchMode::Zombie)
@@ -766,10 +990,6 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 			: ScoreboardFactionNames::GetAttackerKillsLabel_Melee(AttackerDisplayValue);
 		Text_Settlement_AttackerKills->SetText(FText::FromString(Label));
 		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Visible);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_Settlement_AttackerKills 未绑定 (BindWidget 为 nullptr)! 请检查蓝图中是否正确绑定了该控件."));
 	}
 
 	if (Text_Settlement_DefenderKills)
@@ -780,31 +1000,17 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 		Text_Settlement_DefenderKills->SetText(FText::FromString(Label));
 		Text_Settlement_DefenderKills->SetVisibility(ESlateVisibility::Visible);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_Settlement_DefenderKills 未绑定 (BindWidget 为 nullptr)! 请检查蓝图中是否正确绑定了该控件."));
-	}
 
-	// 胜负文字暂时隐藏, 等最终结果广播后再显示
 	if (Text_AttackerWinResult)
 	{
 		Text_AttackerWinResult->SetVisibility(ESlateVisibility::Collapsed);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_AttackerWinResult 未绑定!"));
 	}
 
 	if (Text_DefenderWinResult)
 	{
 		Text_DefenderWinResult->SetVisibility(ESlateVisibility::Collapsed);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowRoundSettlement: Text_DefenderWinResult 未绑定!"));
-	}
 
-	// 强制显示计分板 (结算状态下按 Tab 隐藏后, 再按 Tab 应该能重新显示)
 	SetVisibility(ESlateVisibility::Visible);
 
 	UE_LOG(LogTemp, Log,
@@ -812,13 +1018,19 @@ void UScoreboardWidget::ShowRoundSettlement(int32 AttackerKills, int32 DefenderK
 		static_cast<int32>(CachedMatchMode), AttackerDisplayValue, DefenderDisplayValue);
 }
 
+// ==========================================
+// 【v215 大厂架构重构 — ShowFinalResult 冻结快照入口】
+// ==========================================
+// Bug #1 闪烁修复:
+//   进入结算 → FreezeSnapshot() 一次性拉所有数据
+//   后续刷新只读 FrozenSnapshots, 不再触发任何 UI 重建
+// Bug #2 解耦:
+//   冻结后 Widget 不再订阅/拉 URoomStateService, 完全独立于房间连接
 void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 {
-	// 【v203.0 大厂架构】确保模式与阵营标题与最新同步
 	RefreshCachedMatchMode();
 	RefreshTeamTitles();
 
-	// 从 GameState 获取最新胜局数 (避免参数传递链路中的同步问题)
 	UWorld* World = GetWorld();
 	if (World)
 	{
@@ -832,11 +1044,11 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 		}
 	}
 
-	// 【v203.0 大厂架构重构】胜利文案按模式分支
-	//   - 刀战: "攻方胜利" / "守方胜利" / "平局"
-	//   - 生化: "母体阵营胜利" / "人类阵营胜利" / "平局"
-	//   - 颜色逻辑不变: 攻方红 / 守方蓝 / 平局白
-	//   - 单一真理源: 阵营名走 namespace ScoreboardFactionNames
+	// 【v215 大厂架构重构 — 冻结快照】
+	FreezeSnapshot();
+
+	// 冻结后立即用冻结数据渲染一次 (确保 UI 显示冻结的数据, 不是当前实时数据)
+	RefreshScoreboard();
 
 	// 显示攻方胜利/平局文字
 	if (Text_AttackerWinResult)
@@ -852,10 +1064,6 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
 		Text_AttackerWinResult->SetVisibility(AttackerWins >= DefenderWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowFinalResult: Text_AttackerWinResult 未绑定!"));
 	}
 
 	// 显示守方胜利/平局文字
@@ -873,21 +1081,65 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 		}
 		Text_DefenderWinResult->SetVisibility(DefenderWins >= AttackerWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] ShowFinalResult: Text_DefenderWinResult 未绑定!"));
-	}
 
 	UE_LOG(LogTemp, Log,
-		TEXT("[ScoreboardWidget] ShowFinalResult: Mode=%d, 攻方/母体胜%d局, 守方/人类胜%d局"),
-		static_cast<int32>(CachedMatchMode), AttackerWins, DefenderWins);
+		TEXT("[ScoreboardWidget] ShowFinalResult: 已冻结快照, 攻方/母体胜%d局, 守方/人类胜%d局. "
+		     "【v215 冻结快照】后续刷新只读 FrozenSnapshots, 与房间连接解耦."),
+		AttackerWins, DefenderWins);
+}
+
+// ==========================================
+// 【v215 大厂架构新增 — FreezeSnapshot 实现】
+// ==========================================
+// 大厂原则 — 一次性快照, 不允许分多次拉:
+//   冻结时直接拉所有 FactionTag 的快照到一个 TArray, 永久保存
+//   后续 RefreshScoreboard 通过 GetActiveSnapshots() 自动走 FrozenSnapshots
+void UScoreboardWidget::FreezeSnapshot()
+{
+	// 0 兜底: URoomStateService 拿不到 → Log Error, 不冻结, 不静默
+	URoomStateService* StateSvc = URoomStateService::Get(this);
+	if (!StateSvc)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] FreezeSnapshot: URoomStateService 不可用! "
+			     "【v215 零兜底】冻结失败, 保留旧状态. 检查 World 切换时序 (如已开始离开房间)."));
+		return;
+	}
+
+	// 一次性合并两个阵营到一个 FrozenSnapshots
+	FrozenSnapshots.Empty();
+	FrozenSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense()));
+	FrozenSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense()));
+
+	// 同步冻结队伍击杀/胜局数
+	UWorld* World = GetWorld();
+	if (World)
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			FrozenAttackerKills = RoomGS->AttackerTotalKills;
+			FrozenDefenderKills = RoomGS->DefenderTotalKills;
+			FrozenAttackerWins = RoomGS->AttackerWins;
+			FrozenDefenderWins = RoomGS->DefenderWins;
+		}
+	}
+
+	// 标记冻结
+	bIsFrozen = true;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[ScoreboardWidget] FreezeSnapshot: 冻结完成, 真人+AI 共 %d 个快照, 攻方击杀=%d 守方击杀=%d 攻方胜=%d 守方胜=%d. "
+		     "【v215 冻结快照】后续刷新只读 FrozenSnapshots."),
+		FrozenSnapshots.Num(), FrozenAttackerKills, FrozenDefenderKills, FrozenAttackerWins, FrozenDefenderWins);
 }
 
 void UScoreboardWidget::HideSettlementOverlay()
 {
 	bIsInSettlementState = false;
+	// 【v215 大厂架构新增】解除冻结 (退出结算页时)
+	bIsFrozen = false;
+	FrozenSnapshots.Empty();
 
-	// 隐藏所有结算控件
 	if (Text_Settlement_AttackerKills)
 	{
 		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Collapsed);
@@ -907,4 +1159,374 @@ void UScoreboardWidget::HideSettlementOverlay()
 	{
 		Text_DefenderWinResult->SetVisibility(ESlateVisibility::Collapsed);
 	}
+
+	// 【v216 大厂架构新增】隐藏 Border + Button (退出结算页时)
+	if (Border_SettlementOverlay)
+	{
+		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (Button_ReturnToLobby)
+	{
+		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Collapsed);
+	}
+}
+
+// ==========================================
+// 【v216 大厂架构新增】ApplySnapshot — 跨地图结算快照主入口
+// ==========================================
+//
+// 大厂架构 (v216 — 切图到 L_Login):
+//   - 调用时机: UIViewService 在 L_Login 上 ShowPanel(SettlementPanel) 创建本 Widget 后立即调
+//   - 数据流:
+//     * ApplySnapshot(const FFinalSettlementSnapshot& InSnapshot)
+//     * → 校验 InSnapshot.bIsValid (0 兜底, false → Log Error + return)
+//     * → 缓存快照到 widget 内存 (C++ 字段, 类似 FrozenSnapshots)
+//     * → 显示 Border + 文本 (AttackerKills / DefenderKills / WinResults)
+//     * → 显示 Button_ReturnToLobby
+//     * → 触发 RefreshScoreboard 让 ScoreboardEntryWidget 列表立即渲染
+//
+// 0 兜底:
+//   - InSnapshot.bIsValid=false → Log Error + return, 不静默创建空 UI
+//   - Border_SettlementOverlay / Button_ReturnToLobby 未绑 → Log Error (NativeConstruct 已报过, 这里再 defensive check)
+//   - 不静默 return, 让玩家看到红色日志, 知道哪里出错
+//
+// 大厂原则 — 与 v215 FreezeSnapshot 的关系:
+//   - v215 FreezeSnapshot: 把 URoomStateService 实时数据冻结到 widget (用于旧房间内结算页)
+//   - v216 ApplySnapshot: 把 USettlementSnapshotSubsystem 跨地图快照应用到 widget (用于 L_Login 上)
+//   - 两者都调用 RefreshScoreboard, 但 FreezeSnapshot 走"实时→冻结", ApplySnapshot 走"快照→应用"
+//   - ApplySnapshot 内部也调 FreezeSnapshot-like 缓存 (因为切图后 URoomStateService 已销毁)
+// ==========================================
+void UScoreboardWidget::ApplySnapshot(const FFinalSettlementSnapshot& InSnapshot)
+{
+	// 0 兜底: 快照无效 → Log Error + return, 不静默创建空 UI
+	if (!InSnapshot.bIsValid)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] ApplySnapshot: InSnapshot.bIsValid=false. "
+			     "【v216 零兜底】调用顺序错误: 必须先 MulticastEnterSettlement → USettlementSnapshotSubsystem::WriteSnapshot, "
+			     "再 MulticastShowFinalSettlement → UpdateSnapshotWins. 修复: 检查 RPC 链路时序."));
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[ScoreboardWidget] 【v216】ApplySnapshot: MatchMode=%d, AttackerWins=%d, DefenderWins=%d, "
+		     "AttackerEntries=%d, DefenderEntries=%d, RoundWinner=%d. "
+		     "跨地图持久数据已加载到本 Widget."),
+		static_cast<int32>(InSnapshot.MatchMode),
+		InSnapshot.AttackerWins,
+		InSnapshot.DefenderWins,
+		InSnapshot.AttackerEntries.Num(),
+		InSnapshot.DefenderEntries.Num(),
+		static_cast<int32>(InSnapshot.RoundWinner));
+
+	// 【v216 大厂架构重构 — 设置游戏模式缓存】
+	// ApplySnapshot 接收的是 MatchMode (快照内的纯枚举值), 不依赖 GS 查询
+	// 跨地图后 GameState 已销毁, 不能调 World->GetGameState<ARoomGameState>()
+	// 大厂原则 — 0 兜底: 直接用 InSnapshot.MatchMode, 无 Log Error (快照来自服务器, 必有效)
+	CachedMatchMode = InSnapshot.MatchMode;
+
+	// 刷新阵营标题 (刀战/生化 文案)
+	RefreshTeamTitles();
+
+	// 【v216 大厂架构重构 — 冻结快照到 widget 内存】
+	// 把 InSnapshot.AttackerEntries / DefenderEntries 转成本地 FPlayerSnapshot 缓存
+	// 大厂原则 — 单一真理源:
+	//   - 切图后 URoomStateService 已销毁, 不能再 GetFactionSnapshotsWithAI
+	//   - 必须用 InSnapshot.AttackerEntries / DefenderEntries
+	// 大厂原则 — 类型转换:
+	//   - FFactionSnapshotEntry (纯 POJO, 跨地图持久) ↔ FPlayerSnapshot (View 层缓存)
+	//   - 不能 Array.Append 直接转, 字段语义不同 (FactionTagName vs FactionTag / FGameplayTag)
+	//   - 显式 for 转换, 0 兜底: FactionTagName 空 → Log Error + 用 Offense 兜底 (理论上不该空)
+	FrozenSnapshots.Empty();
+
+	// 攻方转换
+	const FGameplayTag AttackerTag = FFactionTags::Offense();
+	for (const FFactionSnapshotEntry& Entry : InSnapshot.AttackerEntries)
+	{
+		FPlayerSnapshot Snap;
+		Snap.PlayerName = Entry.DisplayName;
+		Snap.bIsAI = Entry.bIsAI;
+		Snap.Kills = Entry.Kills;
+		Snap.Deaths = Entry.Deaths;
+		Snap.Assists = Entry.Assists;
+		Snap.Score = Entry.Score;
+		// FactionTagName 是 FString, 转为 FGameplayTag
+		// 0 兜底: Entry.bIsAttacker=true → 用 Offense; Entry.FactionTagName 空 → Log Error + 用 Offense
+		if (Entry.FactionTagName.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] ApplySnapshot: 攻方快照 Entry '%s' FactionTagName 为空, 用 Offense 兜底. "
+				     "【v216 零兜底】修复: 检查 RoomGameState::MulticastEnterSettlement 写入逻辑."),
+				*Entry.DisplayName);
+			Snap.FactionTag = AttackerTag;
+		}
+		else
+		{
+			const FGameplayTag ParsedTag = FGameplayTag::RequestGameplayTag(FName(*Entry.FactionTagName), false);
+			if (!ParsedTag.IsValid())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[ScoreboardWidget] ApplySnapshot: 攻方快照 Entry '%s' FactionTagName '%s' 不是有效 FGameplayTag, 用 Offense 兜底. "
+					     "【v216 零兜底】修复: 检查 FactionTagName 写入路径."),
+					*Entry.DisplayName, *Entry.FactionTagName);
+				Snap.FactionTag = AttackerTag;
+			}
+			else
+			{
+				Snap.FactionTag = ParsedTag;
+			}
+		}
+		FrozenSnapshots.Add(MoveTemp(Snap));
+	}
+
+	// 守方转换
+	const FGameplayTag DefenderTag = FFactionTags::Defense();
+	for (const FFactionSnapshotEntry& Entry : InSnapshot.DefenderEntries)
+	{
+		FPlayerSnapshot Snap;
+		Snap.PlayerName = Entry.DisplayName;
+		Snap.bIsAI = Entry.bIsAI;
+		Snap.Kills = Entry.Kills;
+		Snap.Deaths = Entry.Deaths;
+		Snap.Assists = Entry.Assists;
+		Snap.Score = Entry.Score;
+		if (Entry.FactionTagName.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] ApplySnapshot: 守方快照 Entry '%s' FactionTagName 为空, 用 Defense 兜底. "
+				     "【v216 零兜底】修复: 检查 RoomGameState::MulticastEnterSettlement 写入逻辑."),
+				*Entry.DisplayName);
+			Snap.FactionTag = DefenderTag;
+		}
+		else
+		{
+			const FGameplayTag ParsedTag = FGameplayTag::RequestGameplayTag(FName(*Entry.FactionTagName), false);
+			if (!ParsedTag.IsValid())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[ScoreboardWidget] ApplySnapshot: 守方快照 Entry '%s' FactionTagName '%s' 不是有效 FGameplayTag, 用 Defense 兜底. "
+					     "【v216 零兜底】修复: 检查 FactionTagName 写入路径."),
+					*Entry.DisplayName, *Entry.FactionTagName);
+				Snap.FactionTag = DefenderTag;
+			}
+			else
+			{
+				Snap.FactionTag = ParsedTag;
+			}
+		}
+		FrozenSnapshots.Add(MoveTemp(Snap));
+	}
+
+	// 同步冻结胜负局数 + 当局击杀数
+	FrozenAttackerKills = InSnapshot.AttackerKills;
+	FrozenDefenderKills = InSnapshot.DefenderKills;
+	FrozenAttackerWins = InSnapshot.AttackerWins;
+	FrozenDefenderWins = InSnapshot.DefenderWins;
+
+	// 标记冻结 (后续刷新走 FrozenSnapshots, 不依赖 URoomStateService)
+	bIsFrozen = true;
+	bIsInSettlementState = true;
+
+	// 【v216 大厂架构新增】显示结算覆盖板 + 返回大厅按钮
+	// 大厂原则 — BindWidget 缺失: 已 Log Error 过了, 这里防御性检查 + 仍走完逻辑
+	if (Border_SettlementOverlay)
+	{
+		Border_SettlementOverlay->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Border_SettlementOverlay=已设置 Visible."));
+	}
+
+	if (Button_ReturnToLobby)
+	{
+		Button_ReturnToLobby->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Button_ReturnToLobby=已设置 Visible."));
+	}
+
+	// 【v216 大厂架构重构 — 显示结算文本】
+	// 大厂原则 — 单一真理源: 所有显示数据来自 InSnapshot, 不再调 GS
+	if (Text_Settlement_AttackerKills)
+	{
+		const FString Label = (CachedMatchMode == ERoomMatchMode::Zombie)
+			? ScoreboardFactionNames::GetAttackerWinsLabel_Zombie(FrozenAttackerWins)
+			: ScoreboardFactionNames::GetAttackerKillsLabel_Melee(FrozenAttackerKills);
+		Text_Settlement_AttackerKills->SetText(FText::FromString(Label));
+		Text_Settlement_AttackerKills->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_Settlement_AttackerKills='%s', 设为 Visible."),
+			*Label);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] 【v216 零兜底】ApplySnapshot: Text_Settlement_AttackerKills 未绑定! "
+			"【修复】打开 WBP_ScoreboardWidget 蓝图, 添加同名 TextBlock 子控件, 命名必须为 Text_Settlement_AttackerKills (区分大小写)."));
+	}
+
+	if (Text_Settlement_DefenderKills)
+	{
+		const FString Label = (CachedMatchMode == ERoomMatchMode::Zombie)
+			? ScoreboardFactionNames::GetDefenderWinsLabel_Zombie(FrozenDefenderWins)
+			: ScoreboardFactionNames::GetDefenderKillsLabel_Melee(FrozenDefenderKills);
+		Text_Settlement_DefenderKills->SetText(FText::FromString(Label));
+		Text_Settlement_DefenderKills->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_Settlement_DefenderKills='%s', 设为 Visible."),
+			*Label);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] 【v216 零兜底】ApplySnapshot: Text_Settlement_DefenderKills 未绑定! "
+			"【修复】打开 WBP_ScoreboardWidget 蓝图, 添加同名 TextBlock 子控件, 命名必须为 Text_Settlement_DefenderKills (区分大小写)."));
+	}
+
+	// 胜利/平局文字
+	if (Text_AttackerWinResult)
+	{
+		if (FrozenAttackerWins > FrozenDefenderWins)
+		{
+			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetAttackerWinLabel(CachedMatchMode)));
+			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Red));
+		}
+		else if (FrozenAttackerWins == FrozenDefenderWins)
+		{
+			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
+			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
+		}
+		Text_AttackerWinResult->SetVisibility(FrozenAttackerWins >= FrozenDefenderWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_AttackerWinResult=已设置."));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] 【v216 零兜底】ApplySnapshot: Text_AttackerWinResult 未绑定! "
+			"【修复】打开 WBP_ScoreboardWidget 蓝图, 添加同名 TextBlock 子控件."));
+	}
+
+	if (Text_DefenderWinResult)
+	{
+		if (FrozenDefenderWins > FrozenAttackerWins)
+		{
+			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetDefenderWinLabel(CachedMatchMode)));
+			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Blue));
+		}
+		else if (FrozenAttackerWins == FrozenDefenderWins)
+		{
+			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
+			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
+		}
+		Text_DefenderWinResult->SetVisibility(FrozenDefenderWins >= FrozenAttackerWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_DefenderWinResult=已设置."));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[ScoreboardWidget] 【v216 零兜底】ApplySnapshot: Text_DefenderWinResult 未绑定! "
+			"【修复】打开 WBP_ScoreboardWidget 蓝图, 添加同名 TextBlock 子控件."));
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: 阵营容器检查: VB_AttackerTeam=%s, VB_DefenderTeam=%s"),
+		VB_AttackerTeam ? TEXT("已绑") : TEXT("未绑"),
+		VB_DefenderTeam ? TEXT("已绑") : TEXT("未绑"));
+
+	// 立即渲染 ScoreboardEntryWidget 列表 (走 FrozenSnapshots)
+	const int32 BeforeCount = (VB_AttackerTeam ? VB_AttackerTeam->GetChildrenCount() : 0) +
+		(VB_DefenderTeam ? VB_DefenderTeam->GetChildrenCount() : 0);
+	RefreshScoreboard();
+	const int32 AfterCount = (VB_AttackerTeam ? VB_AttackerTeam->GetChildrenCount() : 0) +
+		(VB_DefenderTeam ? VB_DefenderTeam->GetChildrenCount() : 0);
+	UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: RefreshScoreboard 完成. Entry 数量: %d → %d (FrozenSnapshots=%d)"),
+		BeforeCount, AfterCount, FrozenSnapshots.Num());
+}
+
+// ==========================================
+// 【v216.3 大厂架构再修正】OnReturnToLobbyClicked — 客户端本地调 GameFlowSubsystem::TransitToState
+// ==========================================
+//
+// v216.2 用 RequestStateOnNextLoad 是错的 (已修复):
+//   - 历史 (v216): 走 RPC 链路 ScoreboardWidget → ARoomPlayerController::Server_SettlementReturnToLobby
+//     → 服务器状态校验 → Client_OpenLobbyFromSettlement → RequestStateOnNextLoad(MainLobby)
+//   - v216.2 修复: 客户端直接调 RequestStateOnNextLoad(MainLobby) (去掉 RPC, 跨 PC 类型工作)
+//   - v216.2 BUG (Session1.txt 12.19.04 验证): 按钮"点了有响应"(状态预约成功), 但实际状态没切!
+//     * 玩家已在 L_Login 上, 没有 OpenLevel → PostLoadMapWithWorld 不会触发
+//     * 预约的状态永远不会被消费
+//     * 玩家卡在 SettlementPage 状态
+//
+// v216.3 真正修复: 改用 TransitToState(MainLobby) (立即切状态 + 广播, 不需要 OpenLevel)
+//   - GameFlowSubsystem::HandleStateEntry(MainLobby) case: **不跳转地图** (单地图常驻模式)
+//   - 只广播 OnStateChanged → UIViewService 自动 ShowPanel(LANRoomPage)
+//   - 0 网络往返, 0 地图跳转, 跨 PC 类型工作
+//
+// v217 大厂架构再重构 — 单一入口 (DRY):
+//   - 旧 (v216.3): 本 Widget 直接调 FlowSubsystem->TransitToState(MainLobby)
+//     → UI 切 ✓, 但 Session **未销毁** ✗
+//     → 下次进房 OSS 拒绝 "Session already exists, can't join twice"
+//     → 用户报告: "进入结算页面点击返回大厅后就进不去任何房间了"
+//   - 新 (v217): 本 Widget 调 URoomService::RequestLeaveRoom (统一入口)
+//     → Service 负责: 销毁 Session + 切 UI 状态 + (战斗地图) OpenLevel(L_Login)
+//     → Service 单一职责: "玩家想离开房间" = 完整 Leave Room 链路
+//
+// 大厂架构修正 (RequestStateOnNextLoad vs TransitToState 语义区分):
+//   - RequestStateOnNextLoad: "预约到下一张地图" - 配合 OpenLevel 使用, 在 PostLoadMapWithWorld 消费
+//   - TransitToState: "立即切状态 + 广播" - 单地图常驻模式专用, 已在目标地图上时使用
+//
+// 旧路径 (v216, 已删除 RPC 链路):
+//   客户端: OnReturnToLobbyClicked
+//     ↓ Server_SettlementReturnToLobby (已删除)
+//   服务器: 收到 RPC → 调 Client_OpenLobbyFromSettlement (已删除)
+//     ↓ RequestStateOnNextLoad(MainLobby) → 预约不消费 ❌
+//
+// 新路径 (v217, 客户端本地 — 单一入口):
+//   客户端: OnReturnToLobbyClicked
+//     ↓ URoomService::RequestLeaveRoom (Service 统一入口)
+//   RoomService: 销毁 Session + TransitToState(MainLobby) + (已在 L_Login) OnInterrupted(LANRoom)
+//   SessionManager: DestroyRoom 成功 → OnSessionTerminated → HandleSessionTerminated
+//   HandleSessionTerminated: 检测"已在 L_Login" → 跳过 OpenLevel (避免循环切图)
+//   UIViewService: 收到 MainLobby → ShowPanel(LANRoomPage)
+//
+// 大厂原则 — 0 兜底:
+//   - OwningPlayer 为空 → Log Error + return, 不静默
+//   - GameInstance 拿不到 → Log Error + return
+//   - RoomService 拿不到 → Log Error + return
+//   - 当前状态不是 SettlementPage → Log Error + return (防御性检查, 理论上不会发生)
+//
+// 不需要 RPC 的理由:
+//   - RequestLeaveRoom 是客户端本地操作 (销毁自己的 Session)
+//   - 玩家已在 L_Login 上, 不需要 OpenLevel
+//   - 没有任何作弊空间 (只是 UI 状态切换 + 自己 Session 销毁, 不涉及游戏世界)
+// ==========================================
+void UScoreboardWidget::OnReturnToLobbyClicked()
+{
+	// 0 兜底: OwningPlayer 为空 → Log Error + return
+	APlayerController* OwningPC = GetOwningPlayer();
+	if (!OwningPC)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] OnReturnToLobbyClicked: GetOwningPlayer 返回 nullptr. "
+			     "【v217 零兜底】按钮无响应. 检查 Widget 创建流程 (OwningPlayer 必须有效)."));
+		return;
+	}
+
+	// 0 兜底: GameInstance 拿不到 → Log Error + return
+	UGameInstance* GI = OwningPC->GetGameInstance();
+	if (!GI)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] OnReturnToLobbyClicked: PlayerController '%s' 拿不到 GameInstance. "
+			     "【v217 零兜底】按钮无响应. 检查 PC 生命周期 (不应在 GameInstance 销毁后被调用)."),
+			*OwningPC->GetName());
+		return;
+	}
+
+	// 大厂原则 — 单一入口: 调 URoomService::RequestLeaveRoom (Service 负责销毁 Session + 切 UI 状态)
+	URoomService* RoomService = URoomService::Get(GI);
+	if (!RoomService)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] OnReturnToLobbyClicked: URoomService 不可用. "
+			     "【v217 零兜底】按钮无响应. 检查 Subsystem 注册."));
+		return;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[ScoreboardWidget] 【v217】OnReturnToLobbyClicked: 玩家请求返回大厅 → URoomService::RequestLeaveRoom (单一入口). "
+		     "PlayerController='%s'. Service 会: 销毁 Session + 切 UI 状态 (已在 L_Login 上时不 OpenLevel)."),
+		*OwningPC->GetName());
+
+	// 单一入口 — 让 Service 负责完整 Leave Room 链路
+	RoomService->RequestLeaveRoom();
 }

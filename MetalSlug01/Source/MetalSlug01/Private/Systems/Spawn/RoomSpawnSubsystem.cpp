@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
+#include "Systems/Spawn/RoomLoadoutDefaults.h" // 【v212】业务默认 RowName 集中管理 (JZ001)
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/Core/RoomPlayerState.h"
@@ -731,13 +732,107 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 										// Possess
 										PC->Possess(NewHumanPawn);
 
-										// 武器 Spawn — 字符串→强类型 (走 ResolveWeaponClassFromID 单一入口)
-										if (!HumanWeaponID.IsEmpty())
+// ==========================================
+// 【v219.1 大厂架构 P0 修复】母体变人类 = 走 Server_SpawnAllWeapons 3 槽位 Spawn
+// ==========================================
+//
+// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+//   "客户端不变母体之前正常切换近战武器，但是只要有一小局变成母体之后，
+//    后面每小局是人类也都无法切换近战武器"
+//
+// 根因 (大厂架构根因 — 链式):
+//   1. RestartZombieRoundPlayers 销毁旧母体 Pawn → Spawn 新人类 Pawn (全新 Pawn)
+//   2. 旧代码只调 RequestWeaponSpawn(WeaponClass) 生成 1 把武器
+//   3. **没**调 Server_SpawnAllWeapons → WeaponsInSlot 数组没 SetNum(3) → 仍是空数组
+//   4. 玩家按 3 键切 Melee → Server_SwitchToWeaponSlot 调 GetWeaponInSlot(Melee) → 数组空 → 返回 nullptr → 拒绝
+//   5. EnsureSlotHasWeapon_Server 也因 WeaponsInSlot.IsValidIndex(SlotIdx)=false 拒绝补 Spawn
+//   结果: 母体变人类后玩家只有 Primary, Secondary/Melee 槽位都不可用
+//
+// 大厂原则 — 单一真理源 + 镜像 HandlePlayerRequestSpawn:
+//   - 必须与 HandlePlayerRequestSpawn 完全镜像 (3 槽位一次性 Spawn)
+//   - 不允许业务层自己调 RequestWeaponSpawn (会绕过 SetNum(3))
+//   - 这是"母体变人类 = 复活路径"的一种, 必须复用标准 Spawn 链
+//   - 与玩家路径**完全相同**的代码 (镜像 HandlePlayerRequestSpawn line 2869-2909), 不写简化版
+//
+// 与 HandlePlayerRequestSpawn 的细微差异:
+//   - HandlePlayerRequestSpawn 走完整的 PS->SetPlayerLoadout → 触发 UI 同步
+//   - 这里 PS->SelectedWeaponID* 已经存好 (玩家没动), 我们只读不写
+//   - 不重复调 PS->SetPlayerLoadout, 避免"清空本地选择的"反模式
+// ==========================================
+
+										// 读取 3 把武器的 RowName (玩家大厅已选 + 业务默认兜底)
+										FString FinalPrimaryID = HumanWeaponID; // 玩家 Primary (已在 line 694 读出)
+										FString FinalSecondaryID = PS->GetSelectedWeapon2ID();
+										FString FinalMeleeID = PS->GetSelectedWeapon3ID();
+
+										// Melee 业务默认兜底 — 与 HandlePlayerRequestSpawn line 2673 完全对称
+										if (FinalMeleeID.IsEmpty())
 										{
-											if (TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(HumanWeaponID))
+											const FString& DefaultMeleeRowName = FRoomLoadoutDefaults::MeleeDefaultRowName;
+											if (WeaponDataTable && WeaponDataTable->FindRow<FWeaponInfo>(FName(*DefaultMeleeRowName), TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.Demutate.MeleeDefault")))
 											{
-												NewHumanPawn->RequestWeaponSpawn(WeaponClass);
+												FinalMeleeID = DefaultMeleeRowName;
+												UE_LOG(LogTemp, Warning,
+													TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家 '%s' 母体变人类 — Melee 未选, 业务兜底使用 JZ001='%s' (FRoomLoadoutDefaults)."),
+													*PC->GetName(), *FinalMeleeID);
 											}
+											else
+											{
+												UE_LOG(LogTemp, Error,
+													TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家 '%s' 母体变人类 — Melee 未选 + DT_WeaponInfo 找不到 RowName='%s' (业务默认). "
+													     "【v212 零兜底】玩家将无近战武器. "
+													     "修复: 1) DT_WeaponInfo 添加 RowName='%s' 的行; "
+													     "2) 修改 FRoomLoadoutDefaults::MeleeDefaultRowName."),
+													*PC->GetName(), *DefaultMeleeRowName, *DefaultMeleeRowName);
+											}
+										}
+
+										// 字符串→强类型 (走 ResolveWeaponClassFromID 单一入口)
+										TSubclassOf<ABaseWeapon> PrimaryClass = nullptr;
+										TSubclassOf<ABaseWeapon> SecondaryClass = nullptr;
+										TSubclassOf<ABaseWeapon> MeleeClass = nullptr;
+
+										if (!FinalPrimaryID.IsEmpty())
+										{
+											PrimaryClass = ResolveWeaponClassFromID(FinalPrimaryID);
+										}
+										if (!FinalSecondaryID.IsEmpty())
+										{
+											SecondaryClass = ResolveWeaponClassFromID(FinalSecondaryID);
+										}
+										if (!FinalMeleeID.IsEmpty())
+										{
+											MeleeClass = ResolveWeaponClassFromID(FinalMeleeID);
+										}
+
+										// 零兜底 (v52): 主武器必须有 — 与 HandlePlayerRequestSpawn line 2889 完全对称
+										if (!PrimaryClass)
+										{
+											UE_LOG(LogTemp, Error,
+												TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家 '%s' 母体变人类 — FinalPrimaryID='%s' 无法反查为 WeaponClass. "
+												     "【v52 零兜底】主武器必须有, 拒绝 Spawn. "
+												     "修复: 检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
+												*PC->GetName(), *FinalPrimaryID, *FinalPrimaryID);
+										}
+
+										UE_LOG(LogTemp, Display,
+											TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家母体变人类 — 触发 3 槽位 Spawn. Primary=%s Secondary=%s Melee=%s (Pawn=%s, Player=%s). "
+											     "【v219.1 P0 修复】母体变人类必须走 Server_SpawnAllWeapons, 否则 WeaponsInSlot 空数组导致无法切槽位."),
+											*FinalPrimaryID, *FinalSecondaryID, *FinalMeleeID,
+											*NewHumanPawn->GetName(), *PC->GetName());
+
+										// 走 3 槽位 Spawn (服务器权威, 与 HandlePlayerRequestSpawn 完全对称)
+										//   关键: 这一步会 Reset + SetNum(3) WeaponsInSlot, 后续切槽位才能正常
+										if (UWeaponAttachmentComponent* WeaponAttachComp = NewHumanPawn->FindComponentByClass<UWeaponAttachmentComponent>())
+										{
+											WeaponAttachComp->Server_SpawnAllWeapons(PrimaryClass, SecondaryClass, MeleeClass);
+										}
+										else
+										{
+											UE_LOG(LogTemp, Error,
+												TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家 '%s' 母体变人类 — NewPawn '%s' 没有 UWeaponAttachmentComponent. "
+												     "【v52 零兜底】必须挂载 WeaponAttachment 组件, 拒绝 Spawn."),
+												*PC->GetName(), *NewHumanPawn->GetName());
 										}
 
 										// 激活移动锁定 + 无敌期闪烁
@@ -954,13 +1049,81 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 					BaseAIC->SetCachedIsMother(false);
 					BaseAIC->SetCachedFactionTag(FFactionTags::Defense());
 
-					// 武器 Spawn — 字符串→强类型 (走 ResolveWeaponClassFromID 单一入口)
-					if (!HumanWeaponID.IsEmpty())
+					// ==========================================
+					// 【v219.1 大厂架构 P0 修复】AI 母体变人类 = 走 Server_SpawnAllWeapons 3 槽位 Spawn
+					// ==========================================
+					//
+					// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+					//   AI 与玩家走完全相同的母体变人类路径, 必须用相同的修复方案
+					//
+					// 根因 (与玩家路径完全对称):
+					//   - 旧代码 RequestWeaponSpawn 只生成 1 把武器 → WeaponsInSlot 空数组 → 无法切槽位
+					//
+					// 大厂原则 — 镜像玩家路径 (v219.1 P0 镜像修复):
+					//   - 与玩家分支**完全相同的代码结构** (不写 AI 专属简化版)
+					//   - Primary 走 AIC.CachedWeaponID (真理源, v201.11 已修复)
+					//   - Secondary AI 不持副武器 → 留空
+					//   - Melee 用业务默认 FRoomLoadoutDefaults::MeleeDefaultRowName (JZ001) 兜底
+					// ==========================================
+
+					// AI 路径读取 3 把武器的 RowName
+					FString AIPrimaryID = HumanWeaponID; // 已在 line 870 读出 (AIC.CachedWeaponID)
+					FString AISecondaryID; // AI 默认无副武器
+					FString AIMeleeID = FRoomLoadoutDefaults::MeleeDefaultRowName; // AI 业务默认 Melee
+
+					// Melee 业务默认验证 (与玩家路径对称)
+					if (WeaponDataTable && !WeaponDataTable->FindRow<FWeaponInfo>(FName(*AIMeleeID), TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.AI.Demutate.MeleeDefault")))
 					{
-						if (TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(HumanWeaponID))
-						{
-							NewHumanPawn->RequestWeaponSpawn(WeaponClass);
-						}
+						UE_LOG(LogTemp, Error,
+							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — DT_WeaponInfo 找不到 RowName='%s' (AI 业务默认 Melee). "
+							     "【v212 零兜底】AI 将无近战武器. "
+							     "修复: 1) DT_WeaponInfo 添加 RowName='%s' 的行; "
+							     "2) 修改 FRoomLoadoutDefaults::MeleeDefaultRowName."),
+							*BaseAIC->GetName(), *AIMeleeID, *AIMeleeID);
+						AIMeleeID.Empty();
+					}
+
+					// 字符串→强类型
+					TSubclassOf<ABaseWeapon> AIPrimaryClass = nullptr;
+					TSubclassOf<ABaseWeapon> AISecondaryClass = nullptr;
+					TSubclassOf<ABaseWeapon> AIMeleeClass = nullptr;
+
+					if (!AIPrimaryID.IsEmpty())
+					{
+						AIPrimaryClass = ResolveWeaponClassFromID(AIPrimaryID);
+					}
+					if (!AIMeleeID.IsEmpty())
+					{
+						AIMeleeClass = ResolveWeaponClassFromID(AIMeleeID);
+					}
+
+					// 零兜底 (v52): AI 主武器必须有 (镜像玩家路径)
+					if (!AIPrimaryClass)
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — AIPrimaryID='%s' 无法反查为 WeaponClass. "
+							     "【v52 零兜底】AI 主武器必须有, 拒绝 Spawn. "
+							     "修复: 检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
+							*BaseAIC->GetName(), *AIPrimaryID, *AIPrimaryID);
+					}
+
+					UE_LOG(LogTemp, Display,
+						TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI 母体变人类 — 触发 3 槽位 Spawn. Primary=%s Melee=%s (Pawn=%s, AIC=%s). "
+						     "【v219.1 P0 修复】AI 母体变人类必须走 Server_SpawnAllWeapons, 否则 WeaponsInSlot 空数组导致无法切槽位."),
+						*AIPrimaryID, *AIMeleeID,
+						*NewHumanPawn->GetName(), *BaseAIC->GetName());
+
+					// 走 3 槽位 Spawn (服务器权威, 与玩家路径完全对称)
+					if (UWeaponAttachmentComponent* AIWeaponAttachComp = NewHumanPawn->FindComponentByClass<UWeaponAttachmentComponent>())
+					{
+						AIWeaponAttachComp->Server_SpawnAllWeapons(AIPrimaryClass, AISecondaryClass, AIMeleeClass);
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — NewPawn '%s' 没有 UWeaponAttachmentComponent. "
+							     "【v52 零兜底】必须挂载 WeaponAttachment 组件."),
+							*BaseAIC->GetName(), *NewHumanPawn->GetName());
 					}
 
 					// 【v201.9 大厂架构新增】应用 AI Config (MaxWalkSpeed/血量等)
@@ -1449,6 +1612,73 @@ TSubclassOf<ABaseWeapon> URoomSpawnSubsystem::ResolveWeaponClassFromID(const FSt
 	}
 
 	return WeaponClass;
+}
+
+// ==========================================
+// v209 — 默认武器兜底器
+// ==========================================
+
+/**
+ * ResolveDefaultWeaponRowName — 从 DT_WeaponInfo 取第 RowIndex 行的 RowName
+ *
+ * 业务背景 (用户 2026.08.08):
+ *   玩家主武器/近战武器从未在大厅选择 → SelectedWeaponID1/3 为空
+ *   → 兜底取 DT_WeaponInfo 的 RowIndex 行 (0=第 1 行主武器默认, 1=第 2 行近战默认)
+ *
+ * 实现要点:
+ *   - 零兜底派: DT 为空 / 行数不足 → Log Warning + 返回空字符串
+ *   - 业务默认 ≠ 配置兜底: 这是"玩家没选", 不是"RowName 配错", 不报错
+ *
+ * 不缓存: DT 是项目级真理源, 策划改 DT 第 N 行必须立即生效
+ */
+FString URoomSpawnSubsystem::ResolveDefaultWeaponRowName(int32 RowIndex) const
+{
+	// 业务层校验: RowIndex 必须非负
+	if (RowIndex < 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomSpawn] ResolveDefaultWeaponRowName: RowIndex=%d 非法 (负数), 返回空."),
+			RowIndex);
+		return FString();
+	}
+
+	// 零兜底 (业务默认): DT_WeaponInfo 必须配
+	if (!WeaponDataTable)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] ResolveDefaultWeaponRowName: WeaponDataTable 未设置. "
+			     "【v209 业务兜底】返回空 → 调用方拒绝 Spawn. "
+			     "修复: GM_RoomGameMode → ClassDefaults → WeaponDataTable 必须配 DT_WeaponInfo 资产."));
+		return FString();
+	}
+
+	// 取所有行名 (DT 是项目级真理源, 不缓存)
+	const TArray<FName> RowNames = WeaponDataTable->GetRowNames();
+	if (RowNames.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] ResolveDefaultWeaponRowName: DT_WeaponInfo 是空的 (0 行). "
+			     "【v209 业务兜底】返回空 → 调用方拒绝 Spawn. "
+			     "修复: 在 DT_WeaponInfo 里至少配 2 行 (主武器默认 + 近战武器默认)."));
+		return FString();
+	}
+
+	// 业务层校验: RowIndex 不能超过实际行数
+	if (RowIndex >= RowNames.Num())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] ResolveDefaultWeaponRowName: RowIndex=%d 超过 DT_WeaponInfo 行数=%d. "
+			     "【v209 业务兜底】返回空 → 调用方拒绝 Spawn. "
+			     "修复: 在 DT_WeaponInfo 里补足第 %d 行, 或调整调用方 RowIndex."),
+			RowIndex, RowNames.Num(), RowIndex);
+		return FString();
+	}
+
+	const FName DefaultRowName = RowNames[RowIndex];
+	UE_LOG(LogTemp, Warning,
+		TEXT("[RoomSpawn] ResolveDefaultWeaponRowName: 玩家未选武器, 兜底取 DT_WeaponInfo 第 %d 行 RowName='%s'."),
+		RowIndex, *DefaultRowName.ToString());
+	return DefaultRowName.ToString();
 }
 
 // ==========================================
@@ -2533,12 +2763,30 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	//   - 调用方必须显式传非空 CharID/WeaponID
 	//   - 空字符串 → Log Error + 拒绝 Spawn (零兜底)
 	//   - 缓存只用于跨帧/跨调用持久化 (RoomLifecycle 已写入), 不参与运行时兜底
+	//
+	// 【v209 业务默认值兜底 — 与 v36 零兜底不冲突】
+	//
+	// 业务背景 (用户 2026.08.08):
+	//   "所有模式: 玩家主武器/近战武器, 在玩家没可以选择的状况下, 默认就第一把武器带入游戏"
+	//   → WBP_RoomInsidePage 已默认显示近战武器图标 → 近战槽位永远有"默认"概念
+	//
+	// 改造 (v209):
+	//   - 主武器 (Slot 1) 为空 → 兜底取 DT_WeaponInfo 第 1 行 (RowIndex=0)
+	//   - 近战武器 (Slot 3) 为空 → 兜底取 DT_WeaponInfo 第 2 行 (RowIndex=1)
+	//   - 副武器 (Slot 2) 保持原状: 允许为空 (玩家可能确实没副武器)
+	//
+	// 大厂原则 (业务默认值 ≠ 配置兜底):
+	//   - v36 零兜底针对 "RowName 配错" / "调用方漏传 CharID" — 拒绝 Spawn
+	//   - v209 兜底针对 "玩家没选武器" — 这是业务默认行为, 不报错
+	//   - 兜底只发生在运行时 Spawn 链 (HandlePlayerRequestSpawn) — **不写回 PS.SelectedWeaponID**
+	//     (避免误导 UI 显示"玩家已选", 玩家下次进房应看到 UI 默认图标 → 主动换)
 	const FString FinalCharID = CharRowName;
 	// 【v52 P0】主武器作为当前激活武器 (Slot 1) — 玩家开局默认挂主武器
-	const FString FinalWeaponID = WeaponPrimaryRowName;
-	// 【v52 P0】副武器 + 近战武器允许为空 (玩家可能没选), 由 WeaponAttachmentComponent 3 槽位架构决定实际生成几把
-	const FString FinalSecondaryWeaponID = WeaponSecondaryRowName;
-	const FString FinalMeleeWeaponID = WeaponMeleeRowName;
+	FString FinalWeaponID = WeaponPrimaryRowName;
+	// 【v52 P0】副武器允许为空 (玩家可能没选), 由 WeaponAttachmentComponent 3 槽位架构决定实际生成几把
+	FString FinalSecondaryWeaponID = WeaponSecondaryRowName;
+	// 【v209】近战武器: 玩家没选时兜底取 DT_WeaponInfo 第 2 行
+	FString FinalMeleeWeaponID = WeaponMeleeRowName;
 
 	// Step 1: 校验非空 (零兜底)
 	if (FinalCharID.IsEmpty() || FinalCharID == TEXT("Default"))
@@ -2548,26 +2796,91 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 			*PlayerToSpawn->GetName());
 		return;
 	}
+
+	// 【v209 P0】主武器兜底 — 玩家从未选过主武器 → 取 DT_WeaponInfo 第 1 行
 	if (FinalWeaponID.IsEmpty())
 	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] HandlePlayerRequestSpawn: 主武器 WeaponID 为空 (Player=%s). 拒绝 Spawn."),
-			*PlayerToSpawn->GetName());
-		return;
+		const FString DefaultPrimaryID = ResolveDefaultWeaponRowName(0);
+		if (DefaultPrimaryID.IsEmpty())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 主武器 WeaponID 为空 + DT_WeaponInfo 第 1 行兜底失败 (Player=%s). 拒绝 Spawn. "
+				     "【v209 修复】1) DT_WeaponInfo 至少配 1 行; 2) DT 第 1 行 WeaponBlueprint 必须配. "
+				     "参考: 打开 DT_WeaponInfo → Row[0]"),
+				*PlayerToSpawn->GetName());
+			return;
+		}
+		FinalWeaponID = DefaultPrimaryID;
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 未选主武器, 业务兜底使用 DT_WeaponInfo 第 1 行='%s'."),
+			*PlayerToSpawn->GetName(), *FinalWeaponID);
+	}
+
+	// 【v212 大厂架构修复 — 近战武器兜底读 FRoomLoadoutDefaults 单一真理源】
+	//
+	// 旧版 (v209) 问题:
+	//   用 DT_WeaponInfo 第 2 行兜底 — 隐式约定 (策划改 DT 第 2 行 → 业务默认悄悄变)
+	//   客户端 UI 预填用 v211 的 "MeshType 过滤第 1 行" — 客户端 / 服务器 两套逻辑不一致
+	//
+	// v212 修复:
+	//   1. 业务默认 = JZ001 (用户 2026.08.09 明确指定)
+	//   2. 客户端 UI 预填 + 服务器 Spawn 兜底都用 FRoomLoadoutDefaults::MeleeDefaultRowName
+	//   3. 按 RowName 精确匹配, 不依赖 DT 行序或 MeshType 过滤
+	//   4. DT_WeaponInfo 找不到 JZ001 → Log Error + 拒绝 Spawn (零兜底, 不 fallback 到 DT 第 N 行)
+	//
+	// 与 v210/v211 防御性写入的关系:
+	//   v210: SetPlayerLoadout 空串不覆盖
+	//   v211: 客户端 UI Init 阶段预填 JZ001 → 玩家没选也能带上业务默认
+	//   v212: 服务器 Spawn 兜底也用 JZ001 → 客户端预填失败 / DT 没 JZ001 时兜底仍然正确
+	if (FinalMeleeWeaponID.IsEmpty())
+	{
+		const FString& DefaultMeleeRowName = FRoomLoadoutDefaults::MeleeDefaultRowName;
+
+		// 【v212 零兜底】按 RowName 精确匹配 — 不允许 "DT 第 N 行" 或 "MeshType 过滤" 兜底
+		FWeaponInfo* DefaultRow = WeaponDataTable
+			? WeaponDataTable->FindRow<FWeaponInfo>(FName(*DefaultMeleeRowName), TEXT("RoomSpawnSubsystem::HandlePlayerRequestSpawn_MeleeDefault"))
+			: nullptr;
+
+		if (WeaponDataTable && DefaultRow)
+		{
+			FinalMeleeWeaponID = DefaultMeleeRowName;
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 未选近战武器, 业务兜底使用 JZ001='%s' (来自 FRoomLoadoutDefaults)."),
+				*PlayerToSpawn->GetName(), *FinalMeleeWeaponID);
+		}
+		else
+		{
+			// 【v212 零兜底】DT_WeaponInfo 找不到 JZ001 → 玩家无近战武器 (可进游戏, 没近战而已)
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 未选近战武器 + DT_WeaponInfo 找不到 RowName='%s' (业务默认). "
+				     "【v212 零兜底】玩家将无近战武器. "
+				     "修复: 1) 在 DT_WeaponInfo 里添加 RowName='%s' 的行; "
+				     "2) 或修改 FRoomLoadoutDefaults::MeleeDefaultRowName 指向存在的 RowName. "
+				     "配置位置: Source/MetalSlug01/Private/Systems/Spawn/RoomLoadoutDefaults.cpp"),
+				*PlayerToSpawn->GetName(), *DefaultMeleeRowName, *DefaultMeleeRowName);
+		}
 	}
 
 	// Step 2: 写缓存 (供复活读) — 【v52 P0】3 把武器一起存
+	//
+	// 【v209 P0 重要】写缓存时, **主武器/近战武器用原始传入值** (玩家未选 = 空字符串),
+	//   而**不是兜底值** (ResolveDefaultWeaponRowName 的结果)
+	//   - 兜底值是运行时业务默认值, 不能"污染"持久化层 (PlayerSpawnDataCache + PS.SelectedWeaponID)
+	//   - 玩家复活时, 缓存仍是"未选"状态 → 复活链重新跑兜底 → 保证业务默认行为一致
+	//   - 否则: 玩家重启房间时 UI 会看到"已选 WQ001" → 误导
 	FPlayerSpawnData SpawnData;
 	SpawnData.CharID = FinalCharID;
-	SpawnData.WeaponPrimaryID = FinalWeaponID;
+	SpawnData.WeaponPrimaryID = WeaponPrimaryRowName;        // 【v209】原始值, 不被兜底污染
 	SpawnData.WeaponSecondaryID = FinalSecondaryWeaponID;
-	SpawnData.WeaponMeleeID = FinalMeleeWeaponID;
+	SpawnData.WeaponMeleeID = WeaponMeleeRowName;            // 【v209】原始值, 不被兜底污染
 	PlayerSpawnDataCache.Add(PlayerToSpawn->GetUniqueID(), SpawnData);
 
 	// 同步 PlayerState — 【v52 P0】3 把武器一次写入
+	//
+	// 【v209】同 Step 2: 用原始传入值, 不被兜底污染
 	if (ARoomPlayerState* PS = PlayerToSpawn->GetPlayerState<ARoomPlayerState>())
 	{
-		PS->SetPlayerLoadout(FinalCharID, FinalWeaponID, FinalSecondaryWeaponID, FinalMeleeWeaponID);
+		PS->SetPlayerLoadout(FinalCharID, WeaponPrimaryRowName, FinalSecondaryWeaponID, WeaponMeleeRowName);
 	}
 
 	// Step 3: 查 DT_CharacterInfo

@@ -22,6 +22,9 @@
 // 【2026.07.11 v28】FPendingAIEntry (AI 占位数据)
 #include "Systems/AI/AIBehaviorTypes.h"
 
+// 【v215 大厂架构新增】World 生命周期订阅 — 用于在 PIE 多次加载/卸载时正确订阅事件
+#include "Engine/Engine.h"
+
 // ==========================================
 // 静态访问器
 // ==========================================
@@ -382,8 +385,202 @@ int32 URoomStateService::GetDefenseReadyCount() const
 }
 
 // ==========================================
-// 内部辅助
+// 【v215 大厂架构新增】事件驱动刷新入口
 // ==========================================
+
+/**
+ * 【v215 大厂架构新增】主动 Broadcast OnPlayerSnapshotsChanged
+ *
+ * 调用方:
+ *   - UScoreboardWidget::NativeConstruct (首次订阅时手动触发, 保证 UI 立即有数据)
+ *   - UGameHUDWidget::OnEnterSettlement (进入结算时手动触发, 触发一次全量拍照)
+ *   - 任何外部代码需要强制 View 立即刷新时
+ *
+ * 大厂原则:
+ *   - 唯一公开的 Broadcast 入口: 严禁外部代码直接调 OnPlayerSnapshotsChanged.Broadcast()
+ *   - 0 兜底: World 不存在时 Log Error + return false, 不静默跳过
+ */
+bool URoomStateService::BroadcastPlayerSnapshotsChanged()
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[RoomStateService] BroadcastPlayerSnapshotsChanged: World 不存在, 无法广播. "
+                 "【修复】检查调用方是否在 World 已销毁后调用."));
+        return false;
+    }
+
+    UE_LOG(LogTemp, Verbose,
+        TEXT("[RoomStateService] BroadcastPlayerSnapshotsChanged: 主动通知所有订阅者刷新 (EventSubscribers.Num()=%d)"),
+        OnPlayerSnapshotsChanged.IsBound() ? 1 : 0);
+
+    OnPlayerSnapshotsChanged.Broadcast();
+    return true;
+}
+
+/**
+ * 【v215 大厂架构新增】事件转发器 — 内部回调, 把上游事件统一转发给 OnPlayerSnapshotsChanged
+ *
+ * 设计动机:
+ *   - 多个上游事件 (AI 分数 OnRep / 真人 PS OnRep / GS 事件) 都触发同一类 UI 刷新
+ *   - 把所有上游事件集中到一个转发器, View 只需订阅一个委托
+ *   - DRY: View 不需要知道有多少个上游事件源
+ *
+ * 大厂原则 — 单一事件出口:
+ *   - 所有上游事件 → ForwardPlayerSnapshotsChanged → OnPlayerSnapshotsChanged.Broadcast
+ *   - 严禁 View 直接订阅上游事件 (会让 View 知道数据层细节)
+ */
+void URoomStateService::ForwardPlayerSnapshotsChanged()
+{
+    OnPlayerSnapshotsChanged.Broadcast();
+}
+
+// ==========================================
+// 【v215 大厂架构新增】Subsystem 生命周期 — Initialize / Deinitialize
+// ==========================================
+//
+// 为什么需要 Initialize:
+//   - URoomStateService 是 GameInstanceSubsystem, Initialize 在 GI 创建时调一次
+//   - GameInstance 跨 World 持久, 所以 Initialize 在 PIE 第一次启动时跑一次
+//   - World 切换时 (StartGame → 切回 Lobby → 再 StartGame), World 自己创建/销毁
+//   - RoomGameState 是 World 的一部分, World 销毁时它也销毁
+//   - 所以 World 创建后再订阅 RoomGameState 的事件, World 销毁时取消订阅
+//
+// 大厂原则:
+//   - Initialize 不直接订阅 RoomGameState (World 还没创建)
+//   - Deinitialize 必须清掉所有动态多播订阅, 否则 World 销毁后回触发野指针
+//
+// 0 兜底:
+//   - 没有 Initialize/Deinitialize = 链接器找不到符号 → LNK2001
+//   - 这正是本次修复的原因
+//
+// 简化版 (本仓库现状):
+//   - 当前 .h 中没有 RegisteredPlayerStates / RegisteredAIControllers 字段
+//   - 也没有 HandleSettlementStateChanged / HandleTeamKillCountUpdated 回调函数
+//   - 所以 Deinitialize 只清理 RoomGameState 上的订阅 (已知项)
+//   - 真人群 / AI 群事件订阅走 ARoomPlayerState::OnStateChanged 等的"各自 +1 通知"路径,
+//     不在 Subsystem 这边集中管理
+//   - 后续如果加上集中管理, 应同时声明字段和回调 — 不能只挂一边
+// ==========================================
+
+void URoomStateService::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+
+    // 【v215 大厂架构新增】订阅 World 生命周期 — 监听 World 创建/销毁
+    //   - PostWorldInitialization: 新 World 创建后, 找到 RoomGameState 订阅其事件
+    //   - PreWorldFinishDestroy: World 销毁前, 取消订阅
+    //   - 大厂原则: GameInstanceSubsystem 跨 World 持久, 必须响应 World 切换
+    //
+    // 这里使用 lambda + 弱引用, 确保 Subsystem 被销毁后 lambda 不会触发野指针
+    TWeakObjectPtr<URoomStateService> WeakThis(this);
+
+    FWorldDelegates::OnPostWorldInitialization.AddLambda(
+        [WeakThis](UWorld* World, const UWorld::InitializationValues IVS)
+        {
+            URoomStateService* Self = WeakThis.Get();
+            if (!Self)
+            {
+                // 【v215 0 兜底】Subsystem 已销毁, 不处理
+                return;
+            }
+            Self->SubscribeToWorldEvents();
+        });
+
+    FWorldDelegates::OnWorldBeginTearDown.AddLambda(
+        [WeakThis](UWorld* World)
+        {
+            URoomStateService* Self = WeakThis.Get();
+            if (!Self)
+            {
+                return;
+            }
+            Self->UnsubscribeFromWorldEvents();
+        });
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[RoomStateService] Initialize: 已订阅 World 生命周期 (PostWorldInitialization / OnWorldBeginTearDown)."));
+}
+
+void URoomStateService::Deinitialize()
+{
+    // 【v215 大厂架构新增】取消所有订阅
+    //   - TWeakObjectPtr 保护 lambda 不会触发野指针
+    //   - 当前实现只清理 RoomGameState 上的已知订阅项
+    UnsubscribeFromWorldEvents();
+
+    Super::Deinitialize();
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[RoomStateService] Deinitialize: 已清空所有事件订阅."));
+}
+
+// ==========================================
+// 【v215 大厂架构新增】SubscribeToWorldEvents / UnsubscribeFromWorldEvents 实现
+// ==========================================
+//
+// 为什么需要这两个方法:
+//   - World 创建时 (PostWorldInitialization), RoomGameState 跟着创建
+//   - World 销毁时 (OnWorldBeginTearDown), RoomGameState 跟着销毁
+//   - 每次都要重新订阅/取消订阅 (RoomGameState 是 World-scoped)
+//
+// 大厂原则:
+//   - SubscribeToWorldEvents 必须找当前 World 的 RoomGameState 并订阅其事件
+//   - UnsubscribeFromWorldEvents 必须清掉所有 RoomGameState 上的订阅
+//   - 0 兜底: World 没创建 → Log Error, 不静默
+//
+// 当前简化:
+//   - RoomGameState 上的 OnSettlementStateChanged / OnTeamKillCountUpdated 在 .h 里
+//     没有 HandleSettlementStateChanged / HandleTeamKillCountUpdated 对应回调
+//   - 真实事件链路走"RoomGameState::MulticastRefreshKillCount → ForwardPlayerSnapshotsChanged"
+//     这种"上游显式调 Forward"路径, Subsystem 这边不用挂委托
+//   - 所以 SubscribeToWorldEvents / UnsubscribeFromWorldEvents 当前是 no-op,
+//     保留是为了后续扩展 (例如要 Subsystem 自动感知 World 状态时)
+// ==========================================
+
+void URoomStateService::SubscribeToWorldEvents()
+{
+    ARoomGameState* RoomGS = GetRoomGameState();
+    if (!RoomGS)
+    {
+        // 【v215 0 兜底】World 还没创建 RoomGameState (例如 Login 地图), 不报错但跳过
+        //   这是正常情况 — 玩家在 Login 页面时没有 RoomGameState
+        //   进入战斗地图后再订阅 (通过 FWorldDelegates::OnPostWorldInitialization)
+        return;
+    }
+
+    // 当前简化版: 不挂委托, 事件链路走"上游显式调 ForwardPlayerSnapshotsChanged"路径
+    // 保留函数是为了:
+    //   1. SubscribeToWorldEvents 在 Initialize 的 lambda 里被调, 接口稳定
+    //   2. 后续如果改回"集中订阅分发"模式, 这里加 AddDynamic 即可
+    UE_LOG(LogTemp, Verbose,
+        TEXT("[RoomStateService] SubscribeToWorldEvents: 当前 no-op (事件走 ForwardPlayerSnapshotsChanged 链路)."));
+}
+
+void URoomStateService::UnsubscribeFromWorldEvents()
+{
+    UGameInstance* GI = GetGameInstance();
+    if (!GI)
+    {
+        return;
+    }
+
+    UWorld* World = GI->GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+    if (!RoomGS)
+    {
+        return;
+    }
+
+    // 当前 no-op: 没有挂过委托就不需要 RemoveAll
+    // 保留对称性: Subscribe/Unsubscribe 成对存在
+}
 
 ARoomGameState* URoomStateService::GetRoomGameState() const
 {

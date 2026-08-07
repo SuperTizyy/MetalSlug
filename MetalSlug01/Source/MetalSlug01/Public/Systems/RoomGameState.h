@@ -17,6 +17,7 @@
 #include "Data/Enums/RoomEnums.h"
 #include "Systems/AI/AIBehaviorTypes.h"  // 【v46 新增】FPendingAIEntry
 #include "GameplayTagContainer.h" // 【2026.07.10 P0 重构】FGameplayTag 阵营
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h"  // 【v217】FFinalSettlementSnapshot 跨端推送需要
 
 // UE 自动生成的头文件
 #include "RoomGameState.generated.h"
@@ -121,6 +122,19 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnEnterSettlementDelegate, int32
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnShowFinalSettlementDelegate, int32, AttackerWins, int32, DefenderWins);
 
 /**
+ * 【v209 大厂架构新增】结算状态变化委托
+ *
+ * 业务规则 (用户 2026.08.07 明确):
+ *   - 整局游戏完全结束，进入结算页面时，锁定所有玩家和 AI 移动
+ *   - 结算期间不能走动，但结算页面内容正常显示
+ *
+ * 订阅方:
+ *   - BaseCharacter::Move 读取 GameState->bInSettlement 决定是否允许移动
+ *   - AI Controller 也可以订阅此事件来停止移动
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnSettlementStateChangedDelegate, bool, bInSettlement);
+
+/**
  * @class ARoomGameState
  * @brief 房间全局状态类
  *
@@ -170,6 +184,37 @@ public:
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_CurrentMatchMode, BlueprintReadOnly, Category = "Room|Match")
 	ERoomMatchMode CurrentMatchMode = ERoomMatchMode::Melee;
+
+	/**
+	 * 【v209 大厂架构新增】是否处于结算状态
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - 整局游戏完全结束，进入结算页面时，锁定所有玩家和 AI 移动
+	 *   - 结算期间不能走动，但结算页面内容正常显示
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 服务器在 MulticastEnterSettlement 时设置为 true
+	 *   - 服务器在返回大厅时设置为 false
+	 *   - BaseCharacter::Move 读取此字段决定是否允许移动
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 结算状态必须显式设置，不允许静默跳过
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_bInSettlement, BlueprintReadOnly, Category = "Room|Settlement")
+	bool bInSettlement = false;
+
+	UFUNCTION()
+	void OnRep_bInSettlement();
+
+	/**
+	 * 【v209 大厂架构新增】服务器专用：设置结算状态
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - MulticastEnterSettlement 时调用，设置 bInSettlement=true
+	 *   - 返回大厅时调用，设置 bInSettlement=false
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement")
+	void SetSettlementState(bool bInSettlementState);
 
 	/**
 	 * 【v93 新增】客户端接到房间模式同步时的回调
@@ -684,6 +729,12 @@ public:
 	FOnShowFinalSettlementDelegate OnShowFinalSettlement;
 
 	/**
+	 * 【v209 大厂架构新增】结算状态变化广播
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement")
+	FOnSettlementStateChangedDelegate OnSettlementStateChanged;
+
+	/**
 	 * 服务器专用: 执行当局结算（由 RoomGameMode 在倒计时归零时调用）
 	 * 内部自动完成: 判断胜负 -> 累加胜局数 -> 广播进入结算 -> 延迟3秒广播最终结果
 	 */
@@ -750,10 +801,14 @@ public:
 	 * 不破坏刀战模式:
 	 *   - 刀战永不调本函数, RPC 永远不发
 	 *
+	 * 【v210.4 大厂架构重构 — 升级为传 FSoftObjectPath】
+	 *   旧签名: MulticastPlayZombieRoundSound(EZombieRoundWinner)
+	 *   新签名: MulticastPlayZombieRoundSound(EZombieRoundWinner, const FSoftObjectPath&)
+	 *   见下方声明 (新签名在 829 行附近, 已替换旧)
+	 *
 	 * @param InRoundWinner 本小局赢家 (必须为 Human 或 Mother, 不允许 None)
 	 */
-	UFUNCTION(NetMulticast, Reliable)
-	void MulticastPlayZombieRoundSound(EZombieRoundWinner InRoundWinner);
+	// 【v210.4】旧声明已删除, 新声明见下方 "服务器 → 所有客户端的小局结束音效 RPC" 段
 
 	/**
 	 * 客户端拿到小局音效 RPC 时的回调 (由 _Implementation 内部 Broadcast)
@@ -778,43 +833,52 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
 	FOnRoundWinnerUpdated OnZombieRoundBriefResult;
 
-	// 【v210.2 大厂架构重构】音效资产缓存 (解决客户端无 AuthGameMode 问题)
-	//   - 根因: 客户端 World->GetAuthGameMode() 返回 nullptr
-	//   - 修复: 服务器在初始化时缓存音效资产到 GameState (GameState 在所有机器都存在)
-	//   - GameState.Replicate 字段会自动复制到所有客户端
-	//   - 客户端可以直接访问, 无需查 GameMode
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Settlement|Zombie|Sound")
-	USoundBase* CachedZombieHumanWinSound;
+	// 【v210.4 大厂架构重构 — 删除重复音效缓存】
+	//   旧 v210.2: USoundBase* CachedZombieHumanWinSound + UPROPERTY(Replicated)
+	//   旧 v210.3: TSoftObjectPtr<USoundBase> CachedZombieHumanWinSound + UPROPERTY(Replicated)
+	//   两者都是"GM → GS 复制 + Replicate"反模式, 且:
+	//     - InitGameState 有 4 处 early-return 跳过 CacheZombieRoundSounds (实际 0% 调用成功)
+	//     - SetCurrentMatchMode 补救路径只补 TotalRounds, 不补音效
+	//     - 即使注入成功, Replicated UObject* / TSoftObjectPtr 在 UE 5.6 中仍可能 GC 误删
+	//   新 v210.4: 唯一真理源 = GameMode->ZombieHumanWinSound (策划唯一配置点)
+	//   音效通过 RPC FSoftObjectPath 跨网络传输 (UE 5.6 标准, GC 安全, 单一真理源)
 
-	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Room|Settlement|Zombie|Sound")
-	USoundBase* CachedZombieMotherWinSound;
+	// 【v210.4 已废弃 — 旧 API 标记】
+	//   调用方已全部改为 RPC + LoadSynchronous, 这些 API 不再被调用
+	//   保留 inline 实现避免链接错误, 函数体永远返回 nullptr (零兜底)
+	UE_DEPRECATED(5.6, "v210.4: 音效已上移至 GameMode, 走 RPC FSoftObjectPath 路径")
+	USoundBase* GetZombieRoundEndSound(EZombieRoundWinner /*InRoundWinner*/) const { return nullptr; }
 
-	/**
-	 * 【v210.2 大厂架构重构】获取小局结束音效 (客户端/服务器通用)
-	 *
-	 * 大厂原则 — 单一体真理源:
-	 *   - 音效资产从 GameState 缓存读取 (GameState 在所有机器都存在)
-	 *   - 替代旧的 GameMode.ResolveZombieRoundEndSound (客户端无 AuthGameMode)
-	 *
-	 * @param InRoundWinner 本小局赢家
-	 * @return 对应音效资产 (Human → CachedZombieHumanWinSound, Mother → CachedZombieMotherWinSound)
-	 */
-	UFUNCTION(BlueprintPure, Category = "Room|Settlement|Zombie|Sound")
-	USoundBase* GetZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const;
+	UE_DEPRECATED(5.6, "v210.4: 已废弃, 音效不再复制到 GS")
+	void CacheZombieRoundSounds(USoundBase* /*InHumanSound*/, USoundBase* /*InMotherSound*/) {}
 
 	/**
-	 * 【v210.2 大厂架构重构】服务器初始化时缓存音效资产 (供 Replicate)
+	 * 【v210.4 大厂架构重构】服务器 → 所有客户端的小局结束音效 RPC
 	 *
-	 * 大厂原则 — 服务器权威:
-	 *   - 仅服务器可调用 (HasAuthority 校验)
-	 *   - 从 GameMode 复制音效资产到 GameState 缓存字段
-	 *   - 引擎自动 Replicate 到所有客户端
+	 * 大厂原则 — RPC 纯数据 (UE 5.6 UObject 指针跨网络限制):
+	 *   - 不传 USoundBase* (UE 5.6 GC 误删 + Replicated 裸指针不可靠, 已确认 v210.2/v210.3 路径均失效)
+	 *   - 传 FSoftObjectPath (UE 5.6 标准 Replicate 资产路径方式, GC 安全, 跨网络稳定)
+	 *   - 服务器调用前从 GM->ZombieHumanWinSound / ZombieMotherWinSound 转 FSoftObjectPath
+	 *   - 客户端 Implementation 调 LoadSynchronous() 加载后 PlaySound2D
 	 *
-	 * @param InHumanSound 人类胜利音效
-	 * @param InMotherSound 母体胜利音效
+	 * 大厂原则 — 单一真理源:
+	 *   - 音效资产只在 GM 配 (策划唯一配置点), GS 不复制不缓存
+	 *   - v210.2 引入的 CachedZombieHumanWinSound + CacheZombieRoundSounds 已废弃 (重复架构, InitGameState 4 处 return 跳过)
+	 *   - v210.3 引入的 TSoftObjectPtr Replicated 已废弃 (GC 误删问题仍存在, 双复制仍是反模式)
+	 *
+	 * @param InRoundWinner 本小局赢家 (Human / Mother)
+	 * @param InSoundPath   对应音效的软引用路径 (服务器从 GM 字段取出, 客户端 LoadSynchronous)
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie|Sound")
-	void CacheZombieRoundSounds(USoundBase* InHumanSound, USoundBase* InMotherSound);
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastPlayZombieRoundSound(EZombieRoundWinner InRoundWinner, const FSoftObjectPath& InSoundPath);
+
+	/**
+	 * 【v210.4 大厂架构重构】小局音效 RPC 实现
+	 *   - 服务器 + 客户端都执行 (UE 5.6 NetMulticast Reliable 在 ListenServer 上服务器自身也会触发 _Implementation)
+	 *   - 内部 LoadSynchronous 加载 SoundPath → PlaySound2D
+	 *   - 加载失败 → Log Error (零兜底, 强制修复 BP 资产配置)
+	 */
+	void PlayZombieRoundSoundFromPath_Implementation(EZombieRoundWinner InRoundWinner, const FSoftObjectPath& InSoundPath);
 
 	/**
 	 * 【v200.2 大厂架构修复】从 private 移到这里，允许 LifecycleSubsystem 调用
@@ -828,6 +892,7 @@ public:
 	 * 统一管理 SettlementTimerHandle，避免外部直接访问 private 字段
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Settlement")
+	// 2026.08.08 调整: 8s → 3s (用户要求改回 3 秒)
 	void ScheduleFinalSettlement(float DelaySeconds = 3.0f);
 
 	/**
@@ -918,7 +983,39 @@ private:
 	 * 替代方案: BroadcastFinalSettlement 中的 HasAuthority 检查导致纯客户端进程直接 return
 	 */
 	UFUNCTION(NetMulticast, Reliable)
-	void MulticastShowFinalSettlement(int32 InAttackerWins, int32 InDefenderWins);
+	void MulticastShowFinalSettlement(int32 InAttackerKills, int32 InDefenderWins);
+
+	/**
+	 * 【v217 大厂架构新增】服务器推结算快照给单个客户端
+	 *
+	 * 根因 (v216.x):
+	 *   - MulticastEnterSettlement 是 NetMulticast,服务器 + 所有客户端都在本地执行整个函数体
+	 *   - 客户端从自己的 URoomStateService 拉数据,但客户端 AIC.CachedFactionTag 是空的 (非 Replicated)
+	 *   → 客户端 Snapshot 永远不含 AI → 用户报告"客户端结算页面只显示玩家信息,不显示房间内AI信息"
+	 *
+	 * 修复 (v217):
+	 *   - 服务端是 AI 数据的唯一真理源 (CachedFactionTag 在服务器侧设置)
+	 *   - 服务端在 MulticastEnterSettlement (HasAuthority=true) 时拉数据 + 写本地 SnapshotSubsystem
+	 *   - 然后通过本 RPC (Client_ReceiveSettlementSnapshot) 推给每个客户端
+	 *   - 客户端收到后调 WriteSnapshot 到自己本地的 USettlementSnapshotSubsystem
+	 *   - 客户端的 MulticastEnterSettlement (HasAuthority=false) 不再写 Snapshot,只广播 OnEnterSettlement 事件
+	 *
+	 * 大厂原则 — RPC 单一真理源:
+	 *   - Server 推 RPC 数据是 UE 5.x 标准网络模式 (NetMulticast 不带大对象, Client RPC 适合点对点大对象)
+	 *   - 客户端从不"自己拉",避免 AIC.CachedFactionTag 非 Replicated 导致的客户端空数据
+	 *   - 0 兜底: 客户端 GameInstance/Subsystem 拿不到 → Log Error + return, 不静默丢弃
+	 *
+	 * 时序 (v217):
+	 *   - t=0: 服务端 MulticastEnterSettlement 拉全数据 + 写本地 Snapshot + 遍历所有客户端 PC 调本 RPC
+	 *   - t=0: 服务端 MulticastEnterSettlement 推 NetMulticast (各端广播 OnEnterSettlement)
+	 *   - t=0+: 各客户端收到 Client_ReceiveSettlementSnapshot → WriteSnapshot 到本地 Subsystem
+	 *   - t=3s: OpenLevel 切图到 L_Login
+	 *   - t=3s+: UScoreboardWidget 构造时 ConsumeSnapshot → ApplySnapshot
+	 *
+	 * 注意: Client_ReceiveSettlementSnapshot 的 UFUNCTION 声明在 ARoomPlayerController 上
+	 *   - 因为 UE 5.6 Client RPC 必须由 Owner PC 接收 → 必须在 PC 类上声明
+	 *   - 服务器在 MulticastEnterSettlement 里遍历 PC 列表 → 对每个 PC 调 RC->Client_ReceiveSettlementSnapshot
+	 */
 
 	/**
 	 * 结算定时器句柄（持久化，避免局部变量在延迟期间失效）

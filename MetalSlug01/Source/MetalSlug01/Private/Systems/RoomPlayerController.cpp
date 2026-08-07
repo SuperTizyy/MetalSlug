@@ -76,6 +76,9 @@
 // 引入房间 PlayerState（用于读写玩家个人数据）
 #include "Systems/Core/RoomPlayerState.h"
 
+// 【v217 大厂架构新增】USettlementSnapshotSubsystem (Client_ReceiveSettlementSnapshot 写入)
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h"
+
 
 // ==========================================
 // 1. 生命周期
@@ -170,6 +173,54 @@ void ARoomPlayerController::BeginPlay()
 			}
 		}
 
+		// ==========================================
+		// 【v211 大厂架构新增】订阅结算状态变化（让结算页面可点击按钮）
+		// ==========================================
+		// 业务规则 (用户 2026.08.07 明确):
+		//   - 进入结算页面时, 必须显示鼠标 + UIOnly 输入
+		//     → 玩家才能点击结算页面按钮 (返回大厅/再来一局)
+		//   - 离开结算时, 恢复 GameOnly 输入 + 隐藏鼠标
+		//
+		// 单一真理源: ARoomGameState::bInSettlement (Replicated, 服务器权威)
+		//   - 服务器: MulticastEnterSettlement → SetSettlementState(true) → Broadcast
+		//   - 客户端: 同样的 Multicast 路径, OnRep_bInSettlement 也会触发 Broadcast
+		//   - 离开: ExecuteLeaveRoom → SetSettlementState(false) → Broadcast
+		//
+		// 时序竞争 (与 OnFlowStateChanged 类似):
+		//   - MulticastEnterSettlement 可能在我们 BeginPlay 之前就触发了
+		//   - 订阅晚了 → 永远不会知道已进入结算
+		//   - 解决: 订阅同时检查当前 bInSettlement, 自我同步一次
+		//
+		// 仅本地订阅 (与 OnFlowStateChanged 一致):
+		//   - Dedicated Server 端 Controller 不渲染 UI, 不需要切输入模式
+		//   - 但 Server 是权威源, SetSettlementState 也是 Server 触发
+		//   - Server 端 PC 不订阅 = 不必收回调, 但需要确保 Server 走 GameOnly
+		//     (Server 端默认就是 GameOnly, 不订阅无害)
+		// ==========================================
+		if (UWorld* World = GetWorld())
+		{
+			if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+			{
+				// 1. 订阅 (单入口, 集中处理)
+				RoomGS->OnSettlementStateChanged.AddDynamic(this, &ARoomPlayerController::HandleSettlementStateChanged);
+
+				// 2. 自我同步 (修复订阅晚于广播的时序竞争)
+				//    0 兜底: 必须先确认 GameState 存在, 否则不强行同步
+				if (RoomGS->bInSettlement)
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[RoomPC::BeginPlay] 自我同步: bInSettlement=true, 主动调 HandleSettlementStateChanged(true) (修复订阅晚于广播的时序竞争)"));
+					HandleSettlementStateChanged(true);
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[RoomPC::BeginPlay] 【v211】GameState 不是 ARoomGameState, 跳过结算状态订阅 (将无法响应结算页面 UI 输入切换). World=%s"),
+					*World->GetName());
+			}
+		}
+
 		// 延迟 2 秒再发玩家信息（等待底层网络连接稳固 + 存档读取完成）
 		FTimerHandle DelayHandle;
 		GetWorld()->GetTimerManager().SetTimer(DelayHandle, this, &ARoomPlayerController::DelayedSendPlayerInfo, 2.0f, false);
@@ -207,11 +258,33 @@ void ARoomPlayerController::DelayedSendPlayerInfo()
 			const FAccountRecord* MyRecord = Repo->FindRecord(MyName);
 			if (MyRecord)
 			{
-			// 【修复 1】: 直接呼叫自身的 RPC，将初始数据推送到服务器！
+			// 【修复 1】: 同步存档 Loadout 到服务器
 			// 【v52 P0 扩展 3 槽位】主武器 + 副武器 + 近战武器
 			// 【Q8 决策】存档层不持久化第 3 把武器 (避免存档迁移问题)
-			//   第 3 把武器由大厅运行期玩家手动选, 不从存档读
-			Server_SelectLoadout(MyRecord->LastSelectedCharacter, MyRecord->LastSelectedWeapon1, MyRecord->LastSelectedWeapon2, TEXT(""));
+			//   第 3 把武器由大厅运行期玩家手动选, 不从存档读 — 所以这里传空串
+			//
+			// 【v210 大厂架构修复】走 RoomService 门面 (UI/Controller 不直调 RPC, 统一出口)
+			//   真正的修复点在 ARoomPlayerState::SetPlayerLoadout (防御性写入):
+			//     - W3 空串 + PS.SelectedWeaponID3 已有值 → 保留玩家已选 (不覆盖)
+			//     - W3 空串 + PS.SelectedWeaponID3 也空   → 写入空串 (玩家没选, Spawn 阶段走 v209 兜底)
+			//
+			// 修复后流程 (用户 2026.08.09 BUG):
+			//   玩家大厅手动选近战 → SyncLoadoutToServer → PS.SelectedWeaponID3 = "WQ003" ✅
+			//   玩家退房/重连 → PostLogin → DelayedSendPlayerInfo → RoomService.RequestSelectLoadout
+			//     → Server_SelectLoadout_Implementation → SetPlayerLoadout 防御性写入 → 保留 "WQ003" ✅
+			//   进游戏 → Spawn 阶段读 PS.SelectedWeaponID3 = "WQ003" → 玩家选过的近战武器 ✅
+			if (URoomService* RoomService = URoomService::Get(this))
+			{
+				RoomService->RequestSelectLoadout(
+					MyRecord->LastSelectedCharacter,
+					MyRecord->LastSelectedWeapon1,
+					MyRecord->LastSelectedWeapon2,
+					TEXT("")); // W3 存档层不持久化 (Q8 决策), SetPlayerLoadout 防御性写入保留玩家运行时已选
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[Room] DelayedSendPlayerInfo: RoomService 不可用, 跳过 Loadout 同步"));
+			}
 			}
 			else
 			{
@@ -390,27 +463,46 @@ void ARoomPlayerController::Server_RequestChangeTeam_Implementation(bool bToAtta
  *
  * 玩家点击"离开房间"按钮时调用
  * 两种情况:
- *   A) 房主: 遍历所有人发 Client_ForceLeaveRoom, 0.5s 后自己也走
+ *   A) 房主 (服务器): 只处理服务器自身 (从 PlayerArray 移除, 自己 OpenLevel 回大厅)
  *   B) 普通玩家: 通知服务器 + 自己立刻走
+ *
+ * 【v215 大厂架构重构 — Bug #2 修复: 房主退出不再强制踢其他客户端】
+ *   历史 (v22-v213):
+ *     - 房主点 ReturnToLobby → 遍历所有客户端 → Client_ForceLeaveRoom → 强制踢
+ *     - 这违反用户业务规则: "结算页面是独立的最终快照, 房主退出不影响其他客户端"
+ *   新 (v215):
+ *     - 房主只处理自己: Server_LeaveRoom() + ExecuteLeaveRoom() (自己回大厅)
+ *     - 其他客户端继续保留结算页面显示, 直到他们各自点 ReturnToLobby
+ *     - 大厂原则 — 各客户端独立:
+ *       * 房主退房 ≠ 解散房间
+ *       * 房间的"逻辑生命周期" = 最后一个人离开 (服务器自动清理)
+ *       * 客户端的"UI 生命周期" = 各自点 ReturnToLobby
+ *       * 两者解耦, 不允许房主用 Server 权限强行踢其他客户端 UI
+ *
+ * 重要: 客户端进入结算页时已经被视为"退房状态" (用户业务规则 2026.08.07)
+ *   - SettlementPage 是 final snapshot, 与房间连接解耦
+ *   - 房主退出后, 其他客户端的 Server_LeaveRoom 也得调用 — 但 Server_LeaveRoom
+ *     不会被房主的 LeaveRoom 触发, 因为他们没点按钮
+ *   - 他们点自己的 ReturnToLobby 时, 走 Server_LeaveRoom + ExecuteLeaveRoom
  */
 void ARoomPlayerController::LeaveRoom()
 {
 	// 【情况 A】: 如果我是房主 (服务器端拥有最高权限)
 	if (HasAuthority())
 	{
-		// 1. 遍历房间里所有人，给其他玩家发"遣散令"
-		for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
-		{
-			ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get());
-			// 如果这个控制器存在，并且不是房主自己，就命令他退房！
-			if (PC && PC != this)
-			{
-				PC->Client_ForceLeaveRoom();
-			}
-		}
+		// 【v215 大厂架构 Bug #2 修复】
+		//   房主退出不再遍历其他客户端发 Client_ForceLeaveRoom
+		//   房主只处理自己: 把自己从 PlayerArray 移除 + 自己回大厅
+		//   其他客户端继续保留结算页面, 直到他们各自点 ReturnToLobby
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomPlayerController] LeaveRoom[Host]: 房主离开房间, 不再强制踢其他客户端 "
+			     "(【v215 Bug #2 修复】各客户端独立退出)."));
 
-		// 2. 给遣散令 0.5 秒的网络传输时间，然后房主自己再走
-		GetWorld()->GetTimerManager().SetTimer(HostLeaveTimer, this, &ARoomPlayerController::ExecuteLeaveRoom, 0.5f, false);
+		// 房主自己也要走 Server_LeaveRoom (从 PlayerArray 移除自己)
+		Server_LeaveRoom();
+
+		// 房主自己回大厅
+		ExecuteLeaveRoom();
 	}
 	// 【情况 B】: 如果我是普通客户端玩家
 	else
@@ -464,79 +556,60 @@ void ARoomPlayerController::Client_ForceLeaveRoom_Implementation()
  *
  * 单一大厂铁律: 跨地图的意图必须放在跨地图持久的层 (Subsystem), 不能放在即将销毁的 Actor (PC) 上
  */
+/**
+ * ExecuteLeaveRoom
+ *
+ * 【v217 大厂架构重构 — 单一入口】ARoomPlayerController 收到 Server_LeaveRoom 后的服务器侧执行
+ *
+ * 之前 (v22-v216.x) 的职责:
+ *   1. SetSettlementState(false)
+ *   2. SessionManager->DestroyRoom
+ *   3. RequestStateOnNextLoad(MainLobby)
+ *   4. OpenLevel(L_Login, ?offline)
+ *   5. PostLoadMapWithWorld Lambda 兜底
+ *   - 大问题: 跟 URoomService::RequestLeaveRoom 完全重复, 两个入口两套实现, 易漂移
+ *
+ * v217 重构: 委托给 URoomService 单一入口
+ *   - 所有"离开房间"的逻辑集中在 URoomService::RequestLeaveRoom
+ *   - ARoomPlayerController 只负责"通知服务器 + 触发 Service"
+ *   - 大厂原则 — 单一职责: PC = 收到 RPC + 通知 Service, Service = 销毁 Session + 切 UI + OpenLevel
+ *
+ * 服务器侧仍然需要 SetSettlementState(false), 这部分不走 Service, 是 GameState 直接操作
+ */
 void ARoomPlayerController::ExecuteLeaveRoom()
 {
-	// 1. 【P0】销毁 Session: 走 SessionManager->DestroyRoom (异步, 不直调 OnlineSubsystem)
-	if (UGameInstance* GI = GetGameInstance())
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomPlayerController] 【v217】ExecuteLeaveRoom: 服务器收到 Server_LeaveRoom, 开始执行退房流程 (委托 URoomService 单一入口)."));
+
+	// 【v209 大厂架构新增】离开结算时解锁移动
+	// 大厂原则 — 单一真理源: 返回大厅时设置 bInSettlement=false
+	if (UWorld* World = GetWorld())
 	{
-		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 		{
-			SessionManager->DestroyRoom(FOnDestroyRoomComplete());
+			RoomGS->SetSettlementState(false);
 		}
 	}
 
-	// 2. 【大厂标准】主动 OpenLevel 回 L_Login
-	//    ?offline 参数: 强制 UE 引擎清理底层 NetDriver, 防止端口死锁
-	UWorld* World = GetWorld();
-	if (!World) return;
-
-	// 3. 【大厂标准 - P0 修复】告诉 GameFlowSubsystem: 下一张地图加载完后, 我要 MainLobby
-	//    这一步替代了旧的 PostLoadMapWithWorld Lambda 订阅
-	//    关键: 不再依赖脆弱的"PC 生命周期内 Lambda", 而是写到跨地图持久的 Subsystem
+	// 委托给 URoomService 单一入口 — 不再各自实现 Session 销毁 + OpenLevel
 	if (UGameInstance* GI = GetGameInstance())
 	{
-		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
+		if (URoomService* RoomService = URoomService::Get(GI))
 		{
-			FlowSubsystem->RequestStateOnNextLoad(EMatchState::MainLobby);
+			RoomService->RequestLeaveRoom();
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("[RoomPlayerController] ExecuteLeaveRoom: GameFlowSubsystem 不可用, 退房后可能跳错页面"));
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomPlayerController] 【v217 零兜底】ExecuteLeaveRoom: URoomService 不可用. "
+				     "修复: 检查 GameInstanceSubsystem 注册."));
 		}
 	}
-
-	// 4. 【P0 兼容】保留旧的 PostLoadMapWithWorld Lambda 作为兜底 (防御性编程)
-	//    虽然 Subsystem 已经接管, 但万一未来有边界情况 (如多次 OpenLevel) 让 Subsystem 错过了
-	//    这个兜底可以保证最后一道防线仍然能切到 MainLobby
-	//    EndPlay 中仍然会 Remove, 但因为 Subsystem 那层已经处理了, 不会重复触发 (TransitToState 有幂等保护)
-	if (!LeaveRoomSafeHandle.IsValid())
+	else
 	{
-		LeaveRoomSafeHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddLambda(
-			[WeakSelf = TWeakObjectPtr<ARoomPlayerController>(this), this](UWorld* LoadedWorld)
-			{
-				// 防御 1: 自己是否还活着 (新地图加载期间可能销毁)
-				if (!WeakSelf.IsValid()) return;
-
-				// 防御 2: 加载的必须是 L_Login (目标地图)
-				if (!LoadedWorld || !LoadedWorld->GetMapName().Contains(TEXT("L_Login"))) return;
-
-				// 防御 3: 拿到新 World 的 GI + GameFlowSubsystem
-				UGameInstance* NewGI = LoadedWorld->GetGameInstance();
-				if (!NewGI) return;
-
-				UGameFlowSubsystem* NewFlow = NewGI->GetSubsystem<UGameFlowSubsystem>();
-				if (!NewFlow)
-				{
-					UE_LOG(LogTemp, Error, TEXT("[RoomPlayerController] PostLoadMapWithWorld(兜底): 新地图找不到 GameFlowSubsystem"));
-					return;
-				}
-
-				// 兜底: 如果当前还是 Login (说明 Subsystem 那层没处理), 强制切到 MainLobby
-				// 大厂设计: 幂等保护, 即使 Subsystem 已经切到 MainLobby, 再调一次也是 no-op
-				if (NewFlow->GetCurrentState() != EMatchState::MainLobby)
-				{
-					UE_LOG(LogTemp, Log, TEXT("[RoomPlayerController] PostLoadMapWithWorld(兜底): 主动切到 MainLobby"));
-					NewFlow->TransitToState(EMatchState::MainLobby);
-				}
-
-				// 一次性事件, 处理完后立即解绑
-				FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(LeaveRoomSafeHandle);
-				LeaveRoomSafeHandle.Reset();
-			});
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerController] 【v217 零兜底】ExecuteLeaveRoom: GetGameInstance() 失败."));
 	}
-
-	// 5. 最后才执行 OpenLevel (确保订阅/预约在先, 不会错过事件)
-	UGameplayStatics::OpenLevel(World, FName("L_Login"), true, TEXT("?offline"));
 }// ==========================================
 // 5. 告诉服务器的 RPC 逻辑
 // ==========================================
@@ -560,6 +633,27 @@ void ARoomPlayerController::Server_LeaveRoom_Implementation()
 		GM->RemovePlayerFromRoom(this);
 	}
 }
+
+/**
+ * 【v216.2 大厂架构重构】Server_SettlementReturnToLobby 系列 RPC 已删除
+ *
+ * 删除原因 (大厂架构 - 去除死代码):
+ *   - 历史: Client → Server RPC → Client RPC → GameFlowSubsystem (3 次网络往返)
+ *   - 问题: 跨地图后 PC 类型变化 (RoomPC → LoginPC), RPC 链路失效, 按钮无反应
+ *   - 修正: UScoreboardWidget::OnReturnToLobbyClicked 直接调 GameFlowSubsystem
+ *   - 同理: Client_OpenLobbyFromSettlement 也已删除 (无调用方)
+ *   - 两个 RPC 对 (_Validate + _Implementation) 全部删除, 头文件 UFUNCTION 声明也删除
+ *
+ * 大厂架构 - 去除死代码原则:
+ *   - UFUNCTION RPC 对必须 _Validate + _Implementation 配对存在 (UE 链接错误会阻止单独删除一半)
+ *   - 既然所有调用方已移除, 整套 RPC 都成为死代码 → 全部删除
+ *   - 不保留 stub 函数 (stub 函数本身也是死代码, 而且会触发 UE_DEPRECATED 警告)
+ *
+ * 修正路径 (v216.2):
+ *   - UScoreboardWidget::OnReturnToLobbyClicked → UGameFlowSubsystem::RequestStateOnNextLoad(MainLobby)
+ *   - UGameFlowSubsystem 是 GameInstanceSubsystem, 跨地图持久, 客户端可访问
+ *   - 无网络往返, 无 PC 类型耦合
+ */
 
 /**
  * 验证函数: 踢人
@@ -1335,6 +1429,73 @@ void ARoomPlayerController::Client_TransitToMatchState_Implementation(EMatchStat
 	}
 }
 
+/**
+ * 【v217 大厂架构新增】Client_ReceiveSettlementSnapshot_Implementation
+ *
+ * 客户端收到服务器推的完整结算快照,写入本地 USettlementSnapshotSubsystem
+ *
+ * 大厂原则 — 算法 1 客户端从不自拉 (v217):
+ *   - 旧 (v216.x): MulticastEnterSettlement 是 NetMulticast,服务器 + 所有客户端都本地执行整段逻辑
+ *     → 客户端从自己的 URoomStateService 拉数据 → 客户端 AIC.CachedFactionTag 是空 → AI 永远被过滤掉
+ *   - 新 (v217): 客户端只走 Broadcast OnEnterSettlement + 跨端预约 SettlementPage (不写 Snapshot)
+ *     → 服务器走"拉数据 + 写本地 Snapshot + 推 Client_ReceiveSettlementSnapshot RPC"
+ *     → 本 RPC 把服务端拉数据的结果推给客户端,客户端 WriteSnapshot 到自己的 Subsystem
+ *
+ * 大厂原则 — 0 兜底:
+ *   - Subsystem 不可用 → Log Error + return (不静默丢弃)
+ *   - Snapshot.bIsValid=false → Log Error + return (服务端拉到空数据,客户端也要写但 UI 显示空)
+ *
+ * 时序 (v217):
+ *   - t=0: Server MulticastEnterSettlement 推 NetMulticast + 推 Client_ReceiveSettlementSnapshot
+ *   - t=0+: Client 收到本 RPC → WriteSnapshot
+ *   - t=3s: Server OpenLevel 切图 L_Login
+ *   - t=3s+: UScoreboardWidget 构造 → ConsumeSnapshot → ApplySnapshot (数据已完整)
+ */
+void ARoomPlayerController::Client_ReceiveSettlementSnapshot_Implementation(const FFinalSettlementSnapshot& InSnapshot)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomPlayerController] 【v217】Client_ReceiveSettlementSnapshot: 客户端收到服务器推的结算快照. "
+		     "AttackerEntries=%d (含AI=%d), DefenderEntries=%d (含AI=%d), AttackerWins=%d, DefenderWins=%d, "
+		     "MatchMode=%d, RoundWinner=%d."),
+		InSnapshot.AttackerEntries.Num(),
+		InSnapshot.AttackerEntries.FilterByPredicate([](const FFactionSnapshotEntry& E){ return E.bIsAI; }).Num(),
+		InSnapshot.DefenderEntries.Num(),
+		InSnapshot.DefenderEntries.FilterByPredicate([](const FFactionSnapshotEntry& E){ return E.bIsAI; }).Num(),
+		InSnapshot.AttackerWins, InSnapshot.DefenderWins,
+		static_cast<int32>(InSnapshot.MatchMode), static_cast<int32>(InSnapshot.RoundWinner));
+
+	if (USettlementSnapshotSubsystem* SnapshotSub = USettlementSnapshotSubsystem::Get(this))
+	{
+		SnapshotSub->WriteSnapshot(InSnapshot);
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomPlayerController] 【v217】Client_ReceiveSettlementSnapshot: 客户端已写入本地 USettlementSnapshotSubsystem. "
+			     "等待 OpenLevel 切图 + ScoreboardWidget 构造 → ConsumeSnapshot → ApplySnapshot."));
+	}
+	else
+	{
+		// 0 兜底: Subsystem 不可用 → Log Error, 不静默丢弃
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomPlayerController] 【v217】Client_ReceiveSettlementSnapshot: USettlementSnapshotSubsystem 不可用, "
+			     "客户端无法写入快照, 切图后 ConsumeSnapshot 失败 → 结算页 UI 数据为空. "
+			     "【v217 零兜底】修复: 检查 GameInstanceSubsystem 注册."));
+	}
+}
+
+/**
+ * 【v216.2 大厂架构重构】Client_OpenLobbyFromSettlement_Implementation 已删除
+ *
+ * 删除原因 (大厂架构 - 去除死代码):
+ *   - 历史: Server 收到 Server_SettlementReturnToLobby RPC → 校验 → 调 Client_OpenLobbyFromSettlement → RequestStateOnNextLoad
+ *   - 修正 (v216.2): UScoreboardWidget 直接调 GameFlowSubsystem, 无 RPC 中转
+ *   - 同理: Server_SettlementReturnToLobby 也已删除, 无调用方
+ *   - 整套 RPC 链路已无任何调用方, 全部清理
+ *
+ * 架构修正路径:
+ *   - Client (L_Login) Button 点击 → UScoreboardWidget::OnReturnToLobbyClicked
+ *   - 直接调 UGameFlowSubsystem::RequestStateOnNextLoad(MainLobby)
+ *   - GameFlowSubsystem 切状态 → UIViewService ShowPanel(MainLobbyPanel)
+ *   - 0 网络往返, 0 PC 类型耦合, 0 服务器校验 (结算状态本身权威)
+ */
 
 // ==========================================
 // 11. Enhanced Input 回调
@@ -1537,6 +1698,98 @@ void ARoomPlayerController::HideEscMenu()
 	// 恢复输入模式: GameOnly
 	SetInputMode(FInputModeGameOnly());
 	bShowMouseCursor = false;
+}
+
+
+// ==========================================
+// 14. v211 结算状态回调 — 让结算页面可点击按钮
+// ==========================================
+
+/**
+ * HandleSettlementStateChanged
+ *
+ * 【v211 大厂架构新增】ARoomGameState::OnSettlementStateChanged 唯一回调
+ *
+ * 业务规则 (用户 2026.08.07 明确):
+ *   - 进入结算页面时, 必须显示鼠标 + UIOnly 输入
+ *     → 玩家才能点击结算页面按钮 (返回大厅/再来一局)
+ *   - 离开结算时, 恢复 GameOnly 输入 + 隐藏鼠标
+ *
+ * 调用链:
+ *   PC::BeginPlay / MulticastEnterSettlement_Implementation
+ *     → RoomGameState::SetSettlementState(true)
+ *     → OnSettlementStateChanged.Broadcast(true)
+ *     → HandleSettlementStateChanged(true)    ← 本函数
+ *     → bShowMouseCursor=true + SetInputMode(FInputModeUIOnly())
+ *
+ * 大厂原则:
+ *   - 单一真理源: ARoomGameState::bInSettlement (Replicated, 服务器权威)
+ *   - 单一入口: 任何结算页面 UI 输入切换都从本函数派生
+ *   - DRY: 不在多处散落 "if (bInSettlement) { bShowMouseCursor = true; }"
+ *   - 0 兜底: 失败时 Log Error + return, 不静默处理
+ *   - 幂等: 重复 Broadcast(true) 多次调用本函数 100% 安全
+ *     (SetInputMode 和 bShowMouseCursor 重复赋值 = no-op)
+ *
+ * 为什么不复用 OnFlowStateChanged:
+ *   - EMatchState 没有 Settlement 状态 (大厂原则: 状态机 = 物理跳转/全局流程, 结算 = 战斗内子阶段)
+ *   - 复原 EMatchState = 改动 GameFlow (影响 Login/MainLobby/InRoom/Battleing 整套)
+ *   - 另起单一真理源 bInSettlement (Replicated) + 单一回调 = 更清晰
+ *
+ * 为什么不放在 BaseCharacter:
+ *   - BaseCharacter 控制角色行为 (IsInSettlement 已禁止移动/攻击)
+ *   - 鼠标/输入模式 = 本机 UI 交互, 属于 PlayerController 职责
+ *   - AI Controller 不需要 (AI 由 BT 控制, 没有鼠标输入)
+ *
+ * @param bInSettlement true=进入结算, false=离开结算
+ */
+void ARoomPlayerController::HandleSettlementStateChanged(bool bInSettlement)
+{
+	// 0 兜底: Dedicated Server 端 Controller 不渲染 UI, 不切换输入模式
+	//   原因: Server 端没有 Viewport, bShowMouseCursor/SetInputMode 无意义
+	//   但 Server 是权威源, SetSettlementState(true) 会在 Server 触发
+	//   必须 return, 否则 Server 端会因 InputMode 异常报错
+	//   注意: BeginPlay 处的 IsLocalPlayerController() 守卫已确保 Server 端不会订阅本回调
+	//   这里再 Check 一次 0 兜底 (防御性: 极端路径下 Subscription 可能绕过守护)
+	if (!IsLocalPlayerController())
+	{
+		return;
+	}
+
+	if (bInSettlement)
+	{
+		// ==========================================
+		// 进入结算: 显示鼠标 + UIOnly 输入
+		// ==========================================
+		// 大厂标准: SetInputMode(UIOnly) + bShowMouseCursor=true
+		//   - 玩家可以点击结算页面按钮
+		//   - 不影响其他客户端 (每个 PC 独立设置 InputMode)
+		//   - 不会触发全局 Pause (与 ESC 菜单一致, 不阻塞服务器)
+		// ==========================================
+		bShowMouseCursor = true;
+		SetInputMode(FInputModeUIOnly());
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomPC::v211] 进入结算页面: 显示鼠标 + UIOnly 输入, PC=%s. (玩家可点击结算页面按钮)"),
+			*GetName());
+	}
+	else
+	{
+		// ==========================================
+		// 离开结算: 恢复 GameOnly 输入 + 隐藏鼠标
+		// ==========================================
+		// 大厂标准: SetInputMode(GameOnly) + bShowMouseCursor=false
+		//   - 退出结算页面 (返回大厅/再来一局) 时恢复游戏输入
+		//   - 鼠标隐藏是因为下一步可能进入战斗或大厅 UI
+		//   - 提示: 后续 OnFlowStateChanged(MainLobby/InRoom) 会重新设置
+		//     注意: 这些会覆盖 bShowMouseCursor, 这里只需"恢复到默认"
+		// ==========================================
+		bShowMouseCursor = false;
+		SetInputMode(FInputModeGameOnly());
+
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomPC::v211] 离开结算页面: 恢复 GameOnly 输入 + 隐藏鼠标, PC=%s. (后续 OnFlowStateChanged 会重新设置鼠标策略)"),
+			*GetName());
+	}
 }
 
 
@@ -1911,6 +2164,16 @@ void ARoomPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 		{
 			FlowSubsystem->OnStateChanged.RemoveDynamic(this, &ARoomPlayerController::OnFlowStateChanged);
+		}
+	}
+
+	// 3.5 【v211 P0 修复】解绑 ARoomGameState 结算状态订阅, 防止 PC 销毁后野指针回调
+	//     (GameState 是 World 持有的, PC 销毁时 GameState 可能仍在, 必须显式 RemoveDynamic)
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			RoomGS->OnSettlementStateChanged.RemoveDynamic(this, &ARoomPlayerController::HandleSettlementStateChanged);
 		}
 	}
 

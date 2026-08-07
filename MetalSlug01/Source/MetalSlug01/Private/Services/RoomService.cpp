@@ -22,6 +22,10 @@
 // 【v51 大厂架构】TSubclassOf<ABaseCharacter> 完整定义 (FAISpawnRequest.AIPawnClass)
 #include "Characters/BaseCharacter.h"
 #include "Engine/DataTable.h"
+// 【v217 大厂架构】RequestLeaveRoom 单一入口 — 销毁 Session + 切回主大厅 UI 状态
+#include "Systems/GameFlowSubsystem.h"
+#include "Kismet/GameplayStatics.h"
+#include "Enums/CoreEnums.h" // EUIPanel, EMatchState
 
 // ==========================================
 // 静态访问器
@@ -420,19 +424,111 @@ void URoomService::RequestStartGame()
 	}
 }
 
+/**
+ * RequestLeaveRoom
+ *
+ * 【v217 大厂架构 - 单一入口】玩家离开房间的统一入口
+ *
+ * 设计目标 — 大厂架构原则:
+ *   - 单一职责: "玩家想离开房间" → 销毁 Session + 切回主大厅 UI
+ *   - 单一入口: 战斗菜单 Esc / 结算页 ReturnToLobby / 房间被踢 / 网络失败 全部走这里
+ *   - 状态正确: 已在 L_Login 上 → 不 OpenLevel, 直接 OnInterrupted + TransitToState
+ *             在战斗地图上 → OpenLevel(L_Login) + RequestStateOnNextLoad
+ *
+ * 之前 (v216.x) 的死代码问题:
+ *   - 旧 RequestLeaveRoom 只调 SessionManager->DestroyRoom, 完全不切 UI 状态
+ *   - 注释说"状态切换交给 LANRoomPresenter 监听 OnDestroyRoomComplete" — LANRoomPresenter 根本没订阅
+ *   - 死代码: 0 调用方
+ *
+ * 旧路径失效导致的具体 bug:
+ *   - 结算页 WBP_ScoreboardWidget::OnReturnToLobbyClicked 调 TransitToState(MainLobby)
+ *     → 切 UI ✓, 但 Session 没销毁 ✗
+ *     → 下次进房 OSS 拒绝 "Session already exists, can't join twice"
+ *
+ * 新路径 (v217) 统一性:
+ *   - UScoreboardWidget / WBP_GameHUDWidget::Button_ReturnToLobby / 其他 ESC 菜单全部调本 API
+ *   - 无论从哪个 UI 进入, 都保证 Session 销毁 + UI 切回 LANRoom
+ *   - 在 L_Login 上时, 不会再 OpenLevel 同一张图(防止循环切图)
+ */
 void URoomService::RequestLeaveRoom()
 {
-	// 【大厂架构】委托 SessionManagerSubsystem 销毁 Session（Service 不直接调 OnlineSubsystem）
-	if (UGameInstance* GI = GetGameInstance())
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomService] 【v217】RequestLeaveRoom: 玩家请求离开房间 (单一入口)."));
+
+	// 0 兜底 - GameInstance 必须存在
+	UGameInstance* GI = GetGameInstance();
+	if (!GI)
 	{
-		if (USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>())
-		{
-			SessionManager->DestroyRoom(FOnDestroyRoomComplete());
-		}
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService] 【v217 零兜底】RequestLeaveRoom: GetGameInstance() 失败. "
+			     "修复: 检查 GameInstance 生命周期."));
+		return;
 	}
 
-	// 状态切换交给 LANRoomPresenter 监听 SessionManager 的 OnDestroyRoomComplete 完成回调
-	// Service 不应自己跨层调 GameFlowSubsystem
+	// 步骤 1: 销毁 Session (异步, 不阻塞 UI 切换)
+	// 大厂原则 — Service 委托 SessionManager, 不直接调 OnlineSubsystem
+	USessionManagerSubsystem* SessionManager = GI->GetSubsystem<USessionManagerSubsystem>();
+	if (!SessionManager)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService] 【v217 零兜底】RequestLeaveRoom: SessionManagerSubsystem 不可用. "
+			     "修复: 检查 GameInstanceSubsystem 注册."));
+		return;
+	}
+
+	// 仅在当前还有 Session 时销毁(测试房主模式 bIsHost=true 但没真 Session)
+	if (SessionManager->IsInSession() || SessionManager->IsHosting())
+	{
+		SessionManager->DestroyRoom(FOnDestroyRoomComplete());
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomService] 【v217】RequestLeaveRoom: 已触发 SessionManager->DestroyRoom."));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[RoomService] 【v217】RequestLeaveRoom: 当前不在 Session 中(测试房主模式?), 跳过 DestroyRoom."));
+	}
+
+	// 步骤 2: 切回主大厅 UI 状态
+	UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>();
+	if (!FlowSubsystem)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomService] 【v217 零兜底】RequestLeaveRoom: GameFlowSubsystem 不可用. "
+			     "修复: 检查 GameInstanceSubsystem 注册."));
+		return;
+	}
+
+	// 步骤 2a: 检测当前地图 — 在 L_Login 上时不要再 OpenLevel(防止循环切图)
+	UWorld* World = GetWorld();
+	const FString CurrentLevel = World ? World->GetMapName() : TEXT("");
+	const bool bIsInLobby = CurrentLevel.Contains(TEXT("L_Login"));
+
+	if (bIsInLobby)
+	{
+		// 场景: 已在 L_Login 上, 主动点 ReturnToLobby(结算页/房间页)
+		// 路径: TransitToState + OnInterrupted, 不走 OpenLevel(已经在 L_Login 上, 无需切图)
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomService] 【v217】RequestLeaveRoom: 已在 L_Login 上, 走 TransitToState+OnInterrupted (无 OpenLevel)."));
+
+		FlowSubsystem->TransitToState(EMatchState::MainLobby);
+		FlowSubsystem->OnInterrupted.Broadcast(EUIPanel::LANRoom);
+	}
+	else
+	{
+		// 场景: 在战斗地图上(Esc 菜单退出房间)
+		// 路径: OpenLevel(L_Login) + RequestStateOnNextLoad(MainLobby)
+		// PostLoadMapWithWorld 会消费 RequestStateOnNextLoad → TransitToState(MainLobby) → UI 切到 LANRoom
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomService] 【v217】RequestLeaveRoom: 在战斗地图上 (%s), 走 OpenLevel(L_Login)+RequestStateOnNextLoad."),
+			*CurrentLevel);
+
+		FlowSubsystem->RequestStateOnNextLoad(EMatchState::MainLobby);
+		if (World)
+		{
+			UGameplayStatics::OpenLevel(World, FName(TEXT("L_Login")), true, TEXT("?offline"));
+		}
+	}
 }
 
 // ==========================================

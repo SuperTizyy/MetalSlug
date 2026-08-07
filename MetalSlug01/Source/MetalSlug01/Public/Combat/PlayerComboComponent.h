@@ -352,6 +352,11 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UAnimMontage> CachedPlayerMontage = nullptr;
 
+	// 【v212 删除】CachedMotherMontage — 母体 trace 启停严格走 ANS_MeleeTraceState 通知
+	//   - 启动: ANS_MeleeTraceState::NotifyBegin (bIsMother=true 分支)
+	//   - 停止: ANS_MeleeTraceState::NotifyEnd   (bIsMother=true 分支)
+	//   - C++ 不再缓存母体蒙太奇, 0 兜底
+
 
 	// ==========================================
 	// 8. 内部状态机字段 (Phase 2.1 从 BaseCharacter 迁移)

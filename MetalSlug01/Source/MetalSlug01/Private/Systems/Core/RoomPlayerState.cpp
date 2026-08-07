@@ -14,6 +14,8 @@
 #include "Data/Enums/CombatEnums.h"   // 【v100 新增】EKillStreakType (连杀真理源派生)
 #include "Data/Config/PlayerConfigAsset.h" // 【v100 新增】UPlayerConfigAsset (连杀超时秒数)
 #include "Systems/RoomGameMode.h"     // 【v100 新增】ARoomGameMode (拿 PlayerConfigAsset)
+// 【v215 大厂架构新增】URoomStateService — 玩家计分板数据变更时主动通知 View
+#include "Services/RoomStateService.h"
 
 
 // ==========================================
@@ -168,6 +170,15 @@ void ARoomPlayerState::OnRep_ScoreboardData()
 {
 	// 计分板数据发生变化，通知 UI 刷新
 	OnScoreboardDataChanged.Broadcast();
+
+	// 【v215 大厂架构新增】通知 RoomStateService 转发给 View
+	//   - 大厂原则 — 单一事件出口: PS 自己最知道"分数变了"
+	//   - 替代旧版 0.5s Tick 拉取 (延迟高 + 浪费 CPU)
+	//   - 0 兜底: World 未初始化时 Get() 返回 nullptr, RoomStateService 内部不静默
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
+	}
 }
 
 
@@ -476,9 +487,57 @@ void ARoomPlayerState::SetPlayerLoadout(const FString& InCharID, const FString& 
 	// 只有服务器有权限修改带有 Replicated 的变量
 	if (HasAuthority())
 	{
-		SelectedCharacterID = InCharID;
-		SelectedWeaponID1 = InPrimaryID;
-		SelectedWeaponID2 = InSecondaryID;
-		SelectedWeaponID3 = InMeleeID;
+		// 【v210 大厂架构修复 — 防御性写入, 零覆盖】
+		//
+		// 根因 (用户 2026.08.09 反馈):
+		//   "客户端自己选择了近战武器, 但是进游戏无法切到近战武器"
+		//
+		// 旧版 Bug:
+		//   SetPlayerLoadout 无脑覆盖全部 4 个字段 (CharID/W1/W2/W3)
+		//   → Init 阶段 (RoomInsidePage.cpp:361) / DelayedSendPlayerInfo (RoomPlayerController.cpp:265)
+		//     主动调 Server_SelectLoadout(Char, W1, W2, "") — W3 永远是空串
+		//   → PS.SelectedWeaponID3 被覆盖为 "" → Spawn 阶段 v209 兜底 DT 第 2 行
+		//   → 玩家大厅手动选过的近战武器"凭空消失" → "无法切到近战武器"
+		//
+		// 修复 (大厂原则 - 防御性写入, zero override for selected items):
+		//   传入字段为空串 + 当前字段已有值 → 保留当前值 (不覆盖玩家已选)
+		//   传入字段为空串 + 当前字段为空   → 写入空串 (玩家没选, Spawn 阶段走 v209 兜底 = 业务默认)
+		//   传入字段非空                     → 写入新值 (玩家主动选择, 更新)
+		//
+		// 与"零兜底"原则的关系:
+		//   - 玩家未选 + 配置错 (DT 第 2 行空) → Spawn 阶段 v209 会**拒绝 Spawn** (Error)
+		//   - 玩家未选 + 配置正确               → Spawn 阶段 v209 给业务默认 (Warning)
+		//   - 玩家已选                         → SetPlayerLoadout 写入值, Spawn 阶段用玩家值 ✅
+		//
+		// 调用方约束:
+		//   - 想"清空玩家已选" → 显式调用 ClearPlayerLoadout() (新增) — 不通过传空串隐式清空
+		//   - 想"保持玩家已选, 仅同步存档字段" → 传入空串 (本函数自动保留)
+		//   - 想"玩家主动改选" → 传入新值 (本函数正常覆盖)
+
+		// CharID: 存档可能有, 也可能空 (首次玩家没存档)
+		//   跟武器槽位一样, **空串保留旧值** — 防止"首次玩家重连"覆盖大厅手动选的 CharID
+		//   真正的兜底由 Spawn 阶段 v209 完成: PS.SelectedCharacterID 空 → 兜底 BP_SWAT_C
+		if (!InCharID.IsEmpty())
+		{
+			SelectedCharacterID = InCharID;
+		}
+
+		// 主武器: 存档可能有, 也可能空 (空 = 玩家没存档过, Spawn 走 v209 兜底)
+		if (!InPrimaryID.IsEmpty())
+		{
+			SelectedWeaponID1 = InPrimaryID;
+		}
+		// 副武器: 存档可能有, 也可能空
+		if (!InSecondaryID.IsEmpty())
+		{
+			SelectedWeaponID2 = InSecondaryID;
+		}
+		// 近战武器 (Q8 决策 = 存档不存, 只能从大厅手动选)
+		// **关键**: 如果 InMeleeID 空 + 已有值 → 保留 (Init 阶段/DelayedSendPlayerInfo 传空串不会覆盖玩家已选)
+		if (!InMeleeID.IsEmpty())
+		{
+			SelectedWeaponID3 = InMeleeID;
+		}
+		// 字段为空时**不写**, 保留旧值 — 这就是"零覆盖"的实现
 	}
 }

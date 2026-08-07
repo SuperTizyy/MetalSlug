@@ -298,6 +298,23 @@ void UPlayerComboComponent::LightAttack_Pressed()
 		return;
 	}
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许攻击
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	//   - 严禁在每个攻击入口重复 `if (RoomGS->bInSettlement) return;` (违反 DRY)
+	//   - 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent] LightAttack_Pressed: Pawn=%s 处于结算状态, 拒绝攻击."),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
 	// ============================================================
 	// 【v93 大厂架构】母体分支 — 母体无武器也能攻击
 	// ============================================================
@@ -431,6 +448,19 @@ void UPlayerComboComponent::HeavyAttack()
 		return;
 	}
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许攻击
+	// ==================================================================
+	// 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	// 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent] HeavyAttack: Pawn=%s 处于结算状态, 拒绝攻击."),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
 	// 重击同样需要检查下蹲权限
 	ABaseWeapon* CurrentWeapon = OwnerCharacter->GetCurrentWeapon();
 	if (OwnerCharacter->bIsCrouched && !CurrentWeapon->bCanAttackWhileCrouched)
@@ -466,6 +496,19 @@ void UPlayerComboComponent::UseSkill()
 	// 死亡状态不能释放技能
 	if (OwnerCharacter->IsDead())
 	{
+		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许释放技能
+	// ==================================================================
+	// 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	// 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent] UseSkill: Pawn=%s 处于结算状态, 拒绝释放技能."),
+			*OwnerCharacter->GetName());
 		return;
 	}
 
@@ -917,16 +960,50 @@ void UPlayerComboComponent::ExecuteMotherAttackSequence()
 	//   - 这与 ExecuteComboSequence 调 Server_PlayAttackAnim(false, ComboIndex) 协议完全一致
 	OwnerCharacter->Server_PlayAttackAnim(false, 0);
 
+	// ==================================================================
+	// 【v212 大厂架构 P0 修复】删除 v209 兜底的显式 StartMotherTrace
+	// ==================================================================
+	//
+	// 业务规则 (用户 2026.08.08 明确):
+	//   "母体攻击是没武器的, 靠身上的插槽 RayDetectionStart_L 和 RayDetectionEnd_L
+	//    只能通过 Melee Trace State 通知来启动射线检测, 其他方式不行. 不能有兜底."
+	//   "Melee Trace State 通知我已经加在蒙太奇攻击动画上了."
+	//
+	// v209 旧版兜底 (反模式 - 违反用户硬要求):
+	//   ExecuteMotherAttackSequence 直接显式调 OwnerCharacter->StartMotherTrace(false)
+	//   + OnPlayerAttackMontageEnded 显式调 OwnerCharacter->StopMotherTrace()
+	//   → 绕过 ANS_MeleeTraceState 通知 → 违反"只能通过 Melee Trace State 通知"
+	//
+	// v212 修复 (大厂原则 - 单一真理源 + 0 兜底):
+	//   - 启动: 严格依赖 ANS_MeleeTraceState::NotifyBegin (bIsMother=true 分支)
+	//   - 停止: 严格依赖 ANS_MeleeTraceState::NotifyEnd   (bIsMother=true 分支)
+	//   - C++ 不再显式调 StartMotherTrace/StopMotherTrace (PlayerComboComponent 路径)
+	//   - 美术已经按用户指示在母体攻击蒙太奇上加了 Melee Trace State 通知
+	//   - 若 ANS 没正确配 → 攻击无伤害 → 强制美术检查蒙太奇资产
+	//
+	// 移除代码:
+	//   OwnerCharacter->StartMotherTrace(false);   // v209 显式调用 — v212 删除
+	//   CachedMotherMontage = MotherMontage;       // v209 缓存 — v212 删除 (StopMotherTrace 也跟着删)
+	//
+	// ==================================================================
+	// (空 — 启动完全由 ANS 通知驱动)
+
 	// 大厂原则 — 镜像 ExecuteComboSequence:
 	//   - 蒙太奇结束回调绑到 OnPlayerAttackMontageEnded 清理状态锁
-	//   - 母体没有武器, 所以不调 StartDamageTrace (ANS_MeleeTraceState 不适用)
-	//   - 母体走 BP_MuTi Pawn 上的蓝图蒙太奇通知 (如果有需要可由美术在 BP_MuTi 蓝图 AnimBP 加自定义 Notify)
+	//   - 母体没有武器, 所以不调 StartDamageTrace
+	//   - StopMotherTrace 由 ANS_MeleeTraceState::NotifyEnd 自动调用 (v212 修复)
 	BindMontageEndCallback(MotherMontage);
 
 	// 大厂原则 — 状态机:
 	//   - 母体没连击系统, 只设 bIsAttacking=true 防止重复触发
 	//   - 不设 bSaveAttack / bCanReceiveInput (无连击逻辑)
 	bIsAttacking = true;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[PlayerCombo] ExecuteMotherAttackSequence: 母体蒙太奇已播放, trace 启动依赖 ANS_MeleeTraceState 通知 (用户硬要求, 0 兜底). "
+		     "Owner=%s Montage=%s"),
+		*OwnerCharacter->GetName(),
+		*MotherMontage->GetName());
 }
 
 
@@ -963,6 +1040,32 @@ void UPlayerComboComponent::OnPlayerAttackMontageEnded(UAnimMontage* Montage, bo
 	// 根因: AI 攻击不走 PlayerComboComponent 路径, CachedPlayerMontage 永远是 nullptr
 	//        导致 Montage != CachedPlayerMontage 比较 (nullptr != AI_Montage) 为 true → 错误执行 EndAttackState
 	//        → 速度被重置为 400 而不是从配置表恢复
+	// ==================================================================
+	// 【v212 大厂架构 P0 修复】删除 v209 兜底的显式 StopMotherTrace
+	// ==================================================================
+	//
+	// v209 旧版兜底 (反模式 - 违反用户硬要求):
+	//   OnPlayerAttackMontageEnded 检测到 CachedMotherMontage 结束
+	//   → 直接显式调 OwnerCharacter->StopMotherTrace()
+	//   → 绕过 ANS_MeleeTraceState::NotifyEnd → 违反"只能通过 Melee Trace State 通知"
+	//
+	// v212 修复 (大厂原则 - 0 兜底):
+	//   - StopMotherTrace 由 ANS_MeleeTraceState::NotifyEnd 自动调用
+	//   - C++ 不再维护 CachedMotherMontage 字段 (v212 删除)
+	//   - 美术已经按用户指示在母体攻击蒙太奇上加了 ANS_MeleeTraceState
+	//     NotifyBegin 触发 StartMotherTrace, NotifyEnd 触发 StopMotherTrace
+	//
+	// 移除代码:
+	//   if (CachedMotherMontage && Montage == CachedMotherMontage) {
+	//       OwnerCharacter->StopMotherTrace();
+	//       CachedMotherMontage = nullptr;
+	//   }
+	// ==================================================================
+	// (空 — 停止完全由 ANS 通知驱动)
+
+	// ==================================================================
+	// 【v42 P0 修复】防御: CachedPlayerMontage 为空时直接返回
+	// ===================================================================
 	// 修复: CachedPlayerMontage 为空说明没有绑定过玩家攻击蒙太奇, 直接 return
 	if (!CachedPlayerMontage)
 	{
@@ -1169,6 +1272,22 @@ void UPlayerComboComponent::Server_ReportMotherAttackHit_Implementation(AActor* 
 	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
 	if (!OwnerCharacter)
 	{
+		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态服务器侧拒绝母体感染报告 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: UMeleeSwStrategy::TickDetection 已拦截, 但 RPC 可能在中途到达
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[PlayerComboComponent] Server_ReportMotherAttackHit: 母体=%s 处于结算状态, 拒绝感染报告 (深度防御)."),
+			*OwnerCharacter->GetName());
 		return;
 	}
 

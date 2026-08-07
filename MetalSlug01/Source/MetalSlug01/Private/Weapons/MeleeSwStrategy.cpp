@@ -54,8 +54,15 @@ const FName UMeleeSwStrategy::SocketName_TraceStart = FName(TEXT("TraceStart"));
 const FName UMeleeSwStrategy::SocketName_TraceEnd   = FName(TEXT("TraceEnd"));
 
 // 【v93.2 母体复用】母体 Socket 名称常量定义 — BP_MuTi Mesh 上必配
-const FName UMeleeSwStrategy::SocketName_MotherTraceStart = FName(TEXT("TraceStart_Mother"));
-const FName UMeleeSwStrategy::SocketName_MotherTraceEnd   = FName(TEXT("TraceEnd_Mother"));
+// 【v212 大厂架构修订】统一 socket 命名为美术指定的 RayDetectionStart_L / RayDetectionEnd_L
+//   - 业务规则 (用户 2026.08.08 明确):
+//     "母体攻击是没武器的, 靠身上的插槽 RayDetectionStart_L 和 RayDetectionEnd_L 启动射线检测,
+//      只能通过 Melee Trace State 通知来启动射线检测, 其他方式不行. 不能有兜底."
+//   - 大厂原则 - 单一真理源:
+//     美术指定的 socket 名 = C++ 真理源 (常量), 不允许 fallback 到别的 socket
+//     → 任何 "找不到 socket 时换用别名 / 退化路径" 都是兜底, 严禁
+const FName UMeleeSwStrategy::SocketName_MotherTraceStart = FName(TEXT("RayDetectionStart_L"));
+const FName UMeleeSwStrategy::SocketName_MotherTraceEnd   = FName(TEXT("RayDetectionEnd_L"));
 
 
 // ==========================================
@@ -182,7 +189,7 @@ bool UMeleeSwStrategy::StartTrace(ABaseWeapon* Weapon, bool bIsHeavy,
 			     "【v93.2 零兜底】%s"),
 			*SubjectName,
 			bUseOwnerMesh
-				? TEXT("修复: 在 BP_MuTi Mesh 编辑器添加 SkeletalMeshComponent, 并配 Socket 'TraceStart_Mother'/'TraceEnd_Mother'.")
+				? TEXT("修复: 在 BP_MuTi Mesh 编辑器添加 SkeletalMeshComponent, 并配 Socket 'RayDetectionStart_L'/'RayDetectionEnd_L'.")
 				: TEXT("修复: 在 BP 蓝图 Components 面板添加 StaticMeshComponent (近战武器) 或 SkeletalMeshComponent (枪械)."));
 		return false;
 	}
@@ -320,8 +327,8 @@ bool UMeleeSwStrategy::StartMotherTrace(ABaseCharacter* OwnerChar, bool bIsHeavy
 	if (!Mesh->DoesSocketExist(SocketName_MotherTraceStart))
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[UMeleeSwStrategy::StartMotherTrace] Owner=%s Mesh 没有 Socket 'TraceStart_Mother' — 拒绝启动. "
-			     "【v93.2 零兜底】修复: 打开 BP_MuTi Mesh → Sockets → Add Socket → 命名 'TraceStart_Mother' → 拖到爪击起点."),
+			TEXT("[UMeleeSwStrategy::StartMotherTrace] Owner=%s Mesh 没有 Socket 'RayDetectionStart_L' — 拒绝启动. "
+			     "【v212 零兜底】修复: 打开 BP_MuTi Mesh → Sockets → Add Socket → 命名 'RayDetectionStart_L' → 拖到左手爪击起点."),
 			*OwnerChar->GetName());
 		bUseOwnerMesh = false;
 		ActiveOwner.Reset();
@@ -330,8 +337,8 @@ bool UMeleeSwStrategy::StartMotherTrace(ABaseCharacter* OwnerChar, bool bIsHeavy
 	if (!Mesh->DoesSocketExist(SocketName_MotherTraceEnd))
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[UMeleeSwStrategy::StartMotherTrace] Owner=%s Mesh 没有 Socket 'TraceEnd_Mother' — 拒绝启动. "
-			     "【v93.2 零兜底】修复: 同上, 加 Socket 'TraceEnd_Mother' → 拖到爪击终点."),
+			TEXT("[UMeleeSwStrategy::StartMotherTrace] Owner=%s Mesh 没有 Socket 'RayDetectionEnd_L' — 拒绝启动. "
+			     "【v212 零兜底】修复: 同上, 加 Socket 'RayDetectionEnd_L' → 拖到左手爪击终点."),
 			*OwnerChar->GetName());
 		bUseOwnerMesh = false;
 		ActiveOwner.Reset();
@@ -402,6 +409,28 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	if (TraceState == EWeaponTraceState::Idle)
 	{
 		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态停止 trace 伤害检测 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: OnFirePressed/OnAIRequestAttack 已拦截, 但 trace 可能在结算前已启动
+	//     (玩家按住了攻击键, BT 已经发出攻击) 需在 tick 入口显式停止
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	//   - 用 ResolveAttackerCharacter 拿 Owner (覆盖母体/刀战两条路径)
+	if (ABaseCharacter* OwnerChar = ResolveAttackerCharacter(Weapon))
+	{
+		if (OwnerChar->IsInSettlement())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[UMeleeSwStrategy::TickDetection] Pawn=%s 处于结算状态, 停止 trace 伤害检测."),
+				*OwnerChar->GetName());
+			StopTrace(Weapon);
+			return;
+		}
 	}
 
 	// ============================================================
@@ -808,32 +837,27 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 			HitResult.BoneName);
 
 		// ============================================================
-		// 【v208.6 大厂架构 P0 修复】移除 HasAuthority() 检查
+		// 【v208.7 大厂架构 P0 修复】移除 HasAuthority() 检查 + 修复母体路径逻辑
 		//
 		// 根因 (用户 2026.08.07 反馈):
-		//   客户端近战射线检测不显示, 监听服务器正常
+		//   玩家母体攻击人类，无法让人类变母体
 		//
-		//   v208.5 的修复理解错误:
-		//     - v208.5 注释说 "HasAuthority() 守卫已从 Multicast_PlayFireTraceVisual_Implementation 移除"
-		//     - 但实际上第 850 行的 `if (Weapon && Weapon->HasAuthority())` 检查阻止了调用
-		//     - 服务器: Weapon->HasAuthority()=true → Multicast 被调用 → 所有客户端收到
-		//     - 客户端: Weapon->HasAuthority()=false → Multicast 不被调用 → 看不到线
+		//   代码逻辑分析:
+		//     - 第 830 行检查 `if (!Weapon)` 后直接 return
+		//     - 母体路径中 Weapon = nullptr，所以母体命中时直接 return
+		//     - 第 872 行的 `if (bUseOwnerMesh && OwnerChar)` 永远无法执行
+		//     - Server_ReportMotherAttackHit 从未被调用
 		//
 		// 修复:
-		//   - 移除 `Weapon && Weapon->HasAuthority()` 检查
-		//   - 改为无条件调用 Multicast_PlayFireTraceVisual
-		//   - 理由: Multicast 是服务器→客户端的单向推送, 服务器调用后自动推送给所有客户端
-		//   - 客户端不需要有 Authority 也能接收 Multicast
-		//
-		//   大厂原则 - 零兜底:
-		//     - Weapon 是 nullptr → Log Error + return (这才是真正的错误情况)
-		//     - HasAuthority 检查应该只在需要服务器权威判断时使用, 这里不需要
+		//   - 刀战路径 (bUseOwnerMesh=false): 必须有 Weapon → Weapon->Multicast_PlayFireTraceVisual + Weapon->Server_ReportHit
+		//   - 母体路径 (bUseOwnerMesh=true): Weapon 可以是 nullptr → OwnerChar->Server_ReportMotherAttackHit
+		//   - 第 830 行检查改为 `if (!bUseOwnerMesh && !Weapon)`，只在刀战路径检查 Weapon
 		// ============================================================
-		if (!Weapon)
+		if (!bUseOwnerMesh && !Weapon)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[UMeleeSwStrategy::TickDetection] 命中分支: Weapon 为空 — 拒绝 Multicast_PlayFireTraceVisual. "
-				     "Owner='%s'. 【v208.6 零兜底】"),
+				TEXT("[UMeleeSwStrategy::TickDetection] 命中分支: Weapon 为空 (刀战路径) — 拒绝 Multicast_PlayFireTraceVisual. "
+				     "Owner='%s'. 【v208.7 零兜底】"),
 				OwnerChar ? *OwnerChar->GetName() : TEXT("<null>"));
 			return;
 		}
@@ -841,13 +865,21 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 		// 服务器命中: 推权威 trace 视觉给所有客户端
 		//   LastMid/CurrentMid 是第 490/491 行算出来的 box 中心线两端 (跨帧缝合路径)
 		//   HitLoc 用 HitResult.ImpactPoint (命中点 = BoxTrace 实际撞上的位置)
+		//
+		//   母体路径 (bUseOwnerMesh=true): Weapon 是 nullptr，但不影响 Multicast 调用
+		//     - Weapon->Multicast_PlayFireTraceVisual 需要 Weapon，可以做条件调用
+		//     - 或者母体路径不需要视觉特效（根据业务需求决定）
 		const FVector BoxLineStart = LastMid;
 		const FVector BoxLineEnd = CurrentMid;
-		Weapon->Multicast_PlayFireTraceVisual(
-			BoxLineStart,
-			BoxLineEnd,
-			/*bHit=*/true,
-			HitResult.ImpactPoint);
+		if (Weapon)
+		{
+			// 刀战路径: Weapon 存在，播视觉特效
+			Weapon->Multicast_PlayFireTraceVisual(
+				BoxLineStart,
+				BoxLineEnd,
+				/*bHit=*/true,
+				HitResult.ImpactPoint);
+		}
 
 		// 【v93.2 母体复用】命中 RPC 路径决策
 		//   - bUseOwnerMesh=false: Weapon->Server_ReportHit (刀战路径, 走武器伤害字段)

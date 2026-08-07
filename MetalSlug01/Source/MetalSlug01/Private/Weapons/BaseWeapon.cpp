@@ -551,6 +551,24 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	ABaseCharacter* Victim = Cast<ABaseCharacter>(HitActor);
 	if (!Victim) return;
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态服务器侧拒绝伤害报告 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: ABaseCharacter::Server_StartFire 已拦截, 但 RPC 可能在中途到达
+	//     (玩家在结算开始前 1ms 触发的 trace 在 100ms 后命中, RPC 仍在网络飞行)
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	const ABaseCharacter* AttackerCharSettlement = Cast<ABaseCharacter>(GetOwner());
+	if (AttackerCharSettlement && AttackerCharSettlement->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseWeapon] Server_ReportHit: Attacker=%s 处于结算状态, 拒绝伤害报告 (深度防御)."),
+			*AttackerCharSettlement->GetName());
+		return;
+	}
+
 	// ============================================================
 	// 【2026.07.11 P0 大厂架构】友军伤害守卫 (Friendly Fire Guard)
 	//

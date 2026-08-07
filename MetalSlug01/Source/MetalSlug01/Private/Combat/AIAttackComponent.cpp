@@ -314,6 +314,26 @@ bool UAIAttackComponent::OnAIRequestAttack_WithOptions(ABaseCharacter* InOwnerCh
 		return false;
 	}
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许 AI 攻击
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	//   - 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	//   - 必须在 OnAIRequestAttack_WithOptions 入口拦截 (v133 单一入口收敛)
+	//     - OnAIRequestAttack_Simple 转发到本方法 → 自动覆盖
+	//     - OnAIRequestAttack_ExplicitMontage 转发到本方法 → 自动覆盖
+	//     - BTTask_PlayAttackMontage 转发到本方法 → 自动覆盖
+	if (InOwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions: AI Pawn=%s 处于结算状态, 拒绝攻击."),
+			*InOwnerCharacter->GetName());
+		return false;
+	}
+
 	// 【v133 调试日志】显示当前攻击配置
 	UE_LOG(LogTemp, Display,
 		TEXT("[AIAttackComponent] OnAIRequestAttack_WithOptions ENTER. Owner=%s (Valid=%d) "
@@ -755,6 +775,21 @@ bool UAIAttackComponent::OnAIRequestAttack_ExplicitMontage(ABaseCharacter* InOwn
 		UE_LOG(LogTemp, Error,
 			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: InOwnerCharacter 为空! "
 			     "调用方必须传入真实 Pawn 实例, 不能传 CDO/Archetype。"));
+		return false;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许 AI 攻击 (与 WithOptions 对称)
+	// ==================================================================
+	// 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	// 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	// 注意: ExplicitMontage 路径不走 WithOptions (用了不同的调用签名),
+	//       必须显式加守卫保持与 WithOptions 入口完全对称
+	if (InOwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[AIAttackComponent] OnAIRequestAttack_ExplicitMontage: AI Pawn=%s 处于结算状态, 拒绝攻击."),
+			*InOwnerCharacter->GetName());
 		return false;
 	}
 
@@ -1392,6 +1427,23 @@ void UAIAttackComponent::Server_ReportAIAttackHit_Implementation(AActor* HitActo
 		return;
 	}
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态服务器侧拒绝伤害报告 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: OnAIRequestAttack_WithOptions 已拦截, 但 RPC 可能在中途到达
+	//     (玩家在结算开始前 1ms 触发的 trace 在 100ms 后命中, RPC 仍在网络飞行)
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[AIAttackComponent] Server_ReportAIAttackHit: AI=%s 处于结算状态, 拒绝伤害报告 (深度防御)."),
+			*OwnerCharacter->GetName());
+		return;
+	}
+
 	// 防御 1: HitActor 必须有效
 	if (!HitActor)
 	{
@@ -1525,6 +1577,22 @@ void UAIAttackComponent::Server_ReportMotherAttackHit_Implementation(AActor* Hit
 	ABaseCharacter* OwnerCharacter = ResolveOwnerCharacter();
 	if (!OwnerCharacter)
 	{
+		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态服务器侧拒绝 AI 母体感染报告 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: UMeleeSwStrategy::TickDetection 已拦截, 但 RPC 可能在中途到达
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (OwnerCharacter->IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[AIAttackComponent] Server_ReportMotherAttackHit: AI 母体=%s 处于结算状态, 拒绝感染报告 (深度防御)."),
+			*OwnerCharacter->GetName());
 		return;
 	}
 

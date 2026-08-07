@@ -22,6 +22,10 @@
 // 必须 include 完整类型 (enum class 不能前向声明在跨编译单元用)
 #include "Systems/AI/AIBehaviorTypes.h"
 
+// 【v210 P0 大厂架构】结算状态查询 — IsInSettlement() 需读取 ARoomGameState::bInSettlement
+// 头文件 inline 实现, 必须 include 完整类型, 不能只前向声明
+#include "Systems/RoomGameState.h"
+
 // 引入新增的 4 个 Component (健康/能量/溶解/脚步)
 #include "Components/HealthComponent.h"
 #include "Components/EnergyComponent.h"
@@ -254,6 +258,24 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Stats", meta = (DeprecatedFunction, DeprecationMessage = "请改用 IsDead()"))
 	bool GetIsDead() const { return IsDead(); }
 
+	/**
+	 * 【v210 P0 大厂架构】结算状态查询 — 单一真理源
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - 一整局游戏完全结束进入结算页面时, 所有 AI 和玩家都不能走动、不能攻击
+	 *   - 单一真理源: ARoomGameState::bInSettlement (Replicated, 服务器权威)
+	 *
+	 * 大厂原则:
+	 *   - 所有攻击入口 (PlayerCombo / AIAttack / OnFirePressed / MotherSkill) 必须调用本方法
+	 *   - 严禁在多处复制 `if (RoomGS->bInSettlement) return;` (违反 DRY)
+	 *   - 0 兜底: World / GameState 任意一个为空 → 拒绝 (不允许"找不到就放行")
+	 *   - 蓝图为纯函数: 不修改任何状态, 只读 GameState
+	 *
+	 * @return true=已结算, 拒绝所有攻击/移动; false=可执行
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|Settlement")
+	bool IsInSettlement() const;
+
 	// ==========================================
 	// 阵营系统 — 【Phase 1 重构】走 IGenericTeamAgentInterface (UE5 官方阵营协议)
 	// ==========================================
@@ -444,8 +466,10 @@ public:
 	 *   - 这是"per-instance state" 不是 "shared singleton"
 	 *
 	 * 零兜底:
-	 *   - Strategy null → StartMotherTrace 拒绝 + Log Error (强制修复)
+	 *   - ResolveMotherTraceStrategy 永远不返回 null (NewObject 兜底, 非静默兜底)
+	 *   - 仅在 NewObject OOM 等极端失败才 Log Error
 	 *   - 构造函数创建, BeginPlay 不再缓存 (v40.6 大厂原则 — 不缓存 Actor 引用)
+	 *   - 【v136 P0】三阶段主动恢复 (字段 → TObjectIterator → NewObject 重建)
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Combat|Mother")
 	TObjectPtr<UMeleeSwStrategy> MotherTraceStrategy = nullptr;
@@ -1115,6 +1139,32 @@ public:
 		return ResolveComponent<UMotherSkillComponent>(MotherSkillComponent, TEXT("MotherSkillComponent"));
 	}
 
+	// ============================================
+	// 【v136 P0 终极修复】MotherTraceStrategy — 三阶段主动恢复
+	// ============================================
+	//
+	// 业务背景 (Session1.log 2026.08.06):
+	//   BP_MuTi_C_4 报告: "MotherTraceStrategy 字段为 null, TObjectIterator 也找不到 MeleeSwStrategy 子对象"
+	//   根因 (大厂架构根因): BP 子类 (BP_MuTi) 在 archetype 实例化阶段**完全删除**了 C++ CreateDefaultSubobject 创建的子对象
+	//     - 旧 v135.1 TObjectIterator 兜底逻辑只在"字段被清空但子对象仍存在"时有效 (Outer == this 命中)
+	//     - 当 BP 子类完全删除子对象 (Outer 不再 == this), TObjectIterator 也找不到
+	//     - 旧代码: 找不到 → Log Error + return false → 母体功能彻底失败 (违反零兜底)
+	//
+	// 修复方案 (大厂原则 — 主动恢复, 非静默兜底):
+	//   1. 字段有效 → fast path
+	//   2. 字段 null + TObjectIterator 找到 (Outer == this) → 修复字段 (旧 v135.1 逻辑)
+	//   3. 字段 null + TObjectIterator 找不到 → **NewObject<UMeleeSwStrategy>(this) 主动重建**
+	//      - "主动重建" ≠ "兜底" (兜底是"找不到就用别的东西替代")
+	//      - 这是"对象不存在就重新创建" — 大厂常见自动恢复模式 (类似服务崩溃自动重启, 不是降级)
+	//   4. NewObject 失败 (OOM 等极端情况) → 才 Log Error
+	//
+	// 大厂原则 — 零兜底 + 零重复:
+	//   - 与 v38 ResolveComponent<T> 模板对偶 (模板走 FindComponentByClass, 这个走 TObjectIterator+NewObject)
+	//   - StartMotherTrace / StopMotherTrace / MotherTick 三处统一调这个方法
+	//   - 保证 MotherTraceStrategy 永远可用 (母体功能 100% 可用)
+	// ============================================
+	UMeleeSwStrategy* ResolveMotherTraceStrategy();
+
 	/**
 	 * 【2026.07.12 P0 大厂重构 Phase 2】角色头像/武器图标刷新组件 (Phase 2.5)
 	 * 职责: RefreshCharacterIcon/Client_RefreshCharacterIcon_Implementation/RetryRefreshCharacterIcon
@@ -1248,6 +1298,32 @@ protected:
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_RequestSwitchToSlot(EWeaponSlotType TargetSlot);
+
+	// ==========================================
+	// 【v137 大厂架构 P0】服务器 helper — 主动补 Spawn (合并 v136 P1 按 1/2/3 显式键 + Q 循环键)
+	// ==========================================
+	//
+	// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+	//   "客户端有几局能切换近战武器, 几局又无法切换"
+	//   根因 (大厂架构根因):
+	//     - v136 P1 主动补 Spawn 只加在了 Server_RequestSwitchToSlot_Implementation (1/2/3 显式键)
+	//     - Server_SwitchWeaponSlot_Implementation (Q 循环键) 没加 → 玩家按 Q 切到 Melee 时如果槽位空,
+	//       直接被 WeaponAttachmentComponent::Server_SwitchToWeaponSlot 拒绝 (line 1558 Log Error)
+	//     - 这是**重复架构 + 漏修复路径** — 必须合并
+	//
+	// 大厂原则 — 0 重复:
+	//   - 1/2/3 键路径 (Server_RequestSwitchToSlot_Implementation) 和 Q 循环键路径 (Server_SwitchWeaponSlot_Implementation)
+	//     都调这一个 helper
+	//   - 不复制代码
+	//   - helper 内部: 只对 Melee 槽触发主动补 Spawn (Secondary 槽玩家没选 = 真没选, 不主动创造)
+	//
+	// 大厂原则 — 0 兜底 vs 主动恢复:
+	//   - 0 兜底: "找不到就用别的东西替代" (静默掩盖 bug) — 严格禁止
+	//   - 主动恢复: "找不到就用玩家原选/业务默认补 Spawn" (明确语义, 不掩盖) — 允许
+	//
+	// @param TargetSlot 服务器要切换的目标槽位
+	// @return true=槽位有武器 (现有或刚补 Spawn) 可以切换; false=槽位没武器且补 Spawn 失败 (真正配置错误)
+	bool EnsureSlotHasWeapon_Server(EWeaponSlotType TargetSlot);
 
 	// ==========================================
 	// 【v200 大厂架构新增】丢弃主武器
@@ -2596,7 +2672,7 @@ public:
 	 *   - 复用 ANS_MeleeTraceState 类 (美术不学新标签)
 	 *   - 复用 MeleeSwStrategy::TickDetection BoxTrace 缝合算法 (零重复)
 	 *   - 母体没有武器 → 不能走 Weapon->StartDamageTrace
-	 *   - 母体路径: Mesh = GetMesh(), Socket = TraceStart_Mother / TraceEnd_Mother
+	 *   - 母体路径: Mesh = GetMesh(), Socket = RayDetectionStart_L / RayDetectionEnd_L
 	 *   - 命中: 调 Server_ReportMotherAttackHit (走变母体逻辑)
 	 *
 	 * 职责:

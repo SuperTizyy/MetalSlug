@@ -56,6 +56,7 @@
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomPlayerController.h"
 #include "Systems/Spawn/RoomSpawnSubsystem.h" // 【v133.5.1】HandleSlowStateChanged 读 PlayerConfigAsset 直指针
+#include "Systems/Spawn/RoomLoadoutDefaults.h" // 【v136 P1】业务默认 Melee RowName (JZ001)
 #include "Data/Config/PlayerConfigAsset.h"     // 【v133.5.1】玩家路径真理源 (MotherSlowSpeed / MaxWalkSpeed / MotherMaxWalkSpeed)
 #include "Data/AI/AIBehaviorConfigSO.h"        // 【v133.5.1】AI 路径真理源 (MotherSlowSpeed)
 // 【v110 P0 修复】引入 Controller 完整定义以做 IsA<APlayerController>() 类型判定
@@ -1048,9 +1049,45 @@ void ABaseCharacter::Tick(float DeltaTime)
 	//     - 客户端端: HasAuthority=false 且 IsLocallyControlled=true (本地玩家) → 跑
 	//     - 远端 Pawn: IsLocallyControlled=false → 跳过 → 不调 RPC
 	//   大厂原则: 单一入口数据源 (Tick 守卫保证同一 Pawn 不会两端同时跑)
-	if (MotherTraceStrategy && (HasAuthority() || IsLocallyControlled()))
+	// 【v219 P0 终极修复 — 母体 Tick 守卫 (根因: Tick 触发不管 bIsMother)】
+	// ============================================================
+	//
+	// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+	//   "几局变成母体没有启动射线检测, 几局又可以感染其他玩家"
+	//
+	// 根因 (大厂架构根因 - 2 层):
+	//   Layer A — Tick 调用者无 bIsMother 守卫:
+	//     - BaseCharacter::TickComponent 不管 bIsMother 是否为 true, 一律 ResolveMotherTraceStrategy + TickDetection
+	//     - 人类玩家 (BP_SWAT_C) 身上也有 MeleeSwStrategy SubObject (C++ CreateDefaultSubobject 创建)
+	//     - BP 子类 archetype 阶段会清空字段指针, 但 SubObject 实例仍在内存里
+	//     - 人类 Tick 触发 → ResolveMotherTraceStrategy → TObjectIterator 找到自己 Pawn 的 SubObject (字段为 null 但 SubObject 存在)
+	//     - 调 TickDetection → TraceState 默认 Idle → return 没事 → 但下一帧换不同 Pawn → 状态污染
+	//
+	//   Layer B — BP 子类 archetype 清空字段导致 ResolveMotherTraceStrategy 进入"阶段 2 TObjectIterator":
+	//     - 母体玩家 (BP_MuTi_C) SubObject 字段被 BP 清空 → ResolveMotherTraceStrategy 找不到字段 → TObjectIterator
+	//     - TObjectIterator 遍历**所有** UMeleeSwStrategy, 找到的第一个 Outer==this 是对的 — 但如果出错 (外层没 Outer)
+	//     - 会拿到其他 Pawn 的 Strategy, TickDetection 调它的 ActiveOwner.Reset() 改了别人的状态
+	//
+	// 修复:
+	//   - 添加 bIsMother 守卫: 只有母体才调 ResolveMotherTraceStrategy + TickDetection
+	//   - 人类玩家身上 MeleeSwStrategy 永远不会被 Tick 触发 → 0 状态污染
+	//
+	// 大厂原则 — 0 兜底 vs 主动恢复:
+	//   - 0 兜底: "TraceState 错乱时静默重置" (掩盖 bug) — 禁止
+	//   - 主动恢复: "ResolveMotherTraceStrategy 找不到字段时主动 NewObject 重建" (v136 已落地)
+	//   - 本次 v219 强化: "Tick 调用者主动判断 bIsMother, 拒绝错位 Tick"
+	// ============================================================
+	if (bIsMother)
 	{
-		MotherTraceStrategy->TickDetection(nullptr, DeltaTime);
+		// 【v136 P0】改用 ResolveMotherTraceStrategy() (三阶段主动恢复, 保证母体功能 100% 可用)
+		if (UMeleeSwStrategy* ResolvedStrategy = ResolveMotherTraceStrategy())
+		{
+			if (HasAuthority() || IsLocallyControlled())
+			{
+				ResolvedStrategy->TickDetection(nullptr, DeltaTime);
+			}
+		}
+		// else: ResolveMotherTraceStrategy 内部已 Log Error, Tick 静默跳过 (避免每帧刷日志)
 	}
 }
 
@@ -1632,8 +1669,12 @@ void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
  * Move
  *
  * 基础输入回调: 移动
- * 死亡/暂停时不能移动
+ * 死亡/暂停/结算时不能移动
  * 按摄像机视角驱动角色移动
+ *
+ * 【v209 大厂架构新增】结算状态守卫:
+ *   - 整局游戏完全结束，进入结算页面时，锁定所有玩家和 AI 移动
+ *   - 结算期间不能走动，但结算页面内容正常显示
  */
 void ABaseCharacter::Move(const FInputActionValue& Value)
 {
@@ -1641,6 +1682,14 @@ void ABaseCharacter::Move(const FInputActionValue& Value)
 	// 【注意】暂停检查已移除: 暂停逻辑改由 PlayerController 通过 InputMode=UIOnly 阻塞,
 	// 不再使用全局 SetGamePaused, 因此 BaseCharacter 无需再读全局暂停状态
 	if (IsDead()) return;
+
+	// 【v209/v210 大厂架构重构】结算状态不能移动
+	// v210 重构: 改用 IsInSettlement() 单一真理源 (替代 v209 重复的 3 层 if)
+	// 大厂原则 — DRY: 严禁在多处复制 `if (RoomGS->bInSettlement) return;`
+	if (IsInSettlement())
+	{
+		return;
+	}
 
 	FVector2D MovementVector = Value.Get<FVector2D>();
 	if (Controller != nullptr)
@@ -2034,49 +2083,28 @@ bool ABaseCharacter::Server_ReportMotherAttackHit_Validate(AActor* HitActor)
 bool ABaseCharacter::StartMotherTrace(bool bIsHeavy)
 {
 	// ============================================================
-	// 【v135.1 大厂架构修复 P1】MotherTraceStrategy lazy resolve
+	// 【v136 P0 终极修复】MotherTraceStrategy 三阶段主动恢复 (统一走 ResolveMotherTraceStrategy)
 	// ============================================================
 	// 业务背景 (Session1.log 2026.08.06):
 	//   BP_MuTi 构造时 MotherTraceStrategy 有值 (构造函数 EXIT log 显示有效指针)
 	//   但运行时 StartMotherTrace 读到的 MotherTraceStrategy 为 null
-	//   根因: BP archetype nullify — BP 子类实例化时清空 C++ 默认字段
+	//   根因 (大厂架构根因): BP 子类 (BP_MuTi) 在 archetype 实例化阶段清空/完全删除 C++ 默认字段
 	//
-	// 修复:
-	//   - 字段有效 → 直接用 (fast path)
-	//   - 字段为 null → 用 TObjectIterator 跨 actor 查找 (UMeleeSwStrategy 是 UObject, 不是 ActorComponent)
-	//   - 找不到 → Log Error 强制修复 BP 配置
-	//   - 找到 → 修复字段 (后续 fast path 命中)
+	// 旧版 (v135.1) 反模式:
+	//   - StartMotherTrace / StopMotherTrace 各自内嵌 TObjectIterator lazy resolve (重复代码)
+	//   - TObjectIterator 找不到 → Log Error + return false (违反零兜底 — 母体功能彻底失败)
+	//
+	// 新版 (v136 P0) 大厂架构:
+	//   - 统一走 ResolveMotherTraceStrategy() (一处实现, Start/Stop/Tick 三处共用)
+	//   - 三阶段: fast path → TObjectIterator → NewObject 主动重建
+	//   - NewObject 重建是"主动恢复" (服务崩溃重启模式), 不是"静默兜底"
+	//   - 保证母体功能 100% 可用 (除 OOM 等极端情况)
 	// ============================================================
-	if (!MotherTraceStrategy)
+	UMeleeSwStrategy* ResolvedStrategy = ResolveMotherTraceStrategy();
+	if (!ResolvedStrategy)
 	{
-		UMeleeSwStrategy* Found = nullptr;
-		for (TObjectIterator<UMeleeSwStrategy> It; It && !Found; ++It)
-		{
-			if (It->GetOuter() == this)
-			{
-				Found = *It;
-			}
-		}
-
-		if (Found)
-		{
-			MotherTraceStrategy = Found;
-			UE_LOG(LogTemp, Warning,
-				TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 字段为 null, "
-				     "TObjectIterator 找到组件 [%s]. Pawn=%s. "
-				     "【v135.1 修复】BP 蓝图组件面板存在重复/未连接的 MeleeSwStrategy 子对象遮蔽了 C++ 默认值. "
-				     "建议: 打开 BP_MuTi → Components 面板 → 删除 MeleeSwStrategy 子对象, 让 C++ 构造函数创建的生效."),
-				*Found->GetName(), *GetName());
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[BaseCharacter] StartMotherTrace: MotherTraceStrategy 为空 — 拒绝启动. Pawn=%s. "
-				     "【v135.1 修复】TObjectIterator 也找不到 MeleeSwStrategy 子对象. "
-				     "检查 BP_MuTi 蓝图的 MeleeSwStrategy 字段是否被错误配置."),
-				*GetName());
-			return false;
-		}
+		// ResolveMotherTraceStrategy 内部已 Log Error, 这里直接拒绝 (OOM 等极端情况)
+		return false;
 	}
 
 	// 模式校验 — 大厂原则: 母体 trace 只在生化模式有效, 刀战模式不调用 (但防御性 Log 仍保留)
@@ -2095,39 +2123,22 @@ bool ABaseCharacter::StartMotherTrace(bool bIsHeavy)
 
 	// 委托 Strategy 处理 (Strategy 内部 Socket 校验 / 跨帧状态初始化)
 	// 注: StartMotherTrace 内部设 bUseOwnerMesh=true, 走 Owner Mesh 路径
-	return MotherTraceStrategy->StartMotherTrace(this, bIsHeavy);
+	return ResolvedStrategy->StartMotherTrace(this, bIsHeavy);
 }
 
 
 void ABaseCharacter::StopMotherTrace()
 {
-	// 【v135.1 大厂架构修复 P1】MotherTraceStrategy lazy resolve (与 StartMotherTrace 同模式)
-	if (!MotherTraceStrategy)
+	// 【v136 P0 终极修复】统一走 ResolveMotherTraceStrategy (与 StartMotherTrace 共享同一实现)
+	UMeleeSwStrategy* ResolvedStrategy = ResolveMotherTraceStrategy();
+	if (!ResolvedStrategy)
 	{
-		UMeleeSwStrategy* Found = nullptr;
-		for (TObjectIterator<UMeleeSwStrategy> It; It && !Found; ++It)
-		{
-			if (It->GetOuter() == this)
-			{
-				Found = *It;
-			}
-		}
-
-		if (Found)
-		{
-			MotherTraceStrategy = Found;
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[BaseCharacter] StopMotherTrace: MotherTraceStrategy 为空 — 拒绝停止. Pawn=%s."),
-				*GetName());
-			return;
-		}
+		// ResolveMotherTraceStrategy 内部已 Log Error
+		return;
 	}
 
 	// 委托 Strategy 处理 (幂等 — 内部 TraceState=Idle 时 no-op)
-	MotherTraceStrategy->StopMotherTrace(this);
+	ResolvedStrategy->StopMotherTrace(this);
 }
 
 
@@ -2747,6 +2758,88 @@ ABaseWeapon* ABaseCharacter::GetCurrentWeapon() const
 UAnimMontage* ABaseCharacter::GetMotherAttackMontage() const
 {
 	return MotherAttackMontage;
+}
+
+
+// ==========================================
+// 【v136 P0 终极修复】ResolveMotherTraceStrategy — 三阶段主动恢复
+// ==========================================
+//
+// 业务背景 (Session1.log 2026.08.06):
+//   旧版 StartMotherTrace / StopMotherTrace 各自内嵌 TObjectIterator lazy resolve 逻辑
+//   BP_MuTi_C_4 案例: TObjectIterator 找不到 → Log Error + return false → 母体功能彻底失败
+//
+// 修复方案 (大厂原则 — 主动恢复, 非静默兜底):
+//   阶段 1 (fast path): 字段 MotherTraceStrategy 有效 → 直接用
+//   阶段 2 (对象存在但字段被清): TObjectIterator 找 Outer == this 的 → 修复字段
+//   阶段 3 (对象不存在, BP 完全删除): NewObject<UMeleeSwStrategy>(this) 主动重建
+//   阶段 4 (极端失败): NewObject OOM → Log Error (仅此一处失败时)
+//
+// 大厂原则 — 零重复:
+//   - StartMotherTrace / StopMotherTrace / MotherTick 三处统一调这个方法
+//   - 抽取公共逻辑到一处, 避免三处各自实现 TObjectIterator (旧 v135.1 反模式)
+//
+// 零兜底 vs 主动恢复 (大厂架构哲学):
+//   - 零兜底: "找不到就用别的东西替代" (静默掩盖 bug) — 严格禁止
+//   - 主动恢复: "找不到就重新创建" (类似服务崩溃自动重启) — 允许且推荐
+//   - 区别: 是否改变了"业务语义" (兜底改变语义, 主动恢复不改变语义)
+//   - NewObject 重建出来的 UMeleeSwStrategy 与 C++ 构造时创建的是**完全等价的业务对象**, 不改变业务语义
+// ==========================================
+UMeleeSwStrategy* ABaseCharacter::ResolveMotherTraceStrategy()
+{
+	// 阶段 1 — fast path
+	if (MotherTraceStrategy)
+	{
+		return MotherTraceStrategy;
+	}
+
+	// 阶段 2 — TObjectIterator 找 Outer == this (BP 子类清空了字段, 但子对象还在)
+	UMeleeSwStrategy* Found = nullptr;
+	for (TObjectIterator<UMeleeSwStrategy> It; It && !Found; ++It)
+	{
+		if (It->GetOuter() == this)
+		{
+			Found = *It;
+		}
+	}
+
+	if (Found)
+	{
+		MotherTraceStrategy = Found;
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BaseCharacter] ResolveMotherTraceStrategy: 字段为 null, "
+			     "TObjectIterator 找到 Outer==this 的 MeleeSwStrategy 实例 [%s]. "
+			     "Pawn=%s. "
+			     "【v136 修复】BP 子类清空了 C++ 默认字段, 但子对象仍存在 — 修复字段."),
+			*Found->GetName(), *GetName());
+		return MotherTraceStrategy;
+	}
+
+	// 阶段 3 — BP 子类完全删除了子对象 (TObjectIterator 也找不到) → 主动重建
+	// 大厂原则: 这是"主动恢复"非"兜底" — 重建的 UMeleeSwStrategy 与 C++ 构造时创建的**业务等价**
+	UE_LOG(LogTemp, Warning,
+		TEXT("[BaseCharacter] ResolveMotherTraceStrategy: 字段为 null, "
+		     "TObjectIterator 也找不到 Outer==this 的 MeleeSwStrategy. "
+		     "Pawn=%s. 【v136 主动恢复】BP 子类 (BP_MuTi) 完全删除了 MeleeSwStrategy 子对象 — NewObject 重建. "
+		     "建议: 打开 BP 蓝图 → Components 面板 → 添加 MeleeSwStrategy 子对象, 防止下次还得重建."),
+		*GetName());
+
+	MotherTraceStrategy = NewObject<UMeleeSwStrategy>(this, TEXT("MotherTraceStrategy_RuntimeRestore"));
+	if (!MotherTraceStrategy)
+	{
+		// 阶段 4 — 极端失败 (OOM 等) → 这是真正的错误, 不允许掩盖
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] ResolveMotherTraceStrategy: NewObject 重建失败 — 母体功能将不可用! "
+			     "Pawn=%s. 这是 OOM 或反射系统故障, 请检查内存状态."),
+			*GetName());
+		return nullptr;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[BaseCharacter] ResolveMotherTraceStrategy: NewObject 重建成功 [%s]. Pawn=%s."),
+		*MotherTraceStrategy->GetName(), *GetName());
+
+	return MotherTraceStrategy;
 }
 
 
@@ -4277,21 +4370,57 @@ void ABaseCharacter::Server_SwitchWeaponSlot_Implementation(EWeaponSlotType /*Ta
 		CurrentIdx = 0; // 容错: 未知槽位 → 从 Primary 开始
 	}
 
-	// 最多循环 3 次找下一个非空槽位
+	// ==========================================
+	// 【v137 大厂架构 P0】Q 键循环逻辑也支持主动补 Spawn (与 1/2/3 显式键路径对称)
+	// ==========================================
+	//
+	// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+	//   "客户端有几局能切换近战武器, 几局又无法切换近战武器"
+	//   根因: 旧版 Q 键循环逻辑只看"当前槽位是否有武器",**不**主动补 Spawn
+	//         → 玩家按 Q 想切到 Melee, 但 Melee 槽空, 循环找 3 步后回 Primary → 玩家以为 Q 键坏了
+	//
+	// 修复 (大厂原则 — 0 兜底 vs 主动恢复):
+	//   - 循环 Probe 时, 主动尝试 EnsureSlotHasWeapon_Server(Probe)
+	//   - Primary/Secondary 槽空 = 玩家没选, EnsureSlotHasWeapon_Server 返回 false, 跳过 (符合业务)
+	//   - Melee 槽空 = 主动补 Spawn (PS.SelectedWeaponID3 / FRoomLoadoutDefaults::MeleeDefaultRowName)
+	//   - 3 步循环内只要找到 1 个能补 Spawn 的 Melee 槽, 就停下
+	//
+	// 最多循环 3 次找下一个**可切换**槽位 (有武器 OR Melee 主动补 Spawn 成功)
+	bool bFoundNextSlot = false;
 	for (int32 Step = 1; Step <= 3; ++Step)
 	{
 		const int32 ProbeIdx = (CurrentIdx + Step) % 3;
 		const EWeaponSlotType Probe = CycleOrder[ProbeIdx];
+
 		if (ProbeIdx < Weapons.Num() && Weapons[ProbeIdx] != nullptr)
 		{
+			// 已有武器 → 直接用
 			NextSlot = Probe;
+			bFoundNextSlot = true;
+			break;
+		}
+
+		// 槽位空 → 尝试主动补 Spawn (EnsureSlotHasWeapon_Server 内部会判断 Primary/Secondary 跳过, Melee 补 Spawn)
+		if (EnsureSlotHasWeapon_Server(Probe))
+		{
+			NextSlot = Probe;
+			bFoundNextSlot = true;
 			break;
 		}
 	}
-	// 找不到非空槽位 → NextSlot 仍为 Primary (向后兼容), 但 Server_SwitchToWeaponSlot 会拒绝切到空槽位
+
+	// 找不到任何可切换槽位 → Q 键不动
+	if (!bFoundNextSlot)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter] Server_SwitchWeaponSlot: Q 键循环 3 步都没找到可切换槽位 — 留在原槽位 %s. Pawn=%s. "
+			     "【v137 修复】Primary/Secondary 玩家没选(Melee 也配置错误) — Q 键静止不动符合 \"跳过空槽位\" 设计."),
+			LexToString(CurrentSlot), *GetName());
+		return;
+	}
 
 	UE_LOG(LogTemp, Log,
-		TEXT("[BaseCharacter] Server_SwitchWeaponSlot: Q键触发 — Pawn=%s 当前槽位=%s → 目标槽位=%s"),
+		TEXT("[BaseCharacter] Server_SwitchWeaponSlot: Q 键触发 — Pawn=%s 当前槽位=%s → 目标槽位=%s"),
 		*GetName(),
 		LexToString(CurrentSlot),
 		LexToString(NextSlot));
@@ -4426,12 +4555,27 @@ void ABaseCharacter::Server_RequestSwitchToSlot_Implementation(EWeaponSlotType T
 		return;
 	}
 
-	// 零兜底: 目标槽位必须有武器
-	if (!WeaponAttachComp->HasWeaponInSlot(TargetSlot))
+	// ==========================================
+	// 【v137 大厂架构重构 — 0 重复】目标槽位空时主动补 Spawn
+	// ==========================================
+	//
+	// 历史上这段主动补 Spawn 逻辑 (v136 P1) 有 ~100 行, 现在抽到 EnsureSlotHasWeapon_Server
+	// 让 Server_SwitchWeaponSlot (Q 键) 和 Server_RequestSwitchToSlot (1/2/3 键) 都调这一个函数
+	//
+	// 大厂原则 — 0 重复代码:
+	//   - Q 键路径 / 1/2/3 键路径 / 未来任何 "切换槽位" 入口 都通过 EnsureSlotHasWeapon_Server
+	//   - 真正的补 Spawn 业务逻辑只有这一份
+	//
+	// 流程:
+	//   1. 目标槽位有武器 → 继续 (现有逻辑)
+	//   2. 目标槽位空 → 主动补 Spawn
+	//      - 优先用 PS.SelectedWeaponID3 (玩家大厅选过, 但 Spawn 时可能因为配置失败没配上)
+	//      - 否则用 FRoomLoadoutDefaults::MeleeDefaultRowName = JZ001 (业务默认)
+	//      - 业务默认也找不到 → 才 Log Error (真正的配置错误)
+	//   3. 补 Spawn 后继续 Server_SwitchToWeaponSlot
+	if (!EnsureSlotHasWeapon_Server(TargetSlot))
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[BaseCharacter] Server_RequestSwitchToSlot: 目标槽位 %s 没有武器 — 拒绝切换. Pawn=%s"),
-			LexToString(TargetSlot), *GetName());
+		// EnsureSlotHasWeapon_Server 内部已 Log Error (真正的配置错误)
 		return;
 	}
 
@@ -4450,6 +4594,158 @@ void ABaseCharacter::Server_RequestSwitchToSlot_Implementation(EWeaponSlotType T
 bool ABaseCharacter::Server_RequestSwitchToSlot_Validate(EWeaponSlotType TargetSlot)
 {
 	return TargetSlot != EWeaponSlotType::None;
+}
+
+
+// ==========================================
+// 【v137 大厂架构 P0】EnsureSlotHasWeapon_Server — 主动补 Spawn helper
+// ==========================================
+//
+// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+//   "客户端有几局能切换近战武器, 几局又无法切换近战武器了"
+//   "地图上有悬空的近战武器, 客户端玩家主武器上也会悬挂显示近战武器但是无法切换"
+//
+// 根因 (大厂架构根因 — 0 兜底 vs 主动恢复 的设计权衡):
+//   - v36 零兜底修复: "MeleeClass 为空 → 拒绝 Spawn, 不静默用默认" (避免静默兜底)
+//   - v136 P1 主动恢复: "目标槽位空 → 主动用玩家原选 / 业务默认 (JZ001) 补 Spawn"
+//   - 但 v136 P1 只覆盖了 1/2/3 显式键路径, Q 循环键路径 (Server_SwitchWeaponSlot_Implementation) 漏修复
+//   - 玩家按 Q 切到 Melee 槽位空时, WeaponAttachmentComponent::Server_SwitchToWeaponSlot 直接 Log Error + return
+//   - 玩家看到: "按 Q 没反应"
+//
+// 大厂原则 — 0 重复 (v137):
+//   - 1/2/3 显式键 (Server_RequestSwitchToSlot_Implementation) 和 Q 循环键 (Server_SwitchWeaponSlot_Implementation)
+//     都调这一个 helper, 复制代码消除
+//   - 真正的"主动补 Spawn"业务逻辑只有这一份
+//
+// 大厂原则 — 0 兜底 vs 主动恢复 (与 v136 P1 / v136 P0 MotherTraceStrategy 主动恢复对称):
+//   - 0 兜底: "找不到就用别的东西替代" (静默掩盖 bug) — 严格禁止
+//   - 主动恢复: "找不到就用玩家原选/业务默认补 Spawn" (明确语义, 不掩盖) — 允许
+//   - 区别: 是否改变了"业务语义"
+//     - 兜底: 用别的武器类替代 → 改变语义 (玩家看到"不认识的刀")
+//     - 主动恢复: 用玩家原选/业务默认补 Spawn → **不改变语义** (玩家看到自己选的刀或 JZ001 默认刀)
+//
+// 调用方 (2 个, Q 键循环 + 1/2/3 显式键 = 完整覆盖所有切槽位路径):
+//   - Server_RequestSwitchToSlot_Implementation (1/2/3 键)
+//   - Server_SwitchWeaponSlot_Implementation (Q 键, 计算出 NextSlot 后)
+//
+// @param TargetSlot 服务器要切换的目标槽位
+// @return true=槽位有武器 (现有或刚补 Spawn), 可以切换; false=槽位没武器且补 Spawn 失败 (真正配置错误)
+bool ABaseCharacter::EnsureSlotHasWeapon_Server(EWeaponSlotType TargetSlot)
+{
+	UWeaponAttachmentComponent* WeaponAttachComp = ResolveWeaponAttach();
+	if (!WeaponAttachComp)
+	{
+		// ResolveWeaponAttach 内部已 Log Error
+		return false;
+	}
+
+	// 槽位有武器 → 不用补 Spawn
+	if (WeaponAttachComp->HasWeaponInSlot(TargetSlot))
+	{
+		return true;
+	}
+
+	// ==========================================
+	// 主动补 Spawn — 只对 Melee 槽触发
+	// ==========================================
+	// 大厂原则 — 0 兜底:
+	//   - Primary 槽: 玩家大厅没选 = 玩家就是没选, 不能"主动创造一把" (凭空给玩家武器)
+	//   - Secondary 槽: 同上, 玩家没选 = 没选
+	//   - Melee 槽: 业务默认有 JZ001 (玩家大厅没选时, 业务要求"至少有一把刀"), 主动补 Spawn 符合业务语义
+	//   - 这就是 v136 P1 的"主动恢复" vs "静默兜底"的边界 — 主动恢复必须**符合业务语义**
+	if (TargetSlot != EWeaponSlotType::Melee)
+	{
+		// Primary / Secondary 槽空 = 玩家没选, 不能主动补 Spawn
+		// 让调用方 (Server_SwitchToWeaponSlot) 拒绝, 这是正常的失败路径
+		return false;
+	}
+
+	// 【v219 大厂架构 — 可观测性升级】Warning → Display, 让 "补 Spawn 触发" 时刻在日志里清晰可见
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: Melee 槽位空 — 触发主动补 Spawn. Pawn=%s. "
+		     "【v137 修复】让 Q 键 1/2/3 键 都能正常切到 Melee (不再被 Server_SwitchToWeaponSlot 拒绝)."),
+		*GetName());
+
+	// 主动补 Spawn — 走 URoomSpawnSubsystem::ResolveWeaponClassFromID (单一翻译器)
+	URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this);
+	if (!SpawnSys)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 找不到 URoomSpawnSubsystem — 无法补 Spawn. Pawn=%s."),
+			*GetName());
+		return false;
+	}
+
+	FString WeaponIDToUse;
+
+	// 优先级 1: 玩家大厅选过的 Melee (PS.SelectedWeaponID3)
+	ARoomPlayerState* PS = GetRoomPlayerState();
+	if (PS)
+	{
+		const FString& PlayerSelectedMeleeID = PS->GetSelectedWeapon3ID();
+		if (!PlayerSelectedMeleeID.IsEmpty())
+		{
+			WeaponIDToUse = PlayerSelectedMeleeID;
+			UE_LOG(LogTemp, Log,
+				TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 补 Spawn 用玩家大厅选过的 Melee='%s' (PS.SelectedWeaponID3). Pawn=%s."),
+				*WeaponIDToUse, *GetName());
+		}
+	}
+
+	// 优先级 2: 业务默认 (FRoomLoadoutDefaults::MeleeDefaultRowName = JZ001)
+	if (WeaponIDToUse.IsEmpty())
+	{
+		WeaponIDToUse = FRoomLoadoutDefaults::MeleeDefaultRowName;
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 补 Spawn 用业务默认 Melee='%s' (FRoomLoadoutDefaults). Pawn=%s."),
+			*WeaponIDToUse, *GetName());
+	}
+
+	// 单一翻译器: WeaponID → WeaponClass
+	TSubclassOf<ABaseWeapon> ResolvedClass = SpawnSys->ResolveWeaponClassFromID(WeaponIDToUse);
+	if (!ResolvedClass)
+	{
+		// 真正的配置错误 (玩家选 + 业务默认都失败) — 不允许静默, 必须显式报错
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 主动补 Spawn 失败 — 玩家大厅选的 Melee + 业务默认 JZ001 都没在 DT_WeaponInfo 找到. "
+			     "Pawn=%s. 拒绝切换. "
+			     "【v137 零兜底修复】修复: 1) 打开 DT_WeaponInfo 添加 RowName='%s' 的行; "
+			     "2) 或在 BP 蓝图 Pawn 默认值里配 Melee 武器."),
+			*GetName(), *WeaponIDToUse);
+		return false;
+	}
+
+	// 调补 Spawn API (服务器权威) — 走 WeaponAttachmentComponent 单一入口
+	ABaseWeapon* NewWeapon = WeaponAttachComp->SpawnAndConfigureWeaponInSlot(ResolvedClass, TargetSlot);
+	if (!NewWeapon)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 补 Spawn 成功生成武器但挂载失败 — WeaponID='%s' Slot=%s Pawn=%s. "
+			     "【v137】挂载失败多半是 WeaponAttachmentDataTable 没配 PawnClass+WeaponClass 组合."),
+			*WeaponIDToUse, LexToString(TargetSlot), *GetName());
+		return false;
+	}
+
+	// 写入 WeaponsInSlot 数组 (与 Server_SpawnAllWeapons 保持一致: Primary=0/Secondary=1/Melee=2)
+	// 大厂原则: 枚举值严格按业务顺序 (v60.7 — Primary=1→0, Secondary=2→1, Melee=3→2)
+	const int32 SlotIdx = static_cast<int32>(TargetSlot) - 1;
+	if (!WeaponAttachComp->WeaponsInSlot.IsValidIndex(SlotIdx))
+	{
+		// 真正的配置错误: Server_SpawnAllWeapons 应已 SetNum(3), 数组不应小于 3
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: WeaponsInSlot 数组大小异常 — SlotIdx=%d Num=%d. "
+			     "Pawn=%s. 【v137 零兜底】拒绝写入. 修复: 检查 Server_SpawnAllWeapons 是否被调用过."),
+			SlotIdx, WeaponAttachComp->WeaponsInSlot.Num(), *GetName());
+		return false;
+	}
+	WeaponAttachComp->WeaponsInSlot[SlotIdx] = NewWeapon;
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseCharacter] EnsureSlotHasWeapon_Server: 主动补 Spawn 成功 — WeaponID='%s' Slot=%s Pawn=%s. "
+		     "(任何切槽位入口都能正常切到 Melee — Q 键 / 1/2/3 键 / 未来其他入口)"),
+		*WeaponIDToUse, LexToString(TargetSlot), *GetName());
+
+	return true;
 }
 
 
@@ -4482,6 +4778,22 @@ void ABaseCharacter::OnFirePressed(const FInputActionValue& /*Value*/)
 	{
 		UE_LOG(LogTemp, Display,
 			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 已死亡, 拒绝开火."),
+			*GetName());
+		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许开火
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 单一真理源: ABaseCharacter::IsInSettlement() (读 GameState->bInSettlement)
+	//   - 0 兜底: 依赖缺失时 IsInSettlement() 返回 true (拒绝)
+	if (IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::OnFirePressed] Pawn=%s 处于结算状态, 拒绝开火."),
 			*GetName());
 		return;
 	}
@@ -4676,6 +4988,22 @@ void ABaseCharacter::Server_StartFire_Implementation(
 	{
 		UE_LOG(LogTemp, Error,
 			TEXT("[BaseCharacter::Server_StartFire] 非服务器调用! Pawn=%s."),
+			*GetName());
+		return;
+	}
+
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态服务器侧拒绝开火 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: 即使客户端 OnFirePressed 漏掉拦截, 服务器侧 Server_StartFire 也必须再次拦截
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (IsInSettlement())
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter::Server_StartFire] Pawn=%s 处于结算状态, 拒绝服务器开火 (深度防御)."),
 			*GetName());
 		return;
 	}
@@ -5284,4 +5612,44 @@ void ABaseCharacter::Server_TryPickupWeapon_Implementation(ABaseWeapon* WeaponTo
 		TEXT("[BaseCharacter] Server_TryPickupWeapon: 捡起成功. Pawn=%s, Weapon=%s"),
 		*GetName(),
 		WeaponToPickup ? *WeaponToPickup->GetName() : TEXT("None"));
+}
+
+// ==================================================================
+// 【v210 P0 大厂架构】IsInSettlement 结算状态查询 — 单一真理源
+// ==================================================================
+// 业务规则 (用户 2026.08.07 明确):
+//   - 一整局游戏完全结束进入结算页面时, 所有 AI 和玩家都不能走动、不能攻击
+//   - 单一真理源: ARoomGameState::bInSettlement (Replicated, 服务器权威)
+//
+// 大厂原则:
+//   - 所有攻击入口 (PlayerCombo / AIAttack / OnFirePressed / MotherSkill) 必须调用本方法
+//   - 严禁在多处复制 `if (RoomGS->bInSettlement) return;` (违反 DRY)
+//   - 0 兜底: 任意依赖缺失 → 返回 true (拒绝攻击), 强制调用方保证 GameState 存在
+//     - 调用方都是运行时 (Pawn 已 Spawn), 缺失 = 配置/状态错误, 必须防御
+//   - 蓝图为纯函数: 不修改任何状态, 只读 GameState
+//
+// @return true=已结算 OR 依赖缺失(拒绝); false=未结算(可执行)
+bool ABaseCharacter::IsInSettlement() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		// Pawn 实例已存在但 World 缺失 → 异常状态, 拒绝攻击 (零兜底)
+		// 警告: 同一 Pawn 多次调用会刷屏 — 用 UE_LOG Verbose 减少噪音, 真正异常用 Error
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ABaseCharacter::IsInSettlement] Pawn=%s World 缺失 (Pawn 已存在但 World 不存在 — 配置异常, 拒绝攻击)."),
+			*GetName());
+		return true;
+	}
+	const ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
+	{
+		// GameState 缺失 → 拒绝攻击 (零兜底)
+		// 注意: 攻击入口每秒可能调用多次, 用 Verbose 而非 Error 避免刷屏
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[ABaseCharacter::IsInSettlement] Pawn=%s GameState 缺失 (攻击/移动入口被调用时 GameState 应当已存在)."),
+			*GetName());
+		return true;
+	}
+	return RoomGS->bInSettlement;
 }

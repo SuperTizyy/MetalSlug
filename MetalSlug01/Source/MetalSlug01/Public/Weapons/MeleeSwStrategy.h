@@ -71,7 +71,7 @@ public:
 	//   - 母体无武器, 不能复用 BaseWeapon::StartDamageTrace
 	//   - 但 BoxTrace 缝合算法 + IgnoreActors 防一刀多伤 = Melee 通用算法, 应该复用
 	//   - 不重写 Strategy 类 — 加 bUseOwnerMesh 标志, 让 Strategy 走 Owner Mesh 路径
-	//   - Socket 名改 TraceStart_Mother / TraceEnd_Mother (母体 Mesh 上, 武器 Mesh 上仍用 TraceStart/TraceEnd)
+	//   - Socket 名改 RayDetectionStart_L / RayDetectionEnd_L (母体 Mesh 上, 武器 Mesh 上仍用 TraceStart/TraceEnd)
 	//   - 命中 RPC 改 Owner->Server_ReportMotherAttackHit 而不是 Weapon->Server_ReportHit
 	//
 	// 大厂原则 — 不重复架构:
@@ -250,8 +250,12 @@ protected:
 	// 【v93.2 母体复用】母体 Socket 名称常量
 	// ==================================
 	// 母体 Pawn Mesh 必须有以下 Socket (美术在 BP_MuTi Mesh 编辑器加):
-	//   - TraceStart_Mother: 母体爪击起点
-	//   - TraceEnd_Mother:   母体爪击终点
+	//   - RayDetectionStart_L: 母体左手爪击起点
+	//   - RayDetectionEnd_L:   母体左手爪击终点
+	// 【v212 大厂架构修订】统一 socket 命名 (用户 2026.08.08 明确指定):
+	//   - 业务规则: 母体没武器, Socket 名为 RayDetectionStart_L / RayDetectionEnd_L
+	//   - 启动方式: 只能通过 Melee Trace State (ANS_MeleeTraceState) 通知启动, 其他方式不允许
+	//   - 严禁兜底: 找不到 Socket → 直接 Log Error + return, 不允许退化到别的 socket
 	// 大厂原则 - DRY: 与武器 Socket 名并列, 单一真理源在头文件声明
 	static const FName SocketName_MotherTraceStart;
 	static const FName SocketName_MotherTraceEnd;

@@ -42,6 +42,7 @@
 #include "Services/RoomStateService.h"
 #include "Components/ComboBoxString.h"
 #include "Engine/DataTable.h"
+#include "Systems/Spawn/RoomLoadoutDefaults.h" // 【v212】业务默认 RowName 集中管理 (JZ001 等)
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Enums/RoomEnums.h"
 #include "Components/UniformGridSlot.h"
@@ -349,17 +350,63 @@ void URoomInsidePage::NativeConstruct()
 						UE_LOG(LogTemp, Warning, TEXT("[Room] Init BP%d 主武器 -> '%s'"), WSlot, *DefaultWeapon);
 					}
 				}
+
+				// 【v212 大厂架构修复 — Init 阶段默认填充 Secondary/Melee 临时选择 (业务默认 = JZ001)】
+				//
+				// 根因 (用户 2026.08.09 反馈):
+				//   "玩家如果没选近战武器, 那就默认使用 DT_WeaponInfo 的 RowName=JZ001 的武器,
+				//    选了就把所选的近战武器带入游戏中"
+				//
+				// v211 历史: 用 "DT 第 1 个 Melee 类型" 作默认 → 依赖 DT 行内容 (策划改 DT Melee 行 → 业务默认悄悄变)
+				// v212 修复: 业务默认值集中在 FRoomLoadoutDefaults (用户明确指定 JZ001)
+				//   1. 按 RowName 精确匹配 (不依赖 MeshType 过滤)
+				//   2. 客户端 UI 预填 + 服务器 Spawn 兜底共享同一真理源
+				//   3. DT_WeaponInfo 找不到 JZ001 → Log Error + 留空 (零兜底, 不 fallback 到 DT 第 N 行)
+				//
+				// 数据流:
+				//   Init 阶段 → InitializeTempSelectedWeaponsByDefault → 读 FRoomLoadoutDefaults::MeleeDefaultRowName
+				//     → 写入 TempSelectedWeaponsByType[Melee] = JZ001
+				//     → SyncLoadoutToServer 读 TMap → 发 W3=JZ001 → SetPlayerLoadout 防御性写入
+				//     → PS.SelectedWeaponID3 = JZ001
+				//     → Spawn 阶段读 PS.SelMeleeID = JZ001 → 玩家拿到 JZ001 武器 ✅
+				//
+				// 注意 (v212 零兜底):
+				//   - DT_WeaponInfo 找不到 RowName=JZ001 → Log Error + 留空 (Spawn 阶段也会兜底失败, 玩家无近战)
+				//   - 玩家已选过 → 不覆盖 (TMap.Contains() 守卫)
+				//
+				// 抽取公共 helper: InitializeTempSelectedWeaponsByDefault
+				InitializeTempSelectedWeaponsByDefault(WeaponDataTable);
 			}
 
-			// 向服务器同步当前的装备配置
-			// 【v52 P0】3 把武器一起发: 主武器(存档) + 副武器(运行时空) + 近战武器(运行时空)
-			if (ARoomPlayerController* PC2 = Cast<ARoomPlayerController>(GetOwningPlayer()))
-			{
-				FString W1 = AccountSub ? AccountSub->GetLastSelectedWeapon(1) : TEXT("");
-				FString W2 = AccountSub ? AccountSub->GetLastSelectedWeapon(2) : TEXT("");
-				// 【v52 P0 3 槽位】主武器 = W1 (BP1 主武器), 副/近战 默认空 (玩家可后续点击换枪按钮选)
-				PC2->Server_SelectLoadout(CharIDToSync, W1, TEXT(""), TEXT(""));
-			}
+			// 【v211 大厂架构修复 — Init 阶段走 SyncLoadoutToServer, 替代直接 RequestSelectLoadout】
+			//
+			// 旧版 (v210) 代码:
+			//   RoomService->RequestSelectLoadout(CharIDToSync, W1, TEXT(""), TEXT(""));
+			//
+			// v210 缺陷:
+			//   Init 阶段直接发空串 W2/W3 → 防御性写入保留空值 → Spawn 走 v209 兜底
+			//   玩家从未点"换近战武器"按钮 → TempSelectedWeaponsByType[Melee] 始终空
+			//   → 玩家看到 DT 第 2 行兜底武器, 以为"我选的武器不见了"
+			//
+			// v211 修复:
+			//   1. Init 阶段先调 InitializeTempSelectedWeaponsByDefault() 预填 TempSelectedWeaponsByType[Secondary/Melee]
+			//   2. Init 阶段调 SyncLoadoutToServer() 而非直接 RequestSelectLoadout
+			//      → SyncLoadoutToServer 内部读 TempSelectedWeaponsByType 拿 Secondary/Melee 默认值
+			//   3. 主武器仍然从存档 (AccountSub->GetLastSelectedWeapon(1)) 读
+			//   4. 角色从 ComboBox_CharacterSelect 读
+			//   5. 配合 SetPlayerLoadout 防御性写入, 玩家手动选过的武器永远不会被覆盖
+			//
+			// 重连流程 (T2 重连场景):
+			//   PostLogin → DelayedSendPlayerInfo → RequestSelectLoadout(char, W1, W2, "")
+			//     → SetPlayerLoadout 防御性写入 → PS.SelMeleeID 保留 "WX001" (v211 预填的) ✅
+			//   进游戏 → Spawn 读 PS.SelMeleeID = "WX001" → 玩家拿到 DT 第 1 个 Melee ✅
+			//
+			// 大厂原则 - 单一写入入口 (Single Write Entry):
+			//   所有 Loadout 写入 → Server_SelectLoadout_Implementation → SetPlayerLoadout (防御性写入)
+			//   Init / DelayedSendPlayerInfo / SyncLoadoutToServer 三个调用方调用方式统一
+
+			// 【v211】调 SyncLoadoutToServer() — 它内部会读 TempSelectedWeaponsByType (已预填)
+			SyncLoadoutToServer();
 
 			// 绑定角色选择变化事件
 			ComboBox_CharacterSelect->OnSelectionChanged.AddDynamic(this, &URoomInsidePage::OnCharacterSelectionChanged);
@@ -2242,6 +2289,102 @@ void URoomInsidePage::SyncLoadoutToServer()
 			// 【架构升级】原 PC->Server_SelectLoadout(...) 调用改走 RoomService
 			// PC->Server_SelectLoadout(CurrentCharID, CurrentWeapon1, CurrentWeapon2, CurrentWeapon3);
 		}
+	}
+}
+
+// ==========================================
+// 【v211 大厂架构 — Init 阶段默认填充 Secondary/Melee 临时选择】
+// ==========================================
+
+/**
+ * InitializeTempSelectedWeaponsByDefault
+ *
+ * 遍历 TempSelectedWeaponsByType, 给"未选过的"武器类型预填业务默认值
+ *
+ * 业务背景 (用户 2026.08.09 反馈):
+ *   "玩家如果没选近战武器, 那就默认使用 DT_WeaponInfo 的 RowName=JZ001 的武器,
+ *    选了就把所选的近战武器带入游戏中"
+ *
+ * 根因 (v211 修复之后暴露的下一个问题):
+ *   v211 用 "DT 第 1 个 Melee 类型" 作默认 → 这是按 MeshType 过滤, 行为依赖 DT 行内容
+ *   → 策划调整 DT_Melee 行 → 业务默认悄悄改变 → 玩家行为变了但代码看不出原因
+ *   → 业务默认值隐式散落在 DT 内容里, 违反大厂架构 "业务规则显式化"
+ *
+ * v212 修复 (大厂架构 — 业务默认值单一真理源):
+ *   1. 业务默认值集中在 FRoomLoadoutDefaults (用户指定 JZ001)
+ *   2. 按 RowName 精确匹配 (不依赖 MeshType 过滤) — 零兜底: 找不到 RowName → Log Error + 留空
+ *   3. 不允许 "DT 第 N 行" 这种隐式约定 (策划改 DT 行序不应该影响业务默认)
+ *   4. 与服务端 Spawn 兜底共享同一真理源 (FRoomLoadoutDefaults::MeleeDefaultRowName)
+ *
+ * 零兜底保证:
+ *   - DT_WeaponInfo 找不到 JZ001 → Log Error + 留空 (Spawn 阶段也会拒绝 Spawn)
+ *   - 玩家已选过 TMap[T] → 不覆盖 (玩家选择优先)
+ *   - 不允许 "DT 第 1 个 Melee 类型" 这种 MeshType 过滤兜底
+ *
+ * 业务默认与 v209 Spawn 兜底的关系:
+ *   - v212 客户端预填 (业务默认 = JZ001, 用户明确指定)
+ *   - v212 Spawn 兜底 (同样读 FRoomLoadoutDefaults::MeleeDefaultRowName → JZ001)
+ *   - 客户端 + 服务器**单一真理源**, 不再依赖 DT 行序 / MeshType 过滤
+ *   - v209 (DT 第 2 行) 兜底已弃用, 但 ResolveDefaultWeaponRowName(0) 主武器兜底保留
+ */
+void URoomInsidePage::InitializeTempSelectedWeaponsByDefault(UDataTable* InWeaponDataTable)
+{
+	if (!InWeaponDataTable)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Room] v212 InitializeTempSelectedWeaponsByDefault: WeaponDataTable 为空, 跳过. "
+			     "【零兜底】玩家未选 + 没默认 → Spawn 阶段兜底会失败. "
+			     "修复: GM_RoomGameMode → ClassDefaults → WeaponDataTable 必须配 DT_WeaponInfo 资产."));
+		return;
+	}
+
+	static const FString ContextString(TEXT("URoomInsidePage::InitializeTempSelectedWeaponsByDefault"));
+
+	// 【v212 大厂架构 — 业务默认值从 FRoomLoadoutDefaults 读 (单一真理源)】
+	//
+	// v211 旧版用 "DT 第 1 个 Melee 类型" 兜底 — 用户已明确指定 JZ001, 不再依赖 MeshType 过滤
+	struct FTypeDefaultMapping
+	{
+		EWeaponMeshType Type;
+		FString DefaultRowName; // 来自 FRoomLoadoutDefaults
+	};
+	const TArray<FTypeDefaultMapping> TypeDefaultMappings = {
+		// Secondary 当前没有业务默认 (用户没指定 Secondary 默认武器) → 留空, 走 Spawn v209 兜底
+		// v212 阶段仅强制约束 Melee 业务默认 = JZ001
+		{ EWeaponMeshType::Melee, FRoomLoadoutDefaults::MeleeDefaultRowName }
+	};
+
+	for (const FTypeDefaultMapping& Mapping : TypeDefaultMappings)
+	{
+		// 零覆盖: 玩家已选过 → 跳过
+		if (TempSelectedWeaponsByType.Contains(Mapping.Type))
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Room] v212 InitializeTempSelectedWeaponsByDefault: 类型=%d 玩家已选过, 跳过默认填充. (现有=%s)"),
+				static_cast<int32>(Mapping.Type), *TempSelectedWeaponsByType[Mapping.Type].ToString());
+			continue;
+		}
+
+		// 【v212 零兜底】按 RowName 精确匹配 — 不允许 "DT 第 N 行" 或 "MeshType 过滤" 兜底
+		const FName DefaultRow(*Mapping.DefaultRowName);
+		FWeaponInfo* Row = InWeaponDataTable->FindRow<FWeaponInfo>(DefaultRow, ContextString);
+		if (!Row)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Room] v212 InitializeTempSelectedWeaponsByDefault: DT_WeaponInfo 中找不到 RowName='%s' (业务默认). "
+				     "【零兜底】不会 fallback 到 DT 第 N 行 — 玩家未选 + 配置缺失 → Spawn 阶段会拒绝 Spawn. "
+				     "修复: 1) 在 DT_WeaponInfo 里添加 RowName='%s' 的行; "
+				     "2) 或修改 FRoomLoadoutDefaults::%s 指向存在的 RowName. "
+				     "配置位置: Source/MetalSlug01/Private/Systems/Spawn/RoomLoadoutDefaults.cpp"),
+				*Mapping.DefaultRowName, *Mapping.DefaultRowName,
+				Mapping.Type == EWeaponMeshType::Melee ? TEXT("MeleeDefaultRowName") : TEXT("PrimaryDefaultRowName"));
+			continue;
+		}
+
+		TempSelectedWeaponsByType.FindOrAdd(Mapping.Type) = DefaultRow;
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Room] v212 InitializeTempSelectedWeaponsByDefault: 类型=%d 业务默认='%s' (玩家未选, 来自 FRoomLoadoutDefaults)"),
+			static_cast<int32>(Mapping.Type), *Mapping.DefaultRowName);
 	}
 }
 

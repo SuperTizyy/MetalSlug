@@ -86,6 +86,25 @@ void UMotherSkillComponent::ActivateSkill(float SpeedMultiplier, float Duration,
 		return;
 	}
 
+	// ==================================================================
+	// 【v210 P0 大厂架构】结算状态不允许激活技能 (深度防御)
+	// ==================================================================
+	// 业务规则 (用户 2026.08.07 明确):
+	//   一整局游戏完全结束 → 进入结算页面 → 所有 AI 和玩家都不能攻击
+	// 大厂原则:
+	//   - 深度防御: UseSkill 入口已拦截, 但 ActivateSkill 是公开方法, 任何调用方都需保护
+	//   - 0 兜底: 单一真理源 IsInSettlement() (读 GameState->bInSettlement)
+	if (ABaseCharacter* OwnerChar = Cast<ABaseCharacter>(OwnerActor))
+	{
+		if (OwnerChar->IsInSettlement())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherSkillComponent] ActivateSkill: Pawn=%s 处于结算状态, 拒绝激活技能 (深度防御)."),
+				*OwnerChar->GetName());
+			return;
+		}
+	}
+
 	// 【v120 零兜底】SpeedMultiplier ≤ 0 → 拒绝激活
 	if (SpeedMultiplier <= 0.0f)
 	{

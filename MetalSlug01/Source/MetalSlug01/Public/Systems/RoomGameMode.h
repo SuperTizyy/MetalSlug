@@ -883,31 +883,31 @@ public:
 	TObjectPtr<USoundBase> ZombieMotherWinSound = nullptr;
 
 	// ==========================================
-	// 【v134 大厂架构新增】生化为零参数查表 (供 GameHUDWidget 在 OnRep_RoundWinner 时调用)
+	// 【v134 大厂架构新增 → v210.4 已废弃】生化为零参数查表 (供 GameHUDWidget 在 OnRep_RoundWinner 时调用)
 	// ==========================================
 	//
-	// 大厂原则 — 不再写"4 个 if 写满" 反模式 (集中查表):
-	//   - GameMode 提供 ResolveZombieRoundEndSound(RoundWinner) 单一入口
-	//   - 调用方只调一个函数, 2 个字段配置决策全在 GameMode 内
-	//   - 零重复: GameHUDWidget / BP 蓝图 / 子类 都不能绕过此函数读字段
+	// 【v210.4 大厂架构重构 — 废弃】
+	//   旧 (v134 - v210.3): GM 提供 ResolveZombieRoundEndSound(RoundWinner) 单一入口
+	//   根因: 客户端 World->GetAuthGameMode() 返回 nullptr, 此函数在客户端永远走 fallback 路径
+	//   修复: 音效查表/播放上移到 RPC 链路 (服务器查 GM → FSoftObjectPath → 客户端 LoadSynchronous)
+	//   调用方: 已无, v210.4 后 UI / Lifecycle 都不再调此函数
+	//   保留声明避免遗留调用编译错误, 但函数体永远返回 nullptr (零兜底, 不允许 fallback)
 	//
-	// 业务规则 (用户 2026.08.06 明确):
+	// 业务规则 (用户 2026.08.06 明确 — 历史):
 	//   - 全体客户端播同一个音效 (不按 ClientFaction 分发)
-	//
-	// 业务规则 (零兜底):
-	//   - RoundWinner == None → 返回 nullptr (调用方拒绝播放 + Log Error, 不静默)
-	//   - 任何分支缺资产 → 返回 nullptr (调用方 Log Error)
 	//
 	// 不破坏刀战模式:
 	//   - 刀战永不调 ResolveZombieRoundEndSound (RoundWinner 只在 Bio 模式写入)
 
 	/**
-	 * @brief 根据本局赢家, 返回所有客户端应统一播放的音效资产指针 (单一入口)
+	 * @brief 【v210.4 已废弃】根据本局赢家返回 USoundBase, v210.4 后永远返回 nullptr
+	 * @deprecated v210.4: 改走 RoomGS->MulticastPlayZombieRoundSound(NewWinner, FSoftObjectPath(Sound))
 	 *
 	 * @param InRoundWinner 本局赢家 (Human / Mother)
-	 * @return 对应 USoundBase* (null 表示无效, 调用方拒绝播放 + Log Error)
+	 * @return 永远返回 nullptr
 	 */
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "MetalSlug|Match|ZombieRound")
+	UE_DEPRECATED(5.6, "v210.4: 改走 RPC FSoftObjectPath 路径, 函数体永远返回 nullptr")
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "MetalSlug|Match|ZombieRound", meta = (DeprecatedFunction, DeprecationMessage = "v210.4: Use MulticastPlayZombieRoundSound(EZombieRoundWinner, FSoftObjectPath) instead"))
 	class USoundBase* ResolveZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const;
 
 	/**

@@ -20,6 +20,25 @@
 
 class ARoomGameState;
 class ARoomPlayerState;
+class ABaseAIController;
+
+/**
+ * 【v215 大厂架构新增】玩家快照变更事件委托
+ *
+ * 触发时机 (服务器 + 客户端均会触发):
+ *   - AIController 击杀分数/击杀数/死亡数/助攻数 Replicated 字段变更 (OnRep_AIScoreboardData)
+ *   - ARoomGameState::OnPlayerArrayChanged (真人进出房)
+ *   - ARoomGameState::OnSettlementStateChanged (进入/离开结算状态)
+ *   - ARoomGameState::OnTeamKillCountUpdated (队伍总击杀变更)
+ *
+ * 大厂原则 — 事件驱动 (替代 Tick 拉取):
+ *   - View (UScoreboardWidget) 订阅此委托, 数据一变立刻刷新
+ *   - 比 0.5s Tick 拉取延迟低 N 倍, 且不浪费 CPU
+ *
+ * 注意: 已进入结算冻结状态 (FrozenSnapshots) 后, 订阅方应忽略此事件
+ *   - 冻结后所有刷新都从 FrozenSnapshots 读取, 不再触发新数据拉取
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnPlayerSnapshotsChangedDelegate);
 
 /**
  * @struct FPlayerSnapshot
@@ -288,6 +307,100 @@ public:
      */
     UFUNCTION(BlueprintPure, Category = "RoomStateService")
     int32 GetDefenseReadyCount() const;
+
+    // ==========================================
+    // 【v215 大厂架构新增】事件驱动刷新
+    // ==========================================
+
+    /**
+     * 【v215 大厂架构新增】玩家快照变更事件
+     *
+     * View (UScoreboardWidget) 订阅此事件实现增量刷新, 替代 0.5s Tick 拉取
+     *
+     * 触发时机:
+     *   - AI 计分板数据 Replicated (OnRep_AIScoreboardData → Broadcast)
+     *   - 真人 PlayerArray 变更 (OnPlayerArrayChanged → Broadcast)
+     *   - 进入/离开结算状态 (OnSettlementStateChanged → Broadcast)
+     *   - 队伍总击杀变更 (OnTeamKillCountUpdated → Broadcast)
+     *
+     * 大厂原则 — 单一真理源 + 事件驱动:
+     *   - 数据源 (AIC/PS/GS) 自己变更时主动通知
+     *   - View 不需要轮询, 也不依赖 Tick 拉取
+     *   - 旧做法 (NativeTick 0.5s 拉取) 在 60Hz 渲染下浪费 CPU, 且不及时
+     */
+    UPROPERTY(BlueprintAssignable, Category = "RoomStateService")
+    FOnPlayerSnapshotsChangedDelegate OnPlayerSnapshotsChanged;
+
+    /**
+     * 【v215 大厂架构新增】主动 Broadcast 一次 OnPlayerSnapshotsChanged
+     *
+     * 使用场景:
+     *   - ScoreboardWidget 在 NativeConstruct 时手动调用, 触发首次全量刷新
+     *   - 外部代码 (如 HUDWidget) 在状态切换时主动触发, 保证 UI 同步
+     *
+     * 大厂原则 — 显式优于默认:
+     *   - Broadcast 入口集中在一处, 不允许外部代码直接 Broadcast 委托
+     *   - 0 兜底: GameInstance 不存在时 Log Error + return false
+     */
+    UFUNCTION(BlueprintCallable, Category = "RoomStateService")
+    bool BroadcastPlayerSnapshotsChanged();
+
+public:
+    /**
+     * 【v215 大厂架构新增】事件转发器 (公开 API) — 把上游事件统一转发给 OnPlayerSnapshotsChanged
+     *
+     * 大厂原则 — 单一事件出口:
+     *   - 所有上游事件 → ForwardPlayerSnapshotsChanged → OnPlayerSnapshotsChanged.Broadcast
+     *   - 严禁 View 直接订阅上游事件 (会让 View 知道数据层细节)
+     *   - 公开此 API 是为了让 ABaseAIController / ARoomPlayerState / ARoomGameState
+     *     在它们的 OnRep_* 和服务器 AddXxx 函数中触发一次转发, 不让它们直接 Broadcast
+     *     URoomStateService 的 OnPlayerSnapshotsChanged (那会破坏封装)
+     */
+    UFUNCTION()
+    void ForwardPlayerSnapshotsChanged();
+
+    /**
+     * 【v215 大厂架构新增】订阅当前 World 的所有上游事件
+     *
+     * 上游事件源:
+     *   - ARoomGameState::OnSettlementStateChanged (进入/离开结算)
+     *   - ARoomGameState::OnTeamKillCountUpdated (队伍总击杀变更)
+     *   - ARoomPlayerState::OnStateChanged (真人准备/阵营变更)
+     *   - ARoomPlayerState::OnScoreboardDataChanged (真人计分板数据)
+     *   - ABaseAIController::OnAIScoreboardDataChanged (AI 计分板数据 Replicated)
+     *
+     * 大厂原则:
+     *   - 唯一订阅入口: Initialize 时调用一次, PIE World 切换时重新订阅
+     *   - 0 兜底: GameState 为空时 Log Error + return, 不静默跳过
+     *   - DRY: 每个事件都转发到 ForwardPlayerSnapshotsChanged, 不需要业务代码重复订阅
+     */
+    void SubscribeToWorldEvents();
+
+    /**
+     * 【v215 大厂架构新增】取消订阅当前 World 的所有上游事件
+     *
+     * 时机: Deinitialize / World 销毁 / 切换房间
+     *
+     * 大厂原则:
+     *   - 唯一解绑入口: 防止重复订阅导致的回调泄漏
+     *   - 0 兜底: 已解绑的状态允许 no-op (幂等)
+     */
+    void UnsubscribeFromWorldEvents();
+
+public:
+    /**
+     * 【v215 大厂架构新增】Subsystem 初始化 — 订阅 World 生命周期
+     *
+     * 大厂原则:
+     *   - GameInstance Subsystem 的 Initialize 只调一次 (GameInstance 生命周期内)
+     *   - World 切换时需要重新订阅 — 通过 FWorldDelegates 处理
+     */
+    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+
+    /**
+     * 【v215 大厂架构新增】Subsystem 销毁 — 取消所有订阅
+     */
+    virtual void Deinitialize() override;
 
 private:
     /**

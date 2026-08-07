@@ -100,10 +100,28 @@ public:
 	 *
 	 * 【v52 P0 扩展】参数从 2 把改为 3 把 (主/副/近战)
 	 *
+	 * 【v210 P0 防御性写入 (大厂架构 — 零覆盖)】
+	 *   - W1/W2/W3 传入空串 + 字段当前已有非空值 → **保留旧值不覆盖** (不主动清空玩家已选)
+	 *   - W1/W2/W3 传入空串 + 字段当前为空       → 写入空串 (玩家未选, Spawn 阶段走 v209 业务兜底)
+	 *   - 传入非空                             → 写入新值 (玩家主动选择, 正常覆盖)
+	 *   - CharID (4 个字段里唯一**永远无脑覆盖**的, 因为存档也没有"角色已选"概念)
+	 *
+	 * 设计动机 (用户 2026.08.09 BUG):
+	 *   "客户端自己选择了近战武器, 但是进游戏无法切到近战武器"
+	 *   根因: DelayedSendPlayerInfo 调 Server_SelectLoadout(Char, W1, W2, "")
+	 *         SetPlayerLoadout 无脑覆盖 → PS.SelectedWeaponID3 = "" → Spawn 走 v209 兜底 DT 第 2 行
+	 *         玩家切近战看到"不认识的刀" → "无法切到近战武器"
+	 *   修复后: 防御性写入, W3 空串不覆盖, 玩家大厅选过的近战武器"重连不丢"
+	 *
+	 * 调用方契约:
+	 *   - "主动同步" (玩家换武器) → 传完整 4 个非空字段 (RoomService 路径, 由 SyncLoadoutToServer 触发)
+	 *   - "同步存档 + 保留运行时已选" (DelayedSendPlayerInfo / Init 阶段) → 传空串给存档没有的字段
+	 *   - "显式清空" → 调用 ClearPlayerLoadout (如需新增, 见 v210 架构说明)
+	 *
 	 * @param InCharID     角色 ID
-	 * @param InPrimaryID  主武器 ID (Slot 1)
-	 * @param InSecondaryID 副武器 ID (Slot 2)
-	 * @param InMeleeID    近战武器 ID (Slot 3)
+	 * @param InPrimaryID  主武器 ID (Slot 1) — 空串保留旧值
+	 * @param InSecondaryID 副武器 ID (Slot 2) — 空串保留旧值
+	 * @param InMeleeID    近战武器 ID (Slot 3) — 空串保留旧值 (关键! 防止 Q8 决策的存档漏洞)
 	 */
 	void SetPlayerLoadout(const FString& InCharID, const FString& InPrimaryID, const FString& InSecondaryID, const FString& InMeleeID);
 
