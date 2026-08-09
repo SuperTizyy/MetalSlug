@@ -119,6 +119,36 @@ public:
 	TSubclassOf<class ABaseWeapon> ResolveWeaponClassFromID(const FString& WeaponID) const;
 
 	/**
+	 * 【v220 大厂架构 — 异步预加载武器资产】消除 32 秒主线程阻塞
+	 *
+	 * 业务背景 (Session1.txt 2026.08.09):
+	 *   "监听服务器点击开始游戏后客户端直接卡死" — 客户端武器 BeginPlay 触发
+	 *   LoadSynchronous() 同步加载 SM_Modern_Melee_ShovelLarge (Marketplace asset),
+	 *   首次启动无 DDC → 编译阻塞主线程 32 秒
+	 *
+	 * 根因 (大厂架构根因):
+	 *   - ResolveWeaponClassFromID 用 TSoftClassPtr::LoadSynchronous() — 强制同步加载
+	 *   - 5 个 Spawn 入口 (HandlePlayerRequestSpawn, SpawnAIInternal, RequestRespawn 玩家/AI, RestartZombieRoundPlayers)
+	 *     全部在 Tick 路径上调用, 第一次执行就是同步加载
+	 *   - 客户端第一次启动, DDC 没 Marketplace asset 编译缓存 → 编译阻塞 30+ 秒
+	 *
+	 * 修复 (大厂架构 — 异步预加载):
+	 *   - PerformGameStart 倒计时阶段 (MatchStartDelay 默认 3s) 调用本函数
+	 *   - 异步遍历 PlayerArray + AI Profile, 收集所有 WeaponBlueprint 软引用
+	 *   - StreamableManager.RequestAsyncLoad 一次性加载所有 → DDC 编译在后台进行
+	 *   - 倒计时结束 Spawn 时, LoadSynchronous() 命中缓存 → 0 阻塞
+	 *
+	 * 大厂原则:
+	 *   - 单一预加载入口: 全项目只有 PerformGameStart 调一次, 不在每个 Spawn 路径重复
+	 *   - 零兜底: 不收集到的武器会在 LoadSynchronous 时报 Error, 用户主动配 (符合现有 ResolveWeaponClassFromID 行为)
+	 *   - 不阻塞主线程: RequestAsyncLoad 是 fire-and-forget, 不等结果
+	 *
+	 * @return 预加载请求数 (用于诊断日志)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Preload")
+	int32 PreloadWeaponMeshesAsync();
+
+	/**
 	 * 【v209 / v212 大厂架构 — 默认武器兜底器】从 DT_WeaponInfo 取第 RowIndex 行的 RowName
 	 *
 	 * ⚠️ v212 状态: 此函数已**部分废弃** — 近战武器兜底已改用 FRoomLoadoutDefaults::MeleeDefaultRowName (JZ001)
@@ -598,6 +628,83 @@ public:
 	 *   - 调用方应优先用 ConsumePendingAIForBattleSpawn(), 那个自动调这个
 	 */
 	FAISpawnRequest BuildSpawnRequestFromPending(const FPendingAIEntry& Entry) const;
+
+	/**
+	 * @brief 【v213 大厂架构新增】刀战模式 Loadout 净化工具函数 — 单一真理源 + DRY
+	 *
+	 * 【业务背景 — 用户 2026.08.09 明确要求】
+	 *   "刀战模式专属逻辑：主武器和副武器进游戏不能加载, 要为空, 只能拿近战武器.
+	 *    现在进游戏还是拿了主武器. 修复一下bug"
+	 *
+	 * 【根因 — 5 个 Spawn 入口全部未检查 CurrentMatchMode】
+	 *   1. HandlePlayerRequestSpawn — 玩家开局/复活/母体变人类, 直接用 PrimaryID/SecondaryID Spawn
+	 *   2. SpawnAIInternal — AI 大厅入队, 用 Request.WeaponID (未按模式过滤)
+	 *   3. RequestRespawn 玩家分支 — 调 HandlePlayerRequestSpawn, 自动净化 (链式生效)
+	 *   4. RequestRespawn AI 分支 — 调 SpawnAIInternal, 自动净化 (链式生效)
+	 *   5. RestartZombieRoundPlayers — 生化模式专用, 仅在 Zombie 模式调, 0 影响
+	 *
+	 * 【大厂原则 — 职责集中 + DRY】
+	 *   - **静态工具函数**: 不需要 Subsystem 实例状态, 纯函数行为
+	 *   - **单一入口**: 5 个 Spawn 入口全部调它, 不写 5 份 if/else 重复代码
+	 *   - **零兜底**: 模式识别失败 (None / GameState 为空) → 默认放行 (与现有 v50 行为一致, 不引入新错误)
+	 *   - **不破坏生化模式**: Mode != Melee → 返回原值, 0 行为变更
+	 *
+	 * 【数据结构 (3 个 RowName 一起净化)】
+	 *   输入: PrimaryID / SecondaryID / MeleeID (来自玩家存档 / AI CachedWeaponID)
+	 *   输出: 同 3 个 RowName (Melee 模式 = Primary/Secondary 清空, Melee 保留)
+	 *
+	 * @param Mode           当前房间模式 (来自 ARoomGameState::CurrentMatchMode, 单一真理源)
+	 * @param PrimaryRowName 输入的主武器 RowName (输出会被清空 if Melee)
+	 * @param SecondaryRowName 输入的副武器 RowName (输出会被清空 if Melee)
+	 * @param MeleeRowName   输入的近战武器 RowName (永远不变, 保留玩家选择 + 业务默认)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn|Purification", meta = (DisplayName = "v213 Purify Loadout For Melee Mode"))
+	static void PurifyLoadoutForMeleeMode(
+		ERoomMatchMode Mode,
+		FString& PrimaryRowName,
+		FString& SecondaryRowName,
+		FString& MeleeRowName);
+
+	/**
+	 * @brief 【v213 大厂架构新增】AI WeaponID 净化 — Request.WeaponID 是单字符串, 走专用净化
+	 *
+	 * 【与 PurifyLoadoutForMeleeMode 区别】
+	 *   - 玩家路径 = 3 个 RowName (主+副+近战), 上面工具函数覆盖
+	 *   - AI 路径 = 1 个 Request.WeaponID (单字符串, 不区分 Slot)
+	 *   - AI 在 Melee 模式下必须强制只拿 Melee 武器
+	 *     → 如果 Request.WeaponID 是 Primary/Secondary → 清空, 让 AI 无武器
+	 *     → 调用方应另外从 AI CachedCharacterRowName / Profile 派生 Melee 默认 (JZ001)
+	 *
+	 * 【如何识别 Primary/Secondary vs Melee?】
+	 *   - 调 DT_WeaponInfo::FindRow<FWeaponInfo>(RowName) 查表
+	 *   - 读 Row->MeshType: Melee 保留, Primary/Secondary 清空
+	 *
+	 * @param Mode           当前房间模式
+	 * @param InOutAIWeaponID  [in] AI 传入的 WeaponID, [out] 净化后 (Melee 模式 = 清空 if 不是 Melee)
+	 * @param OutMeleeDefaultID [out] 如果输入被清空 (AI 强制只拿 Melee), 返回业务默认 Melee ID (JZ001)
+	 * @return true=有净化动作 (Melee 模式 + 原值不是 Melee), false=无需净化
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn|Purification", meta = (DisplayName = "v213 Purify AI Weapon For Melee Mode"))
+	static bool PurifyAIWeaponForMeleeMode(
+		ERoomMatchMode Mode,
+		FString& InOutAIWeaponID,
+		FString& OutMeleeDefaultID);
+
+	/**
+	 * @brief 【v213 大厂架构新增】房间净化状态查询 — UI 用
+	 *
+	 * UI 层 (URoomInsidePage) 在 Init 阶段调一次, 判断当前房间模式是否需要净化 Primary/Secondary 选择
+	 *   - Melee 模式 → true (UI 应清空 TempSelectedWeaponsByType[Primary/Secondary])
+	 *   - 其他模式 → false (UI 不动)
+	 *
+	 * 调用方: URoomInsidePage::InitializeTempSelectedWeaponsByDefault 调用前后
+	 *   注意: InitializeTempSelectedWeaponsByDefault 只预填 Melee, Primary/Secondary 默认就是空的
+	 *   本函数用于**显式清除玩家在 Zombie 模式下选过、然后切到 Melee 模式的残留选择**
+	 *
+	 * @return true = 当前模式是 Melee, UI 应该净化 Primary/Secondary 选择
+	 */
+	UFUNCTION(BlueprintPure, Category = "Room|Spawn|Purification", meta = (DisplayName = "v213 Is Melee Mode"))
+	static bool ShouldPurifyForMeleeMode(ERoomMatchMode Mode);
 
 	// 【v56 新增】扫描场景中的关卡预放 AI 并缓存其阵营
 	//   调用时机: PerformGameStart 前

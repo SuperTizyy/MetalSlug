@@ -398,9 +398,31 @@ private:
 	 * 用 bDeathSequenceStarted 保证 ExecuteDeathLocal 核心步骤只执行一次
 	 *
 	 * 大厂原则 - 单一真理源: 字段在本组件, 不再在 BaseCharacter
+	 *
+	 * 【v207 大厂架构修复】语义变更: 此标志仅由 ExecuteDeathLocal() 设置
+	 *   - 历史 bug: Die() 提前设此标志为 true, 导致 Die() 末尾的 ExecuteDeathLocal() 调用被幂等跳过
+	 *             → 服务器武器不掉落/不溶解, 客户端正常
+	 *   - 修复: Die() 用独立的 bDieStarted 幂等标志 (自身语义), bDeathSequenceStarted 保留给 ExecuteDeathLocal
+	 *   - 不破坏客户端: 客户端走 OnHealthComponentDeath → ExecuteDeathLocal (首次设置 bDeathSequenceStarted), 不受影响
 	 */
 	UPROPERTY(Transient)
 	bool bDeathSequenceStarted = false;
+
+	/**
+	 * Die() 自身的幂等标志 — 【v207 新增】单一真理源分离
+	 *
+	 * 历史 bug (Session1.txt 2026.08.09):
+	 *   - Die() 在 line 547 设置 bDeathSequenceStarted=true
+	 *   - Die() 在 line 669 调 ExecuteDeathLocal() → 被 bDeathSequenceStarted 幂等跳过
+	 *   - 后果: 服务器武器不掉落/不溶解
+	 *
+	 * 大厂原则 - 单一职责:
+	 *   - bDieStarted: Die() 自己的幂等 (防止 Die() 被多次调用)
+	 *   - bDeathSequenceStarted: ExecuteDeathLocal() 自己的幂等 (防止 ExecuteDeathLocal 被多次调用)
+	 *   - 两者互不干扰
+	 */
+	UPROPERTY(Transient)
+	bool bDieStarted = false;
 
 	/**
 	 * 布娃娃定时器句柄 — ExecuteDeathLocal 设置, EnableRagdoll 回调

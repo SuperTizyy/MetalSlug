@@ -154,15 +154,75 @@ public:
 	UFUNCTION(BlueprintPure, Category = "AI")
 	const UAIBehaviorConfigSO* GetConfig() const;
 
-	// 运行时阵营真理源 (v26)
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
+	// ============================================================
+	// 【v221.1 大厂架构 — CachedFactionTag 升级为 Replicated (Tab Scoreboard 修复)】
+	// ============================================================
+	//
+	// 业务根因 (用户 2026.08.09 反馈):
+	//   "刀战模式,客户端按tab键的对战信息不显示ai,但是结算页面显示正常的都显示ai信息"
+	//
+	// 根因 (v26-v220 一直存在):
+	//   - CachedFactionTag 之前是 `VisibleAnywhere, BlueprintReadOnly` (本机权威字段, 不复制)
+	//   - 客户端 AIC.CachedFactionTag 永远是 EmptyTag
+	//   - URoomStateService::GetFactionSnapshotsInternal 客户端遍历 AIC:
+	//     * CachedFactionTag 空 → fallback 到 AIOwnedPawn->FactionTag (Replicated)
+	//     * Pawn 同步时序依赖: AIC 实例先到 → Pawn 实例后到 → FactionTag 字段再后到
+	//     * 任意一个时序窗口失败 → ResolvedFactionTag 仍是 EmptyTag → AI 被过滤 (continue)
+	//   - 结算页能显示 AI: 走 FFinalSettlementSnapshot (服务器 RPC 推送的纯数据), 不依赖 AIC 实例
+	//   - Tab 不显示: 走 AIC 实例读 Replicated 字段, 受时序影响
+	//
+	// 大厂架构修复 (v221.1):
+	//   - CachedFactionTag 升级为 Replicated (单一真理源, 客户端可读)
+	//   - 服务器在 Spawn 时写入 (现有逻辑不变, SetCachedFactionTag API 不动)
+	//   - UE 自动 Replicate 到所有客户端 → AIC 实例同步过来时 FactionTag 已就绪
+	//   - v218 Pawn->FactionTag fallback 保留 (双 Replicated 保障, 时序最坏也不失败)
+	//
+	// 大厂原则 (镜像 CachedIsMother 注释):
+	//   - AI 不跨网络切换阵营 (服务器权威), 客户端需要知道 AI 是哪个阵营
+	//   - 复活时 MutatePawnToMother 同时写 Pawn.FactionTag + AIC.CachedFactionTag, 现在也会自动同步
+	//
+	// 不破坏刀战模式/生化模式:
+	//   - 字段语义没变 (仍然是"运行时阵营真理源"), 只是新增 Replicated 属性
+	//   - 服务器调用路径 (SpawnAIInternal/RequestRespawn/MutatePawnToMother) 完全不变
+	//   - 客户端 AIC.CachedFactionTag 现在能读到值, 但读它的客户端逻辑只有 RoomStateService 的 v218 fallback
+	//
+	// 不重复架构:
+	//   - 已有 Pawn->FactionTag (Replicated, ABaseCharacter) — 保留作为次级 fallback
+	//   - 新增 AIC.CachedFactionTag (Replicated) — 升级原字段, 不新增字段 (避免多真理源)
+	// ============================================================
+	UPROPERTY(ReplicatedUsing = OnRep_CachedFactionTag, VisibleAnywhere, BlueprintReadOnly, Category = "AI|Spawn")
 	FGameplayTag CachedFactionTag;
 
 	UFUNCTION(BlueprintPure, Category = "AI|Spawn")
 	FGameplayTag GetCachedFactionTag() const { return CachedFactionTag; }
 
 	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
-	void SetCachedFactionTag(const FGameplayTag& InTag) { CachedFactionTag = InTag; }
+	void SetCachedFactionTag(const FGameplayTag& InTag);
+
+	/**
+	 * 【v221.1 大厂架构新增】CachedFactionTag 网络同步回调
+	 *
+	 * 触发场景: 服务器修改 AIC.CachedFactionTag → 客户端 OnRep 收到
+	 *
+	 * 为什么需要:
+	 *   - UE AIPerception 调 GetTeamAttitudeTowards → 读 AIC.CachedFactionTag
+	 *   - 如果没 OnRep 兜底, 客户端本地缓存的 GetGenericTeamId 不会同步刷新
+	 *   - 当前阶段 GetTeamAttitudeTowards 主要走 Pawn.FactionTag (v25-v27 修复),
+	 *     但 AIC 自身的 TeamId 也需要同步给 UE 感知系统 (AIPerception 的 TeamAttitude 缓存)
+	 *
+	 * 镜像 (v27 P0): ABaseCharacter::OnRep_FactionTag
+	 */
+	UFUNCTION()
+	void OnRep_CachedFactionTag();
+
+	// 【v221.2 大厂架构新增】Pawn FactionTag 同步辅助函数
+	//   - OnRep_CachedFactionTag 触发时, Pawn 可能尚未复制
+	//   - OnPossess 触发时, Pawn 必定已复制
+	//   - 两个时机都做一次同步, 任何时序组合都能保证 Pawn.FactionTag 被跟上
+	void SyncPawnFactionTagFromCached();
+
+	// 【v221.2】OnPossess 覆写声明在 line 632 (protected 区块), OnUnPossess 在 line 633, 不要重复声明
+	// 客户端补发逻辑直接附加到 line 394 的 OnPossess 末尾 (见 .cpp)
 
 	// ==========================================
 	// 【v109 大厂架构 — AI 母体状态运行时真理源】CachedIsMother
@@ -183,10 +243,10 @@ public:
 	//   - AIC.CachedIsMother 是"上一次存活时的状态", Pawn 销毁后仍存活于 Controller 上
 	//   - 与 CachedFactionTag / CachedAIPawnClass / CachedWeaponID 一致: 复活真理源都在 Controller
 	//
-	// 不复制 (大厂原则 — 镜像 CachedFactionTag):
-	//   - AI 不跨网络切换阵营 (服务器权威), 客户端永远不知道也不需要知道 AI 的 CachedIsMother
-	//   - 客户端通过 Pawn.bIsMother (DOREPLIFETIME) + OnRep_bIsMother 知道当前 Pawn 是母体
-	//   - 与 CachedFactionTag / CachedAIPawnClass / CachedWeaponID 一致: 都不 Replicate
+	// 复制 (大厂原则 — v221.1 镜像 CachedFactionTag):
+	//   - CachedFactionTag 已升级为 Replicated (Tab Scoreboard 修复), AI 阵营会同步给客户端
+	//   - CachedIsMother 暂不复制: 当前阶段只有服务器读 (MutatePawnToMother / RequestRespawn)
+	//     → 客户端通过 Pawn.bIsMother (DOREPLIFETIME) + OnRep_bIsMother 知道当前 Pawn 是母体
 	//
 	// 不破坏刀战模式:
 	//   - 刀战模式从不调 MutatePawnToMother → CachedIsMother 永远是 false → RequestRespawn 走老路径
@@ -570,6 +630,7 @@ public:
 protected:
 	virtual void BeginPlay() override;
 	virtual void OnPossess(APawn* InPawn) override;
+	virtual void OnUnPossess() override; // 【v221.2】客户端 OnPossess 时序兜底, 配套 Symmetric UnPossess 钩子
 	virtual void BeginDestroy() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;

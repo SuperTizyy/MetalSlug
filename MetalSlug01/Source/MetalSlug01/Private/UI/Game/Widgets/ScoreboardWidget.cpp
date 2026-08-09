@@ -435,6 +435,11 @@ void UScoreboardWidget::HandlePlayerSnapshotsChanged()
 //     5. 排名变化用 RemoveChild/InsertChild 增量重排
 void UScoreboardWidget::RefreshScoreboard()
 {
+	// 【v221.2 大厂架构诊断】让用户复测时能看到 RefreshScoreboard 的触发时统计
+	UE_LOG(LogTemp, Display,
+		TEXT("[ScoreboardWidget] 【v221.2】RefreshScoreboard: bIsFrozen=%d, bIsInSettlementState=%d, 触发进入数据刷新流程."),
+		bIsFrozen ? 1 : 0, bIsInSettlementState ? 1 : 0);
+
 	// 1. 拿当前应使用的数据源 (冻结 vs 实时)
 	const TArray<FPlayerSnapshot>& ActiveSnapshots = GetActiveSnapshots();
 
@@ -648,7 +653,7 @@ TArray<FPlayerSnapshot>& UScoreboardWidget::GetActiveSnapshots()
 {
 	// 【v215 大厂架构 — 冻结 vs 实时切换】
 	//   冻结: 返回 FrozenSnapshots (已与 URoomStateService 解耦)
-	//   未冻结: 实时拉 URoomStateService, 写入 CachedLiveSnapshots, 返回引用
+	//   未冻结: 实时拉 RoomStateService(真人) + RoomGameState(AI), 写入 CachedLiveSnapshots, 返回引用
 	if (bIsFrozen)
 	{
 		return FrozenSnapshots;
@@ -666,12 +671,110 @@ TArray<FPlayerSnapshot>& UScoreboardWidget::GetActiveSnapshots()
 		return EmptySnapshots;
 	}
 
-	// 合并两个阵营到一个 CachedLiveSnapshots
+	// ==========================================
+	// 【v223.0 大厂架构 P0 — AI 数据源切换 Server-Authoritative Replicated】
+	// ==========================================
+	//
+	// 根因 (v218-v222.0 仍未解决):
+	//   - 老路径: URoomStateService::GetFactionSnapshotsWithAI → TActorIterator<ABaseAIController>
+	//   - 客户端 AIC 实例数 = 0 (UE 5.6 AAIController 复制受 NetCull/PossessedPawn 时序影响)
+	//   - 客户端 Tab Scoreboard 永远不显示 AI
+	//
+	// 新路径 (镜像 Settlement v217 + PendingAIQueue v46):
+	//   - 真人玩家: StateSvc->GetFactionSnapshots(Offense/Defense) (PlayerArray 复制稳定, 老路径)
+	//   - AI:        RoomGS->GetBattleAIEntries(Offense/Defense) (ReplicatedBattleAIEntries, Server 拉)
+	//   - Server    端在 SpawnAIInternal 末尾写 ReplicatedBattleAIEntries + ForceNetUpdate
+	//   - 完全不依赖 AIC 复制, 0 兜底
+	//
+	// 大厂原则:
+	//   - 单一真理源: Server 拉 AIC → 写 Replicated → Client 读
+	//   - 0 兜底: GetBattleAIEntries 内部已校验 FactionTag 有效性, 这里不重复
+	// ==========================================
+
+	UWorld* World = GetWorld();
+	ARoomGameState* RoomGS = World ? World->GetGameState<ARoomGameState>() : nullptr;
+
+	// 真人玩家 (老路径, PlayerArray 复制稳定)
 	CachedLiveSnapshots.Empty();
-	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense()));
-	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense()));
+	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshots(FFactionTags::Offense()));
+	CachedLiveSnapshots.Append(StateSvc->GetFactionSnapshots(FFactionTags::Defense()));
+
+	// AI (新路径, v223.0 Server-Authoritative 复制)
+	if (RoomGS)
+	{
+		// 攻方 AI
+		const TArray<FFactionSnapshotEntry> OffenseAIEntries = RoomGS->GetBattleAIEntries(FFactionTags::Offense());
+		for (const FFactionSnapshotEntry& Entry : OffenseAIEntries)
+		{
+			CachedLiveSnapshots.Add(ConvertBattleAIEntryToSnapshot(Entry));
+		}
+
+		// 守方 AI
+		const TArray<FFactionSnapshotEntry> DefenseAIEntries = RoomGS->GetBattleAIEntries(FFactionTags::Defense());
+		for (const FFactionSnapshotEntry& Entry : DefenseAIEntries)
+		{
+			CachedLiveSnapshots.Add(ConvertBattleAIEntryToSnapshot(Entry));
+		}
+	}
+	else
+	{
+		// 0 兜底: GameState 拿不到 → AI 数据源缺失, 显式 Log Error
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] GetActiveSnapshots: RoomGameState 不可用, AI 数据源缺失. "
+			     "【v223.0 零兜底】Tab Scoreboard 将不显示 AI. 修复: 检查 GM_RoomGameMode 启动时序."));
+	}
 
 	return CachedLiveSnapshots;
+}
+
+// ==========================================
+// 【v223.0 大厂架构】FFactionSnapshotEntry → FPlayerSnapshot 转换 (镜面 Settlement v217 路径)
+// ==========================================
+//
+// 单一真理源:
+//   - FFactionSnapshotEntry 是 Server-Authoritative 写入的 Replicated 数据
+//   - FPlayerSnapshot 是 UI 内部使用的数据
+//   - 转换函数集中在 ScoreboardWidget.cpp 一处, 避免分散拼凑
+//
+// 0 兜底:
+//   - Entry.DisplayName 为空 → 返回空 Snapshot (RefreshScoreboard 会 Log Error 跳过)
+//   - FactionTagName 解析失败 → 用 FFactionTags::Offense() 默认 (Log Warning, 不静默)
+FPlayerSnapshot UScoreboardWidget::ConvertBattleAIEntryToSnapshot(const FFactionSnapshotEntry& Entry)
+{
+	FPlayerSnapshot Snap;
+
+	// 0 兜底: DisplayName 必须非空
+	if (Entry.DisplayName.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] ConvertBattleAIEntryToSnapshot: Entry.DisplayName 为空, 返回空 Snapshot. "
+			     "【v223.0 零兜底】Server 写入时检查 AIC->GetCharacterID() 是否有效."));
+		return Snap;
+	}
+
+	Snap.PlayerName = FString::Printf(TEXT("[AI] %s"), *Entry.DisplayName); // 镜像 v208 单一真理源
+	Snap.bIsAI      = true;
+	Snap.bIsReady   = false;
+	Snap.bIsHost    = false;
+	Snap.SequenceID = 0;
+	Snap.Score      = Entry.Score;
+	Snap.Kills      = Entry.Kills;
+	Snap.Deaths     = Entry.Deaths;
+	Snap.Assists    = Entry.Assists;
+
+	// FactionTag: Server 写入时用 bIsAttacker (直接对应 Offense/Defense), 客户端无需解析 FactionTagName
+	// 大厂原则: 单一真理源 = bIsAttacker (Server 写入 ReplicatedBattleAIEntries 时已计算)
+	// 0 兜底: Server 写入 bIsAttacker 必须 (1) 正确计算 (2) 与 FactionTagName 逻辑一致 — ServerRefreshBattleAIEntries 内有 IsValidFaction 校验
+	if (Entry.bIsAttacker)
+	{
+		Snap.FactionTag = FFactionTags::Offense();
+	}
+	else
+	{
+		Snap.FactionTag = FFactionTags::Defense();
+	}
+
+	return Snap;
 }
 
 UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const FPlayerSnapshot& Snapshot, bool bIsAttacker)
@@ -1108,20 +1211,54 @@ void UScoreboardWidget::FreezeSnapshot()
 
 	// 一次性合并两个阵营到一个 FrozenSnapshots
 	FrozenSnapshots.Empty();
-	FrozenSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Offense()));
-	FrozenSnapshots.Append(StateSvc->GetFactionSnapshotsWithAI(FFactionTags::Defense()));
 
-	// 同步冻结队伍击杀/胜局数
+	// 【v223.0 大厂架构 P0】同 GetActiveSnapshots: 真人走 StateSvc, AI 走 RoomGS->GetBattleAIEntries
+	// 0 兜底: World 拿不到 → Log Error + 不冻结 (旧路径会静默 return 空)
 	UWorld* World = GetWorld();
-	if (World)
+	if (!World)
 	{
-		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] FreezeSnapshot: World 无效, 不冻结. 【v223.0 零兜底】检查 ShowFinalResult 调用时序."));
+		return;
+	}
+
+	// 真人玩家 (老路径)
+	FrozenSnapshots.Append(StateSvc->GetFactionSnapshots(FFactionTags::Offense()));
+	FrozenSnapshots.Append(StateSvc->GetFactionSnapshots(FFactionTags::Defense()));
+
+	// AI (新路径, v223.0 Server-Authoritative 复制)
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (RoomGS)
+	{
+		const TArray<FFactionSnapshotEntry> OffenseAIEntries = RoomGS->GetBattleAIEntries(FFactionTags::Offense());
+		for (const FFactionSnapshotEntry& Entry : OffenseAIEntries)
 		{
-			FrozenAttackerKills = RoomGS->AttackerTotalKills;
-			FrozenDefenderKills = RoomGS->DefenderTotalKills;
-			FrozenAttackerWins = RoomGS->AttackerWins;
-			FrozenDefenderWins = RoomGS->DefenderWins;
+			FrozenSnapshots.Add(ConvertBattleAIEntryToSnapshot(Entry));
 		}
+
+		const TArray<FFactionSnapshotEntry> DefenseAIEntries = RoomGS->GetBattleAIEntries(FFactionTags::Defense());
+		for (const FFactionSnapshotEntry& Entry : DefenseAIEntries)
+		{
+			FrozenSnapshots.Add(ConvertBattleAIEntryToSnapshot(Entry));
+		}
+
+		// 同步冻结队伍击杀/胜局数 (复用 RoomGS, 不重复 GetGameState)
+		FrozenAttackerKills = RoomGS->AttackerTotalKills;
+		FrozenDefenderKills = RoomGS->DefenderTotalKills;
+		FrozenAttackerWins = RoomGS->AttackerWins;
+		FrozenDefenderWins = RoomGS->DefenderWins;
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ScoreboardWidget] FreezeSnapshot: GameState 不可用, AI 数据 + 队伍击杀将缺失. "
+			     "【v223.0 零兜底】结算页面将不正确. 检查 GM_RoomGameMode 启动时序."));
+
+		// 0 兜底: RoomGS 拿不到 → 击杀数据强制设 0, 不静默
+		FrozenAttackerKills = 0;
+		FrozenDefenderKills = 0;
+		FrozenAttackerWins = 0;
+		FrozenDefenderWins = 0;
 	}
 
 	// 标记冻结

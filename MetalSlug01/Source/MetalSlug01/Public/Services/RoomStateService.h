@@ -257,6 +257,21 @@ public:
     TArray<FPlayerSnapshot> GetDefenseFactionSnapshots() const;
 
     /**
+     * @brief 获取指定阵营的真人玩家快照 (仅真人, 不含 AI)
+     *
+     * 【v223.0 大厂架构新增】
+     * 大厂原则: 显式 API > 隐式参数 (bIncludeAI)
+     *   - ScoreboardWidget 拆分数据源: 真人玩家走 PlayerArray (稳定), AI 走 ReplicatedBattleAIEntries
+     *   - 不需要"GetFactionSnapshotsWithAI 自己再过滤", 因为那样 AI 数据源会双重混合 (PendingAI + AIC + Replicated)
+     *   - 真人玩家快照 = PlayerArray 唯一真理源 (镜像 v28 重构)
+     *
+     * @param FactionTag 阵营 (Offense / Defense)
+     * @return 真人玩家快照数组 (bIsAI=false), AI 完全不返回
+     */
+    UFUNCTION(BlueprintPure, Category = "RoomStateService")
+    TArray<FPlayerSnapshot> GetFactionSnapshots(FGameplayTag FactionTag) const;
+
+    /**
      * 【2026.07.11 v29】显式合并真人 + AI 占位的快照 (供需要"总人数"的查询方用)
      *
      * 大厂原则: 显式 API > 隐式参数 (可读性优先, 不会出现"忘了设 bIncludeAI" 的 bug)

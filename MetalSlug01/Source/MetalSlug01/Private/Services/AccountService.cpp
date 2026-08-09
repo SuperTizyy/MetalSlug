@@ -101,10 +101,14 @@ FString UAccountService::GetCurrentUser() const
 
 FString UAccountService::GetLastSelectedCharacter() const
 {
+	// 【v213+ 大厂架构修复 — 消除默认污染源】
+	//   旧版: User 空或 Repo 缺失时返回 TEXT("Default") → 占位字符串污染下游 Spawn 链
+	//   新版: 返回空串 → 与 PS/Init 默认值一致 → 不会污染 Spawn
+	//   大厂原则 - 零兜底: "没用户/没存档" 必须明确返回空, 而不是返回魔法字符串
 	const FString User = GetCurrentUser();
-	if (User.IsEmpty()) return TEXT("Default");
+	if (User.IsEmpty()) return TEXT("");
 	ULocalAccountRepository* Repo = GetRepository();
-	return Repo ? Repo->GetLastSelectedCharacter(User) : TEXT("Default");
+	return Repo ? Repo->GetLastSelectedCharacter(User) : TEXT("");
 }
 
 void UAccountService::SaveLastSelectedCharacter(const FString& CharacterName)
@@ -119,10 +123,13 @@ void UAccountService::SaveLastSelectedCharacter(const FString& CharacterName)
 
 FString UAccountService::GetLastSelectedWeapon(int32 BackpackSlot) const
 {
+	// 【v213+ 大厂架构修复 — 消除默认污染源】
+	//   旧版: User 空或 Repo 缺失时返回 TEXT("Default") → 占位字符串污染下游 Spawn 链
+	//   新版: 返回空串 → 与 PS/Init 默认值一致 → 不会污染 Spawn
 	const FString User = GetCurrentUser();
-	if (User.IsEmpty()) return TEXT("Default");
+	if (User.IsEmpty()) return TEXT("");
 	ULocalAccountRepository* Repo = GetRepository();
-	return Repo ? Repo->GetLastSelectedWeapon(User, BackpackSlot) : TEXT("Default");
+	return Repo ? Repo->GetLastSelectedWeapon(User, BackpackSlot) : TEXT("");
 }
 
 void UAccountService::SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName)

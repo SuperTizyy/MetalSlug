@@ -620,8 +620,62 @@ private:
 	/**
 	 * 【v52 P0】刷新所有 3 个 Image 控件 (主+副+近战)
 	 * 用途: 切换背包 / 初始化时一次刷完 3 个图标
+	 *
+	 * 【v94 P0 刀战模式专属】改造为"模式感知":
+	 *   - 入口处读取 GameState.CurrentMatchMode (单一真理源)
+	 *   - Melee: 主/副 Image → ApplyMeleeWeaponImageBlock (灰色底 + 无图标), 近战 Image 正常显示玩家选择
+	 *   - Zombie: 3 个 Image 全部正常 (不破坏生化模式)
+	 *   - None/其他: 显式 Log Error + 清空 3 个 Image (零兜底)
+	 *
+	 * 触发点:
+	 *   - 模式切换 (OnGameStateMatchModeChanged 末尾)
+	 *   - 玩家切背包槽位
+	 *   - 玩家切换武器 (Melee/Zombie 通用)
 	 */
 	void RefreshAllWeaponDisplayImages();
+
+	/**
+	 * 【v94 P0 刀战模式专属】把指定 Image 渲染为"灰色底 + 无图标"状态
+	 *
+	 * 业务规则 (用户 2026.08.09 明确):
+	 *   - 刀战模式只允许近战武器, 主/副武器在 UI 上不显示图标
+	 *   - 但 Image 控件仍占位 (避免布局塌陷), 底色填充 8D8D8DFF (灰色)
+	 *   - 不破坏布局 = SetVisibility 仍为 Visible, 只改 Brush + Tint
+	 *
+	 * 单一入口: 仅 RefreshAllWeaponDisplayImages (Melee 分支) 调用, 避免被其他路径意外触发
+	 *
+	 * @param WeaponType 要应用灰色占位的 Image (Primary/Secondary)
+	 */
+	void ApplyMeleeWeaponImageBlock(EWeaponMeshType WeaponType);
+
+	/**
+	 * 【v94 P0 零兜底】把指定 Image 控件清空 (Brush + Tint 还原)
+	 *
+	 * 用途: GameState.CurrentMatchMode = None / 未识别时, 显式清空 3 个 Image
+	 *      拒绝"保留上次状态"的隐式兜底, 强制报错让策划/开发定位
+	 *
+	 * @param WeaponType 要清空的 Image 类型
+	 */
+	void ApplyClearWeaponImage(EWeaponMeshType WeaponType);
+
+	/**
+	 * 【v94 P0 架构复用】EWeaponMeshType → UImage* 映射的单一入口
+	 *
+	 * 背景: UpdateWeaponDisplayImage / ApplyMeleeWeaponImageBlock / ApplyClearWeaponImage
+	 *      三个函数都需要根据 WeaponType 选 Image, 抽出来避免重复 switch
+	 *
+	 * 大厂原则 — DRY:
+	 *   - 1 个 WeaponType 对应 1 个 Image 控件, 这层映射是基础设施
+	 *   - 不允许任何函数自己再写一遍 switch (WeaponType)
+	 *
+	 * 零兜底:
+	 *   - WeaponType 是 None / 未识别值 → 返回 nullptr + Log Error (不返回兜底 Image)
+	 *   - 调用方必须做 nullptr 检查
+	 *
+	 * @param WeaponType 武器类型
+	 * @return 对应的 UImage* 控件, 失败返回 nullptr
+	 */
+	UImage* ResolveWeaponImage(EWeaponMeshType WeaponType);
 
 	/**
 	 * 专门控制高亮框位置的小助手

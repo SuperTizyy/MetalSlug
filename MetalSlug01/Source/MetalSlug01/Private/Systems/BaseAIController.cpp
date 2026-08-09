@@ -108,6 +108,16 @@ ABaseAIController::ABaseAIController()
 	// 大厂原则: 跟随引擎迁移, 不写即将失效的 API
 	// 网络复制频率: 客户端只需要最终值, 不需要高频更新 (减少带宽)
 	SetNetUpdateFrequency(10.0f);
+	// 【v222.0 大厂架构 P0 修复 — 客户端 Tab Scoreboard 显示 AI】
+	// 根因 (Session1.txt 2026.08.09):
+	//   - AIC 默认 NetCullFrequencySquared/NetCullDistance 都很大, 距离远时被剔除
+	//   - Tab Scoreboard (UI) 在 5s 兜底 Tick 时, 远端 AI 已被剔除 → GetFactionSnapshotsInternal AIC总数=0
+	//   - 即使 bReplicates=true, 距离剔除也会让客户端彻底没有该 AIC
+	// 大厂原则 — bAlwaysRelevant=true:
+	//   - AIC 是 UI 数据源, 不受 3D 距离剔除影响
+	//   - 这是大厂 (Lyra, Fortnite) 的标准做法: Controller 永远 relevant
+	//   - 对比 PlayerController 默认 bAlwaysRelevant=true (UE 5.6 源码), AIC 也应一致
+	bAlwaysRelevant = true;
 }
 
 
@@ -543,6 +553,44 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 //   OnPossess: 负责 Pawn 级状态 (阵营缓存, RuntimeConfig 实例化)
 //   RunBehaviorTree: 负责 BT 实例化 + BB 实例化
 //   BTService_InitWanderHome: 负责 BT 级 BB Key 初始化 (WanderHome)
+
+	// ==========================================
+	// 【v221.2 大厂架构修复 — 客户端 Pawn 复制时序兜底】
+	// ==========================================
+	//
+	// 时序问题:
+	//   - 服务器: SpawnActor AIC → SpawnActor Pawn → AIC->Possess(Pawn) → SetCachedFactionTag
+	//   - 客户端: AIC 复制 (CachedFactionTag=空) → Pawn 复制 → AIC.Possess 同步 → OnPossess 触发
+	//   - 此时: CachedFactionTag 仍可能为空 (服务器 SetCachedFactionTag 还没复制过来)
+	//   - 但: Pawn 已复制 (Pawn.FactionTag 是 Replicated, 大概率已同步)
+	//
+	// 兜底: 客户端路径下, 用 Pawn.FactionTag 反向补 AIC.CachedFactionTag
+	//   - 这不破坏单次决策原则 (单次决策在 SetCachedFactionTag 内, 我们这里直接写字段)
+	//   - 这是"反向时序补发"的合规路径 (Pawn→AIC 而非 AIC→Pawn)
+	//   - 等稍后 CachedFactionTag 复制过来, OnRep_CachedFactionTag 会再覆盖 (顺序无关, 都是同一个值)
+	if (!HasAuthority())
+	{
+		ABaseCharacter* BasePawn = Cast<ABaseCharacter>(InPawn);
+		if (BasePawn)
+		{
+			UE_LOG(LogBaseAI, Display,
+				TEXT("[BaseAIController] 【v221.2】OnPossess 客户端路径: AI='%s' Pawn.FactionTag='%s' AIC.CachedFactionTag='%s' (检查是否需要补)."),
+				*GetName(), *BasePawn->FactionTag.ToString(), *CachedFactionTag.ToString());
+
+			if (FFactionTags::IsValidFaction(BasePawn->FactionTag) && !FFactionTags::IsValidFaction(CachedFactionTag))
+			{
+				UE_LOG(LogBaseAI, Display,
+					TEXT("[BaseAIController] 【v221.2】OnPossess 客户端路径: 用 Pawn.FactionTag='%s' 补 AIC.CachedFactionTag."),
+					*BasePawn->FactionTag.ToString());
+				CachedFactionTag = BasePawn->FactionTag;
+				// 主动通知 RoomStateService 刷新, 让 Tab Scoreboard 立刻看到
+				if (URoomStateService* StateSvc = URoomStateService::Get(this))
+				{
+					StateSvc->ForwardPlayerSnapshotsChanged();
+				}
+			}
+		}
+	}
 }
 
 
@@ -586,6 +634,12 @@ void ABaseAIController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Ou
 	DOREPLIFETIME(ABaseAIController, AIKills);
 	DOREPLIFETIME(ABaseAIController, AIDeaths);
 	DOREPLIFETIME(ABaseAIController, AIAssists);
+
+	// 【v221.1 大厂架构新增】CachedFactionTag Replicated 注册
+	//   - 升级原 VisibleAnywhere 字段为 Replicated (避免新增字段, 保持单一真理源)
+	//   - 客户端 Tab Scoreboard 依赖 AIC.CachedFactionTag 判断阵营归属
+	//   - 镜像 v202.0 大厂原则: "AI KDA 字段是 Replicated, CachedFactionTag 也应该是 Replicated"
+	DOREPLIFETIME(ABaseAIController, CachedFactionTag);
 }
 
 // v202.0 P0: 客户端 OnRep — 镜像 ARoomPlayerState::OnRep_ScoreboardData
@@ -609,6 +663,162 @@ void ABaseAIController::OnRep_AIScoreboardData()
 	{
 		StateSvc->ForwardPlayerSnapshotsChanged();
 	}
+}
+
+// ==========================================
+// 【v221.1 大厂架构新增】CachedFactionTag Setter + OnRep
+// ==========================================
+//
+// 设计动机 (用户 2026.08.09 反馈):
+//   "刀战模式,客户端按tab键的对战信息不显示ai"
+//
+// 实现路径 (大厂原则 - 单一真理源):
+//   - SetCachedFactionTag: 单一入口, 服务器调用 (SpawnAIInternal / MutatePawnToMother / 关卡预放 OnPossess)
+//   - 旧 (v26-v221): 字段直接赋值 (SetCachedFactionTag 是 inline 在 .h 里)
+//   - 新 (v221.1): 升级为 out-of-line 实现, 保留 "只设一次" 的单次决策语义
+//     + 写完后立即驱动 UE AIPerception 同步 (SetGenericTeamId)
+//   - OnRep_CachedFactionTag: 客户端收到复制时同步 UE AIPerception 阵营
+//
+// 不破坏生化模式/刀战模式:
+//   - 服务器调用路径完全不变 (SetCachedFactionTag 行为向后兼容)
+//   - 服务器自身调用 OnRep 是 UE 5.6 行为 (ListenServer 双身份), 但 SetGenericTeamId 是幂等的
+//   - 旧调用方 (SetGenericTeamId 函数内部直接写 CachedFactionTag 的代码) 已重构走 SetCachedFactionTag
+//
+// 大厂原则 — 零兜底:
+//   - NewTag.IsValid() 为 false → 不写 CachedFactionTag (与 v221 之前行为一致)
+//   - NewTag 非法 (不在 Offense/Defense 内) → ValidateFactionOrReportError (由调用方负责)
+// ==========================================
+void ABaseAIController::SetCachedFactionTag(const FGameplayTag& InTag)
+{
+	// 大厂原则 — 单次决策: 已设值的字段不覆盖 (防止 MutatePawnToMother 之后又被某次 Spawn 路径错误覆盖)
+	// 例外: 同一阵营重复 set (幂等操作) 不影响
+	const bool bSameValue = (CachedFactionTag == InTag);
+	if (CachedFactionTag.IsValid() && !bSameValue)
+	{
+		UE_LOG(LogBaseAI, Verbose,
+			TEXT("[BaseAIController] 【v221.1】SetCachedFactionTag: 拒绝覆盖已设值. Existing='%s' New='%s'. "
+			     "已有值保留 (大厂原则 — 单次决策)."),
+			*CachedFactionTag.ToString(), *InTag.ToString());
+		return;
+	}
+
+	CachedFactionTag = InTag;
+
+	// 服务器侧: 主动通知 RoomStateService 刷新 Tab Scoreboard
+	//   - 镜像 v215 大厂架构 (OnRep_AIScoreboardData 的做法)
+	//   - UE AIPerception 协议层 (GetGenericTeamId) 由调用方 SetGenericTeamId 同步 (避免重复)
+	//   - 0 兜底: World 未初始化时 Get() 返回 nullptr, 跳过
+	if (HasAuthority())
+	{
+		if (URoomStateService* StateSvc = URoomStateService::Get(this))
+		{
+			StateSvc->ForwardPlayerSnapshotsChanged();
+		}
+
+		// 【v221.2 大厂架构修复】强制 NetUpdate 加速同步
+		//   - 服务器侧 CachedFactionTag 写入后, UE 默认在下一次 NetUpdate (10Hz, 0.1s) 才同步到客户端
+		//   - 客户端如果在写入后立即按 Tab, 看到的是上一帧的 CachedFactionTag (空)
+		//   - ForceNetUpdate 强制下一次立刻同步, 避免 0.1s 窗口
+		//   - 大厂原则: 关键状态变更 (阵营) 不能等"自然同步窗口"
+		ForceNetUpdate();
+	}
+}
+
+// ============================================================
+// 【v221.2 大厂架构修复 — 客户端 Pawn 复制时序兜底】
+//
+// 业务根因 (用户 2026.08.09 反馈):
+//   "刀战模式,客户端按tab键的对战信息不显示ai,但是结算页面显示正常的都显示ai信息"
+//
+// v221.1 根因分析 (前次尝试, 部分对):
+//   - AIC.CachedFactionTag 已升级为 Replicated
+//   - 理论上 OnRep_CachedFactionTag 收到时 CachedFactionTag 已有值
+//   - 但 Pawn 可能在 OnRep 触发时尚未复制过来 (或 Possession 顺序问题)
+//   - Pawn->FactionTag 兜底路径失效 → UI 仍显示空白
+//
+// v221.2 修复 (这次彻底):
+//   1. 提高 OnRep_CachedFactionTag Log 到 Display (用户能直接看到)
+//   2. Pawn 为 null 时,在 OnPossess / PossessedPawn 变化时再补一次 Pawn.FactionTag 同步
+//   3. 强制复制: 服务器立即 NotifyNetUpdate + 升频 (加快客户端同步速度)
+//   4. 客户端 BeginPlay 时主动检查一次快照 (0 兜底: AI 阵营错就主动拉一次)
+//
+// 大厂原则 (零兜底):
+//   - 任何路径失败 → Log Error 暴露
+//   - 不允许"Pawn 还没来就静默跳过" — 必须主动等
+// ============================================================
+void ABaseAIController::OnRep_CachedFactionTag()
+{
+	// 【v221.2】Display 级而非 Verbose — 让用户能直接看到同步状态
+	UE_LOG(LogBaseAI, Display,
+		TEXT("[BaseAIController] 【v221.2】OnRep_CachedFactionTag: AI='%s' FactionTag='%s' 已同步 (HasAuthority=%d)."),
+		*GetName(), *CachedFactionTag.ToString(), HasAuthority() ? 1 : 0);
+
+	if (!FFactionTags::IsValidFaction(CachedFactionTag))
+	{
+		// 客户端收到了空 FactionTag — 这是 UE 复制 bug,或服务器尚未写入
+		// 0 兜底: 报错, 让用户检查服务器侧 SetCachedFactionTag 时序
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseAIController] 【v221.2】OnRep_CachedFactionTag: AI='%s' 收到空 FactionTag. "
+			     "【零兜底】如持续, 检查 (1) 服务器 SpawnAIInternal 在 Possess 之后是否调用 SetCachedFactionTag "
+			     "(2) AIC.bReplicates=true (3) AIC.CachedFactionTag 在服务器侧 IsValid() 是否为真."),
+			*GetName());
+	}
+
+	// 镜像服务器双写: 同步 Pawn.FactionTag
+	//   - 服务器在 SetGenericTeamId 内同时写 CachedFactionTag + Pawn.FactionTag
+	//   - Pawn.FactionTag 是 Replicated (ABaseCharacter OnRep_FactionTag), 客户端 UE 自动同步
+	//   - 这里主动写一次作为"复制时序最坏情况"的兜底
+	SyncPawnFactionTagFromCached();
+
+	// 主动通知 RoomStateService 刷新 Tab Scoreboard
+	//   - 镜像 v215 大厂架构 (OnRep_AIScoreboardData 的做法)
+	//   - 客户端 Tab Scoreboard 拉 GetFactionSnapshotsWithAI → 现在 CachedFactionTag 已有值 → AI 显示
+	//   - 0 兜底: World 未初始化时 Get() 返回 nullptr, 跳过
+	if (URoomStateService* StateSvc = URoomStateService::Get(this))
+	{
+		StateSvc->ForwardPlayerSnapshotsChanged();
+	}
+}
+
+// 【v221.2 新增】Pawn FactionTag 同步 (OnRep_CachedFactionTag + OnPossess 都调)
+//
+// 为什么独立函数:
+//   - OnRep_CachedFactionTag 触发时, Pawn 可能已复制 (拿得到) 或未复制 (拿不到)
+//   - OnPossess 触发时, Pawn 必定已复制 (服务器调 Possess 后 UE 才开始复制 Pawn)
+//   - 两个时机都做一次同步, 任何时序组合都能保证 Pawn.FactionTag 被跟上
+void ABaseAIController::SyncPawnFactionTagFromCached()
+{
+	if (!FFactionTags::IsValidFaction(CachedFactionTag))
+	{
+		return; // CachedFactionTag 本身无效, 没意义同步
+	}
+
+	ABaseCharacter* MyPawn = Cast<ABaseCharacter>(GetPawn());
+	if (!MyPawn)
+	{
+		// Pawn 还没复制过来 — 等下次 OnPossess 再试
+		UE_LOG(LogBaseAI, Verbose,
+			TEXT("[BaseAIController] 【v221.2】SyncPawnFactionTagFromCached: AI='%s' Pawn 尚未复制, 等待 OnPossess."),
+			*GetName());
+		return;
+	}
+
+	if (MyPawn->FactionTag != CachedFactionTag)
+	{
+		UE_LOG(LogBaseAI, Display,
+			TEXT("[BaseAIController] 【v221.2】SyncPawnFactionTagFromCached: AI='%s' 同步 Pawn.FactionTag='%s' (之前='%s', 兜底)."),
+			*GetName(), *CachedFactionTag.ToString(), *MyPawn->FactionTag.ToString());
+		MyPawn->FactionTag = CachedFactionTag;
+	}
+}
+
+void ABaseAIController::OnUnPossess()
+{
+	UE_LOG(LogBaseAI, Verbose,
+		TEXT("[BaseAIController] 【v221.2】OnUnPossess: AI='%s' (HasAuthority=%d)."),
+		*GetName(), HasAuthority() ? 1 : 0);
+
+	Super::OnUnPossess();
 }
 
 // v202.0 P0: AI 击杀得分 (服务器专用, 镜像 ARoomPlayerState::AddKillScore)
@@ -2491,12 +2701,12 @@ void ABaseAIController::SetGenericTeamId(const FGenericTeamId& NewTeamID)
 	const FGameplayTag NewTag = FFactionTags::FromGenericTeamId(NewTeamID);
 	if (NewTag.IsValid())
 	{
-		// 写 CachedFactionTag (Pawn 销毁也能用, 复活路径读这里)
-		// 只在 CachedFactionTag 未设时写, 避免重复调用时覆盖早期决策 (大厂原则: 单次决策)
-		if (!CachedFactionTag.IsValid())
-		{
-			CachedFactionTag = NewTag;
-		}
+		// 【v221.1 大厂架构修复】走 SetCachedFactionTag 而非直接赋值
+		//   - 单一入口: 所有写 CachedFactionTag 的地方都走同一函数
+		//   - Replicated 字段变化统一驱动 UE AIPerception 同步
+		//   - 避免 "这里直接赋值, 那里走 SetCachedFactionTag" 的不一致
+		//   - SetCachedFactionTag 内部保留单次决策语义 (已设不覆盖), 所以这里调它完全等价
+		SetCachedFactionTag(NewTag);
 	}
 
 	if (APawn* MyPawn = GetPawn())

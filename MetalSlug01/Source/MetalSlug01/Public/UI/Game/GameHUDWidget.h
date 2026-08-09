@@ -184,6 +184,26 @@ public:
 	void OnZombieRoundSoundReceived(EZombieRoundWinner RoundWinner);
 
 	/**
+	 * 【v218 大厂架构新增】刀战本局赢家更新回调 — 显示 Text_GameOver
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - Text_RoundCountdown 倒计时结束 → FinishMeleeMatch → SetMeleeWinner → Replicate → OnRep_MeleeWinner
+	 *   - 客户端 OnRep_MeleeWinner 触发本回调
+	 *   - 本回调显示 Text_GameOver ("攻方胜利" / "守方胜利" / "平局")
+	 *   - 3 秒后切图到 L_Login 结算页 (ScheduleFinalSettlement 自动触发)
+	 *
+	 * 大厂原则 — 镜像 OnZombieRoundSoundReceived:
+	 *   - 本回调只负责业务 (Text_GameOver 显示), 不读 GameState (数据已通过参数传入)
+	 *   - UI 显示委托 Text_GameOver (BindWidgetOptional)
+	 *
+	 * 不破坏生化模式:
+	 *   - 生化模式 MeleeWinner 永远 None, 本回调永不触发
+	 *   - 生化胜负文本走 OnEnterSettlement / OnShowZombieRoundBriefResult (业务分离)
+	 */
+	UFUNCTION()
+	void OnMeleeWinnerUpdated(EMeleeWinner NewWinner);
+
+	/**
 	 * 更新 AC 值（Assists / 助攻）
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GameHUD")

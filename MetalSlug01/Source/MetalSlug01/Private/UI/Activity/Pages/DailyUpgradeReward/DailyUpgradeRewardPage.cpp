@@ -134,6 +134,9 @@
 #include "Components/VerticalBoxSlot.h"
 #include "Components/ScrollBox.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/EditableTextBox.h" // 【v213 新增】调试用
+#include "Components/ComboBoxString.h"  // 【v213 新增】调试用
+#include "Engine/Engine.h"              // 【v213 新增】GEngine 屏幕提示
 #include "Styling/SlateTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/EngineTypes.h"
@@ -146,6 +149,7 @@
 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
 #include "UI/Activity/Pages/DailyUpgradeReward/DayLockHintWidget.h"
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
+#include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardViewModel.h" // 【v213 新增】确保 ViewModel 实现已链接
 
 /**
  * @brief 初始化每日升级奖励页面
@@ -192,6 +196,60 @@ bool UDailyUpgradeRewardPage::Initialize()
 	else
 	{
 		
+	}
+
+	// ==========================================
+	// 【v213 新增】调试数据提交控件绑定 + ComboBox 初始化
+	// 大厂原则:
+	//   - 仅绑定事件 + 填充 ComboBox 选项, 不在此处做业务逻辑
+	//   - 业务逻辑全在回调函数中委托 ViewModel
+	// ==========================================
+
+	if (ComboBoxString_SelectedDay)
+	{
+		// 清空已有项 (防御性: 重复 Initialize 不重复添加)
+		ComboBoxString_SelectedDay->ClearOptions();
+
+		// 用户需求: 选项 1~5
+		ComboBoxString_SelectedDay->AddOption(TEXT("1"));
+		ComboBoxString_SelectedDay->AddOption(TEXT("2"));
+		ComboBoxString_SelectedDay->AddOption(TEXT("3"));
+		ComboBoxString_SelectedDay->AddOption(TEXT("4"));
+		ComboBoxString_SelectedDay->AddOption(TEXT("5"));
+
+		// 默认选中: 1 (用户最常改当前天)
+		ComboBoxString_SelectedDay->SetSelectedOption(TEXT("1"));
+
+		// 绑定选项变化回调
+		ComboBoxString_SelectedDay->OnSelectionChanged.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] Initialize: ComboBoxString_SelectedDay 未绑定 (蓝图缺控件)"));
+	}
+
+	if (EditableTextInput_NewExp)
+	{
+		// 仅设置 HintText, 不预设数值 (避免误改存档)
+		EditableTextInput_NewExp->SetHintText(FText::FromString(TEXT("新经验值 (>=0)")));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] Initialize: EditableTextInput_NewExp 未绑定 (蓝图缺控件)"));
+	}
+
+	if (Button_ApplyDebugValues)
+	{
+		Button_ApplyDebugValues->OnClicked.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] Initialize: Button_ApplyDebugValues 未绑定 (蓝图缺控件)"));
 	}
 
 	return true;
@@ -263,6 +321,22 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 	{
 		ReselectRewardButton->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
 
+	}
+
+	// ==========================================
+	// 【v213 新增】解绑调试数据提交控件事件
+	// 大厂原则: 与 Initialize 对称解绑, 防止页面销毁后回调触发野指针
+	// ==========================================
+	if (ComboBoxString_SelectedDay)
+	{
+		ComboBoxString_SelectedDay->OnSelectionChanged.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged);
+	}
+
+	if (Button_ApplyDebugValues)
+	{
+		Button_ApplyDebugValues->OnClicked.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
 	}
 
 	// 改造: 解除 ViewModel 绑定
@@ -2866,4 +2940,154 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 	{
 		BonusInfoText->InvalidateLayoutAndVolatility();
 	}
+}
+
+// ==========================================
+// 【v213 新增】调试数据提交控件回调实现
+// ==========================================
+
+/**
+ * 【v213 大厂架构】ComboBox 选项变化回调
+ *
+ * 大厂原则:
+ *   - Page 仅记录 SelectedDay 字符串, 不在此处解析数字
+ *   - ComboBox 已经在 Initialize 中默认选中 "1", 此回调只在用户主动切换时触发
+ *   - 解析 + 校验全部委托给 ViewModel.ModifyCurrentExperience
+ */
+void UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	// SelectionType::Direct = 初始化时 (Initialize 设默认值触发)
+	// SelectionType::OnMouseClick / Keyboard = 用户主动选择
+	// 调试日志 (Verbose 而非 Display: 避免刷屏)
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[DailyUpgradeRewardPage] OnDebugDayComboBoxSelectionChanged: SelectedItem='%s', SelectionType=%d"),
+		*SelectedItem, static_cast<int32>(SelectionType));
+}
+
+/**
+ * 【v213 大厂架构】提交按钮点击回调
+ *
+ * 流程 (严格 4 步, 无任何兜底):
+ *   1. 校验 3 个 UPROPERTY 控件都存在 (零兜底: 任一为 nullptr → Log Error + return)
+ *   2. 从 EditableText 读取 NewExp, 用 FCString::Atoi 解析 (解析失败 → Log Error + return)
+ *   3. 从 ComboBox 读取 SelectedItem, 用 FCString::Atoi 解析 SelectedDay
+ *   4. 委托 ViewModel.ModifyCurrentExperience(SelectedDay, NewExp)
+ *      → 业务校验 / SaveModifier 初始化 / Subsystem 写入 都在 ViewModel 内
+ *   5. 根据返回值显示反馈 (成功绿/失败红)
+ */
+void UDailyUpgradeRewardPage::OnApplyDebugValuesClicked()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[DailyUpgradeRewardPage] OnApplyDebugValuesClicked: 提交按钮被点击"));
+
+	// 【零兜底】第 1 层: 控件存在性校验
+	if (!ViewModel)
+	{
+		const FString Msg = TEXT("[DailyUpgradeRewardPage] ViewModel 未创建, 拒绝提交");
+		UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	if (!EditableTextInput_NewExp)
+	{
+		const FString Msg = TEXT("[DailyUpgradeRewardPage] EditableTextInput_NewExp 未绑定, 拒绝提交");
+		UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	if (!ComboBoxString_SelectedDay)
+	{
+		const FString Msg = TEXT("[DailyUpgradeRewardPage] ComboBoxString_SelectedDay 未绑定, 拒绝提交");
+		UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	// 【零兜底】第 2 层: 解析 NewExp
+	const FString NewExpStr = EditableTextInput_NewExp->GetText().ToString().TrimStartAndEnd();
+	if (NewExpStr.IsEmpty())
+	{
+		const FString Msg = TEXT("经验值输入为空, 请填写数字 (>=0)");
+		UE_LOG(LogTemp, Warning, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	if (!NewExpStr.IsNumeric())
+	{
+		const FString Msg = FString::Printf(TEXT("经验值 '%s' 不是合法数字"), *NewExpStr);
+		UE_LOG(LogTemp, Error, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	const int32 NewExp = FCString::Atoi(*NewExpStr);
+
+	// 【零兜底】第 3 层: 解析 SelectedDay
+	const FString SelectedDayStr = ComboBoxString_SelectedDay->GetSelectedOption();
+	if (SelectedDayStr.IsEmpty())
+	{
+		const FString Msg = TEXT("天数未选择, 请从下拉框选 1~5");
+		UE_LOG(LogTemp, Warning, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	if (!SelectedDayStr.IsNumeric())
+	{
+		const FString Msg = FString::Printf(TEXT("天数 '%s' 不是合法数字"), *SelectedDayStr);
+		UE_LOG(LogTemp, Error, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	const int32 SelectedDay = FCString::Atoi(*SelectedDayStr);
+
+	// 【v213 大厂架构】第 4 层: 委托 ViewModel
+	const bool bSuccess = ViewModel->ModifyCurrentExperience(SelectedDay, NewExp);
+
+	// 第 5 层: 显示反馈 (绿/红)
+	if (bSuccess)
+	{
+		const FString Msg = FString::Printf(
+			TEXT("[成功] SelectedDay=%d, NewExp=%d 已写入 (UI 自动刷新)"),
+			SelectedDay, NewExp);
+		ShowDebugApplyFeedback(true, Msg);
+	}
+	else
+	{
+		// ViewModel 内部已 Log Error, 这里仅展示简短反馈
+		ShowDebugApplyFeedback(false,
+			FString::Printf(TEXT("[失败] SelectedDay=%d, NewExp=%d 请查看 Output Log"), SelectedDay, NewExp));
+	}
+}
+
+/**
+ * 【v213 大厂架构】屏幕反馈 (不新增控件)
+ * 大厂原则:
+ *   - 用户没要新提示控件, 用 GEngine->AddOnScreenDebugMessage
+ *   - 仅在 PIE/Game 有效 (Editor 预览模式 GEngine 仍可用, 但 World=null)
+ *   - 调试用途, 不写入 SaveGame
+ */
+void UDailyUpgradeRewardPage::ShowDebugApplyFeedback(bool bSuccess, const FString& Message)
+{
+	if (!GEngine)
+	{
+		return;
+	}
+
+	// 绿色 = 成功; 红色 = 失败; 持续 5 秒
+	const FColor MsgColor = bSuccess ? FColor::Green : FColor::Red;
+	const uint64 UniqueId = static_cast<uint64>(reinterpret_cast<UPTRINT>(this)) + GetUniqueID();
+
+	GEngine->AddOnScreenDebugMessage(
+		UniqueId,                          // Key (覆盖之前的同 Key 消息, 防止刷屏)
+		5.0f,                              // 显示时长 (5 秒)
+		MsgColor,                          // 颜色
+		Message                            // 文本
+	);
+
+	UE_LOG(LogTemp, Log, TEXT("[DailyUpgradeRewardPage] %s"), *Message);
 }

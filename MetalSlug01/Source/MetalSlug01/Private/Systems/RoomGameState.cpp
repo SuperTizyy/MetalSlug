@@ -227,6 +227,9 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 【v46 新增】AI 占位队列复制
 	DOREPLIFETIME(ARoomGameState, ReplicatedPendingAIQueue);
 
+	// 【v223.0 大厂架构】战斗阶段 AI 名单 Server-Authoritative 复制
+	DOREPLIFETIME(ARoomGameState, ReplicatedBattleAIEntries);
+
 	// 【v92 新增】母体变异倒计时复制
 	DOREPLIFETIME(ARoomGameState, MotherMutationStartTime);
 	DOREPLIFETIME(ARoomGameState, MotherMutationDuration);
@@ -246,6 +249,10 @@ void ARoomGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	// 【v134 大厂架构新增】小局赢家复制 (RoundWinner)
 	// 大厂原则 — 镜像 AttackerWins / DefenderWins: Replicated → OnRep 触发客户端 UI / 音效查表
 	DOREPLIFETIME(ARoomGameState, RoundWinner);
+
+	// 【v218 大厂架构新增】刀战本局赢家复制 (MeleeWinner)
+	// 大厂原则 — 镜像 RoundWinner: Replicated → OnRep 触发客户端 UI 显示 Text_GameOver
+	DOREPLIFETIME(ARoomGameState, MeleeWinner);
 }
 
 
@@ -1506,6 +1513,224 @@ int32 ARoomGameState::GetPendingAICountInFaction(FGameplayTag FactionTag) const
 
 
 // ==========================================
+// 【v223.0 大厂架构】战斗阶段 AI 名单 Server-Authoritative 复制
+// ==========================================
+
+/**
+ * OnRep_ReplicatedBattleAIEntries
+ *
+ * 客户端收到 ReplicatedBattleAIEntries 同步时的回调
+ * 触发 OnBattleAIEntriesChanged 广播, 让 UScoreboardWidget 刷新 Tab Scoreboard
+ *
+ * 大厂原则 (镜像 OnRep_ReplicatedPendingAIQueue):
+ *   - 只负责 Broadcast, UI 自己决定何时刷新
+ *   - 0 兜底: 不强制刷 UI, 不读取具体条目
+ */
+void ARoomGameState::OnRep_ReplicatedBattleAIEntries()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_ReplicatedBattleAIEntries: 触发战斗 AI 名单刷新! Count=%d"),
+		ReplicatedBattleAIEntries.Num());
+
+	OnBattleAIEntriesChanged.Broadcast();
+}
+
+/**
+ * ServerRefreshBattleAIEntries (Server 唯一写入入口)
+ *
+ * 大厂架构 (Server-Authoritative):
+ *   - HasAuthority 守卫: Client 严禁主动写, 必须由 Server 拉
+ *   - 单一真理源: Server 扫描 World 中所有 ABaseAIController → 写入 Replicated 列表
+ *   - 0 兜底: AIC 找不到/Pawn 无效 → Log Error + 跳过, 不静默
+ *   - 立即 ForceNetUpdate: 保证 Tab Scoreboard 实时同步
+ *
+ * 入口 (v223.0 调用方):
+ *   - RoomSpawnSubsystem::SpawnAIInternal (Spawn 后立即写入)
+ *   - PerformKillSettlement (玩家击杀 AI 后, 更新 Score)
+ *   - 客户端 CombatDamageComponent 累计击杀 → Server 自动复制
+ *
+ * @param InFactionTag 限定只写入特定阵营的 AI (空 = 全部)
+ */
+void ARoomGameState::ServerRefreshBattleAIEntries(FGameplayTag InFactionTag)
+{
+	// 【v223.0 P0 守卫】Client 严禁写 Replicated, 0 兜底
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] ServerRefreshBattleAIEntries: Client 严禁调用! FactionTag=%s. 修复: 确认调用方在 Server 端 (HasAuthority==true)."),
+			*InFactionTag.ToString());
+		return;
+	}
+
+	// 0 兜底: FactionTag 有效但不是空 → 必须有效阵营
+	const bool bFilterByFaction = InFactionTag.IsValid() && FFactionTags::IsValidFaction(InFactionTag);
+		if (InFactionTag.IsValid() && !bFilterByFaction)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] ServerRefreshBattleAIEntries: 无效阵营 Tag='%s'. 修复: 传 FFactionTags::Offense() / Defense() 或空."),
+				*InFactionTag.ToString());
+			return;
+		}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] ServerRefreshBattleAIEntries: World 无效. 修复: 确认 GameState 已初始化."));
+		return;
+	}
+
+	// Server 拉所有 AIC, 转成 FFactionSnapshotEntry
+	// 【v223.0 P0】从 GameState 单点拉, 完全不依赖 UI 路径
+	TArray<FFactionSnapshotEntry> NewEntries;
+	int32 NumScanned = 0;
+
+	for (TActorIterator<ABaseAIController> It(World); It; ++It)
+	{
+		ABaseAIController* AIC = *It;
+		NumScanned++;
+
+		// 0 兜底: AIC 无效 → 跳过 + Log Error
+		if (!IsValid(AIC))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] ServerRefreshBattleAIEntries: 扫描到无效 AIC (Index=%d). 修复: 检查 SpawnAIInternal 是否成功."),
+				NumScanned - 1);
+			continue;
+		}
+
+		APawn* AIPawn = AIC->GetPawn();
+		if (!IsValid(AIPawn))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] ServerRefreshBattleAIEntries: AIC '%s' 没有 Pawn. 修复: 检查 AIC->Possess 时序."),
+				*GetNameSafe(AIC));
+			continue;
+		}
+
+		ABaseCharacter* BaseChar = Cast<ABaseCharacter>(AIPawn);
+		if (!IsValid(BaseChar))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] ServerRefreshBattleAIEntries: AIC '%s' 的 Pawn '%s' 不是 ABaseCharacter. 修复: 检查 BP_GruntAI 继承链."),
+				*GetNameSafe(AIC), *GetNameSafe(AIPawn));
+			continue;
+		}
+
+		// 拿阵营 (Server 上 CachedFactionTag 一定有值, v222 已确认)
+		FGameplayTag AICFactionTag = AIC->GetCachedFactionTag();
+		if (!AICFactionTag.IsValid())
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomGameState] ServerRefreshBattleAIEntries: AIC '%s' CachedFactionTag 无效. 修复: 确认 InitializeFromProfile 在 SetCachedFactionTag 之后."),
+				*GetNameSafe(AIC));
+			continue;
+		}
+
+		// 阵营过滤
+		if (bFilterByFaction && AICFactionTag != InFactionTag)
+		{
+			continue;
+		}
+
+		// 构造 FFactionSnapshotEntry (镜像 USettlementSnapshotSubsystem::BuildSettlementV2)
+		//   - DisplayName: 用 AIC->GetName() (Server 端权威, 与 v208 BuildAISnapshotFromController 同一真理源)
+		//     不是 BaseChar->GetCharacterID() (该方法不存在, CharacterID 字段在 WeaponAttachmentComponent)
+		//   - FactionTag: 用 FFactionTags::Offense() 而非 GetOffenseTag() (后者 API 不存在)
+		FFactionSnapshotEntry Entry;
+		Entry.DisplayName = AIC->GetName(); // 与 BuildAISnapshotFromController 完全一致
+		Entry.bIsAI = true;
+		Entry.Kills = AIC->AIKills;       // 直接读 Replicated 字段 (v202.0)
+		Entry.Deaths = AIC->AIDeaths;     // 直接读 Replicated 字段
+		Entry.Assists = AIC->AIAssists;   // 直接读 Replicated 字段
+		Entry.Score = AIC->AIScore;       // 直接读 Replicated 字段
+		Entry.bIsAttacker = (AICFactionTag == FFactionTags::Offense());
+		Entry.FactionTagName = AICFactionTag.ToString();
+
+		NewEntries.Add(Entry);
+	}
+
+	// 写入 + 同步
+	ReplicatedBattleAIEntries = NewEntries;
+
+	// 【v223.0 P0】Server 写入后立即 ForceNetUpdate, 客户端不必等 NetUpdateFrequency
+	ForceNetUpdate();
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] ServerRefreshBattleAIEntries: 写入完成! FactionTag=%s, Scanned=%d, Written=%d, FilterByFaction=%s"),
+		*InFactionTag.ToString(),
+		NumScanned,
+		NewEntries.Num(),
+		bFilterByFaction ? TEXT("true") : TEXT("false"));
+}
+
+/**
+ * ServerRefreshAllBattleAIEntries (无过滤便利函数)
+ */
+void ARoomGameState::ServerRefreshAllBattleAIEntries()
+{
+	ServerRefreshBattleAIEntries(FGameplayTag());
+}
+
+/**
+ * GetBattleAIEntries (客户端读取 API)
+ *
+ * 客户端 Tab Scoreboard 调用此 API, 读 Replicated 列表
+ * 完全不依赖 AIC 复制 + TActorIterator
+ *
+ * 0 兜底:
+ *   - World 无效 → Log Error + 返回空数组
+ *   - GameState 无效 → Log Error + 返回空数组
+ *   - FactionTag 有效但非 Offense/Defense → Log Error + 返回空数组
+ *
+ * @param InFactionTag 过滤特定阵营 (空 = 全部)
+ */
+TArray<FFactionSnapshotEntry> ARoomGameState::GetBattleAIEntries(FGameplayTag InFactionTag) const
+{
+	TArray<FFactionSnapshotEntry> Result;
+
+	// 0 兜底: GameState 必须有效
+	if (!IsValid(this))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] GetBattleAIEntries: this GameState 无效. 修复: 检查调用方时序."));
+		return Result;
+	}
+
+	// 0 兜底: FactionTag 过滤合法性
+	const bool bFilterByFaction = InFactionTag.IsValid() && FFactionTags::IsValidFaction(InFactionTag);
+	if (InFactionTag.IsValid() && !bFilterByFaction)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] GetBattleAIEntries: 无效阵营 Tag='%s'. 修复: 传 FFactionTags::Offense() / Defense() 或空."),
+			*InFactionTag.ToString());
+		return Result;
+	}
+
+	// 客户端读取 Replicated 列表
+	if (bFilterByFaction)
+	{
+		Result = ReplicatedBattleAIEntries.FilterByPredicate([InFactionTag](const FFactionSnapshotEntry& Entry)
+		{
+			return Entry.FactionTagName == InFactionTag.ToString();
+		});
+	}
+	else
+	{
+		Result = ReplicatedBattleAIEntries;
+	}
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[RoomGameState] GetBattleAIEntries: FactionTag=%s, FilterByFaction=%s, Returned=%d"),
+		*InFactionTag.ToString(),
+		bFilterByFaction ? TEXT("true") : TEXT("false"),
+		Result.Num());
+
+	return Result;
+}
+
+
+// ==========================================
 // 【生化模式】空投降临倒计时
 // ==========================================
 
@@ -1741,6 +1966,88 @@ void ARoomGameState::ResetRoundWinner()
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[RoomGameState] ResetRoundWinner: 小局赢家已重置为 None (新小局开始)."));
+}
+
+/**
+ * 【v218 大厂架构新增】SetMeleeWinner — 刀战本局赢家设置 (镜像 SetRoundWinner)
+ *
+ * 与 SetRoundWinner 区别:
+ *   - SetRoundWinner 适用生化模式 (Human/Mother)
+ *   - SetMeleeWinner 适用刀战模式 (Attacker/Defender/Draw)
+ *   - 两者业务模型不同, 字段独立维护 (GameState.MeleeWinner vs RoundWinner)
+ *
+ * 大厂原则 — 零兜底 + 显式优于隐式:
+ *   - 不允许传 None (语义混乱), 如需重置请走 ResetMeleeWinner
+ *   - 服务器手动 Broadcast, 客户端 OnRep 自动 Broadcast
+ */
+void ARoomGameState::SetMeleeWinner(EMeleeWinner InWinner)
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetMeleeWinner: 客户端调用非法, HasAuthority=false. 仅服务器可设置刀战赢家."));
+		return;
+	}
+
+	if (InWinner == EMeleeWinner::None)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] SetMeleeWinner: InWinner=None 拒绝写入. "
+			     "【修复】调用方必须传 Attacker/Defender/Draw, 不允许传 None. "
+			     "【业务后果】如需重置请改调 ResetMeleeWinner 入口."));
+		return;
+	}
+
+	MeleeWinner = InWinner;
+
+	// 服务器自身不会触发 OnRep, 手动广播 (镜像 SetRoundWinner)
+	OnMeleeWinnerUpdated.Broadcast(MeleeWinner);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] SetMeleeWinner: 刀战本局赢家已设置! MeleeWinner=%d"),
+		static_cast<int32>(MeleeWinner));
+}
+
+/**
+ * 【v218 大厂架构新增】ResetMeleeWinner — 镜像 ResetRoundWinner
+ *
+ * 调用方:
+ *   - URoomLifecycleSubsystem::StartNewMeleeMatch / 模式切换 (新一局开始)
+ */
+void ARoomGameState::ResetMeleeWinner()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] ResetMeleeWinner: 客户端调用非法, HasAuthority=false."));
+		return;
+	}
+
+	MeleeWinner = EMeleeWinner::None;
+
+	// 服务器自身不会触发 OnRep, 手动广播
+	OnMeleeWinnerUpdated.Broadcast(MeleeWinner);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] ResetMeleeWinner: 刀战赢家已重置为 None (新一局开始)."));
+}
+
+/**
+ * 【v218 大厂架构新增】OnRep_MeleeWinner — 客户端 MeleeWinner 复制回调
+ *
+ * 大厂原则 — UE 5.6 OnRep:
+ *   - 必须用 UFUNCTION() 标记
+ *   - 触发后立即 Broadcast OnMeleeWinnerUpdated 让 UI 刷新
+ *
+ * 不在服务器调 (服务器写字段时已手动 Broadcast), 避免双发
+ */
+void ARoomGameState::OnRep_MeleeWinner()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] OnRep_MeleeWinner: 客户端收到 MeleeWinner=%d"),
+		static_cast<int32>(MeleeWinner));
+
+	OnMeleeWinnerUpdated.Broadcast(MeleeWinner);
 }
 
 

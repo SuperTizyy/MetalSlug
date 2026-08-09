@@ -9,6 +9,11 @@
 #include "Blueprint/UserWidget.h"
 #include "Data/Enums/RoomEnums.h" // 引入 ERoomMatchMode
 // 【v202.0 大厂架构】不再 include RoomGameState / RoomPlayerState (走快照路径)
+// 【v223.0 大厂架构】Include FFactionSnapshotEntry 的完整定义 (Compile Error 修复: ConvertBattleAIEntryToSnapshot 的参数类型)
+//   - 完整定义带来 FGameplayTag / FFactionSnapshotEntry 所有字段, 头文件编译完全自给
+//   - 不依赖 .cpp include 顺序 (UE 编译依赖传递性低, 必须每编译单元独立 include)
+#include "Systems/Settlement/SettlementSnapshotSubsystem.h" // 【v223.0】FFactionSnapshotEntry 完整定义
+#include "GameplayTagContainer.h" // 【v223.0】FGameplayTag 完整定义 (ServerValidateFactionConsistency 参数)
 #include "ScoreboardWidget.generated.h"
 
 // 前向声明
@@ -516,13 +521,36 @@ private:
 	/**
 	 * 【v215 大厂架构新增】获取当前应使用的数据源
 	 *   - 冻结后返回 FrozenSnapshots (const 引用)
-	 *   - 未冻结时实时拉 URoomStateService, 并缓存到 CachedLiveSnapshots
+	 *   - 未冻结时实时拉 URoomStateService(真人) + RoomGameState(AI),并缓存到 CachedLiveSnapshots
 	 *   - 因为要写缓存 (CachedLiveSnapshots), 此函数不能是 const
 	 *   - 0 兜底: URoomStateService 拿不到 → Log Error + 返回空数组
+	 *
+	 * 【v223.0 大厂架构重构】AI 数据源切换:
+	 *   - 老路径: URoomStateService::GetFactionSnapshotsWithAI → TActorIterator<ABaseAIController>
+	 *   - 新路径: RoomGameState->GetBattleAIEntries(FFactionSnapshotEntry Replicated 列表)
+	 *   - 真人玩家: 仍走 URoomStateService (PlayerArray 复制稳定)
+	 *   - 单点转换: ConvertBattleAIEntryToSnapshot 把 FFactionSnapshotEntry 转 FPlayerSnapshot
 	 *
 	 * 单一入口, 调用方不感知冻结状态
 	 */
 	TArray<FPlayerSnapshot>& GetActiveSnapshots();
+
+	/**
+	 * 【v223.0 大厂架构新增】FFactionSnapshotEntry → FPlayerSnapshot 转换
+	 *
+	 * 单一真理源 (镜面 Settlement v217 路径):
+	 *   - FFactionSnapshotEntry 是 Server-Authoritative 写入的 Replicated 数据
+	 *   - FPlayerSnapshot 是 UI 内部使用的数据
+	 *   - 转换函数集中在此, 避免分散拼凑
+	 *
+	 * 0 兜底:
+	 *   - Entry.DisplayName 为空 → 返回空 Snapshot (RefreshScoreboard 会 Log Error 跳过)
+	 *   - FactionTagName 解析失败 → 显式 Log Error + 用 Offense 默认 (不静默)
+	 *
+	 * @param Entry 来自 RoomGS->GetBattleAIEntries 的 Replicated Entry
+	 * @return FPlayerSnapshot (bIsAI=true, 含 PlayerName 前缀)
+	 */
+	FPlayerSnapshot ConvertBattleAIEntryToSnapshot(const FFactionSnapshotEntry& Entry);
 
 	/**
 	 * 【v215 大厂架构新增】缓存当前快照 (可变缓存, 用于增量删除已退玩家)

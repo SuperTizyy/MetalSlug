@@ -14,6 +14,7 @@
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Tables/SpawnTableRow.h"
 #include "Data/Tables/WeaponTableRow.h"      // 【v54.3 新增】FWeaponInfo (DT_WeaponInfo 行)
+#include "Data/Enums/CombatEnums.h"          // 【v213 新增】EWeaponMeshType (AI WeaponID 净化识别武器类型)
 #include "Weapons/BaseWeapon.h"              // 【v54.3 新增】ABaseWeapon (ResolveWeaponClassFromID 返回类型)
 #include "Combat/WeaponAttachmentComponent.h" // 【v52 P0 新增】Server_SpawnAllWeapons 调用
 #include "Combat/CharacterIconComponent.h"    // 【v105 新增】MutatePawnToMother 末尾调用刷新头像
@@ -25,6 +26,8 @@
 #include "AIController.h"  // 【v54 修复】AAIController 完整类型 - SpawnActor<AAIController> 需要
 #include "BehaviorTree/BlackboardComponent.h" // 【v201.10】BB Key 清空 (RestartZombieRoundPlayers)
 #include "BehaviorTree/BehaviorTreeComponent.h" // 【v201.10】BT 停止 (RestartZombieRoundPlayers)
+#include "Engine/StreamableManager.h"      // 【v220】异步预加载武器 Blueprint
+#include "Engine/AssetManager.h"            // 【v220】UAssetManager::GetStreamableManager
 #include "Components/WeaponFireComponent.h" // 【v208.5】每小局弹药还原
 #include "Engine/World.h"
 #include "EngineUtils.h" // TActorIterator
@@ -765,6 +768,23 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 										FString FinalSecondaryID = PS->GetSelectedWeapon2ID();
 										FString FinalMeleeID = PS->GetSelectedWeapon3ID();
 
+										// ============================================================
+										// 【v213 大厂架构 — 母体变人类路径刀战模式净化 (链式防护)】
+										// ============================================================
+										//
+										// 业务背景: RestartZombieRoundPlayers 当前只在 Zombie 模式被调用 (RoomLifecycleSubsystem 确认),
+										//   对 Melee 模式 0 影响. 但作为防御性编程 + 大厂原则"职责集中",
+										//   仍然调用同一个 PurifyLoadoutForMeleeMode 函数, 与 HandlePlayerRequestSpawn/SpawnAIInternal 镜像.
+										//
+										// 大厂原则 (职责集中 + DRY):
+										//   - 5 个 Spawn 入口全部调同一个 PurifyLoadoutForMeleeMode
+										//   - 即便 RestartZombieRoundPlayers 现在只在 Zombie 跑, 未来若扩展也能直接用
+										//   - 与 HandlePlayerRequestSpawn / SpawnAIInternal 完全镜像的代码结构
+										if (ARoomGameState* GS2 = World->GetGameState<ARoomGameState>())
+										{
+											PurifyLoadoutForMeleeMode(GS2->CurrentMatchMode, FinalPrimaryID, FinalSecondaryID, FinalMeleeID);
+										}
+
 										// Melee 业务默认兜底 — 与 HandlePlayerRequestSpawn line 2673 完全对称
 										if (FinalMeleeID.IsEmpty())
 										{
@@ -805,13 +825,16 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 											MeleeClass = ResolveWeaponClassFromID(FinalMeleeID);
 										}
 
-										// 零兜底 (v52): 主武器必须有 — 与 HandlePlayerRequestSpawn line 2889 完全对称
+										// 【v52 + v213+ 零兜底 + 刀战模式条件豁免】
+										//   生化模式: 主武器必须有 (人类玩家必须能打) → 配置错 (RowName 缺失/拼错) 时 Log Error
+										//   刀战模式: v213 净化故意清空 Primary → PrimaryClass=nullptr 是业务规则, 不算配置错, 只 Log Display
+										//   不 return — 让 Server_SpawnAllWeapons 走 nullptr 跳过 Primary 槽位的合法分支
+										//   (Server_SpawnAllWeapons 已实现 nullptr 安全, 与 HandlePlayerRequestSpawn v213+ 修复对称)
 										if (!PrimaryClass)
 										{
 											UE_LOG(LogTemp, Error,
 												TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: 玩家 '%s' 母体变人类 — FinalPrimaryID='%s' 无法反查为 WeaponClass. "
-												     "【v52 零兜底】主武器必须有, 拒绝 Spawn. "
-												     "修复: 检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
+												     "【v52 零兜底】生化模式主武器必须有, 请检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
 												*PC->GetName(), *FinalPrimaryID, *FinalPrimaryID);
 										}
 
@@ -1097,13 +1120,15 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 						AIMeleeClass = ResolveWeaponClassFromID(AIMeleeID);
 					}
 
-					// 零兜底 (v52): AI 主武器必须有 (镜像玩家路径)
+					// 【v52 + v213+ 零兜底 + 刀战模式条件豁免】
+					//   生化模式 (母体变人类): AI 主武器必须有 (人类 AI 必须能打) → 配置错 Log Error
+					//   刀战模式: 不走这里 (RestartZombieRoundPlayers 仅在 Zombie 模式调用)
+					//   不 return — Server_SpawnAllWeapons nullptr 安全, 与玩家路径对称
 					if (!AIPrimaryClass)
 					{
 						UE_LOG(LogTemp, Error,
 							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — AIPrimaryID='%s' 无法反查为 WeaponClass. "
-							     "【v52 零兜底】AI 主武器必须有, 拒绝 Spawn. "
-							     "修复: 检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
+							     "【v52 零兜底】生化模式 AI 主武器必须有, 请检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
 							*BaseAIC->GetName(), *AIPrimaryID, *AIPrimaryID);
 					}
 
@@ -1615,6 +1640,142 @@ TSubclassOf<ABaseWeapon> URoomSpawnSubsystem::ResolveWeaponClassFromID(const FSt
 }
 
 // ==========================================
+// v220 — 异步预加载武器资产（消除 32 秒主线程阻塞）
+// ==========================================
+
+/**
+ * PreloadWeaponMeshesAsync — 在 PerformGameStart 倒计时阶段异步预加载所有玩家+AI 的 WeaponBlueprint
+ *
+ * 大厂架构 — 单一预加载入口:
+ *   - PerformGameStart 调用本函数一次, 倒计时期间 (默认 3s) 完成 DDC 编译
+ *   - 倒计时结束 Spawn 时, ResolveWeaponClassFromID 命中缓存 → LoadSynchronous 0 阻塞
+ *
+ * 实现步骤:
+ *   1. 遍历 GS->PlayerArray → 收集 PS->SelectedWeaponID1/2/3 的 WeaponBlueprint 软引用
+ *   2. 遍历 AI Profile (ModeRules) → 收集所有 AI 武器的 WeaponBlueprint 软引用
+ *   3. 去重 (同一武器可能被多个玩家选)
+ *   4. UAssetManager::GetStreamableManager().RequestAsyncLoad 批量加载
+ *   5. 不等结果 (fire-and-forget), DDC 编译在后台进行
+ *
+ * 零兜底:
+ *   - DT_WeaponInfo / Profile / PS 任一缺失 → 跳过该武器, 不补默认
+ *   - 失败的预加载会在 Spawn 时被 LoadSynchronous 报告 (现有 ResolveWeaponClassFromID 行为)
+ *
+ * @return 成功发起预加载的 WeaponBlueprint 数量
+ */
+int32 URoomSpawnSubsystem::PreloadWeaponMeshesAsync()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: World 为空. "
+			     "【v220 零兜底】拒绝预加载."));
+		return 0;
+	}
+
+	if (!WeaponDataTable)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: WeaponDataTable 未配 — 跳过预加载. "
+			     "【v220 零兜底】Spawn 时 LoadSynchronous 会失败, 请检查 UE 编辑器配置."));
+		return 0;
+	}
+
+	// 1. 收集所有 WeaponID
+	TArray<FString> WeaponIDs;
+	WeaponIDs.Reserve(16);
+
+	// 1a. 玩家武器
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(It->Get()))
+		{
+			if (ARoomPlayerState* PS = PC->GetPlayerState<ARoomPlayerState>())
+			{
+				// 【v220 修复】用公开 getter 替换直接访问 protected 字段
+				//   原: PS->SelectedWeaponID1/2/3 (C2248 编译失败)
+				//   修: PS->GetSelectedWeapon1ID/2/3ID() (公开 inline 函数, 已存在)
+				const FString W1 = PS->GetSelectedWeapon1ID();
+				if (!W1.IsEmpty()) WeaponIDs.AddUnique(W1);
+				const FString W2 = PS->GetSelectedWeapon2ID();
+				if (!W2.IsEmpty()) WeaponIDs.AddUnique(W2);
+				const FString W3 = PS->GetSelectedWeapon3ID();
+				if (!W3.IsEmpty()) WeaponIDs.AddUnique(W3);
+			}
+		}
+	}
+
+	// 1b. AI 武器 (从 PendingAIQueue 收集 — 大厅入队的 AI 待 Spawn 数据)
+	//   真理源在 URoomSpawnSubsystem::PendingAIQueue (v50 重构后从 RoomGameMode 迁移过来)
+	for (const FPendingAIEntry& Entry : PendingAIQueue)
+	{
+		if (!Entry.WeaponID.IsEmpty())
+		{
+			WeaponIDs.AddUnique(Entry.WeaponID);
+		}
+	}
+
+	if (WeaponIDs.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: 没有任何武器 ID 需要预加载 (房间可能只有玩家没选武器)."));
+		return 0;
+	}
+
+	// 2. WeaponID → TSoftClassPtr (DT 查询, 不加载)
+	TArray<FSoftObjectPath> WeaponPaths;
+	WeaponPaths.Reserve(WeaponIDs.Num());
+
+	for (const FString& WeaponID : WeaponIDs)
+	{
+		static const FString Context(TEXT("PreloadWeaponMeshesAsync"));
+		if (FWeaponInfo* Row = WeaponDataTable->FindRow<FWeaponInfo>(FName(*WeaponID), Context))
+		{
+			if (!Row->WeaponBlueprint.IsNull())
+			{
+				WeaponPaths.AddUnique(Row->WeaponBlueprint.ToSoftObjectPath());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: WeaponID='%s' 的 Blueprint 为空, 跳过预加载."),
+					*WeaponID);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: DT_WeaponInfo 中找不到 WeaponID='%s', 跳过预加载."),
+				*WeaponID);
+		}
+	}
+
+	if (WeaponPaths.Num() == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: 没有任何有效 WeaponBlueprint 路径 (DT 配置缺失)."));
+		return 0;
+	}
+
+	// 3. 异步加载 (不阻塞主线程, DDC 编译在后台进行)
+	FStreamableManager& Streamable = UAssetManager::GetStreamableManager();
+	Streamable.RequestAsyncLoad(
+		WeaponPaths,
+		FStreamableDelegate(),
+		FStreamableManager::AsyncLoadHighPriority,
+		/*bManageActiveHandle*/ false,
+		/*bStartStalled*/ false,
+		TEXT("PreloadWeaponMeshesAsync"));
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomSpawn] PreloadWeaponMeshesAsync: 异步预加载 %d 个武器 Blueprint (DDC 编译在后台进行, 倒计时结束 LoadSynchronous 命中缓存)"),
+		WeaponPaths.Num());
+
+	return WeaponPaths.Num();
+}
+
+// ==========================================
 // v209 — 默认武器兜底器
 // ==========================================
 
@@ -2037,6 +2198,30 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		return 0;
 	}
 
+	// ============================================================
+	// 【v213 大厂架构 — 刀战模式 AI WeaponID 净化 (单一入口)】
+	// ============================================================
+	//
+	// 业务背景 (用户 2026.08.09 反馈):
+	//   "AI 强制只拿 Melee 武器" — 即使 AI Profile / Config 配了 Primary/Secondary, 刀战模式也强制覆盖
+	//
+	// 设计 (大厂原则 — 职责集中 + DRY):
+	//   - 与 HandlePlayerRequestSpawn 净化对称 (同一函数族)
+	//   - Request.WeaponID 是单字符串, 走 PurifyAIWeaponForMeleeMode
+	//   - 在循环外净化一次 (循环内复用净化后的值), 避免重复 Log
+	//
+	// 净化策略:
+	//   - Melee 模式 + WeaponID 是 Primary/Secondary → 清空 + 用业务默认 Melee (JZ001)
+	//   - 非 Melee 模式 → 0 行为变更
+	FString PurifiedWeaponID = Request.WeaponID;
+	FString PurifiedMeleeDefaultID;
+	const bool bAIPurified = PurifyAIWeaponForMeleeMode(Request.Mode, PurifiedWeaponID, PurifiedMeleeDefaultID);
+	if (bAIPurified && !PurifiedMeleeDefaultID.IsEmpty())
+	{
+		// 净化生效: 用业务默认 Melee (JZ001) 替代原 Primary/Secondary
+		PurifiedWeaponID = PurifiedMeleeDefaultID;
+	}
+
 	// 4. 循环 Spawn
 	int32 SpawnedCount = 0;
 	for (int32 i = 0; i < Request.Count; ++i)
@@ -2157,12 +2342,30 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		}
 
 		// 4b. Spawn Controller (复用 OptionalExistingController if provided, 用于复活场景)
+		//
+		// 【v222.0 大厂架构 P0 修复 — 客户端 Tab Scoreboard 不显示 AI】
+		// 根因 (Session1.txt 2026.08.09):
+		//   - 旧代码 SP.Owner = GetWorld()->GetAuthGameMode()
+		//   - AGameModeBase 是 server-only Actor, 不会复制到客户端
+		//   - UE 复制规则: replicated Actor 的 Owner 必须在客户端存在, 否则该 Actor 不被复制
+		//   - 结果: AIC 实例没被复制到客户端, TActorIterator<ABaseAIController> 找不到任何实例
+		//   - 客户端 GetFactionSnapshotsInternal 报 "AIC总数=0" → 整局 Tab Scoreboard 没 AI
+		//   - 僵尸模式不受影响 (僵尸 AI 是关卡预放, Owner 默认 nullptr, 复制正常)
+		//
+		// 大厂原则:
+		//   - replicated Actor 的 Owner 必须是 replicated Actor (GameMode/GameInstance 等都是 server-only)
+		//   - 标准做法: SP.Owner = nullptr, 让 AIC 由 Pawn 的 Controller 链路复制
+		//   - 参考 Epic 官方: AAIController::GetInstigator() 也不依赖 Owner
 		AAIController* AIC = OptionalExistingController;
 		if (!AIC)
 		{
 			FActorSpawnParameters SP;
-			SP.Owner = GetWorld()->GetAuthGameMode();
+			SP.Owner = nullptr; // 【v222.0】不设 Owner, 避免被 server-only GameMode 阻断复制
 			SP.Name = FName(*FString::Printf(TEXT("AIC_%s"), *AIName));
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[RoomSpawn] 【v222.0】SpawnAIInternal: Spawn AIC Class=%s, AIName=%s, Owner=nullptr (修复客户端 AIC 不复制 bug)."),
+				*GetNameSafe(ControllerClass), *AIName);
 
 			AIC = GetWorld()->SpawnActor<AAIController>(
 				ControllerClass, SpawnLoc, SpawnRot, SP);
@@ -2210,7 +2413,8 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		//   - 不再 fallback 到 Profile.WeaponID (那是关卡预放 AI 的字段)
 		// ============================================================
 		FString DesiredCharID = Request.CharacterInfoRowName.ToString();  // 【v49】不再用 Profile.CharacterRowName
-		FString DesiredWeaponID = Request.WeaponID;
+		// 【v213 大厂架构】刀战模式净化后的 WeaponID (循环外已净化, 复用避免重复 Log)
+		FString DesiredWeaponID = PurifiedWeaponID;
 
 		if (DesiredWeaponID.IsEmpty())
 		{
@@ -2304,13 +2508,16 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
 		{
 			BaseAIC->SetCachedAIPawnClass(Request.AIPawnClass);
-			BaseAIC->SetCachedWeaponID(Request.WeaponID);
+			// 【v213 大厂架构】刀战模式净化后的 WeaponID 写入 CachedWeaponID
+			// 真理源单一化: 循环外已净化, Cached 字段也用净化后值
+			BaseAIC->SetCachedWeaponID(PurifiedWeaponID);
 			BaseAIC->SetCachedFactionTag(Request.FactionTag); // ← 先写, InitializeFromConfig 会读这个
 			BaseAIC->SetCachedIsMother(false); // 【v109.1 大厂架构】新 Spawn 的 AI 初始为非母体
 			BaseAIC->InitializeFromConfig(Config, LobbyBehaviorTree);
 
 			// 【v54.3 大厂重构 — Class 强类型真理源】同步 CachedWeaponClass
-			TSubclassOf<ABaseWeapon> ResolvedClass = ResolveWeaponClassFromID(Request.WeaponID);
+			// 【v213】同样用 PurifiedWeaponID (刀战模式 Primary/Secondary 已被清空)
+			TSubclassOf<ABaseWeapon> ResolvedClass = ResolveWeaponClassFromID(PurifiedWeaponID);
 			if (ResolvedClass)
 			{
 				BaseAIC->SetCachedWeaponClass(ResolvedClass);
@@ -2318,10 +2525,10 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			else
 			{
 				UE_LOG(LogTemp, Error,
-					TEXT("[RoomSpawn] SpawnAIInternal: AI='%s' 的 Request.WeaponID='%s' 反查失败. "
+					TEXT("[RoomSpawn] SpawnAIInternal: AI='%s' 的 PurifiedWeaponID='%s' 反查失败. "
 					     "【v54.3】CachedWeaponClass 留空. 复活路径将无法生成武器. "
 					     "修复: 检查 GM_RoomGameMode.ClassDefaults.WeaponDataTable 配置."),
-					*AIPawn->GetName(), *Request.WeaponID);
+					*AIPawn->GetName(), *PurifiedWeaponID);
 			}
 		}
 
@@ -2349,7 +2556,8 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			}
 
 			// 【v56.2】直接用 Request.WeaponID
-			const FString UIWeaponID = Request.WeaponID;
+			// 【v213 大厂架构】刀战模式净化后用 PurifiedWeaponID (循环外已净化)
+			const FString UIWeaponID = PurifiedWeaponID;
 			if (!UIWeaponID.IsEmpty())
 			{
 				TSubclassOf<ABaseWeapon> WeaponClass = ResolveWeaponClassFromID(UIWeaponID);
@@ -2373,7 +2581,7 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			else
 			{
 				UE_LOG(LogTemp, Error,
-					TEXT("[RoomSpawn] SpawnAIInternal: AI '%s' 的 Request.WeaponID 为空. "
+					TEXT("[RoomSpawn] SpawnAIInternal: AI '%s' 的 PurifiedWeaponID 为空 (净化后空 = 模式/配置拒绝). "
 						 "【v56.3 零兜底】拒绝 Spawn 武器."),
 					*AIPawn->GetName());
 			}
@@ -2488,6 +2696,20 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
 		{
 			GM->BroadcastSystemMessage(FString::Printf(TEXT("已添加 %d 名 AI 参战"), SpawnedCount));
+		}
+
+		// 【v223.0 大厂架构 P0】Server 写入战斗 AI 名单 (ReplicatedBattleAIEntries)
+		// 单一入口: 每次 SpawnAIInternal 成功后, 立即触发 GameState 刷新
+		// 0 兜底: GameState 上有完整守卫 (HasAuthority/AIC/Pawn Tag 均检查)
+		if (ARoomGameState* RoomGS = GetWorld()->GetGameState<ARoomGameState>())
+		{
+			// 全量刷新 (不过滤阵营, 让 Server 一次性写入所有 AI)
+			RoomGS->ServerRefreshAllBattleAIEntries();
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomSpawn] SpawnAIInternal: GameState 不是 ARoomGameState. 修复: 检查 GM_RoomGameMode 设置."));
 		}
 	}
 
@@ -2620,13 +2842,43 @@ void URoomSpawnSubsystem::SpawnAllPlayersIntoBattle()
 				const FString SecondaryID = PS->GetSelectedWeapon2ID();
 				const FString MeleeID = PS->GetSelectedWeapon3ID();
 
-				if (CharID.IsEmpty() || PrimaryID.IsEmpty())
+				// 【v213+ 大厂架构 — 刀战模式条件豁免】
+				//   业务背景: 刀战模式 v213 净化会清空 Primary/Secondary → PrimaryID 永远是空
+				//     旧版 v31.2 检查 PrimaryID.IsEmpty() → continue → 玩家永远进不去游戏
+				//   修复策略: 刀战模式下, CharID 非空 + MeleeID 非空 → 允许 PrimaryID/SecondaryID 为空
+				//     非 Melee 模式: 维持 v31.2 检查 (CharID + PrimaryID 都不能为空)
+				bool bIsMeleeModeForCheck = false;
+				if (UWorld* WorldCheck = GetWorld())
 				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[Spawn] SpawnAllPlayersIntoBattle: 玩家 '%s' Loadout 不完整 (CharID='%s', Primary='%s'). "
-						     "【v31.2 零兜底】拒绝 Spawn."),
-						*PS->GetPlayerName(), *CharID, *PrimaryID);
-					continue;
+					if (ARoomGameState* GSCheck = WorldCheck->GetGameState<ARoomGameState>())
+					{
+						bIsMeleeModeForCheck = (GSCheck->CurrentMatchMode == ERoomMatchMode::Melee);
+					}
+				}
+
+				const bool bLoadoutIncomplete =
+					CharID.IsEmpty() ||
+					CharID == TEXT("Default") ||
+					(PrimaryID.IsEmpty() && !bIsMeleeModeForCheck);
+
+				if (bLoadoutIncomplete)
+				{
+					if (bIsMeleeModeForCheck && CharID.IsEmpty() == false && CharID != TEXT("Default"))
+					{
+						// 刀战模式 + CharID 合法 → PrimaryID 空是正常的 (净化结果), 走 HandlePlayerRequestSpawn 兜底
+						UE_LOG(LogTemp, Warning,
+							TEXT("[Spawn] SpawnAllPlayersIntoBattle: 玩家 '%s' 刀战模式 PrimaryID 为空 (v213 净化结果, 合法). "
+							     "CharID='%s', Primary='%s', Melee='%s'. 继续 HandlePlayerRequestSpawn."),
+							*PS->GetPlayerName(), *CharID, *PrimaryID, *MeleeID);
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("[Spawn] SpawnAllPlayersIntoBattle: 玩家 '%s' Loadout 不完整 (CharID='%s', Primary='%s'). "
+							     "【v31.2 零兜底】拒绝 Spawn."),
+							*PS->GetPlayerName(), *CharID, *PrimaryID);
+						continue;
+					}
 				}
 
 				HandlePlayerRequestSpawn(PC, CharID, PrimaryID, SecondaryID, MeleeID);
@@ -2788,6 +3040,36 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	// 【v209】近战武器: 玩家没选时兜底取 DT_WeaponInfo 第 2 行
 	FString FinalMeleeWeaponID = WeaponMeleeRowName;
 
+	// ============================================================
+	// 【v213 大厂架构 — 刀战模式 Loadout 净化 (单一入口)】
+	// ============================================================
+	//
+	// 业务背景 (用户 2026.08.09 反馈):
+	//   "刀战模式专属逻辑: 主武器和副武器进游戏不能加载, 要为空, 只能拿近战武器.
+	//    现在进游戏还是拿了主武器. 修复一下bug"
+	//
+	// 设计 (大厂原则 — 职责集中 + DRY):
+	//   - 5 个 Spawn 入口 (HandlePlayerRequestSpawn / SpawnAIInternal /
+	//     RequestRespawn 玩家+AI / RestartZombieRoundPlayers / MutatePawnToMother)
+	//     全部调同一个 PurifyLoadoutForMeleeMode / PurifyAIWeaponForMeleeMode
+	//   - 这里 (玩家路径) 净化 Primary/Secondary RowName
+	//   - 不写 5 份 if/else 重复代码
+	//   - 净化必须在 Step 1 (CharID 校验) 之前 — 净化后的空字符串不应该被 Step 1 误判
+	//   - 净化必须在兜底逻辑之前 — 净化后空 Primary, 不会触发 ResolveDefaultWeaponRowName(0) 兜底
+	//
+	// 真理源 (单一):
+	//   - ARoomGameState::CurrentMatchMode (Replicated + OnRep, v93 引入)
+	//
+	// 不破坏生化模式:
+	//   - PurifyLoadoutForMeleeMode 内部 Mode != Melee → return (0 行为变更)
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+		{
+			PurifyLoadoutForMeleeMode(GS->CurrentMatchMode, FinalWeaponID, FinalSecondaryWeaponID, FinalMeleeWeaponID);
+		}
+	}
+
 	// Step 1: 校验非空 (零兜底)
 	if (FinalCharID.IsEmpty() || FinalCharID == TEXT("Default"))
 	{
@@ -2798,22 +3080,48 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	}
 
 	// 【v209 P0】主武器兜底 — 玩家从未选过主武器 → 取 DT_WeaponInfo 第 1 行
+	//
+	// 【v213 大厂架构 — 刀战模式净化豁免兜底】
+	//   业务背景: 玩家在 Melee Mode 根本没选主武器 (UI 净化已清空), FinalWeaponID 是空
+	//     → 旧版兜底会用 DT_WeaponInfo 第 1 行 (很可能是 BQ001 AK47) 兜底 → 玩家拿到主武器, 违反 Melee 模式
+	//   净化策略: Melee Mode 下跳过主武器兜底, FinalWeaponID 留空 → Server_SpawnAllWeapons 收 nullptr → 跳过 Primary 槽位 ✓
+	//   不破坏生化模式: 非 Melee 模式 0 行为变更
 	if (FinalWeaponID.IsEmpty())
 	{
-		const FString DefaultPrimaryID = ResolveDefaultWeaponRowName(0);
-		if (DefaultPrimaryID.IsEmpty())
+		bool bSkipFallbackForMelee = false;
+		if (UWorld* World = GetWorld())
 		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[Spawn] HandlePlayerRequestSpawn: 主武器 WeaponID 为空 + DT_WeaponInfo 第 1 行兜底失败 (Player=%s). 拒绝 Spawn. "
-				     "【v209 修复】1) DT_WeaponInfo 至少配 1 行; 2) DT 第 1 行 WeaponBlueprint 必须配. "
-				     "参考: 打开 DT_WeaponInfo → Row[0]"),
-				*PlayerToSpawn->GetName());
-			return;
+			if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+			{
+				bSkipFallbackForMelee = (GS->CurrentMatchMode == ERoomMatchMode::Melee);
+			}
 		}
-		FinalWeaponID = DefaultPrimaryID;
-		UE_LOG(LogTemp, Warning,
-			TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 未选主武器, 业务兜底使用 DT_WeaponInfo 第 1 行='%s'."),
-			*PlayerToSpawn->GetName(), *FinalWeaponID);
+
+		if (bSkipFallbackForMelee)
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 【v213 大厂架构】刀战模式 — 玩家 '%s' 未选主武器, "
+				     "跳过 DT_WeaponInfo 第 1 行兜底 (避免污染刀战模式). FinalWeaponID 留空 → Server_SpawnAllWeapons 跳过 Primary 槽位."),
+				*PlayerToSpawn->GetName());
+			// 不设 FinalWeaponID, 让它留空
+		}
+		else
+		{
+			const FString DefaultPrimaryID = ResolveDefaultWeaponRowName(0);
+			if (DefaultPrimaryID.IsEmpty())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] HandlePlayerRequestSpawn: 主武器 WeaponID 为空 + DT_WeaponInfo 第 1 行兜底失败 (Player=%s). 拒绝 Spawn. "
+					     "【v209 修复】1) DT_WeaponInfo 至少配 1 行; 2) DT 第 1 行 WeaponBlueprint 必须配. "
+					     "参考: 打开 DT_WeaponInfo → Row[0]"),
+					*PlayerToSpawn->GetName());
+				return;
+			}
+			FinalWeaponID = DefaultPrimaryID;
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 未选主武器, 业务兜底使用 DT_WeaponInfo 第 1 行='%s'."),
+				*PlayerToSpawn->GetName(), *FinalWeaponID);
+		}
 	}
 
 	// 【v212 大厂架构修复 — 近战武器兜底读 FRoomLoadoutDefaults 单一真理源】
@@ -3045,8 +3353,32 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 				MeleeClass = ResolveWeaponClassFromID(FinalMeleeWeaponID);
 			}
 
-			// 零兜底 (v52): 主武器必须有, 副/近战可空
-			if (!PrimaryClass)
+			// 【v213+ 大厂架构修复 — 刀战模式条件豁免】
+			//
+			// 旧版 (v52) bug:
+			//   - 主武器必须有, 否则 return 拒绝 Spawn
+			//   - 但 v213 净化在 Melee Mode 把 Primary 清空 → PrimaryClass = nullptr
+			//   - Pawn 已经在 line 3099 SpawnActor 出来了 → return 后 Pawn 仍存在但无武器
+			//   - 玩家看到"角色是 a 型 (BP_SWAT_C)"但手里啥也没有, 而 Melee 武器也没 Spawn
+			//
+			// 大厂原则 - 业务规则优先于零兜底:
+			//   - Melee Mode 业务规则: 不允许有 Primary 武器 (业务层面硬约束)
+			//   - 在 Melee Mode 下, PrimaryClass = nullptr 是预期状态, 不应当 return
+			//   - 仅当 Mode != Melee + PrimaryClass == nullptr → 配置错, return 拒绝
+			//
+			// 不破坏生化模式: Zombie Mode + PrimaryClass == nullptr 仍然 return (兜底保护)
+			//
+			// 进一步 (v213+): Primary 留空但不阻拦, 让 Melee 武器正常 Spawn, 玩家进游戏后只拿 Melee ✓
+			bool bAllowPrimaryEmpty = false;
+			if (UWorld* WorldForCheck = GetWorld())
+			{
+				if (ARoomGameState* GSCheck = WorldForCheck->GetGameState<ARoomGameState>())
+				{
+					bAllowPrimaryEmpty = (GSCheck->CurrentMatchMode == ERoomMatchMode::Melee);
+				}
+			}
+
+			if (!PrimaryClass && !bAllowPrimaryEmpty)
 			{
 				UE_LOG(LogTemp, Error,
 					TEXT("[Spawn] HandlePlayerRequestSpawn: 玩家 '%s' 的 FinalWeaponID='%s' 无法反查为 WeaponClass. "
@@ -3055,6 +3387,16 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 					     "2) DT_WeaponInfo 里有 RowName='%s' 的行"),
 					*PlayerToSpawn->GetName(), *FinalWeaponID, *FinalWeaponID);
 				return;
+			}
+
+			if (!PrimaryClass && bAllowPrimaryEmpty)
+			{
+				// 【v213+ 刀战模式】PrimaryClass 故意为空, 这是业务规则, 不算配置错
+				//   只 Log Warning (非 Error) 让玩家知道 "刀战模式不带主武器, 正常"
+				UE_LOG(LogTemp, Display,
+					TEXT("[Spawn] HandlePlayerRequestSpawn: 【v213+ 大厂架构】刀战模式 — 玩家 '%s' FinalWeaponID 留空 (业务规则). "
+					     "PrimaryClass=nullptr 合法, Server_SpawnAllWeapons 跳过 Primary 槽位. Melee 武器正常 Spawn."),
+					*PlayerToSpawn->GetName());
 			}
 
 			UE_LOG(LogTemp, Log,
@@ -3197,6 +3539,159 @@ void URoomSpawnSubsystem::RestartPlayer(AController* NewPlayer)
 		TEXT("[Spawn] RestartPlayer: Controller=%s 无缓存. "
 		     "【v31.1 零兜底】拒绝调 Super::RestartPlayer (会随机挑 PlayerStart)."),
 		*NewPlayer->GetName());
+}
+
+// ==========================================
+// 【v213 大厂架构 — 刀战模式 Loadout 净化工具函数实现】单一真理源 + DRY
+// ==========================================
+//
+// 【业务背景】用户 2026.08.09 反馈: 刀战模式进游戏仍拿了主武器
+//
+// 【设计决策】3 个静态函数, 不需要 Subsystem 实例状态 (纯函数)
+//   - PurifyLoadoutForMeleeMode: 玩家路径 (3 RowName 同时净化)
+//   - PurifyAIWeaponForMeleeMode: AI 路径 (单 WeaponID, 按 MeshType 识别)
+//   - ShouldPurifyForMeleeMode: UI 路径 (返回 bool, 让 UI 决定要不要清空 TempSelectedWeaponsByType)
+//
+// 【零兜底约束】
+//   - GameState::CurrentMatchMode == None → 默认放行 (与 v50 RequestRespawn 行为一致)
+//     (None 永远不会在生产环境出现, 出现 = GameState 配置错, 让上层 Spawn 链路报错)
+//   - DT_WeaponInfo 查不到 RowName → 视为"非 Melee", AI 路径下清空 (保持零兜底)
+// ==========================================
+
+void URoomSpawnSubsystem::PurifyLoadoutForMeleeMode(
+	ERoomMatchMode Mode,
+	FString& PrimaryRowName,
+	FString& SecondaryRowName,
+	FString& MeleeRowName)
+{
+	// 0. 单一真理源检查 — 非 Melee 模式 0 行为变更 (不破坏生化模式)
+	if (Mode != ERoomMatchMode::Melee)
+	{
+		return;
+	}
+
+	// 1. Melee 模式: Primary/Secondary 必须清空, Melee 保留
+	//
+	// 大厂原则 (零兜底):
+	//   - 玩家存档可能有 Primary = BQ001 (AK47), 必须显式清掉
+	//   - 玩家 UI 选了 Secondary 也必须清掉
+	//   - 业务默认 Melee (JZ001) 仍走 v212 HandlePlayerRequestSpawn 兜底逻辑
+	//     (本函数只负责净化上层输入, 不替代 Spawn 兜底)
+	//
+	// 大厂原则 (集中调度):
+	//   - 不写 5 份 if/else 重复代码, 全部走这一个函数
+	//   - 输出 Log 让玩家知道"主/副武器为什么没了"
+	const bool bHasPrimary = !PrimaryRowName.IsEmpty();
+	const bool bHasSecondary = !SecondaryRowName.IsEmpty();
+
+	if (bHasPrimary || bHasSecondary)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[Spawn] 【v213】刀战模式 Loadout 净化: 清空 Primary/Secondary. "
+			     "原 Primary='%s' Secondary='%s' → 净化后 Primary='' Secondary='' Melee='%s' (保留). "
+			     "【业务规则】刀战模式只能拿近战武器, 主/副武器强制不加载."),
+			*PrimaryRowName, *SecondaryRowName, *MeleeRowName);
+	}
+
+	PrimaryRowName.Empty();
+	SecondaryRowName.Empty();
+	// MeleeRowName 永远保留 (玩家选择 + 业务默认 JZ001 兜底)
+}
+
+bool URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode(
+	ERoomMatchMode Mode,
+	FString& InOutAIWeaponID,
+	FString& OutMeleeDefaultID)
+{
+	OutMeleeDefaultID.Empty();
+
+	// 0. 单一真理源检查 — 非 Melee 模式不净化
+	if (Mode != ERoomMatchMode::Melee)
+	{
+		return false;
+	}
+
+	// 1. Melee 模式: AI 必须只拿 Melee 武器
+	//
+	// 业务背景 (用户 2026.08.09):
+	//   "AI 强制只拿 Melee 武器" — 即使 AI Profile 配了 Primary/Secondary, 刀战模式也强制覆盖
+	//
+	// 净化策略:
+	//   - InOutAIWeaponID 为空 → 默认放过 (Spawn 路径会用 ConfigSO 兜底, 决策权给上游)
+	//   - InOutAIWeaponID 查 DT_WeaponInfo, 读 MeshType
+	//     - Melee → 保留 (已经合法)
+	//     - Primary / Secondary → 清空 + 输出业务默认 Melee (JZ001)
+	//     - 查不到 (DT 配置错) → 清空 (零兜底)
+	//
+	// 返回值含义:
+	//   - true = 有净化动作 (原值被清空), 上游应使用 OutMeleeDefaultID 作为 Melee 武器
+	//   - false = 无需净化 (已经合法 / 非 Melee 模式)
+	if (InOutAIWeaponID.IsEmpty())
+	{
+		return false;
+	}
+
+	UWorld* World = nullptr;
+	if (GEngine && GEngine->GetWorldContexts().Num() > 0)
+	{
+		World = GEngine->GetWorldContexts()[0].World();
+	}
+
+	UDataTable* WeaponDT = nullptr;
+	if (World)
+	{
+		if (ARoomGameMode* GM = World->GetAuthGameMode<ARoomGameMode>())
+		{
+			WeaponDT = GM->WeaponDataTable;
+		}
+	}
+
+	// 查不到 WeaponDT → 清空 (零兜底, 强制修复配置)
+	if (!WeaponDT)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v213】PurifyAIWeaponForMeleeMode: GM->WeaponDataTable 为空. "
+			     "【零兜底】无法识别 AI WeaponID='%s' 是否是 Melee 类型, 强制清空. "
+			     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → WeaponDataTable 必须配 DT_WeaponInfo."),
+			*InOutAIWeaponID);
+		InOutAIWeaponID.Empty();
+		OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
+		return true;
+	}
+
+	static const FString Ctx(TEXT("URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode"));
+	FWeaponInfo* Row = WeaponDT->FindRow<FWeaponInfo>(FName(*InOutAIWeaponID), Ctx);
+	if (!Row)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v213】PurifyAIWeaponForMeleeMode: DT_WeaponInfo 找不到 RowName='%s'. "
+			     "【零兜底】无法识别武器类型, 清空 (Melee 模式不允许非 Melee). "
+			     "修复: 在 DT_WeaponInfo 添加 RowName='%s' 的行."),
+			*InOutAIWeaponID, *InOutAIWeaponID);
+		InOutAIWeaponID.Empty();
+		OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
+		return true;
+	}
+
+	// 检查 MeshType — 只有 Melee 合法
+	if (Row->MeshType == EWeaponMeshType::Melee)
+	{
+		return false; // 已经合法, 无需净化
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[Spawn] 【v213】刀战模式 AI WeaponID 净化: 原 WeaponID='%s' (MeshType=%d) 是非 Melee 类型, "
+		     "强制清空. AI 改拿业务默认 Melee='%s'."),
+		*InOutAIWeaponID, static_cast<int32>(Row->MeshType), *FRoomLoadoutDefaults::MeleeDefaultRowName);
+
+	InOutAIWeaponID.Empty();
+	OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
+	return true;
+}
+
+bool URoomSpawnSubsystem::ShouldPurifyForMeleeMode(ERoomMatchMode Mode)
+{
+	return Mode == ERoomMatchMode::Melee;
 }
 
 void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImmediateRespawn)
@@ -3367,9 +3862,33 @@ void URoomSpawnSubsystem::RequestRespawn(AController* DeadController, bool bImme
 
 		// 【v52 P0】3 把武器一起读 (主+副+近战), 完整恢复 Loadout
 		const FString CharID = Cached->CharID;
-		const FString PrimaryID = Cached->WeaponPrimaryID;
-		const FString SecondaryID = Cached->WeaponSecondaryID;
-		const FString MeleeID = Cached->WeaponMeleeID;
+		FString PrimaryID = Cached->WeaponPrimaryID;
+		FString SecondaryID = Cached->WeaponSecondaryID;
+		FString MeleeID = Cached->WeaponMeleeID;
+
+		// ============================================================
+		// 【v213 大厂架构 — 玩家复活链净化】链式防护
+		// ============================================================
+		//
+		// 业务背景: 玩家在 HandlePlayerRequestSpawn 时净化过, 但 PlayerSpawnDataCache
+		//   可能还存着净化前的 PrimaryID = "BQ001"
+		//   → 复活时直接传 PrimaryID 给 HandlePlayerRequestSpawn → 净化再次生效 ✓
+		//   → 但净化 Log 会重复打印 (一次开局, 一次复活), 调试体验差
+		//
+		// 修复: 复活链读缓存后立即净化一次, HandlePlayerRequestSpawn 内的净化变 no-op (0 Log)
+		//
+		// 大厂原则 (职责集中 + DRY):
+		//   - 净化逻辑只有一份 (PurifyLoadoutForMeleeMode)
+		//   - HandlePlayerRequestSpawn 净化是"入口净化" (单入口)
+		//   - RequestRespawn 净化是"缓存净化" (防止 cache 持有脏数据)
+		//   - 两处都调用同一个函数 = 零重复代码
+		if (UWorld* World = GetWorld())
+		{
+			if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+			{
+				PurifyLoadoutForMeleeMode(GS->CurrentMatchMode, PrimaryID, SecondaryID, MeleeID);
+			}
+		}
 
 		if (bImmediateRespawn)
 		{

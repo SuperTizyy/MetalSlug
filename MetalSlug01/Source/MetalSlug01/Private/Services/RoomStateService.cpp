@@ -21,6 +21,8 @@
 #include "Data/Faction/FactionTags.h"
 // 【2026.07.11 v28】FPendingAIEntry (AI 占位数据)
 #include "Systems/AI/AIBehaviorTypes.h"
+// 【v218 大厂架构新增】ABaseCharacter 完整类型 (Pawn->FactionTag fallback 需要)
+#include "Characters/BaseCharacter.h"
 
 // 【v215 大厂架构新增】World 生命周期订阅 — 用于在 PIE 多次加载/卸载时正确订阅事件
 #include "Engine/Engine.h"
@@ -205,16 +207,95 @@ TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshotsInternal(FGameplay
         // 大厂原则 — 数据驱动: 不维护账本 (容易漂移), 直接 GetAllActorsOfClass
         //   - 极端 case: 关卡预放 AI 也包括在内 (它们的 AIC 也是 ABaseAIController 派生)
         //   - 战斗死亡时 AIC 不被销毁 (v116 修复), 仍可读到
+        //
+        // 【v221.2 大厂架构诊断】添加 Display Log 让用户复测时能看到具体哪条 AI 被过滤
+        int32 AICScannedCount = 0;
+        int32 AICFilteredByFactionCount = 0;
+        int32 AICInvalidFactionCount = 0;
         for (TActorIterator<ABaseAIController> It(World); It; ++It)
         {
             ABaseAIController* AIController = *It;
             if (!AIController) continue;
+            AICScannedCount++;
+
+            // 【v218 + v221.1 + v221.2 大厂架构修复 — 客户端 AI 阵营过滤 fallback】
+            //   根因 (v218 之前):
+            //     - ABaseAIController::CachedFactionTag 非 Replicated (本机权威字段, 与 CachedAIPawnClass/CachedWeaponID 一致)
+            //     - 客户端 AIC.CachedFactionTag 永为空 (EmptyTag)
+            //     → 客户端 GetFactionSnapshotsWithAI 把所有 AI 过滤掉 (line 209 continue)
+            //     → 用户报告: "客户端游戏内 Scoreboard 不显示 AI 信息, 而监听服务器能看到"
+            //
+            //   修复 (v218):
+            //     - CachedFactionTag 为空时 fallback 到 Pawn->FactionTag (ABaseCharacter::FactionTag 是 Replicated, 客户端可见)
+            //     - Pawn 也为空 → 跳过 (与 AIC.CachedFactionTag == FactionTag 一致语义: 没法判定就排除)
+            //
+            //   二次修复 (v221.1):
+            //     - ABaseAIController::CachedFactionTag 升级为 Replicated (单一真理源, 客户端可读)
+            //     - v218 的 Pawn->FactionTag fallback 链路依赖 Pawn 实例 + FactionTag 字段两个同步时序
+            //       任何一个时序窗口失败 → 仍会 continue 跳过 AI (用户报告 "Tab 不显示 AI")
+            //     - 升级后 AIC->CachedFactionTag 直接同步, 不依赖 Pawn
+            //     - Pawn->FactionTag 保留作为次级 fallback (双 Replicated 保障, 万一 CachedFactionTag 同步比 AIC 还晚)
+            //
+            //   三次修复 (v221.2 大厂架构):
+            //     - 客户端 OnPossess 时如果 AIC.CachedFactionTag 仍空, 用 Pawn.FactionTag 反向补 AIC.CachedFactionTag
+            //     - 服务器 SetCachedFactionTag 加 ForceNetUpdate 加速同步
+            //     - 0 兜底: 任何路径失败 → Log Warning 暴露, 不静默
+            //
+            //   大厂原则 — 零兜底:
+            //     - 所有 fallback 都失败 → 不静默返回默认值 (会让客户端看到"未知阵营"AI, 业务错乱)
+            //     - 显式 continue + Log Warning, 强制配置正确 (虽然升级后这个 case 几乎不会发生)
+            // ============================================================
+            FGameplayTag ResolvedFactionTag = AIController->CachedFactionTag;
+
+            // v221.1: Pawn->FactionTag fallback (次级, 仅在 CachedFactionTag 仍为空时启用)
+            //   - 升级 CachedFactionTag 为 Replicated 后, 主路径已能用
+            //   - 但保留次级 fallback 应对 CachedFactionTag 复制极晚于 AIC 实例的极端 case
+            if (!FFactionTags::IsValidFaction(ResolvedFactionTag))
+            {
+                if (const ABaseCharacter* AIOwnedPawn = Cast<ABaseCharacter>(AIController->GetPawn()))
+                {
+                    if (FFactionTags::IsValidFaction(AIOwnedPawn->FactionTag))
+                    {
+                        ResolvedFactionTag = AIOwnedPawn->FactionTag;
+                    }
+                }
+            }
 
             // 阵营过滤: 只返回当前 FactionTag 的 AI
-            if (AIController->CachedFactionTag != FactionTag) continue;
+            //   - 用 IsValidFaction 守卫 (ResolvedFactionTag 仍可能为空 — 极罕见 case)
+            //   - v221.1 双 Replicated 保障后, fallback 链几乎不会失败
+            if (!FFactionTags::IsValidFaction(ResolvedFactionTag))
+            {
+                AICInvalidFactionCount++;
+                UE_LOG(LogTemp, Warning,
+                    TEXT("[RoomStateService] 【v221.2】GetFactionSnapshotsInternal: AI '%s' 阵营无法判定 (CachedFactionTag+Pawn->FactionTag 都无效), "
+                         "跳过本条. 【零兜底】如持续出现, 检查 (1) 服务器 SetCachedFactionTag 时序 (2) AIC.bReplicates=true "
+                         "(3) 服务器 ForceNetUpdate 是否成功 (4) 客户端 OnPossess 时 Pawn.FactionTag 是否已复制."),
+                    *AIController->GetName());
+                continue;
+            }
+            if (ResolvedFactionTag != FactionTag)
+            {
+                AICFilteredByFactionCount++;
+                continue;
+            }
 
             Result.Add(BuildAISnapshotFromController(AIController));
         }
+
+        // 【v221.2 大厂架构诊断】让用户复测时能看到完整的 AI 扫描统计
+        //   - 已扫描: 客户端有几只 AIC 实例
+        //   - 阵营有效: CachedFactionTag + Pawn fallback 至少一个有效
+        //   - 阵营过滤: 属于其他阵营,被本函数过滤掉
+        //   - 阵营无效: 两侧都拿不到,被跳过 (b端问题)
+        //   - 最终 Result: 本 FactionTag 的 AI 数(应等于 阵营有效 - 阵营过滤)
+        UE_LOG(LogTemp, Display,
+            TEXT("[RoomStateService] 【v221.2】GetFactionSnapshotsInternal: FactionTag='%s' 扫描统计: "
+                 "AIC总数=%d, 阵营有效=%d, 阵营过滤=%d, 阵营无效=%d, 加入Result=%d."),
+            *FactionTag.ToString(),
+            AICScannedCount, AICScannedCount - AICInvalidFactionCount - AICFilteredByFactionCount,
+            AICFilteredByFactionCount, AICInvalidFactionCount,
+            Result.Num());
     }
 
     return Result;
@@ -233,7 +314,17 @@ TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshotsInternal(FGameplay
  */
 TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshotsWithAI(FGameplayTag FactionTag) const
 {
-    return GetFactionSnapshotsInternal(FactionTag, /*bIncludeAI=*/true);
+	return GetFactionSnapshotsInternal(FactionTag, /*bIncludeAI=*/true);
+}
+
+/**
+ * 【v223.0 大厂架构新增】只返回真人玩家 (无 AI 混合)
+ * 内部委托 GetFactionSnapshotsInternal(FactionTag, false)
+ * 0 兜底: GameState 拿不到 → Log Error + 返回空 (与 GetFactionSnapshotsWithAI 一致)
+ */
+TArray<FPlayerSnapshot> URoomStateService::GetFactionSnapshots(FGameplayTag FactionTag) const
+{
+	return GetFactionSnapshotsInternal(FactionTag, /*bIncludeAI=*/false);
 }
 
 
@@ -316,8 +407,41 @@ FPlayerSnapshot URoomStateService::BuildAISnapshotFromController(ABaseAIControll
     //     - CreateEntryWidgetFromSnapshot 不再拼接前缀 (避免双前缀)
     //     - 比较 Entry->GetPlayerName() == Snapshot.PlayerName 永远命中
     //     - 大厂原则 — 单一真理源: "[AI] " 前缀只在 BuildAISnapshot 一处拼, 不在 UI 层重复
+    //
+    // 【v218 大厂架构修复】FactionTag 单一真理源改为 Pawn->FactionTag (Replicated)
+    //   历史: Snap.FactionTag = AIController->CachedFactionTag (本机权威, 客户端永为空)
+    //     → 客户端 Snap.FactionTag 为空 → UI 显示空白阵营标签
+    //   新 (v218): Pawn->FactionTag 是 Replicated, 客户端可见 → 单一真理源
+    //   - AIC.CachedFactionTag 仍保留, 仅用于服务器端 Spawn 流程 + GameState 阵营判定
+    //   - 客户端读取场景一律走 Pawn->FactionTag (镜像 RoomStateService::GetFactionSnapshotsInternal 的 v218 fallback)
     Snap.PlayerName          = FString::Printf(TEXT("[AI] %s"), *AIController->GetName()); // 大厂原则: 显示名 = AIC Name (Server authoritative) + AI 前缀
-    Snap.FactionTag          = AIController->CachedFactionTag; // 单一真理源: AIC 阵营缓存
+
+    // 【v221.1 大厂架构重构 — FactionTag 真理源升级】
+    //   历史 (v218): 用 Pawn->FactionTag 作为真理源 (Pawn 已复制 → FactionTag 字段已复制)
+    //     → 但依赖 Pawn 实例 + FactionTag 字段两个同步时序, 任一失败 → FactionTag 空
+    //   新 (v221.1): 优先用 AIC.CachedFactionTag (v221.1 升级为 Replicated, 不依赖 Pawn)
+    //     → 升级后 AIC 实例同步过来时 CachedFactionTag 已就绪, 任何时序都能拿到
+    //     → Pawn->FactionTag 作为次级 fallback (Pawn 销毁/未复制时的兜底)
+    //
+    // 不破坏既有业务:
+    //   - AIC->CachedFactionTag 是 Pawn->FactionTag 的运行时段缓存 (v25-v26 大厂原则)
+    //   - 两者在 Spawn 路径上一致写入, 客户端读到的是同一个值
+    if (FFactionTags::IsValidFaction(AIController->CachedFactionTag))
+    {
+        Snap.FactionTag = AIController->CachedFactionTag; // v221.1: 主路径, 永远可用
+    }
+    else if (const ABaseCharacter* AIOwnedPawn = Cast<ABaseCharacter>(AIController->GetPawn()))
+    {
+        Snap.FactionTag = AIOwnedPawn->FactionTag; // 次级 fallback, 镜像 GetFactionSnapshotsInternal 的 v221.1 fallback 链
+    }
+    else
+    {
+        // 0 兜底: 两者都为空 → 不设默认值 (返回空 FactionTag, 调用方 RefreshScoreboard 会 Log Error)
+        UE_LOG(LogTemp, Warning,
+            TEXT("[RoomStateService] 【v221.1】BuildAISnapshotFromController: AIC '%s' CachedFactionTag 与 Pawn->FactionTag 都无效, "
+                 "Snap.FactionTag 留空. 【零兜底】如持续出现, 检查 AIC 网络复制与 Spawn 链路."),
+            *AIController->GetName());
+    }
     Snap.bIsReady            = false;
     Snap.bIsHost             = false;
     Snap.SequenceID          = 0;

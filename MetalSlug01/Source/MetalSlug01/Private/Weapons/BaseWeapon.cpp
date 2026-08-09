@@ -267,41 +267,37 @@ void ABaseWeapon::BeginPlay()
 	//   - 这是"装饰 Actor"的标准做法 (与 Projectile Actor 相反 — 子弹需要物理碰撞)
 	SetActorEnableCollision(false);
 
-	// 【v200.2.18 大厂架构 P0 — RootComponent 兜底修复 (防御式 + 零兜底)】
-	//   根因: C++ 构造函数没设 RootComponent (武器可能是 StaticMesh 或 SkeletalMesh, 类型未知)
-	//         完全依赖 BP 蓝图配置 → BP 配错 → RootComponent=null 或不是 PrimitiveComponent
-	//         → UE 物理同步、Attach、Movement Replication 全失败 → 客户端悬空
-	//   大厂原则 (单一真理源 — RootComponent 必须能物理模拟):
-	//     - RootComponent 必须是 USceneComponent 派生, 且能挂物理 Body (PrimitiveComponent)
-	//     - 否则 ReplicateMovement/AttachToComponent/物理模拟 全部失效
-	//   修复策略:
-	//     1. BeginPlay 入口立即检查 RootComponent
-	//     2. 如果 RootComponent 是 nullptr 或不是 PrimitiveComponent, 立即用第一个 MeshComponent 当 Root
-	//     3. 找不到 MeshComponent → Log Error (零兜底, 不允许"没 RootComponent 也继续")
-	//     4. 修复成功 → Log Warning (告诉开发者 BP 应该手动设, 这是兜底)
+	// 【v220.1 大厂架构 P0 — 移除 RootComponent 兜底 (零兜底原则)】
+	//   v200.2.18 错误:
+	//     - 之前在 BeginPlay 中检测到 RootComponent 为空/类型不对时, 主动 SetRootComponent(WeaponMesh)
+	//     - 这在客户端触发 StaticMesh/SkeletalMesh 资产的同步加载 (DDC 同步 await)
+	//     - 现象: 客户端进游戏 → SetRootComponent 触发 → 3.7s+ 卡死 (LogStaticMesh: Waiting on ...)
+	//     - 与用户 2026.08.09 反馈"客户端进游戏又卡死了"直接相关
+	//   v220.1 修复 (P0 大厂架构 — 零兜底):
+	//     - 1. 不再 SetRootComponent (兜底自动修复 = 静默同步加载 = 卡死)
+	//     - 2. 检测到 RootComponent 错配 → Log Error + 继续 (不改变组件结构)
+	//     - 3. 强制要求开发者在 BP 中配置 RootComponent (零兜底 = 错误必须显式)
+	//     - 4. 客户端不会触发放任性的同步加载 → 渲染线程/资产线程正常异步加载
+	//
+	//   大厂原则 — 零兜底:
+	//     - "Hard Restore On Error" 看似用户友好, 实际是隐藏的同步阻塞
+	//     - 错误必须显式化: Log Error + 强制修复 BP, 而不是"自动修复" (用户根本不知道)
+	//     - 零兜底 = 错误可视化 + 强制开发者修复
 	USceneComponent* CurrentRoot = GetRootComponent();
 	if (!CurrentRoot || !CurrentRoot->IsA<UPrimitiveComponent>())
 	{
-		// 尝试用主武器 Mesh 作为 Root
-		if (UMeshComponent* WeaponMesh = GetMeshComponent())
-		{
-			SetRootComponent(WeaponMesh);
-			UE_LOG(LogTemp, Warning,
-				TEXT("[v200.2.18] ABaseWeapon::BeginPlay: RootComponent 兜底修复 — Weapon=%s 之前 RootComponent=%s (类型不对/为空), "
-				     "已自动用 MeshComponent=%s 作为 RootComponent. "
-				     "【最佳实践】在 BP 蓝图手动设 Mesh 为 RootComponent (避免每次启动都走兜底)."),
-				*GetName(),
-				CurrentRoot ? *CurrentRoot->GetName() : TEXT("nullptr"),
-				*WeaponMesh->GetName());
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("[v200.2.18] ABaseWeapon::BeginPlay: RootComponent 兜底失败 — Weapon=%s 没 RootComponent 且没 MeshComponent. "
-				     "物理同步、Attach、Movement Replication 全部失效. "
-				     "【零兜底】必须修复 BP 蓝图: 添加 StaticMeshComponent 或 SkeletalMeshComponent 子对象, 设为 RootComponent."),
-				*GetName());
-		}
+		// 零兜底: 检测到 RootComponent 错配 → Log Error + 拒绝继续 (不修改组件结构)
+		// 强制要求开发者在 BP 蓝图手动设 Mesh 为 RootComponent
+		UE_LOG(LogTemp, Error,
+			TEXT("[v220.1] ABaseWeapon::BeginPlay: RootComponent 错配 — Weapon=%s 当前 RootComponent=%s (类型不对/为空). "
+			     "【零兜底】v220.1 已移除 SetRootComponent 兜底 (.presentate 引发客户端同步加载卡死). "
+			     "【修复方法】在 BP_%s 的 Components 面板手动设 MeshComponent 为 RootComponent. "
+			     "【客户端表现】actor 物理同步/Attach/Movement Replication 可能异常, 但不会卡死主线程."),
+			*GetName(),
+			CurrentRoot ? *CurrentRoot->GetName() : TEXT("nullptr"),
+			*GetClass()->GetName());
+		// ⚠️ 不调 SetRootComponent — 避免 3.7s+ 同步加载卡死
+		// ⚠️ 不 return — 继续播放游戏, 让客户端异步加载资源 (UE 5.6 内部异步加载)
 	}
 
 	// 双保险: 单独对 Mesh 组件设 ECollisionEnabled::NoCollision

@@ -437,6 +437,13 @@ void UGameHUDWidget::TryBindToGameState()
 			// 【v201 大厂架构新增】绑定事件: 短暂显示小局结果（不进入结算页面）
 			RoomGS->OnZombieRoundBriefResult.AddDynamic(this, &UGameHUDWidget::OnShowZombieRoundBriefResult);
 
+			// 【v218 大厂架构新增】绑定事件: 刀战本局赢家更新 → 显示 Text_GameOver
+			//   - 镜像 OnZombieRoundBriefResult 订阅位置 (紧邻, 业务对称)
+			//   - 触发路径: FinishMeleeMatch → SetMeleeWinner → OnRep_MeleeWinner → 本回调
+			//   - 刀战模式唯一显示 Text_GameOver 的入口 (业务分离)
+			//   - 生化模式永远不触发 (MeleeWinner=Default None)
+			RoomGS->OnMeleeWinnerUpdated.AddDynamic(this, &UGameHUDWidget::OnMeleeWinnerUpdated);
+
 			// 绑定事件: 显示最终胜负（延迟 3 秒后触发）
 			RoomGS->OnShowFinalSettlement.AddDynamic(this, &UGameHUDWidget::OnShowFinalSettlement);
 
@@ -663,6 +670,87 @@ void UGameHUDWidget::OnZombieRoundSoundReceived(EZombieRoundWinner InRoundWinner
 	//   - 不在这里重复播放, 避免双声道叠加
 }
 
+/**
+ * 【v218 大厂架构新增】OnMeleeWinnerUpdated — 刀战本局赢家更新回调
+ *
+ * 触发链路:
+ *   - Text_RoundCountdown 倒计时归零 → URoomLifecycleSubsystem::HandleMatchTimeOut
+ *   - → URoomLifecycleSubsystem::FinishMeleeMatch (新)
+ *   - → ARoomGameState::SetMeleeWinner(NewWinner) → 写 Replicated 字段 + 服务器手动 Broadcast
+ *   - → ARoomGameState::MulticastEnterSettlement (复用 RPC, 推击杀数)
+ *   - → 客户端 OnRep_MeleeWinner 触发 Broadcast OnMeleeWinnerUpdated
+ *   - → 本回调触发 (UI 层订阅 OnMeleeWinnerUpdated)
+ *
+ * 业务职责:
+ *   - 显示 Text_GameOver: "攻方胜利" / "守方胜利" / "平局"
+ *   - 镜像 OnEnterSettlement 的 Text_GameOver 处理, 但语义更清晰 (用 EMeleeWinner)
+ *   - 3 秒后 ScheduleFinalSettlement 切图到 L_Login 结算页 (走 ScheduleFinalSettlement 路径)
+ *
+ * 大厂原则 — 单一真理源 + 镜像 OnZombieRoundSoundReceived:
+ *   - 本回调只负责业务 (Text_GameOver 显示), 不读 GameState (数据已通过参数传入)
+ *   - UI 显示委托 Text_GameOver (BindWidgetOptional, 旧 v200.2 已存在)
+ *   - 不动 MulticastEnterSettlement 链路, 避免重复架构
+ *
+ * 不破坏生化模式:
+ *   - 生化模式 MeleeWinner 永远 None, 本回调永不触发
+ *   - 生化胜负文本走 OnEnterSettlement / OnShowZombieRoundBriefResult (业务分离)
+ *
+ * 不破坏旧 v200.2 刀战行为:
+ *   - 旧版 Text_GameOver 在 OnEnterSettlement 里 Collapsed (Melee 模式)
+ *   - 新版在 OnMeleeWinnerUpdated 里显示 (Melee 模式专属) — OnEnterSettlement 不再覆盖
+ */
+void UGameHUDWidget::OnMeleeWinnerUpdated(EMeleeWinner NewWinner)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[GameHUDWidget] 【v218】OnMeleeWinnerUpdated: 刀战本局赢家同步! MeleeWinner=%d"),
+		static_cast<int32>(NewWinner));
+
+	// 0 兜底 — None 拒绝显示 (防止 UI 显示空文本)
+	if (NewWinner == EMeleeWinner::None)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GameHUDWidget] OnMeleeWinnerUpdated: NewWinner=None 拒绝显示. "
+			     "【修复】调用方必须传 Attacker/Defender/Draw, 不允许传 None."));
+		return;
+	}
+
+	if (!Text_GameOver)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[GameHUDWidget] OnMeleeWinnerUpdated: Text_GameOver 未绑定, 无法显示刀战胜负. "
+			     "【修复】检查 WBP_GameHUDWidget 是否包含同名 Text_GameOver 控件."));
+		return;
+	}
+
+	// 大厂原则 — 单一映射表: 不在 UI 层做 if/else, 用 switch 显式映射所有枚举值
+	FString WinnerText;
+	switch (NewWinner)
+	{
+	case EMeleeWinner::Attacker:
+		WinnerText = TEXT("攻方胜利");
+		break;
+	case EMeleeWinner::Defender:
+		WinnerText = TEXT("守方胜利");
+		break;
+	case EMeleeWinner::Draw:
+		WinnerText = TEXT("平局");
+		break;
+	default:
+		// 0 兜底 — 这里实际走不到 (上面 None 已 return), 但保留作为防御
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] OnMeleeWinnerUpdated: 未识别的 MeleeWinner=%d. "
+			     "【修复】检查 RoomEnums.h::EMeleeWinner 枚举, 是否新增了值但本函数未更新."),
+			static_cast<int32>(NewWinner));
+		return;
+	}
+
+	Text_GameOver->SetText(FText::FromString(WinnerText));
+	Text_GameOver->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+	// 3 秒后 ScheduleFinalSettlement 触发 BroadcastFinalSettlement 切图, Text_GameOver 随 GameHUDWidget 销毁而消失
+	// 不需要手动 SetTimer 隐藏, 镜像 OnShowZombieRoundBriefResult 的 SetTimer (这里不需要, 因为 3s 后切图)
+}
+
 /** 根据游戏模式切换 Text_RemainingRounds 的可见性 */
 void UGameHUDWidget::OnMatchModeChangedForHUD(ERoomMatchMode NewMode)
 {
@@ -820,7 +908,9 @@ void UGameHUDWidget::ActivateChatInput()
 /** 显示计分板 */
 void UGameHUDWidget::ShowScoreboard()
 {
-	UE_LOG(LogTemp, Log, TEXT("[GameHUDWidget] ShowScoreboard: Widget_Scoreboard=%s"), *GetNameSafe(Widget_Scoreboard));
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] 【v221.2】ShowScoreboard: Widget_Scoreboard=%s, 即将刷新 (Tab 按键/Hold 状态)."),
+		*GetNameSafe(Widget_Scoreboard));
 	if (Widget_Scoreboard)
 	{
 		Widget_Scoreboard->SetVisibility(ESlateVisibility::Visible);
@@ -831,6 +921,9 @@ void UGameHUDWidget::ShowScoreboard()
 /** 隐藏计分板 */
 void UGameHUDWidget::HideScoreboard()
 {
+	UE_LOG(LogTemp, Display,
+		TEXT("[GameHUDWidget] 【v221.2】HideScoreboard: Widget_Scoreboard=%s, Tab 按键释放."),
+		*GetNameSafe(Widget_Scoreboard));
 	if (Widget_Scoreboard)
 	{
 		Widget_Scoreboard->SetVisibility(ESlateVisibility::Hidden);
@@ -1021,7 +1114,6 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills,
 	if (Text_GameOver)
 	{
 		// 生化模式: 显示"人类胜利" / "幽灵胜利" / "平局"
-		// 刀战模式: 暂不显示
 		if (CachedMatchMode == ERoomMatchMode::Zombie)
 		{
 			FString WinnerText;
@@ -1040,9 +1132,46 @@ void UGameHUDWidget::OnEnterSettlement(int32 AttackerKills, int32 DefenderKills,
 			Text_GameOver->SetText(FText::FromString(WinnerText));
 			Text_GameOver->SetVisibility(ESlateVisibility::HitTestInvisible);
 		}
+		else if (CachedMatchMode == ERoomMatchMode::Melee)
+		{
+			// 【v218 大厂架构修复】刀战模式: 不在此处显示 Text_GameOver
+			//
+			// 大厂原则 — 单一入口 (零重复架构):
+			//   - 刀战 Text_GameOver 显示由 OnMeleeWinnerUpdated 触发的 EMeleeWinner (Attacker/Defender/Draw)
+			//   - OnEnterSettlement 的 RoundWinner 参数对刀战无意义 (走 EZombieRoundWinner::None 显式传)
+			//   - 旧 (v200.2): 在此处 Collapsed Text_GameOver → 会和 OnMeleeWinnerUpdated 抢显示 (顺序竞争)
+			//
+			// 不设置 Visibility — 让 OnMeleeWinnerUpdated 自由控制:
+			//   - 如果 MeleeWinner 复制比 MulticastEnterSettlement 先到 → OnMeleeWinnerUpdated 已显示
+			//   - 如果 MeleeWinner 复制后到 → OnMeleeWinnerUpdated 接着显示
+			//   - 如果 GameHUDWidget 初始化晚于 MeleeWinner 复制 → 需要额外的 RefreshCache 路径
+			//
+			// 大厂原则 — 零兜底: 不主动 Hide 也不主动 Show, 业务分离 (OnMeleeWinnerUpdated 负责显示)
+			UE_LOG(LogTemp, Log,
+				TEXT("[GameHUDWidget] 【v218】OnEnterSettlement (Melee): Text_GameOver 显示委托给 OnMeleeWinnerUpdated. "
+				     "MeleeWinner 复制抵达后客户端 UI 自动刷新."));
+
+			// 大厂原则 — 防御性兜底: 如果 MeleeWinner 已经在 GameState 复制抵达 (时序早于本回调),
+			//   兜底主动触发一次显示 (避免 OnMeleeWinnerUpdated 因某些极端时序未触发)
+			// 大厂原则 — 单一真理源: MeleeWinner 字段从 GameState 取 (服务器权威 Replicated 字段)
+			ARoomGameState* RoomGS = GetWorld() ? GetWorld()->GetGameState<ARoomGameState>() : nullptr;
+			if (RoomGS && RoomGS->MeleeWinner != EMeleeWinner::None)
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[GameHUDWidget] 【v218】OnEnterSettlement (Melee): 检测到 MeleeWinner=%d 已同步, 主动显示 Text_GameOver."),
+					static_cast<int32>(RoomGS->MeleeWinner));
+				OnMeleeWinnerUpdated(RoomGS->MeleeWinner);
+			}
+			else if (!RoomGS)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[GameHUDWidget] 【v218】OnEnterSettlement (Melee): RoomGS 为空, 跳过 MeleeWinner 检查. "
+					     "【修复】检查 GameHUDWidget 初始化时 GameState 是否已存在."));
+			}
+		}
 		else
 		{
-			// 刀战模式: 隐藏 Text_GameOver (旧 v200.2 行为)
+			// 未来其他模式: 暂不显示
 			Text_GameOver->SetVisibility(ESlateVisibility::Collapsed);
 		}
 	}

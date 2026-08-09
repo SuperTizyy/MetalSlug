@@ -46,10 +46,25 @@ ARoomPlayerState::ARoomPlayerState()
 	// 确保 PlayerState 开启网络同步
 	bReplicates = true;
 
-	SelectedCharacterID = TEXT("Default");
-	// 使用新的变量名，并初始化双武器
-	SelectedWeaponID1 = TEXT("Default");
-	SelectedWeaponID2 = TEXT("Default");
+	// 【v213+ 大厂架构修复 — 消除默认污染源】
+	//
+	// 旧版 (v23-v213) bug:
+	//   - SelectedWeaponID1/2 = TEXT("Default") 是 literal string, 不是 DT_WeaponInfo RowName
+	//   - 防御性写入 (v210 SetPlayerLoadout): 空串不覆盖 → "Default" 永远不会被净化清掉
+	//   - Spawn 阶段读 PS.SelectedWeaponID1 = "Default" → HandlePlayerRequestSpawn 收到污染值
+	//   - v213 净化把 "Default" 清空 → 但 PS 仍可能先读到 "Default" (时序问题)
+	//   - 大厂原则 - 真理源一致性: PS 默认值应当代表"没选", 而不是"用 'Default' 占位"
+	//
+	// v213+ 修复:
+	//   - 默认空串 TEXT(""), 代表"玩家没存档/没选"
+	//   - v210 防御性写入逻辑保留 — 空串不覆盖玩家已选 (与默认空不冲突)
+	//   - v213 净化在 HandlePlayerRequestSpawn 入口净化 "Default" 也不需要了 (PS 不再有 "Default")
+	//   - Spawn 兜底由 HandlePlayerRequestSpawn v209/v212 业务默认接管 (DT_WeaponInfo 第一行 + JZ001)
+	SelectedCharacterID = TEXT("");
+	// 使用新的变量名，并初始化双武器 (默认空, 玩家没存档 = 空)
+	SelectedWeaponID1 = TEXT("");
+	SelectedWeaponID2 = TEXT("");
+	SelectedWeaponID3 = TEXT(""); // 近战武器默认空, 由 InitializeTempSelectedWeaponsByDefault (UI) / HandlePlayerRequestSpawn v212 兜底
 }
 
 

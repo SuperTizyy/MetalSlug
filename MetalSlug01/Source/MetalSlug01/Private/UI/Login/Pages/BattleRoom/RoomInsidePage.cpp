@@ -340,15 +340,96 @@ void URoomInsidePage::NativeConstruct()
 				FString DefaultWeapon = TEXT("");
 				if (WeaponRows.Num() > 0) DefaultWeapon = WeaponRows[0].ToString();
 
-				// 为两个背包槽位设置默认主武器 (向后兼容旧存档结构: 2 个 BackpackSlot 各存 1 把)
-				for (int32 WSlot = 1; WSlot <= 2; WSlot++)
+				// ============================================================
+				// 【v213 大厂架构 — UI 层净化 (双层防护之一)】
+				// ============================================================
+				//
+				// 业务背景 (用户 2026.08.09 反馈):
+				//   "刀战模式专属逻辑：主武器和副武器进游戏不能加载，要为空，只能拿近战武器"
+				//   "现在进游戏还是拿了主武器"
+				//
+				// 根因 (Session1.txt):
+				//   Init BP1 主武器 -> 'BQ001'  ← 即便 Room 是刀战模式, 也强制写入 BQ001
+				//   因为 v52 Init 逻辑只 "如果空就写入默认值", 不会判断模式
+				//
+				// 净化策略 (UI 层双层防护):
+				//   - Init 阶段检测 GameState.CurrentMatchMode == Melee
+				//   - 如果是 Melee Mode → 强制清空 BP1/BP2 存档 (SaveLastSelectedWeapon 写空串)
+				//   - 清空后 SyncLoadoutToServer 读 GetLastSelectedWeapon 会拿到空
+				//   - Spawn 阶段 HandlePlayerRequestSpawn 再用 PurifyLoadoutForMeleeMode 二次净化 (链式防护)
+				//
+				// 大厂原则:
+				//   - 单点真理源: GameState.CurrentMatchMode
+				//   - DRY: 净化函数复用 Spawn 阶段同一份 PurifyLoadoutForMeleeMode
+				//   - 零兜底: 清空而不是"默认填 Melee 武器到 BP1" (避免污染主武器语义)
+				//   - 不破坏生化模式: GameState.CurrentMatchMode == Zombie 时, 不做任何净化
+				bool bIsMeleeMode = false;
+				if (UWorld* World = GetWorld())
 				{
-					FString SavedWeapon = AccountSub->GetLastSelectedWeapon(WSlot);
-					if (SavedWeapon.IsEmpty())
+					if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
 					{
-						AccountSub->SaveLastSelectedWeapon(WSlot, DefaultWeapon);
-						UE_LOG(LogTemp, Warning, TEXT("[Room] Init BP%d 主武器 -> '%s'"), WSlot, *DefaultWeapon);
+						bIsMeleeMode = (GS->CurrentMatchMode == ERoomMatchMode::Melee);
 					}
+				}
+
+				if (bIsMeleeMode)
+				{
+					// 刀战模式: 强制清空 BP1/BP2 存档, 不写入任何主武器
+					for (int32 WSlot = 1; WSlot <= 2; WSlot++)
+					{
+						const FString SavedWeapon = AccountSub->GetLastSelectedWeapon(WSlot);
+						if (!SavedWeapon.IsEmpty())
+						{
+							AccountSub->SaveLastSelectedWeapon(WSlot, TEXT(""));
+							UE_LOG(LogTemp, Warning,
+								TEXT("[Room] 【v213 大厂架构】刀战模式 UI 净化: 清空 BP%d 存档主武器 '%s' (Init 阶段)."),
+								WSlot, *SavedWeapon);
+						}
+					}
+				}
+				else
+				{
+					// 生化模式 / 其他: 保持原有 Init 逻辑 — 如果空就写入默认主武器
+					for (int32 WSlot = 1; WSlot <= 2; WSlot++)
+					{
+						FString SavedWeapon = AccountSub->GetLastSelectedWeapon(WSlot);
+						if (SavedWeapon.IsEmpty())
+						{
+							AccountSub->SaveLastSelectedWeapon(WSlot, DefaultWeapon);
+							UE_LOG(LogTemp, Warning, TEXT("[Room] Init BP%d 主武器 -> '%s'"), WSlot, *DefaultWeapon);
+						}
+					}
+				}
+
+				// ============================================================
+				// 【v213 大厂架构 — TempSelectedWeaponsByType 净化 (双层防护之二)】
+				// ============================================================
+				//
+				// 业务背景: 玩家进入房间后, 可能主动点过副武器 / 主武器 ComboBox 选过武器
+				//   (玩家手动选择会写入 TempSelectedWeaponsByType)
+				//   → 刀战模式下即便 BP 存档清空了, TempSelectedWeaponsByType 里仍可能有 Primary/Secondary
+				//
+				// 净化策略: 刀战模式下清空 TempSelectedWeaponsByType 的 Primary/Secondary key
+				//   - 保留 Melee key (玩家可能手动选过 Melee)
+				//   - 走 InitializeTempSelectedWeaponsByDefault 会预填 Melee (JZ001)
+				//
+				// 调用 InitializeTempSelectedWeaponsByDefault 之前先清空 (必须在它之前)
+				if (bIsMeleeMode)
+				{
+					int32 PurgeCount = 0;
+					if (TempSelectedWeaponsByType.Contains(EWeaponMeshType::Primary))
+					{
+						TempSelectedWeaponsByType.Remove(EWeaponMeshType::Primary);
+						PurgeCount++;
+					}
+					if (TempSelectedWeaponsByType.Contains(EWeaponMeshType::Secondary))
+					{
+						TempSelectedWeaponsByType.Remove(EWeaponMeshType::Secondary);
+						PurgeCount++;
+					}
+					UE_LOG(LogTemp, Warning,
+						TEXT("[Room] 【v213 大厂架构】刀战模式 UI 净化: 清空 TempSelectedWeaponsByType Primary/Secondary (清除 %d 个 key)."),
+						PurgeCount);
 				}
 
 				// 【v212 大厂架构修复 — Init 阶段默认填充 Secondary/Melee 临时选择 (业务默认 = JZ001)】
@@ -797,7 +878,10 @@ void URoomInsidePage::OnCharacterSelectionChanged(FString SelectedItem, ESelectI
 		if (UAccountService* AccSub = UAccountService::Get(this))
 		{
 			int32 SelectedIdx = ComboBox_CharacterSelect->GetSelectedIndex();
-			FString CurrentCharID = (SelectedIdx != INDEX_NONE) ? CachedCharacterIDs[SelectedIdx].ToString() : TEXT("Default");
+			// 【v213+ 大厂架构修复 — 消除默认污染源】
+			//   旧版: SelectedIdx == INDEX_NONE 时回退到 TEXT("Default") → 占位字符串污染存档
+			//   新版: 回退到空串 → 与 PS 默认值一致 → 不会污染下游 Spawn 链
+			FString CurrentCharID = (SelectedIdx != INDEX_NONE) ? CachedCharacterIDs[SelectedIdx].ToString() : TEXT("");
 			AccSub->SaveLastSelectedCharacter(CurrentCharID);
 		}
 	}
@@ -1220,16 +1304,9 @@ void URoomInsidePage::UpdateWeaponDisplayImage(EWeaponMeshType WeaponType)
 {
 	if (!WeaponDataTable) return;
 
-	// 选对应的 Image 控件 (大厂原则 — 职责对等)
-	UImage* TargetImage = nullptr;
-	switch (WeaponType)
-	{
-	case EWeaponMeshType::Primary:   TargetImage = Image_PrimaryWeaponIcon;   break;
-	case EWeaponMeshType::Secondary: TargetImage = Image_SecondaryWeaponIcon; break;
-	case EWeaponMeshType::Melee:     TargetImage = Image_MeleeWeaponIcon;     break;
-	default: return; // EWeaponMeshType::None — 跳过
-	}
-	if (!TargetImage) return;
+	// 选对应的 Image 控件 — 走 ResolveWeaponImage 单一入口 (大厂原则 — DRY)
+	UImage* TargetImage = ResolveWeaponImage(WeaponType);
+	if (!TargetImage) return; // ResolveWeaponImage 内部已 Log Error
 
 	// 1. 读取对应武器 ID
 	FString WeaponRowStr = TEXT("");
@@ -1294,12 +1371,181 @@ void URoomInsidePage::UpdateWeaponDisplayImage(EWeaponMeshType WeaponType)
  *
  * 【v52 P0】一次刷新 3 个 Image 控件 (主+副+近战)
  * 用途: 切背包 / 初始化时调用, 避免 3 次单独调
+ *
+ * 【v94 P0 刀战模式专属】改造为"模式感知":
+ *   - 入口处读取 GameState.CurrentMatchMode (单一真理源)
+ *   - Melee: 主/副 Image 灰底无图, 近战 Image 显示玩家选择 (用户 2026.08.09 明确: 8D8D8DFF)
+ *   - Zombie: 3 个 Image 全部走 UpdateWeaponDisplayImage (不破坏生化模式)
+ *   - None/未识别: Log Error + 清空 3 个 Image (零兜底)
+ *
+ * 触发点:
+ *   - OnGameStateMatchModeChanged 末尾 (模式切换立即重渲)
+ *   - 玩家切背包槽位 / 切武器 (原 v52 路径)
  */
 void URoomInsidePage::RefreshAllWeaponDisplayImages()
 {
-	UpdateWeaponDisplayImage(EWeaponMeshType::Primary);
-	UpdateWeaponDisplayImage(EWeaponMeshType::Secondary);
-	UpdateWeaponDisplayImage(EWeaponMeshType::Melee);
+	// 0. 读 GameState.CurrentMatchMode (单一真理源)
+	ERoomMatchMode CurrentMode = ERoomMatchMode::None;
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
+		{
+			CurrentMode = GS->CurrentMatchMode;
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] RefreshAllWeaponDisplayImages: GameState 为空! "
+				     "【零兜底】拒绝基于空 GameState 渲染武器图标, 请检查 World 状态."));
+			// GameState 缺失 = 最严重状态 → 清空 3 个 Image 让错误可见
+			ApplyClearWeaponImage(EWeaponMeshType::Primary);
+			ApplyClearWeaponImage(EWeaponMeshType::Secondary);
+			ApplyClearWeaponImage(EWeaponMeshType::Melee);
+			return;
+		}
+	}
+
+	// 1. 按模式分支渲染 (职责对等)
+	if (CurrentMode == ERoomMatchMode::Melee)
+	{
+		// 刀战: 主+副 灰色底无图 (业务规则), 近战正常显示玩家选择
+		ApplyMeleeWeaponImageBlock(EWeaponMeshType::Primary);
+		ApplyMeleeWeaponImageBlock(EWeaponMeshType::Secondary);
+		UpdateWeaponDisplayImage(EWeaponMeshType::Melee);
+	}
+	else if (CurrentMode == ERoomMatchMode::Zombie)
+	{
+		// 生化: 3 个 Image 全部正常显示玩家选择 (不破坏生化模式)
+		UpdateWeaponDisplayImage(EWeaponMeshType::Primary);
+		UpdateWeaponDisplayImage(EWeaponMeshType::Secondary);
+		UpdateWeaponDisplayImage(EWeaponMeshType::Melee);
+	}
+	else
+	{
+		// 零兜底: None/未识别模式 → Log Error + 清空 3 个 Image
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] RefreshAllWeaponDisplayImages: 未识别模式=%d, 清空所有武器 Image. "
+			     "【修复】检查 GameState.CurrentMatchMode 是否被合法赋值 (Melee/Zombie)."),
+			static_cast<int32>(CurrentMode));
+		ApplyClearWeaponImage(EWeaponMeshType::Primary);
+		ApplyClearWeaponImage(EWeaponMeshType::Secondary);
+		ApplyClearWeaponImage(EWeaponMeshType::Melee);
+	}
+}
+
+
+/**
+ * ApplyMeleeWeaponImageBlock
+ *
+ * 【v94 P0 刀战模式专属】把指定 Image 渲染为"灰色底 + 无图标"状态
+ *
+ * 业务规则 (用户 2026.08.09 明确):
+ *   - 刀战模式只允许近战武器, 主/副武器在 UI 上不显示图标
+ *   - 但 Image 控件仍占位 (避免布局塌陷), 底色填充 8D8D8DFF (灰色)
+ *   - 不破坏布局: SetVisibility 保持 Visible (隐含 SetBrushFromTexture(nullptr) 的默认值)
+ *   - 不允许做"改色" (用户原话: "不做改色操作") → 含义解读: 不改变 Image BrushTintColor 的运行时值,
+ *     仅用灰色底作为"未配置图标"的占位标记
+ *
+ * 大厂原则 — 单一入口:
+ *   - 仅 RefreshAllWeaponDisplayImages (Melee 分支) 调用
+ *   - 不允许其他路径直接调用, 避免被外部误用
+ *
+ * @param WeaponType 要应用灰色占位的 Image (Primary/Secondary)
+ */
+void URoomInsidePage::ApplyMeleeWeaponImageBlock(EWeaponMeshType WeaponType)
+{
+	// 【v94 P0】零兜底校验: Melee 类型不应该走这个函数 (Melee Image 正常显示)
+	if (WeaponType == EWeaponMeshType::Melee)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] ApplyMeleeWeaponImageBlock: 错误传入 WeaponType=Melee (Melee Image 正常显示, 不应被灰色占位). "
+			     "【零兜底】拒绝渲染, 请检查调用方."));
+		return;
+	}
+
+	UImage* TargetImage = ResolveWeaponImage(WeaponType);
+	if (!TargetImage) return; // ResolveWeaponImage 内部已 Log Error
+
+	// 1. 清空图标 (无图标状态)
+	//    SetBrushFromTexture(nullptr) 会让 Brush.ResourceObject 为空, UE 渲染时不绘制任何贴图
+	TargetImage->SetBrushFromTexture(nullptr);
+
+	// 2. 设置灰色底 8D8D8DFF (用户明确指定: 刀战模式主/副默认显示这个颜色)
+	//    FLinearColor::FromSRGBColor(FColor(0x8D, 0x8D, 0x8D, 0xFF)) = 灰色不透明
+	TargetImage->SetColorAndOpacity(FLinearColor::FromSRGBColor(FColor(0x8D, 0x8D, 0x8D, 0xFF)));
+}
+
+
+/**
+ * ApplyClearWeaponImage
+ *
+ * 【v94 P0 零兜底】把指定 Image 控件清空 (Brush + Tint 还原)
+ *
+ * 用途:
+ *   - GameState.CurrentMatchMode = None / 未识别时 (RefreshAllWeaponDisplayImages 兜底分支)
+ *   - GameState 为空时 (RefreshAllWeaponDisplayImages 入口检查失败)
+ *   拒绝"保留上次状态"的隐式兜底, 显式清空 + Log Error 让错误可见
+ *
+ * @param WeaponType 要清空的 Image 类型 (Primary/Secondary/Melee)
+ */
+void URoomInsidePage::ApplyClearWeaponImage(EWeaponMeshType WeaponType)
+{
+	UImage* TargetImage = ResolveWeaponImage(WeaponType);
+	if (!TargetImage) return; // ResolveWeaponImage 内部已 Log Error
+
+	// 显式清空 (零兜底: 拒绝保留任何上次状态)
+	TargetImage->SetBrushFromTexture(nullptr);
+	TargetImage->SetColorAndOpacity(FLinearColor::White);
+}
+
+
+/**
+ * ResolveWeaponImage
+ *
+ * 【v94 P0 DRY 重构】EWeaponMeshType → UImage* 映射的单一入口
+ *
+ * 背景: UpdateWeaponDisplayImage / ApplyMeleeWeaponImageBlock / ApplyClearWeaponImage
+ *      三个函数都需要根据 WeaponType 选 Image, 抽出来避免重复 switch
+ *
+ * 大厂原则 — DRY:
+ *   - 1 个 WeaponType 对应 1 个 Image 控件, 这层映射是基础设施
+ *   - 不允许任何函数自己再写一遍 switch (WeaponType)
+ *
+ * 零兜底:
+ *   - WeaponType 是 None / 未识别值 → 返回 nullptr + Log Error
+ *   - 控件字段本身为空 → 返回 nullptr + Log Error (BP 端未配置同名控件)
+ *   - 调用方必须做 nullptr 检查
+ *
+ * @param WeaponType 武器类型
+ * @return 对应的 UImage* 控件, 失败返回 nullptr
+ */
+UImage* URoomInsidePage::ResolveWeaponImage(EWeaponMeshType WeaponType)
+{
+	UImage* TargetImage = nullptr;
+	switch (WeaponType)
+	{
+	case EWeaponMeshType::Primary:   TargetImage = Image_PrimaryWeaponIcon;   break;
+	case EWeaponMeshType::Secondary: TargetImage = Image_SecondaryWeaponIcon; break;
+	case EWeaponMeshType::Melee:     TargetImage = Image_MeleeWeaponIcon;     break;
+	default:
+		// 零兜底: None / 未识别值 → 返回 nullptr + 显式 Log Error
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] ResolveWeaponImage: 未识别 WeaponType=%d, 返回 nullptr. "
+			     "【修复】检查 EWeaponMeshType 枚举值 (应为 Primary/Secondary/Melee)."),
+			static_cast<int32>(WeaponType));
+		return nullptr;
+	}
+
+	if (!TargetImage)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] ResolveWeaponImage: WeaponType=%d 对应的 Image 控件为空! "
+			     "【修复】检查 BP_WBP_RoomInsidePage 是否有同名 Image 控件."),
+			static_cast<int32>(WeaponType));
+		return nullptr;
+	}
+
+	return TargetImage;
 }
 
 
@@ -2262,8 +2508,10 @@ void URoomInsidePage::SyncLoadoutToServer()
 		{
 			int32 SelectedIndex = ComboBox_CharacterSelect->GetSelectedIndex();
 
-			// 获取当前选择的角色 ID
-			FString CurrentCharID = (SelectedIndex != INDEX_NONE) ? CachedCharacterIDs[SelectedIndex].ToString() : TEXT("Default");
+			// 【v213+ 大厂架构修复 — 消除默认污染源】
+			//   旧版: SelectedIndex == INDEX_NONE 时回退到 TEXT("Default") → 占位字符串污染下游
+			//   新版: 回退到空串 → 与 PS 默认值一致 → 不会污染 Spawn 链
+			FString CurrentCharID = (SelectedIndex != INDEX_NONE) ? CachedCharacterIDs[SelectedIndex].ToString() : TEXT("");
 
 			// 【v52 P0】3 把武器:
 			//   - W1 (主武器): 来自存档 BP1 的 LastSelectedWeapon[1] — 向后兼容旧存档
@@ -2587,11 +2835,16 @@ void URoomInsidePage::OnRoomServiceHostChanged(bool bIsHostNow)
  * 流程:
  *   1. 立即 ApplyVisibilityByMode(NewMode) 切换 Canvas 显隐
  *   2. RefreshRoomUI 重新渲染当前模式的玩家标签
+ *   3. 【v94 P0 刀战模式专属】RefreshAllWeaponDisplayImages 重渲 3 个武器 Image
+ *      (刀战模式 → 主/副 Image 立即变灰底; 生化模式 → 3 个 Image 立即恢复)
  *
- * 为什么必须 RefreshRoomUI:
- *   - 模式切换后, 旧 Box (例如 Melee 的 VerticalBox) 可能残留旧 widget
- *   - 新模式需要在新的 Canvas 里渲染对应模式的玩家/AI 标签
- *   - RefreshRoomUI 会清空所有 Box 然后按当前模式渲染
+ * 为什么必须 RefreshAllWeaponDisplayImages:
+ *   - 模式切换后, 旧 Image 可能保留上一个模式的渲染状态
+ *   - 玩家在切背包槽位之前不会触发 UpdateWeaponDisplayImage, 模式切换是更早的窗口
+ *
+ * 大厂原则 — 职责对等:
+ *   - ApplyVisibilityByMode 管"容器显隐" (Canvas)
+ *   - RefreshAllWeaponDisplayImages 管"图标渲染" (Image) — 两条路径并列, 不交叉
  */
 void URoomInsidePage::OnGameStateMatchModeChanged(ERoomMatchMode NewMode)
 {
@@ -2604,6 +2857,9 @@ void URoomInsidePage::OnGameStateMatchModeChanged(ERoomMatchMode NewMode)
 
 	// 2. 重新刷新玩家标签列表（按新模式渲染到对应 Canvas 内的容器）
 	RefreshRoomUI();
+
+	// 3. 【v94 P0】重新渲染武器 Image (刀战→灰底无图, 生化→正常显示)
+	RefreshAllWeaponDisplayImages();
 }
 
 

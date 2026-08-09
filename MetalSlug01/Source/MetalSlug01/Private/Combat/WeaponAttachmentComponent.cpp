@@ -277,9 +277,20 @@ void UWeaponAttachmentComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProp
 
 	// 【v81 大厂架构 — 客户端武器姿态修复】
 	//   旧: 服务器调 SetActorRelativeLocation 但 UE 不复制 RelativeLocation 字段
-	//   新: 服务器写入 ActiveSlotAttachment (FWeaponAttachmentRuntime) → UE 自动复制
-	//       → 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读取并强制应用偏移
-	DOREPLIFETIME(UWeaponAttachmentComponent, ActiveSlotAttachment);
+	//   新: 服务器写入 RuntimeBySlot (3 个独立字段) → UE 自动复制
+	//       → 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读取 GetRuntimeBySlot(CurrentSlot) 并强制应用偏移
+	//
+	// 【v219 大厂架构 — Per-Slot Runtime】每个槽位独立写, 不再"Slot == CurrentSlot 才写"
+	//   原因: 单字段在 SpawnAllWeapons 顺序生成 Primary/Secondary/Melee 时只有 Primary 会写
+	//         → Secondary/Melee 的 bIsValid=false → 切槽位时 ApplyAttachmentRuntime 拒绝
+	//         → 客户端武器永远挂错位置 (Session1.txt 2026.08.09 用户报告)
+	//
+	// 【v220 大厂架构 — UE 5.6 Replicated Maps 不支持】
+	//   - 旧: DOREPLIFETIME(RuntimeBySlot TMap) → UE 5.6 编译失败 "Replicated maps are not supported"
+	//   - 新: 3 个独立 UPROPERTY(Replicated) 字段, 各自 DOREPLIFETIME
+	DOREPLIFETIME(UWeaponAttachmentComponent, RuntimePrimary);
+	DOREPLIFETIME(UWeaponAttachmentComponent, RuntimeSecondary);
+	DOREPLIFETIME(UWeaponAttachmentComponent, RuntimeMelee);
 }
 
 
@@ -377,17 +388,23 @@ void UWeaponAttachmentComponent::EndPlay(const EEndPlayReason::Type EndPlayReaso
 //              → 客户端武器 Actor 已挂在角色 Mesh 上 (Socket 位置) 但没有策划偏移
 //              → IsWeaponAttachedToSocket 返回 true → 跳过补偏移 → 客户端姿态错
 //
-// 新架构 (v81 — 单一真理源 + 显式同步):
+// 新架构 (v81 — 单一真理源 + 显式同步) / v219 — Per-Slot Map 升级:
 //
-//   1. 服务器 SpawnAndEquipWeapon → Attach + SetActorRelativeLocation/Rotation/Scale + 写入 ActiveSlotAttachment (Replicated)
+//   1. 服务器 SpawnAndEquipWeapon → Attach + SetActorRelativeLocation/Rotation/Scale + 写入 RuntimeBySlot[Slot] (Replicated)
 //   2. 客户端 OnRep_CurrentWeapon 触发 → 走 ApplyAttachmentRuntime(CurrentWeapon)
-//      → 强制 Attach 到角色 Mesh + 应用 ActiveSlotAttachment 配置的偏移
+//      → 强制 Attach 到角色 Mesh + 应用 RuntimeBySlot[CurrentSlot] 配置的偏移
 //      → 不论武器之前是否已挂载, 都应用服务器配置的偏移
 //   3. 不再调用 Destroy() / 不再做"已挂载就跳过"分支
 //
+// 【v219 大厂架构 — Per-Slot Map】每个槽位独立存, 不再"Slot == CurrentSlot 才写"
+//   旧 (v81) 反模式: 单字段 ActiveSlotAttachment 在 SpawnAndConfigureWeaponInSlot 末尾 (line 2548) 有条件写
+//                    (Slot != CurrentSlot → 不写) → Secondary/Melee 永远写不到 → 切槽位时 bIsValid=false
+//                    → ApplyAttachmentRuntime 拒绝 → 客户端武器永远挂错位置
+//   新 (v219): TMap<EWeaponSlotType, FWeaponAttachmentRuntime> RuntimeBySlot, 3 个槽位各自写
+//
 // 大厂原则:
-//   - 单一真理源: 服务器 ActiveSlotAttachment 是偏移唯一权威
-//   - 零兜底: 服务器未写入偏移 → bIsValid=false → 客户端 Log Error 强制修复
+//   - 单一真理源: 服务器 RuntimeBySlot 是偏移唯一权威
+//   - 零兜底: 服务器未写入偏移 → RuntimeBySlot[Slot].bIsValid=false → 客户端 Log Error 强制修复
 //   - 不依赖 UE 隐式行为: 显式同步偏移, 不依赖"Attach 自动同步"
 // ==============================================================================
 void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
@@ -424,8 +441,8 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 		return;
 	}
 
-	// 【v81 修复】删除 IsWeaponAttachedToSocket 跳过分支 — 不论是否已挂载, 都强制应用偏移
-	//   单一真理源: ActiveSlotAttachment 字段 (服务器写入, Replicated)
+	// 【v219 修复】删除 IsWeaponAttachedToSocket 跳过分支 — 不论是否已挂载, 都强制应用偏移
+	//   单一真理源: RuntimeBySlot[CurrentWeaponSlot] 字段 (服务器写入, Replicated)
 	//   客户端必须严格应用服务器配置的偏移, 不能依赖"已挂载就跳过" 的隐式行为
 	ApplyAttachmentRuntime(CurrentWeapon);
 
@@ -454,7 +471,7 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 // ==============================================================================
 // 【v81 大厂架构】ApplyAttachmentRuntime — 应用挂载运行时数据到武器 Actor
 //
-// 真理源 = ActiveSlotAttachment (服务器写入 Replicated)
+// 真理源 = RuntimeBySlot[CurrentWeaponSlot] (服务器写入 Replicated)
 // 调用方 (3 个, 都是 OnRep 入口):
 //   - OnRep_CurrentWeapon 末尾 (远端玩家新武器复制过来时)
 //   - OnRep_CurrentWeaponSlot 末尾 (远端玩家槽位切换时)
@@ -465,6 +482,37 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 //   - bIsValid=false → Log Error + return (服务器没写入偏移, 强制修复服务器逻辑)
 //   - 不允许"已挂载就跳过" (v77 反模式已删除, 客户端必须强制应用偏移)
 // ==============================================================================
+FWeaponAttachmentRuntime* UWeaponAttachmentComponent::GetRuntimeBySlot(EWeaponSlotType Slot)
+{
+	switch (Slot)
+	{
+	case EWeaponSlotType::Primary:   return &RuntimePrimary;
+	case EWeaponSlotType::Secondary: return &RuntimeSecondary;
+	case EWeaponSlotType::Melee:     return &RuntimeMelee;
+	case EWeaponSlotType::None:
+	default:
+		// 零兜底: 无效 Slot 必须 Log Error + return nullptr
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] GetRuntimeBySlot: Slot=%s 无效. "
+			     "【v220 零兜底】拒绝访问. 检查调用方是否传入合法 Slot."),
+			LexToString(Slot));
+		return nullptr;
+	}
+}
+
+const FWeaponAttachmentRuntime* UWeaponAttachmentComponent::GetRuntimeBySlot(EWeaponSlotType Slot) const
+{
+	switch (Slot)
+	{
+	case EWeaponSlotType::Primary:   return &RuntimePrimary;
+	case EWeaponSlotType::Secondary: return &RuntimeSecondary;
+	case EWeaponSlotType::Melee:     return &RuntimeMelee;
+	case EWeaponSlotType::None:
+	default:
+		return nullptr;
+	}
+}
+
 void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 {
 	if (!Weapon)
@@ -475,16 +523,22 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 		return;
 	}
 
-	if (!ActiveSlotAttachment.bIsValid)
+	// 【v219 大厂架构 — Per-Slot Runtime】读 RuntimeBySlot(CurrentWeaponSlot)
+	//   原因: 旧单字段写法只在 SpawnAndConfigureWeaponInSlot 的 Slot == CurrentSlot 分支写,
+	//         Secondary/Melee 永远写不到, 切槽位时 ApplyAttachmentRuntime 拒绝 → 客户端武器永远挂错位置
+	//   修复 (v220): 3 个独立字段 (RuntimePrimary/Secondary/Melee), 每个槽位都各自写,
+	//         ApplyAttachmentRuntime 按当前槽位 GetRuntimeBySlot(CurrentSlot) 查
+	const FWeaponAttachmentRuntime* Runtime = GetRuntimeBySlot(CurrentWeaponSlot);
+	if (!Runtime || !Runtime->bIsValid)
 	{
-		// 服务器还没写入偏移 → 拒绝应用
-		//   这通常意味着 Spawn 时未写入, 或 Server_SwitchToWeaponSlot 找不到配置
 		UE_LOG(LogTemp, Error,
-			TEXT("[WeaponAttachment] ApplyAttachmentRuntime: ActiveSlotAttachment.bIsValid=false — 服务器未写入挂载偏移. "
-			     "Weapon=%s. 【v81 零兜底】客户端无法应用偏移, 请检查服务器 SpawnAndEquipWeapon/Server_SwitchToWeaponSlot 写入逻辑. "
-			     "【排查路径】1) 确认服务器 SpawnAndEquipWeapon 末尾写入了 ActiveSlotAttachment; "
+			TEXT("[WeaponAttachment] ApplyAttachmentRuntime: RuntimeBySlot(%s).bIsValid=false — 服务器未写入挂载偏移. "
+			     "Weapon=%s. 【v81 零兜底】客户端无法应用偏移, 请检查服务器 SpawnAndConfigureWeaponInSlot 写入逻辑. "
+			     "【排查路径】1) 确认服务器 SpawnAndConfigureWeaponInSlot 末尾写入了 RuntimeBySlot(%s); "
 			     "2) 确认 DT_WeaponAttachmentConfig 有 PawnClass=%s + WeaponClass=%s 的精确匹配行."),
+			LexToString(CurrentWeaponSlot),
 			*Weapon->GetName(),
+			LexToString(CurrentWeaponSlot),
 			*GetOwner()->GetClass()->GetName(),
 			*Weapon->GetClass()->GetName());
 		return;
@@ -499,10 +553,10 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 		return;
 	}
 
-	const FName SocketName = ActiveSlotAttachment.SocketName;
-	const FVector RelativeLocation = ActiveSlotAttachment.RelativeLocation;
-	const FRotator RelativeRotation = ActiveSlotAttachment.RelativeRotation;
-	const FVector RelativeScale3D = ActiveSlotAttachment.RelativeScale3D;
+	const FName SocketName = Runtime->SocketName;
+	const FVector RelativeLocation = Runtime->RelativeLocation;
+	const FRotator RelativeRotation = Runtime->RelativeRotation;
+	const FVector RelativeScale3D = Runtime->RelativeScale3D;
 
 	// 【v200.2.11 大厂架构 P0 修复】Attach 前获取 socket 世界坐标并直接设置武器位置
 	//   根因(v200.2.10 验证): 旧版 SetWorldLocationAndRotation(ZeroVector) 把武器扔到原点
@@ -1046,20 +1100,53 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 	//
 	// 因此这里不再调 HUD.UpdateWeaponIconFromID, 否则会形成两条独立链路, 违背 v40.1 "职责单一"
 
-	// 9. 【v81 大厂架构 — 客户端武器姿态修复】写入挂载运行时数据
-	//    服务器写入 → UE 复制 → 客户端 OnRep_CurrentWeapon/OnRep_CurrentWeaponSlot 读取并应用偏移
+	// 9. 【v219 大厂架构 — Per-Slot Runtime】写入挂载运行时数据到 RuntimeBySlot[Slot]
+	//    服务器写入 → UE 复制 → 客户端 OnRep_CurrentWeapon/OnRep_CurrentWeaponSlot 读取 RuntimeBySlot[CurrentSlot] 并应用偏移
 	//    客户端不再依赖"服务器 Attach + 客户端被 UE 自动同步 Attach 关系" 的隐式行为
-	ActiveSlotAttachment.SocketName = SocketName;
-	ActiveSlotAttachment.RelativeLocation = RelativeLocation;
-	ActiveSlotAttachment.RelativeRotation = RelativeRotation;
-	ActiveSlotAttachment.RelativeScale3D = RelativeScale;
-	ActiveSlotAttachment.bIsValid = true; // 标记服务器已应用 → 客户端可以信任
+	//
+	// 【大厂原则 — Per-Slot Map】每个槽位独立存, 不再有"Slot == CurrentWeaponSlot 才写"条件分支
+	//   旧 (v81) 反模式: 单字段 ActiveSlotAttachment 在 SpawnAndEquipWeapon 末尾写 → 但 SpawnAndConfigureWeaponInSlot
+	//                    else 分支 (非激活槽位) 不写 → 切槽位时 bIsValid=false → ApplyAttachmentRuntime 拒绝
+	//   新 (v219): TMap<EWeaponSlotType, FWeaponAttachmentRuntime> RuntimeBySlot[Slot], 3 个槽位都各自写
+	{
+		// 【MeshType → SlotType 映射】零兜底: MeshType 必须映射到合法 SlotType
+		EWeaponSlotType WeaponSlot = EWeaponSlotType::None;
+		switch (NewWeapon->GetMeshType())
+		{
+		case EWeaponMeshType::Primary:   WeaponSlot = EWeaponSlotType::Primary;   break;
+		case EWeaponMeshType::Secondary: WeaponSlot = EWeaponSlotType::Secondary; break;
+		case EWeaponMeshType::Melee:     WeaponSlot = EWeaponSlotType::Melee;     break;
+		default:
+			UE_LOG(LogTemp, Error,
+				TEXT("[WeaponAttachment] SpawnAndEquipWeapon: MeshType=%d 无法映射到 SlotType — 拒绝写 RuntimeBySlot. Weapon=%s. "
+				     "【v219 零兜底】修复 DT_WeaponInfo 该武器的 MeshType 字段."),
+				static_cast<int32>(NewWeapon->GetMeshType()), *NewWeapon->GetName());
+			break;
+		}
 
-	UE_LOG(LogTemp, Log,
-		TEXT("[WeaponAttachment] SpawnAndEquipWeapon: 写入 ActiveSlotAttachment (Replicated) — Socket=%s Loc=%s Rot=%s — 客户端将自动应用"),
-		*SocketName.ToString(),
-		*RelativeLocation.ToString(),
-		*RelativeRotation.ToString());
+		if (WeaponSlot != EWeaponSlotType::None)
+		{
+			FWeaponAttachmentRuntime* RuntimePtr = GetRuntimeBySlot(WeaponSlot);
+			if (!RuntimePtr)
+			{
+				// 零兜底: GetRuntimeBySlot 已 Log Error, 直接跳过 (不阻断武器 Spawn 链路)
+				return;
+			}
+			FWeaponAttachmentRuntime& Runtime = *RuntimePtr;
+			Runtime.SocketName = SocketName;
+			Runtime.RelativeLocation = RelativeLocation;
+			Runtime.RelativeRotation = RelativeRotation;
+			Runtime.RelativeScale3D = RelativeScale;
+			Runtime.bIsValid = true; // 标记服务器已应用 → 客户端可以信任
+
+			UE_LOG(LogTemp, Log,
+				TEXT("[WeaponAttachment][v219] SpawnAndEquipWeapon: 写入 RuntimeBySlot(%s) (Replicated) — Socket=%s Loc=%s Rot=%s — 客户端将自动应用"),
+				LexToString(WeaponSlot),
+				*SocketName.ToString(),
+				*RelativeLocation.ToString(),
+				*RelativeRotation.ToString());
+		}
+	}
 }
 
 
@@ -1688,36 +1775,43 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	//     - Slot.Entry.Sound 为空 → Log Error + 拒绝播放
 	PlayEquipSoundForSlot(TargetSlot);
 
-	// 【v81 大厂架构 — 客户端武器姿态修复】写入新槽位的挂载运行时数据
-	//   切换到 TargetSlot 时, 必须用目标武器的挂载配置刷新 ActiveSlotAttachment
-	//   → 客户端 OnRep_CurrentWeaponSlot 触发 → 读取并应用新槽位的偏移
+	// 【v219 大厂架构 — Per-Slot Runtime】写入新槽位的挂载运行时数据到 RuntimeBySlot(TargetSlot)
+	//   切换到 TargetSlot 时, 必须用目标武器的挂载配置刷新 RuntimeBySlot(TargetSlot)
+	//   → 客户端 OnRep_CurrentWeaponSlot 触发 → 读取 RuntimeBySlot(CurrentSlot) 并应用新槽位的偏移
 	{
 		FWeaponAttachmentConfig* TargetSlotConfig = FindWeaponAttachmentConfig(
 			Owner->GetClass(), TargetWeapon->GetClass());
 		if (TargetSlotConfig)
 		{
-			ActiveSlotAttachment.SocketName = TargetSlotConfig->SocketName;
-			ActiveSlotAttachment.RelativeLocation = TargetSlotConfig->RelativeLocation;
-			ActiveSlotAttachment.RelativeRotation = TargetSlotConfig->RelativeRotation;
-			ActiveSlotAttachment.RelativeScale3D = TargetSlotConfig->RelativeScale;
-			ActiveSlotAttachment.bIsValid = true;
+			FWeaponAttachmentRuntime* RuntimePtr = GetRuntimeBySlot(TargetSlot);
+			if (!RuntimePtr)
+			{
+				// 零兜底: GetRuntimeBySlot 已 Log Error, 直接跳过 (不阻断 Switch 链路)
+				return;
+			}
+			FWeaponAttachmentRuntime& Runtime = *RuntimePtr;
+			Runtime.SocketName = TargetSlotConfig->SocketName;
+			Runtime.RelativeLocation = TargetSlotConfig->RelativeLocation;
+			Runtime.RelativeRotation = TargetSlotConfig->RelativeRotation;
+			Runtime.RelativeScale3D = TargetSlotConfig->RelativeScale;
+			Runtime.bIsValid = true;
 
 			// 【v200.2.13】打印 DT 配置的完整信息, 用于诊断 Position offset 不匹配问题
 			UE_LOG(LogTemp, Display,
-				TEXT("[v200.2.13 诊断] Server_SwitchToWeaponSlot: DT 配置 (Loc=%s Rot=%s) Socket=%s Slot=%s"),
+				TEXT("[v200.2.13 诊断] Server_SwitchToWeaponSlot: DT 配置写入 RuntimeBySlot(%s) (Loc=%s Rot=%s) Socket=%s"),
+				LexToString(TargetSlot),
 				*TargetSlotConfig->RelativeLocation.ToCompactString(),
 				*TargetSlotConfig->RelativeRotation.ToCompactString(),
-				*TargetSlotConfig->SocketName.ToString(),
-				LexToString(TargetSlot));
+				*TargetSlotConfig->SocketName.ToString());
 		}
 		else
 		{
-			// 零兜底: 找不到配置 → 不写 ActiveSlotAttachment (bIsValid 保持 false)
+			// 零兜底: 找不到配置 → 不写 RuntimeBySlot(TargetSlot) (该 Slot 的 bIsValid 保持 false)
 			//   客户端 OnRep 会检测到 bIsValid=false → Log Error + 强制修复
 			UE_LOG(LogTemp, Error,
-				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: TargetSlot=%s 的挂载配置缺失 — ActiveSlotAttachment.bIsValid 保持 false. "
+				TEXT("[WeaponAttachment] Server_SwitchToWeaponSlot: TargetSlot=%s 的挂载配置缺失 — RuntimeBySlot(%s).bIsValid 保持 false. "
 				     "PawnClass=%s WeaponClass=%s. 【v81 零兜底】客户端将看到 Log Error, 请修复 DT_WeaponAttachmentConfig."),
-				LexToString(TargetSlot),
+				LexToString(TargetSlot), LexToString(TargetSlot),
 				*Owner->GetClass()->GetName(),
 				*TargetWeapon->GetClass()->GetName());
 		}
@@ -1730,10 +1824,8 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 	//   修复: 服务器主动调 ApplyAttachmentRuntime(TargetWeapon), 让 Listen Server 也能正确挂载
 	//   客户端: 仍然走 OnRep_CurrentWeaponSlot → ApplyAttachmentRuntime 路径 (无副作用, ApplyAttachmentRuntime 是幂等的)
 	UE_LOG(LogTemp, Display,
-		TEXT("[v200.2.8 诊断] Server_SwitchToWeaponSlot: 服务器端主动 ApplyAttachmentRuntime (Listen Server 不走 OnRep) — TargetWeapon=%s, ActiveSlotAttachment.bIsValid=%d, Socket=%s"),
-		*TargetWeapon->GetName(),
-		ActiveSlotAttachment.bIsValid ? 1 : 0,
-		*ActiveSlotAttachment.SocketName.ToString());
+		TEXT("[v200.2.8 诊断] Server_SwitchToWeaponSlot: 服务器端主动 ApplyAttachmentRuntime (Listen Server 不走 OnRep) — TargetWeapon=%s, CurrentSlot=%s"),
+		*TargetWeapon->GetName(), LexToString(CurrentWeaponSlot));
 	ApplyAttachmentRuntime(TargetWeapon);
 
 	// 【v58 大厂架构诊断】切换后检查武器是否真的可见
@@ -1873,14 +1965,17 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot
 	CurrentWeaponSlot = TrueSlot;
 
 	// 【v81 大厂架构 — 客户端武器姿态修复】槽位切换后必须应用新槽位的挂载偏移
-	//   服务器 Server_SwitchToWeaponSlot 末尾已写入 ActiveSlotAttachment (新槽位)
-	//   客户端 OnRep 触发 → 应用服务器配置的新槽位偏移
+	//   服务器 Server_SwitchToWeaponSlot 末尾已写入 RuntimeBySlot(TargetSlot) (新槽位)
+	//   客户端 OnRep 触发 → 读取 RuntimeBySlot(CurrentSlot) 并应用服务器配置的新槽位偏移
+	const FWeaponAttachmentRuntime* Runtime = GetRuntimeBySlot(WeaponState.ActiveSlot);
+	const bool bRuntimeValid = Runtime && Runtime->bIsValid;
 	UE_LOG(LogTemp, Display,
-		TEXT("[v200.2.8 诊断] OnRep_CurrentWeaponSlot: ApplyAttachmentRuntime 前 — WeaponState.ActiveWeapon=%s, ActiveSlot=%s, ActiveSlotAttachment.bIsValid=%d, Socket=%s"),
+		TEXT("[v219 诊断] OnRep_CurrentWeaponSlot: ApplyAttachmentRuntime 前 — WeaponState.ActiveWeapon=%s, ActiveSlot=%s, RuntimeBySlot(%s).bIsValid=%d, Socket=%s"),
 		*GetNameSafe(WeaponState.ActiveWeapon),
 		LexToString(WeaponState.ActiveSlot),
-		ActiveSlotAttachment.bIsValid ? 1 : 0,
-		*ActiveSlotAttachment.SocketName.ToString());
+		LexToString(WeaponState.ActiveSlot),
+		bRuntimeValid ? 1 : 0,
+		bRuntimeValid ? *Runtime->SocketName.ToString() : TEXT("<none>"));
 	ApplyAttachmentRuntime(WeaponState.ActiveWeapon);
 
 	// 【v219 大厂架构 — 可观测性升级】Log → Display, 默认在控制台和文件都可见
@@ -2541,44 +2636,51 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 		Strategy && Strategy.GetObject() ? *Strategy.GetObject()->GetClass()->GetName() : TEXT("<none>"),
 		LexToString(Slot));
 
-	// 【v81 大厂架构 — 客户端武器姿态修复】写入挂载运行时数据
+	// 【v219 大厂架构 — Per-Slot Runtime】写入挂载运行时数据到 RuntimeBySlot(Slot)
 	//   服务器 SpawnAndConfigureWeaponInSlot 是"槽位专用" Spawn 入口 (v52+)
-	//   仅当 Spawn 的是当前激活槽位时, 写入 ActiveSlotAttachment
-	//   (否则 — 比如生成副武器时 ActiveSlot 还是 Primary — 会被 Primary 的 OnRep 错误覆盖)
-	if (Slot == CurrentWeaponSlot)
+	//   【修复 — 每个槽位都写】无论是否当前激活槽位, RuntimeBySlot(Slot) 都必须写
+	//   原因: 旧单字段 ActiveSlotAttachment 在 Slot != CurrentWeaponSlot 时不写 → 切槽位时 bIsValid=false
+	//         → 客户端切槽位后 ApplyAttachmentRuntime 拒绝 → 武器永远挂错位置 (Session1.txt 2026.08.09)
+	//   新方案 (v220): 3 个独立字段 RuntimePrimary/Secondary/Melee, 各自 Replicated
 	{
-		ActiveSlotAttachment.SocketName = AttachmentConfig->SocketName;
-		ActiveSlotAttachment.RelativeLocation = AttachmentConfig->RelativeLocation;
-		ActiveSlotAttachment.RelativeRotation = AttachmentConfig->RelativeRotation;
-		ActiveSlotAttachment.RelativeScale3D = AttachmentConfig->RelativeScale;
-		ActiveSlotAttachment.bIsValid = true;
+		FWeaponAttachmentRuntime* RuntimePtr = GetRuntimeBySlot(Slot);
+		if (!RuntimePtr)
+		{
+			// 零兜底: GetRuntimeBySlot 已 Log Error, 直接跳过 (不阻断 Spawn 链路)
+			return NewWeapon;
+		}
+		FWeaponAttachmentRuntime& Runtime = *RuntimePtr;
+		Runtime.SocketName = AttachmentConfig->SocketName;
+		Runtime.RelativeLocation = AttachmentConfig->RelativeLocation;
+		Runtime.RelativeRotation = AttachmentConfig->RelativeRotation;
+		Runtime.RelativeScale3D = AttachmentConfig->RelativeScale;
+		Runtime.bIsValid = true;
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[WeaponAttachment] SpawnAndConfigureWeaponInSlot: 写入 ActiveSlotAttachment (当前激活槽位=%s) — Socket=%s"),
+			TEXT("[WeaponAttachment][v219] SpawnAndConfigureWeaponInSlot: 写入 RuntimeBySlot(%s) (Replicated) — Socket=%s"),
 			LexToString(Slot),
 			*AttachmentConfig->SocketName.ToString());
 	}
-	else
+
+	// 【v219 P0 终极修复 — 非激活槽位立即隐藏】
+	// ============================================================
+	//
+	// 业务背景 (Session1.txt 2026.08.09 用户反馈):
+	//   "客户端主武器上挂着近战武器, 但无法切换" — Spawn 阶段非激活槽位武器立即可见
+	//
+	// 根因 (大厂架构根因):
+	//   - 武器 Attach 到角色 Mesh 后立即可见 → 玩家看到"主武器上还挂着副武器/近战武器"
+	//   - Server_SpawnAllWeapons 末尾会统一 SetActorHiddenInGame, 但:
+	//     - 客户端走 OnRep_CurrentWeapon (可能延迟 N 帧) 才看到隐藏状态
+	//     - Listen Server 写字段不触发 OnRep, 靠自己看
+	//
+	// 修复:
+	//   - 这里立刻 SetActorHiddenInGame(true), SpawnAllWeapons 末尾逻辑保留 (双保险)
+	//   - SetActorEnableCollision(NoCollision) 也立即应用 (与 v77 P0 修复对称)
+	//   - 与 Server_SpawnAllWeapons 末尾的逻辑**互不冲突** (都设 Hidden=true), 幂等
+	// ============================================================
+	if (Slot != CurrentWeaponSlot)
 	{
-		// 【v219 P0 终极修复 — 非激活槽位立即隐藏】
-		// ============================================================
-		//
-		// 业务背景 (Session1.txt 2026.08.09 用户反馈):
-		//   "客户端主武器上挂着近战武器, 但无法切换" — Spawn 阶段非激活槽位武器立即可见
-		//
-		// 根因 (大厂架构根因):
-		//   - SpawnAndConfigureWeaponInSlot 末尾有条件写 ActiveSlotAttachment (只有 Slot == CurrentWeaponSlot 才写)
-		//   - "非激活槽位"分支只 Verbose Log, **没 SetActorHiddenInGame(true)**
-		//   - 武器 Attach 到角色 Mesh 后立即可见 → 玩家看到"主武器上还挂着副武器/近战武器"
-		//   - Server_SpawnAllWeapons 末尾 (line 2160) 会统一 SetActorHiddenInGame, 但:
-		//     - 客户端走 OnRep_CurrentWeapon (可能延迟 N 帧) 才看到隐藏状态
-		//     - Listen Server 写字段不触发 OnRep, 靠自己看
-		//
-		// 修复:
-		//   - 这里立刻 SetActorHiddenInGame(true), SpawnAllWeapons 末尾逻辑保留 (双保险)
-		//   - SetActorEnableCollision(NoCollision) 也立即应用 (与 v77 P0 修复对称)
-		//   - 与 Server_SpawnAllWeapons 末尾的逻辑**互不冲突** (都设 Hidden=true), 幂等
-		// ============================================================
 		NewWeapon->SetActorHiddenInGame(true);
 		NewWeapon->SetActorEnableCollision(ECollisionEnabled::NoCollision);
 

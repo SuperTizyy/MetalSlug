@@ -891,23 +891,26 @@ protected:
 	EWeaponSlotType CurrentWeaponSlot = EWeaponSlotType::Primary;
 
 	/**
-	 * 【v81 大厂架构 — 客户端武器姿态修复】武器挂载运行时数据
+	 * 【v219 大厂架构 — Per-Slot Runtime】武器挂载运行时数据 (3 个独立字段)
+	 *
+	 * 修复 (v220 大厂架构 — UE 5.6 Replicated Maps 不支持):
+	 *   - 旧: UPROPERTY(Replicated) TMap<EWeaponSlotType, FWeaponAttachmentRuntime> → UE 5.6 编译失败
+	 *   - 新: 3 个独立 FWeaponAttachmentRuntime 字段 (RuntimePrimary / RuntimeSecondary / RuntimeMelee)
+	 *   - 每个槽位独立 Replicated, 服务器写入路径与 v219 一致
+	 *   - 客户端 ApplyAttachmentRuntime 按 CurrentWeaponSlot 选对应字段
 	 *
 	 * 复制策略:
-	 *   - Replicated 字段 (普通复制, 无 OnRep — OnRep 通过 CurrentWeapon / CurrentWeaponSlot 触发)
-	 *   - 服务器 SpawnAndEquipWeapon 末尾写入 SocketName + RelativeLocation/Rotation/Scale
-	 *   - 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读取 RuntimeData 强制应用偏移
-	 *
-	 * 为什么不用 OnRep:
-	 *   - OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 已经在用, 偏移应用放在它们里面
-	 *   - 一个 OnRep 函数, 用 RuntimeData 作为真理源
-	 *
-	 * 真理源 vs 缓存:
-	 *   - RuntimeData[Slot] 是真理源 (服务器写入, 客户端读)
-	 *   - 不需要每个武器独立存偏移, 因为当前激活的槽位只有一个
+	 *   - 3 个 UPROPERTY(Replicated) 字段, 服务器 SpawnAndConfigureWeaponInSlot 末尾**无条件**写对应 Slot 字段
+	 *   - 客户端 OnRep_CurrentWeapon / OnRep_CurrentWeaponSlot 读 RuntimeBySlot(CurrentSlot) 强制应用偏移
 	 */
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Weapons|Attachment")
-	FWeaponAttachmentRuntime ActiveSlotAttachment;
+	FWeaponAttachmentRuntime RuntimePrimary;
+
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Weapons|Attachment")
+	FWeaponAttachmentRuntime RuntimeSecondary;
+
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Combat|Weapons|Attachment")
+	FWeaponAttachmentRuntime RuntimeMelee;
 
 	/**
 	 * 【v78 大厂架构】RefreshWeaponVisibilityForSlotChange — 槽位切换刷新可见性
@@ -917,9 +920,9 @@ protected:
 	void RefreshWeaponVisibilityForSlotChange(EWeaponSlotType NewActiveSlot);
 
 	/**
-	 * 【v81 大厂架构 — 客户端武器姿态修复】应用挂载运行时数据到武器 Actor
+	 * 【v219 大厂架构 — 客户端武器姿态修复】应用挂载运行时数据到武器 Actor
 	 *
-	 * 职责: 把 ActiveSlotAttachment 字段 (SocketName + RelativeLocation/Rotation/Scale)
+	 * 职责: 把 RuntimeBySlot[CurrentWeaponSlot] 字段 (SocketName + RelativeLocation/Rotation/Scale)
 	 *       实际应用到武器 Actor 上 (Attach + SetActorRelative*).
 	 *
 	 * 调用方 (3 个, 都是 OnRep 入口):
@@ -935,6 +938,24 @@ protected:
 	 * @param Weapon 要应用偏移的武器 Actor (通常 = CurrentWeapon)
 	 */
 	void ApplyAttachmentRuntime(ABaseWeapon* Weapon);
+
+	/**
+	 * 【v220 大厂架构 — Per-Slot runtime 访问器】按 Slot 返回对应 Runtime 字段指针
+	 *
+	 * 业务背景 (UE 5.6 Replicated Maps 不支持):
+	 *   - 旧: TMap<EWeaponSlotType, FWeaponAttachmentRuntime> RuntimeBySlot → 编译失败
+	 *   - 新: 3 个独立 UPROPERTY(Replicated) 字段 (RuntimePrimary/RuntimeSecondary/RuntimeMelee)
+	 *   - 访问器封装备选, 调用方统一用 GetRuntimeBySlot(Slot) 拿指针
+	 *
+	 * 设计原则:
+	 *   - 输入 Slot 无效 → 返回 nullptr, 调用方判空
+	 *   - 不做隐式默认值, 零兜底
+	 *
+	 * @param Slot 槽位类型
+	 * @return Runtime 字段指针 (无效 Slot 返回 nullptr)
+	 */
+	FWeaponAttachmentRuntime* GetRuntimeBySlot(EWeaponSlotType Slot);
+	const FWeaponAttachmentRuntime* GetRuntimeBySlot(EWeaponSlotType Slot) const;
 
 	/**
 	 * 【v51 大厂架构】OnRep_CurrentWeaponSlot — 客户端槽位同步回调

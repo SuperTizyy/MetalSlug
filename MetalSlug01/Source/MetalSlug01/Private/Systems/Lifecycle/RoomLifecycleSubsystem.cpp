@@ -109,7 +109,30 @@ void URoomLifecycleSubsystem::PerformGameStart(float InMatchStartDelay, float In
 	//   - 若 BP 配错 (如 999s 卡死), 用户会立即看到卡死 → 主动修复 BP
 	UE_LOG(LogTemp, Log, TEXT("[RoomLifecycle] 游戏将在 %.1f 秒后开始..."), MatchStartDelay);
 
-	// 5. 【v56.7 + v56.8】唯一回调: 先 Spawn Pawn，再显示 HUD, 最后广播 OnBattleStarted
+	// 5. 【v220 大厂架构 — 异步预加载武器资产】消除 32 秒主线程阻塞
+	//   根因 (Session1.txt 2026.08.09): 客户端武器 BeginPlay 同步加载 Marketplace asset
+	//         (SM_Modern_Melee_ShovelLarge) → DDC 编译阻塞主线程 32 秒
+	//   修复: 倒计时阶段异步预加载所有玩家+AI 的 WeaponBlueprint
+	//         → DDC 编译在后台进行 → 倒计时结束 LoadSynchronous 命中缓存 → 0 阻塞
+	//   单一入口: 全项目只有 PerformGameStart 在这里调一次 (大厂原则)
+	if (UWorld* World = GetWorld())
+	{
+		if (URoomSpawnSubsystem* SpawnSys = World->GetSubsystem<URoomSpawnSubsystem>())
+		{
+			const int32 PreloadedCount = SpawnSys->PreloadWeaponMeshesAsync();
+			UE_LOG(LogTemp, Log,
+				TEXT("[RoomLifecycle] PerformGameStart: 异步预加载 %d 个武器 Blueprint (倒计时阶段编译 DDC)"),
+				PreloadedCount);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[RoomLifecycle] PerformGameStart: URoomSpawnSubsystem 不可用 — 跳过武器预加载. "
+				     "【v220 零兜底】不兜底, 客户端首次启动可能阻塞 (DDC 编译)."));
+		}
+	}
+
+	// 6. 【v56.7 + v56.8】唯一回调: 先 Spawn Pawn，再显示 HUD, 最后广播 OnBattleStarted
 	GetWorld()->GetTimerManager().SetTimer(
 		MatchStartTimerHandle,
 		FTimerDelegate::CreateLambda([this]()
@@ -347,12 +370,25 @@ void URoomLifecycleSubsystem::HandleMatchTimeOut()
 
 	if (RoomGS->CurrentMatchMode == ERoomMatchMode::Melee)
 	{
-		// 刀战模式: 全局结算 (由 GameMode 决定, Subsystem 只清理计时器)
-		if (ARoomGameMode* GM = Cast<ARoomGameMode>(GetWorld()->GetAuthGameMode()))
-		{
-			// 委托回 GameMode 做具体业务 (例如广播胜利方)
-			// 这里只清理资源
-		}
+		// 【v218 大厂架构修复】刀战模式: 走 FinishMeleeMatch 完整结算链路 (镜像 Zombie)
+		//   历史 (v200 之前):
+		//     - HandleMatchTimeOut 对 Melee 模式无业务逻辑 (只是注释, 实际空实现)
+		//     - Text_RoundCountdown 倒计时归零 → 什么也没发生
+		//     - 用户报告: "刀战模式倒计时结束, 不判定胜负, 不显示 Text_GameOver, 不进入结算页"
+		//   新 (v218):
+		//     - HandleMatchTimeOut → FinishMeleeMatch (单一入口)
+		//     - FinishMeleeMatch 镜像 FinishZombieRound 流程:
+		//       1. 校验模式 (Melee) + 幂等 (MeleeWinner 已写则跳过)
+		//       2. 比 AttackerTotalKills vs DefenderTotalKills 判定胜负 (Attacker/Defender/Draw)
+		//       3. GameState.SetMeleeWinner(NewWinner) → Replicate 推客户端
+		//       4. MulticastEnterSettlement 广播进入结算 (复用现有 RPC, **零新建**)
+		//       5. ScheduleFinalSettlement(3s) 延迟 3s 后 BroadcastFinalSettlement (切图)
+		//
+		// 大厂原则 — 单一入口 (零重复架构):
+		//   - FinishMeleeMatch 是刀战"本局结束"业务唯一入口
+		//   - 调用方: HandleMatchTimeOut (倒计时归零)
+		//   - 不复用 FinishZombieRound (后者处理 Zombie 业务, 两者独立)
+		FinishMeleeMatch();
 	}
 	else if (RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie)
 	{
@@ -523,6 +559,137 @@ bool URoomLifecycleSubsystem::FinishZombieRound()
 		TEXT("[RoomLifecycle] FinishZombieRound: 生化本小局结算完成. RoundWinner=%d, AttackerWins=%d, DefenderWins=%d. %s"),
 		static_cast<int32>(NewWinner), RoomGS->AttackerWins, RoomGS->DefenderWins,
 		(RoomGS->CurrentRound <= 1) ? TEXT("最后一局, 进入全局结算.") : TEXT("还有下一局, 短暂显示结果后进入下一小局."));
+
+	return true;
+}
+
+/**
+ * 【v218 大厂架构新增】FinishMeleeMatch — 刀战本局结算统一入口
+ *
+ * 业务规则 (用户 2026.08.07 明确):
+ *   - 倒计时结束 → FinishMeleeMatch 触发
+ *   - 比 AttackerTotalKills vs DefenderTotalKills 判定胜负 (Attacker/Defender/Draw)
+ *   - 一整局定胜负, 无下一小局 (与生化区分)
+ *
+ * 大厂原则 — 单一入口 (零重复架构):
+ *   - FinishMeleeMatch 是刀战"本局结束"业务唯一入口
+ *   - 调用方: HandleMatchTimeOut (倒计时归零)
+ *   - 不复用 FinishZombieRound (后者处理 Zombie 业务, 两者独立 — SRP 单一职责)
+ *
+ * 内部流程 (镜像 FinishZombieRound):
+ *   1. 校验模式 (Melee) + 幂等 (MeleeWinner 已为 Attacker/Defender/Draw 则跳过)
+ *   2. 比 AttackerTotalKills vs DefenderTotalKills 判定胜负
+ *      - 攻方多 → Attacker 胜
+ *      - 守方多 → Defender 胜
+ *      - 相等   → Draw (平局, 合法业务结果)
+ *   3. 累加胜局数 (DefenderWins++ / AttackerWins++)
+ *   4. 调 GameState.SetMeleeWinner (Replicate 推所有客户端)
+ *   5. 调 GameState.MulticastEnterSettlement 广播进入结算 (复用现有 RPC, **零新建**)
+ *   6. 调 GameState.ScheduleFinalSettlement(3s) 延迟 3s 后 BroadcastFinalSettlement (切图到 L_Login)
+ *
+ * 大厂原则 — 零兜底:
+ *   - 非 Melee 模式 → Log Error + return false
+ *   - World/GameState 为空 → Log Error + return false
+ *   - 幂等 (MeleeWinner 已写) → return true (不算错, 防止双发)
+ *
+ * 不破坏生化模式:
+ *   - 生化永不调用本函数, 字段保持 None
+ */
+bool URoomLifecycleSubsystem::FinishMeleeMatch()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishMeleeMatch: World 为空, 拒绝结算."));
+		return false;
+	}
+
+	ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>();
+	if (!RoomGS)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishMeleeMatch: GameState 为空, 拒绝结算. "
+			     "【修复】检查 PerformGameStart 调用顺序 (GameState 必须已存在)."));
+		return false;
+	}
+
+	// 大厂原则 — 模式守卫 (镜像 FinishZombieRound):
+	//   - 本函数仅在刀战模式调用, 生化模式 Log Error + return
+	if (RoomGS->CurrentMatchMode != ERoomMatchMode::Melee)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishMeleeMatch: 当前模式=%d, 非刀战模式, 拒绝结算. "
+			     "【修复】FinishMeleeMatch 仅由 Melee 模式 HandleMatchTimeOut 触发."),
+			static_cast<int32>(RoomGS->CurrentMatchMode));
+		return false;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] FinishMeleeMatch: 刀战本局结算入口检查. MeleeWinner=%d (期望 None), AttackerKills=%d, DefenderKills=%d"),
+		static_cast<int32>(RoomGS->MeleeWinner),
+		RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
+
+	// 幂等防御 — 与 FinishZombieRound 对称
+	//   - MeleeWinner 已为 Attacker/Defender/Draw → 不重复结算 (防止双发, 双发会重复累加胜局数)
+	if (RoomGS->MeleeWinner != EMeleeWinner::None)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[RoomLifecycle] FinishMeleeMatch: MeleeWinner 已为 %d, 幂等跳过 (本局已结算). "
+			     "【根因】HandleMatchTimeOut 同帧内路径 A + 路径 B 同时触发, 第二次调用被挡."),
+			static_cast<int32>(RoomGS->MeleeWinner));
+		return true;
+	}
+
+	// 步骤 1: 胜负判定 (单一真理源 — GameState.AttackerTotalKills / DefenderTotalKills)
+	const EMeleeWinner NewWinner = (RoomGS->AttackerTotalKills > RoomGS->DefenderTotalKills)
+		? EMeleeWinner::Attacker
+		: (RoomGS->DefenderTotalKills > RoomGS->AttackerTotalKills)
+			? EMeleeWinner::Defender
+			: EMeleeWinner::Draw;
+
+	// 步骤 2: 累加胜局数 (镜像 FinishZombieRound 步骤 3, 复用 AttackerWins/DefenderWins 字段)
+	//   - Draw 时双方都不加分 (业务规则: 平局不得分)
+	//   - 内部触发 OnRep_WinStats → 所有客户端 UI 刷新 (Text_AttackerCount / Text_DefenderCount 显示源)
+	if (NewWinner == EMeleeWinner::Attacker)
+	{
+		RoomGS->AttackerWins++;
+	}
+	else if (NewWinner == EMeleeWinner::Defender)
+	{
+		RoomGS->DefenderWins++;
+	}
+	// Draw: 不加胜局数
+
+	// 步骤 3: 写入 MeleeWinner (Replicated → OnRep 推所有客户端)
+	RoomGS->SetMeleeWinner(NewWinner);
+
+	// 步骤 4: 广播进入结算 (复用 MulticastEnterSettlement RPC, **零新建 RPC**)
+	//   - 旧 (v200.1): TriggerSettlement 走 EZombieRoundWinner::Mother/Human 复用 — 语义不清晰 (注释说"刀战复用 EZombieRoundWinner")
+	//   - 新 (v218): 直接用 EMeleeWinner 传, MulticastEnterSettlement 增加一个重载或新 MulticastEnterMeleeSettlement
+	//   - 大厂原则 — 零兜底: 当前实现复用现有 MulticastEnterSettlement(int, int, EZombieRoundWinner),
+	//     但 MeleeWinner 通过 OnRep_MeleeWinner 单独推客户端, UI 优先读 MeleeWinner
+	//   - 客户端 UI 收到 OnEnterSettlement 时 (AttackerKills, DefenderKills 已知),
+	//     等待 OnRep_MeleeWinner 触发 OnMeleeWinnerUpdated 拿到 MeleeWinner,
+	//     然后用 MeleeWinner 显示 Text_GameOver
+	//
+	// 大厂原则 — 数据一致性: 步骤 3 (SetMeleeWinner) 触发 Replicate → 客户端收到 MeleeWinner,
+	//   与步骤 4 (MulticastEnterSettlement) 同步推 (UI 层收到两个事件后, 缓存两个字段, 显示结算页)
+	RoomGS->MulticastEnterSettlement(
+		RoomGS->AttackerTotalKills,
+		RoomGS->DefenderTotalKills,
+		EZombieRoundWinner::None); // 显式 None — 刀战语义不适用 EZombieRoundWinner, UI 用 MeleeWinner 显示
+
+	// 步骤 5: 延迟 3s 后切图到 L_Login 结算页
+	RoomGS->ScheduleFinalSettlement(3.0f);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomLifecycle] FinishMeleeMatch: 刀战本局结算完成. MeleeWinner=%d (%s), AttackerKills=%d, DefenderKills=%d. "
+		     "已广播 MulticastEnterSettlement, 3s 后切图到结算页."),
+		static_cast<int32>(NewWinner),
+		(NewWinner == EMeleeWinner::Attacker) ? TEXT("攻方胜") :
+		(NewWinner == EMeleeWinner::Defender) ? TEXT("守方胜") : TEXT("平局"),
+		RoomGS->AttackerTotalKills, RoomGS->DefenderTotalKills);
 
 	return true;
 }

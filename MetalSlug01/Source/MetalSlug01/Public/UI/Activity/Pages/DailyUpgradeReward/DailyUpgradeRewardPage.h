@@ -31,6 +31,8 @@ class UExperienceChestClaimWidget;
 class UDailyTaskWidget;
 class UTaskDetailWidget;
 class UDayLockHintWidget;
+class UEditableTextBox; // 【v213 新增】输入新经验值
+class UComboBoxString;  // 【v213 新增】选择天数
 
 
 /**
@@ -176,6 +178,26 @@ protected:
 	/** 固定奖励控件引用（通常显示最后一个 FixedPrize） */
 	UPROPERTY(meta = (BindWidget))
 	UExperienceChestClaimWidget* FixedPrizeWidget;
+
+	// ==========================================
+	// 4.0 【v213 新增】调试数据提交控件
+	// ==========================================
+	// 职责 (大厂原则):
+	//   - 仅在 Editor / Development Build 启用 (蓝图设计师可自行控制可见性)
+	//   - Page 提交数据 → ViewModel.ModifyCurrentExperience → SaveModifier → Subsystem
+	//   - 拒绝直接 NewObject SaveModifier (大厂原则: 生命周期归 ViewModel)
+
+	/** 【v213 新增】新经验值输入框 (用户输入 1~999 经验值) */
+	UPROPERTY(meta = (BindWidget))
+	UEditableTextBox* EditableTextInput_NewExp;
+
+	/** 【v213 新增】目标天数下拉框 (选项: "1" "2" "3" "4" "5") */
+	UPROPERTY(meta = (BindWidget))
+	UComboBoxString* ComboBoxString_SelectedDay;
+
+	/** 【v213 新增】提交按钮 (点击后: 读 EditableText + ComboBox, 调 ViewModel.ModifyCurrentExperience) */
+	UPROPERTY(meta = (BindWidget))
+	UButton* Button_ApplyDebugValues;
 
 	// ==========================================
 	// 4. Widget 蓝图类引用
@@ -431,6 +453,41 @@ private:
 	 */
 	UFUNCTION()
 	void OnReselectRewardClicked();
+
+	// ==========================================
+	// 11.1 【v213 新增】调试数据提交控件回调
+	// ==========================================
+
+	/**
+	 * 【v213 大厂架构】ComboBox 选项变化回调
+	 * 大厂原则: UI 仅触发回调, 不在此解析 SelectedDay; ViewModel 内部校验
+	 *
+	 * @param SelectedItem 选中的字符串 ("1" / "2" / ... / "5")
+	 * @param SelectionType 选择类型 (UMG 内部传递)
+	 */
+	UFUNCTION()
+	void OnDebugDayComboBoxSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	/**
+	 * 【v213 大厂架构】提交按钮点击回调 (组合 EditableText + ComboBox 的值)
+	 * 大厂原则:
+	 *   - Page 不解析 SelectedDay (那是 ViewModel 的事)
+	 *   - Page 不直接调 SaveModifier (那是 ViewModel 的事)
+	 *   - Page 只做"读 UI → 解析数字 → 委托 ViewModel"三件事
+	 */
+	UFUNCTION()
+	void OnApplyDebugValuesClicked();
+
+	/**
+	 * 【v213 大厂架构】提交结果反馈: 显示在屏幕上 (避免新增控件)
+	 * 大厂原则:
+	 *   - 用户没要新提示控件, 用 GEngine->AddOnScreenDebugMessage
+	 *   - 调试目的, 不进生产日志
+	 *
+	 * @param bSuccess 是否成功
+	 * @param Message 反馈内容
+	 */
+	void ShowDebugApplyFeedback(bool bSuccess, const FString& Message);
 
 	/**
 	 * 处理宝箱领取请求

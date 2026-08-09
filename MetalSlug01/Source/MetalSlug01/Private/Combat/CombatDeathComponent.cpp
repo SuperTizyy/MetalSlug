@@ -249,6 +249,7 @@ void UCombatDeathComponent::DiagnoseMeshRenderingSetup() const
  *   - Clear RagdollTimerHandle (防止 Actor 销毁后定时器回调)
  *   - 清空 OwnerCharacter 弱引用 (避免野指针)
  *   - 重置 bDeathSequenceStarted (理论上不必要, 但跨关卡时安全)
+ *   - 重置 bDieStarted (v207 新增, 与 bDeathSequenceStarted 对称清理)
  */
 void UCombatDeathComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
@@ -263,6 +264,7 @@ void UCombatDeathComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 	// 重置死亡标志 (跨关卡时安全)
 	bDeathSequenceStarted = false;
+	bDieStarted = false; // 【v207 新增】对称清理
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -534,17 +536,23 @@ void UCombatDeathComponent::Die()
 		return;
 	}
 
-	// 【v115.6 大厂架构修复】幂等检查：防止 Die() 被多次调用（短时间内多次击杀）
-	if (bDeathSequenceStarted)
+	// 【v207 大厂架构修复】幂等检查: 用 bDieStarted 而非 bDeathSequenceStarted
+	//   历史 bug: Die() 提前设 bDeathSequenceStarted=true → Die() 末尾 ExecuteDeathLocal() 被幂等跳过
+	//   修复: Die() 用独立的 bDieStarted (自身幂等), ExecuteDeathLocal() 用 bDeathSequenceStarted (其自身幂等)
+	//   两者职责完全分离, 互不干扰
+	if (bDieStarted)
 	{
 		UE_LOG(LogTemp, Warning,
-			TEXT("[CombatDeathComponent] Die: 幂等跳过 — 死亡序列已开始. Pawn=%s, HasAuthority=%d"),
+			TEXT("[CombatDeathComponent] Die: 幂等跳过 — Die() 已被调用. Pawn=%s, HasAuthority=%d"),
 			*Owner->GetName(), Owner->HasAuthority() ? 1 : 0);
 		return;
 	}
 
-	// 标记死亡序列已开始（必须在任何可能重复调用的代码之前）
-	bDeathSequenceStarted = true;
+	// 标记 Die() 已开始（必须在任何可能重复调用的代码之前）
+	bDieStarted = true;
+
+	// 【v207 大厂架构】bDeathSequenceStarted 不再在 Die() 中设置
+	//   留给 ExecuteDeathLocal() 作为唯一设置点 (避免服务器路径被错误幂等)
 
 	UE_LOG(LogTemp, Warning,
 		TEXT("[CombatDeathComponent] Die: Pawn=%s, HasAuthority=%d"),
@@ -1011,15 +1019,33 @@ void UCombatDeathComponent::EnableRagdoll()
 /**
  * Multicast_Die_Implementation
  *
- * 服务器流程: HealthComponent::ApplyDamage → OnDeath.Broadcast → OnHealthComponentDeath → Die() → Multicast_Die (服务器自己)
- * 客户端流程: HealthComponent::OnRep_bIsDead → OnDeath.Broadcast → OnHealthComponentDeath → ExecuteDeathLocal()
- *              + Multicast_Die RPC → ExecuteDeathLocal() (兜底)
+ * 【大厂 P0 v207 (2026.08.09) — 服务器执行路径修复】
+ *   历史 bug (Session1.txt 2026.08.09):
+ *     - 服务器 Die() 设置 bDeathSequenceStarted=true → Owner->Multicast_Die() 在服务器自己本地执行本方法
+ *     - 本方法无条件 ExecuteDeathLocal() → 因 bDeathSequenceStarted 已 true → 跳过
+ *     - 然后 Die() 末尾再调 ExecuteDeathLocal() → 同样跳过
+ *     - 后果: 服务器武器不掉落/不溶解, 尸体下残留武器; 客户端正常 (客户端走 OnHealthComponentDeath → ExecuteDeathLocal, 没被 Die 预先污染)
  *
- * 注: 实际 UE 中, Multicast_Die 是 UFUNCTION(NetMulticast, Reliable), 由 UE 反射机制展开
- *     这里声明实现 _Implementation, 因为 UCombatDeathComponent 不是 Actor, 没有 UFUNCTION RPC 装饰
- *     实际 BaseCharacter::Multicast_Die 仍存在, 通过转发调用本方法
+ *   修复 (单一真理源 — 服务器走 Die 路径):
+ *     - 服务器端跳过本方法的 ExecuteDeathLocal 调用 (服务器走 Die() 集中调度路径)
+ *     - 服务器端重置 AC 仍执行 (这是 RPC 副作用, 与死亡流程独立)
+ *     - 客户端照常执行 ExecuteDeathLocal (OnRep_bIsDead → ExecuteDeathLocal + Multicast_Die → ExecuteDeathLocal 幂等兜底)
  *
- *     大厂原则 - 集中调度: Multicast_Die 的"如何响应"逻辑全部在本方法
+ *   时序约束 (服务器):
+ *     Die() [bDeathSequenceStarted=true] → Multicast_Die (服务器本地, 跳过 ExecuteDeathLocal) → ExecuteDeathLocal (执行核心) → SetLifeSpan
+ *
+ *   时序约束 (客户端):
+ *     OnRep_bIsDead → OnHealthComponentDeath → ExecuteDeathLocal [bDeathSequenceStarted=true] → Multicast_Die RPC → ExecuteDeathLocal 幂等跳过
+ *
+ *   不破坏生化模式:
+ *     - 生化模式死亡仍走 Die() → ExecuteDeathLocal, 完整路径不变
+ *     - 母体 / 非母体 死亡均适用本修复
+ *
+ *   注: 实际 UE 中, Multicast_Die 是 UFUNCTION(NetMulticast, Reliable), 由 UE 反射机制展开
+ *       这里声明实现 _Implementation, 因为 UCombatDeathComponent 不是 Actor, 没有 UFUNCTION RPC 装饰
+ *       实际 BaseCharacter::Multicast_Die 仍存在, 通过转发调用本方法
+ *
+ *   大厂原则 - 集中调度: 服务器死亡副作用由 Die() 统一编排, RPC Implementation 仅服务客户端
  */
 void UCombatDeathComponent::Multicast_Die_Implementation()
 {
@@ -1029,14 +1055,24 @@ void UCombatDeathComponent::Multicast_Die_Implementation()
 		return;
 	}
 
-	// 服务器专属: 重置 AC/ACE
-	if (Owner->HasAuthority())
+	// 【v207 大厂架构 — 服务器路径分离】服务器已走 Die() 集中调度, 不再重复 ExecuteDeathLocal
+	//   服务器侧 Die() 内已显式调用 ExecuteDeathLocal + SetLifeSpan (line 669/686), 不需要 RPC Implementation 再触发
+	//   客户端侧照常走 ExecuteDeathLocal (OnRep_bIsDead 兜底 + RPC 双保险)
+	if (!Owner->HasAuthority())
 	{
-		Owner->ResetAC();
+		// 执行本地死亡流程 (幂等, OnRep_bIsDead 已调过则跳过)
+		ExecuteDeathLocal();
 	}
+	else
+	{
+		// 服务器: 仅执行 RPC 独有的副作用 (重置 AC), 不重复死亡流程
+		// 注: ResetAC 是 Multicast_Die 独有的副作用, 与死亡流程独立, 不属于 ExecuteDeathLocal 范畴
+		Owner->ResetAC();
 
-	// 执行本地死亡流程 (幂等, CurrentWeapon 已被 nullptr 后再次进入会被 if 短路)
-	ExecuteDeathLocal();
+		UE_LOG(LogTemp, Display,
+			TEXT("[CombatDeathComponent] Multicast_Die_Implementation: 【v207】服务器侧跳过 ExecuteDeathLocal (Die() 已统一调度), 仅执行 ResetAC. Pawn=%s"),
+			*Owner->GetName());
+	}
 
 	// 复活定时器仅服务器需要
 	if (Owner->HasAuthority())
@@ -1474,41 +1510,59 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 	}
 
 	// ==========================================
-	// 【v208 大厂架构 — GameState 团队击杀累加集中调度】
-	//   业务规则: GameState 的 AttackerKills/DefenderKills = "被击杀者" 所属阵营的累计击杀数
-	//     - 玩家击杀 AI 母体(Offense) → AddTeamKill(Offense) → AttackerKills+1
-	//     - AI 人类击杀 AI 母体(Offense) → AddTeamKill(Offense) → AttackerKills+1
-	//     - AI 母体击杀 玩家(Defense) → AddTeamKill(Defense) → DefenderKills+1
+	// 【v219 大厂架构 — 修正 AttackerKills/DefenderKills 累加语义】
+	//   业务规则 (用户 2026.08.09 反馈 + 字段名语义):
+	//     - GameState.AttackerKills / DefenderKills = 该阵营作为 Killer 累计造成的击杀数
+	//     - 即 "Text_AttackerCount" 显示 "攻方累计杀了几个人"
+	//     - UI 端: UScoreboardWidget (Melee 路径) 直接读 AttackerTotalKills/DefenderTotalKills 显示
 	//
-	//   历史 (v22-v202) 错位根因:
-	//     - ARoomPlayerState::AddKillScore / ABaseAIController::AddKillScore 内部用 Killer 阵营调 AddTeamKill
-	//     - Killer != Victim 阵营时 (如玩家杀 AI 母体), 累加完全错位
+	//   历史 (v208) 错位根因:
+	//     - v208 注释错误地认定 "AttackerKills = 被击杀阵营" 累加
+	//     - 用 VictimFactionTag 累加 → 完全翻转 (玩家杀 AI 母体 → AttackerKills++, 应是 DefenderKills++)
+	//     - 用户报告: "攻方阵营最终击杀数最多, Text_GameOver 显示守方胜利" (Winner 翻转)
+	//     - 因为 FinishMeleeMatch 拿 AttackerKills vs DefenderKills 比大小, 累加翻转 → 胜负翻转
 	//
-	//   新 (v208) 集中调度:
-	//     - AddTeamKill 调用从 PS/AIC::AddKillScore 内部删除
-	//     - 唯一入口 = 本函数 PerformKillSettlement (同时持有 Killer+Victim, 知道 Victim 阵营)
-	//     - Victim 阵营从 Pawn->FactionTag 读 (与 Spawn 链路单一真理源)
-	//     - 大厂原则 — 集中调度: GameState 团队击杀累加只有这一处入口
+	//   旧 (v22-v202) 也错 (用 Killer 阵营在 PS/AIC.AddKillScore 内累加):
+	//     - 旧版实际上是对的 (Player AddKillScore 用 Killer 阵营 → Killer 阵营累加)
+	//     - v208 误以为旧版错, 改成 Victim 累加 → 反而引入翻转 bug
+	//
+	//   新 (v219) 正确语义:
+	//     - 唯一入口 = 本函数 PerformKillSettlement (同时持有 Killer+Victim)
+	//     - Killer 阵营从 KillerCharacter->FactionTag 读 (Replicated, 与 Spawn 链路同一真理源)
+	//     - 大厂原则 — 集中调度: GameState 团队击杀累加只有这一处入口 (与 v208 一致)
+	//     - 大厂原则 — 零兜底: KillerCharacter 为空 / Killer.FactionTag 无效 → 显式 Log Error + 不累加
 	// ==========================================
 	if (UWorld* World = GetWorld())
 	{
 		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
 		{
-			const FGameplayTag VictimFactionTag = Owner->FactionTag;
-			if (FFactionTags::IsValidFaction(VictimFactionTag))
+			// 大厂原则 — 零兜底: KillerCharacter 为空 (Instigator 已 Destroy) 不允许静默累加 Victim 阵营
+			if (!KillerCharacter)
 			{
-				UE_LOG(LogTemp, Log,
-					TEXT("[CombatDeathComponent] 【v208】PerformKillSettlement: GameState 团队击杀累加. Victim='%s' VictimFactionTag='%s'."),
-					*Owner->GetName(), *VictimFactionTag.ToString());
-				RoomGS->AddTeamKill(VictimFactionTag);
+				UE_LOG(LogTemp, Error,
+					TEXT("[CombatDeathComponent] 【v219】PerformKillSettlement: KillerCharacter 为空, 拒绝 AddTeamKill. "
+					     "Victim='%s' 的阵营击杀数将不累加 (零兜底 — 不静默回退到 Victim 阵营累加). "
+					     "【修复】检查 TakeDamage 链路 Instigator 是否被 Destroy 过早 (理想情况 Instigator 与 Victim 同时死亡)."),
+					*Owner->GetName());
 			}
 			else
 			{
-				UE_LOG(LogTemp, Error,
-					TEXT("[CombatDeathComponent] 【v208】PerformKillSettlement: Victim '%s' 的 FactionTag='%s' 非有效阵营, 拒绝 AddTeamKill. "
-					     "【零兜底】检查 Spawn 链路是否写入 FactionTag, 或被母体变异步骤切错阵营. "
-					     "如不修, GameState 团队击杀数会少累加这一次."),
-					*Owner->GetName(), *VictimFactionTag.ToString());
+				const FGameplayTag KillerFactionTag = KillerCharacter->FactionTag;
+				if (FFactionTags::IsValidFaction(KillerFactionTag))
+				{
+					UE_LOG(LogTemp, Log,
+						TEXT("[CombatDeathComponent] 【v219】PerformKillSettlement: GameState 团队击杀累加. Killer='%s' KillerFactionTag='%s', Victim='%s'."),
+						*KillerCharacter->GetName(), *KillerFactionTag.ToString(), *Owner->GetName());
+					RoomGS->AddTeamKill(KillerFactionTag);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[CombatDeathComponent] 【v219】PerformKillSettlement: Killer '%s' 的 FactionTag='%s' 非有效阵营, 拒绝 AddTeamKill. "
+						     "【零兜底】检查 Spawn 链路是否写入 FactionTag, 或被母体变异步骤切错阵营. "
+						     "如不修, GameState 团队击杀数会少累加这一次."),
+						*KillerCharacter->GetName(), *KillerFactionTag.ToString());
+				}
 			}
 		}
 	}
@@ -1614,4 +1668,16 @@ void UCombatDeathComponent::PerformKillSettlement(float DamageAmount, AControlle
 		KillerCharacter->Multicast_NotifyKill(KillerName, VictimName, KillMethod, /*bIsAssist=*/false, bIsKillerPlayer, CalculatedStreakType, KillSoundAsset);
 	}
 	// else: 零兜底 — 不广播击杀消息(没有 Killer 就没有击杀事件)
+
+	// 【v223.0 大厂架构 P0】Server 刷新战斗 AI 名单
+	//   单一入口: 每次击杀结算后, 立即同步 ReplicatedBattleAIEntries
+	//   0 兜底: GameState 内部有完整守卫 (HasAuthority/AIC/Pawn/Tag)
+	//   客户端会立即看到 KDA 变化 (击杀数 + 1)
+	if (UWorld* World = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = World->GetGameState<ARoomGameState>())
+		{
+			RoomGS->ServerRefreshAllBattleAIEntries();
+		}
+	}
 }

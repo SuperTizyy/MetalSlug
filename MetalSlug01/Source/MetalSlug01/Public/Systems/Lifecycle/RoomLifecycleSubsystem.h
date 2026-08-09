@@ -168,6 +168,34 @@ public:
 	bool FinishZombieRound();
 
 	// ==========================================
+	// 【v218 大厂架构新增】刀战本局结算统一入口 (镜像 FinishZombieRound)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.07 明确):
+	//   - 倒计时结束 (Text_RoundCountdown 归零) → FinishMeleeMatch 触发
+	//   - 业务唯一入口: 写 MeleeWinner + MulticastEnterSettlement 广播 (复用现有 RPC, **零新建**)
+	//
+	// 大厂原则 — 单一入口 (零重复架构):
+	//   - FinishMeleeMatch 是刀战"本局结束"业务唯一入口
+	//   - 调用方: HandleMatchTimeOut (倒计时结束)
+	//   - 内部流程 (镜像 FinishZombieRound):
+	//     1. 校验模式 (Melee) + 幂等 (MeleeWinner 已写则跳过)
+	//     2. 比 AttackerTotalKills vs DefenderTotalKills 判定胜负 (Attacker/Defender/Draw)
+	//     3. GameState.SetMeleeWinner(NewWinner) → Replicate 推客户端
+	//     4. 累加胜局数 (AttackerWins++ / DefenderWins++) — 与生化共用字段
+	//     5. MulticastEnterSettlement 广播进入结算 (复用现有 RPC)
+	//     6. ScheduleFinalSettlement(3s) 延迟切图
+	//
+	// 大厂原则 — 零兜底:
+	//   - 非 Melee 模式 → Log Error + return false
+	//   - World/GameState 为空 → Log Error + return false
+	//   - 幂等 (MeleeWinner 已写) → return true (不算错)
+	//
+	// 不破坏生化模式:
+	//   - 生化永不调用本函数, 字段保持 None
+	bool FinishMeleeMatch();
+
+	// ==========================================
 	// 【v134 大厂架构新增】生化模式母体变异倒计时调度
 	// ==========================================
 	//

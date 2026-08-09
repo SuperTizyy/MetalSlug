@@ -99,6 +99,18 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchModeChanged, ERoomMatchMode,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoundWinnerUpdated, EZombieRoundWinner, NewWinner);
 
 /**
+ * 【v218 大厂架构新增】刀战模式赢家更新委托 — 与 FOnRoundWinnerUpdated 分离
+ *
+ * 业务语义:
+ *   - 刀战: 一整局定胜负 → 用 Attacker/Defender/Draw 表达
+ *   - 生化: 每小局结束 → 用 Human/Mother 表达
+ *   - 两者业务模型不同, 不复用同一个 Delegate (避免调用方做模式判断)
+ *
+ * @param NewWinner 刀战本局赢家 (Attacker / Defender / Draw)
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMeleeWinnerUpdated, EMeleeWinner, NewWinner);
+
+/**
  * @brief 双方击杀人数变化委托
  * @param AttackerKills 攻方击杀数
  * @param DefenderKills 守方击杀数
@@ -603,6 +615,62 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Room|AI")
 	FOnPendingAIQueueChanged OnPendingAIQueueChanged;
 
+	// ==========================================
+	// 【v223.0 大厂架构 P0 修复 — 战斗阶段 AI 名单 Server-Authoritative 复制】
+	// ==========================================
+	//
+	// 根因 (v222.0 仍未解决):
+	//   - AIC 在 SpawnAIInternal 时设了 SP.Owner=nullptr + bAlwaysRelevant=true
+	//   - 但 UE 5.6 AIC 复制仍可能因 NetCull/PossessedPawn 链路时序问题, 未到 Client
+	//   - Client 端 GetFactionSnapshotsInternal TActorIterator<ABaseAIController> 返回 0
+	//   - Tab Scoreboard 永远不显示 AI (Client 端)
+	//
+	// 解决方案 (镜像 Settlement v217 路径):
+	//   - Server 端在 SpawnAIInternal 后, 把 AIC 名单写入 ReplicatedBattleAIEntries
+	//   - Client 端 RefreshScoreboard 走 GetBattleAIEntries(FactionTag) → 读 Replicated 列表
+	//   - 完全不依赖 AIC 复制路径, 0 兜底 (Server 写入 = 唯一真理源)
+	//
+	// 大厂原则:
+	//   - Server-Authoritative 复制 (这是 UE 标准模式, Lyra/Fortnite 都用)
+	//   - 单一真理源: Server 拉 AIC 数据 → 写 Replicated 列表 → Client 读
+	//   - 0 兜底: 找不到 AIC (None) → Log Error + 跳过, 不静默
+	//   - 数据驱动: Replicated 列表, 客户端不需要 TActorIterator
+	UPROPERTY(ReplicatedUsing = OnRep_ReplicatedBattleAIEntries, BlueprintReadOnly, Category = "Room|AI")
+	TArray<FFactionSnapshotEntry> ReplicatedBattleAIEntries;
+
+	UFUNCTION()
+	void OnRep_ReplicatedBattleAIEntries();
+
+	/**
+	 * 【v223.0 大厂架构】Server 写入 AI 名单 (单一入口)
+	 *
+	 * 调用时机:
+	 *   - SpawnAIInternal Spawn 后调 ServerRefreshBattleAIEntries
+	 *   - 玩家击杀导致 Score/Kills 变化时, 也调一次 (保证 Tab 实时同步)
+	 *
+	 * 0 兜底:
+	 *   - HasAuthority=false → Log Error + return (Client 严禁调)
+	 *   - AIC 找不到 → Log Error + 跳过该条, 不静默
+	 *
+	 * @param InFactionTag 限定只写入特定阵营的 AI (性能优化 + 客户端过滤)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|AI")
+	void ServerRefreshBattleAIEntries(FGameplayTag InFactionTag);
+
+	/** 全量刷新 (不带阵营过滤, 用于循环触发) */
+	UFUNCTION(BlueprintCallable, Category = "Room|AI")
+	void ServerRefreshAllBattleAIEntries();
+
+	/** 客户端读取 API (Tab Scoreboard 用) */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|AI")
+	TArray<FFactionSnapshotEntry> GetBattleAIEntries(FGameplayTag InFactionTag) const;
+
+	/**
+	 * AI 战斗名单变化事件 (客户端 UI 订阅刷新 Tab)
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|AI")
+	FOnPendingAIQueueChanged OnBattleAIEntriesChanged;
+
 	/**
 	 * 查询指定阵营的 AI 占位数量 (客户端 UI 用)
 	 */
@@ -826,6 +894,39 @@ public:
 	FOnRoundWinnerUpdated OnZombieRoundSoundReceived;
 
 	/**
+	 * 【v218 大厂架构新增】刀战模式本局赢家 (与生化 RoundWinner 分离,语义更清晰)
+	 *
+	 * 业务规则 (用户 2026.08.07 明确):
+	 *   - 倒计时结束 → FinishMeleeMatch 判定 → 写 MeleeWinner (Replicated)
+	 *   - 客户端 OnRep_MeleeWinner → Broadcast OnMeleeWinnerUpdated
+	 *   - UGameHUDWidget 缓存字段 + 显示 Text_GameOver ("攻方胜利" / "守方胜利" / "平局")
+	 *
+	 * 大厂原则 — 模式分离:
+	 *   - 不复用 RoundWinner (EZombieRoundWinner 是"人 vs 母体", 语义不适用刀战)
+	 *   - MeleeWinner 仅在刀战模式写入, 生化模式永远 None
+	 *
+	 * 大厂原则 — 单一真理源 + 零兜底:
+	 *   - 不允许其他类创建自定义"哪边赢"判定 — 全部走 URoomLifecycleSubsystem::FinishMeleeMatch → SetMeleeWinner
+	 *   - 服务器手动 Broadcast (自身 OnRep 不触发), 客户端 OnRep 自动 Broadcast
+	 *   - SetMeleeWinner 调用方: URoomLifecycleSubsystem::FinishMeleeMatch (本局结束唯一入口)
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_MeleeWinner, BlueprintReadOnly, Category = "Room|Settlement|Melee")
+	EMeleeWinner MeleeWinner = EMeleeWinner::None;
+
+	/**
+	 * MeleeWinner 复制回调 (客户端) — 触发 OnMeleeWinnerUpdated 广播
+	 * 大厂原则 — UE 5.6 OnRep: 必须用 UFUNCTION() 标记
+	 */
+	UFUNCTION()
+	void OnRep_MeleeWinner();
+
+	/**
+	 * UI 监听的委托: MeleeWinner 变化时刷新 UI (Text_GameOver 显示哪方获胜)
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Melee")
+	FOnMeleeWinnerUpdated OnMeleeWinnerUpdated;
+
+	/**
 	 * 【v201 大厂架构新增】短暂显示小局结果委托
 	 *   - MulticastShowZombieRoundBriefResult RPC 触发
 	 *   - UI 层订阅后显示胜负文本，3 秒后自动隐藏
@@ -937,6 +1038,30 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Zombie")
 	void SetRoundWinner(EZombieRoundWinner InWinner);
+
+	/**
+	 * 服务器专用: 设置刀战本局赢家 (大厂原则 — 显式优于隐式)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - InWinner 必须为 Attacker / Defender / Draw, 不允许传 None (显式优于隐式, 拒绝静默清空)
+	 *   - 服务器写入字段后立即手动 Broadcast (镜像 SetRoundWinner)
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishMeleeMatch (服务器本局结束唯一入口)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Melee")
+	void SetMeleeWinner(EMeleeWinner InWinner);
+
+	/**
+	 * 服务器专用: 重置 MeleeWinner 为 None (新一局开始 / 模式切换)
+	 *
+	 * 大厂原则 — 镜像 ResetRoundWinner:
+	 *   - 仅服务器可调用 (HasAuthority 校验)
+	 *   - 调用方: URoomLifecycleSubsystem::StartNewMeleeMatch / 模式切换
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Settlement|Melee")
+	void ResetMeleeWinner();
 
 	/**
 	 * 服务器专用: 重置 RoundWinner 为 None (新小局开始 / 模式切换)

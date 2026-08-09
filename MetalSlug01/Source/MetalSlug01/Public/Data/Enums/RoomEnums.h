@@ -95,3 +95,33 @@ enum class EHASResult : uint8
 	HasAliveHuman	UMETA(DisplayName = "有人类活着"),
 	NoAliveHuman	UMETA(DisplayName = "无人存活")
 };
+
+/**
+ * @enum EMeleeWinner (v218 大厂架构新增)
+ * @brief 刀战模式本局赢家 — 与生化模式 EZombieRoundWinner 分离,语义更清晰
+ *
+ * 业务规则 (用户 2026.08.07 明确):
+ *   - 倒计时结束 (Text_RoundCountdown 归零) → 比 AttackerTotalKills vs DefenderTotalKills
+ *   - AttackerTotalKills > DefenderTotalKills → 攻方胜 (Offense 阵营)
+ *   - DefenderTotalKills > AttackerTotalKills → 守方胜 (Defense 阵营)
+ *   - 双方相等 → 平局
+ *   - 一整局定胜负,无下一小局 (与生化模式区分)
+ *
+ * 大厂原则 — 模式分离:
+ *   - 不复用 EZombieRoundWinner (后者语义是"人 vs 母体",不适用刀战"攻 vs 守")
+ *   - GameState.MeleeWinner (Replicated) 是刀战唯一字段,UI 订阅
+ *   - 不允许其他类创建自定义"哪边赢"判定 — 全部走 URoomLifecycleSubsystem::FinishMeleeMatch → SetMeleeWinner
+ *
+ * 大厂原则 — 零兜底:
+ *   - None 用于"尚未结算", 调用方拒绝基于 None 触发后续逻辑
+ *   - 业务流程强制要求 MeleeWinner 必为 Attacker 或 Defender, 不允许 None 进入"结算页"
+ *   - 平局 (Draw) 是合法业务结果, UI 可显示"平局"
+ */
+UENUM(BlueprintType)
+enum class EMeleeWinner : uint8
+{
+	None		UMETA(DisplayName = "尚未结算"),
+	Attacker	UMETA(DisplayName = "攻方胜 (Offense)"),
+	Defender	UMETA(DisplayName = "守方胜 (Defense)"),
+	Draw		UMETA(DisplayName = "平局 (双方击杀数相等)")
+};
