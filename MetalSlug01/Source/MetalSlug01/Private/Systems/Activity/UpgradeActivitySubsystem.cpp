@@ -180,18 +180,40 @@ void UUpgradeActivitySubsystem::ReloadLatestRecord()
 }
 
 /**
- * @brief 获取活动配置数据
- * @return 指向ActivityID=110的配置数据指针，如果找不到则返回nullptr
- * @details 从缓存的配置表中查找指定活动ID的配置信息：
- * 1. 首先检查配置表是否已加载
- * 2. 遍历配置表的所有行数据
- * 3. 查找ActivityID等于110的记录
- * 4. 返回找到的配置数据指针
- * @note 使用缓存机制避免重复加载，提高性能
+ * @brief 【v217 DEPRECATED for task fields】获取 MainConfig (ActivityID=110 的第一行)
+ * @return 指向 ActivityID=110 的配置数据指针；如果找不到则返回 nullptr
+ *
+ * @warning 【v217 SSOT 警告】严禁用于以下 day-specific 字段:
+ *          - TaskTypes
+ *          - TaskDescriptions
+ *          - TaskRelatedValues
+ *          - GameModes
+ *          - RewardItemIDs
+ *          - RewardItemCounts
+ *          原因: 这些字段的 day-specific 版本 (ActivityID=102, DayIdentifier=dayX) 才是 UI 渲染/数据初始化的真相源.
+ *          MainConfig 的这些字段要么为空、要么语义不同 (例如 RewardItemIDs 在 MainConfig 是"全局宝箱列表",
+ *          在 day-specific Config 是"per-task 宝箱列表"),混用会产生数据不一致.
+ *          → 业务 API 必须改用 GetExtraConfigForSpecificDay(DayNumber).
+ *
+ * @warning 【v217 零兜底】严禁在找不到 day-specific Config 时回退到本 API 作为兜底.
+ *          找不到 day-specific Config 应直接 Log Error + return, 强制修复 DT_DailyUpgradeRewardConfigRow 缺行.
+ *
+ * @note 允许用途 (MainConfig 字段访问):
+ *       - BonusDescription / BonusDurationHours / BonusCount / BonusIDs (全局限时加成元数据)
+ *       - RewardItemIDs.Num() 用于宝箱 UI 数量固定初始化 (前提是 day-specific Config 不参与)
+ *       - GetChestBoxIcons / GetChestCount 等全局宝箱图标 API
+ *       - InitializeTodayRecordData 里的"备用"字段 (例如 day1 Config 缺失时的临时回退, 已废弃)
+ *
+ * @note 性能: 使用缓存机制避免重复加载
  */
 const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetActivityConfig()
 {
-    if (!CachedConfigTable) return nullptr;
+    if (!CachedConfigTable)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] GetActivityConfig: CachedConfigTable 为空, 无法查找 ActivityID=110."));
+        return nullptr;
+    }
     static const FString ContextString(TEXT("UpgradeSubsystem"));
 
     // 封装重复的 RowMap 遍历逻辑 - 遍历配置表查找目标活动
@@ -310,9 +332,19 @@ void UUpgradeActivitySubsystem::UpdateTaskProgress(int32 TaskIndex, int32 Count)
  */
 bool UUpgradeActivitySubsystem::ClaimTaskReward(int32 TaskIndex)
 {
-    const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
+    // 🔧【v217 SSOT 重构】统一用 day-specific Config, 不再用 MainConfig 第一行
+    // 大厂原则: SSOT - TaskTypes / TaskDescriptions / TaskRelatedValues 必须从 day-specific Config 读
+    // 旧实现 GetActivityConfig() 返回 ActivityID=110 的第一行, 其 TaskTypes 数组可能为空,
+    // 导致 TaskIndex 边界检查永远越界 → 领取永远失败 → 按钮状态永不更新 (v216 bug)
+    // 当前 CurrentRecord.GetDayNumber() → 构造 day%d → 找 ActivityID=102 的 day-specific Config
+    const int32 CurrentDayNumber = CurrentRecord.GetDayNumber();
+    const FDailyUpgradeRewardConfigRow* Config = GetExtraConfigForSpecificDay(CurrentDayNumber);
     if (!Config)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskReward: 找不到 Day=%d 的 Config (DayIdentifier=day%d, ActivityID=102). "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 day%d 行. 拒绝领取."),
+            CurrentDayNumber, CurrentDayNumber, CurrentDayNumber);
         return false;
     }
 
@@ -361,6 +393,123 @@ bool UUpgradeActivitySubsystem::ClaimTaskReward(int32 TaskIndex)
 }
 
 /**
+ * @brief UUpgradeActivitySubsystem::ClaimTaskRewardForDay
+ *
+ * 流程 (与 ClaimTaskReward 一致, 但基于 GetRecordByDate):
+ * 1. 防御: Config / DayRecord
+ * 2. 验证 TaskIndex 范围
+ * 3. 验证未领取 (防重复)
+ * 4. 验证 TaskCompleteCounts >= TaskRelatedValues (任务完成度)
+ * 5. TaskClaimStatus[TaskIndex] = 1 (数组不足自动扩容)
+ * 6. MutableRecord.LastUpdateTime = Now
+ * 7. AddOrUpdateRecord(DayNumber, MutableRecord) 持久化
+ * 8. 如果当前 CurrentRecord 是同一 day, 同步更新 CurrentRecord
+ *
+ * @param DayNumber 天数 (1-based)
+ * @param TaskIndex 任务索引
+ * @return 是否领取成功
+ */
+bool UUpgradeActivitySubsystem::ClaimTaskRewardForDay(int32 DayNumber, int32 TaskIndex)
+{
+    // 防御: Config
+    // 🔧【v217 SSOT 重构】统一用 day-specific Config, 不再用 MainConfig 第一行
+    // 大厂原则: SSOT - TaskTypes / TaskDescriptions / TaskRelatedValues 必须从 day-specific Config 读
+    // 旧实现 GetActivityConfig() 返回 ActivityID=110 的第一行, 其 TaskTypes 数组可能为空,
+    // 导致 TaskIndex 边界检查永远越界 → 领取永远失败 → 按钮状态永不更新 (v216 bug)
+    const FDailyUpgradeRewardConfigRow* Config = GetExtraConfigForSpecificDay(DayNumber);
+    if (!Config)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: 找不到 Day=%d 的 Config (DayIdentifier=day%d, ActivityID=102). "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 day%d 行. 拒绝领取."),
+            DayNumber, DayNumber, DayNumber);
+        return false;
+    }
+
+    // 防御: DayRecord
+    const FUpgradeRewardSaveRecord* DayRecord = GetRecordByDate(DayNumber);
+    if (!DayRecord)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: 找不到 Day=%d 的记录"),
+            DayNumber);
+        return false;
+    }
+
+    // 验证 TaskIndex 范围
+    if (!IsValidIndex(TaskIndex, Config->TaskTypes.Num()))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: TaskIndex(%d) 超出 TaskTypes 数组范围 (%d)"),
+            TaskIndex, Config->TaskTypes.Num());
+        return false;
+    }
+
+    // 检查是否已领取 - 防止重复领取
+    if (DayRecord->TaskClaimStatus.IsValidIndex(TaskIndex) &&
+        DayRecord->TaskClaimStatus[TaskIndex] == 1)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: Day=%d, TaskIndex=%d 已领取, 跳过"),
+            DayNumber, TaskIndex);
+        return false;
+    }
+
+    // 检查任务完成度
+    const int32 RequiredCount = Config->TaskRelatedValues.IsValidIndex(TaskIndex)
+        ? Config->TaskRelatedValues[TaskIndex] : 0;
+    if (!DayRecord->TaskCompleteCounts.IsValidIndex(TaskIndex) ||
+        DayRecord->TaskCompleteCounts[TaskIndex] < RequiredCount)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: 任务未完成 Day=%d, TaskIndex=%d, 当前=%d, 需要=%d"),
+            DayNumber, TaskIndex,
+            DayRecord->TaskCompleteCounts.IsValidIndex(TaskIndex) ? DayRecord->TaskCompleteCounts[TaskIndex] : -1,
+            RequiredCount);
+        return false;
+    }
+
+    // 创建可修改副本
+    FUpgradeRewardSaveRecord MutableRecord = *DayRecord;
+
+    // 设置 TaskClaimStatus[TaskIndex] = 1 (数组不足自动扩容)
+    if (MutableRecord.TaskClaimStatus.IsValidIndex(TaskIndex))
+    {
+        MutableRecord.TaskClaimStatus[TaskIndex] = 1;
+    }
+    else
+    {
+        while (MutableRecord.TaskClaimStatus.Num() <= TaskIndex)
+        {
+            MutableRecord.TaskClaimStatus.Add(0);
+        }
+        MutableRecord.TaskClaimStatus[TaskIndex] = 1;
+    }
+
+    // 更新 LastUpdateTime
+    MutableRecord.LastUpdateTime = FDateTime::Now();
+
+    // 持久化: 写回 SaveGame->UpgradeRewardRecords map
+    AddOrUpdateRecord(DayNumber, MutableRecord);
+
+    // 如果这是 CurrentRecord 对应的 day, 同步更新 CurrentRecord
+    //   (CurrentRecord 应该是 map 中某项的引用, AddOrUpdateRecord 已更新引用,
+    //    这里仅做防御性同步, 避免引用失效)
+    if (DayNumber == CurrentRecord.GetDayNumber())
+    {
+        CurrentRecord = MutableRecord;
+    }
+
+    // 持久化保存到磁盘 (与 ClaimTaskReward 行为一致)
+    SaveStatus();
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[UUpgradeActivitySubsystem] ClaimTaskRewardForDay: 领取成功 Day=%d, TaskIndex=%d"),
+        DayNumber, TaskIndex);
+    return true;
+}
+
+/**
  * @brief 检查宝箱是否可以领取
  * @param ChestIndex 宝箱索引
  * @return 是否可以领取
@@ -372,24 +521,51 @@ bool UUpgradeActivitySubsystem::ClaimTaskReward(int32 TaskIndex)
  */
 bool UUpgradeActivitySubsystem::CanClaimChest(int32 ChestIndex) const
 {
-    const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
-    if (!Config)
+    // 🔧【v217 SSOT 重构】SSOT 边界明确化: ChestIndex 边界查 MainConfig (全局宝箱数),
+    // TaskRelatedValues[i] 查 day-specific Config (per-day 任务数值)
+    //
+    // 大厂原则: SSOT - 每个字段都有唯一的真相源
+    // - MainConfig.RewardItemIDs.Num() = 全局宝箱数 (FixedPrize 初始化时确定)
+    //   → ChestClaimStatus 数组初始化长度,ChestIndex 是这个数组的索引
+    // - ExtraConfig.TaskRelatedValues[i] = per-day 任务达成阈值
+    //   → CurrentRecord.TaskCompleteCounts[i] 与之对比
+    //
+    // 旧实现: 整个 Config = MainConfig,TaskRelatedValues[i] 从 MainConfig 取 → 跨语义数据污染
+
+    // SSOT-1: MainConfig 提供 ChestIndex 边界 (全局宝箱数)
+    const FDailyUpgradeRewardConfigRow* MainConfig = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
+    if (!MainConfig)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] CanClaimChest: 找不到 MainConfig (ActivityID=110), 拒绝检查."));
         return false;
+    }
 
     // 检查索引有效性 - 确保宝箱索引在配置范围内
-    if (!IsValidIndex(ChestIndex, Config->RewardItemIDs.Num()))
+    if (!IsValidIndex(ChestIndex, MainConfig->RewardItemIDs.Num()))
         return false;
 
     // 检查是否已领取 - 防止重复领取
-    if (IsValidIndex(ChestIndex, CurrentRecord.ChestClaimStatus.Num()) && 
+    if (IsValidIndex(ChestIndex, CurrentRecord.ChestClaimStatus.Num()) &&
         CurrentRecord.ChestClaimStatus[ChestIndex] == 1)
         return false;
+
+    // SSOT-2: day-specific Config 提供 per-day TaskRelatedValues (任务达成阈值)
+    const int32 CurrentDayNumber = CurrentRecord.GetDayNumber();
+    const FDailyUpgradeRewardConfigRow* DayConfig = const_cast<UUpgradeActivitySubsystem*>(this)->GetExtraConfigForSpecificDay(CurrentDayNumber);
+    if (!DayConfig)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] CanClaimChest: 找不到 Day=%d 的 day-specific Config, 拒绝检查任务完成度."),
+            CurrentDayNumber);
+        return false;
+    }
 
     // 检查任务完成情况 - 所有任务都必须完成才能领取宝箱
     for (int32 i = 0; i < CurrentRecord.TaskCompleteCounts.Num(); ++i)
     {
-        if (CurrentRecord.TaskCompleteCounts[i] < 
-            (Config->TaskRelatedValues.IsValidIndex(i) ? Config->TaskRelatedValues[i] : 0))
+        if (CurrentRecord.TaskCompleteCounts[i] <
+            (DayConfig->TaskRelatedValues.IsValidIndex(i) ? DayConfig->TaskRelatedValues[i] : 0))
         {
             return false;
         }
@@ -410,22 +586,31 @@ bool UUpgradeActivitySubsystem::CanClaimChest(int32 ChestIndex) const
  */
 bool UUpgradeActivitySubsystem::CanClaimTask(int32 TaskIndex) const
 {
-    const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
+    // 🔧【v217 SSOT 重构】任务检查必须用 day-specific Config
+    // 旧实现 GetActivityConfig() 返回 MainConfig, TaskTypes.Num() / TaskRelatedValues[i] 都是错的
+    // 改为 GetExtraConfigForSpecificDay(CurrentRecord.GetDayNumber())
+    const int32 CurrentDayNumber = CurrentRecord.GetDayNumber();
+    const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetExtraConfigForSpecificDay(CurrentDayNumber);
     if (!Config)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] CanClaimTask: 找不到 Day=%d 的 day-specific Config, 拒绝检查."),
+            CurrentDayNumber);
         return false;
+    }
 
     // 检查索引有效性 - 确保任务索引在配置范围内
     if (!IsValidIndex(TaskIndex, Config->TaskTypes.Num()))
         return false;
 
     // 检查是否已领取 - 防止重复领取
-    if (IsValidIndex(TaskIndex, CurrentRecord.TaskClaimStatus.Num()) && 
+    if (IsValidIndex(TaskIndex, CurrentRecord.TaskClaimStatus.Num()) &&
         CurrentRecord.TaskClaimStatus[TaskIndex] == 1)
         return false;
 
     // 检查任务完成度 - 验证是否满足领取条件
     if (!IsValidIndex(TaskIndex, CurrentRecord.TaskCompleteCounts.Num()) ||
-        CurrentRecord.TaskCompleteCounts[TaskIndex] < 
+        CurrentRecord.TaskCompleteCounts[TaskIndex] <
         (Config->TaskRelatedValues.IsValidIndex(TaskIndex) ? Config->TaskRelatedValues[TaskIndex] : 0))
         return false;
 
@@ -459,6 +644,88 @@ void UUpgradeActivitySubsystem::SaveStatus()
     }
     // 保存到磁盘
     UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
+}
+
+
+/**
+ * @brief 【v222 新增】一键重置整个 DailyUpgradeReward 页面所有活动进度
+ *
+ * 执行步骤 (严格顺序, 每步带日志):
+ *   1. 清空内存 AllRecords
+ *   2. 清空磁盘 SaveGame.UpgradeRewardRecords (先 LoadGameFromSlot, 避免清掉其他业务数据)
+ *   3. SaveGameToSlot 立即落盘
+ *   4. CreateTodayRecord() 重建 day1 (复用, 内部已含 day1 Config 零兜底校验)
+ *   5. Broadcast OnGlobalRefresh + OnRewardIconIndexChanged (UI 自动刷新)
+ *
+ * 大厂原则 (单一真理):
+ *   - 严禁在 ViewModel/Page 各自操作 AllRecords 或 SaveGame → 数据漂移
+ *   - 走与 ClaimTaskReward/ModifyCurrentExperience 相同的"Subsystem 写 -> 广播"路径
+ */
+bool UUpgradeActivitySubsystem::ResetAllUpgradeActivityProgress()
+{
+    UE_LOG(LogTemp, Log, TEXT("\n==========================================================="));
+    UE_LOG(LogTemp, Log, TEXT("🗑️ [v222] ResetAllUpgradeActivityProgress 开始"));
+    UE_LOG(LogTemp, Log, TEXT("==========================================================="));
+
+    // 步骤 1: 清空内存中所有 day 的记录
+    const int32 OldAllRecordsCount = AllRecords.Num();
+    AllRecords.Empty();
+    UE_LOG(LogTemp, Log,
+        TEXT("[v222] 步骤 1: 内存 AllRecords 已清空 (旧数量=%d)"),
+        OldAllRecordsCount);
+
+    // 步骤 2: 清空磁盘存档中的 UpgradeRewardRecords 字段
+    //   ⚠️ 仅清 UpgradeRewardRecords, 不动 SaveGame 的其它字段 (DailyLogin 等)
+    UActivitySaveGame* SaveGame = Cast<UActivitySaveGame>(
+        UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+    if (!SaveGame)
+    {
+        // 没有存档: 这是合法的 (新游戏可能根本没存档), 直接 NewObject 一个新存档对象
+        SaveGame = NewObject<UActivitySaveGame>();
+        UE_LOG(LogTemp, Warning,
+            TEXT("[v222] 步骤 2: 磁盘无存档, 已创建全新 UActivitySaveGame 对象"));
+    }
+
+    SaveGame->UpgradeRewardRecords.Empty();
+    UE_LOG(LogTemp, Log, TEXT("[v222] 步骤 2: 磁盘 SaveGame.UpgradeRewardRecords 已清空"));
+
+    // 步骤 3: 立即 SaveGameToSlot 写盘 (用户明确要求立即同步)
+    const bool bSaved = UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
+    if (!bSaved)
+    {
+        // 零兜底: 落盘失败必须显式 Log Error 并 return false, 不能吞错
+        UE_LOG(LogTemp, Error,
+            TEXT("[v222] 步骤 3 失败: SaveGameToSlot 失败 (Slot=%s, UserIndex=%d). "
+                 "内存已清空但磁盘未持久化, 异常状态!"),
+            *SaveSlotName, SaveUserIndex);
+        return false;
+    }
+    UE_LOG(LogTemp, Log, TEXT("[v222] 步骤 3: 立即落盘成功 (Slot=%s)"), *SaveSlotName);
+
+    // 步骤 4: 重建 day1 (复用现有 CreateTodayRecord, 内部含 day1 Config 零兜底)
+    //   CreateTodayRecord 内: SetRecordDate(1) + InitializeTodayRecordData() + AllRecords.Add(1, ...)
+    CreateTodayRecord();
+    if (!AllRecords.Contains(1))
+    {
+        // CreateTodayRecord 内部 InitializeTodayRecordData 因 day1 Config 缺失而 Log Error return;
+        // AllRecords 仍未添加 day1 → 函数失败
+        UE_LOG(LogTemp, Error,
+            TEXT("[v222] 步骤 4 失败: CreateTodayRecord 未生成 day1 记录. "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 day1 行 (ActivityID=102, DayIdentifier=day1)."));
+        return false;
+    }
+    UE_LOG(LogTemp, Log, TEXT("[v222] 步骤 4: day1 重建完成 (AllRecords.Num()=%d)"), AllRecords.Num());
+
+    // 步骤 5: 广播刷新事件 (与 ForceRefreshAllPages 同源事件)
+    OnGlobalRefresh.Broadcast();
+    OnRewardIconIndexChanged.Broadcast(CurrentRecord.RewardIconIndex);
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[v222] ResetAllUpgradeActivityProgress 完成: 旧 %d 条记录已清空, day1 已重建, 磁盘已同步"),
+        OldAllRecordsCount);
+    UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
+
+    return true;
 }
 
 
@@ -506,34 +773,34 @@ void UUpgradeActivitySubsystem::CreateTodayRecord()
  */
 void UUpgradeActivitySubsystem::InitializeTodayRecordData()
 {
-    // 获取主配置数据 (ActivityID=110)
-    const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
-    if (!MainConfig)
-    {
-        return;
-    }
-
-    // 获取额外配置数据 (ActivityID=102, DayIdentifier=day1)
+    // 🔧【v217 SSOT 重构】day-specific Config 是任务数组的唯一真相源
+    // 大厂原则: SSOT - 任务相关数组长度必须从 day1 的 day-specific Config 读
+    // 旧实现用 GetExtraConfigForDay1() 失败时 fallback 到 MainConfig->TaskTypes.Num(),
+    //   这是兜底行为,违反零兜底原则;且两个 Config 字段可能不一致 → 数据漂移.
+    // 当前: ExtraConfig 找不到直接 Log Error + return, 强制修复 DT 缺 day1 行.
     const FDailyUpgradeRewardConfigRow* ExtraConfig = GetExtraConfigForDay1();
     if (!ExtraConfig)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] InitializeTodayRecordData: 找不到 day1 的 day-specific Config (ActivityID=102, DayIdentifier=day1). "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 day1 行. 拒绝初始化."));
+        return;
     }
 
-    // 初始化任务相关数组 - 根据ActivityID=102的GameModes数组长度创建
+    // 初始化任务相关数组 - 根据 day1 day-specific Config 的 GameModes 数组长度创建
     CurrentRecord.TaskCompleteCounts.Empty();
     CurrentRecord.TaskClaimStatus.Empty();
 
-    int32 TaskCount = 0;
-    if (ExtraConfig && ExtraConfig->GameModes.Num() > 0)
+    // 🔧【v217 零兜底】day1 Config 必须有 GameModes 配置, 不允许 fallback 到 MainConfig
+    if (ExtraConfig->GameModes.Num() == 0)
     {
-        // 使用ActivityID=102的GameModes数组长度
-        TaskCount = ExtraConfig->GameModes.Num();
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] InitializeTodayRecordData: day1 Config 的 GameModes 数组为空 (Num=0). "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 中 day1 行的 GameModes 配置. 拒绝初始化."));
+        return;
     }
-    else if (MainConfig->TaskTypes.Num() > 0)
-    {
-        // 回退到主配置的TaskTypes长度
-        TaskCount = MainConfig->TaskTypes.Num();
-    }
+
+    const int32 TaskCount = ExtraConfig->GameModes.Num();
 
     // 为每个任务创建对应的计数和状态记录（初始化为0）
     for (int32 i = 0; i < TaskCount; ++i)
@@ -542,9 +809,20 @@ void UUpgradeActivitySubsystem::InitializeTodayRecordData()
         CurrentRecord.TaskClaimStatus.Add(0);
     }
 
-    // 初始化宝箱相关数组 - 根据ActivityID=110的RewardItemIDs数组长度创建
+    // 初始化宝箱相关数组 - 根据 MainConfig (ActivityID=110) 的 RewardItemIDs 数组长度创建
+    // 🔧【v217 SSOT】ChestClaimStatus 数组长度 = MainConfig.RewardItemIDs.Num() (全局宝箱数)
+    //   与任务数组 (ExtraConfig.GameModes.Num()) 是两个独立的真相源, 不能混用
+    const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
+    if (!MainConfig)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] InitializeTodayRecordData: 找不到 MainConfig (ActivityID=110). "
+                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 ActivityID=110 行. 拒绝初始化宝箱数组."));
+        return;
+    }
+
     CurrentRecord.ChestClaimStatus.Empty();
-    int32 ChestCount = MainConfig->RewardItemIDs.Num();
+    const int32 ChestCount = MainConfig->RewardItemIDs.Num();
     for (int32 i = 0; i < ChestCount; ++i)
     {
         CurrentRecord.ChestClaimStatus.Add(0);
@@ -982,6 +1260,66 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardIconIndex() const
 }
 
 /**
+ * 【v218 新增】获取当前选中的 RewardText 数量 (ItemCount)
+ * 大厂原则 SSOT 链路:
+ *   MainConfig.RewardItemIDs.Last() → BoxID
+ *   → UActivitySubsystem::GetTreasureBoxItemsByBoxID(BoxID)
+ *   → TreasureBoxItems[CurrentRecord.RewardIconIndex].ItemCount
+ *
+ * 零兜底: 任何一步失败返回 -1 + Log Error; 调用方必须显式处理.
+ */
+int32 UUpgradeActivitySubsystem::GetCurrentRewardItemCount() const
+{
+    // 1. 取 MainConfig (FixedPrize 域, GetActivityConfig 合法用途 - 见头文件 SSOT 注释)
+    const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
+    if (!Config || Config->RewardItemIDs.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetCurrentRewardItemCount: 找不到 MainConfig 或 RewardItemIDs 为空, 返回 -1."));
+        return -1;
+    }
+
+    // 2. 最后一个 RewardItemID 即 BoxID (与 GetRewardItemIcons / UpdateRewardIconIndexAndSave 保持一致)
+    const int32 BoxID = FCString::Atoi(*Config->RewardItemIDs.Last());
+    if (BoxID <= 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetCurrentRewardItemCount: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回 -1."),
+            *Config->RewardItemIDs.Last());
+        return -1;
+    }
+
+    // 3. 拿 TreasureBoxItems
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
+    if (!ActivitySub)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetCurrentRewardItemCount: 拿不到 UActivitySubsystem, 返回 -1."));
+        return -1;
+    }
+
+    const TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+    if (TreasureBoxItems.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetCurrentRewardItemCount: BoxID=%d 查不到任何 TreasureBoxItem, 返回 -1."), BoxID);
+        return -1;
+    }
+
+    // 4. 按当前 RewardIconIndex 取 ItemCount
+    const int32 CurrentIconIndex = CurrentRecord.RewardIconIndex;
+    if (!IsValidIndex(CurrentIconIndex, TreasureBoxItems.Num()))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetCurrentRewardItemCount: RewardIconIndex=%d 越界 (TreasureBoxItems.Num()=%d), 返回 -1."),
+            CurrentIconIndex, TreasureBoxItems.Num());
+        return -1;
+    }
+
+    return TreasureBoxItems[CurrentIconIndex]->ItemCount;
+}
+
+/**
  * @brief 设置奖励图标索引
  * @param NewIndex 新的索引值
  * @return 是否设置成功
@@ -1206,6 +1544,12 @@ void UUpgradeActivitySubsystem::CreateInheritedRecord(const FUpgradeRewardSaveRe
     AllRecords.Add(CurrentRecord.GetDayNumber(), CurrentRecord);
 }
 
+/**
+ * @brief 获取宝箱数量
+ * @details 🔧【v217 SSOT 边界】此 API 属于 FixedPrize (固定奖) UI, MainConfig 访问是合理的
+ *          MainConfig.RewardItemIDs 是全局宝箱列表 (固定 3 个),
+ *          不应与 day-specific 的 RewardItemIDs (per-task 宝箱列表) 混用
+ */
 FString UUpgradeActivitySubsystem::GetChestCount()
 {
     // 1. 获取活动配置数据 (ActivityID=110)

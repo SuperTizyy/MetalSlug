@@ -23,6 +23,7 @@ class UButton;
 class UTextBlock;
 class UImage;
 class UProgressBar;
+class USizeBox;
 
 
 /**
@@ -91,6 +92,19 @@ public:
 	/** 经验值文本（如 "0/100"） */
 	UPROPERTY(meta = (BindWidget))
 	UTextBlock* ExperienceText;
+
+	// ==========================================
+	// 2.5 Slots 专用 SizeBox (2026-08-10)
+	// ==========================================
+	// 用途: 承载 WBP_FixedPrizeWidget 的 "SizeBox 控件" 引用 (ItemsScrollBox 动态生成的子项专用)
+	//      页面单独绑定的 FixedPrizeWidget 不需要设 Padding, 仅 ItemsScrollBox 里的子项需要 Top=28/Bottom=80
+	// 调用方: UDailyUpgradeRewardPage::InitializeExperienceChestWidgets
+	//        在 AddChild 后调用 SetPrizeSlotPadding(Top, Bottom)
+	// ⚠️ 不允许兜底: SizeBoxPrizeSlot 为 null 必须 Log Error + 不调 SetPadding (避免静默失败)
+
+	/** WBP_FixedPrizeWidget 蓝图内的 SizeBox 控件引用 */
+	UPROPERTY(meta = (BindWidget))
+	USizeBox* SizeBoxPrizeSlot;
 
 	// ==========================================
 	// 3. 数据管理
@@ -170,6 +184,29 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Experience Chest")
 	void SetChestIndex(int32 Index);
+
+	// ==========================================
+	// 2.6 容器布局 API (2026-08-10)
+	// ==========================================
+
+	/**
+	 * @brief 设置 WBP_FixedPrizeWidget 内 SizeBox 的 Padding (Top + Bottom + Right)
+	 * @details 容器 (UScrollBox) 中子项的上下右内边距, 用于调整子项视觉布局
+	 *
+	 * 调用场景:
+	 *  - 仅 UDailyUpgradeRewardPage::InitializeExperienceChestWidgets 调用
+	 *  - 页面单独 FixedPrizeWidget (右侧大宝箱) 不调用 (布局由蓝图控制)
+	 *
+	 * @param PaddingTop    SizeBox 顶部内边距 (像素, >= 0)
+	 * @param PaddingBottom SizeBox 底部内边距 (像素, >= 0)
+	 * @param PaddingRight  SizeBox 右侧内边距 (像素, >= 0)
+	 *
+	 * ⚠️ 零兜底原则:
+	 *  - SizeBoxPrizeSlot 为 null: Log Error + return (不静默吞错)
+	 *  - 参数 < 0: Log Error + return (不允许负值)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Experience Chest|Layout")
+	void SetPrizeSlotPadding(float PaddingTop, float PaddingBottom, float PaddingRight);
 
 	/**
 	 * @delegate FOnChestClaimRequested

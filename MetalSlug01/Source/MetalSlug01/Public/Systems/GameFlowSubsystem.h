@@ -102,6 +102,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MetalSlug|GameFlow")
 	void TransitToState(EMatchState NewState);
 
+	// 【v228 调试用】内部重载：C++ 调用点用此版本（Blueprint 无需感知 CallerSite）
+	void TransitToState(EMatchState NewState, const TCHAR* CallerSite);
+
 	/**
 	 * @brief 获取当前的游戏链路状态
 	 * @return CurrentState 当前状态

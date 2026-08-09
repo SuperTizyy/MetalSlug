@@ -263,6 +263,12 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 		// 改造: 走 FActivityDataTableService, 避免硬编码路径
 		UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
 
+		if (!ActivityInfoTable)
+		{
+			// ⚠️ DataTable 缺失防御: 必须显式返回 nullptr (CreateNavItemButton 返回 UActivityNavButton*)
+			return nullptr;
+		}
+
 		// 初始化显示标题和图标
 		FText DisplayTitle = FText::GetEmpty();
 		UTexture2D* IconTexture = nullptr;
@@ -279,21 +285,16 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 			// 查找活动信息
 			FActivityInfoRow* ActivityInfo = ActivityInfoTable->FindRow<FActivityInfoRow>(RowName, ContextString);
 
-			// 备用方案: 全表遍历
+			// 备用方案: 用 FindRowByIdSafe 全表遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
 			if (!ActivityInfo)
 			{
-				// 获取所有行
-				TArray<FActivityInfoRow*> AllRows;
-				ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-				// 遍历所有行寻找匹配的活动 ID
-				for (FActivityInfoRow* Row : AllRows)
-				{
-					if (Row && Row->ActivityID == TargetActivityId)
-					{
-						ActivityInfo = Row;
-						break;
-					}
-				}
+				ActivityInfo = const_cast<FActivityInfoRow*>(
+					FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+						ActivityDataTable::ActivityInfo,
+						[](const FActivityInfoRow& Row) { return Row.ActivityID; },
+						TargetActivityId
+					)
+				);
 			}
 
 			if (ActivityInfo)
@@ -686,17 +687,17 @@ void UActivityNavMenuWidget::LoadNavItemsFromDataTable()
 	}
 
 
-	// 获取所有行数据
-	static const FString ContextString(TEXT("NavMenuContext"));
-	TArray<FActivityInfoRow*> AllRows;
-	ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-
+	// 用 GetRowsSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
+	const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+		ActivityDataTable::ActivityInfo,
+		[](const FActivityInfoRow& Row) { return Row.ActivityType == EActivityType::CategoryHeader; }
+	);
 
 	// 清空现有的导航项数组
 	NavItems.Empty();
 
 	// 筛选出导航项（CategoryHeader 类型）
-	for (FActivityInfoRow* Row : AllRows)
+	for (const FActivityInfoRow* Row : AllRows)
 	{
 		if (Row && Row->ActivityType == EActivityType::CategoryHeader)
 		{
@@ -749,17 +750,17 @@ void UActivityNavMenuWidget::LoadAllActivityItemsFromDataTable()
 	}
 
 
-	// 获取所有行数据
-	static const FString ContextString(TEXT("NavMenuContext"));
-	TArray<FActivityInfoRow*> AllRows;
-	ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-
+	// 用 GetRowsSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
+	const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+		ActivityDataTable::ActivityInfo,
+		[](const FActivityInfoRow& Row) { return true; } // 不过滤, 收集所有行
+	);
 
 	// 清空现有的导航项数组
 	NavItems.Empty();
 
 	// 为每一行创建导航项（显示所有活动，而不仅仅是 CategoryHeader 类型）
-	for (FActivityInfoRow* Row : AllRows)
+	for (const FActivityInfoRow* Row : AllRows)
 	{
 		if (Row)
 		{
@@ -813,21 +814,16 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 		// 尝试通过行名直接查找活动信息
 		FActivityInfoRow* ActivityInfo = ActivityInfoTable->FindRow<FActivityInfoRow>(RowName, ContextString);
 
-		// 备用方案: 如果直接查找失败，则遍历整个表
+		// 备用方案: 用 FindRowByIdSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
 		if (!ActivityInfo)
 		{
-			// 获取所有行
-			TArray<FActivityInfoRow*> AllRows;
-			ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-			// 遍历所有行寻找匹配的活动 ID
-			for (FActivityInfoRow* Row : AllRows)
-			{
-				if (Row && Row->ActivityID == TargetActivityId)
-				{
-					ActivityInfo = Row;
-					break;
-				}
-			}
+			ActivityInfo = const_cast<FActivityInfoRow*>(
+				FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+					ActivityDataTable::ActivityInfo,
+					[](const FActivityInfoRow& Row) { return Row.ActivityID; },
+					TargetActivityId
+				)
+			);
 		}
 
 		// 如果找到了活动信息且显示名称不为空，则返回该名称
@@ -858,15 +854,15 @@ FName UActivityNavMenuWidget::GetDefaultSelectedActivityId()
 
 	if (ActivityInfoTable)
 	{
-		// 定义查找上下文字符串
-		static const FString ContextString(TEXT("NavMenuContext"));
-		// 创建行数组存储所有数据
-		TArray<FActivityInfoRow*> AllRows;
-		// 获取数据表中的所有行
-		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
+		// 用 FindRowByIdSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
+		// 仅查找 bIsDefaultSelected 为 true 的第一行
+		const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+			ActivityDataTable::ActivityInfo,
+			[](const FActivityInfoRow& Row) { return Row.bIsDefaultSelected; }
+		);
 
 		// 遍历所有行，查找设置了默认选中的活动
-		for (FActivityInfoRow* Row : AllRows)
+		for (const FActivityInfoRow* Row : AllRows)
 		{
 			// 检查行是否有效且设置了默认选中标志
 			if (Row && Row->bIsDefaultSelected)
@@ -1032,24 +1028,18 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 		else
 		{
 			// 从 DataTable 中查找对应 ActivityID 的配置
-			static const FString ContextString(TEXT("ActivityNavContext"));
-			TArray<FActivityInfoRow*> AllRows;
-			ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
+			// 用 FindRowByIdSafe 防御性查找 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
 
-			FActivityInfoRow* TargetConfig = nullptr;
 			// 将活动 ID 转换为整数
 			int32 TargetActivityId = FCString::Atoi(*ActivityId.ToString());
 
-			// 遍历所有行，查找匹配的活动配置
-			for (FActivityInfoRow* Row : AllRows)
-			{
-				if (Row && Row->ActivityID == TargetActivityId)
-				{
-					// 找到目标配置
-					TargetConfig = Row;
-					break;
-				}
-			}
+			FActivityInfoRow* TargetConfig = const_cast<FActivityInfoRow*>(
+				FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+					ActivityDataTable::ActivityInfo,
+					[](const FActivityInfoRow& Row) { return Row.ActivityID; },
+					TargetActivityId
+				)
+			);
 
 			if (!TargetConfig)
 			{

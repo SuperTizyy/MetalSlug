@@ -36,7 +36,7 @@
  *
  * 1. 缓存 ActivitySub 弱引用
  * 2. 绑定 ActivitySub->OnActivityDataChanged -> RefreshRewardList
- * 3. 绑定 ClaimAllButton
+ * 3. 绑定 ClaimAllButton + ResetProgressButton
  * 4. Log 输出所有 TSubclassOf 设置状态
  * 5. 首次 RefreshRewardList
  * 6. SetTimerForNextTick 延迟 ScrollToCurrentDay（保证布局完成）
@@ -65,7 +65,6 @@ void UDailyLoginPage::NativeConstruct()
 	}
 
 	// 绑定全部领取按钮点击事件
-	// // UE_LOG(LogTemp, Warning, TEXT("检查ClaimAllButton是否存在: %s"), ClaimAllButton ? TEXT("存在") : TEXT("不存在"));
 	if (ClaimAllButton)
 	{
 		ClaimAllButton->OnClicked.AddDynamic(this, &UDailyLoginPage::OnClaimAllButtonClicked);
@@ -74,6 +73,16 @@ void UDailyLoginPage::NativeConstruct()
 	else
 	{
 		UE_LOG(LogTemp, Error, TEXT("ClaimAllButton为空！请检查蓝图中是否正确设置了按钮绑定"));
+	}
+
+	// 绑定重置领取进度按钮点击事件
+	if (ResetProgressButton)
+	{
+		ResetProgressButton->OnClicked.AddDynamic(this, &UDailyLoginPage::OnResetProgressButtonClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("ResetProgressButton为空！请检查蓝图中是否正确设置了按钮绑定"));
 	}
 
 	// 检查必要的类是否已设置
@@ -143,7 +152,14 @@ void UDailyLoginPage::NativeDestruct()
  *    d. Clear 旧绑定, AddDynamic(this, &HandleRewardClick)
  *    e. 判定 bIsSpecial: 检查当天是否有 bIsSpecialReward = true 的奖励
  *    f. NewItem->Init(i, Progress, State, bIsSpecial, ActivitySub)
- *    g. 特殊 -> BigRewardItemWidget, 普通 -> DayListScroll（FMargin(80) 间距）
+ *    g. 特殊 -> BigRewardItemWidget, 普通 -> DayListScroll（间距由蓝图 Slot 定义）
+ *
+ * [修复历史 v2026.08.12]
+ * 删除原本 SetPadding(FMargin(80.0f)) 的代码 — FMargin(float) 单参数构造导致
+ * 每个滚动条目 +80px 内边距（上下左右均 80），DayListScroll ContentSize 异常膨胀。
+ * 删除原本 3 处 SetRenderScale(1.5) + SetZOrder(1000) 的代码 — 让按钮占用 1.5 倍空间，
+ * 也贡献于尺寸异常。删除原本 3 处 SetFont Size 的代码 — 强行放大文本撑大条目 widget。
+ * 所有尺寸/间距/字号控制权交还蓝图 UMG 编辑器统一管理。
  * 6. 重新初始化 BigRewardItem（第 8 天）
  *    - 独立计算 State（基于 Progress 和 IsDayClaimed(8)）
  *    - Init(8, Progress, State, bIsSpecial)
@@ -243,20 +259,11 @@ void UDailyLoginPage::RefreshRewardList()
 					bHasBigReward = true;
 					// // UE_LOG(LogTemp, Warning, TEXT("第%d天是特殊奖励，将显示在大奖格子中"), i);
 				}
-				else
-				{
-					// 普通奖励: 统一添加到滚动列表中
-					// // UE_LOG(LogTemp, Warning, TEXT("第%d天是普通奖励，将添加到滚动列表中"), i);
-					UScrollBoxSlot* NewSlot = Cast<UScrollBoxSlot>(DayListScroll->AddChild(NewItem));
-					if (NewSlot)
-					{
-						NewSlot->SetPadding(FMargin(80.0f)); // 增大间距
-					}
-					else
-					{
-						DayListScroll->AddChild(NewItem);
-					}
-				}
+				// [修复] 删除原本 SetPadding(FMargin(80.0f)) 的代码 — FMargin(float) 单参数构造表示
+					// 「左/上/右/下 全部 80px」，会在滚动方向上每个条目 +80px 内边距，导致 DayListScroll
+					// 测得的 ContentSize 异常膨胀。原代码意图只是增大条目间距，应该交给蓝图 Widget 的
+					// Slot Padding 属性或 ScrollBox 的 Orientation 方向布局策略来处理，而不是 C++ 强行覆盖。
+					DayListScroll->AddChild(NewItem);
 
 				// 奖励图标加载已移到 Init 函数中自动处理
 			}
@@ -351,15 +358,8 @@ void UDailyLoginPage::RefreshRewardList()
 			// 降级方案: 如果 BigRewardItem 不是 DayItemWidget 类型，仍将原始的 BigRewardItemWidget 添加到滚动框
 			if (DayListScroll && BigRewardItemWidget)
 			{
-				UScrollBoxSlot* NewSlot = Cast<UScrollBoxSlot>(DayListScroll->AddChild(BigRewardItemWidget));
-				if (NewSlot)
-				{
-					NewSlot->SetPadding(FMargin(15.0f)); // 设置15像素间距
-				}
-				else
-				{
-					DayListScroll->AddChild(BigRewardItemWidget);
-				}
+				// [修复] 删除原本 SetPadding(FMargin(15.0f)) 的代码 — 同上, 间距交给蓝图处理。
+				DayListScroll->AddChild(BigRewardItemWidget);
 				BigRewardItemWidget->SetVisibility(ESlateVisibility::Visible);
 				BigRewardItemWidget->SetRenderOpacity(1.0f);
 
@@ -386,15 +386,8 @@ void UDailyLoginPage::RefreshRewardList()
 		// 降级方案: 添加到主滚动框
 		if (DayListScroll && BigRewardItemWidget)
 		{
-			UScrollBoxSlot* NewSlot = Cast<UScrollBoxSlot>(DayListScroll->AddChild(BigRewardItemWidget));
-			if (NewSlot)
-			{
-				NewSlot->SetPadding(FMargin(15.0f)); // 设置15像素间距
-			}
-			else
-			{
-				DayListScroll->AddChild(BigRewardItemWidget);
-			}
+			// [修复] 删除原本 SetPadding(FMargin(15.0f)) 的代码 — 同上, 间距交给蓝图处理。
+			DayListScroll->AddChild(BigRewardItemWidget);
 			BigRewardItemWidget->SetVisibility(ESlateVisibility::Visible);
 			BigRewardItemWidget->SetRenderOpacity(1.0f);
 
@@ -853,6 +846,44 @@ void UDailyLoginPage::OnClaimAllButtonClicked()
 	else
 	{
 		// UE_LOG(LogTemp, Warning, TEXT("没有可领取的奖励"));
+	}
+}
+
+
+/**
+ * UDailyLoginPage::OnResetProgressButtonClicked
+ *
+ * 重置领取进度按钮点击 — 大厂架构职责:
+ * 1. UI 层不做兜底 (没有 else / 没有 try-catch)
+ * 2. 唯一动作 = 通知 ActivitySubsystem
+ * 3. ActivitySubsystem::ResetPlayerRecord 内部:
+ *    - 委托 SaveModifier 重置存档 (Progress=1, 清空 ClaimedDays)
+ *    - 广播 OnActivityDataChanged → RefreshRewardList 自动刷新 UI
+ * 4. 不手动 RefreshRewardList — 这是大厂架构的反手关键点:
+ *    "按钮只通知业务层, UI 刷新是业务层广播触发的, 不在按钮里写"
+ *
+ * 错误处理:
+ * - ActivitySub 为 null 是开发者错误 (NativeConstruct 已绑), 必须暴露
+ * - 不用 silent return, 因为会掩盖 Blueprint 配错 / BindWidget 失败等上游问题
+ */
+void UDailyLoginPage::OnResetProgressButtonClicked()
+{
+	if (!ActivitySub)
+	{
+		// 大厂架构: 不静默吞错 — 暴露给开发者立即修
+		UE_LOG(LogTemp, Error,
+			TEXT("[DailyLoginPage] OnResetProgressButtonClicked: ActivitySubsystem 为 null. "
+				 "NativeConstruct 中应已通过 GameInstance->GetSubsystem 初始化. 请检查 Subsystem 注入流程."));
+		return;
+	}
+
+	// 单一入口: 重置后 UI 自动通过广播刷新, 此处不调 RefreshRewardList
+	const bool bSuccess = ActivitySub->ResetPlayerRecord(101, /*bAutoSave=*/true);
+	if (!bSuccess)
+	{
+		// SaveModifier 内部已 Log Error (SaveGame 获取失败 / 存档损坏)
+		// UI 层不再二次 Log, 避免重复日志
+		UE_LOG(LogTemp, Warning, TEXT("[DailyLoginPage] 重置玩家领取进度返回 false, 详见上方 Modify 日志. ActivityID=101"));
 	}
 }
 

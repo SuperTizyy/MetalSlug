@@ -520,8 +520,32 @@ void UGameFlowSubsystem::BootToLogin()
  * 3. 广播 OnStateChanged 事件
  * 4. 调用 HandleStateEntry() 执行底层物理操作
  */
+// 【Blueprint 入口】无 CallerSite，供蓝图调用（UHT 解析用）
 void UGameFlowSubsystem::TransitToState(EMatchState NewState)
 {
+	// Blueprint 层不关心 caller，直接转发给内部实现
+	TransitToState(NewState, TEXT("(Blueprint)"));
+}
+
+void UGameFlowSubsystem::TransitToState(EMatchState NewState, const TCHAR* CallerSite)
+{
+	// ==========================================
+	// [DEBUG-v228] TransitToState 入口 trace — 定位异常 Broadcast(2) 的 caller
+	// ==========================================
+	// 背景: __FUNCTION__ 在被调函数体内只能输出函数自身, 无法显示调用方
+	// 修复: TransitToState 加了 CallerSite 参数, 所有调用点显式传入 __FUNCTION__
+	//       → 从此 caller 100% 可定位
+	// 字段: CurrentState/NewState/Name/bHasBootedToLogin/PendingPostLoadState/CallerSite/ThreadId
+	// ==========================================
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[DEBUG-v228][TransitToState-ENTRY] Thread=%u CallerSite=%s CurrentState=%d NewState=%d (Name=%s) bHasBootedToLogin=%s PendingPostLoadState=%d"),
+		FPlatformTLS::GetCurrentThreadId(),
+		CallerSite,
+		(int32)CurrentState, (int32)NewState,
+		*UEnum::GetValueAsString(NewState),
+		bHasBootedToLogin ? TEXT("true") : TEXT("false"),
+		(int32)PendingPostLoadState);
+
 	// ==========================================
 	// 【安全防御】防止同一状态被重复调用
 	// ==========================================
@@ -876,6 +900,14 @@ void UGameFlowSubsystem::HandlePostLoadMapWithWorld(UWorld* LoadedWorld)
 		UE_LOG(LogGameFlow, Log,
 			TEXT("[DEBUG-S7-A][PathA-Broadcast] WorldName=%s Desired=%d (Name=%s) → 强制 Broadcast"),
 			LoadedWorld ? *LoadedWorld->GetMapName() : TEXT("NULL"), (int32)Desired, *DesiredName);
+		// [DEBUG-v228] PathA 强制广播前 trace
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[DEBUG-v228][PathA-FORCE-Broadcast] Thread=%u Caller=%s WorldName=%s CurrentState=%d Desired=%d (Name=%s) bHasBootedToLogin=%s"),
+			FPlatformTLS::GetCurrentThreadId(),
+			ANSI_TO_TCHAR(__FUNCTION__),
+			LoadedWorld ? *LoadedWorld->GetMapName() : TEXT("NULL"),
+			(int32)CurrentState, (int32)Desired, *DesiredName,
+			bHasBootedToLogin ? TEXT("true") : TEXT("false"));
 		OnStateChanged.Broadcast(Desired);
 		return;
 	}
@@ -954,6 +986,13 @@ void UGameFlowSubsystem::HandlePostLoadMapWithWorld(UWorld* LoadedWorld)
 		WorldName.Contains(TEXT("Room")) ||
 		WorldName.Contains(TEXT("Battle")) ||
 		WorldName.Contains(TEXT("Combat"));
+	// [DEBUG-v228] PathB 战斗地图自愈入口 trace
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[DEBUG-v228][PathB-BattleMapCheck] Thread=%u Caller=%s WorldName=%s bIsBattleMapWorld=%s CurrentState=%d (Name=%s)"),
+		FPlatformTLS::GetCurrentThreadId(),
+		ANSI_TO_TCHAR(__FUNCTION__),
+		*WorldName, bIsBattleMapWorld ? TEXT("true") : TEXT("false"),
+		(int32)CurrentState, *CurName);
 	if (bIsBattleMapWorld && CurrentState != EMatchState::InRoom)
 	{
 		const FString CurName2 = UEnum::GetValueAsString(CurrentState);
@@ -1032,6 +1071,15 @@ void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
 		bHasPendingStateOnNextLoad = false;
 		PendingPostLoadState = EMatchState::PreLogin;
 
+		// [DEBUG-v228] OnWorldBeginPlay 路径 1 入口 trace
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[DEBUG-v228][OnWorldBeginPlay-Path1] Thread=%u Caller=%s WorldName=%s bHasPendingStateOnNextLoad=true Desired=%d (Name=%s) CurrentState=%d"),
+			FPlatformTLS::GetCurrentThreadId(),
+			ANSI_TO_TCHAR(__FUNCTION__),
+			*World->GetMapName(),
+			(int32)Desired, *UEnum::GetValueAsString(Desired),
+			(int32)CurrentState);
+
 		if (Desired == EMatchState::PreLogin)
 		{
 			// 落到 BootToLogin 默认路径
@@ -1043,6 +1091,13 @@ void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
 		UE_LOG(LogGameFlow, Log,
 			TEXT("[GameFlow] OnWorldBeginPlay (PIE 入口 B): 消费预约状态 %d (Name=%s), 覆盖默认 Login"),
 			(int32)Desired, *DesiredName);
+
+		// [DEBUG-v228] OnWorldBeginPlay 路径 1 强制 Broadcast 前 trace
+		UE_LOG(LogGameFlow, Log,
+			TEXT("[DEBUG-v228][OnWorldBeginPlay-Path1-FORCE-Broadcast] Thread=%u Caller=%s CurrentState=%d → Desired=%d (Name=%s)"),
+			FPlatformTLS::GetCurrentThreadId(),
+			ANSI_TO_TCHAR(__FUNCTION__),
+			(int32)CurrentState, (int32)Desired, *DesiredName);
 
 		// 绕过 TransitToState 幂等保护, 强制 Broadcast (同 PostLoadMap 路径 A 逻辑)
 		CurrentState = Desired;
@@ -1088,6 +1143,16 @@ void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
 		WorldName.Contains(TEXT("Room")) ||
 		WorldName.Contains(TEXT("Battle")) ||
 		WorldName.Contains(TEXT("Combat"));
+
+	// [DEBUG-v228] OnWorldBeginPlay 路径 3 入口 trace (WorldName/bIsBattleMapWorld 提前到这里)
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[DEBUG-v228][OnWorldBeginPlay-Path3-ENTRY] Thread=%u Caller=%s WorldName=%s CurrentState=%d (Name=%s) bIsBattleMapWorld=%s bHasBootedToLogin=%s"),
+		FPlatformTLS::GetCurrentThreadId(),
+		ANSI_TO_TCHAR(__FUNCTION__),
+		*WorldName,
+		(int32)CurrentState, *CurName,
+		bIsBattleMapWorld ? TEXT("true") : TEXT("false"),
+		bHasBootedToLogin ? TEXT("true") : TEXT("false"));
 	// 【v54.5 关键修复】排除 Login 状态 — Login 是启动过渡态, 战斗地图自愈不应干预
 	if (bIsBattleMapWorld && CurrentState > EMatchState::Login && CurrentState != EMatchState::InRoom)
 	{
@@ -1100,6 +1165,12 @@ void UGameFlowSubsystem::HandleWorldBeginPlay(UWorld* World)
 	}
 
 	// 主动 Broadcast (覆盖 UIViewService 因时序问题没拉起的边缘场景)
+	// [DEBUG-v228] OnWorldBeginPlay 路径 3 最终 Broadcast trace
+	UE_LOG(LogGameFlow, Log,
+		TEXT("[DEBUG-v228][OnWorldBeginPlay-Path3-FINAL-Broadcast] Thread=%u Caller=%s CurrentState=%d (Name=%s)"),
+		FPlatformTLS::GetCurrentThreadId(),
+		ANSI_TO_TCHAR(__FUNCTION__),
+		(int32)CurrentState, *CurName);
 	OnStateChanged.Broadcast(CurrentState);
 }
 

@@ -95,50 +95,22 @@ URedDotManager* UActivitySubsystem::GetRedDotManager() const
 
 TArray<const FActivityInfoRow*> UActivitySubsystem::GetAllNavItems() const
 {
-	// 改造: 通过 FActivityDataTableService 统一加载, 避免硬编码路径
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
-
-	TArray<const FActivityInfoRow*> Result;
-
-	if (ActivityInfoTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FActivityInfoRow*> AllRows;
-		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-
-		for (FActivityInfoRow* Row : AllRows)
-		{
-			if (Row)
-			{
-				Result.Add(Row);
-			}
-		}
-	}
-
-	return Result;
+	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
+	// (避开 GetAllRows 内部 RowMap dangling 指针导致的崩溃 v4 - 2026-08-10)
+	return FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+		ActivityDataTable::ActivityInfo,
+		[](const FActivityInfoRow& Row) { return true; } // 不过滤,收集所有行
+	);
 }
 
 const FActivityInfoRow* UActivitySubsystem::GetActivityInfo(int32 ActivityID) const
 {
-	// 改造: 通过 FActivityDataTableService 统一加载
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
-
-	if (ActivityInfoTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FActivityInfoRow*> AllRows;
-		ActivityInfoTable->GetAllRows<FActivityInfoRow>(ContextString, AllRows);
-
-		for (FActivityInfoRow* Row : AllRows)
-		{
-			if (Row && Row->ActivityID == ActivityID)
-			{
-				return Row;
-			}
-		}
-	}
-
-	return nullptr;
+	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
+	return FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+		ActivityDataTable::ActivityInfo,
+		[](const FActivityInfoRow& Row) { return Row.ActivityID; },
+		ActivityID
+	);
 }
 
 FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
@@ -205,52 +177,28 @@ void UActivitySubsystem::SavePlayerRecord(int32 ActivityID)
 
 TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetDailyLoginConfigs(int32 ActivityID) const
 {
-	// 改造: 走 FActivityDataTableService
-	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyLoginConfig);
-
-	TArray<FDailyLoginConfigRow*> Result;
-
-	if (ConfigTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FDailyLoginConfigRow*> AllRows;
-		ConfigTable->GetAllRows<FDailyLoginConfigRow>(ContextString, AllRows);
-
-		for (FDailyLoginConfigRow* Row : AllRows)
-		{
-			if (Row && Row->ActivityID == ActivityID)
-			{
-				Result.Add(Row);
-			}
-		}
-	}
-
-	return Result;
+	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
+	// ⚠️ helper 返回 TArray<const T*>, 但头文件声明为 TArray<T*>
+	//    const_cast 是因为本函数对外契约是"只读访问", 不应该有 mutating 调用方
+	//    历史上 DailyLoginDayItemWidget / DailyLoginPage 10+ 处都用 TArray<T*>, 改头文件牵涉广
+	TArray<const FDailyLoginConfigRow*> ConstRows = FActivityDataTableService::GetRowsSafe<FDailyLoginConfigRow>(
+		ActivityDataTable::DailyLoginConfig,
+		[ActivityID](const FDailyLoginConfigRow& Row) { return Row.ActivityID == ActivityID; }
+	);
+	return *reinterpret_cast<TArray<FDailyLoginConfigRow*>*>(&ConstRows);
 }
 
 TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetRewardsByDay(int32 ActivityID, int32 Day) const
 {
-	// 改造: 走 FActivityDataTableService
-	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyLoginConfig);
-
-	TArray<FDailyLoginConfigRow*> Result;
-
-	if (ConfigTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FDailyLoginConfigRow*> AllRows;
-		ConfigTable->GetAllRows<FDailyLoginConfigRow>(ContextString, AllRows);
-
-		for (FDailyLoginConfigRow* Row : AllRows)
+	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
+	TArray<const FDailyLoginConfigRow*> ConstRows = FActivityDataTableService::GetRowsSafe<FDailyLoginConfigRow>(
+		ActivityDataTable::DailyLoginConfig,
+		[ActivityID, Day](const FDailyLoginConfigRow& Row)
 		{
-			if (Row && Row->ActivityID == ActivityID && Row->DayIndex == Day)
-			{
-				Result.Add(Row);
-			}
+			return Row.ActivityID == ActivityID && Row.DayIndex == Day;
 		}
-	}
-
-	return Result;
+	);
+	return *reinterpret_cast<TArray<FDailyLoginConfigRow*>*>(&ConstRows);
 }
 
 bool UActivitySubsystem::TryClaimReward(int32 ActivityID, int32 DayIndex)
@@ -346,69 +294,69 @@ bool UActivitySubsystem::TryClaimMultipleRewards(int32 ActivityID, const TArray<
 
 const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 {
-	// 改造: 走 FActivityDataTableService (替代硬编码路径)
-	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::ItemDetail);
-
-	if (ConfigTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FItemDetailRow*> AllRows;
-		ConfigTable->GetAllRows<FItemDetailRow>(ContextString, AllRows);
-
-		for (FItemDetailRow* Row : AllRows)
-		{
-			if (Row && Row->ItemID == ItemID)
-			{
-				return Row;
-			}
-		}
-	}
-
-	return nullptr;
+	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
+	return FActivityDataTableService::FindRowByIdSafe<FItemDetailRow>(
+		ActivityDataTable::ItemDetail,
+		[](const FItemDetailRow& Row) { return Row.ItemID; },
+		ItemID
+	);
 }
 
 const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) const
 {
-	// 改造: 走 FActivityDataTableService
-	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::TreasureBoxItem);
-
-	if (ConfigTable)
-	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TArray<FTreasureBoxItemRow*> AllRows;
-		ConfigTable->GetAllRows<FTreasureBoxItemRow>(ContextString, AllRows);
-
-		for (FTreasureBoxItemRow* Row : AllRows)
-		{
-			if (Row && Row->BoxID == BoxID)
-			{
-				return Row;
-			}
-		}
-	}
-
-	return nullptr;
+	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
+	return FActivityDataTableService::FindRowByIdSafe<FTreasureBoxItemRow>(
+		ActivityDataTable::TreasureBoxItem,
+		[](const FTreasureBoxItemRow& Row) { return Row.BoxID; },
+		BoxID
+	);
 }
 
 TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxID(int32 BoxID) const
 {
-	// 改造: 走 FActivityDataTableService
+	// 改造: 走 FActivityDataTableService (Get 内部已加 IsValid 防御 + 失效重载)
 	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::TreasureBoxItem);
 
+	// ⚠️【防崩溃 v3 — 三层防御】
+	// 崩溃历史:
+	//   v1 (2026-08-09): GetRowMap() + reinterpret_cast → Pair.Value = 0xffffffffffffffff
+	//   v2 (2026-08-10): GetAllRows<T>() 内部 UStruct::IsChildOf() → RowStruct->SuperStruct = 0xffffffffffffffff
+	//   根因分析: FActivityDataTableService::GetCache() 静态 TMap 中的 TObjectPtr<UDataTable>
+	//             在 DataTable 资产重载/GC/编辑器热刷新后可能持有失效指针
+	//   修复: 三层防御全部到位
+	//     1. FActivityDataTableService::Get() 内部加 IsValid 校验 + 失效时自动重载 (核心修复)
+	//     2. 本函数再加 ConfigTable + RowStruct 双重 IsValid 防御 (兜底)
+	//     3. 用 FindRow<T>() 单条查询, 避免 GetAllRows 内部的 IsChildOf 整表类型校验
 	TArray<const FTreasureBoxItemRow*> Result;
 
-	if (ConfigTable)
+	// 防御 1: ConfigTable 必须有效 (FActivityDataTableService::Get 已保证, 双保险)
+	if (!IsValid(ConfigTable))
 	{
-		static const FString ContextString(TEXT("ActivitySubsystem"));
-		TMap<FName, uint8*> RowMap = ConfigTable->GetRowMap();
+		UE_LOG(LogTemp, Error,
+			TEXT("[ActivitySubsystem] GetTreasureBoxItemsByBoxID: ConfigTable 失效 (BoxID=%d)"),
+			BoxID);
+		return Result;
+	}
 
-		for (const auto& Pair : RowMap)
+	// 防御 2: RowStruct 必须有效 (DataTable 资产重载后此字段可能失效)
+	const UScriptStruct* RowStruct = ConfigTable->GetRowStruct();
+	if (!IsValid(RowStruct))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ActivitySubsystem] GetTreasureBoxItemsByBoxID: ConfigTable->RowStruct 失效 (BoxID=%d, ConfigTable=%p, RowStruct=%p)"),
+			BoxID, ConfigTable, RowStruct);
+		return Result;
+	}
+
+	// 防御 3: 用 GetRowNames + FindRow 路径, 避免 GetAllRows 的 IsChildOf 整表类型校验
+	static const FString ContextString(TEXT("ActivitySubsystem"));
+	const TArray<FName> RowNames = ConfigTable->GetRowNames();
+	for (const FName& RowName : RowNames)
+	{
+		const FTreasureBoxItemRow* Row = ConfigTable->FindRow<FTreasureBoxItemRow>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
+		if (Row && Row->BoxID == BoxID)
 		{
-			const FTreasureBoxItemRow* Row = reinterpret_cast<const FTreasureBoxItemRow*>(Pair.Value);
-			if (Row && Row->BoxID == BoxID)
-			{
-				Result.Add(Row);
-			}
+			Result.Add(Row);
 		}
 	}
 

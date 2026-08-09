@@ -54,7 +54,6 @@ public:
 	 * 添加奖励图标（通过 RewardItemID 查询 FItemDetailRow）
 	 * @param RewardID 物品 ID
 	 * @param RewardCount 物品数量
-	 * @note RewardID 和 Count 必须和表里的字段名对应
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void AddRewardIcon(int32 RewardID, int32 RewardCount);
@@ -83,13 +82,7 @@ public:
 	void AddRewardIconFromTreasureBox(int32 BoxID, int32 RewardCount);
 
 	/**
-	 * 纹理异步加载完成回调
-	 */
-	UFUNCTION()
-	void OnTextureLoaded(const FSoftObjectPath& Path, UObject* LoadedObject, UImage* RewardImage, int32 RewardID);
-
-	/**
-	 * 清空奖励容器
+	 * 清空奖励图标
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DailyLogin")
 	void ClearRewardIcons();
@@ -134,13 +127,13 @@ protected:
 	// 3. UI 组件
 	// ==========================================
 
-	/** 对应蓝图里的容器（HorizontalBox 或 WrapBox） */
+	/** 奖励图标 Image (直接引用蓝图中的控件) */
 	UPROPERTY(meta = (BindWidget))
-	class UPanelWidget* RewardContainer;
+	class UImage* RewardIconImage;
 
-	/** 奖励图标蓝图类（需要在编辑器里赋值） */
-	UPROPERTY(EditAnywhere, Category = "DailyLogin")
-	TSubclassOf<class UUserWidget> RewardIconClass;
+	/** 奖励数量 Text (直接引用蓝图中的控件) */
+	UPROPERTY(meta = (BindWidget))
+	class UTextBlock* RewardCountText;
 
 	/**
 	 * 组件构造完成回调

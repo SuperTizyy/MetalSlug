@@ -109,21 +109,24 @@ bool UUpgradeActivitySaveModifier::ModifyCurrentExperience(int32 RecordDate, int
 	int32 OriginalExp = ModifiedRecord.CurrentExperience;
 	ModifiedRecord.CurrentExperience = NewExp;
 	ModifiedRecord.LastUpdateTime = FDateTime::Now();
-	
+
+	// 🔧【Bug 1 修复】同步更新 AllRecords 映射表中的对应记录 (与 ModifyRewardIconIndex/ModifyTaskCompleteCount 保持一致)
+	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
+
 	// 同步更新 CurrentRecord（如果 RecordDate 匹配）
 	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
 	{
 		TargetSubsystem->GetRecord() = ModifiedRecord;
 	}
-	
+
 	LogModification(TEXT("经验值"), FString::Printf(TEXT("%d -> %d"), OriginalExp, NewExp));
 	ForceRefreshAllPages();
-	
+
 	if (bAutoSave)
 	{
 		UE_LOG(LogTemp, Log, TEXT("标记为需要保存到磁盘（游戏关闭时执行）"));
 	}
-	
+
 	return true;
 }
 

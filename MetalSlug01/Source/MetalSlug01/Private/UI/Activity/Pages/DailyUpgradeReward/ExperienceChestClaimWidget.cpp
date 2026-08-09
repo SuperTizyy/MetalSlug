@@ -18,6 +18,8 @@
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
 #include "Components/ProgressBar.h"
+#include "Components/SizeBox.h"         // USizeBox 控件类型
+#include "Components/SizeBoxSlot.h"     // ⚠️ 2026-08-10 Padding 在 Slot 上, 不在 USizeBox 自身; USizeBoxSlot::SetPadding(FMargin) 才是 API
 #include "Kismet/GameplayStatics.h"
 #include "Systems/Activity/UpgradeActivitySubsystem.h"
 
@@ -710,6 +712,63 @@ void UExperienceChestClaimWidget::SetChestIndex(int32 Index)
 
 	// 设置索引后立即更新 SuccessText 状态
 	UpdateSuccessTextVisibility();
+}
+
+// ==========================================
+// 9.5 容器布局 API (2026-08-10)
+// ==========================================
+
+/**
+ * @brief 设置 WBP_FixedPrizeWidget 内 SizeBox 的 Padding (Top + Bottom)
+ *
+ * 职责: ItemsScrollBox 中动态生成的子项专用, 控制其上下内边距
+ *       页面单独 FixedPrizeWidget 不调用本方法 (布局由蓝图控制)
+ *
+ * @param PaddingTop    SizeBox 顶部内边距 (像素, 必须 >= 0)
+ * @param PaddingBottom SizeBox 底部内边距 (像素, 必须 >= 0)
+ *
+ * 零兜底原则 (大厂架构):
+ *  - SizeBoxPrizeSlot 为 null → Log Error + return (不静默吞错)
+ *  - 参数 < 0 → Log Error + return (不允许负值, 避免布局计算异常)
+ */
+void UExperienceChestClaimWidget::SetPrizeSlotPadding(float PaddingTop, float PaddingBottom, float PaddingRight)
+{
+	// 1. 参数校验: 必须 >= 0 (负值会导致 Slate layout 计算异常)
+	if (PaddingTop < 0.0f || PaddingBottom < 0.0f || PaddingRight < 0.0f)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ExperienceChestClaimWidget] SetPrizeSlotPadding: 参数无效 (Top=%.2f, Bottom=%.2f, Right=%.2f), 必须 >= 0"),
+			PaddingTop, PaddingBottom, PaddingRight);
+		return;
+	}
+
+	// 2. 防御链: SizeBoxPrizeSlot 必须绑定
+	if (!SizeBoxPrizeSlot)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ExperienceChestClaimWidget] SetPrizeSlotPadding: SizeBoxPrizeSlot 控件未绑定 (WBP 蓝图里缺少 'SizeBoxPrizeSlot' 控件, 或命名不一致)"));
+		return;
+	}
+
+	// 3. 应用 Padding: 设 Top + Bottom + Right, Left 保持 0 (不破坏现有水平布局)
+	//    ⚠️ Padding 不在 USizeBox 自身, 而在它的唯一子项 Slot (USizeBoxSlot) 上
+	//    UE 5.6 UMG 编辑器里 "SizeBox 控件面板上的 Top/Bottom/Right" 实际就是 Slot 的 FMargin
+	//    API 路径: UContentWidget::GetContentSlot() → Cast<USizeBoxSlot> → SetPadding(FMargin)
+	//    FMargin 4 参数构造顺序: (Left, Top, Right, Bottom)
+	USizeBoxSlot* SizeBoxSlot = Cast<USizeBoxSlot>(SizeBoxPrizeSlot->GetContentSlot());
+	if (!SizeBoxSlot)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ExperienceChestClaimWidget] SetPrizeSlotPadding: SizeBox 上没有 Content Slot (WBP 蓝图里 SizeBoxPrizeSlot 可能没拖入子控件)"));
+		return;
+	}
+
+	const FMargin NewPadding(0.0f, PaddingTop, PaddingRight, PaddingBottom);
+	SizeBoxSlot->SetPadding(NewPadding);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[ExperienceChestClaimWidget] SetPrizeSlotPadding: 已设置 Padding Top=%.2f, Bottom=%.2f, Right=%.2f"),
+		PaddingTop, PaddingBottom, PaddingRight);
 }
 
 

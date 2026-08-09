@@ -124,8 +124,6 @@
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardViewModel.h" // 改造: ViewModel
 #include "Components/Border.h"
 #include "Components/HorizontalBox.h"
-#include "Components/HorizontalBoxSlot.h"
-#include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
 #include "Components/Button.h"
 #include "Components/TextBlock.h"
@@ -133,7 +131,6 @@
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "Components/ScrollBox.h"
-#include "Components/CanvasPanelSlot.h"
 #include "Components/EditableTextBox.h" // 【v213 新增】调试用
 #include "Components/ComboBoxString.h"  // 【v213 新增】调试用
 #include "Engine/Engine.h"              // 【v213 新增】GEngine 屏幕提示
@@ -252,6 +249,32 @@ bool UDailyUpgradeRewardPage::Initialize()
 			TEXT("[DailyUpgradeRewardPage] Initialize: Button_ApplyDebugValues 未绑定 (蓝图缺控件)"));
 	}
 
+	// 【v222 新增】一键重置按钮绑定
+	if (Button_ResetAllActivity)
+	{
+		Button_ResetAllActivity->OnClicked.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] Initialize: Button_ResetAllActivity 未绑定 (蓝图缺控件)"));
+	}
+
+	// ==========================================
+	// 【v213.1 新增】任务完成次数 ComboBox 绑定 (选项 0-9)
+	// 大厂原则:
+	//   - 仅绑定事件 + 填充 ComboBox 选项, 不做业务逻辑
+	//   - SelectedDay 切换时不刷新 (用户选择 B: 保持上次选择的值)
+	//   - 回调仅防崩溃, 不触发任何存档操作
+	// ==========================================
+	BindTaskCountComboBox(ComboBoxString_Task1Count);
+	BindTaskCountComboBox(ComboBoxString_Task2Count);
+	BindTaskCountComboBox(ComboBoxString_Task3Count);
+
+	// 【v213.1 新增】绑定任务次数 ComboBox 的 OnSelectionChanged 事件
+	BindTaskCountComboBoxCallbacks();
+
 	return true;
 }
 
@@ -270,16 +293,15 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	// 初始化当前选中的天数索引为-1（表示未选择）
 	CurrentDayIndex = -1;
 	CurrentSelectedDay = 0; // 0表示没有临时高亮
-	
+
 	// 清空按钮映射表以避免重复添加
 	ButtonToDayIndexMap.Empty();
-	
-	
+
 	Super::NativeConstruct();
-	
+
 	// 订阅UpgradeActivitySubsystem的奖励图标索引更新事件
 	SubscribeToSubsystemEvents();
-	
+
 	// 在NativeConstruct阶段执行初始化逻辑，确保UI完全准备好
 	InitializeRewardItemIcons();
 	UpdateChestCountText();
@@ -287,6 +309,31 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	InitializeFixedPrizeWidget();  // 初始化固定奖励控件
 	UpdateExperienceDisplay();
 	UpdateDailyTasks();  // 初始化每日任务列表
+
+	// 🔧 【v215 修复】首次进入页面: 显式触发默认 day 渲染 (大厂原则: 职责分离)
+	// 🐛 原 Bug: UpdateDailyTasks 内部强制把 CurrentDayIndex 改回 MaxRecordDate (反模式)
+	// ✅ 修复后: UpdateDailyTasks 不再改 CurrentDayIndex; 这里显式触发首次默认 day
+	//   - 取 MaxRecordDate 作为默认 day (符合用户原期望: 打开页面看最新 day 任务)
+	//   - 注意: 这段只在首次 NativeConstruct 跑, 不影响后续 RefreshUI 的"保留选中 day" 行为
+	{
+		UGameInstance* GI = GetGameInstance();
+		if (GI)
+		{
+			if (UUpgradeActivitySubsystem* UpgradeSub = GI->GetSubsystem<UUpgradeActivitySubsystem>())
+			{
+				const int32 MaxDay = UpgradeSub->GetMaxRecordDate();
+				if (MaxDay >= 1)
+				{
+					CurrentDayIndex = MaxDay - 1; // 0-based 索引
+					const FString DefaultDayIdentifier = FString::Printf(TEXT("day%d"), MaxDay);
+					OnDayButtonClicked(DefaultDayIdentifier, CurrentDayIndex);
+					UE_LOG(LogTemp, Log,
+						TEXT("[DailyUpgradeRewardPage] NativeConstruct: 首次进入, 默认显示 day=%d 的任务详情"),
+						MaxDay);
+				}
+			}
+		}
+	}
 	
 	// 延迟执行居中显示，等待UI完全渲染完成
 	FTimerHandle CenterTimerHandle;
@@ -316,6 +363,9 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 	// 注意：不取消订阅Subsystem事件，让缓存的页面也能持续接收广播
 	// UnsubscribeFromSubsystemEvents(); // 已删除此行
 
+	// 🔧【v219 新增】停止 Bonus 倒计时定时器, 防止页面销毁后回调触发野指针
+	StopBonusCountdownTimer();
+
 	// 解绑重选奖励按钮事件
 	if (ReselectRewardButton)
 	{
@@ -333,10 +383,43 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 			this, &UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged);
 	}
 
+	// ==========================================
+	// 【v213.1 新增】解绑任务完成次数 ComboBox
+	// ==========================================
+	if (ComboBoxString_Task1Count)
+	{
+		ComboBoxString_Task1Count->OnSelectionChanged.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask1CountComboBoxChanged);
+	}
+	if (ComboBoxString_Task2Count)
+	{
+		ComboBoxString_Task2Count->OnSelectionChanged.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask2CountComboBoxChanged);
+	}
+	if (ComboBoxString_Task3Count)
+	{
+		ComboBoxString_Task3Count->OnSelectionChanged.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask3CountComboBoxChanged);
+	}
+
 	if (Button_ApplyDebugValues)
 	{
 		Button_ApplyDebugValues->OnClicked.RemoveDynamic(
 			this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
+	}
+
+	// 【v222 新增】一键重置按钮解绑
+	if (Button_ResetAllActivity)
+	{
+		Button_ResetAllActivity->OnClicked.RemoveDynamic(
+			this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
+	}
+
+	// 【Ensure 修复】解绑 FixedPrizeWidget 事件 + 重置幂等标志
+	if (FixedPrizeWidget && bIsFixedPrizeWidgetEventBound)
+	{
+		FixedPrizeWidget->OnChestClaimRequested.RemoveDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
+		bIsFixedPrizeWidgetEventBound = false;
 	}
 
 	// 改造: 解除 ViewModel 绑定
@@ -522,12 +605,13 @@ void UDailyUpgradeRewardPage::SwitchToPreviousRewardIcon()
 }
 
 /**
- * @brief 更新宝箱数量显示文本
- * @details 从配置表中获取奖励物品数量信息并显示在界面上
- * 数据流向：
- * 1. 读取DT_DailyUpgradeRewardConfigRow表(ActivityID==110)
- * 2. 获取RewardItemCounts数组的最后一个元素
- * 3. 格式化为"X数量"的形式显示在ChestCountText控件上
+ * @brief 更新宝箱数量显示文本 (页面级 ChestCountText)
+ * @details 🔧【v218 大厂原则 SSOT】联动 popup 选中:
+ *          - 数据源: UUpgradeActivitySubsystem::GetCurrentRewardItemCount()
+ *          - 链路: MainConfig.RewardItemIDs.Last() → BoxID → TreasureBoxItems[CurrentRewardIconIndex].ItemCount
+ *          - 与 WBP_RewardOptionCardWidget::RewardText 显示的 ItemCount 完全一致
+ *          - 事件: 订阅 OnRewardIconIndexChanged, popup 选中卡片后自动同步
+ *          - 零兜底: API 返回 -1 (查不到任何一步) → 显示空字符串 + Log Error
  * @note 在编辑器预览模式下会静默返回
  */
 void UDailyUpgradeRewardPage::UpdateChestCountText()
@@ -543,27 +627,32 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 		return; // 静默返回，不输出日志
 	}
 
-	// 通过Subsystem获取宝箱数量
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		ChestCountText->SetText(FText::FromString(TEXT("0")));
+		ChestCountText->SetText(FText::FromString(TEXT("")));
+		UE_LOG(LogTemp, Error, TEXT("[v218] UpdateChestCountText: 无法获取GameInstance, 清空 ChestCountText"));
 		return;
 	}
 
 	UUpgradeActivitySubsystem* Sub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!Sub)
 	{
-		ChestCountText->SetText(FText::FromString(TEXT("0")));
+		ChestCountText->SetText(FText::FromString(TEXT("")));
+		UE_LOG(LogTemp, Error, TEXT("[v218] UpdateChestCountText: 无法获取UpgradeActivitySubsystem, 清空 ChestCountText"));
 		return;
 	}
 
-	// 调用Subsystem方法获取宝箱数量
-	FString ChestCount = Sub->GetChestCount();
-	
-	// 显示在ChestCountText控件上（拼接X前缀）
-	FString DisplayText = FString::Printf(TEXT("X%s"), *ChestCount);
-	ChestCountText->SetText(FText::FromString(DisplayText));
+	// 🔧【v218 SSOT】读 GetCurrentRewardItemCount (与 popup RewardText 同步)
+	const int32 ItemCount = Sub->GetCurrentRewardItemCount();
+	if (ItemCount < 0)
+	{
+		// API 内部已 Log Error 给出具体失败点, 此处按"无可用值"显式清空 (零兜底: 不显示假数据)
+		ChestCountText->SetText(FText::FromString(TEXT("")));
+		return;
+	}
+
+	ChestCountText->SetText(FText::FromString(FString::Printf(TEXT("X%d"), ItemCount)));
 }
 
 /**
@@ -735,9 +824,14 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		
 		ItemsScrollBox->AddChild(ChestWidget);
 
+		// ⚠️ 2026-08-10: 设置 ScrollBox 子项 SizeBox 的 Padding (Top=30, Bottom=30, Right=10)
+		// 页面单独 FixedPrizeWidget (右侧大宝箱) 不调用此方法, 布局由 WBP_DailyUpgradeRewardPage 控制
+		// 大厂架构: ScrollBox 子项 vs 页面 FixedPrizeWidget 走不同路径, 互不干扰
+		ChestWidget->SetPrizeSlotPadding(30.0f, 30.0f, 10.0f);
+
 		// 更新DiamondIcon颜色
 		ChestWidget->UpdateDiamondIconColor();
-		
+
 		// 更新ExperienceText颜色
 		ChestWidget->UpdateExperienceTextColor();
 	}
@@ -962,21 +1056,21 @@ void UDailyUpgradeRewardPage::UpdateDailyTasks()
 			
 			// 绑定点击事件（使用 UFUNCTION 包装器）
 			TaskWidget->DayButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::HandleDayButtonClicked);
-			
+
 		}
 	}
-	
-	// 🔧 核心业务逻辑：默认显示最大RecordDate那天的任务详情
-	int32 MaxRecordDate = Subsystem->GetMaxRecordDate();
-	FString DefaultDayIdentifier = FString::Printf(TEXT("day%d"), MaxRecordDate);
-	int32 DefaultDayIndex = MaxRecordDate - 1;
-	
-	
-	// 设置当前选中的天数索引
-	CurrentDayIndex = DefaultDayIndex;
-	
-	// 调用OnDayButtonClicked显示默认天数的任务详情
-	OnDayButtonClicked(DefaultDayIdentifier, DefaultDayIndex);
+
+	// 🔧 【v215 修复】移除反模式: 不再强制重置 CurrentDayIndex = MaxRecordDate
+	// 🐛 原 Bug: 用户停留在 day=3 任务页面 → 点 ClaimButton → RewardOptionWidget 弹窗 StoreBtn
+	//   → 广播 OnGlobalRefresh → RefreshUI step 6 走 UpdateDailyTasks
+	//   → 原 line 1014-1022 强制把 CurrentDayIndex 改回 MaxRecordDate
+	//   → 用户看到"跳转到最新 day 的任务页面"
+	// ✅ 正确职责分离:
+	//   - UpdateDailyTasks: 只重建 DayButtonsContainer UI (清空 + 重建), 不改任何状态
+	//   - TasksContainer 重建由 RefreshUI step 6.1 负责 (用 CurrentDayIndex 渲染)
+	//   - 默认初始选中由 Initialize() 或首次 NativeConstruct 路径处理 (单次, 不在每次刷新里)
+	//   - 重建 DayButtons 后, 用户手动点击 DayButton 来切换; 首次进入的默认选中
+	//     应该在 NativeConstruct / Initialize 中显式调用一次 OnDayButtonClicked, 而不是在刷新里反复重置
 }
 
 /**
@@ -1021,32 +1115,29 @@ void UDailyUpgradeRewardPage::OnDayButtonClicked(const FString& DayIdentifier, i
 	CurrentSelectedDay = SelectedDayNumber;
 	UE_LOG(LogTemp, Log, TEXT("[HIGHLIGHT_DEBUG] 设置CurrentSelectedDay为: %d"), CurrentSelectedDay);
 		
-	// 刷新每日任务高亮状态（确保点击DayButton后SelectionHighlightImage跟随）
+// 刷新每日任务高亮状态（确保点击DayButton后SelectionHighlightImage跟随）
 	RefreshDailyTaskHighlights();
-		
+
 	// 强制刷新UI
 	if (DayButtonsContainer)
 	{
 		DayButtonsContainer->InvalidateLayoutAndVolatility();
 	}
-	
-	// 更新限时加成信息文本
+
+	// 更新限时加成信息文本 (一次性, 不要重复)
 	UpdateBonusInfoText(DayIdentifier);
-		
+
 	// 更新限时加成图标容器
 	UpdateBonusIconsContainer();
-	
+
 	// 确保在游戏世界中运行
 	if (!GetWorld() || !GetWorld()->IsGameWorld())
 	{
 		return;
 	}
 
-	// 更新限时加成信息文本
-	UpdateBonusInfoText(DayIdentifier);
-	
-	// 更新限时加成图标容器
-	UpdateBonusIconsContainer();
+	// 🔧【v219 重复调用清理】原代码在 1109 和 1121 重复调用 UpdateBonusInfoText/UpdateBonusIconsContainer
+	// 大厂原则 DRY: 同一函数内同一调用不要出现 2 次. 已合并到上面一次.
 
 	// 检查必要的组件是否存在
 	if (!TasksContainer || !TaskDetailWidgetClass)
@@ -1549,13 +1640,16 @@ void UDailyUpgradeRewardPage::UnsubscribeFromSubsystemEvents()
 void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 接收到奖励图标索引更新事件，新索引: %d"), NewIndex);
-	
+
 	// 重新初始化奖励图标数据
 	InitializeRewardItemIcons();
-	
+
 	// 更新奖励物品图像显示
 	UpdateRewardItemImage();
-	
+
+	// 🔧【v218 SSOT 联动】popup 选中 WBP_RewardOptionCardWidget → 同步 ChestCountText
+	UpdateChestCountText();
+
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 奖励图标索引更新完成"));
 }
 
@@ -2104,9 +2198,13 @@ void UDailyUpgradeRewardPage::InitializeFixedPrizeWidget()
 	// 更新经验文本颜色 - 这里会根据CurrentExperience和TaskRelatedValues值判断颜色
 	FixedPrizeWidget->UpdateExperienceTextColor();
 	
-	// 绑定FixedPrizeWidget的领取事件
-	FixedPrizeWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget事件绑定完成"));
+	// 🔧【Ensure 修复】幂等保护: 避免 NativeConstruct + RefreshUI 双路径触发重复绑定
+	if (!bIsFixedPrizeWidgetEventBound)
+	{
+		FixedPrizeWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
+		bIsFixedPrizeWidgetEventBound = true;
+		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget事件首次绑定完成"));
+	}
 	
 	// 设置FixedPrizeWidget的宝箱数量文本
 	FString ChestCount = Sub->GetFixedPrizeChestCount();
@@ -2667,39 +2765,26 @@ void UDailyUpgradeRewardPage::UpdateBonusIconsContainer()
 		}
 		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 成功创建WBP_RewardIcon实例"));
 
-		// 获取RewardImage控件并设置ItemIcon
+		// 同步加载图标, 与 SetupRewardsContainer 逻辑一致 (避免异步占位符淡色问题)
+		UTexture2D* ItemTexture = ItemDetailRow->ItemIcon.LoadSynchronous();
+
+		// 设置图标
+		// 蓝图自身控制尺寸, C++ 不干预
 		UImage* RewardImage = Cast<UImage>(RewardIconWidget->GetWidgetFromName(TEXT("RewardImage")));
-		if (RewardImage && !ItemDetailRow->ItemIcon.IsNull())
+		if (RewardImage && ItemTexture)
 		{
-			RewardImage->SetBrushFromSoftTexture(ItemDetailRow->ItemIcon);
-			
-			// 🔧 Canvas Panel中需要直接操作Slot来设置尺寸（参考TaskDetailWidget实现）
-			if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(RewardImage->Slot))
-			{
-				CanvasSlot->SetSize(FVector2D(128.0f, 128.0f));
-				// 设置锚点为左上角
-				CanvasSlot->SetAnchors(FAnchors(0.0f, 0.0f));
-				CanvasSlot->SetAlignment(FVector2D(0.0f, 0.0f));
-			}
+			RewardImage->SetBrushFromTexture(ItemTexture);
 		}
 
-		// 隐藏CountText控件（根据项目规范）
+		// 隐藏 CountText 控件
 		UTextBlock* CountText = Cast<UTextBlock>(RewardIconWidget->GetWidgetFromName(TEXT("CountText")));
 		if (CountText)
 		{
 			CountText->SetVisibility(ESlateVisibility::Collapsed);
 		}
 
-		// 添加到BonusIconsContainer
+		// 添加到 BonusIconsContainer, 蓝图自身控制 Slot 布局
 		BonusIconsContainer->AddChild(RewardIconWidget);
-
-		// 对于HorizontalBox，尺寸主要由子控件自身决定
-		// RewardImage的尺寸通过SetDesiredSizeOverride设置为128x128
-		if (UHorizontalBoxSlot* HorizontalBoxSlot = Cast<UHorizontalBoxSlot>(RewardIconWidget->Slot))
-		{
-			// 清除内边距以确保正确显示
-			HorizontalBoxSlot->SetPadding(FMargin(0.0f));
-		}
 
 		UE_LOG(LogTemp, Log, TEXT("[BONUS_ICONS] 成功创建奖励图标 %d: ItemID=%d"), i + 1, ItemID);
 	}
@@ -2709,7 +2794,7 @@ void UDailyUpgradeRewardPage::UpdateBonusIconsContainer()
 }
 
 /**
- * @brief 更新限时加成信息文本 (BonusInfoText) - 显示 "{描述} {完成数}/{总数} 剩余时长: {H}H {M}M"
+ * @brief 更新限时加成信息文本 (BonusInfoText) - 显示 "{描述} {完成数}/{总数} 剩余时长: {H}H {M}M {S}S"
  * @param DayIdentifier 天数标识符 (如 "day1", "day3")
  *
  * 业务流程:
@@ -2779,6 +2864,7 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】隐藏时停倒计时
 		return;
 	}
 
@@ -2791,6 +2877,7 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】隐藏时停倒计时
 		return;
 	}
 
@@ -2804,6 +2891,7 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】隐藏时停倒计时
 		return;
 	}
 
@@ -2815,6 +2903,7 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】隐藏时停倒计时
 		return;
 	}
 
@@ -2831,6 +2920,7 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】隐藏时停倒计时
 		return;
 	}
 	
@@ -2861,56 +2951,41 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 		{
 			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
 		}
+		StopBonusCountdownTimer(); // 🔧【v219】过期时停倒计时
 		return;
 	}
 
-	// 计算剩余时长
+	// 🔧【v218】增加秒显示 - 大厂原则: 时间精度要全, 不能丢精度
 	FTimespan RemainingTime = EndTime - CurrentTime;
-	int32 RemainingHours = RemainingTime.GetHours();
-	int32 RemainingMinutes = RemainingTime.GetMinutes() % 60;
+	const int32 RemainingHours = RemainingTime.GetHours();
+	const int32 RemainingMinutes = RemainingTime.GetMinutes() % 60;
+	const int32 RemainingSeconds = RemainingTime.GetSeconds() % 60;
 
-	// 格式化显示文本
-	FString DisplayText = FString::Printf(TEXT("%s %d/%d 剩余时长：%dH %dM"), 
-		*ConfigRow->BonusDescription, 
-		LimitedActivityCompleteCount, 
-		BonusCount, 
-		RemainingHours, 
-		RemainingMinutes);
+	// 格式化显示文本 (H + M + S)
+	const FString DisplayText = FString::Printf(TEXT("%s %d/%d 剩余时长：%dH %dM %dS"),
+		*ConfigRow->BonusDescription,
+		LimitedActivityCompleteCount,
+		BonusCount,
+		RemainingHours,
+		RemainingMinutes,
+		RemainingSeconds);
 
 	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] UDailyUpgradeRewardPage::UpdateBonusInfoText: 显示文本 - %s"), *DisplayText);
 
 	// 设置文本并显示
 	BonusInfoText->SetText(FText::FromString(DisplayText));
-	
-	// 强制设置字体大小以确保正确计算大小
-	FSlateFontInfo FontInfo = BonusInfoText->GetFont();
-	UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoText原始字体大小: %.2f"), FontInfo.Size);
-	if (FontInfo.Size <= 0)
-	{
-		// 如果字体大小未设置，使用默认大小
-		FontInfo.Size = 16.0f;
-		BonusInfoText->SetFont(FontInfo);
-		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] 已设置字体大小为16"));
-	}
-	
+
+	// 【大厂架构】字体大小由蓝图控制, C++ 不干预
+	// 原因: 这是布局属性, 蓝图改样式不会触发 C++ 重置, 避免 C++ 与蓝图反复打架
+
 	BonusInfoText->SetVisibility(ESlateVisibility::Visible);
 	
-	// 设置背景颜色和尺寸（如果Border存在）
+	// 设置 Border 可见性（如果 Border 存在）
+	// 【大厂架构】Padding / BrushColor / 尺寸规则 全部由蓝图控制
+	// 原因: 这些是布局属性, 蓝图改样式不会触发 C++ 重置, 避免 C++ 与蓝图反复打架
 	if (BonusInfoBorder)
 	{
-		// 设置内边距 (Left, Top, Right, Bottom)
-		FMargin BorderPadding(10.0f, 5.0f, 10.0f, 5.0f);
-		BonusInfoBorder->SetPadding(BorderPadding);
-		
-		// 强制设置Border的尺寸规则为自动
-		// 注意：这需要在父容器的Slot中设置，但我们可以尝试其他方法
-		
-		// 背景色建议在蓝图中设置，C++中主要控制可见性和尺寸
 		BonusInfoBorder->SetVisibility(ESlateVisibility::Visible);
-		
-		// 调试：检查Border的大小
-		FVector2D BorderSize = BonusInfoBorder->GetDesiredSize();
-		UE_LOG(LogTemp, Log, TEXT("[BONUS_DEBUG] BonusInfoBorder控件大小: %.2f x %.2f"), BorderSize.X, BorderSize.Y);
 	}
 	
 	// 调试：检查文本是否为空
@@ -2940,6 +3015,248 @@ void UDailyUpgradeRewardPage::UpdateBonusInfoText(const FString& DayIdentifier)
 	{
 		BonusInfoText->InvalidateLayoutAndVolatility();
 	}
+
+	// 🔧【v219】启动/重启 Bonus 倒计时 1Hz 定时器
+	// - 进入"显示"状态时启动定时器, 让秒数每秒刷新
+	// - 调用前已经确保 BonusInfoText->GetVisibility() == Visible (上面的 2980 行的 SetVisibility 已设)
+	StartBonusCountdownTimer();
+}
+
+// ==========================================
+// 【v219 新增】Bonus 倒计时 1Hz Tick 实现
+// 大厂原则: 事件 + Tick 双轨, 事件轨 (UpdateBonusInfoText) 负责重算 EndTime / 处理过期;
+//          Tick 轨仅在未过期时用最新 CurrentTime 刷新数字. 互不重复.
+// ==========================================
+
+/**
+ * 启动 1Hz 定时器 (如果已经在跑则先清, 避免叠加)
+ * - 只有 BonusInfoText 当前可见且有显式数据时才启动
+ * - 零兜底: World 无效 → Log Error + return (不允许静默)
+ */
+void UDailyUpgradeRewardPage::StartBonusCountdownTimer()
+{
+	if (!BonusInfoText || BonusInfoText->GetVisibility() != ESlateVisibility::Visible)
+	{
+		return; // 没有可见的 Bonus, 不需要倒计时
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v219] StartBonusCountdownTimer: World 无效, 无法启动定时器"));
+		return;
+	}
+
+	FTimerManager& TimerManager = World->GetTimerManager();
+
+	// 防叠加: 先清后启
+	if (TimerManager.IsTimerActive(BonusCountdownTimerHandle))
+	{
+		TimerManager.ClearTimer(BonusCountdownTimerHandle);
+	}
+
+	TimerManager.SetTimer(
+		BonusCountdownTimerHandle,
+		this,
+		&UDailyUpgradeRewardPage::OnBonusCountdownTick,
+		/*InRate=*/1.0f,    // 1Hz (秒级精度)
+		/*bLoop=*/true);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[v219] StartBonusCountdownTimer: Bonus 倒计时 1Hz 定时器已启动"));
+}
+
+void UDailyUpgradeRewardPage::StopBonusCountdownTimer()
+{
+	if (UWorld* World = GetWorld())
+	{
+		if (World->GetTimerManager().IsTimerActive(BonusCountdownTimerHandle))
+		{
+			World->GetTimerManager().ClearTimer(BonusCountdownTimerHandle);
+			UE_LOG(LogTemp, Log, TEXT("[v219] StopBonusCountdownTimer: 定时器已停止"));
+		}
+	}
+	// World 无效时不报错 (页面销毁时常见, 直接吞掉)
+}
+
+/**
+ * 1Hz Tick - 仅刷新秒级倒计时数字 (不重算 EndTime / 不检查过期)
+ * 过期检查交给下一次事件轨 (UpdateBonusInfoText) 或手动触发
+ * @note 大厂原则: Tick 里不做任何重算 + 不查 DataTable, 只读取已在内存中的 CurrentDayIndex 等少量数据
+ */
+void UDailyUpgradeRewardPage::OnBonusCountdownTick()
+{
+	if (!BonusInfoText || !IsValid(BonusInfoText))
+	{
+		StopBonusCountdownTimer();
+		return;
+	}
+
+	// 防御: 已经被外部设为隐藏, 直接停止定时器, 避免后台空转
+	if (BonusInfoText->GetVisibility() != ESlateVisibility::Visible)
+	{
+		StopBonusCountdownTimer();
+		return;
+	}
+
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		StopBonusCountdownTimer();
+		UE_LOG(LogTemp, Error,
+			TEXT("[v219] OnBonusCountdownTick: 无法获取GameInstance, 停止定时器"));
+		return;
+	}
+
+	UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!Subsystem)
+	{
+		StopBonusCountdownTimer();
+		UE_LOG(LogTemp, Error,
+			TEXT("[v219] OnBonusCountdownTick: 无法获取UpgradeActivitySubsystem, 停止定时器"));
+		return;
+	}
+
+	// 🔧【v219 优化】Tick 不再走完整 UpdateBonusInfoText (避免重复查 ConfigRow / HasDayDataInMemory / 设置字体等)
+	//    只重算"秒级倒计时数字"部分, 用最少的 API 调用刷新文本
+	const int32 CurrentDayIndex1Based = CurrentDayIndex + 1; // 0-based → 1-based
+	const FString DayIdentifier = FString::Printf(TEXT("day%d"), CurrentDayIndex1Based);
+
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(DayIdentifier);
+	if (!ConfigRow || ConfigRow->BonusDescription.IsEmpty())
+	{
+		// 配置没了 → 停止定时器 (避免空转报错)
+		StopBonusCountdownTimer();
+		return;
+	}
+
+	const FUpgradeRewardSaveRecord* DayRecord = Subsystem->GetRecordByDate(CurrentDayIndex1Based);
+	if (!DayRecord)
+	{
+		// 内存中没数据 → 隐藏 (走原事件轨逻辑), 停定时器
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		StopBonusCountdownTimer();
+		return;
+	}
+
+	const FDateTime EndTime = DayRecord->CreatedTime + FTimespan::FromHours(ConfigRow->BonusDurationHours);
+	const FDateTime CurrentTime = FDateTime::Now();
+
+	// 已过期 → 走原事件轨的过期逻辑 (隐藏 + 停定时器)
+	if (CurrentTime >= EndTime)
+	{
+		BonusInfoText->SetVisibility(ESlateVisibility::Collapsed);
+		if (BonusInfoBorder)
+		{
+			BonusInfoBorder->SetVisibility(ESlateVisibility::Collapsed);
+		}
+		StopBonusCountdownTimer();
+		return;
+	}
+
+	// 还在有效期内 → 仅刷新倒计时数字, 不重算 EndTime, 不重查 ConfigRow
+	const FTimespan RemainingTime = EndTime - CurrentTime;
+	const int32 RemainingHours = RemainingTime.GetHours();
+	const int32 RemainingMinutes = RemainingTime.GetMinutes() % 60;
+	const int32 RemainingSeconds = RemainingTime.GetSeconds() % 60;
+
+	const int32 LimitedActivityCompleteCount = Subsystem->GetLimitedActivityCompleteCount();
+	const int32 BonusCount = ConfigRow->BonusCount;
+
+	const FString DisplayText = FString::Printf(TEXT("%s %d/%d 剩余时长：%dH %dM %dS"),
+		*ConfigRow->BonusDescription,
+		LimitedActivityCompleteCount,
+		BonusCount,
+		RemainingHours,
+		RemainingMinutes,
+		RemainingSeconds);
+
+	BonusInfoText->SetText(FText::FromString(DisplayText));
+}
+
+// ==========================================
+// 【v213.1 新增】任务完成次数 ComboBox 回调实现
+// ==========================================
+
+/**
+ * 【v213.1 大厂架构】任务完成次数 ComboBox 绑定辅助函数
+ * 大厂原则: DRY, 3 个 ComboBox 共用同一逻辑
+ * @param ComboBox 目标 ComboBox (可能为 null)
+ */
+void UDailyUpgradeRewardPage::BindTaskCountComboBox(UComboBoxString* ComboBox)
+{
+	if (ComboBox)
+	{
+		// 清空已有项 (防御性: 重复 Initialize 不重复添加)
+		ComboBox->ClearOptions();
+
+		// 用户需求: 选项 0-9
+		for (int32 i = 0; i <= 9; ++i)
+		{
+			ComboBox->AddOption(FString::FromInt(i));
+		}
+
+		// 默认选中 0
+		ComboBox->SetSelectedOption(TEXT("0"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] Initialize: 任务次数 ComboBox 未绑定 (蓝图缺控件)"));
+	}
+}
+
+// ==========================================
+// 【v213.1 新增】任务完成次数 ComboBox 回调绑定 (在 Initialize 中统一处理)
+// ==========================================
+
+/**
+ * 【v213.1 大厂架构】绑定任务完成次数 ComboBox 的事件回调
+ * 绑定到对应的 OnTaskXCountComboBoxChanged
+ */
+void UDailyUpgradeRewardPage::BindTaskCountComboBoxCallbacks()
+{
+	if (ComboBoxString_Task1Count)
+	{
+		ComboBoxString_Task1Count->OnSelectionChanged.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask1CountComboBoxChanged);
+	}
+	if (ComboBoxString_Task2Count)
+	{
+		ComboBoxString_Task2Count->OnSelectionChanged.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask2CountComboBoxChanged);
+	}
+	if (ComboBoxString_Task3Count)
+	{
+		ComboBoxString_Task3Count->OnSelectionChanged.AddDynamic(
+			this, &UDailyUpgradeRewardPage::OnTask3CountComboBoxChanged);
+	}
+}
+
+void UDailyUpgradeRewardPage::OnTask1CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[DailyUpgradeRewardPage] OnTask1CountComboBoxChanged: SelectedItem='%s', SelectionType=%d (无业务操作)"),
+		*SelectedItem, static_cast<int32>(SelectionType));
+}
+
+void UDailyUpgradeRewardPage::OnTask2CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[DailyUpgradeRewardPage] OnTask2CountComboBoxChanged: SelectedItem='%s', SelectionType=%d (无业务操作)"),
+		*SelectedItem, static_cast<int32>(SelectionType));
+}
+
+void UDailyUpgradeRewardPage::OnTask3CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
+{
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[DailyUpgradeRewardPage] OnTask3CountComboBoxChanged: SelectedItem='%s', SelectionType=%d (无业务操作)"),
+		*SelectedItem, static_cast<int32>(SelectionType));
 }
 
 // ==========================================
@@ -3045,22 +3362,146 @@ void UDailyUpgradeRewardPage::OnApplyDebugValuesClicked()
 
 	const int32 SelectedDay = FCString::Atoi(*SelectedDayStr);
 
+	// ==========================================
+	// 【v213.1 新增】解析 3 个任务完成次数
+	// 大厂原则:
+	//   - 零兜底: 控件 null → Log Error + return
+	//   - ComboBox 约束 0-9, C++ 仍重校验 (防止 BP 绕过)
+	// ==========================================
+	int32 TaskCounts[3] = {0, 0, 0};
+	UComboBoxString* TaskCombos[3] = {
+		ComboBoxString_Task1Count,
+		ComboBoxString_Task2Count,
+		ComboBoxString_Task3Count
+	};
+	const TCHAR* TaskNames[3] = {TEXT("Task1Count"), TEXT("Task2Count"), TEXT("Task3Count")};
+
+	for (int32 i = 0; i < 3; ++i)
+	{
+		if (!TaskCombos[i])
+		{
+			const FString Msg = FString::Printf(
+				TEXT("[DailyUpgradeRewardPage] ComboBoxString_%s 未绑定, 拒绝提交"), TaskNames[i]);
+			UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+
+		const FString CountStr = TaskCombos[i]->GetSelectedOption();
+		if (CountStr.IsEmpty())
+		{
+			const FString Msg = FString::Printf(
+				TEXT("任务%d完成次数未选择, 请从下拉框选0~9"), i + 1);
+			UE_LOG(LogTemp, Warning, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+
+		if (!CountStr.IsNumeric())
+		{
+			const FString Msg = FString::Printf(
+				TEXT("任务%d完成次数 '%s' 不是合法数字"), i + 1, *CountStr);
+			UE_LOG(LogTemp, Error, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+
+		const int32 CountVal = FCString::Atoi(*CountStr);
+		if (CountVal < 0 || CountVal > 9)
+		{
+			const FString Msg = FString::Printf(
+				TEXT("任务%d完成次数 %d 超出合法范围 [0,9]"), i + 1, CountVal);
+			UE_LOG(LogTemp, Error, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+
+		TaskCounts[i] = CountVal;
+	}
+
 	// 【v213 大厂架构】第 4 层: 委托 ViewModel
-	const bool bSuccess = ViewModel->ModifyCurrentExperience(SelectedDay, NewExp);
+	// 写入 4 个值: 经验值 + 3 个任务次数
+	const bool bExpSuccess = ViewModel->ModifyCurrentExperience(SelectedDay, NewExp);
+	const bool bTaskSuccess = ViewModel->ModifyAllTaskCounts(SelectedDay, TaskCounts[0], TaskCounts[1], TaskCounts[2]);
+	const bool bSuccess = bExpSuccess && bTaskSuccess;
 
 	// 第 5 层: 显示反馈 (绿/红)
 	if (bSuccess)
 	{
 		const FString Msg = FString::Printf(
-			TEXT("[成功] SelectedDay=%d, NewExp=%d 已写入 (UI 自动刷新)"),
-			SelectedDay, NewExp);
+			TEXT("[成功] SelectedDay=%d, NewExp=%d, Task1=%d, Task2=%d, Task3=%d 已写入 (UI 自动刷新)"),
+			SelectedDay, NewExp, TaskCounts[0], TaskCounts[1], TaskCounts[2]);
 		ShowDebugApplyFeedback(true, Msg);
 	}
 	else
 	{
 		// ViewModel 内部已 Log Error, 这里仅展示简短反馈
 		ShowDebugApplyFeedback(false,
-			FString::Printf(TEXT("[失败] SelectedDay=%d, NewExp=%d 请查看 Output Log"), SelectedDay, NewExp));
+			FString::Printf(TEXT("[失败] 请查看 Output Log")));
+	}
+}
+
+
+/**
+ * 【v222 新增】一键重置按钮点击回调
+ *
+ * 大厂原则 (分层):
+ *   - Page 不直接调 Subsystem (那是 ViewModel 的事)
+ *   - Page 仅通过 ViewModel.ResetAllActivityProgress() 委托
+ *   - 复位成功后回写 3 个任务 ComboBox 默认 "0" (避免 UI 与重建后的 day1 数据不一致)
+ *
+ * 大厂原则 (零兜底):
+ *   - ViewModel == null → Log Error + 屏幕红字 + return
+ *   - ViewModel 内部失败 → 屏幕红字 + return (具体原因 ViewModel 已 Log)
+ *
+ * 大厂原则 (职责分工):
+ *   - 没有确认弹窗 (用户明确要求)
+ *   - 成功反馈用 ShowDebugApplyFeedback (绿色) 而不是新增控件
+ *   - Subsystem 内部已 Broadcast OnGlobalRefresh, UI 自动刷新 (无需手动 Refresh)
+ */
+void UDailyUpgradeRewardPage::OnResetAllActivityClicked()
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[DailyUpgradeRewardPage] OnResetAllActivityClicked: 一键重置按钮被点击"));
+
+	// 【零兜底】第 1 层: ViewModel 存在性
+	if (!ViewModel)
+	{
+		const FString Msg = TEXT("[DailyUpgradeRewardPage] ViewModel 未创建, 拒绝重置");
+		UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+		ShowDebugApplyFeedback(false, Msg);
+		return;
+	}
+
+	// 委托 ViewModel → Subsystem 执行真正的重置 (清内存 + 落盘 + 重建 day1 + Broadcast)
+	const bool bSuccess = ViewModel->ResetAllActivityProgress();
+	if (bSuccess)
+	{
+		// 大厂原则 (职责分工): UI 复位 ComboBox 默认值, 避免与 day1 重建后的数据漂移
+		//   注: Subsystem 已 Broadcast OnGlobalRefresh → 触发 Page RefreshUI → ComboBox_SelectedDay 重新填充
+		//   但 3 个任务 ComboBox 不在 Refresh 范围 (用户原设计: 不随日切换刷新, 保留上次)
+		//   重置是"全部清空" → 必须显式回写为 "0", 否则 UI 显示的是重置前最后的"7"之类
+		if (ComboBoxString_Task1Count)
+		{
+			ComboBoxString_Task1Count->SetSelectedOption(TEXT("0"));
+		}
+		if (ComboBoxString_Task2Count)
+		{
+			ComboBoxString_Task2Count->SetSelectedOption(TEXT("0"));
+		}
+		if (ComboBoxString_Task3Count)
+		{
+			ComboBoxString_Task3Count->SetSelectedOption(TEXT("0"));
+		}
+
+		ShowDebugApplyFeedback(true,
+			FString::Printf(TEXT("[成功] 活动进度已重置 (清空所有 day + 落盘 + 重建 day1)")));
+	}
+	else
+	{
+		// ViewModel/Subsystem 内部已 Log Error (落盘失败 / day1 Config 缺失)
+		ShowDebugApplyFeedback(false,
+			FString::Printf(TEXT("[失败] 重置失败, 请查看 Output Log")));
 	}
 }
 

@@ -611,8 +611,8 @@ void UDailyLoginSaveModifier::RegisterConsoleCommands()
 			{
 				int32 ActivityID = FCString::Atoi(*Args[0]);
 				
-				bool bSuccess = ResetDailyLoginData(ActivityID);
-				UE_LOG(LogTemp, Log, TEXT("DailyLogin控制台: 重置数据 ActivityID=%d %s"), 
+				bool bSuccess = ResetPlayerRecord(ActivityID);
+				UE_LOG(LogTemp, Log, TEXT("DailyLogin控制台: 重置数据 ActivityID=%d %s (走 ResetPlayerRecord, Progress=1)"),
 					ActivityID, bSuccess ? TEXT("成功") : TEXT("失败"));
 			}
 			else
@@ -658,73 +658,9 @@ void UDailyLoginSaveModifier::UnregisterConsoleCommands()
 
 // ==================== 公共接口实现 ====================
 
-bool UDailyLoginSaveModifier::ResetDailyLoginData(int32 ActivityID, bool bAutoSave)
-{
-	if (!IsInitialized())
-	{
-		UE_LOG(LogTemp, Error, TEXT("DailyLoginSaveModifier: 未初始化"));
-		return false;
-	}
-
-	UActivitySaveGame* SaveGame = GetOrCreateSaveGame(ActivityID);
-	if (!SaveGame)
-	{
-		return false;
-	}
-
-	// 查找或创建活动记录
-	FPlayerLoginRecord* Record = SaveGame->ActivityRecords.Find(ActivityID);
-	if (!Record)
-	{
-		// 创建新的记录
-		FPlayerLoginRecord NewRecord;
-		NewRecord.ActivityID = ActivityID;
-		NewRecord.PlayerID = TEXT("DefaultPlayer");
-		NewRecord.Progress = 0;
-		NewRecord.CurrentClaimCount = 0;
-		NewRecord.ClaimedHistoryMask = 0;
-		NewRecord.ClaimedDays.Empty();
-		NewRecord.LastClaimTimestamp = 0;
-		NewRecord.LastUpdateTime = FDateTime::Now();
-		
-		SaveGame->ActivityRecords.Add(ActivityID, NewRecord);
-		Record = SaveGame->ActivityRecords.Find(ActivityID);
-	}
-
-	// 保存原始数据用于记录
-	FString OriginalProgress = FString::FromInt(Record->Progress);
-	FString OriginalClaimedDays = "[";
-	for (int32 i = 0; i < Record->ClaimedDays.Num(); ++i)
-	{
-		if (i > 0) OriginalClaimedDays += ", ";
-		OriginalClaimedDays += FString::FromInt(Record->ClaimedDays[i]);
-	}
-	OriginalClaimedDays += "]";
-
-	// 重置数据
-	Record->Progress = 0;
-	Record->CurrentClaimCount = 0;
-	Record->ClaimedHistoryMask = 0;
-	Record->ClaimedDays.Empty();
-	Record->LastClaimTimestamp = 0;
-	Record->LastUpdateTime = FDateTime::Now();
-
-	// 添加修改记录
-	AddModificationRecord(ActivityID, TEXT("Progress"), OriginalProgress, TEXT("0"));
-	AddModificationRecord(ActivityID, TEXT("CurrentClaimCount"), TEXT("0"), TEXT("0"));
-	AddModificationRecord(ActivityID, TEXT("ClaimedHistoryMask"), TEXT("0"), TEXT("0"));
-	AddModificationRecord(ActivityID, TEXT("ClaimedDays"), OriginalClaimedDays, TEXT("[]"));
-	AddModificationRecord(ActivityID, TEXT("LastClaimTimestamp"), TEXT("0"), TEXT("0"));
-
-	UE_LOG(LogTemp, Log, TEXT("DailyLoginSaveModifier: 重置活动%d的数据"), ActivityID);
-
-	if (bAutoSave)
-	{
-		return SaveAllRecords();
-	}
-
-	return true;
-}
+// 【大厂架构】原 ResetDailyLoginData 已并入上方的 ResetPlayerRecord
+// (单一真相源: Progress=1 + 自动广播 OnActivityDataChanged)
+// 控制台 DailyLogin.Reset 改为直接调用 ResetPlayerRecord
 
 void UDailyLoginSaveModifier::DisplayDailyLoginInfo(int32 ActivityID)
 {

@@ -80,7 +80,11 @@ bool ULANRoomPage::Initialize()
 	{
 		UE_LOG(LogTemp, Error, TEXT("[LANRoomPage] Btn_EnterRoom 为空! 请检查蓝图中的变量名是否匹配"));
 	}
-	if (Btn_BackToMenu) Btn_BackToMenu->OnClicked.AddDynamic(this, &ULANRoomPage::OnBackToMenuClicked);
+	if (Btn_BackToMenu)
+	{
+		Btn_BackToMenu->OnClicked.RemoveDynamic(this, &ULANRoomPage::OnBackToMenuClicked);
+		Btn_BackToMenu->OnClicked.AddDynamic(this, &ULANRoomPage::OnBackToMenuClicked);
+	}
 
 	// ==========================================
 	// 1.5 账号冲突模态对话框初始化（从 LoginPage 迁移）
@@ -725,11 +729,17 @@ void ULANRoomPage::OnBackToMenuClicked()
 	// ==========================================
 
 	// 【架构升级】返回主菜单: 走 GameFlowSubsystem, 由 UIViewService 自动接管
+	// 【v228.1 修复】加状态守卫: 若已在 MainMenu(2) 则静默返回, 避免 TransitToState(2→2) 被拦截
     if (UGameInstance* GI = GetGameInstance())
     {
         if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
         {
-            FlowSubsystem->TransitToState(EMatchState::MainMenu);
+            if (FlowSubsystem->GetCurrentState() == EMatchState::MainMenu)
+            {
+                // 已经在 MainMenu, GameMenuPage 已显示, 无需重复跳转
+                return;
+            }
+            FlowSubsystem->TransitToState(EMatchState::MainMenu, TEXT("LANRoomPage::OnBackToMenuClicked"));
         }
     }
     // 注意: 不再手动 RemoveFromParent, UIViewService 会处理

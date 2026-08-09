@@ -15,8 +15,13 @@
 #include "Systems/Activity/UpgradeActivitySubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "Systems/Activity/ActivitySubsystem.h"
-#include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
+// 【v218 大厂架构 - 移除冗余】原有 line 18 重复 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
+//   已在 line 6 include 过, 此处删除避免重复包含
 #include "Data/Tables/DailyLoginTableRow.h"
+// 【v218 大厂架构新增】"去完成" 跳转 LANRoom 所需
+#include "Services/UIViewService.h"
+#include "Enums/CoreEnums.h"
+#include "Engine/GameInstance.h"
 
 // UE 会自动生成构造函数，无需手动实现
 
@@ -32,8 +37,8 @@
  * 2. 防御链: GameInstance / UUpgradeActivitySubsystem
  * 3. 解析 DayIdentifier (RightChop(3)) 提取 DayNumber
  * 4. 读取 TaskClaimStatus[TaskIndex]（可能越界 -> 隐藏所有）
- * 5. 状态机:
- *    - Claimed (=1): 隐藏按钮+提示, 显示成功图标
+ * 5. 状态机 (大厂单一职责, 每个分支调对应 helper):
+ *    - Claimed (=1): 调 ApplyClaimedUI() (按钮置灰 + "已领取" + 成功图标)
  *    - Unclaimed + 满足条件: 按钮黄色 + "可领取"
  *    - Unclaimed + 未满足: 按钮灰色 + "去完成"
  *    - Invalid: 全部隐藏
@@ -54,6 +59,16 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 
 	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: 设置领取按钮 - Day:%s, TaskIndex:%d, Complete:%d, Required:%d"),
 		*DayIdentifier, TaskIndex, CompleteCount, RequiredCount);
+
+// ✅ 【v218 修复】未完成状态也要可点击，按下去 → 跳转到 LANRoom (WBP_LANRoomPage)
+// 大厂原则: 永远绑事件，内部 Wrapper 自行判状态 — 不让 Blueprint 端判
+// 跳转走 SSOT = UUIViewService::ShowPanel(EUIPanel::LANRoom), 不重复造轮子
+	ClaimButton->OnClicked.RemoveAll(this);
+	ClaimButton->OnClicked.AddDynamic(this, &UTaskDetailWidget::HandleClaimButtonClickWrapper);
+
+	// 存储参数到成员变量（用于包装器读取当前所属任务 ID）
+	CurrentDayIdentifier = DayIdentifier;
+	CurrentTaskIndex = TaskIndex;
 
 	// 🔧 调试日志: 确认接收到的任务完成数量
 	UE_LOG(LogTemp, Log, TEXT("🔍 UTaskDetailWidget: 接收到任务完成数量 - Day:%s, TaskIndex:%d, Complete:%d"), *DayIdentifier, TaskIndex, CompleteCount);
@@ -100,32 +115,12 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 	int32 ClaimStatus = TaskClaimStatus[TaskIndex];
 	UE_LOG(LogTemp, Log, TEXT("🔧 UTaskDetailWidget: TaskClaimStatus[%d] = %d"), TaskIndex, ClaimStatus);
 
-	// 🔥 强制检查: 如果已领取，立即设置 UI 状态
+	// 🔧【v216 重构】已领取状态: 走 ApplyClaimedUI() 单一职责函数
+	// 大厂原则: 按钮置灰 (SetIsEnabled false) + ClaimHintText="已领取" + ClaimSuccessImage Visible
 	if (ClaimStatus == 1)
 	{
 		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 已领取状态检测到! ClaimStatus=1, Day=%s, TaskIndex=%d"), *DayIdentifier, TaskIndex);
-		// 隐藏按钮和提示文本（不占位）
-		if (ClaimButton)
-		{
-			ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
-		}
-		if (ClaimHintText)
-		{
-			ClaimHintText->SetText(FText::FromString(TEXT("")));
-			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
-		}
-		// 显示成功图标
-		if (ClaimSuccessImage)
-		{
-			ClaimSuccessImage->SetVisibility(ESlateVisibility::Visible);
-			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ✅ ClaimSuccessImage 设置为 Visible"));
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针!"));
-		}
-
-		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 UI状态更新完成!"));
+		ApplyClaimedUI();
 		return;
 	}
 
@@ -182,20 +177,18 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 			// 也存储到 RewardOptionWidget 的上下文中，用于事件处理
 			CurrentTaskIndexForReward = TaskIndex;
 
-			// 存储参数到成员变量（用于无参委托）
-			CurrentDayIdentifier = DayIdentifier;
-			CurrentTaskIndex = TaskIndex;
-
-			// 绑定点击事件（使用无参 UFUNCTION 包装器）
-			ClaimButton->OnClicked.AddDynamic(this, &UTaskDetailWidget::HandleClaimButtonClickWrapper);
+			// [v217] 重复绑定已上移到顶部, 此处删除避免重复
+			// ClaimButton->OnClicked.AddDynamic(this, &UTaskDetailWidget::HandleClaimButtonClickWrapper);
 
 			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🟡 按钮已启用（黄色），可点击"));
 		}
 		else
 		{
-			// ❌ 不满足条件: 禁用按钮，设置为灰色
+			// ❌ 不满足条件: 按钮仍然可见且可点击（按下去什么都不发生）
+			//       [v217 修复] 用户要求"未完成时可点击，但无后续操作"
+			//       由 HandleClaimButtonClickWrapper 实时查 Subsystem 判定
 			ClaimButton->SetVisibility(ESlateVisibility::Visible);
-			ClaimButton->SetIsEnabled(false);
+			ClaimButton->SetIsEnabled(true);
 			FButtonStyle GrayStyle = ClaimButton->GetStyle();
 			GrayStyle.Normal.TintColor = FLinearColor::Gray;
 			ClaimButton->SetStyle(GrayStyle);
@@ -211,7 +204,7 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 				UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针（禁用状态）!"));
 			}
 
-			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ⚪ 按钮已禁用（灰色），条件不满足（%d/%d）"), CompleteCount, RequiredCount);
+			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ⚪ 按钮未完成状态（灰色），可点击 → 点击跳转 LANRoom（%d/%d）"), CompleteCount, RequiredCount);
 		}
 	}
 	else
@@ -228,6 +221,70 @@ void UTaskDetailWidget::SetupClaimButton(const FString& DayIdentifier, int32 Tas
 		{
 			ClaimSuccessImage->SetVisibility(ESlateVisibility::Collapsed);
 		}
+	}
+}
+
+
+// ==========================================
+// 1.5 已领取 UI 应用 - v216 新增 (大厂单一职责)
+// ==========================================
+
+/**
+ * UTaskDetailWidget::ApplyClaimedUI
+ *
+ * 职责: 集中管理"已领取"状态的 UI 视觉
+ * 1. ClaimButton: SetIsEnabled(false) + 灰色 + Visible (保留布局, 满足 v216 需求)
+ * 2. ClaimHintText: "已领取" + Visible (满足 v216 需求)
+ * 3. ClaimSuccessImage: Visible
+ *
+ * @note 每个控件必须有指针, 否则 Log Error + 跳过 (大厂原则: 零兜底)
+ */
+void UTaskDetailWidget::ApplyClaimedUI()
+{
+	UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 ApplyClaimedUI 被调用"));
+
+	// 1. ClaimButton: 保留布局, 设为不可点击 + 灰色
+	if (ClaimButton)
+	{
+		ClaimButton->SetVisibility(ESlateVisibility::Visible);
+		ClaimButton->SetIsEnabled(false);
+
+		// 设置按钮颜色为灰色 - 与"未完成条件"分支一致
+		FButtonStyle GrayStyle = ClaimButton->GetStyle();
+		GrayStyle.Normal.TintColor = FLinearColor::Gray;
+		GrayStyle.Disabled.TintColor = FLinearColor::Gray;
+		ClaimButton->SetStyle(GrayStyle);
+
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 ClaimButton 已置灰且 SetIsEnabled(false)"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimButton 为空指针! ApplyClaimedUI 失败"));
+		return;
+	}
+
+	// 2. ClaimHintText: 显示"已领取"
+	if (ClaimHintText)
+	{
+		ClaimHintText->SetText(FText::FromString(TEXT("已领取")));
+		ClaimHintText->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 ClaimHintText 显示「已领取」"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimHintText 为空指针! ApplyClaimedUI 部分失败"));
+		// 不 return: ClaimButton 已经置灰, ClaimSuccessImage 还要显示
+	}
+
+	// 3. ClaimSuccessImage: 显示成功图标
+	if (ClaimSuccessImage)
+	{
+		ClaimSuccessImage->SetVisibility(ESlateVisibility::Visible);
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ✅ ClaimSuccessImage 设置为 Visible"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针!"));
 	}
 }
 
@@ -338,10 +395,95 @@ void UTaskDetailWidget::HandleClaimButtonClicked(const FString& DayIdentifier, i
  *
  * 无参包装器（用于委托绑定）
  * 使用成员变量中存储的参数调用实际处理方法
+ *
+ * ✅ 【v217 修复】未完成/已领取状态点了按钮 = 什么都不发生
+ *    实时查 Subsystem 当前状态,非可领取则直接 return,不做任何业务
+ *    大厂原则: 状态查实时源(SSOT),不依赖 SetupClick 时缓存的旧值
  */
 void UTaskDetailWidget::HandleClaimButtonClickWrapper()
 {
-	// 使用成员变量中存储的参数调用实际处理方法
+	// 防御链: 成员变量未初始化
+	if (CurrentDayIdentifier.IsEmpty() || CurrentTaskIndex < 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - 成员变量未初始化, 不做任何操作"));
+		return;
+	}
+
+	// 实时查 Subsystem 当前状态
+	UGameInstance* GameInstance = GetGameInstance();
+	UUpgradeActivitySubsystem* Subsystem = GameInstance ? GameInstance->GetSubsystem<UUpgradeActivitySubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - 无法获取 UpgradeActivitySubsystem"));
+		return;
+	}
+
+	int32 DayNumber = FCString::Atoi(*CurrentDayIdentifier.RightChop(3));
+	const FUpgradeRewardSaveRecord* DayRecord = Subsystem->GetRecordByDate(DayNumber);
+	if (!DayRecord || !DayRecord->TaskClaimStatus.IsValidIndex(CurrentTaskIndex))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - Data 越界, 不做任何操作"));
+		return;
+	}
+
+	int32 ClaimStatus = DayRecord->TaskClaimStatus[CurrentTaskIndex];
+	if (ClaimStatus == 1)
+	{
+		UE_LOG(LogTemp, Log, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - 已领取状态, 不做任何操作"));
+		return;
+	}
+
+	// 实时查完成度
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Subsystem->GetConfigRowForDay(CurrentDayIdentifier);
+	if (!ConfigRow || !ConfigRow->TaskRelatedValues.IsValidIndex(CurrentTaskIndex))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - Config 越界, 不做任何操作"));
+		return;
+	}
+
+	const int32 CompleteCount = DayRecord->TaskCompleteCounts.IsValidIndex(CurrentTaskIndex) ? DayRecord->TaskCompleteCounts[CurrentTaskIndex] : 0;
+	const int32 RequiredCount = ConfigRow->TaskRelatedValues[CurrentTaskIndex];
+	if (CompleteCount < RequiredCount)
+	{
+		// ==========================================
+		// 【v218 大厂架构 - SSOT 跳转】未完成 → 跳 LANRoom
+		// ==========================================
+		// 决策:
+		//   - 走 UUIViewService::ShowPanel(EUIPanel::LANRoom), 自动注入 LANRoomPresenter, 自动隐藏活动页
+		//   - 不直接 OpenLevel: 静态面板切换, 不需要切图
+		//   - 不直接 CreateWidget<WBP_LANRoomPage>: 重复架构 (UIViewService 内部已处理)
+		//   - Q3=B: 奖励进度保留 — UUpgradeActivitySubsystem 是 GameInstanceSubsystem, 跨 Widget 持久
+		//     重进 DailyUpgradeRewardPage 时自动恢复进度, 无需额外代码
+		//
+		// 大厂原则:
+		//   - SSOT: 跳转入口唯一 = UUIViewService
+		//   - 0 兜底: GI/UIView null 必须 Log Error, 不静默
+		// ==========================================
+		UE_LOG(LogTemp, Log, TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - 未完成状态 (%d/%d), 跳转 LANRoom"), CompleteCount, RequiredCount);
+
+		UGameInstance* GI = GetGameInstance();
+		if (!GI)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - GameInstance 为空, 无法跳转 LANRoom. "
+				     "【v218 零兜底】请检查 UTaskDetailWidget 是否在合法 World 中."));
+			return;
+		}
+
+		UUIViewService* UIView = GI->GetSubsystem<UUIViewService>();
+		if (!UIView)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - UUIViewService 不可用, 无法跳转 LANRoom. "
+				     "【v218 零兜底】请检查 GameInstanceSubsystem 注册."));
+			return;
+		}
+
+		UIView->ShowPanel(EUIPanel::LANRoom);
+		return;
+	}
+
+	// ✅ 唯一真正可领取分支: 弹 RewardOptionWidget
 	this->HandleClaimButtonClicked(CurrentDayIdentifier, CurrentTaskIndex);
 }
 
@@ -353,17 +495,20 @@ void UTaskDetailWidget::HandleClaimButtonClickWrapper()
 /**
  * UTaskDetailWidget::HandleRewardStore
  *
+ * 🔧【v216 重构】大厂原则: 单一数据真相源 (Single Source of Truth)
+ *
+ * 新流程 (5 步):
  * 1. 防御链: GameInstance / UUpgradeActivitySubsystem
- * 2. 使用 CurrentTaskIndexForReward 锁定任务索引
- * 3. 解析 DayNumber
- * 4. DayRecord = GetRecordByDate
- * 5. 创建可修改副本 FUpgradeRewardSaveRecord MutableRecord
- * 6. while 确保 TaskClaimStatus 数组足够大
- * 7. TaskClaimStatus[ActualTaskIndex] = 1
- * 8. LastUpdateTime = Now
- * 9. AddOrUpdateRecord 保存
- * 10. 同步 CurrentRecord（如匹配）
- * 11. UI: 隐藏按钮+提示, 显示成功图标
+ * 2. 取 ActualTaskIndex = CurrentTaskIndexForReward (SetupClaimButton 时缓存)
+ * 3. 解析 DayNumber = FCString::Atoi(CurrentDayIdentifier.RightChop(3))
+ * 4. 调 Subsystem->ClaimTaskRewardForDay(DayNumber, ActualTaskIndex)
+ *    ├─ Subsystem 内部: AddOrUpdateRecord + 同步 CurrentRecord + SaveStatus
+ *    └─ 大厂原则: UI 只负责触发, 业务逻辑收敛到 Subsystem
+ * 5. 成功 → ApplyClaimedUI() (按钮置灰 + "已领取" + 成功图标)
+ *
+ * 反模式 (v216 之前):
+ *   - TaskDetailWidget 手动 AddOrUpdateRecord + 改 TaskClaimStatus + 同步 CurrentRecord
+ *   - 重复了 Subsystem 已有 ClaimTaskReward 的逻辑
  *
  * @param TaskIndex 任务索引（从 RewardOptionWidget 传递, 实际使用 CurrentTaskIndexForReward）
  */
@@ -393,80 +538,32 @@ void UTaskDetailWidget::HandleRewardStore(int32 TaskIndex)
 	int32 ActualTaskIndex = CurrentTaskIndexForReward;
 	UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 实际任务索引: %d"), ActualTaskIndex);
 
-	// 直接更新 TaskClaimStatus 而不通过 ClaimTaskReward
-	const FUpgradeRewardSaveRecord* DayRecord = nullptr;
-	int32 DayNumber = FCString::Atoi(*CurrentDayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
-	DayRecord = Subsystem->GetRecordByDate(DayNumber);
-
-	bool bClaimSuccess = false;
-
-	if (DayRecord)
-	{
-		// 创建可修改的记录副本
-		FUpgradeRewardSaveRecord MutableRecord = *DayRecord;
-
-		// 确保 TaskClaimStatus 数组足够大
-		while (MutableRecord.TaskClaimStatus.Num() <= ActualTaskIndex)
-		{
-			MutableRecord.TaskClaimStatus.Add(0);
-		}
-
-		// 设置为已领取
-		MutableRecord.TaskClaimStatus[ActualTaskIndex] = 1;
-		MutableRecord.LastUpdateTime = FDateTime::Now();
-
-		// 更新到子系统
-		Subsystem->AddOrUpdateRecord(DayNumber, MutableRecord);
-
-		// 如果这是当前记录，也更新 CurrentRecord
-		if (DayNumber == Subsystem->GetRecord().GetDayNumber())
-		{
-			Subsystem->GetRecord() = MutableRecord;
-		}
-
-		// 注意: 不在游戏运行时保存到本地磁盘，游戏关闭时统一保存
-
-		bClaimSuccess = true;
-		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 直接更新成功! Day=%d, TaskIndex=%d"), DayNumber, ActualTaskIndex);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ 无法找到天数记录 Day=%d"), DayNumber);
-	}
+	// 🔧【v216 重构】调用 Subsystem 权威 API ClaimTaskRewardForDay
+	// 大厂原则: 大厂原则: 单一数据真相源 (Single Source of Truth)
+	//   - 反模式: TaskDetailWidget 手动 AddOrUpdateRecord + 改 TaskClaimStatus
+	//   - 正解: TaskDetailWidget 委托给 Subsystem 统一处理
+	// 收益:
+	//   - 重复架构消除 (Subsystem 已有 ClaimTaskReward 系列)
+	//   - 持久化行为一致 (ClaimTaskRewardForDay 内部 SaveStatus)
+	//   - 业务逻辑收敛到 Subsystem, UI 只负责触发
+	const int32 DayNumber = FCString::Atoi(*CurrentDayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
+	const bool bClaimSuccess = Subsystem->ClaimTaskRewardForDay(DayNumber, ActualTaskIndex);
 
 	if (bClaimSuccess)
 	{
+		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 领取成功! Day=%d, TaskIndex=%d"), DayNumber, ActualTaskIndex);
 
-		// 强制更新 UI 状态
-		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 强制更新 UI 状态"));
-
-		// 隐藏按钮和提示文本（不占位）
-		if (ClaimButton)
-		{
-			ClaimButton->SetVisibility(ESlateVisibility::Collapsed);
-		}
-		if (ClaimHintText)
-		{
-			ClaimHintText->SetText(FText::FromString(TEXT("")));
-			ClaimHintText->SetVisibility(ESlateVisibility::Collapsed);
-		}
-
-		// 显示成功图标
-		if (ClaimSuccessImage)
-		{
-			ClaimSuccessImage->SetVisibility(ESlateVisibility::Visible);
-			UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] ✅ ClaimSuccessImage 设置为 Visible"));
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("[HIDE_DEBUG] ❌ ClaimSuccessImage 为空指针!"));
-		}
-
-		UE_LOG(LogTemp, Log, TEXT("[HIDE_DEBUG] 🎯 UI 更新完成!"));
+		// 🔧【v216 重构】走 ApplyClaimedUI() 单一职责函数 (与 SetupClaimButton 已领取分支共享)
+		// 大厂原则: DRY - 不在多处重复"已领取 UI" 设置
+		ApplyClaimedUI();
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[HIDE_DEBUG] ❌ 领取任务奖励失败 - TaskIndex:%d"), ActualTaskIndex);
+		// 🔧【v216 重构】领取失败: 强制 Log Error 让用户/QA 立即看到
+		// 大厂原则: 零兜底 - 不静默 return, 不"假装成功"
+		UE_LOG(LogTemp, Error,
+			TEXT("[HIDE_DEBUG] ❌ 领取任务奖励失败 - Day=%d, TaskIndex=%d (请检查 Subsystem 日志)"),
+			DayNumber, ActualTaskIndex);
 	}
 }
 

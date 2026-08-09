@@ -217,6 +217,45 @@ void UUIViewService::ShowPanelWhenPCReady(EUIPanel Panel)
 	if (Panel == EUIPanel::None) return;
 
 	// ==========================================
+	// 【大厂架构 v229 修复】全局状态守卫 — 防止面板在非法状态下被直接调用
+	// ==========================================
+	// 根因 (line 728 日志):
+	//   TaskDetailWidget 的任务按钮(未完成) → ShowPanel(LANRoom)
+	//   → 在 MainMenu(2) 状态下直接创建 LANRoomPage, 销毁 GameMenuPage
+	//   → Btn_BackToMenu 看似"点了没反应" (实际被 ShowPanel 循环覆盖)
+	//
+	// 大厂原则:
+	//   - ShowPanel(EUIPanel::X) 应该只在对应 EMatchState 状态下生效
+	//   - StateToPanelMap 是面板→状态的映射, 用于校验合法性
+	//   - 不匹配 = 调用方 bug, 静默拒绝 + Log Error
+	// ==========================================
+	{
+		UWorld* W = GetWorld();
+		UGameInstance* GI = W ? W->GetGameInstance() : nullptr;
+		UGameFlowSubsystem* FlowSubsystem = GI ? GI->GetSubsystem<UGameFlowSubsystem>() : nullptr;
+		if (FlowSubsystem)
+		{
+			EMatchState CurrentGameState = FlowSubsystem->GetCurrentState();
+			if (EUIPanel* ValidPanelPtr = StateToPanelMap.Find(CurrentGameState))
+			{
+				if (*ValidPanelPtr != Panel)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[UIViewService] ShowPanel: 非法面板调用! Panel=%d 在当前状态 %d 下不允许. "
+							 "调用已被静默拒绝. 【v229 零兜底修复】调用方需修复逻辑, 不应在状态 %d 下请求面板 %d."),
+						(int32)Panel,
+						(int32)CurrentGameState,
+						(int32)CurrentGameState,
+						(int32)Panel);
+					return;
+				}
+			}
+			// 若 StateToPanelMap 中无当前状态的映射 (如 Battleing 等特殊状态), 放行
+		}
+	}
+	// 若 FlowSubsystem 不可用, 放行 (原有逻辑会处理)
+
+	// ==========================================
 	// 【大厂 P0 修复 v4 2026.07.03】彻底重构守卫: 用 IsInViewport 作为唯一"已显示"凭证
 	// ==========================================
 	// 旧问题 (v3):

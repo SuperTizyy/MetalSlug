@@ -104,6 +104,19 @@ public:
 	UFUNCTION()
 	void HandleRewardStore(int32 TaskIndex);
 
+	/**
+	 * 【v216 新增】应用"已领取"UI 状态
+	 * 职责: 单一职责函数 - 集中管理 ClaimButton/ClaimHintText/ClaimSuccessImage 的已领取视觉
+	 * 大厂原则:
+	 *   - 按钮: SetIsEnabled(false) + 灰色 + Visible (保留布局)
+	 *   - 提示: "已领取" 文本 + Visible
+	 *   - 成功图标: Visible
+	 * 调用方:
+	 *   - SetupClaimButton 在 TaskClaimStatus[i]==1 分支
+	 *   - HandleRewardStore 领取成功后立即调用
+	 */
+	void ApplyClaimedUI();
+
 	// ==========================================
 	// 4. 配置
 	// ==========================================

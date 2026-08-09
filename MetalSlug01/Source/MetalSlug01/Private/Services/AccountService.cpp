@@ -171,6 +171,6 @@ void UAccountService::OnLoginSuccess(const FString& Username)
 	// UIViewService 监听状态变化 → 销毁 LoginPage + 创建 GameMenuPage
 	if (UGameFlowSubsystem* FlowSubsystem = GI->GetSubsystem<UGameFlowSubsystem>())
 	{
-		FlowSubsystem->TransitToState(EMatchState::MainMenu);
+		FlowSubsystem->TransitToState(EMatchState::MainMenu, TEXT("AccountService::OnLoginSuccess"));
 	}
 }

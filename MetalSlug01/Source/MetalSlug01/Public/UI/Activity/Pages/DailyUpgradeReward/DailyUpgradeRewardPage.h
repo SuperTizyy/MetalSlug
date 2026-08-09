@@ -15,6 +15,8 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/ComboBoxString.h" // 【v213.1 修复】模板函数体调用成员函数, 前向声明不足
+#include "Engine/EngineTypes.h" // 【v219 新增】FTimerHandle 完整定义
 #include "DailyUpgradeRewardPage.generated.h"
 
 // 前向声明: 仅引用指针, 避免循环包含
@@ -199,6 +201,26 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	UButton* Button_ApplyDebugValues;
 
+	/** 【v222 新增】一键重置按钮 (点击后: 调 ViewModel.ResetAllActivityProgress, 清空所有 day 记录 + 落盘 + 重建 day1) */
+	UPROPERTY(meta = (BindWidget))
+	UButton* Button_ResetAllActivity;
+
+	// ==========================================
+	// 4.1 【v213.1 新增】任务完成次数调试控件 (ComboBox 选项 0-9)
+	// ==========================================
+
+	/** 【v213.1 新增】ComboBox 1: 所选日期的任务一完成次数设置 (选项 0-9) */
+	UPROPERTY(meta = (BindWidget))
+	UComboBoxString* ComboBoxString_Task1Count;
+
+	/** 【v213.1 新增】ComboBox 2: 所选日期的任务二完成次数设置 (选项 0-9) */
+	UPROPERTY(meta = (BindWidget))
+	UComboBoxString* ComboBoxString_Task2Count;
+
+	/** 【v213.1 新增】ComboBox 3: 所选日期的任务三完成次数设置 (选项 0-9) */
+	UPROPERTY(meta = (BindWidget))
+	UComboBoxString* ComboBoxString_Task3Count;
+
 	// ==========================================
 	// 4. Widget 蓝图类引用
 	// ==========================================
@@ -211,9 +233,7 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class URewardOptionWidget> RewardOptionWidgetClass;
 
-	/** FixedPrizeWidget 蓝图类引用 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
-	TSubclassOf<class UExperienceChestClaimWidget> FixedPrizeWidgetClass;
+	// ⚠️ 2026-08-10: 移除 FixedPrizeWidgetClass 死代码 (整个项目零调用, 仅 .h 声明, 无任何引用)
 
 	/** ActivityConfirmPopupWidget 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
@@ -231,7 +251,7 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UDayLockHintWidget> DayLockHintWidgetClass;
 
-	/** WBP_RewardIcon 蓝图类引用 */
+	/** WBP_RewardIcon_BonusIconsContainer 蓝图类引用 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DailyUpgrade|UI")
 	TSubclassOf<class UUserWidget> RewardIconWidgetClass;
 
@@ -256,6 +276,9 @@ protected:
 
 	/** 缓存的物品图标数据（全局变量, 用于循环切换） */
 	TArray<TSoftObjectPtr<UTexture2D>> CachedItemIcons;
+
+	/** 【Ensure 修复】FixedPrizeWidget 的 OnChestClaimRequested 事件是否已绑定 (幂等保护) */
+	bool bIsFixedPrizeWidgetEventBound = false;
 
 	// ==========================================
 	// 6. 事件处理
@@ -469,6 +492,37 @@ private:
 	void OnDebugDayComboBoxSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
 
 	/**
+	 * 【v213.1 新增】任务完成次数 ComboBox 1 选项变化回调 (无操作, 仅订阅事件防崩溃)
+	 */
+	UFUNCTION()
+	void OnTask1CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	/**
+	 * 【v213.1 新增】任务完成次数 ComboBox 2 选项变化回调 (无操作, 仅订阅事件防崩溃)
+	 */
+	UFUNCTION()
+	void OnTask2CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	/**
+	 * 【v213.1 新增】任务完成次数 ComboBox 3 选项变化回调 (无操作, 仅订阅事件防崩溃)
+	 */
+	UFUNCTION()
+	void OnTask3CountComboBoxChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	/**
+	 * 【v213.1 新增】任务完成次数 ComboBox 绑定辅助函数
+	 * 大厂原则: DRY, 3 个 ComboBox 共用同一逻辑, 但为避免 UE AddDynamic 模板推导问题,
+	 *           每个控件单独绑定 (非模板, UE 编译器更稳定)
+	 */
+	void BindTaskCountComboBox(UComboBoxString* ComboBox);
+
+	/**
+	 * 【v213.1 新增】绑定任务次数 ComboBox 的 OnSelectionChanged 事件回调
+	 * 大厂原则: AddDynamic 必须分开调用, 避免 UE 编译器 VTable 推导问题
+	 */
+	void BindTaskCountComboBoxCallbacks();
+
+	/**
 	 * 【v213 大厂架构】提交按钮点击回调 (组合 EditableText + ComboBox 的值)
 	 * 大厂原则:
 	 *   - Page 不解析 SelectedDay (那是 ViewModel 的事)
@@ -477,6 +531,22 @@ private:
 	 */
 	UFUNCTION()
 	void OnApplyDebugValuesClicked();
+
+	/**
+	 * 【v222 新增】一键重置按钮点击回调
+	 *
+	 * 大厂原则:
+	 *   - Page 不直接操作 AllRecords 或磁盘 (那是 Subsystem 的事)
+	 *   - Page 仅通过 ViewModel 委托 (与 ApplyDebugValues 路径一致)
+	 *   - 失败/成功都通过 OnScreen DebugMessage + ShowDebugApplyFeedback 反馈 (避免新增弹窗)
+	 *
+	 * 业务规则 (用户 2026.08.11):
+	 *   - 立即落盘 (Subsystem 内部 SaveGameToSlot)
+	 *   - 直接执行, 不弹确认框
+	 *   - 成功后需要把 3 个任务 ComboBox 回写默认值 "0" (避免 UI 与数据不一致)
+	 */
+	UFUNCTION()
+	void OnResetAllActivityClicked();
 
 	/**
 	 * 【v213 大厂架构】提交结果反馈: 显示在屏幕上 (避免新增控件)
@@ -579,6 +649,35 @@ private:
 	 * @return 滚动偏移量
 	 */
 	float CalculateCenterScrollOffset(int32 TargetIndex);
+
+	/**
+	 * 🔧【v219 新增】Bonus 倒计时 1Hz Tick 回调
+	 * @details 大厂原则 - 数据驱动 + 节流:
+	 *          每秒更新一次 BonusInfoText 的倒计时 (H/M/S) 显示,
+	 *          与创建/选中 day 等事件触发的全量 UpdateBonusInfoText 配合形成"事件 + Tick" 双轨.
+	 *          - 事件轨: UpdateBonusInfoText 重算 EndTime + 重新设置文本 + 处理过期
+	 *          - Tick 轨: 仅在 EndTime 仍未过期时, 用最新 CurrentTime 刷新倒计时数字 (不重算 EndTime)
+	 * @note 1Hz 是秒级精度够用的最低频率, 避免 60Hz Tick 浪费 CPU
+	 */
+	void OnBonusCountdownTick();
+
+	/**
+	 * 🔧【v219 新增】启动 Bonus 倒计时 1Hz 定时器
+	 * @details 仅在 BonusInfoText 当前 Visible 且 ConfigRow.BonusDescription 非空时启动
+	 *          (有可视化的限时加成才需要倒计时, 没有就跳过)
+	 */
+	void StartBonusCountdownTimer();
+
+	/**
+	 * 🔧【v219 新增】停止 Bonus 倒计时定时器
+	 * @details NativeDestruct / UpdateBonusInfoText 进入隐藏状态时调用, 避免后台空转
+	 */
+	void StopBonusCountdownTimer();
+
+	/**
+	 * 🔧【v219 新增】Bonus 倒计时 1Hz TimerHandle
+	 */
+	FTimerHandle BonusCountdownTimerHandle;
 
 	/**
 	 * 计算 ScrollBox 的最大滚动偏移量

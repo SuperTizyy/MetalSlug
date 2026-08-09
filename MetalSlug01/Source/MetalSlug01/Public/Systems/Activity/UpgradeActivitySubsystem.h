@@ -128,8 +128,19 @@ public:
     const FDailyUpgradeRewardConfigRow* GetConfigRowForDay(const FString& DayIdentifier) const;
 
     /**
-     * @brief 获取配置表行（封装了ID 110的查找逻辑）
+     * @brief 【v217 DEPRECATED for task fields】获取 MainConfig (ActivityID=110 的第一行)
      * @return 配置表行指针，找不到则返回nullptr
+     *
+     * @warning 【v217 SSOT 警告】严禁用于以下 day-specific 字段:
+     *          - TaskTypes / TaskDescriptions / TaskRelatedValues / GameModes
+     *          - RewardItemIDs / RewardItemCounts (per-task 版)
+     *          → 业务 API 必须改用 GetExtraConfigForSpecificDay(DayNumber)
+     *
+     * @warning 【v217 零兜底】严禁在找不到 day-specific Config 时回退到本 API.
+     *          找不到 day-specific Config 应直接 Log Error + return false.
+     *
+     * @note 允许用途: FixedPrize (固定奖) UI 相关字段访问, 例如 GetChestCount / GetRewardItemIcons /
+     *       ShouldShowFixedPrizeHighlight 等. 这些字段在 MainConfig 中是"全局"语义.
      */
     const FDailyUpgradeRewardConfigRow* GetActivityConfig();
     
@@ -261,6 +272,18 @@ public:
     bool ClaimTaskReward(int32 TaskIndex);
 
     /**
+     * @brief 【v216 新增】领取指定天数的任务奖励
+     * @param DayNumber 天数 (1-based, 来自 DayIdentifier)
+     * @param TaskIndex 任务索引
+     * @return 是否领取成功
+     * @note 与 ClaimTaskReward 的区别:
+     *       - ClaimTaskReward 只操作 CurrentRecord
+     *       - ClaimTaskRewardForDay 操作指定 DayNumber 对应的 FUpgradeRewardSaveRecord (从 GetRecordByDate 获取)
+     *       - 如果 DayNumber 不存在对应记录, 失败
+     */
+    bool ClaimTaskRewardForDay(int32 DayNumber, int32 TaskIndex);
+
+    /**
      * @brief 检查宝箱是否可领取
      * @param ChestIndex 宝箱索引
      * @return 是否可领取
@@ -326,6 +349,18 @@ public:
      * @return 当前RewardIconIndex值
      */
     int32 GetCurrentRewardIconIndex() const;
+
+    /**
+     * @brief 【v218 新增】获取当前选中的 RewardText 数量 (ItemCount)
+     * @details 大厂原则 - SSOT 单一数据源:
+     *          数据链路: MainConfig.RewardItemIDs.Last() → BoxID → TreasureBoxItemsByBoxID[CurrentRewardIconIndex].ItemCount
+     *          与 URewardOptionCardWidget::RewardText 显示的 ItemCount 完全一致
+     * @return 当前选中的 RewardText 数量; 查不到返回 -1 (调用方按零兜底之外的方式处理)
+     * @note ⚠️ 零兜底: 任何一步查不到 (Config / ActivitySub / TreasureBoxItem / Index越界) 都返回 -1,
+     *       并 Log Error 给出具体失败点; 调用方 (Page) 必须显式处理 -1 (按"无可用值"显示, 严禁静默吞掉)
+     */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Upgrade Activity")
+    int32 GetCurrentRewardItemCount() const;
 
     /**
      * @brief 获取当前激活的"第几天" (1-based, 与 DailyUpgradeRewardPage 显示一致)
@@ -464,6 +499,32 @@ public:
      * @details 从磁盘加载存档游戏实例，用于访问所有记录数据
      */
     UActivitySaveGame* GetSaveGameInstance() const;
+
+    /**
+     * @brief 【v222 新增】一键重置整个 DailyUpgradeReward 页面所有活动进度
+     *
+     * 业务规则 (用户 2026.08.11):
+     *   1. 清空内存中所有 day 的记录 (AllRecords.Empty())
+     *   2. 清空磁盘 SaveGame->UpgradeRewardRecords (避免下次启动再读回来)
+     *   3. 立即 SaveGameToSlot 同步磁盘 (用户明确要求"立即写盘", 不留 dirty)
+     *   4. 重建 day1 (复用现有 CreateTodayRecord(), 已含零兜底 day1 Config 校验)
+     *   5. Broadcast OnGlobalRefresh + OnRewardIconIndexChanged (复用 ForceRefreshAllPages 同源事件)
+     *
+     * 大厂原则 (单一真理 + 职责集中):
+     *   - 清空 + 重建只在 Subsystem 这一处发生, 严禁 Page/ViewModel 各自操作 AllRecords / SaveGame
+     *   - 与 SaveModifier.ModifyCurrentExperience 走完全相同的"Subsystem 写 -> 广播 -> UI 刷新"路径
+     *   - 立即落盘与现有 SaveStatus() 一致 (但 SaveStatus 是 dirty 标记, 本函数是 force immediate)
+     *
+     * 零兜底:
+     *   - CreateTodayRecord() 内部 day1 Config 缺失 → Log Error + 返回, 函数直接 return false
+     *   - SaveGameToSlot 失败 → Log Error + return false (内存已清, 但磁盘未持久化, 异常状态需显式告知)
+     *
+     * @return true=内存 + 磁盘均已重置并重建 day1; false=任意一步失败
+     *
+     * @note 此 API 不动 CurrentRecord 的 GameInstance Subsystem 自身的状态 (GameInstance 不重建),
+     *       只重置 UpgradeReward 业务数据; 其他业务模块 (DailyLogin 等) 的存档数据不受影响.
+     */
+    bool ResetAllUpgradeActivityProgress();
 
 
 private:

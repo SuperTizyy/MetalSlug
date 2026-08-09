@@ -172,6 +172,16 @@ protected:
 	UFUNCTION()
 	void OnClaimAllButtonClicked();
 
+	/**
+	 * 重置领取进度按钮点击
+	 * 大厂架构职责: UI 只负责通知业务层, 不直接动存档
+	 * 1. ActivitySub->ResetPlayerRecord(101, true) — 单一入口
+	 * 2. 该入口会自动广播 OnActivityDataChanged → RefreshRewardList, UI 自动刷新
+	 * 不做任何兜底: Subsystem 为 nullptr 时直接报错, 不静默吞错
+	 */
+	UFUNCTION()
+	void OnResetProgressButtonClicked();
+
 	// ==========================================
 	// 4. UI 组件
 	// ==========================================
@@ -183,6 +193,14 @@ protected:
 	/** 全部领取按钮 */
 	UPROPERTY(meta = (BindWidget))
 	class UButton* ClaimAllButton;
+
+	/**
+	 * 重置领取进度按钮
+	 * 大厂架构: BindWidget 让蓝图无需手动绑定同名 Button 控件, 编译时自动匹配
+	 * 与 ClaimAllButton 命名风格一致
+	 */
+	UPROPERTY(meta = (BindWidget))
+	class UButton* ResetProgressButton;
 
 	/** 单天条目 Widget 类 */
 	UPROPERTY(EditAnywhere, Category = "DailyLogin|Classes")

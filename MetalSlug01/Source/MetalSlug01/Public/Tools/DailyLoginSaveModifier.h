@@ -279,14 +279,8 @@ private:
 	 */
 	void CleanupOldHistory();
 
-	/**
-	 * @brief 重置每日登录数据
-	 * @param ActivityID 活动ID
-	 * @param bAutoSave 是否自动保存
-	 * @return 是否重置成功
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Data Modification")
-	bool ResetDailyLoginData(int32 ActivityID, bool bAutoSave = true);
+	// 【大厂架构】ResetDailyLoginData 已并入 ResetPlayerRecord (Progress=1 + 广播 OnActivityDataChanged)
+	// 控制台 DailyLogin.Reset 直接走 ResetPlayerRecord — 单一真相源, 避免两个 Reset 行为不一致
 
 	/**
 	 * @brief 显示每日登录信息

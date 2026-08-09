@@ -27,23 +27,44 @@ UDataTable* FActivityDataTableService::LoadTableInternal(FName TableID)
 	UDataTable* Loaded = LoadObject<UDataTable>(nullptr, *AssetPath);
 	if (!Loaded)
 	{
-		UE_LOG(LogAssetLoad, Error, TEXT("[ActivityDT] 加载失败: %s (路径: %s)"), *TableID.ToString(), *AssetPath);
+		UE_LOG(LogTemp, Error, TEXT("[ActivityDT] 加载失败: %s (路径: %s)"), *TableID.ToString(), *AssetPath);
 		return nullptr;
 	}
 
-	UE_LOG(LogAssetLoad, Log, TEXT("[ActivityDT] 已加载: %s (Rows: %d)"), *TableID.ToString(), Loaded->GetRowMap().Num());
+	UE_LOG(LogTemp, Log, TEXT("[ActivityDT] 已加载: %s (Rows: %d)"), *TableID.ToString(), Loaded->GetRowMap().Num());
 	return Loaded;
 }
 
 UDataTable* FActivityDataTableService::Get(FName TableID)
 {
-	// 1. 命中缓存直接返回
+	// 1. 命中缓存: 校验是否仍有效 (UPROPERTY 的 TObjectPtr 在 GC 时会自动 null)
+	//    但缓存的 TMap 不在 UPROPERTY 体系, GC 不会自动清理 entry
+	//    → 必须手动校验 + IsValid 检测, 失效时自动重载
 	if (TObjectPtr<UDataTable>* Cached = GetCache().Find(TableID))
 	{
-		return Cached->Get();
+		UDataTable* RawPtr = Cached->Get();
+		if (IsValid(RawPtr))
+		{
+			// 额外防御: RowStruct 也不能失效 (DataTable 资产重载/热刷新后)
+			if (IsValid(RawPtr->GetRowStruct()))
+			{
+				return RawPtr;
+			}
+			UE_LOG(LogTemp, Warning,
+				TEXT("[ActivityDT] Get: '%s' DataTable.RowStruct 失效, 强制重新加载"),
+				*TableID.ToString());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[ActivityDT] Get: '%s' 缓存中的 DataTable 已失效 (GC/unload), 强制重新加载"),
+				*TableID.ToString());
+		}
+		// 失效: 清理 entry, 重新走 LoadTableInternal
+		GetCache().Remove(TableID);
 	}
 
-	// 2. 首次访问: 同步加载并写入缓存
+	// 2. 首次访问 / 失效重载: 同步加载并写入缓存
 	UDataTable* Loaded = LoadTableInternal(TableID);
 	if (Loaded)
 	{
@@ -54,7 +75,7 @@ UDataTable* FActivityDataTableService::Get(FName TableID)
 
 void FActivityDataTableService::ReloadAll()
 {
-	UE_LOG(LogAssetLoad, Warning, TEXT("[ActivityDT] ReloadAll: 清空缓存并重新加载 %d 张表"), GetCache().Num());
+	UE_LOG(LogTemp, Warning, TEXT("[ActivityDT] ReloadAll: 清空缓存并重新加载 %d 张表"), GetCache().Num());
 	for (auto& Pair : GetCache())
 	{
 		Pair.Value = nullptr; // 解除引用, 等待 GC
@@ -97,6 +118,8 @@ TArray<FName> FActivityDataTableService::GetMissingTables()
 
 void FActivityDataTableService::Shutdown()
 {
-	UE_LOG(LogAssetLoad, Log, TEXT("[ActivityDT] Shutdown: 清理 %d 张缓存表"), GetCache().Num());
+	UE_LOG(LogTemp, Log, TEXT("[ActivityDT] Shutdown: 清理 %d 张缓存表"), GetCache().Num());
 	GetCache().Empty();
 }
+
+// 注意: 模板方法 GetRowsSafe / FindRowByIdSafe 的实现已搬到 .h 末尾 (因模板必须在头文件中可见)
