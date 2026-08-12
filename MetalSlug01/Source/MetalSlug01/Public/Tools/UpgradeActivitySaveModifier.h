@@ -109,8 +109,14 @@ public:
 	bool ModifyRewardIconIndex(int32 RecordDate, int32 NewIndex, bool bAutoSave = true);
 
 	/**
-	 * @brief 修改宝箱领取状态
-	 * @param RecordDate 记录日期
+	 * @brief 【v228 改为全局接口】修改宝箱领取状态
+	 *
+	 * 大厂原则 SSOT 修正（用户 2026.08.13 明确）：
+	 *   - ChestClaimStatus 是全局状态，跨天共享，ItemsScrollBox 领取进度不变
+	 *   - 移除 RecordDate 参数，真源固定在 Subsystem->GlobalChestClaimStatus
+	 *   - 签名兼容：RecordDate 参数保留但忽略（仅作历史兼容，避免调用方编译错误）
+	 *
+	 * @param RecordDate 【已废弃-忽略】仅保留兼容旧调用方
 	 * @param ChestIndex 宝箱索引
 	 * @param IsClaimed 是否已领取(0=未领取, 1=已领取)
 	 * @param bAutoSave 是否自动保存
@@ -189,10 +195,16 @@ public:
 	int32 GetRewardIconIndex(int32 RecordDate) const;
 
 	/**
-	 * @brief 获取宝箱领取状态
-	 * @param RecordDate 记录日期
+	 * @brief 【v228 SSOT 重构】获取宝箱领取状态（全局真源 - 跨天共享）
+	 *
+	 * 大厂原则 SSOT（用户 2026.08.13 明确）：
+	 *   - ChestClaimStatus 是全局状态, ItemsScrollBox 在所有天共用同一份领取进度
+	 *   - 移除 RecordDate 参数语义, 真源固定在 Subsystem->GlobalChestClaimStatus
+	 *   - 签名兼容: RecordDate 参数保留但忽略 (仅作历史兼容, 避免调用方编译错误)
+	 *
+	 * @param RecordDate 【已废弃-忽略】仅保留兼容旧调用方
 	 * @param ChestIndex 宝箱索引
-	 * @return 是否已领取
+	 * @return 是否已领取 (0=未领取, 1=已领取)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Data Query")
 	int32 GetChestClaimStatus(int32 RecordDate, int32 ChestIndex) const;

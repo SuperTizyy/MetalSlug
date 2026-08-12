@@ -116,9 +116,18 @@ public:
 	UPROPERTY(SaveGame)
 	int32 CurrentExperience;
 
-	/** 宝箱领取情况数组（与 RewardItemIDs 数组一一对应, 0=未领取, 1=已领取） */
+	/**
+	 * 【v228 拆出】宝箱领取情况数组 - 旧字段（per-day，已废弃）
+	 *
+	 * 大厂原则 SSOT 修正（用户 2026.08.13 明确）：
+	 *   - ChestClaimStatus 跟天数无关，ItemsScrollBox 在所有天共用同一份领取进度
+	 *   - 真源已迁移到 UActivitySaveGame::GlobalChestClaimStatus
+	 *   - 此字段保留仅为兼容老存档反序列化，运行时不再使用
+	 *
+	 * @deprecated 自 v228 起请使用 UActivitySaveGame::GlobalChestClaimStatus
+	 */
 	UPROPERTY(SaveGame)
-	TArray<int32> ChestClaimStatus;
+	TArray<int32> ChestClaimStatus_DEPRECATED;
 
 	/** 记录创建时间 */
 	UPROPERTY(SaveGame)
@@ -175,4 +184,17 @@ public:
 	/** 升级奖励活动存档记录映射表（按日期存储） */
 	UPROPERTY(SaveGame)
 	TMap<int32, FUpgradeRewardSaveRecord> UpgradeRewardRecords;
+
+	/**
+	 * 【v228 新增】全局宝箱领取情况数组（与 MainConfig.RewardItemIDs 一一对应, 0=未领取, 1=已领取）
+	 *
+	 * 大厂原则 SSOT（用户 2026.08.13 明确）：
+	 *   - ItemsScrollBox 跨天共享同一份领取进度，ChestClaimStatus 跟天数无关
+	 *   - 真源放在 SaveGame 全局而非 per-day record
+	 *   - 老存档反序列化时默认空数组，由 Subsystem 在 LoadStatus 时按 MainConfig.RewardItemIDs.Num() 初始化
+	 *
+	 * @note 与 FUpgradeRewardSaveRecord.ChestClaimStatus_DEPRECATED 完全独立，不会互相覆盖
+	 */
+	UPROPERTY(SaveGame)
+	TArray<int32> GlobalChestClaimStatus;
 };

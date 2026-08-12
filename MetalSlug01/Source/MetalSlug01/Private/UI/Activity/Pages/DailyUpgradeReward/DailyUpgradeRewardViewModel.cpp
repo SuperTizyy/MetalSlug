@@ -301,6 +301,11 @@ bool UDailyUpgradeRewardViewModel::ModifyCurrentExperience(int32 SelectedDay, in
 		return false;
 	}
 
+	// 【vXXX.2 反向伤害已删除】原代码在此处"提交经验值后重置 ChestClaimStatus"
+	//   业务解释 (已纠正): Debug 提交按钮是 "改经验 / 改任务次数", 与 "玩家是否点过领奖按钮" 是正交两件事.
+	//   ViewModel 不该越权修改领进度 — 那是 ClaimChest 的职责 (Subsystem 直接落盘).
+	//   详见 v228 重构日志.
+
 	UE_LOG(LogTemp, Log,
 		TEXT("[DailyUpgradeRewardViewModel] ModifyCurrentExperience: 提交成功 (SelectedDay=%d → TargetRecordDate=%d, NewExp=%d)"),
 		SelectedDay, TargetRecordDate, NewExp);
@@ -426,6 +431,8 @@ bool UDailyUpgradeRewardViewModel::ModifyAllTaskCounts(int32 SelectedDay, int32 
 			TEXT("[DailyUpgradeRewardViewModel] ModifyAllTaskCounts: Task3 (index=2) 写入失败"));
 		return false;
 	}
+
+	// 【vXXX.2 反向伤害已删除】同 ModifyCurrentExperience, 不再重置 ChestClaimStatus
 
 	UE_LOG(LogTemp, Log,
 		TEXT("[DailyUpgradeRewardViewModel] ModifyAllTaskCounts: 提交成功 (SelectedDay=%d → TargetRecordDate=%d, Task1=%d, Task2=%d, Task3=%d)"),

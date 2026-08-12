@@ -56,20 +56,22 @@ void UActivityConfirmPopupWidget::NativeConstruct()
 /**
  * UActivityConfirmPopupWidget::InitializePopup
  *
- * 1. 缓存 RewardOptions + SelectedIndex
+ * 1. 缓存 RewardOptions + SelectedIndex + CurrentDayIndex
  * 2. 清空 RewardOptionsContainer
  * 3. 前 3 个 RewardOptions -> CreateRewardCardsForBox
  *
  * @param InRewardOptions 奖励选项数组
  * @param InSelectedIndex 默认选中索引
+ * @param InDayIndex 当前处理的天数
  */
-void UActivityConfirmPopupWidget::InitializePopup(const TArray<FDailyLoginConfigRow>& InRewardOptions, int32 InSelectedIndex)
+void UActivityConfirmPopupWidget::InitializePopup(const TArray<FDailyLoginConfigRow>& InRewardOptions, int32 InSelectedIndex, int32 InDayIndex)
 {
 	RewardOptions = InRewardOptions;
 	SelectedIndex = InSelectedIndex;
+	CurrentDayIndex = InDayIndex;
 
-	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 初始化弹窗，奖励选项数量: %d, 默认选中索引: %d"),
-		RewardOptions.Num(), SelectedIndex);
+	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 初始化弹窗，奖励选项数量: %d, 默认选中索引: %d, 天数: %d"),
+		RewardOptions.Num(), SelectedIndex, CurrentDayIndex);
 
 	// 如果有奖励选项容器，创建奖励卡片
 	if (RewardOptionsContainer && RewardOptions.Num() > 0)
@@ -333,7 +335,8 @@ void UActivityConfirmPopupWidget::OnCloseClicked()
  * 2. 若未选 -> 用默认值
  * 3. 防御链: GameInstance / UUpgradeActivitySubsystem
  * 4. UpdateRewardIconIndexAndSave(FinalSelectedIndex) 保存到存档
- * 5. RemoveFromParent
+ * 5. 广播 OnRewardConfirmed 事件（供父页面处理奖励领取）
+ * 6. RemoveFromParent
  */
 void UActivityConfirmPopupWidget::OnConfirmClicked()
 {
@@ -375,6 +378,12 @@ void UActivityConfirmPopupWidget::OnConfirmClicked()
 	{
 		UE_LOG(LogTemp, Error, TEXT("ActivityConfirmPopup: 无法获取GameInstance"));
 	}
+
+	// 【v206.2 修复】广播领取完成事件，让父页面处理奖励领取和刷新
+	// 原因: ActivityConfirmPopupWidget 是通用弹窗，不知道如何处理具体的奖励领取逻辑
+	// 父页面（DailyLoginPage）订阅此事件，自行调用 TryClaimReward 和 RefreshRewardList
+	UE_LOG(LogTemp, Log, TEXT("ActivityConfirmPopup: 广播 OnRewardConfirmed 事件，天数: %d"), CurrentDayIndex);
+	OnRewardConfirmed.Broadcast(CurrentDayIndex);
 
 	// 关闭弹窗
 	RemoveFromParent();

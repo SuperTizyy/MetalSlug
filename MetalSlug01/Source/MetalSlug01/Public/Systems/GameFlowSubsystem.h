@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 #pragma once
 
@@ -25,17 +25,10 @@
 // UE 自动生成的头文件（必须放在最后一行）
 #include "GameFlowSubsystem.generated.h"
 
-// 【架构规范：事件驱动】
-// 【大厂架构 2026.06.28 - 修复 P0 编译错误】
-// 修复: DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam 宏在 UE 5.6 中
-//   必须出现在 *.generated.h 之后 (注意 RoomGameState.h 也是此顺序)。
-//   原因: 该宏展开时引用 CURRENT_FILE_ID 拼接的 FID_*_DELEGATE 宏,
-//         以及 FUNC_DECLARE_DYNAMIC_MULTICAST_DELEGATE 宏, 都在 .generated.h 中定义。
-//   若放在 .generated.h 之前, 在 Subsystem 头文件这种 include 链较短的场景下,
-//   编译器会报 "缺少 ; (在 <class-head> 的前面)" 错误。
+// ==========================================
+// 动态多播委托声明（必须在 generated.h 之后，类定义之前）
+// ==========================================
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGameFlowStateChanged, EMatchState, NewState);
-
-// 【大厂架构 - 独立中断通道】
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGameInterrupted, EUIPanel, TargetPanel);
 
 /**
@@ -236,6 +229,25 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MetalSlug|GameFlow")
 	void RequestStateOnNextLoad(EMatchState DesiredState);
+
+	/**
+	 * @brief 【v229 新增】从任意状态跳转到 MainLobby 大厅
+	 *
+	 * 业务场景:
+	 *   - TaskDetailWidget 的"未完成任务"按钮点击 → 跳转 LANRoom
+	 *   - 在 MainMenu 状态下点击 → 也需要能跳转大厅
+	 *
+	 * 流程:
+	 *   1. TransitToState(MainLobby) → 状态机广播 OnStateChanged
+	 *   2. UIViewService::OnGameFlowStateChanged → ShowPanel(LANRoom)
+	 *
+	 * 大厂原则 SSOT:
+	 *   - 不允许跨状态直接 ShowPanel(LANRoom) (会被 StateToPanelMap 拦截)
+	 *   - 必须走状态机 TransitToState 入口, 让 UIViewService 同步状态
+	 *   - StateToPanelMap 已添加 MainMenu → LANRoom 映射, 允许跨状态跳转
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|GameFlow")
+	void TransitionToMainLobby();
 
 	/**
 	 * @brief 内部: PostLoadMapWithWorld 回调 (跨地图持久, 不会因 PC 销毁而丢失)

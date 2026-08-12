@@ -12,6 +12,13 @@
 // 前置声明
 class URewardOptionCardWidget;
 
+/**
+ * @delegate FOnRewardConfirmed
+ * @brief 玩家确认奖励选择时广播
+ * @param DayIndex 天数索引
+ */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRewardConfirmed, int32, DayIndex);
+
 
 /**
  * @class UActivityConfirmPopupWidget
@@ -66,10 +73,11 @@ public:
 	 * 初始化弹窗组件
 	 * @param InRewardOptions 奖励选项数据数组
 	 * @param InSelectedIndex 默认选中索引
+	 * @param InDayIndex 当前处理的天数（用于回调）
 	 * @note 在蓝图 Construct 事件中调用此函数进行初始化
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Activity Popup")
-	void InitializePopup(const TArray<struct FDailyLoginConfigRow>& InRewardOptions, int32 InSelectedIndex = 1);
+	void InitializePopup(const TArray<struct FDailyLoginConfigRow>& InRewardOptions, int32 InSelectedIndex = 1, int32 InDayIndex = 0);
 
 	/**
 	 * 设置当前选中索引
@@ -84,6 +92,13 @@ public:
 	 */
 	UFUNCTION(BlueprintPure, Category = "Activity Popup")
 	int32 GetSelectedIndex() const { return SelectedIndex; }
+
+	/**
+	 * 领取完成回调（供外部订阅）
+	 * 用途: DailyLoginPage 订阅此事件来处理奖励领取和刷新
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Activity Popup|Events")
+	FOnRewardConfirmed OnRewardConfirmed;
 
 protected:
 	// ==========================================
@@ -116,6 +131,10 @@ private:
 	/** 奖励选项数据 */
 	UPROPERTY()
 	TArray<struct FDailyLoginConfigRow> RewardOptions;
+
+	/** 当前处理的天数（用于回调时传递） */
+	UPROPERTY()
+	int32 CurrentDayIndex = 0;
 
 	// ==========================================
 	// 5. 私有辅助

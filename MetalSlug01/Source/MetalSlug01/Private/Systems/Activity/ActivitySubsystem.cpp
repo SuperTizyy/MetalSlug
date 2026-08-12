@@ -1,4 +1,4 @@
-﻿#include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Activity/ActivitySubsystem.h"
 #include "Systems/Activity/RedDotManager.h"
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"

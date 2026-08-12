@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 #include "Services/UIViewService.h"
 #include "Systems/GameFlowSubsystem.h"
@@ -410,6 +410,11 @@ void UUIViewService::TryShowPendingPanel()
 void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 {
 	// ==========================================
+	// 【v228 新增】保存旧面板，以便广播事件时使用
+	// ==========================================
+	const EUIPanel OldPanel = ActivePanel;
+
+	// ==========================================
 	// 【DEBUG-SET-4-D】真正进入 Show 逻辑: 即将销毁旧面板+显示新面板
 	// ==========================================
 	UWorld* CurrentWorld = GetWorld();
@@ -481,6 +486,11 @@ void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 	}
 
 	UE_LOG(LogUI, Log, TEXT("[UIViewService] 显示预创建面板: %d"), (int32)Panel);
+
+	// ==========================================
+	// 【v228 新增】通知业务层面板已切换（MusicManager 等订阅此事件）
+	// ==========================================
+	OnPanelChanged.Broadcast(OldPanel, Panel);
 }
 
 void UUIViewService::HideAllPanels()

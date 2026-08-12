@@ -120,6 +120,21 @@ void UExperienceChestClaimWidget::NativeDestruct()
  */
 void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 {
+	// 【vXXX.1 防御性检查】按钮本身是否有效
+	if (!ChestClaimButton)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ExperienceChestClaimWidget: ChestClaimButton未绑定！请检查蓝图是否正确绑定 ChestClaimButton 控件。Widget=%s"), *GetName());
+		return;
+	}
+
+	// 【vXXX.1 防御性检查】回调是否已绑定到父页面
+	if (!OnChestClaimRequested.IsBound())
+	{
+		UE_LOG(LogTemp, Error, TEXT("ExperienceChestClaimWidget: OnChestClaimRequested事件未绑定！请检查蓝图或C++代码是否正确绑定了OnChestClaimRequested事件。Widget=%s, ChestIndex=%d"),
+			*GetName(), ChestIndex);
+		return;
+	}
+
 	// 检查领取条件
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
@@ -160,8 +175,9 @@ void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 检测为普通Widget，使用索引%d"), TargetIndex);
 	}
 
-	// 检查是否已领取（读取目标索引的 ChestClaimStatus）
-	if (Record.ChestClaimStatus.IsValidIndex(TargetIndex) && Record.ChestClaimStatus[TargetIndex] == 1)
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 必须从 Subsystem 读取全局真源
+	const TArray<int32>& GlobalChestStatus = Subsystem->GetGlobalChestClaimStatus();
+	if (GlobalChestStatus.IsValidIndex(TargetIndex) && GlobalChestStatus[TargetIndex] == 1)
 	{
 		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: 宝箱%d已领取，无法重复领取"), TargetIndex);
 		return; // 已领取，不处理点击
@@ -590,8 +606,9 @@ void UExperienceChestClaimWidget::UpdateButtonState()
 		}
 	}
 
-	// 判断按钮状态
-	bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(TargetIndex) && Record.ChestClaimStatus[TargetIndex] == 1;
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 必须从 Subsystem 读取全局真源
+	const TArray<int32>& GlobalChestStatus2 = Subsystem->GetGlobalChestClaimStatus();
+	bool bIsClaimed = GlobalChestStatus2.IsValidIndex(TargetIndex) && GlobalChestStatus2[TargetIndex] == 1;
 
 	if (bIsClaimed)
 	{
@@ -835,10 +852,11 @@ void UExperienceChestClaimWidget::UpdateSuccessTextVisibility()
 		UE_LOG(LogTemp, Log, TEXT("ExperienceChestClaimWidget: SuccessText检测为普通Widget，使用索引%d"), TargetIndex);
 	}
 
-	// 根据目标索引的 ChestClaimStatus 数据控制 SuccessText 显示
-	if (Record.ChestClaimStatus.IsValidIndex(TargetIndex))
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 必须从 Subsystem 读取全局真源
+	const TArray<int32>& GlobalChestStatus3 = Subsystem->GetGlobalChestClaimStatus();
+	if (GlobalChestStatus3.IsValidIndex(TargetIndex))
 	{
-		bool bIsClaimed = (Record.ChestClaimStatus[TargetIndex] == 1);
+		bool bIsClaimed = (GlobalChestStatus3[TargetIndex] == 1);
 
 		if (SuccessText)
 		{
@@ -858,7 +876,7 @@ void UExperienceChestClaimWidget::UpdateSuccessTextVisibility()
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: ChestClaimStatus索引%d无效"), TargetIndex);
+		UE_LOG(LogTemp, Warning, TEXT("ExperienceChestClaimWidget: GlobalChestClaimStatus索引%d无效"), TargetIndex);
 		if (SuccessText)
 		{
 			SuccessText->SetVisibility(ESlateVisibility::Hidden);

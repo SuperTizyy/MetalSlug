@@ -291,6 +291,26 @@ public:
     bool CanClaimChest(int32 ChestIndex) const;
 
     /**
+     * @brief 【v228 新增】获取全局宝箱领取状态数组（SSOT 真源 - 跨天共享）
+     * @return 全局 TArray<int32>，索引对应 RewardItemIDs 中的宝箱，0=未领取/1=已领取
+     * @details 大厂原则 SSOT: ChestClaimStatus 跟天数无关，ItemsScrollBox 在所有天共用同一份领取进度
+     * @note 【v229 热重载修复】懒加载初始化: 热重载时 Initialize() 不重跑，导致 GlobalChestClaimStatus 始终为空
+     *        若数组为空则按 GetChestCount 初始化全零数组，确保宝箱领取不失败
+     */
+    const TArray<int32>& GetGlobalChestClaimStatus();
+
+    /**
+     * @brief 【v228 新增】修改全局宝箱领取状态（SSOT 真源写入 - 跨天共享）
+     * @param ChestIndex 宝箱索引
+     * @param IsClaimed 是否已领取 (0/1)
+     * @param bAutoSave 是否自动落盘
+     * @return 是否成功
+     * @details 大厂原则 SSOT: 唯一允许写入 GlobalChestClaimStatus 的入口；
+     *          严禁 Page/Widget/ViewModel 直接写 Subsystem 内部字段
+     */
+    bool ModifyGlobalChestClaimStatus(int32 ChestIndex, int32 IsClaimed, bool bAutoSave = true);
+
+    /**
      * @brief 检查任务是否可领取
      * @param TaskIndex 任务索引
      * @return 是否可领取
@@ -532,9 +552,20 @@ private:
     
     /** 所有存档记录 - 表格形式存储每一天的数据 */
     TMap<int32, FUpgradeRewardSaveRecord> AllRecords;
-    
+
     /** 当前存档记录 - 页面加载时调取的那一行数据 */
     FUpgradeRewardSaveRecord CurrentRecord;
+
+    /**
+     * 【v228 新增】全局宝箱领取状态缓存（SSOT 真源 - 跨天共享）
+     *
+     * 大厂原则 SSOT（用户 2026.08.13 明确）：
+     *   - ItemsScrollBox 在所有天共用同一份领取进度
+     *   - 与 SaveGame->GlobalChestClaimStatus 双向同步
+     *   - LoadStatus 时从 SaveGame 加载；SaveStatus 时回写
+     *   - 严禁 Page/Widget 直接读写此字段，全部走 Get/Modify 接口
+     */
+    TArray<int32> GlobalChestClaimStatus;
     
     /** 升级活动存档修改器 */
     UPROPERTY()

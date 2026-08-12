@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -16,6 +16,8 @@
 #include "Services/AccountService.h"
 // 引入登录地图控制器（用于切换子页面）
 #include "Systems/LoginPlayerController.h"
+// 【v228 新增】引入音乐管理器
+#include "Systems/Music/MusicManagerSubsystem.h"
 
 
 // ==========================================
@@ -169,6 +171,15 @@ void UGameMenuPage::OnActivityCenterClicked()
 		// 将活动中心页面添加到玩家的屏幕上（层级高于菜单）
 		// AddToViewport 会自动将控件置顶显示，覆盖当前菜单
 		ActivityNavMenuWidget->AddToViewport();
+
+		// 【v228 新增】切换到活动页面音乐
+		if (UGameInstance* GI = GetWorld()->GetGameInstance())
+		{
+			if (UMusicManagerSubsystem* MusicManager = GI->GetSubsystem<UMusicManagerSubsystem>())
+			{
+				MusicManager->PlayActivityMusic();
+			}
+		}
 
 		// 【重要】保留当前菜单页面: 与"多人模式"按钮不同，
 		// 活动中心是一个覆盖层（Overlay），用户关闭活动页面后应返回到菜单，

@@ -5,6 +5,7 @@
 // ==========================================
 #include "UI/Activity/Pages/Navigation/ActivityNavMenuWidget.h"
 #include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Music/MusicManagerSubsystem.h"
 #include "Data/ActivitySaveGame.h"
 #include "Components/Button.h"
 #include "Components/VerticalBox.h"
@@ -15,6 +16,7 @@
 #include "Engine/Texture2D.h"
 #include "Blueprint/UserWidget.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口
+#include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
 
 
 // ==========================================
@@ -1191,7 +1193,7 @@ void UActivityNavMenuWidget::ShowPageInContainer(UUserWidget* PageWidget)
 	}
 
 	// 页面已添加到容器并设置为可见
-
+				if (UDailyUpgradeRewardPage* DailyUpgradePage = Cast<UDailyUpgradeRewardPage>(PageWidget)) { DailyUpgradePage->ManualRefreshUI(); }
 }
 
 
@@ -1252,6 +1254,15 @@ void UActivityNavMenuWidget::OnBackToMenuClicked()
 	if (GetWorld() && RedDotRefreshTimerHandle.IsValid())
 	{
 		GetWorld()->GetTimerManager().ClearTimer(RedDotRefreshTimerHandle);
+	}
+
+	// 【v228 新增】恢复之前的音乐
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		if (UMusicManagerSubsystem* MusicManager = GI->GetSubsystem<UMusicManagerSubsystem>())
+		{
+			MusicManager->RestorePreviousMusic();
+		}
 	}
 
 	// 步骤 D: 【核心操作】销毁自身，返回游戏主菜单

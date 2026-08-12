@@ -113,6 +113,15 @@ public:
 	UUserWidget* GetActiveWidget() const { return ActiveWidget; }
 
 	// ==========================================
+	// 面板变化事件（供 MusicManager 等业务层订阅）
+	// ==========================================
+
+	/** 面板激活时广播（参数：旧面板 → 新面板） */
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnPanelChanged, EUIPanel, OldPanel, EUIPanel, NewPanel);
+	UPROPERTY(BlueprintAssignable, Category = "UIView|Events")
+	FOnPanelChanged OnPanelChanged;
+
+	// ==========================================
 	// 配置（蓝图可改）
 	// ==========================================
 

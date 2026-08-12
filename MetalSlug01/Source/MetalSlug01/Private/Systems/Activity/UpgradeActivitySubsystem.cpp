@@ -165,17 +165,48 @@ void UUpgradeActivitySubsystem::ReloadLatestRecord()
                 // 没有找到有效记录
                 CreateTodayRecord();
             }
+
+            // 【v228 新增】同步全局 ChestClaimStatus（SSOT 真源 - 跨天共享）
+            // 大厂原则 SSOT: LoadStatus 是唯一允许从 SaveGame 读 GlobalChestClaimStatus 的入口
+            // 兜底（仅在数组为空时）: 按 MainConfig.RewardItemIDs.Num() 初始化全零
+            GlobalChestClaimStatus = LoadedSave->GlobalChestClaimStatus;
+            if (GlobalChestClaimStatus.Num() == 0)
+            {
+                const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
+                if (MainConfig && MainConfig->RewardItemIDs.Num() > 0)
+                {
+                    GlobalChestClaimStatus.SetNumZeroed(MainConfig->RewardItemIDs.Num());
+                    UE_LOG(LogTemp, Log,
+                        TEXT("[v228] ReloadLatestRecord: GlobalChestClaimStatus 从存档为空，按 MainConfig.RewardItemIDs=%d 初始化全零"),
+                        MainConfig->RewardItemIDs.Num());
+                }
+                else
+                {
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("[v228] ReloadLatestRecord: MainConfig.RewardItemIDs 也为空，GlobalChestClaimStatus 保持空数组"));
+                }
+            }
+            else
+            {
+                UE_LOG(LogTemp, Log,
+                    TEXT("[v228] ReloadLatestRecord: 从存档加载 GlobalChestClaimStatus (大小=%d)"),
+                    GlobalChestClaimStatus.Num());
+            }
         }
         else
         {
             // 存档损坏或不包含该活动数据
             CreateTodayRecord();
+            // 兜底初始化 GlobalChestClaimStatus
+            GlobalChestClaimStatus.Empty();
         }
     }
     else
     {
         // 没有找到存档文件
         CreateTodayRecord();
+        // 兜底初始化 GlobalChestClaimStatus
+        GlobalChestClaimStatus.Empty();
     }
 }
 
@@ -216,16 +247,22 @@ const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetActivityConfig
     }
     static const FString ContextString(TEXT("UpgradeSubsystem"));
 
-    // 封装重复的 RowMap 遍历逻辑 - 遍历配置表查找目标活动
-    for (auto& Pair : CachedConfigTable->GetRowMap())
+    // 🔧【v230 热重载修复】改用 GetRowNames() + FindRow() 路径
+    // 原因: GetRowMap() 在热重载后可能返回失效指针，导致 Row->ActivityID 访问崩溃或数据错误
+    // 这与 DT_TreasureBoxItem 的 FindRowByIdSafe 使用相同的安全路径
+    const TArray<FName> RowNames = CachedConfigTable->GetRowNames();
+    for (const FName& RowName : RowNames)
     {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 110) 
+        FDailyUpgradeRewardConfigRow* Row = CachedConfigTable->FindRow<FDailyUpgradeRewardConfigRow>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
+        if (Row && Row->ActivityID == 110)
         {
             // 找到目标活动配置
             return Row;
         }
     }
+    UE_LOG(LogTemp, Error,
+        TEXT("[UUpgradeActivitySubsystem] GetActivityConfig: 遍历 %d 行未找到 ActivityID=110."),
+        RowNames.Num());
     return nullptr;
 }
 
@@ -277,16 +314,77 @@ const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetConfigRowForDa
  */
 bool UUpgradeActivitySubsystem::ClaimChest(int32 ChestIndex)
 {
-    // 验证宝箱是否可以领取
-    if (CurrentRecord.ChestClaimStatus.IsValidIndex(ChestIndex) && CurrentRecord.ChestClaimStatus[ChestIndex] == 0)
+    // 【v228 SSOT 修正】ChestClaimStatus 是全局状态（跨天共享）
+    // 原实现用 CurrentRecord.ChestClaimStatus 是 per-day, 切天后会被重置, 这是用户报告的 Bug 2 真因
+
+    // 零兜底: ChestIndex 必须落在 GlobalChestClaimStatus 范围内
+    if (!GlobalChestClaimStatus.IsValidIndex(ChestIndex))
     {
-        CurrentRecord.ChestClaimStatus[ChestIndex] = 1; // 标记已领
-        CurrentRecord.CurrentExperience += 20; // 经验值累加
-        CurrentRecord.LastUpdateTime = FDateTime::Now();
-        SaveStatus(); // 持久化保存
-        return true;
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ClaimChest: ChestIndex=%d 超出 GlobalChestClaimStatus 范围 (大小=%d)"),
+            ChestIndex, GlobalChestClaimStatus.Num());
+        return false;
     }
-    return false;
+
+    // 已领取则拒绝（防止重复领取）
+    if (GlobalChestClaimStatus[ChestIndex] == 1)
+    {
+        UE_LOG(LogTemp, Log,
+            TEXT("[UUpgradeActivitySubsystem] ClaimChest: ChestIndex=%d 已领取, 拒绝重复领取"),
+            ChestIndex);
+        return false;
+    }
+
+    // 标记已领取（全局真源）
+    GlobalChestClaimStatus[ChestIndex] = 1;
+
+    // 经验值累加仍走 per-day record（CurrentExperience 是 per-day, 不变）
+    CurrentRecord.CurrentExperience += 20;
+    CurrentRecord.LastUpdateTime = FDateTime::Now();
+
+    SaveStatus(); // 持久化（同时回写 GlobalChestClaimStatus）
+    return true;
+}
+
+/**
+ * @brief 【v228 新增】修改全局宝箱领取状态（SSOT 真源写入 - 跨天共享）
+ *
+ * 大厂原则 SSOT:
+ *   - 唯一允许写入 Subsystem 内部 GlobalChestClaimStatus 的入口
+ *   - Page/Widget/ViewModel 严禁直接写 Subsystem 内部字段
+ *   - 自动同步到 SaveGame->GlobalChestClaimStatus（落盘）
+ *
+ * 零兜底:
+ *   - ChestIndex 越界 → Log Error + return false
+ *   - IsClaimed 非法（不是 0/1）→ Log Error + return false
+ *
+ * @return true=成功写入并落盘；false=任一校验失败
+ */
+bool UUpgradeActivitySubsystem::ModifyGlobalChestClaimStatus(int32 ChestIndex, int32 IsClaimed, bool bAutoSave)
+{
+    if (!GlobalChestClaimStatus.IsValidIndex(ChestIndex))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ModifyGlobalChestClaimStatus: ChestIndex=%d 超出 GlobalChestClaimStatus 范围 (大小=%d)"),
+            ChestIndex, GlobalChestClaimStatus.Num());
+        return false;
+    }
+
+    if (IsClaimed != 0 && IsClaimed != 1)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[UUpgradeActivitySubsystem] ModifyGlobalChestClaimStatus: IsClaimed=%d 非法，必须为 0 或 1"),
+            IsClaimed);
+        return false;
+    }
+
+    GlobalChestClaimStatus[ChestIndex] = IsClaimed;
+
+    if (bAutoSave)
+    {
+        SaveStatus();
+    }
+    return true;
 }
 
 /**
@@ -545,9 +643,9 @@ bool UUpgradeActivitySubsystem::CanClaimChest(int32 ChestIndex) const
     if (!IsValidIndex(ChestIndex, MainConfig->RewardItemIDs.Num()))
         return false;
 
-    // 检查是否已领取 - 防止重复领取
-    if (IsValidIndex(ChestIndex, CurrentRecord.ChestClaimStatus.Num()) &&
-        CurrentRecord.ChestClaimStatus[ChestIndex] == 1)
+    // 检查是否已领取 - 防止重复领取（v228 SSOT: 读全局而非 per-day record）
+    if (IsValidIndex(ChestIndex, GlobalChestClaimStatus.Num()) &&
+        GlobalChestClaimStatus[ChestIndex] == 1)
         return false;
 
     // SSOT-2: day-specific Config 提供 per-day TaskRelatedValues (任务达成阈值)
@@ -642,6 +740,11 @@ void UUpgradeActivitySubsystem::SaveStatus()
     {
         SaveGame->UpgradeRewardRecords.Add(Pair.Key, Pair.Value);
     }
+
+    // 【v228 新增】同步全局 ChestClaimStatus（SSOT 真源 - 跨天共享）
+    // 大厂原则: SaveStatus 是唯一允许写 SaveGame->GlobalChestClaimStatus 的入口
+    SaveGame->GlobalChestClaimStatus = GlobalChestClaimStatus;
+
     // 保存到磁盘
     UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
 }
@@ -674,8 +777,16 @@ bool UUpgradeActivitySubsystem::ResetAllUpgradeActivityProgress()
         TEXT("[v222] 步骤 1: 内存 AllRecords 已清空 (旧数量=%d)"),
         OldAllRecordsCount);
 
+    // 步骤 1.5: 清空内存中的全局宝箱领取状态
+    //   ⚠️ GlobalChestClaimStatus 是独立的全局数据，不属于 per-day record，必须单独重置
+    const int32 OldGlobalChestCount = GlobalChestClaimStatus.Num();
+    GlobalChestClaimStatus.Empty();
+    UE_LOG(LogTemp, Log,
+        TEXT("[v222] 步骤 1.5: 内存 GlobalChestClaimStatus 已清空 (旧大小=%d)"),
+        OldGlobalChestCount);
+
     // 步骤 2: 清空磁盘存档中的 UpgradeRewardRecords 字段
-    //   ⚠️ 仅清 UpgradeRewardRecords, 不动 SaveGame 的其它字段 (DailyLogin 等)
+    //   ⚠️ 仅清 UpgradeRewardRecords, 不动 SaveGame 的其它字段 (DailyLogin / GlobalChestClaimStatus 等)
     UActivitySaveGame* SaveGame = Cast<UActivitySaveGame>(
         UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
     if (!SaveGame)
@@ -688,6 +799,10 @@ bool UUpgradeActivitySubsystem::ResetAllUpgradeActivityProgress()
 
     SaveGame->UpgradeRewardRecords.Empty();
     UE_LOG(LogTemp, Log, TEXT("[v222] 步骤 2: 磁盘 SaveGame.UpgradeRewardRecords 已清空"));
+
+    // 步骤 2.5: 清空磁盘存档中的 GlobalChestClaimStatus 字段
+    SaveGame->GlobalChestClaimStatus.Empty();
+    UE_LOG(LogTemp, Log, TEXT("[v222] 步骤 2.5: 磁盘 SaveGame.GlobalChestClaimStatus 已清空"));
 
     // 步骤 3: 立即 SaveGameToSlot 写盘 (用户明确要求立即同步)
     const bool bSaved = UGameplayStatics::SaveGameToSlot(SaveGame, SaveSlotName, SaveUserIndex);
@@ -721,8 +836,8 @@ bool UUpgradeActivitySubsystem::ResetAllUpgradeActivityProgress()
     OnRewardIconIndexChanged.Broadcast(CurrentRecord.RewardIconIndex);
 
     UE_LOG(LogTemp, Log,
-        TEXT("[v222] ResetAllUpgradeActivityProgress 完成: 旧 %d 条记录已清空, day1 已重建, 磁盘已同步"),
-        OldAllRecordsCount);
+        TEXT("[v222] ResetAllUpgradeActivityProgress 完成: AllRecords清空(%d→0), GlobalChestClaimStatus清空(%d→0), day1重建, 磁盘已同步"),
+        OldAllRecordsCount, OldGlobalChestCount);
     UE_LOG(LogTemp, Log, TEXT("===========================================================\n"));
 
     return true;
@@ -809,24 +924,22 @@ void UUpgradeActivitySubsystem::InitializeTodayRecordData()
         CurrentRecord.TaskClaimStatus.Add(0);
     }
 
-    // 初始化宝箱相关数组 - 根据 MainConfig (ActivityID=110) 的 RewardItemIDs 数组长度创建
-    // 🔧【v217 SSOT】ChestClaimStatus 数组长度 = MainConfig.RewardItemIDs.Num() (全局宝箱数)
-    //   与任务数组 (ExtraConfig.GameModes.Num()) 是两个独立的真相源, 不能混用
-    const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
-    if (!MainConfig)
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("[UUpgradeActivitySubsystem] InitializeTodayRecordData: 找不到 MainConfig (ActivityID=110). "
-                 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 ActivityID=110 行. 拒绝初始化宝箱数组."));
-        return;
-    }
+// 初始化宝箱相关数组 - 根据 MainConfig (ActivityID=110) 的 RewardItemIDs 数组长度创建
+	// 🔧【v217 SSOT】ChestClaimStatus 数组长度 = MainConfig.RewardItemIDs.Num() (全局宝箱数)
+	//   与任务数组 (ExtraConfig.GameModes.Num()) 是两个独立的真相源, 不能混用
+	const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
+	if (!MainConfig)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySubsystem] InitializeTodayRecordData: 找不到 MainConfig (ActivityID=110). "
+				 "请检查 DT_DailyUpgradeRewardConfigRow 是否配置 ActivityID=110 行. 拒绝初始化宝箱数组."));
+		return;
+	}
 
-    CurrentRecord.ChestClaimStatus.Empty();
-    const int32 ChestCount = MainConfig->RewardItemIDs.Num();
-    for (int32 i = 0; i < ChestCount; ++i)
-    {
-        CurrentRecord.ChestClaimStatus.Add(0);
-    }
+	// 【v228 SSOT 重构】ChestClaimStatus 不再属于 per-day record
+	// 全局初始化交给 ReloadLatestRecord() / SaveStatus() 处理 (跨天共享)
+	// 此处仅记录 ChestCount 供本函数其余逻辑参考
+	const int32 ChestCount = MainConfig->RewardItemIDs.Num();
 
     // 初始化其他字段 - 设置默认初始值
     CurrentRecord.RewardIconIndex = 0;
@@ -1191,28 +1304,21 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetRewardItemIcons
         return Result;
     }
 
-    // 5. 根据BoxID获取TreasureBoxItemRow数据
-    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-    if (TreasureBoxItems.Num() == 0)
+    // 5. 根据BoxID通过单条查询获取TreasureBoxItemRow数据 (避免 GetTreasureBoxItemsByBoxID 的遍历失效问题)
+    // 原因: GetTreasureBoxItem 使用 FindRowByIdSafe 防御性查询，稳定性更高
+    const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+    if (!TreasureBoxItem)
     {
         return Result;
     }
 
     // 6. 通过ItemID关联ItemDetailRow表获取ItemIcon数据
-    for (const FTreasureBoxItemRow* TreasureBoxItem : TreasureBoxItems)
+    const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
+    if (ItemDetail && !ItemDetail->ItemIcon.IsNull())
     {
-        if (TreasureBoxItem)
-        {
-            const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
-            if (ItemDetail && !ItemDetail->ItemIcon.IsNull())
-            {
-                Result.Add(ItemDetail->ItemIcon);
-
-            }
-        }
+        Result.Add(ItemDetail->ItemIcon);
     }
 
-    
     return Result;
 }
 
@@ -1223,13 +1329,30 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetChestBoxIcons()
     const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
     if (!Config || Config->RewardItemIDs.Num() == 0)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetChestBoxIcons: Config=%p, RewardItemIDs.Num()=%d"),
+            Config, Config ? Config->RewardItemIDs.Num() : 0);
         return Result;
     }
+
+    // 🔍【诊断日志】打印 RewardItemIDs 数组内容
+    FString RewardItemIDsStr;
+    for (int32 i = 0; i < Config->RewardItemIDs.Num(); ++i)
+    {
+        RewardItemIDsStr += Config->RewardItemIDs[i];
+        if (i < Config->RewardItemIDs.Num() - 1) RewardItemIDsStr += TEXT(", ");
+    }
+    UE_LOG(LogTemp, Log,
+        TEXT("[v218] GetChestBoxIcons: RewardItemIDs.Num()=%d, 内容=[%s]"),
+        Config->RewardItemIDs.Num(), *RewardItemIDsStr);
+
     // 2. 通过GameInstance获取ActivitySubsystem
     // 改造: 通过统一 helper
     UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v218] GetChestBoxIcons: ActivitySub 为空"));
         return Result;
     }
     // 3. 遍历RewardItemIDs，依次关联TreasureBoxItemRow表获取BoxIcon
@@ -1238,15 +1361,34 @@ TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetChestBoxIcons()
         int32 BoxID = FCString::Atoi(*RewardItemID);
         if (BoxID <= 0)
         {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[v218] GetChestBoxIcons: RewardItemID='%s' 解析为 BoxID=%d, 跳过"),
+                *RewardItemID, BoxID);
             continue;
         }
         // 根据BoxID获取TreasureBoxItemRow数据
         const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
-        if (TreasureBoxItem && !TreasureBoxItem->BoxIcon.IsNull())
+        if (!TreasureBoxItem)
         {
-            Result.Add(TreasureBoxItem->BoxIcon);
+            UE_LOG(LogTemp, Warning,
+                TEXT("[v218] GetChestBoxIcons: BoxID=%d (RewardItemID='%s') 查不到 TreasureBoxItem, 跳过"),
+                BoxID, *RewardItemID);
+            continue;
         }
+        if (TreasureBoxItem->BoxIcon.IsNull())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[v218] GetChestBoxIcons: BoxID=%d 的 BoxIcon 为空, 跳过"),
+                BoxID);
+            continue;
+        }
+        UE_LOG(LogTemp, Log,
+            TEXT("[v218] GetChestBoxIcons: BoxID=%d 找到 BoxIcon, 添加到结果 (累计=%d)"),
+            BoxID, Result.Num() + 1);
+        Result.Add(TreasureBoxItem->BoxIcon);
     }
+    UE_LOG(LogTemp, Log,
+        TEXT("[v218] GetChestBoxIcons: 共添加 %d 个图标"), Result.Num());
     return Result;
 }
 
@@ -1279,13 +1421,29 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardItemCount() const
         return -1;
     }
 
+    // 🔍【诊断日志】打印 RewardItemIDs 数组内容
+    FString RewardItemIDsStr;
+    for (int32 i = 0; i < Config->RewardItemIDs.Num(); ++i)
+    {
+        RewardItemIDsStr += Config->RewardItemIDs[i];
+        if (i < Config->RewardItemIDs.Num() - 1) RewardItemIDsStr += TEXT(", ");
+    }
+    UE_LOG(LogTemp, Log,
+        TEXT("[v218] GetCurrentRewardItemCount: RewardItemIDs.Num()=%d, 内容=[%s], Last()='%s'"),
+        Config->RewardItemIDs.Num(), *RewardItemIDsStr, *Config->RewardItemIDs.Last());
+
     // 2. 最后一个 RewardItemID 即 BoxID (与 GetRewardItemIcons / UpdateRewardIconIndexAndSave 保持一致)
-    const int32 BoxID = FCString::Atoi(*Config->RewardItemIDs.Last());
+    const FString LastRewardItemID = Config->RewardItemIDs.Last();
+    const int32 BoxID = FCString::Atoi(*LastRewardItemID);
+    
+    UE_LOG(LogTemp, Log,
+        TEXT("[v218] GetCurrentRewardItemCount: 解析 BoxID=%d (LastRewardItemID='%s')"), BoxID, *LastRewardItemID);
+    
     if (BoxID <= 0)
     {
         UE_LOG(LogTemp, Error,
             TEXT("[v218] GetCurrentRewardItemCount: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回 -1."),
-            *Config->RewardItemIDs.Last());
+            *LastRewardItemID);
         return -1;
     }
 
@@ -1298,25 +1456,18 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardItemCount() const
         return -1;
     }
 
-    const TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-    if (TreasureBoxItems.Num() == 0)
+    // 3. 通过 GetTreasureBoxItem 单条查询获取 ItemCount (避免 GetTreasureBoxItemsByBoxID 的遍历失效问题)
+    // 原因: GetTreasureBoxItem 使用 FindRowByIdSafe 防御性查询，稳定性更高
+    const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+    if (!TreasureBoxItem)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: BoxID=%d 查不到任何 TreasureBoxItem, 返回 -1."), BoxID);
+            TEXT("[v218] GetCurrentRewardItemCount: BoxID=%d 查不到 TreasureBoxItem, 返回 -1."), BoxID);
         return -1;
     }
 
-    // 4. 按当前 RewardIconIndex 取 ItemCount
-    const int32 CurrentIconIndex = CurrentRecord.RewardIconIndex;
-    if (!IsValidIndex(CurrentIconIndex, TreasureBoxItems.Num()))
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: RewardIconIndex=%d 越界 (TreasureBoxItems.Num()=%d), 返回 -1."),
-            CurrentIconIndex, TreasureBoxItems.Num());
-        return -1;
-    }
-
-    return TreasureBoxItems[CurrentIconIndex]->ItemCount;
+    // 4. 返回 ItemCount
+    return TreasureBoxItem->ItemCount;
 }
 
 /**
@@ -1341,33 +1492,8 @@ bool UUpgradeActivitySubsystem::SetCurrentRewardIconIndex(int32 NewIndex)
  */
 bool UUpgradeActivitySubsystem::UpdateRewardIconIndexAndSave(int32 NewIndex)
 {
-    // 验证索引有效性
-    const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
-    if (!Config)
-    {
-        return false;
-    }
-
-    // 获取奖励图标总数
-    int32 TotalIcons = 0;
-
-    // 通过同样的数据关联逻辑计算图标总数
-    if (Config->RewardItemIDs.Num() > 0)
-    {
-        FString LastRewardItemID = Config->RewardItemIDs.Last();
-        int32 BoxID = FCString::Atoi(*LastRewardItemID);
-
-        if (BoxID > 0)
-        {
-            // 改造: 走统一 helper
-            UActivitySubsystem* ActivitySub = GetActivitySub(this);
-            if (ActivitySub)
-            {
-                TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
-                TotalIcons = TreasureBoxItems.Num();
-            }
-        }
-    }
+    // 获取奖励图标总数 - 使用 GetChestBoxIcons 获取数量 (避免 GetTreasureBoxItemsByBoxID 的遍历失效问题)
+    int32 TotalIcons = GetChestBoxIcons().Num();
 
     // 验证新索引是否在有效范围内
     if (NewIndex < 0 || NewIndex >= TotalIcons)
@@ -1529,13 +1655,14 @@ void UUpgradeActivitySubsystem::CreateInheritedRecord(const FUpgradeRewardSaveRe
         CurrentRecord.TaskClaimStatus.Add(0);
     }
 
-    // 7. 继承前一天的经验值
-    CurrentRecord.CurrentExperience = PreviousRecord.CurrentExperience;
+// 7. 继承前一天的经验值
+	CurrentRecord.CurrentExperience = PreviousRecord.CurrentExperience;
 
-    // 8. 继承宝箱领取状态
-    CurrentRecord.ChestClaimStatus = PreviousRecord.ChestClaimStatus;
+	// 【v228 SSOT 重构】ChestClaimStatus 不再属于 per-day record
+	//   全局 ChestClaimStatus 跨天共享, 不需要从前一天继承 (也不会被新一天重置)
+	//   详见 v228 重构日志.
 
-    // 9-10. 设置创建和更新时间
+	// 9-10. 设置创建和更新时间
     FDateTime Now = FDateTime::Now();
     CurrentRecord.CreatedTime = Now;
     CurrentRecord.LastUpdateTime = Now;
@@ -1568,6 +1695,61 @@ FString UUpgradeActivitySubsystem::GetChestCount()
     return LastRewardItemCount;
 }
 
+/**
+ * @brief 【v229 热重载修复】懒加载 GlobalChestClaimStatus
+ *
+ * 热重载(HotReload)时:
+ *   - Subsystem 实例被保留
+ *   - Initialize() 不重新运行
+ *   - GlobalChestClaimStatus 始终为空数组
+ *   - 导致 ModifyGlobalChestClaimStatus 写入失败 (数组是空的)
+ *
+ * 修复: 首次访问时检测到数组为空,立即从存档懒加载或按 MainConfig 初始化全零
+ *
+ * 大厂原则 SSOT: GetGlobalChestClaimStatus 是唯一允许读取内部 GlobalChestClaimStatus 的入口
+ */
+const TArray<int32>& UUpgradeActivitySubsystem::GetGlobalChestClaimStatus()
+{
+    // 【v229 懒加载】热重载场景: GlobalChestClaimStatus 始终为空,需要检测并初始化
+    if (GlobalChestClaimStatus.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("[v229] GetGlobalChestClaimStatus: 数组为空(热重载场景),尝试从存档懒加载..."));
+
+        // 尝试从存档加载 GlobalChestClaimStatus
+        if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
+        {
+            UActivitySaveGame* LoadedSave = Cast<UActivitySaveGame>(
+                UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+            if (LoadedSave && LoadedSave->GlobalChestClaimStatus.Num() > 0)
+            {
+                GlobalChestClaimStatus = LoadedSave->GlobalChestClaimStatus;
+                UE_LOG(LogTemp, Log,
+                    TEXT("[v229] GetGlobalChestClaimStatus: 从存档加载 GlobalChestClaimStatus (大小=%d)"),
+                    GlobalChestClaimStatus.Num());
+                return GlobalChestClaimStatus;
+            }
+        }
+
+        // 兜底: 按 MainConfig.RewardItemIDs.Num() 初始化全零
+        const FDailyUpgradeRewardConfigRow* MainConfig = GetActivityConfig();
+        if (MainConfig && MainConfig->RewardItemIDs.Num() > 0)
+        {
+            GlobalChestClaimStatus.SetNumZeroed(MainConfig->RewardItemIDs.Num());
+            UE_LOG(LogTemp, Warning,
+                TEXT("[v229] GetGlobalChestClaimStatus: 存档中没有,按 MainConfig.RewardItemIDs=%d 初始化全零"),
+                MainConfig->RewardItemIDs.Num());
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[v229] GetGlobalChestClaimStatus: MainConfig.RewardItemIDs 也为空,无法初始化"));
+        }
+    }
+
+    return GlobalChestClaimStatus;
+}
+
 TArray<int32> UUpgradeActivitySubsystem::GetTaskRelatedValues()
 {
     TArray<int32> Result;
@@ -1595,19 +1777,19 @@ bool UUpgradeActivitySubsystem::ShouldShowFixedPrizeHighlight()
     {
         return false;
     }
-    // 获取最后一个索引的值
-    int32 LastTaskValue = Config->TaskRelatedValues.Last();
-    int32 CurrentExp = CurrentRecord.CurrentExperience;
-    // 检查最后一个索引的领取状态
-    int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
-    bool bIsLastChestClaimed = false;
-    if (CurrentRecord.ChestClaimStatus.IsValidIndex(LastIndex))
-    {
-        bIsLastChestClaimed = (CurrentRecord.ChestClaimStatus[LastIndex] == 1);
-    }
-    // 判断显示条件：CurrentExperience >= LastTaskValue 且 ChestClaimStatus = 0
-    bool bShouldShow = (CurrentExp >= LastTaskValue) && !bIsLastChestClaimed;
-    return bShouldShow;
+// 获取最后一个索引的值
+	int32 LastTaskValue = Config->TaskRelatedValues.Last();
+	int32 CurrentExp = CurrentRecord.CurrentExperience;
+	// 【v228 SSOT 重构】检查最后一个索引的领取状态 - 读全局而非 per-day
+	int32 LastIndex = Config->TaskRelatedValues.Num() - 1;
+	bool bIsLastChestClaimed = false;
+	if (GlobalChestClaimStatus.IsValidIndex(LastIndex))
+	{
+		bIsLastChestClaimed = (GlobalChestClaimStatus[LastIndex] == 1);
+	}
+	// 判断显示条件：CurrentExperience >= LastTaskValue 且 GlobalChestClaimStatus = 0
+	bool bShouldShow = (CurrentExp >= LastTaskValue) && !bIsLastChestClaimed;
+	return bShouldShow;
 }
 
 int32 UUpgradeActivitySubsystem::GetFixedPrizeExperienceValue()

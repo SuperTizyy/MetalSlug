@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file DailyUpgradeRewardPage.cpp
  * @brief 每日升级奖励活动页面实现
  * @author AI Assistant
@@ -132,8 +132,9 @@
 #include "Components/VerticalBoxSlot.h"
 #include "Components/ScrollBox.h"
 #include "Components/EditableTextBox.h" // 【v213 新增】调试用
-#include "Components/ComboBoxString.h"  // 【v213 新增】调试用
 #include "Engine/Engine.h"              // 【v213 新增】GEngine 屏幕提示
+#include "Styling/SlateTypes.h"
+#include "Components/ComboBoxString.h"  // 【v31.5.1】必须在 SlateTypes.h 之后, 否则 EUMGSequencePlayMode 未定义
 #include "Styling/SlateTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/EngineTypes.h"
@@ -165,18 +166,11 @@ bool UDailyUpgradeRewardPage::Initialize()
 		return false;
 	}
 
-	// 改造: 创建 ViewModel 并 Bind 到 Subsystem
+	// 改造: 创建 ViewModel (不 Bind, Bind 在 NativeConstruct 中)
+	// 【vXXX.1 大厂修复】Bind 必须在每次页面激活时执行, 否则页面缓存激活时 ViewModel->Subsystem 为 null
 	if (!ViewModel)
 	{
 		ViewModel = NewObject<UDailyUpgradeRewardViewModel>(this);
-	}
-	UGameInstance* GI = GetGameInstance();
-	if (GI && ViewModel)
-	{
-		if (UUpgradeActivitySubsystem* UpgradeSub = GI->GetSubsystem<UUpgradeActivitySubsystem>())
-		{
-			ViewModel->Bind(UpgradeSub);
-		}
 	}
 
 	// 初始化默认值
@@ -184,16 +178,6 @@ bool UDailyUpgradeRewardPage::Initialize()
 	CurrentExperience = 0;
 	CurrentBonusMultiplier = 1.0f;
 
-	// 绑定重选奖励按钮事件
-	if (ReselectRewardButton)
-	{
-		ReselectRewardButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
-		
-	}
-	else
-	{
-		
-	}
 
 	// ==========================================
 	// 【v213 新增】调试数据提交控件绑定 + ComboBox 初始化
@@ -238,28 +222,14 @@ bool UDailyUpgradeRewardPage::Initialize()
 			TEXT("[DailyUpgradeRewardPage] Initialize: EditableTextInput_NewExp 未绑定 (蓝图缺控件)"));
 	}
 
-	if (Button_ApplyDebugValues)
-	{
-		Button_ApplyDebugValues->OnClicked.AddDynamic(
-			this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[DailyUpgradeRewardPage] Initialize: Button_ApplyDebugValues 未绑定 (蓝图缺控件)"));
-	}
+	// 【vXXX.1 修复】调试按钮 OnClicked 绑定已移至 BindDebugButtons(), 在 NativeConstruct 调用
+	// 原因: Initialize() 仅首次创建时调用一次, 页面从缓存激活时不会重新调用 → 按钮 OnClicked 失效
+	// 修复: 模仿 BindReselectRewardButton 模式, 在 NativeConstruct 中再次绑定 (包含先解绑)
 
+	// ==========================================
 	// 【v222 新增】一键重置按钮绑定
-	if (Button_ResetAllActivity)
-	{
-		Button_ResetAllActivity->OnClicked.AddDynamic(
-			this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[DailyUpgradeRewardPage] Initialize: Button_ResetAllActivity 未绑定 (蓝图缺控件)"));
-	}
+	// 【vXXX.1 修复】OnClicked 绑定已移至 BindDebugButtons(), 此处保留变量检查日志
+	// ==========================================
 
 	// ==========================================
 	// 【v213.1 新增】任务完成次数 ComboBox 绑定 (选项 0-9)
@@ -294,10 +264,41 @@ void UDailyUpgradeRewardPage::NativeConstruct()
 	CurrentDayIndex = -1;
 	CurrentSelectedDay = 0; // 0表示没有临时高亮
 
+	// 【v228 Bug 1 修】初始化 ComboBox 待提交快照
+	//   - 旧实现 (-1) 会导致: BP 默认 ComboBox=1, 但用户没切换直接点 Apply, 此时 PendingSelectedDay=-1
+	//     → 校验 [1,5] 失败 → Log Error "PendingSelectedDay=-1" (用户报告)
+	//   - 修正: 默认值 = 1 (与 ComboBox BP 初始选项同步), 与 .h 字段默认值一致
+	PendingSelectedDay = 1;
+
 	// 清空按钮映射表以避免重复添加
 	ButtonToDayIndexMap.Empty();
 
+	// 【vXXX.1 大厂修复】ViewModel.Bind 必须在 NativeConstruct 中执行, 防止页面缓存激活时 Subsystem 丢失
+	// 大厂原则: ViewModel.Bind 依赖运行时 GameInstance, 必须在每次页面激活时重新绑定
+	if (ViewModel)
+	{
+		UGameInstance* GI = GetGameInstance();
+		if (GI)
+		{
+			if (UUpgradeActivitySubsystem* UpgradeSub = GI->GetSubsystem<UUpgradeActivitySubsystem>())
+			{
+				ViewModel->Bind(UpgradeSub);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[DailyUpgradeRewardPage] NativeConstruct: 无法获取 UUpgradeActivitySubsystem, ViewModel.Bind 失败"));
+			}
+		}
+	}
+
 	Super::NativeConstruct();
+	// 【vXXX 大厂修复】按钮绑定移到 NativeConstruct，确保页面从缓存激活时重新绑定
+	BindReselectRewardButton();
+
+	// 【vXXX.1 修复】调试按钮绑定 (Button_ApplyDebugValues / Button_ResetAllActivity / ComboBoxString_SelectedDay)
+	// 原因: 模仿 BindReselectRewardButton 模式, 防止页面从缓存激活时按钮失效
+	BindDebugButtons();
 
 	// 订阅UpgradeActivitySubsystem的奖励图标索引更新事件
 	SubscribeToSubsystemEvents();
@@ -360,10 +361,14 @@ void UDailyUpgradeRewardPage::NativeConstruct()
  */
 void UDailyUpgradeRewardPage::NativeDestruct()
 {
-	// 注意：不取消订阅Subsystem事件，让缓存的页面也能持续接收广播
-	// UnsubscribeFromSubsystemEvents(); // 已删除此行
+	// 【vXXX.1 大厂架构修复】取消订阅Subsystem事件
+	// 根本原因: NativeDestruct 故意不解绑会导致多个缓存页面同时响应子系统广播
+	// 架构问题: "让缓存的页面也能持续接收广播" 是错误的设计决策
+	// 大厂原则: 订阅/取消订阅必须成对出现，不允许残留绑定
+	// 修复: 页面销毁时必须解绑，页面激活时重新订阅
+	UnsubscribeFromSubsystemEvents();
 
-	// 🔧【v219 新增】停止 Bonus 倒计时定时器, 防止页面销毁后回调触发野指针
+	// 停止 Bonus 倒计时定时器, 防止页面销毁后回调触发野指针
 	StopBonusCountdownTimer();
 
 	// 解绑重选奖励按钮事件
@@ -710,6 +715,10 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 	int32 DisplayWidgetCount = FMath::Min(Config->RewardItemIDs.Num() - 1, ChestBoxIcons.Num());
 	auto& Record = Sub->GetRecord();
 
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 必须从 Subsystem 读取全局真源
+	// 严禁直接读 Record.ChestClaimStatus (该字段已废弃, 切天后会被重置)
+	const TArray<int32>& GlobalChestStatus4 = Sub->GetGlobalChestClaimStatus();
+
 	// 检查 ExperienceChestWidgetClass 是否设置
 	if (ExperienceChestWidgetClass == nullptr)
 	{
@@ -738,7 +747,8 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 		ChestWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
 		
 		// 关键：根据完整条件来决定显示状态
-		bool bIsClaimed = Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 1;
+		// 【v228 SSOT】 读 GlobalChestClaimStatus 而非 Record.ChestClaimStatus
+		bool bIsClaimed = GlobalChestStatus4.IsValidIndex(i) && GlobalChestStatus4[i] == 1;
 		bool bHasEnoughExp = false;
 		
 		// 检查经验值条件
@@ -795,9 +805,10 @@ void UDailyUpgradeRewardPage::InitializeExperienceChestWidgets()
 			ChestWidget->ExperienceText->SetText(FText::FromString(ExperienceValue));
 			
 			// 根据条件控制HighlightFrameImage显示：
-			// ChestClaimStatus=0 且 CurrentExperience >= TaskRelatedValues[i] 时显示高亮框
+			// GlobalChestClaimStatus=0 且 CurrentExperience >= TaskRelatedValues[i] 时显示高亮框
+			// 【v228 SSOT】 读 GlobalChestClaimStatus 而非 Record.ChestClaimStatus
 			bool bShouldShowHighlight = false;
-			if (Record.ChestClaimStatus.IsValidIndex(i) && Record.ChestClaimStatus[i] == 0)
+			if (GlobalChestStatus4.IsValidIndex(i) && GlobalChestStatus4[i] == 0)
 			{
 				if (CurrentExpFromSubsystem >= TaskRelatedValues[i])
 				{
@@ -1322,8 +1333,18 @@ void UDailyUpgradeRewardPage::RefreshUI()
 	
 	// 2.2 根据当前经验值居中显示相关内容
 	UE_LOG(LogTemp, Log, TEXT("\n[步骤2.2/7] 🎯 根据经验值居中显示内容..."));
-	CenterScrollBoxOnCurrentExperience();
-	UE_LOG(LogTemp, Log, TEXT("✅ ScrollBox已根据经验值居中定位"));
+	// 【v228 Bug 3 修】领取宝箱后不应滚动, 仅页面刷新时滚动
+	//   HandleChestClaimRequest 在领取后 Set bSuppressNextCenterScroll=true, 此处跳过一次
+	if (bSuppressNextCenterScroll)
+	{
+		bSuppressNextCenterScroll = false;
+		UE_LOG(LogTemp, Log, TEXT("⏭️ 跳过本次居中 (领取后)"));
+	}
+	else
+	{
+		CenterScrollBoxOnCurrentExperience();
+		UE_LOG(LogTemp, Log, TEXT("✅ ScrollBox已根据经验值居中定位"));
+	}
 	
 	// 3. 更新宝箱数量显示
 	UE_LOG(LogTemp, Log, TEXT("\n[步骤3/7] 📊 更新宝箱数量显示..."));
@@ -1660,6 +1681,69 @@ void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
  * 内部实现: 直接调用 RefreshUI()
  * 日志: 输出当前 Page 地址, 便于多实例调试
  */
+
+// 【vXXX 大厂修复】将按钮绑定逻辑抽取为独立方法
+// 原因: Initialize() 只调用一次，页面从缓存激活时不会重新调用
+// 解决: 在 NativeConstruct() 中调用此方法，确保每次激活都重新绑定
+void UDailyUpgradeRewardPage::BindReselectRewardButton()
+{
+	if (ReselectRewardButton)
+	{
+		// 先解绑，防止重复绑定
+		ReselectRewardButton->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
+		// 重新绑定
+		ReselectRewardButton->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::OnReselectRewardClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ReselectRewardButton 未绑定"));
+	}
+}
+
+/**
+ * @brief 绑定调试按钮事件 (在 NativeConstruct 调用, 防止页面缓存激活时事件失效)
+ * 【vXXX.1 大厂修复】模仿 BindReselectRewardButton 模式
+ * - Button_ApplyDebugValues: 提交体验值/任务次数
+ * - Button_ResetAllActivity: 一键重置活动
+ * - ComboBoxString_SelectedDay: 调试天数选择
+ * 大厂原则: 先解绑再绑定, 防止重复绑定导致事件不触发
+ */
+void UDailyUpgradeRewardPage::BindDebugButtons()
+{
+	if (Button_ApplyDebugValues)
+	{
+		// 先解绑, 防止重复绑定
+		Button_ApplyDebugValues->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
+		Button_ApplyDebugValues->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::OnApplyDebugValuesClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: Button_ApplyDebugValues 未绑定"));
+	}
+
+	if (Button_ResetAllActivity)
+	{
+		Button_ResetAllActivity->OnClicked.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
+		Button_ResetAllActivity->OnClicked.AddDynamic(this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: Button_ResetAllActivity 未绑定"));
+	}
+
+	if (ComboBoxString_SelectedDay)
+	{
+		// 先解绑, 防止重复绑定
+		ComboBoxString_SelectedDay->OnSelectionChanged.RemoveDynamic(this, &UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged);
+		ComboBoxString_SelectedDay->OnSelectionChanged.AddDynamic(this, &UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ComboBoxString_SelectedDay 未绑定"));
+	}
+}
+
+
 void UDailyUpgradeRewardPage::ManualRefreshUI()
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 手动刷新UI被调用 - 页面地址=%p"), this);
@@ -2058,36 +2142,32 @@ void UDailyUpgradeRewardPage::HandleRewardStore(int32 DayIndex)
 	
 	// DayIndex实际上就是ChestIndex
 	int32 ChestIndex = DayIndex;
-	
-	// 修改内存数据 - 同时更新 CurrentRecord 和 AllRecords
-	FUpgradeRewardSaveRecord ModifiedRecord = Subsystem->GetRecord();
-	if (ModifiedRecord.ChestClaimStatus.IsValidIndex(ChestIndex))
+
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享
+	// 严禁直接改 Subsystem 内部字段 (反向伤害)
+	// 唯一允许写入的入口: Subsystem->ModifyGlobalChestClaimStatus
+	if (!Subsystem->ModifyGlobalChestClaimStatus(ChestIndex, 1, /*bAutoSave=*/false))
 	{
-		ModifiedRecord.ChestClaimStatus[ChestIndex] = 1; // 标记为已领取
-		ModifiedRecord.LastUpdateTime = FDateTime::Now();
-		
-		// 🔧 关键修复：同步更新 AllRecords 映射表
-		int32 CurrentDay = ModifiedRecord.GetDayNumber();
-		Subsystem->AddOrUpdateRecord(CurrentDay, ModifiedRecord);
-		
-		// 同时更新 CurrentRecord
-		Subsystem->GetRecord() = ModifiedRecord;
-		
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 成功更新宝箱%d状态为已领取，同步到AllRecords[Day=%d]"), ChestIndex, CurrentDay);
-		
-		// 全局刷新活动页面
-		Subsystem->OnGlobalRefresh.Broadcast();
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已广播全局刷新事件"));
-		
-		// 特别更新FixedPrizeWidget状态
-		UpdateFixedPrizeWidget();
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget状态已更新"));
+		UE_LOG(LogTemp, Error,
+			TEXT("DailyUpgradeRewardPage: HandleChestClaimRequest ModifyGlobalChestClaimStatus 失败, ChestIndex=%d"),
+			ChestIndex);
+		return;
 	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: ChestClaimStatus索引%d无效"), ChestIndex);
-	}
-	
+	UE_LOG(LogTemp, Log,
+		TEXT("DailyUpgradeRewardPage: 成功更新全局宝箱%d状态为已领取"),
+		ChestIndex);
+
+	// 【v228 Bug 3 修】领取后抑制下次 RefreshUI 内的居中滚动 (用户要求: 仅页面刷新时才滚)
+	bSuppressNextCenterScroll = true;
+
+	// 全局刷新活动页面
+	Subsystem->OnGlobalRefresh.Broadcast();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 已广播全局刷新事件"));
+
+	// 特别更新FixedPrizeWidget状态
+	UpdateFixedPrizeWidget();
+	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget状态已更新"));
+
 	// 关闭RewardOptionWidget弹窗
 	if (RewardOptionWidgetClass)
 	{
@@ -3264,21 +3344,60 @@ void UDailyUpgradeRewardPage::OnTask3CountComboBoxChanged(FString SelectedItem, 
 // ==========================================
 
 /**
- * 【v213 大厂架构】ComboBox 选项变化回调
+ * 【v217 大厂架构】ComboBox 选项变化回调
  *
  * 大厂原则:
  *   - Page 仅记录 SelectedDay 字符串, 不在此处解析数字
  *   - ComboBox 已经在 Initialize 中默认选中 "1", 此回调只在用户主动切换时触发
  *   - 解析 + 校验全部委托给 ViewModel.ModifyCurrentExperience
+ *
+ * 【v217 修复】根因分析 (用户反馈 "每次更新 ComboBoxString_SelectedDay 点击 Button_ApplyDebugValues, 领取状态没重置"):
+ *   - Page 的 CurrentDayIndex 在首次 NativeConstruct 时被设成 MaxDay-1 (来自 Subsystem)
+ *   - 之前该回调为空 → 用户切换 ComboBox 时, CurrentDayIndex 不变
+ *   - 用户以为 ComboBox 切到 day=3 → 实际 Page 内部 CurrentDayIndex 还是 day=2
+ *   - 即使 viewmodel 已经把 CurrentRecord 改成了 day=3, Page 任务列表/高亮还在 day=2 上 → 视觉上 "老样子"
+ *
+ * 【v217 修复】新增逻辑:
+ *   1. 解析 SelectedItem 为 SelectedDayNumber
+ *   2. 同步更新 CurrentDayIndex + CurrentSelectedDay
+ *   3. 调用 OnDayButtonClicked 触发任务详情重建 (复用 day 切换流程)
+ *   4. 这样任务列表/TasksContainer/任务高亮全部跟随 ComboBox 切换, UI 与数据一致
  */
 void UDailyUpgradeRewardPage::OnDebugDayComboBoxSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
 {
-	// SelectionType::Direct = 初始化时 (Initialize 设默认值触发)
-	// SelectionType::OnMouseClick / Keyboard = 用户主动选择
 	// 调试日志 (Verbose 而非 Display: 避免刷屏)
 	UE_LOG(LogTemp, Verbose,
 		TEXT("[DailyUpgradeRewardPage] OnDebugDayComboBoxSelectionChanged: SelectedItem='%s', SelectionType=%d"),
 		*SelectedItem, static_cast<int32>(SelectionType));
+
+	// 【零兜底】第 1 层: 入参合法性校验
+	if (SelectedItem.IsEmpty() || !SelectedItem.IsNumeric())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] OnDebugDayComboBoxSelectionChanged: SelectedItem='%s' 非空数字, 拒绝更新"),
+			*SelectedItem);
+		return;
+	}
+
+	const int32 SelectedDayNumber = FCString::Atoi(*SelectedItem);
+	if (SelectedDayNumber < 1 || SelectedDayNumber > 5)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[DailyUpgradeRewardPage] OnDebugDayComboBoxSelectionChanged: SelectedDayNumber=%d 超出合法范围 [1,5], 拒绝更新"),
+			SelectedDayNumber);
+		return;
+	}
+
+	// 【v228 重构 - 大厂架构】ComboBox 仅作为 "待提交控件"
+	// 1. ComboBox 选中后, 仅缓存到 PendingSelectedDay (SSOT 单源, 此刻 UI 不变)
+	// 2. 不动 CurrentDayIndex / CurrentSelectedDay (DayButtonsContainer 高亮不变)
+	// 3. 不动 ItemsScrollBox (ItemsScrollBox 领取进度不变, 避免 Apply 过程中出现 bug)
+	// 4. 只有 Button_ApplyDebugValues 确认后, 才把 PendingSelectedDay 推到正式位
+	PendingSelectedDay = SelectedDayNumber;
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[DailyUpgradeRewardPage] 【v228 待提交快照】 ComboBox 切换: PendingSelectedDay=%d (CurrentDayIndex 仍=%d, UI 未刷新, 等待 Apply 确认)"),
+		PendingSelectedDay, CurrentDayIndex);
 }
 
 /**
@@ -3322,6 +3441,43 @@ void UDailyUpgradeRewardPage::OnApplyDebugValuesClicked()
 		return;
 	}
 
+	// 【v228 SSOT 修 - ComboBox 真源同步】每次 Apply 入口都把 ComboBox 当前选中解析回 PendingSelectedDay
+	//   - 大厂原则 (SSOT): ComboBox 的选项范围 1~5 是 BP 配置, 永远不会越界
+	//   - 旧反模式: Apply 成功后清空 PendingSelectedDay=-1, 用户连续点 Apply 时因 -1 校验失败而报错
+	//     即使 ComboBox 选中合法, 因为 PendingSelectedDay 是缓存字段而不是真源
+	//   - 修正: ComboBox 真源 → 每次 Apply 入口主动同步一次到 PendingSelectedDay
+	//     (PendingSelectedDay 仍是 ComboBox 的"待提交快照", 但快照必须随 ComboBox 实时更新)
+	{
+		const FString ComboSelectedStr = ComboBoxString_SelectedDay->GetSelectedOption().TrimStartAndEnd();
+		if (ComboSelectedStr.IsEmpty())
+		{
+			const FString Msg = TEXT("[DailyUpgradeRewardPage] ComboBoxString_SelectedDay 当前未选中任何项 (空字符串), 拒绝提交");
+			UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+		if (!ComboSelectedStr.IsNumeric())
+		{
+			const FString Msg = FString::Printf(TEXT("[DailyUpgradeRewardPage] ComboBox 选中 '%s' 不是合法数字, 拒绝提交"), *ComboSelectedStr);
+			UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+		const int32 ComboSelectedDay = FCString::Atoi(*ComboSelectedStr);
+		if (ComboSelectedDay < 1 || ComboSelectedDay > 5)
+		{
+			const FString Msg = FString::Printf(
+				TEXT("[DailyUpgradeRewardPage] ComboBox 选中 %d 不在合法范围 [1,5], 请检查 BP ComboBoxString_SelectedDay 配置"), ComboSelectedDay);
+			UE_LOG(LogTemp, Error, TEXT("%s"), *Msg);
+			ShowDebugApplyFeedback(false, Msg);
+			return;
+		}
+		PendingSelectedDay = ComboSelectedDay;
+		UE_LOG(LogTemp, Log,
+			TEXT("[DailyUpgradeRewardPage] 【v228 ComboBox 真源同步】 ComboBox 当前选中=%d → PendingSelectedDay=%d (校验通过)"),
+			ComboSelectedDay, PendingSelectedDay);
+	}
+
 	// 【零兜底】第 2 层: 解析 NewExp
 	const FString NewExpStr = EditableTextInput_NewExp->GetText().ToString().TrimStartAndEnd();
 	if (NewExpStr.IsEmpty())
@@ -3342,25 +3498,20 @@ void UDailyUpgradeRewardPage::OnApplyDebugValuesClicked()
 
 	const int32 NewExp = FCString::Atoi(*NewExpStr);
 
-	// 【零兜底】第 3 层: 解析 SelectedDay
-	const FString SelectedDayStr = ComboBoxString_SelectedDay->GetSelectedOption();
-	if (SelectedDayStr.IsEmpty())
+	// 【v228 重构 - 大厂架构】第 3 层: 读取 PendingSelectedDay (v228 新增字段)
+	// 1. PendingSelectedDay 是 ComboBox 选中后的 "待提交快照", 它**不等于** Page 当前的 CurrentDayIndex
+	// 2. ComboBox 切换时 Page UI 不变 (DayButtonsContainer 高亮 / ItemsScrollBox 全部不动)
+	// 3. 只有 Apply 时, PendingSelectedDay 才推送到 CurrentDayIndex/CurrentSelectedDay
+	// 4. 【零兜底】PendingSelectedDay 必须是合法值; 否则 Log Error + return
+	const int32 SelectedDay = PendingSelectedDay;
+	if (SelectedDay < 1 || SelectedDay > 5)
 	{
-		const FString Msg = TEXT("天数未选择, 请从下拉框选 1~5");
-		UE_LOG(LogTemp, Warning, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
-		ShowDebugApplyFeedback(false, Msg);
-		return;
-	}
-
-	if (!SelectedDayStr.IsNumeric())
-	{
-		const FString Msg = FString::Printf(TEXT("天数 '%s' 不是合法数字"), *SelectedDayStr);
+		const FString Msg = FString::Printf(
+			TEXT("PendingSelectedDay=%d 不在合法范围 [1,5], 必须先在 ComboBox 选中 1~5 中的某一天"), SelectedDay);
 		UE_LOG(LogTemp, Error, TEXT("[DailyUpgradeRewardPage] %s"), *Msg);
 		ShowDebugApplyFeedback(false, Msg);
 		return;
 	}
-
-	const int32 SelectedDay = FCString::Atoi(*SelectedDayStr);
 
 	// ==========================================
 	// 【v213.1 新增】解析 3 个任务完成次数
@@ -3419,11 +3570,44 @@ void UDailyUpgradeRewardPage::OnApplyDebugValuesClicked()
 		TaskCounts[i] = CountVal;
 	}
 
-	// 【v213 大厂架构】第 4 层: 委托 ViewModel
-	// 写入 4 个值: 经验值 + 3 个任务次数
+	// 【v228 重构 - 大厂架构】第 4 层: 先把 PendingSelectedDay 推到正式位, 再调 ViewModel
+	// 大厂原则 (UI 与数据同步):
+	//   1. Apply 是 "提交并切换" 的合并点, 而不是 "只提交不切换"
+	//   2. Apply 时先把 PendingSelectedDay 推到 CurrentDayIndex/CurrentSelectedDay
+	//   3. 调用 OnDayButtonClicked 重建: DayButtonsContainer 高亮 + ItemsScrollBox 重建 (不丢 Claim)
+	//   4. ItemsScrollBox 重建后, 领取进度仍由 Subsystem.ChestClaimStatus 决定 (v228 不再重置)
+	//   5. 最后 ViewModel.ModifyCurrentExperience/ModifyAllTaskCounts 修改数据 + SaveModifier 落盘
+	const int32 NewDayIndex = SelectedDay - 1; // 0-based
+	const bool bDayChanged = (NewDayIndex != CurrentDayIndex);
+
+	if (bDayChanged)
+	{
+		CurrentDayIndex = NewDayIndex;
+		CurrentSelectedDay = SelectedDay;
+		const FString DayIdentifier = FString::Printf(TEXT("day%d"), SelectedDay);
+		UE_LOG(LogTemp, Log,
+			TEXT("[DailyUpgradeRewardPage] 【v228 正式切换】 Apply 触发: PendingSelectedDay=%d → CurrentDayIndex=%d (0-based), CurrentSelectedDay=%d, DayIdentifier='%s'"),
+			PendingSelectedDay, CurrentDayIndex, CurrentSelectedDay, *DayIdentifier);
+
+		// 调用 OnDayButtonClicked 触发 DayButtonsContainer 高亮 + TasksContainer + 任务详情 widget 重建
+		OnDayButtonClicked(DayIdentifier, NewDayIndex);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[DailyUpgradeRewardPage] 【v228 同日 Apply】 SelectedDay=%d 与 CurrentDayIndex=%d 相同, 跳过重建"),
+			SelectedDay, CurrentDayIndex);
+	}
+
+	// 委托 ViewModel → Subsystem 写入经验值 + 3 个任务次数
 	const bool bExpSuccess = ViewModel->ModifyCurrentExperience(SelectedDay, NewExp);
 	const bool bTaskSuccess = ViewModel->ModifyAllTaskCounts(SelectedDay, TaskCounts[0], TaskCounts[1], TaskCounts[2]);
 	const bool bSuccess = bExpSuccess && bTaskSuccess;
+
+	// 【v228 反模式移除】不再清空 PendingSelectedDay = -1
+	//   - 旧反模式: 清空后, 用户连续按 Apply 时 PendingSelectedDay=-1 触发校验失败, 而 ComboBox 实际选中合法
+	//   - 修正: PendingSelectedDay 在 Apply 入口已由 ComboBox 真源同步, Apply 完成后保持合法值
+	//   - 下次 Apply 入口会再次重新同步 (用户可换 ComboBox 选项, 也可不换, 都正确)
 
 	// 第 5 层: 显示反馈 (绿/红)
 	if (bSuccess)

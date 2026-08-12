@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -6,7 +6,8 @@
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Components/Button.h"
 #include "Data/Tables/DailyLoginTableRow.h"
-#include "Systems/Activity/UpgradeActivitySubsystem.h"
+// 移除 UpgradeActivitySubsystem: RewardOptionWidget 属于每日登录模块, 不应跨子系统调用
+//#include "Systems/Activity/UpgradeActivitySubsystem.h"
 
 
 // ==========================================
@@ -120,17 +121,12 @@ void URewardOptionWidget::HandleStoreClicked()
 		UE_LOG(LogTemp, Warning, TEXT("OnStoreToBag 未绑定"));
 	}
 
-	// 直接强制刷新相关页面
-	UGameInstance* GameInstance = GetGameInstance();
-	if (GameInstance)
-	{
-		UUpgradeActivitySubsystem* Subsystem = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-		if (Subsystem)
-		{
-			Subsystem->OnGlobalRefresh.Broadcast();
-			UE_LOG(LogTemp, Warning, TEXT("✅ 已强制刷新所有相关页面"));
-		}
-	}
+	// 【v206.1 修复】移除跨子系统错误调用
+	// 原因: RewardOptionWidget 是每日登录模块的 Widget, 应该由 UActivitySubsystem 广播刷新
+	// 而非 UUpgradeActivitySubsystem。这个错误导致每日登录页面收不到刷新事件,
+	// BigRewardItem 的 ClaimButton 无法变成"已领取"状态。
+	// 正确流程: HandleStoreClicked 广播 OnStoreToBag -> DailyLoginPage::HandleRewardOptionStore
+	// -> TryClaimReward + RefreshRewardList -> ActivitySubsystem 广播 OnActivityDataChanged -> 页面刷新
 
 	// 确保只调用一次 RemoveFromParent，并添加额外的安全检查
 	if (IsValid(this))

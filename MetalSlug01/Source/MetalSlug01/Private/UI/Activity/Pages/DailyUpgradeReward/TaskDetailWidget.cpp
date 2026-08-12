@@ -19,7 +19,9 @@
 //   已在 line 6 include 过, 此处删除避免重复包含
 #include "Data/Tables/DailyLoginTableRow.h"
 // 【v218 大厂架构新增】"去完成" 跳转 LANRoom 所需
+// 【v229 重构】改为调用 GameFlowSubsystem::TransitionToMainLobby() 走状态机
 #include "Services/UIViewService.h"
+#include "Systems/GameFlowSubsystem.h"
 #include "Enums/CoreEnums.h"
 #include "Engine/GameInstance.h"
 
@@ -466,20 +468,21 @@ void UTaskDetailWidget::HandleClaimButtonClickWrapper()
 		{
 			UE_LOG(LogTemp, Error,
 				TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - GameInstance 为空, 无法跳转 LANRoom. "
-				     "【v218 零兜底】请检查 UTaskDetailWidget 是否在合法 World 中."));
+				     "【v229 零兜底】请检查 UTaskDetailWidget 是否在合法 World 中."));
 			return;
 		}
 
-		UUIViewService* UIView = GI->GetSubsystem<UUIViewService>();
-		if (!UIView)
+		// 【v229 重构】走 GameFlowSubsystem 状态机, 不再直接 ShowPanel(LANRoom)
+		UGameFlowSubsystem* Flow = GI->GetSubsystem<UGameFlowSubsystem>();
+		if (!Flow)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - UUIViewService 不可用, 无法跳转 LANRoom. "
-				     "【v218 零兜底】请检查 GameInstanceSubsystem 注册."));
+				TEXT("UTaskDetailWidget: HandleClaimButtonClickWrapper - GameFlowSubsystem 不可用, 无法跳转 LANRoom. "
+				     "【v229 零兜底】请检查 GameInstanceSubsystem 注册."));
 			return;
 		}
 
-		UIView->ShowPanel(EUIPanel::LANRoom);
+		Flow->TransitionToMainLobby();
 		return;
 	}
 

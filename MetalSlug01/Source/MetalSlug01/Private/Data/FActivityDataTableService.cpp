@@ -48,7 +48,28 @@ UDataTable* FActivityDataTableService::Get(FName TableID)
 			// 额外防御: RowStruct 也不能失效 (DataTable 资产重载/热刷新后)
 			if (IsValid(RawPtr->GetRowStruct()))
 			{
-				return RawPtr;
+				// 🔧【v230 增强防御】验证 DataTable 实际行数据是否有效
+				// 原因: RowStruct 指针看起来有效, 但热重载后内部行数据可能已失效
+				//       GetRowNames() 返回空数组 = DataTable 内部数据已损坏
+				const TArray<FName> RowNames = RawPtr->GetRowNames();
+				if (RowNames.Num() > 0)
+				{
+					// 额外验证: 尝试查找第一行, 确认 FindRow 路径仍然有效
+					static const FString ContextString(TEXT("FActivityDataTableService::Get_Validate"));
+					if (RawPtr->FindRow<FTableRowBase>(RowNames[0], ContextString, /*bWarnIfRowMissing=*/false))
+					{
+						return RawPtr;
+					}
+					UE_LOG(LogTemp, Warning,
+						TEXT("[ActivityDT] Get: '%s' FindRow 返回 nullptr (DataTable 内部数据损坏), 强制重新加载"),
+						*TableID.ToString());
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[ActivityDT] Get: '%s' GetRowNames() 返回 %d 行 (DataTable 数据已失效), 强制重新加载"),
+						*TableID.ToString(), RowNames.Num());
+				}
 			}
 			UE_LOG(LogTemp, Warning,
 				TEXT("[ActivityDT] Get: '%s' DataTable.RowStruct 失效, 强制重新加载"),

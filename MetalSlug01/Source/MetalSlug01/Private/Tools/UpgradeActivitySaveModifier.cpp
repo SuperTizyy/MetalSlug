@@ -172,49 +172,16 @@ bool UUpgradeActivitySaveModifier::ModifyRewardIconIndex(int32 RecordDate, int32
 
 bool UUpgradeActivitySaveModifier::ModifyChestClaimStatus(int32 RecordDate, int32 ChestIndex, int32 IsClaimed, bool bAutoSave)
 {
-	if (!ValidateAndLog(TEXT("ModifyChestClaimStatus")) || 
-	    !ValidateBinaryState(IsClaimed, TEXT("宝箱状态")))
+	// 【v228 SSOT 重构】ChestClaimStatus 改为全局真源（跨天共享）
+	// 保留 RecordDate 参数仅为签名兼容 - 内部忽略
+	// 严禁直接修改 per-day record - 那是反向伤害 (用户 2026.08.13 报告 Bug 2 真因)
+	if (!ValidateAndLog(TEXT("ModifyChestClaimStatus")))
 	{
 		return false;
 	}
 
-	// 获取目标记录（支持任意日期）
-	const FUpgradeRewardSaveRecord* RecordPtr = TargetSubsystem->GetRecordByDate(RecordDate);
-	if (!RecordPtr)
-	{
-		UE_LOG(LogTemp, Error, TEXT("ModifyChestClaimStatus: 记录%d不存在"), RecordDate);
-		return false;
-	}
-		
-	if (!RecordPtr->ChestClaimStatus.IsValidIndex(ChestIndex))
-	{
-		UE_LOG(LogTemp, Error, TEXT("ModifyChestClaimStatus: 宝箱索引%d超出范围"), ChestIndex);
-		return false;
-	}
-		
-	// 创建一个副本以避免引用问题
-	FUpgradeRewardSaveRecord ModifiedRecord = *RecordPtr;
-		
-	int32 OriginalStatus = ModifiedRecord.ChestClaimStatus[ChestIndex];
-	ModifiedRecord.ChestClaimStatus[ChestIndex] = IsClaimed;
-	ModifiedRecord.LastUpdateTime = FDateTime::Now();
-		
-	// 同步更新 AllRecords 映射表中的对应记录
-	TargetSubsystem->AddOrUpdateRecord(RecordDate, ModifiedRecord);
-		
-	// 如果修改的是当前记录，同步更新 CurrentRecord
-	if (TargetSubsystem->GetRecord().GetDayNumber() == RecordDate)
-	{
-		TargetSubsystem->GetRecord() = ModifiedRecord;
-	}
-
-	FString StatusText = (IsClaimed == 1) ? TEXT("已领取") : TEXT("未领取");
-	UE_LOG(LogTemp, Log, TEXT("ModifyChestClaimStatus: RecordDate=%d, 宝箱%d [%s] -> [%s]"), 
-		RecordDate, ChestIndex, OriginalStatus ? TEXT("已领取") : TEXT("未领取"), *StatusText);
-
-	ForceRefreshAllPages();
-
-	return true;
+	// 委派给 Subsystem 的全局接口 - 唯一允许写入 GlobalChestClaimStatus 的入口
+	return TargetSubsystem->ModifyGlobalChestClaimStatus(ChestIndex, IsClaimed, bAutoSave);
 }
 
 bool UUpgradeActivitySaveModifier::ModifyTaskCompleteCount(int32 RecordDate, int32 TaskIndex, int32 Count, bool bAutoSave)
@@ -387,12 +354,9 @@ bool UUpgradeActivitySaveModifier::ResetRecordData(int32 RecordDate, bool bAutoS
 	TargetSubsystem->GetRecord().CurrentExperience = 0;
 	TargetSubsystem->GetRecord().RewardIconIndex = 0;
 	TargetSubsystem->GetRecord().LimitedActivityCompleteCount = 0;
-	
+
 	// 重置数组
-	for (int32 i = 0; i < MAX_CHEST_COUNT && i < TargetSubsystem->GetRecord().ChestClaimStatus.Num(); ++i)
-	{
-		TargetSubsystem->GetRecord().ChestClaimStatus[i] = 0;
-	}
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态，跨天共享，不在此处重置
 	for (int32 i = 0; i < MAX_TASK_COUNT && i < TargetSubsystem->GetRecord().TaskCompleteCounts.Num(); ++i)
 	{
 		TargetSubsystem->GetRecord().TaskCompleteCounts[i] = 0;
@@ -463,20 +427,18 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	}
 	
 	// 初始化数组为默认值（不继承前一天的任务数据）
-	NewRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+	// 【v228 SSOT 重构】ChestClaimStatus 不再属于 per-day record, 移到 SaveGame->GlobalChestClaimStatus
+	// 不再初始化 NewRecord.ChestClaimStatus - 保留旧字段仅为兼容老存档反序列化
 	NewRecord.TaskCompleteCounts.SetNumZeroed(TaskCount);
 	NewRecord.TaskClaimStatus.SetNumZeroed(TaskCount);
-	
+
 	// 🔧 明确设置所有任务数据为 0，确保不会继承
 	for (int32 i = 0; i < TaskCount; ++i)
 	{
 		NewRecord.TaskCompleteCounts[i] = 0;
 		NewRecord.TaskClaimStatus[i] = 0;
 	}
-	for (int32 i = 0; i < MAX_CHEST_COUNT; ++i)
-	{
-		NewRecord.ChestClaimStatus[i] = 0;
-	}
+	// 【v228 SSOT 重构】不再初始化 ChestClaimStatus - 已移至 GlobalChestClaimStatus (跨天共享)
 	
 	UE_LOG(LogTemp, Log, TEXT("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 	UE_LOG(LogTemp, Log, TEXT("【Upgrade.CreateRecord - 初始化后验证】刚创建时的任务数据:"));
@@ -548,11 +510,8 @@ bool UUpgradeActivitySaveModifier::CreateNewRecord(int32 RecordDate, bool bInher
 	{
 		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.TaskClaimStatus[i]);
 	}
-	UE_LOG(LogTemp, Log, TEXT("  📊 ChestClaimStatus (必须全为 0):"));
-	for (int32 i = 0; i < NewRecord.ChestClaimStatus.Num(); ++i)
-	{
-		UE_LOG(LogTemp, Log, TEXT("    [%d] = %d"), i, NewRecord.ChestClaimStatus[i]);
-	}
+	UE_LOG(LogTemp, Log, TEXT("  📊 ChestClaimStatus (v228: 已移至 GlobalChestClaimStatus, 此字段保留仅兼容老存档):"));
+	UE_LOG(LogTemp, Log, TEXT("    GlobalChestClaimStatus 大小=%d"), TargetSubsystem->GetGlobalChestClaimStatus().Num());
 	UE_LOG(LogTemp, Log, TEXT("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"));
 	
 	// 更新Subsystem中的记录
@@ -625,8 +584,16 @@ int32 UUpgradeActivitySaveModifier::GetRewardIconIndex(int32 RecordDate) const
 
 int32 UUpgradeActivitySaveModifier::GetChestClaimStatus(int32 RecordDate, int32 ChestIndex) const
 {
-	const FUpgradeRewardSaveRecord* Record = GetRecordOrNull(RecordDate);
-	return (Record && Record->ChestClaimStatus.IsValidIndex(ChestIndex)) ? Record->ChestClaimStatus[ChestIndex] : 0;
+	// 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 必须从 Subsystem 读取全局真源
+	// RecordDate 参数已被废弃, 内部忽略
+	if (!TargetSubsystem)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySaveModifier] GetChestClaimStatus: TargetSubsystem 为空, 无法读取全局 ChestClaimStatus"));
+		return 0;
+	}
+	const TArray<int32>& GlobalChestStatus = TargetSubsystem->GetGlobalChestClaimStatus();
+	return GlobalChestStatus.IsValidIndex(ChestIndex) ? GlobalChestStatus[ChestIndex] : 0;
 }
 
 int32 UUpgradeActivitySaveModifier::GetTaskCompleteCount(int32 RecordDate, int32 TaskIndex) const
@@ -825,7 +792,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 						ModifiedRecord.CurrentExperience = 0;
 						ModifiedRecord.RewardIconIndex = 0;
 						ModifiedRecord.LimitedActivityCompleteCount = 0;
-						ModifiedRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+						// 【v228 SSOT 重构】ChestClaimStatus 已迁至 GlobalChestClaimStatus, 不再初始化 per-day record 字段
 						ModifiedRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
 						ModifiedRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
 					}
@@ -908,7 +875,7 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 							ModifiedRecord.CurrentExperience = 0;
 							ModifiedRecord.RewardIconIndex = 0;
 							ModifiedRecord.LimitedActivityCompleteCount = 0;
-							ModifiedRecord.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+							// 【v228 SSOT 重构】ChestClaimStatus 已迁至 GlobalChestClaimStatus, 不再初始化 per-day record 字段
 							ModifiedRecord.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
 							ModifiedRecord.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
 						}
@@ -1065,14 +1032,17 @@ void UUpgradeActivitySaveModifier::RegisterConsoleCommands()
 						UE_LOG(LogTemp, Log, TEXT("📊 当前经验值：%d"), Record->CurrentExperience);
 						UE_LOG(LogTemp, Log, TEXT("🎁 奖励图标索引：%d"), Record->RewardIconIndex);
 						
-						// 显示宝箱状态
-						FString ChestStatus = TEXT("📦 宝箱领取状态 [索引=状态]: ");
-						for (int32 i = 0; i < Record->ChestClaimStatus.Num() && i < MAX_CHEST_COUNT; ++i)
+// 显示宝箱状态 - 【v228 SSOT 重构】ChestClaimStatus 是全局状态, 跨天共享, 只显示一次
+					{
+						FString ChestStatus = TEXT("📦 全局宝箱领取状态 (跨天共享): ");
+						const TArray<int32>& GlobalChestStatus5 = this->TargetSubsystem->GetGlobalChestClaimStatus();
+						for (int32 i = 0; i < GlobalChestStatus5.Num() && i < MAX_CHEST_COUNT; ++i)
 						{
-							FString StatusText = (Record->ChestClaimStatus[i] == 1) ? TEXT("已领取") : TEXT("未领取");
+							FString StatusText = (GlobalChestStatus5[i] == 1) ? TEXT("已领取") : TEXT("未领取");
 							ChestStatus += FString::Printf(TEXT("[%d]=%s "), i, *StatusText);
 						}
 						UE_LOG(LogTemp, Log, TEXT("%s"), *ChestStatus);
+					}
 						
 						// 显示任务状态
 						UE_LOG(LogTemp, Log, TEXT("📝 任务完成情况:"));
@@ -1254,7 +1224,7 @@ void UUpgradeActivitySaveModifier::InitializeNewRecord(FUpgradeRewardSaveRecord&
 	Record.LimitedActivityCompleteCount = 0;
 	
 	// 初始化数组
-	Record.ChestClaimStatus.SetNumZeroed(MAX_CHEST_COUNT);
+	// 【v228 SSOT 重构】ChestClaimStatus 已迁至 GlobalChestClaimStatus, 不再初始化 per-day record 字段
 	Record.TaskCompleteCounts.SetNumZeroed(MAX_TASK_COUNT);
 	Record.TaskClaimStatus.SetNumZeroed(MAX_TASK_COUNT);
 	

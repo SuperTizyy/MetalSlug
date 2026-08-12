@@ -7,7 +7,6 @@
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "Components/ComboBoxString.h"
 #include "Data/Tables/CharacterTableRow.h"
 #include "Data/Enums/CombatEnums.h"  // 【v56 重构】EWeaponMeshType (武器类型过滤)
 #include "Data/Enums/RoomEnums.h"    // 【v93 新增】ERoomMatchMode (游戏模式)
@@ -24,6 +23,7 @@ class UImage;
 class UUniformGridPanel;
 class UOverlay;
 class UWeaponIconWidget;
+class UComboBoxString;
 class UDataTable;
 class UCanvasPanel;  // 【v93 新增】刀战/生化模式容器
 class UWrapBox;      // 【v93 新增】生化模式专用横向自动换行玩家标签容器

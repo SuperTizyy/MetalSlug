@@ -67,9 +67,9 @@ public:
 	// ==========================================
 
 	/**
-	 * 【v214 大厂架构】提交调试数据: 在指定天数下设置 CurrentExperience
+	 * 【v228 重构后, 与 v213 文档一致】提交调试数据: 在指定天数下设置 CurrentExperience
 	 *
-	 * 业务规则 (用户 2026.08.11 明确):
+	 * 业务规则 (用户 2026.08.13 明确, 与 v213 阶段一致):
 	 *   1. SelectedDay ∈ [1, 5] (合法范围, 超出 → Log Error + return false)
 	 *   2. SelectedDay 是绝对天数 (1=day1, 2=day2, ...)
 	 *   3. 若 SelectedDay > MaxRecordDate, 依次创建 MaxRecordDate+1 ~ SelectedDay 的所有中间记录
@@ -80,6 +80,9 @@ public:
 	 * 大厂原则 (单一真理 + 职责对等):
 	 *   - SelectedDay 解析逻辑只在此一处, 禁止 Page 自行决策
 	 *   - SaveModifier 生命周期归 ViewModel, Page 通过接口访问
+	 *   - **【v228 显式声明】本函数不操作 ChestClaimStatus**。
+	 *     领取进度归属 ClaimChest / Subsystem 的独立路径, ViewModel 越权改领进度
+	 *     会导致 "Apply Debug 后 ItemsScrollBox 领取进度消失" bug (v217~vXXX.2 已踩).
 	 *
 	 * @param SelectedDay 用户在 ComboBox 选中的天数 (1-5)
 	 * @param NewExp 新的经验值 (必须 >= 0, 否则 Log Error + return false)

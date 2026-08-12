@@ -189,18 +189,46 @@ const T* FActivityDataTableService::FindRowByIdSafe(FName TableID, IdExtractor E
 		return nullptr;
 	}
 
+	// 🔍【诊断日志】打印查找目标
+	UE_LOG(LogTemp, Log,
+		TEXT("[ActivityDT] FindRowByIdSafe: TableID='%s', TargetId=%d, RowStruct='%s'"),
+		*TableID.ToString(), TargetId, *RowStruct->GetName());
+
 	// 3. GetRowNames + FindRow 单条路径
 	static const FString ContextString(TEXT("FActivityDataTableService::FindRowByIdSafe"));
 	const TArray<FName> RowNames = Table->GetRowNames();
 
+	UE_LOG(LogTemp, Log,
+		TEXT("[ActivityDT] FindRowByIdSafe: 遍历 %d 行..."), RowNames.Num());
+
 	for (const FName& RowName : RowNames)
 	{
 		const T* Row = Table->FindRow<T>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
-		if (Row && Extractor(*Row) == TargetId)
+		if (Row)
 		{
-			return Row;
+			// 🔍【诊断日志】打印每一行的 ID 值
+			const int32 RowId = Extractor(*Row);
+			UE_LOG(LogTemp, Log,
+				TEXT("[ActivityDT] FindRowByIdSafe: RowName='%s', RowId=%d, Match=%d"),
+				*RowName.ToString(), RowId, (RowId == TargetId) ? 1 : 0);
+			
+			if (RowId == TargetId)
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("[ActivityDT] FindRowByIdSafe: ✅ 匹配成功! TargetId=%d, RowName='%s'"),
+					TargetId, *RowName.ToString());
+				return Row;
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[ActivityDT] FindRowByIdSafe: RowName='%s' FindRow 返回 nullptr"), *RowName.ToString());
 		}
 	}
 
+	UE_LOG(LogTemp, Warning,
+		TEXT("[ActivityDT] FindRowByIdSafe: '%s' 遍历完成, 未找到 TargetId=%d"),
+		*TableID.ToString(), TargetId);
 	return nullptr;
 }

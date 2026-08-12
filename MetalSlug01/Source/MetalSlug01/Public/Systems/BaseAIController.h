@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026.
+// Copyright (c) 2026.
 //
 // 【v54.4 大厂架构重构】BaseAIController 删除 UAIProfileAsset 中间层
 //

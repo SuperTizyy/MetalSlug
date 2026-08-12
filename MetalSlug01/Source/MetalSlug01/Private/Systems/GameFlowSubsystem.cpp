@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -814,6 +814,32 @@ void UGameFlowSubsystem::RequestStateOnNextLoad(EMatchState DesiredState)
 	const FString StateName = UEnum::GetValueAsString(DesiredState);
 	UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] 已预约下一张地图的状态: %d (Name=%s)"),
 		(int32)DesiredState, *StateName);
+}
+
+/**
+ * 【v229 新增】从任意状态跳转到 MainLobby 大厅
+ *
+ * 业务场景:
+ *   - TaskDetailWidget 的"未完成任务"按钮点击 → 跳转 LANRoom
+ *   - 在 MainMenu 状态下点击 → 也需要能跳转大厅
+ *
+ * 流程:
+ *   1. TransitToState(MainLobby) → 状态机广播 OnStateChanged
+ *   2. UIViewService::OnGameFlowStateChanged → ShowPanel(LANRoom)
+ *
+ * @note 不做 OpenLevel, MainLobby 是 UI 状态不是地图状态 (L_Login 常驻)
+ */
+void UGameFlowSubsystem::TransitionToMainLobby()
+{
+	UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] TransitionToMainLobby: 当前状态=%d, 跳转 MainLobby"),
+		(int32)GetCurrentState());
+
+	// TransitToState 会:
+	// 1. 更新 CurrentState = MainLobby
+	// 2. 广播 OnStateChanged(MainLobby)
+	// 3. HandleStateEntry(MainLobby) → break (不 OpenLevel)
+	// 4. UIViewService 收到 OnStateChanged → ShowPanel(LANRoom)
+	TransitToState(EMatchState::MainLobby, TEXT("TransitionToMainLobby"));
 }
 
 /**

@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026.
+// Copyright (c) 2026.
 //
 // 【v54.4 大厂架构重构】MeleeAIController 简化 — 直接接 UAIBehaviorConfigSO
 //

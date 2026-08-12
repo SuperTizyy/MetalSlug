@@ -52,7 +52,9 @@ enum class EUIPanel : uint8
 	//   - 在 L_Login 上由 UIViewService 创建, 通过 UScoreboardWidget::ApplySnapshot 应用跨地图快照
 	//   - 历史 (v22-v215.x): 在 WBP_GameHUDWidget 内嵌结算覆盖板, 玩家不能离开房间关卡
 	//   - 新 (v216): 在 L_Login 上独立显示, 玩家切图到大厅, 状态机驱动 UI 切换
-	SettlementPanel	UMETA(DisplayName = "Settlement Panel") // 结算面板：跨地图, 在 L_Login 上显示
+	SettlementPanel	UMETA(DisplayName = "Settlement Panel"), // 结算面板：跨地图, 在 L_Login 上显示
+	// 【v228 新增】活动页面
+	ActivityPanel	UMETA(DisplayName = "Activity Panel") // 活动面板：每日登录/升级奖励等
 };
 
 // UE 自动生成的头文件（必须放在所有 UENUM/USTRUCT/UCLASS 声明之后，

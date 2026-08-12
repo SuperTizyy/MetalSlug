@@ -1,4 +1,4 @@
-﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
+// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
 // 头文件包含区
@@ -255,15 +255,18 @@ void UDailyLoginPage::RefreshRewardList()
 				if (bIsSpecial)
 				{
 					// 特殊奖励: 保存为大奖项，不添加到滚动列表
+					// 【v206.3 修复】必须 continue 跳过 AddChild，否则特殊奖励会被重复添加到滚动列表
 					BigRewardItemWidget = NewItem;
 					bHasBigReward = true;
-					// // UE_LOG(LogTemp, Warning, TEXT("第%d天是特殊奖励，将显示在大奖格子中"), i);
+					UE_LOG(LogTemp, Log, TEXT("RefreshRewardList: 第 %d 天是特殊奖励，跳过滚动列表"), i);
+					continue; // ← 关键！跳过下面的 AddChild
 				}
-				// [修复] 删除原本 SetPadding(FMargin(80.0f)) 的代码 — FMargin(float) 单参数构造表示
-					// 「左/上/右/下 全部 80px」，会在滚动方向上每个条目 +80px 内边距，导致 DayListScroll
-					// 测得的 ContentSize 异常膨胀。原代码意图只是增大条目间距，应该交给蓝图 Widget 的
-					// Slot Padding 属性或 ScrollBox 的 Orientation 方向布局策略来处理，而不是 C++ 强行覆盖。
-					DayListScroll->AddChild(NewItem);
+
+				// 【v206.3 修复】删除原本 SetPadding(FMargin(80.0f)) 的代码 — FMargin(float) 单参数构造表示
+				// 「左/上/右/下 全部 80px」，会在滚动方向上每个条目 +80px 内边距，导致 DayListScroll
+				// 测得的 ContentSize 异常膨胀。原代码意图只是增大条目间距，应该交给蓝图 Widget 的
+				// Slot Padding 属性或 ScrollBox 的 Orientation 方向布局策略来处理，而不是 C++ 强行覆盖。
+				DayListScroll->AddChild(NewItem);
 
 				// 奖励图标加载已移到 Init 函数中自动处理
 			}
@@ -662,41 +665,46 @@ void UDailyLoginPage::OpenTreasureBox(int32 DayIndex)
 		}
 	}
 
-	// 创建并显示 ActivityConfirmPopupWidget
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		UE_LOG(LogTemp, Error, TEXT("无法获取世界上下文"));
-		return;
-	}
-
-	UE_LOG(LogTemp, Warning, TEXT("检查 ActivityConfirmPopupClass 是否设置: %s"),
-		   ActivityConfirmPopupClass ? *ActivityConfirmPopupClass->GetName() : TEXT("未设置"));
-
-	if (ActivityConfirmPopupClass)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("开始创建 ActivityConfirmPopupWidget..."));
-		UActivityConfirmPopupWidget* ConfirmPopup = CreateWidget<UActivityConfirmPopupWidget>(World, ActivityConfirmPopupClass.Get());
-		if (ConfirmPopup)
+		// 创建并显示 ActivityConfirmPopupWidget
+		UWorld* World = GetWorld();
+		if (!World)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建 ActivityConfirmPopupWidget 实例"));
+			UE_LOG(LogTemp, Error, TEXT("无法获取世界上下文"));
+			return;
+		}
 
-			// 初始化弹窗数据
-			ConfirmPopup->InitializePopup(ValueOptions, 1); // 默认选中第二个选项
-			ConfirmPopup->AddToViewport(13); // 层级高于 TreasureBox
+		UE_LOG(LogTemp, Warning, TEXT("检查 ActivityConfirmPopupClass 是否设置: %s"),
+			   ActivityConfirmPopupClass ? *ActivityConfirmPopupClass->GetName() : TEXT("未设置"));
 
-			UE_LOG(LogTemp, Warning, TEXT("✅ ActivityConfirmPopupWidget 已添加到视口"));
+		if (ActivityConfirmPopupClass)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("开始创建 ActivityConfirmPopupWidget..."));
+			UActivityConfirmPopupWidget* ConfirmPopup = CreateWidget<UActivityConfirmPopupWidget>(World, ActivityConfirmPopupClass.Get());
+			if (ConfirmPopup)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("✅ 成功创建 ActivityConfirmPopupWidget 实例"));
+
+				// 初始化弹窗数据，传入当前天数
+				ConfirmPopup->InitializePopup(ValueOptions, 1, CurrentDayIndex);
+
+				// 【v206.2 修复】绑定领取完成回调
+				// 原因: ActivityConfirmPopupWidget 确认后需要通知 DailyLoginPage 处理奖励领取和刷新
+				ConfirmPopup->OnRewardConfirmed.AddDynamic(this, &UDailyLoginPage::HandleConfirmPopupRewardClaimed);
+
+				ConfirmPopup->AddToViewport(13); // 层级高于 TreasureBox
+
+				UE_LOG(LogTemp, Warning, TEXT("✅ ActivityConfirmPopupWidget 已添加到视口"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("❌ 创建 ActivityConfirmPopupWidget 失败！"));
+			}
 		}
 		else
 		{
-			UE_LOG(LogTemp, Error, TEXT("❌ 创建 ActivityConfirmPopupWidget 失败！"));
+			UE_LOG(LogTemp, Error, TEXT("❌ ActivityConfirmPopupClass 未设置！请在蓝图中指定 WBP_ActivityConfirmPopupWidget 类"));
 		}
 	}
-	else
-	{
-		UE_LOG(LogTemp, Error, TEXT("❌ ActivityConfirmPopupClass 未设置！请在蓝图中指定 WBP_ActivityConfirmPopupWidget 类"));
-	}
-}
 
 
 /**
@@ -712,6 +720,34 @@ void UDailyLoginPage::OnFinalClaimComplete()
 		FPlayerLoginRecord& Record = ActivitySub->GetOrInitPlayerRecord(101);
 		ActivitySub->TryClaimReward(101, Record.CurrentClaimCount);
 	}
+}
+
+
+/**
+ * UDailyLoginPage::HandleConfirmPopupRewardClaimed
+ *
+ * 【v206.2 新增】处理宝箱确认弹窗的奖励领取
+ * 用途: ActivityConfirmPopupWidget 确认后广播 OnRewardConfirmed，通知 DailyLoginPage 处理奖励领取和刷新
+ *
+ * 流程:
+ * 1. ActivitySub->TryClaimReward(101, DayIndex) - 领取奖励
+ * 2. RefreshRewardList() - 刷新 UI
+ */
+void UDailyLoginPage::HandleConfirmPopupRewardClaimed(int32 DayIndex)
+{
+	UE_LOG(LogTemp, Log, TEXT("[v206.2] HandleConfirmPopupRewardClaimed: 宝箱确认完成，领取第 %d 天奖励"), DayIndex);
+
+	if (!ActivitySub)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[v206.2] HandleConfirmPopupRewardClaimed: ActivitySub 为空，无法领取奖励"));
+		return;
+	}
+
+	// 1. 领取奖励
+	ActivitySub->TryClaimReward(101, DayIndex);
+
+	// 2. 刷新 UI
+	RefreshRewardList();
 }
 
 

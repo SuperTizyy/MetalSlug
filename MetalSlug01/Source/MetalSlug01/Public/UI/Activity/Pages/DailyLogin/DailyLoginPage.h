@@ -155,6 +155,13 @@ protected:
 	void OnFinalClaimComplete();
 
 	/**
+	 * 【v206.2 新增】处理宝箱确认弹窗的奖励领取
+	 * 用途: ActivityConfirmPopupWidget 确认后广播 OnRewardConfirmed，通知 DailyLoginPage 处理奖励领取和刷新
+	 */
+	UFUNCTION()
+	void HandleConfirmPopupRewardClaimed(int32 DayIndex);
+
+	/**
 	 * 滚动到当前可领取天
 	 * 1. Clamp Progress 到 1~8
 	 * 2. 大于等于 8 时 TargetIndex = 6（第 7 天, 滚动列表最大索引）
