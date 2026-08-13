@@ -15,6 +15,52 @@ class ARoomGameState;
 class UTextBlock;
 class UHorizontalBox;
 class UImage;
+class USoundBase; // 【v222 大厂架构】母体变异倒计时数字音效 — 可选 USoundBase 指针
+
+
+// ==========================================
+// 【v222 大厂架构】母体变异倒计时数字 -> 音效映射项
+// ==========================================
+/**
+ * @struct FMotherMutationTickSoundEntry
+ * @brief 将"剩余秒数"映射到具体的 USoundBase
+ *
+ * 设计原则 (大厂原则 — 显式优于隐式):
+ *   - 不用 TMap<int32, USoundBase*>: TMap 在 UE 5.6 BP 编辑器体验差, 不好读
+ *   - 改用 TArray<FMotherMutationTickSoundEntry>: BP 拖 10 行即可, 一眼看清
+ *   - 字段命名零歧义: Seconds 是倒计时显示的整数, Sound 是播放的 USoundBase
+ *
+ * 业务规则 (用户 2026.08.14 明确):
+ *   - 倒计时从 10 秒开始: 每倒数 1 秒播对应音
+ *   - 仅在 1..10 秒范围内播 (例如 30s 倒计时, 30→11 都不播, 10→1 播)
+ *   - 0 秒不播 (倒计时结束, 服务器触发母体变异业务)
+ *   - 大于 10 秒不播 (避免每秒 spam)
+ *
+ * 零兜底:
+ *   - FindEntryBySeconds 找不到 → Log Error + 拒绝播放
+ *   - 找到 Entry 但 Sound 为空 → Log Error + 拒绝播放
+ *   - TArray 本身为空 → Log Warning + 跳过 (业务可禁用整组音效)
+ */
+USTRUCT(BlueprintType)
+struct FMotherMutationTickSoundEntry
+{
+	GENERATED_BODY()
+
+	/**
+	 * 倒计时显示的"剩余秒数"(整数)
+	 * 触发条件: 仅当 1 <= Value <= 10 时查询
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mother Mutation Countdown",
+		meta = (ClampMin = "1", ClampMax = "10"))
+	int32 Seconds = 0;
+
+	/**
+	 * 该秒数到达时播放的音效资产
+	 * 必填 (零兜底): 为空 → Log Error + 拒绝播放
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mother Mutation Countdown")
+	TObjectPtr<USoundBase> Sound = nullptr;
+};
 
 
 /**
@@ -130,6 +176,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MatchInfo")
 	void AddDefenderIcon(UTexture2D* Icon);
 
+	// ==========================================
+	// 【v222 大厂架构新增】母体变异倒计时数字音效 — 内部辅助
+	// ==========================================
+	//
+	// 不暴露为 UFUNCTION BlueprintCallable:
+	//   - 这是 NativeTick 数字递减的内部联动, 外部不应主动调
+	//   - 不开 BP 入口防误用
+	//   - 与现有 UpdateMotherMutationCountdown (BlueprintCallable) 形成清晰职责分离
+	//     - UpdateMotherMutationCountdown = 业务事件入口
+	//     - PlayMotherMutationTickSound = 数字递减触发的内部副作用
+	//
+	// @param InSeconds 当前显示的剩余秒数 (1..10, 调用方应已校验)
+	void PlayMotherMutationTickSound(int32 InSeconds);
+
 protected:
 	// ==========================================
 	// 2. 生命周期
@@ -200,6 +260,34 @@ protected:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Style")
 	FSlateColor WarningTimeColor = FSlateColor(FLinearColor::Red);
+
+	// ==========================================
+	// 【v222 大厂架构】母体变异倒计时数字音效映射表
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.14 明确):
+	//   - 仅当倒计时数字从 N-1 变到 N (1 <= N <= 10) 时播放 TickSounds[N-1].Sound
+	//   - 倒计时 > 10 秒不播 (避免 spam, 例: 30s 倒计时 30→11 都不播)
+	//   - 倒计时 = 0 秒不播 (倒计时结束, 服务器触发母体变异业务)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 数据在 WBP_MatchInfoWidget 蓝图配置, BP 策划一行一音效, 零硬编码
+	//   - 暴露 EditDefaultsOnly + BlueprintReadOnly: BP 写, C++ 读
+	//   - 不在 GameMode 暴露: 这是 UI 表现层数据, 不污染 GameMode 业务字段
+	//   - 不在 C++ 默认值硬编码 USoundBase 指针: UE C++ 不持有资源引用, BP 才是资产配点
+	//
+	// 大厂原则 — 零兜底:
+	//   - TArray 为空 → Log Warning + 跳过 (业务可禁用整组, 与 v30.0 配错决策同款)
+	//   - 找不到匹配的 Seconds → Log Error + 拒绝 (策划忘配, 必须显式)
+	//   - 找到 Entry 但 Sound 为空 → Log Error + 拒绝 (策划配错, 必须显式)
+	//
+	// 数据布局 (BP 编辑器一行一个):
+	//   Index 0: Seconds=1  Sound=Ghost_Count_1
+	//   Index 1: Seconds=2  Sound=Ghost_Count_2
+	//   ...
+	//   Index 9: Seconds=10 Sound=Ghost_Count_10
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MatchInfo|Mother Mutation|Sound")
+	TArray<FMotherMutationTickSoundEntry> MotherMutationTickSounds;
 
 private:
 	// ==========================================
@@ -305,4 +393,20 @@ private:
 	 * 母体变异倒计时进行期间即使收到空投状态，也必须继续隐藏控件。
 	 */
 	bool bIsAirdropCountdownActive = false;
+
+	// ==========================================
+	// 【v222 大厂架构】母体变异倒计时数字音效 — 内部辅助
+	// ==========================================
+
+	/**
+	 * 在 TArray<FMotherMutationTickSoundEntry> 中按 Seconds 字段查找 Entry
+	 *
+	 * 大厂原则 — 显式优于隐式:
+	 *   - 不调用 Algo::FindByPredicate, 显式 for 循环, 易读
+	 *   - 不缓存, 每次调用 O(N) — N<=10, 可忽略
+	 *
+	 * @param InSeconds 要查找的秒数 (1..10)
+	 * @return 找到的 Entry 指针; 找不到返回 nullptr
+	 */
+	const FMotherMutationTickSoundEntry* FindMotherMutationTickSoundEntry(int32 InSeconds) const;
 };

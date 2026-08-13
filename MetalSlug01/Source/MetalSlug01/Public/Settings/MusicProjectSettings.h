@@ -74,15 +74,45 @@ public:
 	// 战斗音乐
 	// ==========================================
 
-	/** 战斗背景音乐 */
+	/** 战斗背景音乐（刀战模式使用，生化模式走 ZombieBattleMusic） */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Music|Battle",
 		meta = (DisplayName = "Battle Music", AllowedClasses = "SoundBase"))
 	TSoftObjectPtr<USoundBase> BattleMusic;
 
-	/** 战斗音乐是否循环播放 */
+	/** 战斗音乐是否循环播放（刀战模式） */
 	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Music|Battle",
 		meta = (DisplayName = "Loop Battle Music"))
 	bool BattleMusicLoop = true;
+
+	// ==========================================
+	// 【v260 大厂架构新增】生化模式战斗音乐（仅 Zombie 模式生效）
+	// ==========================================
+	//
+	// 设计动机 (用户 2026.08.14):
+	//   - 刀战模式战斗态不播 BGM
+	//   - 生化模式战斗态播此专属音乐（僵尸围城的恐怖氛围）
+	//   - 通过 ERoomMatchMode::Zombie 触发,与刀战 Battle 完全分离
+	//
+	// 大厂原则:
+	//   - 单一真理源: 配置在 Project Settings 唯一入口 (大厂 v229 已重构到这里)
+	//   - 零兑底: 未配置时 Log Error + 静默不播 (不返回默认 Battle Music)
+	//
+	// 触发点 (C++ 业务流):
+	//   - MusicManagerSubsystem::OnGameFlowStateChanged(Battleing) → 检查 RoomGameMode 的 MatchMode
+	//   - 如果 Zombie: PlayZombieBattleMusic() (私有内部方法)
+	//   - 如果 Melee: 静默切换 (调用方 EnterBattleMode 时主动调 StopAllMusic)
+	//
+	// ==========================================
+
+	/** 生化模式战斗背景音乐 */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Music|Zombie",
+		meta = (DisplayName = "Zombie Battle Music", AllowedClasses = "SoundBase"))
+	TSoftObjectPtr<USoundBase> ZombieBattleMusic;
+
+	/** 生化战斗音乐是否循环播放 */
+	UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category = "Music|Zombie",
+		meta = (DisplayName = "Loop Zombie Battle Music"))
+	bool ZombieBattleMusicLoop = true;
 
 	// ==========================================
 	// 全局设置

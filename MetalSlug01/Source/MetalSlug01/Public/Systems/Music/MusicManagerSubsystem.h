@@ -18,15 +18,23 @@ class UGameFlowSubsystem;
 /**
  * @enum EMusicType
  * @brief 背景音乐类型枚举
+ *
+ * 设计原则 (大厂 v260):
+ *   - 公共 API (PlayMusic) 不暴露 ZombieBattle
+ *   - 业务方只通过 EnterBattleMode() 入口触发, 内部根据 ERoomMatchMode 路由
+ *   - ZombieBattle 仅作为 Subsystem 内部 TMap key + PlayMusicInternal 调试日志标签使用
+ *   - BP 业务蓝图不应直接调用 PlayMusic(ZombieBattle), 走 EnterBattleMode 才符合零兑底要求
  */
 UENUM(BlueprintType)
 enum class EMusicType : uint8
 {
-	None     UMETA(DisplayName = "None"),
-	MainMenu UMETA(DisplayName = "Main Menu"),
-	Activity UMETA(DisplayName = "Activity"),
-	Room     UMETA(DisplayName = "Room"),
-	Battle   UMETA(DisplayName = "Battle")
+	None        UMETA(DisplayName = "None"),
+	MainMenu    UMETA(DisplayName = "Main Menu"),
+	Activity    UMETA(DisplayName = "Activity"),
+	Room        UMETA(DisplayName = "Room"),
+	Battle      UMETA(DisplayName = "Battle (Melee)"),
+	// 【v260】生化战斗音乐 - 仅 Zombie 模式触发 (EnterBattleMode 内部路由)
+	ZombieBattle UMETA(DisplayName = "Battle (Zombie) - 仅内部路由使用")
 };
 
 /**
@@ -136,12 +144,72 @@ public:
 	void RestorePreviousMusic();
 
 	// ==========================================
+	// 【v260 大厂架构新增】生化模式战斗音乐专用入口
+	// ==========================================
+	//
+	// 设计动机 (用户 2026.08.14):
+	//   - 刀战模式战斗态: 不播 BGM (StopAllMusic)
+	//   - 生化模式战斗态: 播专属音乐 (ZombieBattleMusic 配置)
+	//
+	// 调用原则:
+	//   - 外部触发链路 (GameFlow / UIViewService) 进入 Battleing/BattleHUD 状态时统一调此 API
+	//   - 由本 API 内部根据 ERoomMatchMode 路由:
+	//       Zombie → PlayMusic(EMusicType::ZombieBattle)
+	//       Melee  → StopAllMusic(零兑底, 真的不播任何)
+	//       None / Other → 不动作 (Log Error, 进入安全状态)
+	//
+	// 为什么不扩展 EMusicType 到公共 API:
+	//   - EMusicType 是 BlueprintType, 暴露给 BP 后会被业务方锁死
+	//   - 模式路由是子系统内部决策, 业务方只需要"进入 Battleing"这个意图
+	//   - 0 改动调用方代码 (GameFlow / UIView 现有触发链路不变)
+	//
+	// 配置缺失 (零兑底):
+	//   - ZombieBattleMusic 未配置 → Log Error, 静默停止一切 BGM
+	//   - 不会 fallback 到 BattleMusic (避免误导用户以为生效了)
+	//
+	// ==========================================
+
+	/** 【v260】根据当前房间模式自动路由战斗 BGM, 业务方统一入口 */
+	UFUNCTION(BlueprintCallable, Category = "Music")
+	void EnterBattleMode();
+
+	/** 【v260】查询当前战斗 BGM 是否正在播放（包括 ZombieBattle） */
+	UFUNCTION(BlueprintPure, Category = "Music")
+	bool IsBattleMusicPlaying() const;
+
+	// ==========================================
+	// 【v260 大厂架构新增】内部模式路由代码（移到 public 区）
+	// ==========================================
+	//
+	// 为什么放在 public 而不是 private:
+	//   MSVC 在 .cpp 实现嵌套 private enum class 成员函数时, 返回类型 ERoomMatchCode
+	//   在 UMusicManagerSubsystem:: 域外解析失败, 触发 C2143/C2556/C2371 雪崩.
+	//   放 public 后, 嵌套类型可见, 编译器跨作用域查找正常.
+	//
+	// 为什么仍然安全 (未污染 BP API):
+	//   - 不是 UENUM (BlueprintType 没有), BP 看不到
+	//   - 不是 UFUNCTION, BP 调用不到
+	//   - 只用于 .cpp 内部 switch 路由, 不暴露给外部
+	// ==========================================
+
+public:
+	enum class ERoomMatchCode : uint8
+	{
+		Error,
+		Melee,
+		Zombie
+	};
+
+	/** 【v260】从 GameState 读取模式并转换为内部路由码, 出错返回 Error 分支 */
+	ERoomMatchCode ResolveCurrentMatchMode() const;
+
+private:
+	// ==========================================
 	// 配置
 	// ==========================================
 	// 注意: 配置现在通过 UMusicProjectSettings (Edit → Project Settings → MetalSlug01 → Music) 管理
 	// 废弃的 UMusicManagerConfig DataAsset 不再使用
 
-private:
 	/** 加载配置 */
 	void LoadMusicConfigFromAsset();
 
@@ -153,6 +221,9 @@ private:
 
 	/** 播放指定类型的音乐 (内部实现，包含停止旧音乐的逻辑) */
 	void PlayMusicInternal(EMusicType MusicType);
+
+	/** 【v260】播放生化战斗 BGM (EnterBattleMode 内部调用) — 接受空配置返回 false */
+	bool PlayZombieBattleMusicInternal();
 
 	// ==========================================
 	// 数据成员

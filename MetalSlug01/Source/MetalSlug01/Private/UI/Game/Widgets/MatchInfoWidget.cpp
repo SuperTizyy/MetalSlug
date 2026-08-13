@@ -8,6 +8,7 @@
 #include "Components/HorizontalBox.h"
 #include "Components/Image.h"
 #include "Kismet/GameplayStatics.h"
+#include "Sound/SoundBase.h"  // 【v222 大厂架构】PlaySound2D 需 USoundBase 完整类型
 #include "Systems/RoomGameState.h"
 #include "Data/Enums/RoomEnums.h" // 【v134 大厂架构修复】显式 include, 不依赖 transitive (v40.5.1 教训)
 
@@ -213,6 +214,30 @@ void UMatchInfoWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime
 			// 使用 FText::Format 镜像 UpdateTotalRounds 的本地化友好模式
 			const FString MotherMutationText = FString::Printf(TEXT("生化变异倒计时：%d秒"), MotherMutationSeconds);
 			Text_MotherMutationCountdown->SetText(FText::FromString(MotherMutationText));
+
+			// ==========================================
+			// 【v222 大厂架构新增】倒计时数字变化时播音效
+			// ==========================================
+			//
+			// 业务规则 (用户 2026.08.14 明确):
+			//   - 仅在 1 <= Seconds <= 10 时播音效 (10→1 范围, 不 spam)
+			//   - 数字每变一次 (DirtyFlag 触发) 播一次, 不重复
+			//   - 例如 30s 倒计时: 30→11 都不播, 11→10 触发, 10→9→8...→1 每次都播
+			//   - 例如 8s 倒计时 (项目默认): 8→7→6→5→4→3→2→1 播, 0 不播
+			//
+			// 大厂原则 — 单一入口:
+			//   - 播放逻辑全部在 NativeTick 数字递减分支内, 与 TextBlock SetText 同一时机
+			//   - 不新建 Timer / 事件: 复用现有 DirtyFlag 检测, 零新架构
+			//
+			// 大厂原则 — 零兜底 (与 v30 MotherMutationDuration <= 0 同款决策):
+			//   - TArray 为空 (BP 未配) → Log Warning + 跳过 (业务可禁用整组)
+			//   - 找不到匹配 Seconds → Log Error + 拒绝 (策划忘配, 必须显式修)
+			//   - Entry.Seconds > 10 或 < 1 → Log Error (策划配错范围, 需修)
+			//   - Entry.Sound 为空 → Log Error + 拒绝 (策划配错资产, 需修)
+			if (MotherMutationSeconds >= 1 && MotherMutationSeconds <= 10)
+			{
+				PlayMotherMutationTickSound(MotherMutationSeconds);
+			}
 
 			UE_LOG(LogTemp, Verbose,
 				TEXT("[MatchInfoWidget] 刷新母体变异倒计时: %d秒"),
@@ -671,4 +696,130 @@ void UMatchInfoWidget::AddDefenderIcon(UTexture2D* Icon)
 		// NewIcon->SetBrushSize(FVector2D(20.0f, 20.0f)); // Deprecated, already set with SetDesiredSizeOverride
 		HB_DefenderIcons->AddChild(NewIcon);
 	}
+}
+
+
+// ==========================================
+// 【v222 大厂架构】母体变异倒计时数字音效 — 私有辅助
+// ==========================================
+
+/**
+ * UMatchInfoWidget::FindMotherMutationTickSoundEntry
+ *
+ * 在 BP 配置的 TArray<FMotherMutationTickSoundEntry> 中按 Seconds 字段查找 Entry
+ *
+ * 大厂原则 — 显式优于隐式:
+ *   - 不调 Algo::FindByPredicate, 显式 for 循环, 易读
+ *   - N<=10, O(N) 可忽略
+ *
+ * @param InSeconds 要查找的秒数 (调用方应已校验 1<=InSeconds<=10)
+ * @return 找到的 Entry 指针; 找不到返回 nullptr
+ */
+const FMotherMutationTickSoundEntry* UMatchInfoWidget::FindMotherMutationTickSoundEntry(int32 InSeconds) const
+{
+	for (const FMotherMutationTickSoundEntry& Entry : MotherMutationTickSounds)
+	{
+		if (Entry.Seconds == InSeconds)
+		{
+			return &Entry;
+		}
+	}
+	return nullptr;
+}
+
+
+/**
+ * UMatchInfoWidget::PlayMotherMutationTickSound (v222 新增)
+ *
+ * 在倒计时数字从 N-1 变到 N 时 (1 <= N <= 10), 查 TArray 找匹配的 USoundBase 播放
+ *
+ * 业务规则 (用户 2026.08.14 明确):
+ *   - 1..10 范围: 倒计时显示"10"时播 10 对应音, "9"播 9 对应音, ... "1"播 1 对应音
+ *   - 0 不播 (倒计时结束, 服务器触发母体变异业务)
+ *   - >10 不播 (避免每秒 spam)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 数据在 WBP_MatchInfoWidget 蓝图配置 (MotherMutationTickSounds)
+ *   - C++ 不持有硬编码资源, BP 策划一行一音效
+ *   - 与现有 KillSoundComponent / MotherSpawnSoundComponent 同款"BP 配资源"模式
+ *
+ * 大厂原则 — 零兜底:
+ *   - TArray 为空 → Log Warning + 跳过 (业务可禁用整组, 与 v30 配错决策同款)
+ *   - 找不到匹配 Seconds → Log Error + 拒绝 (策划忘配, 显式修)
+ *   - Entry.Sound 为空 → Log Error + 拒绝 (策划配错资产, 显式修)
+ *
+ * 大厂原则 — 2D 本地播放 (用户决策 q4_a):
+ *   - 倒计时是 UI 状态事件, 不带空间感
+ *   - 与比赛倒计时 0 秒后隐藏的视觉提醒配套
+ *   - 客户端本地播放, 不走 RPC (与 v100 KillSoundComponent 同款"各自本地"模式)
+ *   - 服务器 / 客户端各自独立播, 互不干扰
+ */
+void UMatchInfoWidget::PlayMotherMutationTickSound(int32 InSeconds)
+{
+	// ===== 校验层 1: TArray 是否配置 =====
+	//
+	// 大厂原则 - 用户决策 (与 v30 配错 ≤ 0 静默跳过同款):
+	//   - 业务可禁用整组音效: BP 策划不填数组, 视为"不要音效"功能
+	//   - 警告一次即可, 不需要每帧刷错误日志
+	if (MotherMutationTickSounds.Num() == 0)
+	{
+		// 用 Log Warning 而非 Log Error: 这是"业务主动禁用", 不是"配置错"
+		// 不需要修复, 但要看到"为何没音效"的原因
+		UE_LOG(LogTemp, Warning,
+			TEXT("[MatchInfoWidget] PlayMotherMutationTickSound: MotherMutationTickSounds 为空, "
+			     "业务禁用倒计时数字音效. (按用户决策: BP 配空数组即禁用音效功能)."));
+		return;
+	}
+
+	// ===== 校验层 2: 范围校验 =====
+	//
+	// 大厂原则 - 防御性: 即使调用方已校验, 这里再校验一次, 防止未来调用方扩展时漏判
+	// 配错范围 (例 0 或 11) → Log Error + 拒绝, 显式修
+	if (InSeconds < 1 || InSeconds > 10)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] PlayMotherMutationTickSound: InSeconds=%d 超出 [1, 10] 范围, "
+			     "拒绝播放. 【修复】检查 NativeTick 倒计时分支的范围守卫条件."),
+			InSeconds);
+		return;
+	}
+
+	// ===== 校验层 3: 查表 =====
+	const FMotherMutationTickSoundEntry* FoundEntry = FindMotherMutationTickSoundEntry(InSeconds);
+	if (!FoundEntry)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] PlayMotherMutationTickSound: TArray<FMotherMutationTickSoundEntry> "
+			     "找不到 Seconds=%d 的 Entry. 【修复路径】在 WBP_MatchInfoWidget → Class Defaults → "
+			     "MatchInfo|Mother Mutation|Sound → Mother Mutation Tick Sounds 数组添加 "
+			     "Seconds=%d 的项, 并配 USoundBase 字段. "
+			     "(业务期望: 倒计时数字 = Seconds, 找到对应音效播)."),
+			InSeconds, InSeconds);
+		return;
+	}
+
+	// ===== 校验层 4: 音效资产 =====
+	if (!FoundEntry->Sound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MatchInfoWidget] PlayMotherMutationTickSound: Seconds=%d 的 Entry.Sound 为空! "
+			     "【修复路径】在 WBP_MatchInfoWidget → Class Defaults → Mother Mutation Tick Sounds "
+			     "找到 Seconds=%d 的行, 拖入 USoundBase 资产 (建议复用现有 Content/Blueprints/Audio/ "
+			     "Ghost_Count_%d.uasset)."),
+			InSeconds, InSeconds, InSeconds);
+		return;
+	}
+
+	// ===== 执行层: 2D 本地播放 =====
+	//
+	// 大厂原则 - 2D vs 3D (用户决策 q4_a):
+	//   - 倒计时数字是 UI 事件, 不带空间感, 用 PlaySound2D
+	//   - 同一局内服务器 + 各自客户端都会本地播一次 (无 RPC, 无双发)
+	//   - 不传 VolumeMultiplier / PitchMultiplier — SoundCue 自身参数控制
+	UGameplayStatics::PlaySound2D(this, FoundEntry->Sound);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MatchInfoWidget] PlayMotherMutationTickSound: 已播放倒计时数字音效. "
+		     "Seconds=%d, Sound=%s"),
+		InSeconds, *FoundEntry->Sound->GetName());
 }
