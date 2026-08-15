@@ -11,6 +11,9 @@
 // 引入 UE 原生 APlayerState 类（基类）
 #include "GameFramework/PlayerState.h"
 
+// 【v229.x 大厂架构】KDA 公式单一真理源 (业务层 + UI 层共用)
+#include "Utils/KdaScoring.h"
+
 // 引入房间相关枚举（ERoomState/ERoomMatchMode — ERoomTeam 已于 2026.07.10 删除）
 #include "Data/Enums/RoomEnums.h"
 #include "Data/Enums/CombatEnums.h"  // 【v100 新增】EKillStreakType 连杀类型
@@ -498,15 +501,23 @@ protected:
 
 private:
 	// ==========================================
-	// 7. 计分板常量
+	// 7. 【v229.x 大厂架构重构】计分常量 — 委托 FKdaScoring 单一真理源
 	// ==========================================
-	/**
-	 * 击杀得分（每次击杀 +20 分）
-	 */
-	static constexpr int32 KillScoreValue = 20;
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 旧 (v22-v228): 本类硬编码 KillScoreValue=20 / AssistScoreValue=10
+	//     - 与 UI 层规则 (10/5) 不一致 → 大厂反模式
+	//     - 死亡不做操作 → 业务层缺失死亡扣分逻辑
+	//   - 新 (v229.x): 委托 FKdaScoring::KillScore / FKdaScoring::AssistScore
+	//     - 业务层 = UI 层 = 同一公式 (10/5/-1)
+	//     - 死亡 -1 分由 AddDeath 统一处理 (走 FKdaScoring::ComputeStep)
+	//
+	// 保留同名常量作为 deprecated alias:
+	//   - 旧代码引用 KillScoreValue/AssistScoreValue 时仍能编译
+	//   - 但已弃用 (v229.x 起), 业务新增代码必须直接用 FKdaScoring
+	[[deprecated("v229.x: 使用 FKdaScoring::KillScore / FKdaScoring::AssistScore")]]
+	static constexpr int32 KillScoreValue = FKdaScoring::KillScore;
 
-	/**
-	 * 助攻得分（每次助攻 +10 分）
-	 */
-	static constexpr int32 AssistScoreValue = 10;
+	[[deprecated("v229.x: 使用 FKdaScoring::AssistScore")]]
+	static constexpr int32 AssistScoreValue = FKdaScoring::AssistScore;
 };

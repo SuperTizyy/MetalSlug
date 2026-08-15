@@ -6,6 +6,9 @@
 #include "UI/Game/Widgets/SubWidgets/ScoreboardEntryWidget.h"
 #include "Components/TextBlock.h"
 
+// 【v229.x 大厂架构】KDA 公式单一真理源 — 业务层 / UI 层共用
+#include "Utils/KdaScoring.h"
+
 
 // ==========================================
 // 1. 排名
@@ -14,35 +17,38 @@
 /**
  * UScoreboardEntryWidget::SetRank
  *
- * 1: 🥇 + 金色 / 2: 🥈 + 银色 / 3: 🥉 + 铜色 / 其他: 纯数字 + 白色
- * 注意: emoji 在某些 UE 版本中可能不显示, 颜色方案更可靠
+ * 【v229.x 大厂架构】仅显示数字 (用户业务规则 2026.08.16)
+ *   - 1: 数字 + 金色 / 2: 数字 + 银色 / 3: 数字 + 铜色 / 其他: 数字 + 白色
+ *   - 严格只显示数字, 无任何 emoji / 符号 / 前缀
+ *
+ * 大厂原则 — 0 兜底:
+ *   - 旧 (v22-v228): 拼接 emoji ("🥇 1" "🥈 2" "🥉 3"), 跨 UE 版本渲染不可控
+ *   - 新 (v229.x): 严格只输出 %d, 颜色按排名分层, 但不影响文本
+ *   - 用户规则 2026.08.16: "排名显示就数字就行, 不要特殊字符"
  */
 void UScoreboardEntryWidget::SetRank(int32 Rank)
 {
 	if (Text_Rank)
 	{
-		// 根据排名设置不同的显示格式
-		FString RankText;
+		// 【v229.x】严格只显示数字, 无任何 emoji / 字符
+		Text_Rank->SetText(FText::AsNumber(Rank));
+
+		// 颜色分层 (视觉强化, 不影响文本 — 不违反"只显示数字"规则)
 		switch (Rank)
 		{
 		case 1:
-			RankText = FString::Printf(TEXT("🥇 %d"), Rank);
 			Text_Rank->SetColorAndOpacity(FSlateColor(FLinearColor(1.0f, 0.84f, 0.0f, 1.0f))); // 金色
 			break;
 		case 2:
-			RankText = FString::Printf(TEXT("🥈 %d"), Rank);
 			Text_Rank->SetColorAndOpacity(FSlateColor(FLinearColor(0.75f, 0.75f, 0.75f, 1.0f))); // 银色
 			break;
 		case 3:
-			RankText = FString::Printf(TEXT("🥉 %d"), Rank);
 			Text_Rank->SetColorAndOpacity(FSlateColor(FLinearColor(0.8f, 0.5f, 0.2f, 1.0f))); // 铜色
 			break;
 		default:
-			RankText = FString::Printf(TEXT("%d"), Rank);
 			Text_Rank->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 			break;
 		}
-		Text_Rank->SetText(FText::FromString(RankText));
 	}
 }
 
@@ -108,9 +114,19 @@ void UScoreboardEntryWidget::SetScore(int32 InScore)
  *   - 母体击杀/死亡直接走 ARoomPlayerState::RoomKills/Deaths (单一真理源, 不开新字段)
  *   - PerformKillSettlement 内按 Killer/Victim 身份分发到母体/非母体的 RoomKills/RoomDeaths
  *   - Text_KDA 只需要展示现有 K/D/A 三列, 不污染业务字段
+ *
+ * 大厂原则 — 缓存同步 (v229.x):
+ *   - 同步写 CachedKills / CachedDeaths / CachedAssists — ScoreboardWidget 排序读源
+ *   - 不缓存 CachedScore — 派生数据每次 GetScore() 现算 (单一真理源)
+ *   - 替代旧 (v22-v228) 排序时回查 ActiveSnapshots 的 N² 重复架构
  */
 void UScoreboardEntryWidget::SetKDA(int32 Kills, int32 Deaths, int32 Assists)
 {
+	// 【v229.x】单一真理源: 写缓存 (排序排名读源), 与 TextBlock 双写同步
+	CachedKills   = Kills;
+	CachedDeaths  = Deaths;
+	CachedAssists = Assists;
+
 	if (Text_KDA)
 	{
 		// 格式: 击杀 / 死亡 / 助攻
@@ -174,4 +190,32 @@ FString UScoreboardEntryWidget::GetPlayerName() const
 		return Text_PlayerName->GetText().ToString();
 	}
 	return FString();
+}
+
+
+/**
+ * UScoreboardEntryWidget::GetScore
+ *
+ * 【v229.x 大厂架构】得分公式单一真理源 + 现算 (不缓存)
+ *
+ * 业务规则 (用户 2026.08.16 明确):
+ *   - 击杀 +10 / 助攻 +5 / 死亡 -1
+ *   - 公式: Score = Kills*10 + Assists*5 - Deaths
+ *   - 走 FKdaScoring::Compute (业务层 = UI 层 = 同一公式)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 旧 (v22-v228): CachedScore = Kills*20 + Assists*10 缓存
+ *     → 字段飘移风险: Kills 改但 CachedScore 未更新
+ *     → 业务层 20/10 与 UI 排名公式不一致 (大厂反模式)
+ *   - 新 (v229.x): 每次现算
+ *     → CachedKills/Deaths/Assists 写入, GetScore 走 FKdaScoring
+ *     → 业务层 (10/5/-1) = UI 层 (10/5/-1) = 同一公式
+ *
+ * 0 兜底:
+ *   - CachedKills/Deaths/Assists 默认 0 → Score = 0
+ *   - 不允许"如果 Kills==0 用默认值",因为 0 击杀是合法业务状态
+ */
+int32 UScoreboardEntryWidget::GetScore() const
+{
+	return FKdaScoring::Compute(CachedKills, CachedAssists, CachedDeaths);
 }

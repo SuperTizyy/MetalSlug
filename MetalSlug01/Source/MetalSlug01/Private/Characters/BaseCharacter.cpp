@@ -3347,21 +3347,19 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(const FString& KillerNa
 		}
 	}
 
-	// 【v40.9 P0 大厂架构】只有 Killer 是玩家时才推送 KillFeed 图标
-	// 业务规则: "击杀图标只用于玩家击杀其他玩家或者AI时才显示，被击杀不应该显示别人的击杀图标"
-	// - 玩家击杀玩家 → bIsKillerPlayer=true → KillFeed 显示 ✅
-	// - 玩家击杀 AI → bIsKillerPlayer=true → KillFeed 显示 ✅
-	// - AI 击杀玩家 → bIsKillerPlayer=false → KillFeed 不显示 ✅
-	// - AI 击杀 AI → bIsKillerPlayer=false → KillFeed 不显示 ✅
-
-	if (!bIsKillerPlayer)
-	{
-		// AI 击杀: KillFeed 不显示，音效已在上面播完(音效无 Killer 类型限制)
-		// 连杀图标逻辑: 仅在当前玩家是击杀者时才更新（原有逻辑不变）
-		return;
-	}
-
-	// Killer 是玩家 — 推送 KillFeed 图标给所有客户端
+	// 【v229.x v7 大厂架构】业务规则变更 — AI 击杀也显示 KillFeed
+	// 旧 v40.9 规则: 只有 Killer 是玩家时才显示 KillFeed
+	//   - 玩家击杀玩家 → bIsKillerPlayer=true → KillFeed 显示 ✅
+	//   - 玩家击杀 AI → bIsKillerPlayer=true → KillFeed 显示 ✅
+	//   - AI 击杀玩家 → bIsKillerPlayer=false → KillFeed 不显示 ❌ (用户反馈后修)
+	//   - AI 击杀 AI → bIsKillerPlayer=false → KillFeed 不显示 ❌ (用户反馈后修)
+	//
+	// 新 v229.x v7 规则: 所有击杀都显示 KillFeed (含 AI 击杀)
+	//   - 大厂原则 — 与音效业务规则一致 (v100): 全员播放
+	//   - KillFeed 和音效是平行的可见/可听反馈,业务规则应一致
+	//   - bIsKillerPlayer 参数仍保留 — 未来可能用 (比如过滤不同模式), 当前业务规则全员显示
+	//
+	// Killer 是玩家/AI 都推送 KillFeed 图标给所有客户端
 	if (UWorld* World = GetWorld())
 	{
 		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
@@ -3372,17 +3370,69 @@ void ABaseCharacter::Multicast_NotifyKill_Implementation(const FString& KillerNa
 				{
 					if (UGameHUDWidget* HUDWidget = RoomPC->GetGameHUDWidget())
 					{
-						// 推送击杀消息 (KillFeed) — 只有玩家击杀才显示
+						// 推送击杀消息 (KillFeed) — 所有击杀都显示 (含 AI 击杀)
 						HUDWidget->AddKillFeedMessage(KillerName, VictimName, KillMethod);
 
-						// 判断是否是本地玩家（击杀者）自己的 HUD
-						// 如果击杀者是当前控制的角色, 则更新连杀图标 (仅非助攻)
-						if (!bIsAssist && IsLocallyControlled())
+						// 【v229.x v8 大厂架构 — KillStreak 业务规则】
+						// 只有 Killer 是当前 PC 控制的玩家时, 才在该 PC 的 HUD 上显示连杀图标
+						//
+						// 旧 (v229.x v7) 反模式: if (IsLocallyControlled()) ← Owner 是 Victim, 完全错!
+						//   - Killer=玩家A, Victim=玩家B(本地) → Owner=玩家B → IsLocallyControlled=true → 显示连杀 ❌
+						//   - Killer=AI, Victim=玩家B(本地) → Owner=玩家B → IsLocallyControlled=true → 显示连杀 ❌
+						//   - Killer=玩家B(本地), Victim=玩家A → Owner=玩家A → IsLocallyControlled=false → 不显示连杀 ❌
+						//
+						// 新 (v229.x v8) 大厂架构: 二段判定
+						//   Step 1 (粗筛): bIsKillerPlayer == false → AI 击杀, 直接跳过 KillStreak
+						//   Step 2 (细筛): bIsKillerPlayer == true → 遍历 PC, 字符串匹配 "我的 PlayerName == KillerName"
+						//     - 匹配命中 → 该 PC 是 Killer, 显示连杀 ✓
+						//     - 匹配不命中 → 该 PC 不是 Killer, 不显示连杀 ✓
+						//   大厂原则 — RPC 纯数据: 不传 Actor 指针 (v31.6), 用 FString + bIsKillerPlayer 判定
+						//   大厂原则 — 业务规则 0 兜底: 不允许"AI 击杀也显示连杀"的隐藏兜底
+						if (bIsAssist)
 						{
-							const bool bIsHeadshot = (KillMethod == EKillMethod::PrimaryHeadshot ||
-								KillMethod == EKillMethod::SecondaryHeadshot ||
-								KillMethod == EKillMethod::MeleeHeadshot);
-							HUDWidget->OnPlayerKill(bIsHeadshot);
+							// 助攻不显示连杀 (业务规则) — 大厂 0 兜底: 不静默, Verbose 日志
+							UE_LOG(LogTemp, Verbose,
+								TEXT("[BaseCharacter] Multicast_NotifyKill: 助攻, 跳过 KillStreak. PC=%s"),
+								*GetNameSafe(RoomPC));
+						}
+						else if (!bIsKillerPlayer)
+						{
+							// Step 1 (粗筛): Killer 是 AI → 任何 PC 都不显示连杀
+							// 大厂 0 兜底: 不依赖 KillerName 字符串, 用 bIsKillerPlayer 布尔字段权威判定
+							UE_LOG(LogTemp, Verbose,
+								TEXT("[BaseCharacter] Multicast_NotifyKill: Killer='%s' 是 AI (bIsKillerPlayer=false), PC='%s' 跳过 KillStreak."),
+								*KillerName, *GetNameSafe(RoomPC));
+						}
+						else if (ARoomPlayerState* LocalPS = RoomPC->GetPlayerState<ARoomPlayerState>())
+						{
+							// Step 2 (细筛): Killer 是真人 → 找当前 PC 是不是 Killer
+							const FString LocalPlayerName = LocalPS->GetPlayerName();
+							if (!LocalPlayerName.Equals(KillerName, ESearchCase::IgnoreCase))
+							{
+								// 当前 PC 不是 Killer → 不显示连杀 (正确行为)
+								UE_LOG(LogTemp, Verbose,
+									TEXT("[BaseCharacter] Multicast_NotifyKill: PC='%s' 不是 Killer='%s', 不显示 KillStreak."),
+									*LocalPlayerName, *KillerName);
+							}
+							else
+							{
+								// 当前 PC 是 Killer → 显示连杀图标
+								const bool bIsHeadshot = (KillMethod == EKillMethod::PrimaryHeadshot ||
+									KillMethod == EKillMethod::SecondaryHeadshot ||
+									KillMethod == EKillMethod::MeleeHeadshot);
+								HUDWidget->OnPlayerKill(bIsHeadshot);
+
+								UE_LOG(LogTemp, Verbose,
+									TEXT("[BaseCharacter] Multicast_NotifyKill: PC='%s' 是 Killer='%s', 显示 KillStreak. Headshot=%d"),
+									*LocalPlayerName, *KillerName, bIsHeadshot ? 1 : 0);
+							}
+						}
+						else
+						{
+							UE_LOG(LogTemp, Warning,
+								TEXT("[BaseCharacter] Multicast_NotifyKill: PC='%s' 无 ARoomPlayerState, 跳过 KillStreak 判定. ")
+								TEXT("【大厂 0 兜底】检查 ARoomGameMode::InitPlayerState / AddPlayerToRoom 链路."),
+								*GetNameSafe(RoomPC));
 						}
 					}
 				}
@@ -3576,9 +3626,10 @@ void ABaseCharacter::GrantAssistsToEligiblePlayers(ABaseCharacter* Victim, ABase
 		}
 
 		// 广播助攻信息给所有客户端 — 纯数据 RPC, 不传 Actor*
-		// 【v40.9】助攻者的 KillFeed 显示由 bIsKillerPlayer 决定（主击杀者是否为玩家）
+		// 【v229.x v7】助攻者的 KillFeed 显示全员显示 (与音效业务规则一致)
 		// 【v100】助攻不计入连杀 → StreakType=None → KillSoundComponent 收到 None 不播音
 		//     （助攻只显示图标,不刷"二连杀"音效 — 与 KillStreakWidget 业务一致）
+		// 【v229.x v7】bIsKillerPlayer 参数保留透传 — 当前业务规则全员显示, 未来可过滤
 		AssistantChar->Multicast_NotifyKill(AssistantName, VictimName, KillMethod, /*bIsAssist=*/true, bIsKillerPlayer, EKillStreakType::None, /*KillSoundAsset=*/nullptr);
 	}
 

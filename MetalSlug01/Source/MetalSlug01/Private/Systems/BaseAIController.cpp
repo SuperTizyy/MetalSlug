@@ -688,21 +688,57 @@ void ABaseAIController::OnRep_AIScoreboardData()
 //   - NewTag.IsValid() 为 false → 不写 CachedFactionTag (与 v221 之前行为一致)
 //   - NewTag 非法 (不在 Offense/Defense 内) → ValidateFactionOrReportError (由调用方负责)
 // ==========================================
-void ABaseAIController::SetCachedFactionTag(const FGameplayTag& InTag)
+void ABaseAIController::SetCachedFactionTag(const FGameplayTag& InTag, bool bForce)
 {
-	// 大厂原则 — 单次决策: 已设值的字段不覆盖 (防止 MutatePawnToMother 之后又被某次 Spawn 路径错误覆盖)
-	// 例外: 同一阵营重复 set (幂等操作) 不影响
+	// 【v221.1 + v229.x 大厂架构 — 单次决策 + 业务反转支持】
+	//
+	// 设计意图 (v221.1):
+	//   - 默认: 已设值的字段不覆盖
+	//   - 防止 MutatePawnToMother 之后又被某次 Spawn 路径错误覆盖
+	//   - 例外: 同一阵营重复 set (幂等操作) 不影响
+	//
+	// v229.x 修复: Bug 2 真根因 — 单次决策拦截了母体变异
+	//   - 触发链: MutatePawnToMother Step 5.5 调 SetCachedFactionTag(Offense)
+	//           但 AIC.CachedFactionTag = Defense (变异前) → bSameValue=false → 拒绝覆盖
+	//           → CachedFactionTag 永远是 Defense → ServerRefreshBattleAIEntries 读 bIsAttacker=false
+	//           → Tab Scoreboard 的 VB_AttackerTeam 不显示母体
+	//
+	// 修复: bForce=true 强制覆盖 (业务反转场景专用)
+	//   - 母体变异 = 跨阵营反转 = 业务反转 (Offense ← Defense)
+	//   - 强制覆盖后, ReplicatedBattleAIEntries 立即拿到 bIsAttacker=true
+	//   - 0 兜底: bForce=true 仍校验 InTag.IsValid() (脏数据不应被强制写入)
+	//
+	// 0 兜底 — 脏数据防护:
+	//   - InTag.IsValid() == false → 不写 (与 v221.1 行为一致)
+	//   - InTag.IsValid() 但不在 Offense/Defense 内 → 仍允许 (业务可能扩展)
 	const bool bSameValue = (CachedFactionTag == InTag);
-	if (CachedFactionTag.IsValid() && !bSameValue)
+	if (!bForce && CachedFactionTag.IsValid() && !bSameValue)
 	{
 		UE_LOG(LogBaseAI, Verbose,
 			TEXT("[BaseAIController] 【v221.1】SetCachedFactionTag: 拒绝覆盖已设值. Existing='%s' New='%s'. "
-			     "已有值保留 (大厂原则 — 单次决策)."),
+			     "已有值保留 (大厂原则 — 单次决策). "
+			     "【v229.x 修复】如需强制覆盖 (业务反转场景), 传 bForce=true."),
 			*CachedFactionTag.ToString(), *InTag.ToString());
 		return;
 	}
 
+	// 0 兜底: 脏数据防护
+	if (!InTag.IsValid())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[BaseAIController] 【v229.x】SetCachedFactionTag: InTag.IsValid() == false. 拒绝写入. "
+			     "【零兜底】检查调用方传参是否正确 (不要传 EmptyTag). bForce=%d"),
+			bForce ? 1 : 0);
+		return;
+	}
+
+	const FGameplayTag OldTag = CachedFactionTag;
 	CachedFactionTag = InTag;
+
+	UE_LOG(LogBaseAI, Display,
+		TEXT("[BaseAIController] 【v229.x】SetCachedFactionTag: CachedFactionTag '%s' → '%s' (bForce=%d, bSameValue=%d). "
+		     "Caller 决定是否驱动 ServerRefreshBattleAIEntries 刷新 Tab Scoreboard."),
+		*OldTag.ToString(), *InTag.ToString(), bForce ? 1 : 0, bSameValue ? 1 : 0);
 
 	// 服务器侧: 主动通知 RoomStateService 刷新 Tab Scoreboard
 	//   - 镜像 v215 大厂架构 (OnRep_AIScoreboardData 的做法)
@@ -855,7 +891,10 @@ void ABaseAIController::AddKillScore()
 	}
 
 	AIKills += 1;
-	AIScore += KillScoreValue;
+	// 【v229.x 大厂架构】公式单一真理源: 击杀 +10 分 (FKdaScoring::KillScore)
+	//   旧 (v22-v228): AIScore += KillScoreValue (= 20) → 与 UI 排名 10 分不一致
+	//   新 (v229.x): 委托 FKdaScoring 单一真理源 — 业务层 = UI 层 = 同一公式
+	AIScore += FKdaScoring::ComputeStep(1, 0, 0);
 
 	// 【v208 P0 重构】删除 AddTeamKill 调用 — 上移到 PerformKillSettlement 集中调度
 	//   业务语义: GameState 的 AttackerKills/DefenderKills = 被击杀阵营累计击杀数
@@ -890,7 +929,8 @@ void ABaseAIController::AddAssistScore()
 	}
 
 	AIAssists += 1;
-	AIScore += AssistScoreValue;
+	// 【v229.x】单一真理源: 助攻 +5 分 (FKdaScoring::ComputeStep(0,1,0))
+	AIScore += FKdaScoring::ComputeStep(0, 1, 0);
 
 	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
 	{
@@ -909,6 +949,7 @@ void ABaseAIController::AddAssistScore()
 }
 
 // v202.0 P0: AI 死亡计数 (服务器专用, 镜像 ARoomPlayerState::AddDeath)
+// 【v229.x】死亡 -1 分同步累加 AIScore (用户规则 2026.08.16 确认)
 void ABaseAIController::AddDeath()
 {
 	if (!HasAuthority())
@@ -919,6 +960,8 @@ void ABaseAIController::AddDeath()
 	}
 
 	AIDeaths += 1;
+	// 【v229.x】单一真理源: 死亡 -1 分 (FKdaScoring::ComputeStep(0,0,1))
+	AIScore += FKdaScoring::ComputeStep(0, 0, 1);
 
 	if (GetNetMode() == NM_ListenServer || GetNetMode() == NM_Standalone)
 	{
@@ -932,8 +975,8 @@ void ABaseAIController::AddDeath()
 	}
 
 	UE_LOG(LogBaseAI, Verbose,
-		TEXT("[BaseAIController] AddDeath: AI='%s' NewAIDeaths=%d"),
-		*GetName(), AIDeaths);
+		TEXT("[BaseAIController] AddDeath: AI='%s' NewAIDeaths=%d NewAIScore=%d"),
+		*GetName(), AIDeaths, AIScore);
 }
 
 // v202.0 P0: AI 每小局重置计分数据 (服务器专用, 镜像 ARoomPlayerState::ResetScoreboardStats)

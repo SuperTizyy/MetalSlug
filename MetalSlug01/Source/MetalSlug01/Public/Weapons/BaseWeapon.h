@@ -426,6 +426,36 @@ public:
 	EWeaponMeshType GetMeshType() const;
 
 	/**
+	 * ResolveKillMethod — 【v229.x v6 大厂架构】KillMethod 单一真理源
+	 *
+	 * 根据武器 MeshType + 命中部位 (BoneName) 决定 EKillMethod:
+	 *   - Melee + head → MeleeHeadshot
+	 *   - Melee + body → MeleeWeapon
+	 *   - Primary + head → PrimaryHeadshot
+	 *   - Primary + body → PrimaryWeapon
+	 *   - Secondary + head → SecondaryHeadshot
+	 *   - Secondary + body → SecondaryWeapon
+	 *   - None → Log Error + 返回 MeleeWeapon (0 兜底 — 不静默)
+	 *
+	 * 业务背景 (用户 2026.08.16 反馈):
+	 *   - 旧版 Server_ReportHit 5 个分支硬编码 LastKillMethod = MeleeWeapon/MeleeHeadshot
+	 *   - 导致主武器击杀 (BP_Weapon_AK47, MeshType=Primary) 被错配成 MeleeWeapon
+	 *   - KillFeed 显示 DaoBaoTou(近战爆头)而非 BuQiangJiSha(主武器击杀)
+	 *
+	 * 大厂原则:
+	 *   - 单一真理源: KillMethod 推导唯一入口, 5 处散落赋值集中到这里
+	 *   - 数据驱动: 真理源 = this->MeshType (DT_WeaponInfo.MeshType 写入, 已 Replicated)
+	 *   - 0 兜底: MeshType==None → Log Error + 默认 MeleeWeapon (不静默)
+	 *
+	 * 调用方: ABaseWeapon::Server_ReportHit_Implementation 末尾
+	 *
+	 * @param BoneName 命中骨骼名 ("head" = 头, 其他 = 身体, NAME_None = 未指定)
+	 * @return 推导出的 EKillMethod
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Combat")
+	EKillMethod ResolveKillMethod(FName BoneName) const;
+
+	/**
 	 * GetMeshComponent — 获取武器 Mesh 组件 (UMeshComponent)
 	 *
 	 * 调用方: WeaponAttachmentComponent / CombatDeathComponent / MeleeSwStrategy

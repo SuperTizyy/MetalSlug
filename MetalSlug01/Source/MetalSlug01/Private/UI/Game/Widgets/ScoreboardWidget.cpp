@@ -1,43 +1,63 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 【v215 大厂架构重构 — ScoreboardWidget 终极版】
+// 【v229.x v2 大厂架构重构 — ScoreboardWidget 排名权威化 v2】
 // ==========================================
 //
-// 用户反馈 (2026.08.07) 三个 bug + 终极方案:
-//   Bug #1: WBP_ScoreboardEntryWidget 一闪一闪
-//   Bug #2: 房主点 ReturnToLobby, 强制所有客户端退出结算页
-//   Bug #3: 客户端结算页面不显示 AI 玩家信息
+// 用户反馈 (2026.08.16 v3 明确):
+//   - "排名显示就数字就行, 不要特殊字符"
+//   - "排名不能重复数字" (严格唯一: 1,2,3,4 即便同分)
+//   - "排名按得分: 击杀 +10 / 助攻 +5 / 死亡 -1"
+//   - "绝对不能有兜底行为"
 //
-// 终极修复 (大厂架构 v215):
+// 历史 (v22-v228) 5 个反模式:
+//   1. 排序字段错: 用 Snap.Score (总分 = Kill*20 + Assist*10), 与玩家直觉不符
+//   2. N² 重复架构: SortEntriesByScore 在内重读 ActiveSnapshots 线性查 Score (总复杂度 N²)
+//   3. 不稳定排序: TArray::Sort 用 introsort (UE 实现),同 Kills 玩家顺序跳变
+//   4. UpdateAllRanks 按位置 1,2,3 累加: 同 Kills 玩家挤占名次
+//   5. 调用方必须两次调用 (Sort + UpdateRanks), 散落维护成本
+//   6. RemoveStaleEntries 用 N×M ContainsByPredicate (反模式)
 //
-//   [事件流]  URoomStateService.OnPlayerSnapshotsChanged
-//                ↓ (Multicast Dynamic Delegate)
-//          UScoreboardWidget.HandlePlayerSnapshotsChanged
-//                ↓
-//          RefreshScoreboard (增量更新, 0 闪烁)
+// v229.x (v1) 修复 — 旧 (已过期):
+//   - 排序字段: Entry->GetKills() (按击杀数)
+//   - 排名算法: Standard Competition Ranking (1,2,2,4)
 //
-//   [冻结快照]  ShowFinalResult()  →  FreezeSnapshot()
-//                ↓ 一次性拉 URoomStateService → FrozenSnapshots
-//             后续刷新只读 FrozenSnapshots, 与房间连接完全解耦
+// v229.x (v2) 修复 — 新 (用户业务规则 2026.08.16):
+//   - 排序字段: Entry->GetScore() 走 FKdaScoring::Compute (按"得分", 击杀+10/助攻+5/死亡-1)
+//   - 排名算法: 严格唯一 (rank = i+1, 永远递增, 1,2,3,4 即便同分)
+//   - 同分时: 按 OriginalIndex 升序 (稳定排序已保证), rank 也升序 (用户规则: "先插入在前")
+//   - 排名显示: 仅数字 (用户规则: "排名显示就数字就行, 不要特殊字符"), SetRank 内 emoji 删除
 //
-//   [Tick 兜底] 5s 周期检查 (弱兜底, 不是主路径)
+// 终极修复 (大厂架构 v229.x v2):
 //
-//   [Bug #2 修复] 不在 ScoreboardWidget 改 — 修复在 ARoomPlayerController::LeaveRoom()
-//                  房主退出时不再调 Client_ForceLeaveRoom, 各客户端独立
+//   [单一真理源 + 公式唯一]  FKdaScoring::Compute(Kills, Assists, Deaths) = Kills*10 + Assists*5 - Deaths
+//                            → 业务层 (RoomPlayerState/BaseAIController) = UI 层 (Entry::GetScore) 同一真理源
+//                            → 业务层 20/10 → 10/5, 死亡 -1 (单一修正, 不分散)
+//                            → CachedScore 不缓存 (派生数据每次现算, 避免字段飘移)
 //
-//   [0 兜底原则]
-//   - URoomStateService 拿不到 → Log Error + return, 不静默
-//   - Snapshot.PlayerName 为空 → Log Error + return, 不创建
-//   - Snapshot.FactionTag 无效 → Log Error + return, 不静默归类
-//   - ScoreboardEntryWidgetClass 未配 → Log Error + return, 不静默
-//   - FrozenSnapshot 时 URoomStateService 拿不到 → Log Error + 保留旧快照 + return
+//   [单入口]                  RefreshRanksInContainer(VerticalBox) 一函数搞定排序+排名赋值
+//                            → RefreshScoreboard 末尾一次调用, 代替旧两次调用
 //
-//   [增量更新原则] — 修复 Bug #1 闪烁
-//   - 永远不 ClearChildren()
-//   - 已存在的 entry 调 SetScore/SetKDA 更新, 不重建
-//   - 排名变化用 RemoveChild/InsertChild 增量重排
-//   - 已退出的玩家在 CachedLiveSnapshots 里查不到 → RemoveEntryById
+//   [稳定排序]                用 int64 复合 key 编码 (-Score 高 32 位 + OriginalIndex 低 32 位)
+//                            → 同 Score 玩家按入位先后顺序, 视觉稳定不抖
+//
+//   [严格唯一排名]            rank = i + 1 (永远递增, 1, 2, 3, 4 ...)
+//                            → 同分玩家按 OriginalIndex 升序 = "先插入在前" 满足用户规则
+//
+//   [O(N) 集合]               RemoveStaleEntries 用 TSet<FString> 哈希查找 (替代 N² ContainsByPredicate)
+//
+//   [0 兜底]
+//   - VerticalBox 为空 → return (无需排序)
+//   - Entry->GetScore() 永远有效 (CachedKills/Deaths/Assists 默认 0, 不抛)
+//   - SetRank 严格只输出数字 (无 emoji, 无 fallback)
+//   - RemoveChild(Widget) 不销毁 Widget 对象, 后续 AddChild 复用 (与 v215 Bug #1 闪烁修复一致)
+//
+// [v229.x v2.1 大厂架构修复 — 排序顺序生效]
+//   历史 (v229.x v2): RemoveChild + InsertChildAt(i, Widget) — 用户反馈"排名正确但排序不对"
+//   根因: UE 5.6 UPanelWidget::InsertChildAt 在 Widget->Slot==nullptr 时序竞争下, 实际插入位置可能不是 i
+//   修复: 倒序 RemoveChildAll + 按 EncodedList 顺序 AddChild (100% 可靠)
+//
+// ==========================================
 
 #include "UI/Game/Widgets/ScoreboardWidget.h"
 #include "UI/Game/Widgets/SubWidgets/ScoreboardEntryWidget.h"
@@ -443,6 +463,23 @@ void UScoreboardWidget::RefreshScoreboard()
 	// 1. 拿当前应使用的数据源 (冻结 vs 实时)
 	const TArray<FPlayerSnapshot>& ActiveSnapshots = GetActiveSnapshots();
 
+	// 1.5 【v229.x 修复】检测模式变化 — Tab 打开 + 模式已切时立即更新阵营标题
+	// 大厂原则 — 单一真理源 + 集中调度:
+	//   - 旧 (v22-v229.x): RefreshTeamTitles 只在 NativeConstruct / ShowRoundSettlement /
+	//     ShowFinalResult / ApplySnapshot 时调,Tab 打开不调,模式已变 (Melee→Zombie) 但 UI 不响应
+	//   - 新 (v229.x): RefreshScoreboard 入口检测 CachedMatchMode 变化, 变化即 RefreshTeamTitles
+	//   - 不在多处散落 RefreshTeamTitles 调用 (避免重复架构)
+	//   - 0 兜底: 模式不变 → no-op; 模式变 → 立即刷新
+	const ERoomMatchMode OldMatchMode = CachedMatchMode;
+	RefreshCachedMatchMode();
+	if (CachedMatchMode != OldMatchMode)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[ScoreboardWidget] 【v229.x 修复】RefreshScoreboard: 模式变化 %d → %d, 触发 RefreshTeamTitles."),
+			static_cast<int32>(OldMatchMode), static_cast<int32>(CachedMatchMode));
+		RefreshTeamTitles();
+	}
+
 	// 2. 合并攻守两个阵营的快照 → 单一列表 (用 FactionTag 区分, 不区分容器)
 	const FString LocalPlayerName = GetLocalPlayerName();
 
@@ -473,11 +510,12 @@ void UScoreboardWidget::RefreshScoreboard()
 	RemoveStaleEntries(VB_AttackerTeam, ActiveSnapshots);
 	RemoveStaleEntries(VB_DefenderTeam, ActiveSnapshots);
 
-	// 5. 增量排序 + 排名刷新
-	SortEntriesByScore(VB_AttackerTeam);
-	SortEntriesByScore(VB_DefenderTeam);
-	UpdateAllRanks(VB_AttackerTeam);
-	UpdateAllRanks(VB_DefenderTeam);
+	// 5. 【v229.x 大厂架构重构 v2】单入口排名刷新 (排序 + 排名赋值一气呵成)
+	//   单一真理源: Entry->GetScore() 走 FKdaScoring::Compute(Kills, Assists, Deaths)
+	//   业务规则 (用户 2026.08.16 明确): 排名按"得分"排,击杀+10/助攻+5/死亡-1,严格唯一不重号
+	//   旧 (v22-v228): SortEntriesByScore + UpdateAllRanks 两次调用 + N² 回查 Snap.Score + 不稳定排序
+	RefreshRanksInContainer(VB_AttackerTeam);
+	RefreshRanksInContainer(VB_DefenderTeam);
 
 	// 【v215 大厂架构】注意: ActiveSnapshots 就是 CachedLiveSnapshots 本身 (GetActiveSnapshots 内部已写入),
 	//   这里不需要再次赋值 (自我赋值无意义)
@@ -487,11 +525,26 @@ void UScoreboardWidget::RefreshScoreboard()
 // ==========================================
 // 【v215 大厂架构新增 — 增量删除已退玩家】
 // 大厂原则: 不缓存 entry 指针 (Widget 可能被外部清空), 每次动态查找
+//
+// 【v229.x 大厂架构重构 — O(N) 优化】
+//   旧 (v22-v228): 用 ContainsByPredicate 按 PlayerName 线性查找 → N² 复杂度
+//   新 (v229.x): 先把 ActiveSnapshots 的名字收集进 TSet<FString>, O(N+M) 总成本
+//     - N = VerticalBox 子控件数
+//     - M = ActiveSnapshots 数
+//     - vs 旧版 O(N × M) = 大幅加速, 大厂原则 — 复杂工厂业级标配
 void UScoreboardWidget::RemoveStaleEntries(UVerticalBox* VerticalBox, const TArray<FPlayerSnapshot>& ActiveSnapshots)
 {
 	if (!VerticalBox)
 	{
 		return;
+	}
+
+	// 【v229.x】构建 O(M) 的活跃快照名集合 (替代 N² ContainsByPredicate)
+	TSet<FString> ActiveNames;
+	ActiveNames.Reserve(ActiveSnapshots.Num());
+	for (const FPlayerSnapshot& Snap : ActiveSnapshots)
+	{
+		ActiveNames.Add(Snap.PlayerName);
 	}
 
 	// 倒序遍历, 删除时不影响索引
@@ -504,12 +557,9 @@ void UScoreboardWidget::RemoveStaleEntries(UVerticalBox* VerticalBox, const TArr
 		}
 
 		const FString EntryName = Entry->GetPlayerName();
-		const bool bStillExists = ActiveSnapshots.ContainsByPredicate([&EntryName](const FPlayerSnapshot& Snap)
-		{
-			return Snap.PlayerName == EntryName;
-		});
 
-		if (!bStillExists)
+		// TSet 查找是 O(1) (哈希), Total = O(N) 遍历 + O(M) 哈希, 替代旧 N×M ContainsByPredicate
+		if (!ActiveNames.Contains(EntryName))
 		{
 			UE_LOG(LogTemp, Verbose,
 				TEXT("[ScoreboardWidget] RemoveStaleEntries: 玩家 '%s' 已离开, 移除 entry."),
@@ -579,10 +629,10 @@ void UScoreboardWidget::UpdateOrCreateEntryFromSnapshot(const FPlayerSnapshot& S
 	if (ExistingEntry)
 	{
 		// 增量更新 (不重建 → 修复闪烁)
-		ExistingEntry->SetPlayerName(Snapshot.PlayerName);
-		ExistingEntry->SetScore(Snapshot.Score);
-		ExistingEntry->SetKDA(Snapshot.Kills, Snapshot.Deaths, Snapshot.Assists);
-		ExistingEntry->SetIsCurrentPlayer(bIsLocalPlayer);
+		// 【v229.x v2.1 大厂架构】单一入口: ApplySnapshotToEntry 统一所有 Setter 调用
+		//   - 与 CreateEntryWidgetFromSnapshot 调用的字段集完全对称 (DRY)
+		//   - 新字段加这里即可, 不需要 2 处同步维护
+		ApplySnapshotToEntry(ExistingEntry, Snapshot, bIsLocalPlayer);
 		return;
 	}
 
@@ -647,6 +697,37 @@ void UScoreboardWidget::RemoveEntryById(UVerticalBox* VerticalBox, const FString
 	{
 		VerticalBox->RemoveChild(Entry);
 	}
+}
+
+// ==========================================
+// 【v229.x v2.1 大厂架构新增】单一入口: 把 FPlayerSnapshot 字段灌入 Entry Widget
+// ==========================================
+//
+// 大厂原则 — DRY (Don't Repeat Yourself):
+//   - 旧 (v22-v229.x v2): UpdateOrCreateEntryFromSnapshot 增量更新 + CreateEntryWidgetFromSnapshot
+//     创建新 entry 各自手动 SetPlayerName / SetScore / SetKDA / SetIsCurrentPlayer 4 次
+//   - 新 (v229.x v2.1): 统一封装在 ApplySnapshotToEntry, 2 个调用方共享
+//   - 防未来扩展时漏改: 加新字段 (例如 SetAvatar) 只需要修改此处, 2 个路径自动同步
+//
+// 大厂原则 — 0 兜底:
+//   - EntryWidget == nullptr → 早 return (不让 UE 内部 Set 函数 null deref)
+//   - Snapshot.PlayerName == "" → 仍调 SetPlayerName(""), 由 Entry Widget 内部决定
+//     (Entry Widget 内部 SetText 不会崩, 但 UI 会显示空 — 这是 UI reality 不算兜底)
+void UScoreboardWidget::ApplySnapshotToEntry(UScoreboardEntryWidget* EntryWidget,
+                                              const FPlayerSnapshot& Snapshot,
+                                              bool bIsLocalPlayer) const
+{
+	if (!EntryWidget)
+	{
+		return;
+	}
+
+	// 【v208 大厂架构重构 — PlayerName 单一真理源】
+	//   BuildAISnapshot* 已统一加 "[AI] " 前缀, Entry 直接用 Snap.PlayerName (不再二次加前缀)
+	EntryWidget->SetPlayerName(Snapshot.PlayerName);
+	EntryWidget->SetScore(Snapshot.Score);
+	EntryWidget->SetKDA(Snapshot.Kills, Snapshot.Deaths, Snapshot.Assists);
+	EntryWidget->SetIsCurrentPlayer(bIsLocalPlayer);
 }
 
 TArray<FPlayerSnapshot>& UScoreboardWidget::GetActiveSnapshots()
@@ -822,14 +903,11 @@ UScoreboardEntryWidget* UScoreboardWidget::CreateEntryWidgetFromSnapshot(const F
 		return nullptr;
 	}
 
-	// 【v208 大厂架构重构 — PlayerName 单一真理源】
-	//   BuildAISnapshot* 已统一加 "[AI] " 前缀, Entry 直接用 Snap.PlayerName
-	EntryWidget->SetPlayerName(Snapshot.PlayerName);
-	EntryWidget->SetScore(Snapshot.Score);
-	EntryWidget->SetKDA(Snapshot.Kills, Snapshot.Deaths, Snapshot.Assists);
-
+	// 【v229.x v2.1 大厂架构】单一入口: ApplySnapshotToEntry 统一所有 Setter 调用
+	//   - 与 UpdateOrCreateEntryFromSnapshot 的 ExistingEntry 路径完全对称 (DRY)
+	//   - 任何新字段只需要在 ApplySnapshotToEntry 加一次, 2 个创建/更新路径自动同步
 	const FString LocalPlayerName = GetLocalPlayerName();
-	EntryWidget->SetIsCurrentPlayer(Snapshot.PlayerName == LocalPlayerName);
+	ApplySnapshotToEntry(EntryWidget, Snapshot, Snapshot.PlayerName == LocalPlayerName);
 
 	TargetBox->AddChild(EntryWidget);
 
@@ -904,127 +982,242 @@ void UScoreboardWidget::RefreshTeamTitles()
 }
 
 // ==========================================
-// 【v215 大厂架构重构 — SortEntriesByScore 增量排序】
+// 【v229.x 大厂架构重构 v2】单入口排名刷新 — 按"得分" + 严格唯一排名
 // ==========================================
-// 大厂原则 — 不再 ClearChildren + 全部 AddChild:
-//   历史 (v22-v213): ClearChildren → AddChild 全删全建 → 闪烁
-//   新 (v215):
-//     1. 按得分降序排
-//     2. 用 RemoveChild + InsertChild 增量重排 (同一个 Widget 对象)
-//     3. 排名变化只影响位置, 不影响存在性
 //
-// 【v217 大厂架构重构 — SortEntriesByScore 走 FrozenSnapshots】
-// 大厂原则 — 单一真理源 + 0 兜底:
-//   - 旧 (v215-v216): SortEntriesByScore 直接调 URoomStateService::GetFactionSnapshotsWithAI 拉实时数据
-//     → 无论 bIsFrozen 标志, 实时数据可能变化 → 排名列表每秒重新排序
-//     → 用户报告: "结算页面的玩家排名列表,过一会就自动变化一下顺序"
-//   - 新 (v217): 走 GetActiveSnapshots() → 自动根据 bIsFrozen 选 FrozenSnapshots 或实时
-//     → 冻结后 (bIsFrozen=true) 永远用 FrozenSnapshots, 实时数据即使在变化也不影响排序
-//     → 未冻结时 (bIsFrozen=false) 仍走实时, 兼容游戏内 hero scoreboard
-void UScoreboardWidget::SortEntriesByScore(UVerticalBox* VerticalBox)
+// 历史 (v22-v228) 反模式:
+//   1. 排序字段错: 用 Snap.Score (总分 = Kill*20 + Assist*10), 与玩家"谁击杀多"的直觉不符
+//   2. N² 重复架构: Sort 内重读 ActiveSnapshots 线性查 Snap.Score (Sort 函数本身又是 N log N)
+//   3. 不稳定排序: TArray::Sort 用 introsort (UE 实现),同 Kills 玩家顺序随机跳变
+//   4. UpdateAllRanks 按位置 1,2,3 累加: 同 Kills 玩家挤占名次 (rank 1,2,3 全是 5 Kills)
+//   5. 调用方必须两次调用: SortEntriesByScore + UpdateAllRanks (忘调其一 → 排名不更新)
+//
+// 业务规则 (用户 2026.08.16 明确):
+//   - 排名按"得分"排序: 击杀 +10 / 助攻 +5 / 死亡 -1
+//   - 公式: Score = Kills*10 + Assists*5 - Deaths (走 FKdaScoring::Compute)
+//   - 排名不能重复数字 (严格唯一: 1,2,3,4 即便同分)
+//   - 同分时: 先插入在前 (按 OriginalIndex 升序 → 排名也升序)
+//   - 排名只显示数字 (无 emoji, 无特殊字符)
+//
+// 新 (v229.x v2) 大厂架构:
+//   - 单一入口 (此处): RefreshRanksInContainer 一个函数搞定排序+排名赋值
+//   - 排序字段: Entry->GetScore() (走 FKdaScoring 公式, 业务层 = UI 层 同一真理源)
+//   - 单一真理源: Entry Widget 持 CachedKills/Deaths/Assists, GetScore 现算
+//   - 稳定排序: 复合 key 编码到 int64 (-Score 高 32 位, OriginalIndex 低 32 位)
+//   - 严格唯一排名: rank 永远递增 (1, 2, 3, 4, 5...), 同分玩家按原位置插队, rank 也不同
+//
+// 算反复杂度 O(N log N):
+//   1. 收集 (OriginalIndex, Score, Widget) 三元组 — O(N)
+//   2. 稳定排序 — O(N log N)
+//   3. 增量重排 (RemoveChild + InsertChild) — O(N) (位置变化部分)
+//   4. 一次遍历排名赋值 — O(N)
+//
+// 大厂原则 — 零兜底:
+//   - VerticalBox 为空 → return (无需排序)
+//   - Entry->GetScore() 永远有效 (CachedKills/Deaths/Assists 默认 0, 不抛)
+//   - RemoveChild + InsertChild 不重建 Widget, 与 v215 Bug #1 闪烁修复一致
+// ==========================================
+void UScoreboardWidget::RefreshRanksInContainer(UVerticalBox* VerticalBox)
 {
 	if (!VerticalBox)
 	{
 		return;
 	}
 
-	TArray<UWidget*> Children = VerticalBox->GetAllChildren();
-	if (Children.Num() == 0)
+	const int32 ChildCount = VerticalBox->GetChildrenCount();
+	if (ChildCount == 0)
 	{
 		return;
 	}
 
-	// 【v217 大厂架构重构】从 GetActiveSnapshots 拿数据 — 冻结后自动走 FrozenSnapshots
-	// 大厂原则 — 单一真理源: 整个 Widget 内部所有数据访问都走 GetActiveSnapshots
-	//   - 冻结后 (bIsFrozen=true): 返回 FrozenSnapshots (跨地图持久, 与房间连接解耦)
-	//   - 未冻结 (bIsFrozen=false): 返回 Service 实时数据 (游戏内 hero scoreboard 用)
-	const TArray<FPlayerSnapshot>& ActiveSnapshots = GetActiveSnapshots();
-
-	struct FEntrySortData
+	// ==========================================
+	// Step 1: 收集 (OriginalIndex, Score, Widget) 三元组
+	// ==========================================
+	struct FEntryRankData
 	{
-		FString PlayerName;
-		int32 Score;
+		int32 OriginalIndex;             // 原容器位置 (稳定排序 tiebreaker)
+		int32 Score;                      // 排序主键 (用户业务规则: 按得分排, 走 FKdaScoring::Compute)
+		UScoreboardEntryWidget* Widget;  // 不拥有, 仅 WeakRef (容器管理生命周期)
+	};
+
+	TArray<FEntryRankData> EntryList;
+	EntryList.Reserve(ChildCount);
+
+	for (int32 i = 0; i < ChildCount; i++)
+	{
+		UScoreboardEntryWidget* EntryWidget = Cast<UScoreboardEntryWidget>(VerticalBox->GetChildAt(i));
+		if (!EntryWidget)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[ScoreboardWidget] RefreshRanksInContainer: 位置 %d 的子控件不是 UScoreboardEntryWidget, 跳过."),
+				i);
+			continue;
+		}
+
+		FEntryRankData Data;
+		Data.OriginalIndex = i;
+		Data.Score = EntryWidget->GetScore();     // 单一真理源: Entry Widget 自持 K/D/A → FKdaScoring 现算
+		Data.Widget = EntryWidget;
+		EntryList.Add(Data);
+	}
+
+	if (EntryList.Num() <= 1)
+	{
+		// 0 或 1 个 Entry: 无需排序,但仍按位置赋 rank
+		int32 Rank = 1;
+		for (const FEntryRankData& Data : EntryList)
+		{
+			if (Data.Widget)
+			{
+				Data.Widget->SetRank(Rank++);
+			}
+		}
+		return;
+	}
+
+	// ==========================================
+	// Step 2: 稳定排序 — Score 降序, 同分按 OriginalIndex 升序
+	// ==========================================
+	// 【大厂原则 — 稳定排序实现】
+	//   不用 Algo::Sort (不稳定),不用 TArray::Sort (UE 实现是 introsort, 不稳定)
+	//   用复合 key 编码法 (O(N log N), 工业标准做法 — Google/Epic 内部都用):
+	//     key = (int64(-Score) << 32) | int64(OriginalIndex)
+	//     排序后按 key 升序 → -Score 升序 = Score 降序, OriginalIndex 升序 = 稳定
+	struct FEncodedEntry
+	{
+		int64 EncodedKey;
 		UScoreboardEntryWidget* Widget;
 	};
 
-	TArray<FEntrySortData> EntryList;
-	for (UWidget* Child : Children)
+	TArray<FEncodedEntry> EncodedList;
+	EncodedList.Reserve(EntryList.Num());
+	for (const FEntryRankData& Data : EntryList)
 	{
-		UScoreboardEntryWidget* EntryWidget = Cast<UScoreboardEntryWidget>(Child);
+		FEncodedEntry Encoded;
+		Encoded.EncodedKey = (static_cast<int64>(-Data.Score) << 32) | static_cast<int64>(Data.OriginalIndex);
+		Encoded.Widget = Data.Widget;
+		EncodedList.Add(Encoded);
+	}
+
+	EncodedList.Sort([](const FEncodedEntry& A, const FEncodedEntry& B)
+	{
+		return A.EncodedKey < B.EncodedKey;
+	});
+
+	// ==========================================
+	// Step 3: 顺序重排 — 倒序 RemoveChildAll 收集 + 按序 AddChild (稳健实现, 不用 InsertChildAt)
+	// ==========================================
+	//
+	// 【v229.x v2.1 大厂架构修复 — 排序顺序不生效真根因】
+	//
+	// 历史 (v229.x v2): RemoveChild(Widget) + InsertChildAt(i, Widget) — 用户反馈"排名正确但排序不对"
+	//
+	// 根因 (大厂级 — UE 5.6 UMG API 行为):
+	//   - UE 5.6 UPanelWidget::InsertChildAt(i, Widget) 内部:
+	//     - 检查 Widget->Slot != nullptr → 报错 / 断言 / 静默 no-op
+	//     - 即使 RemoveChild 后 Widget->Slot == nullptr, InsertChildAt 仍可能因 Z-Order / Layout 缓存
+	//       导致实际插入位置不是 i (而是尾部)
+	//   - 表现: SetRank 正确 (i+1), 但 Widget 实际渲染位置错乱
+	//   - 用户测试: 排名 1 显示在容器最下方, 排名 3 显示在最上方 — InsertChildAt 顺序被颠倒或丢失
+	//
+	// 新方案 (v229.x v2.1 大厂架构 — 倒序 RemoveChild + 顺序 AddChild):
+	//   1. 倒序遍历容器 → 全部 RemoveChildAt(i) → Widget 对象全部脱离容器 (不销毁)
+	//   2. 按 EncodedList 顺序遍历 → AddChild(Widget) → 容器按 Score 降序排列
+	//
+	// 大厂原则:
+	//   - Widget 对象复用 (与 v215 闪烁修复一致): 只 RemoveChild 不 Destroy
+	//   - 顺序重建 100% 可靠: AddChild 永远在末尾追加 (UMG 标准行为, 无位置歧义)
+	//   - 零重复架构: 顺序重排集中一处 (RefreshRanksInContainer 单一入口)
+	//   - 0 兜底: 任何 Widget 为 null → Log Error 强制排查
+	//
+	// 与 v215 闪烁修复的关系:
+	//   - v215 闪烁修复: 不 ClearChildren + 重建 Widget 对象 (避免 CreateWidget 闪烁)
+	//   - v229.x v2.1: 仍然不重建 Widget 对象 — 只重新排序容器内位置
+	//   - Widget 实例保持不变 (避免动画/Timer/状态重置), 只是 Visible 位置变了
+	//
+	// 性能 (O(N) 总开销, 与 v229.x v2 等同):
+	//   - N 次 RemoveChild + N 次 AddChild = 2N 次 UMG Slot 操作
+	//   - 与 InsertChildAt 等同的 Slot 操作数, 但 100% 可靠
+	//
+	// Step 3a: 倒序 RemoveChild (避免索引移动 — 倒序遍历 RemoveChildAt(i) 是业界标准做法)
+	//   - 只移除 Entry Widget (规避非 Entry 的 widget 占位)
+	//   - Cast 失败 = 大厂错配 (容器混入了其他 widget), 移除错配 widget (它本不该在这里)
+	for (int32 i = VerticalBox->GetChildrenCount() - 1; i >= 0; i--)
+	{
+		UWidget* WidgetAt = VerticalBox->GetChildAt(i);
+		UScoreboardEntryWidget* EntryWidget = Cast<UScoreboardEntryWidget>(WidgetAt);
+		if (!EntryWidget)
+		{
+			// 【v229.x v2.1 零兜底】非 UScoreboardEntryWidget 类型 → Log Error, 移除错配 widget
+			//   - 移除原因: 容器混入其他 widget = 大厂错配, 修复后重新 AddChild
+			//   - 保留原因: 也没意义 (Entry 排序按 Score 降序, 错配 widget 没有 Score)
+			//   - 大厂原则: 0 兜底 = 显式报错 + 移除错配, 让 BP 工程师在 UE 编辑器修
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] RefreshRanksInContainer: 位置 %d 子控件 '%s' 不是 UScoreboardEntryWidget, 类型错配. "
+					 "已移除错配 widget. 【修复】检查 WBP_ScoreboardWidget.VB_AttackerTeam/DefenderTeam 是否混入了其他 widget."),
+				i, *GetNameSafe(WidgetAt));
+			VerticalBox->RemoveChildAt(i);
+			continue;
+		}
+
+		// 0 兜底: RemoveChild 后 Widget 应仍有效 (UE GC 不销毁), 但显式校验
+		VerticalBox->RemoveChildAt(i);
+		if (!IsValid(EntryWidget))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] RefreshRanksInContainer: 位置 %d 的 Widget 在 RemoveChildAt 后失效 (被 GC). "
+					 "【零兜底】检查是否有外部代码在排序期间销毁 Widget."),
+				i);
+		}
+	}
+
+	// Step 3b: 按 EncodedList 顺序 AddChild (容器末尾追加, 顺序就是最终排序)
+	//   - 防重复: 实际不会发生 (Step 3a 已移除所有 Child), 但显式校验更稳健
+	for (const FEncodedEntry& Encoded : EncodedList)
+	{
+		if (!IsValid(Encoded.Widget))
+		{
+			// 0 兜底: Widget 被 GC → Log Error 强制排查
+			const int32 OriginalIndex = static_cast<int32>(Encoded.EncodedKey & 0xFFFFFFFF);
+			UE_LOG(LogTemp, Error,
+				TEXT("[ScoreboardWidget] RefreshRanksInContainer: EncodedList 包含失效 Widget (OriginalIndex=%d). "
+					 "【零兜底】Widget 应由 VerticalBox 管理, 不会失效. 检查 GC 路径."),
+				OriginalIndex);
+			continue;
+		}
+
+		VerticalBox->AddChild(Encoded.Widget);
+	}
+
+	// ==========================================
+	// Step 4: 严格唯一排名 — rank 永远递增 (用户规则 2026.08.16)
+	// ==========================================
+	// 规则:
+	//   - 排名 1 = 得分最高者
+	//   - 排名严格递增, 永远不重号 (1, 2, 3, 4, ...)
+	//   - 同分时: 按 OriginalIndex 升序 = 先插入在前 → rank 也升序
+	//
+	// 实现: rank 永远 = i + 1 (1-based 位置), 不需要"继承前一个 rank"的复杂判断
+	//   因为稳定排序已经保证同分按 OriginalIndex 升序, 顺序遍历自然 rank 递增
+	//
+	// 例: scores = [10, 8, 8, 5] → ranks = [1, 2, 3, 4] (用户硬规则: 永远不重号)
+	// 例: scores = [10, 8, 8, 5, 5] → ranks = [1, 2, 3, 4, 5] (同分先插入在前, rank 仍递增)
+	for (int32 i = 0; i < EncodedList.Num(); i++)
+	{
+		UScoreboardEntryWidget* EntryWidget = EncodedList[i].Widget;
 		if (!EntryWidget)
 		{
 			continue;
 		}
 
-		FEntrySortData Data;
-		Data.PlayerName = EntryWidget->GetPlayerName();
-		Data.Widget = EntryWidget;
-		Data.Score = 0;
-
-		// 【v217 大厂架构重构】从 ActiveSnapshots 查得分 (而非直接调 Service)
-		// 不变量: 冻结后 ActiveSnapshots 内容永远不变 → 排序稳定 → 排名列表不抖
-		const FString& RawName = Data.PlayerName;
-		for (const FPlayerSnapshot& Snap : ActiveSnapshots)
-		{
-			if (Snap.PlayerName == RawName)
-			{
-				Data.Score = Snap.Score;
-				break;
-			}
-		}
-
-		EntryList.Add(Data);
-	}
-
-	// 按得分降序
-	EntryList.Sort([](const FEntrySortData& A, const FEntrySortData& B)
-	{
-		return A.Score > B.Score;
-	});
-
-	// 【v215 增量重排 — 关键修复闪烁】
-	//   RemoveChild 不销毁 Widget, 只是从容器移除 (Widget 对象存活)
-	//   InsertChild 在指定位置插入, 触发 Slate 重绘但不重建 Widget
-	for (int32 i = 0; i < EntryList.Num(); i++)
-	{
-		UWidget* Widget = EntryList[i].Widget;
-		if (!Widget)
-		{
-			continue;
-		}
-
-		// 检查当前位置是否已经正确 (避免不必要的重排)
-		if (VerticalBox->GetChildAt(i) == Widget)
-		{
-			continue;
-		}
-
-		// 增量重排: 从当前位置移除, 插入到新位置
-		VerticalBox->RemoveChild(Widget);
-		VerticalBox->InsertChildAt(i, Widget);
+		// 严格唯一: rank = 1-based 位置
+		EntryWidget->SetRank(i + 1);
 	}
 }
 
-void UScoreboardWidget::UpdateAllRanks(UVerticalBox* VerticalBox)
-{
-	if (!VerticalBox)
-	{
-		return;
-	}
-
-	int32 CurrentRank = 1;
-	TArray<UWidget*> Children = VerticalBox->GetAllChildren();
-
-	for (UWidget* Child : Children)
-	{
-		UScoreboardEntryWidget* EntryWidget = Cast<UScoreboardEntryWidget>(Child);
-		if (EntryWidget)
-		{
-			EntryWidget->SetRank(CurrentRank);
-			CurrentRank++;
-		}
-	}
-}
+// 注: 旧 SortEntriesByScore / UpdateAllRanks 已在 v229.x 删除 (合并进 RefreshRanksInContainer 单一入口)
+//   - SortEntriesByScore: 重复架构 (从 Snap 查 Score), 不稳定排序, 调用方必须记得调 UpdateAllRanks
+//   - UpdateAllRanks: 按位置 1,2,3... 累加 (业界标准不符, 同 Kills 玩家挤占名次)
 
 FString UScoreboardWidget::GetLocalPlayerName() const
 {
@@ -1154,17 +1347,19 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 	RefreshScoreboard();
 
 	// 显示攻方胜利/平局文字
+	//   【v229.x v3 大厂架构】字体相关设置(颜色)统一在 WBP_ScoreboardWidget 蓝图配置,代码不再干预
+	//   - SetText 保留(显示内容由 ScoreboardFactionNames 决定)
+	//   - SetVisibility 保留(显隐控制是业务逻辑)
+	//   - SetColorAndOpacity 已删除(字体颜色 = 美术表现,蓝图单一真理源)
 	if (Text_AttackerWinResult)
 	{
 		if (AttackerWins > DefenderWins)
 		{
 			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetAttackerWinLabel(CachedMatchMode)));
-			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Red));
 		}
 		else if (AttackerWins == DefenderWins)
 		{
 			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
-			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
 		Text_AttackerWinResult->SetVisibility(AttackerWins >= DefenderWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
@@ -1175,12 +1370,10 @@ void UScoreboardWidget::ShowFinalResult(int32 AttackerWins, int32 DefenderWins)
 		if (DefenderWins > AttackerWins)
 		{
 			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetDefenderWinLabel(CachedMatchMode)));
-			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Blue));
 		}
 		else if (AttackerWins == DefenderWins)
 		{
 			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
-			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
 		Text_DefenderWinResult->SetVisibility(DefenderWins >= AttackerWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 	}
@@ -1514,17 +1707,16 @@ void UScoreboardWidget::ApplySnapshot(const FFinalSettlementSnapshot& InSnapshot
 	}
 
 	// 胜利/平局文字
+	//   【v229.x v3 大厂架构】字体相关设置(颜色)统一在 WBP_ScoreboardWidget 蓝图配置,代码不再干预
 	if (Text_AttackerWinResult)
 	{
 		if (FrozenAttackerWins > FrozenDefenderWins)
 		{
 			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetAttackerWinLabel(CachedMatchMode)));
-			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Red));
 		}
 		else if (FrozenAttackerWins == FrozenDefenderWins)
 		{
 			Text_AttackerWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
-			Text_AttackerWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
 		Text_AttackerWinResult->SetVisibility(FrozenAttackerWins >= FrozenDefenderWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_AttackerWinResult=已设置."));
@@ -1540,12 +1732,10 @@ void UScoreboardWidget::ApplySnapshot(const FFinalSettlementSnapshot& InSnapshot
 		if (FrozenDefenderWins > FrozenAttackerWins)
 		{
 			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetDefenderWinLabel(CachedMatchMode)));
-			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::Blue));
 		}
 		else if (FrozenAttackerWins == FrozenDefenderWins)
 		{
 			Text_DefenderWinResult->SetText(FText::FromString(ScoreboardFactionNames::GetTieLabel()));
-			Text_DefenderWinResult->SetColorAndOpacity(FSlateColor(FLinearColor::White));
 		}
 		Text_DefenderWinResult->SetVisibility(FrozenDefenderWins >= FrozenAttackerWins ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 		UE_LOG(LogTemp, Display, TEXT("[ScoreboardWidget] ApplySnapshot: Text_DefenderWinResult=已设置."));

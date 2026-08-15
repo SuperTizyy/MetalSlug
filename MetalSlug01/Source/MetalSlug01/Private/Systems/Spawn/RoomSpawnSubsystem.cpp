@@ -659,6 +659,34 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 				// 设置 bIsMother = false (变成人类)
 				PS->bIsMother = false;
 
+				// 【v229.x 大厂架构修复】镜像 RoomMembershipSubsystem 的 PS->OnRep_FactionTag 调用模式
+				//
+				// 根因 (用户 2026.08.16 反馈):
+				//   "进入第二小局,场景里没母体时那个玩家还是在 VB_AttackerTeam 容器里"
+				//
+				// 触发链:
+				//   1. 真人母体阶段: PS->CurrentFactionTag = Offense (MutatePawnToMother 写)
+				//   2. 服务器侧 OnRep_FactionTag() 在服务器侧从不自动触发 (UE OnRep 只在客户端跑)
+				//   3. RestartZombieRoundPlayers 写 PS->CurrentFactionTag = Defense 后,服务器侧 UI
+				//      (URoomStateService 缓存的快照) 不会立即更新 — 因为 OnStateChanged 没触发
+				//   4. 客户端 OnRep_FactionTag 通过 Replicated 同步触发 (这里 OK)
+				//   5. 服务器侧 UI (例如 RoomInsidePage 服务器自渲染) 显示旧值
+				//
+				// 修复 (镜像 RoomMembershipSubsystem line 167/233 的 OnRep_FactionTag 调用):
+				//   - 服务器侧显式调 PS->OnRep_FactionTag() → 立即触发 OnStateChanged.Broadcast()
+				//   - URoomStateService 订阅 → ForwardPlayerSnapshotsChanged → UI 立即刷新
+				//
+				// 不破坏既有链路:
+				//   - 客户端 OnRep_FactionTag 仍由 UE 自动触发 (Replicated 同步)
+				//   - 服务器侧 OnRep_FactionTag 由这里手动触发 (避免服务器 UI 显示旧值)
+				//   - 重复触发安全: OnRep_FactionTag 内部只 Broadcast OnStateChanged,幂等无副作用
+				PS->OnRep_FactionTag();
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[Spawn] 【v229.x 修复】RestartZombieRoundPlayers: 玩家 '%s' PS->CurrentFactionTag=Defense + PS->OnRep_FactionTag 已显式触发 "
+					     "(镜像 RoomMembershipSubsystem, 立即驱动服务器侧 UI 刷新)."),
+					*PC->GetName());
+
 				// 释放旧的复活点占用
 				ReleaseSpawnPointByController(PC);
 
@@ -1070,7 +1098,23 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 					// Possess + 状态清零
 					BaseAIC->Possess(NewHumanPawn);
 					BaseAIC->SetCachedIsMother(false);
-					BaseAIC->SetCachedFactionTag(FFactionTags::Defense());
+					// 【v229.x 大厂架构修复 — Bug 2 真根因】传 bForce=true
+					//
+					// 根因 (用户 2026.08.16 反馈):
+					//   "进入第二小局,场景里没母体时那个玩家还是在 VB_AttackerTeam 容器里这是错的"
+					//
+					// 触发链 (AI 母体变人类):
+					//   1. AI 母体的 AIC.CachedFactionTag = Offense (v229.x 已允许跨阵营写入)
+					//   2. 旧版 RestartZombieRoundPlayers 调 SetCachedFactionTag(Defense) 不带 bForce
+					//   3. SetCachedFactionTag 单次决策拦截: CachedFactionTag=Offense (已设), NewTag=Defense → bSameValue=false → 拒绝覆盖
+					//   4. CachedFactionTag 永远是 Offense → ServerRefreshBattleAIEntries 读 bIsAttacker=true
+					//   5. 客户端 GetBattleAIEntries(Offense) 仍拿到这个 AI → VB_AttackerTeam (错)
+					//
+					// 修复: 母体变人类 = 跨阵营反转 (Offense → Defense), 必须传 bForce=true
+					//   - 这是业务反转场景 (与母体变异对称)
+					//   - 与单次决策的"防 Spawn 路径错误回滚"目标不冲突
+					//   - 镜像 MutatePawnToMother line 4830 的 bForce=true 修复
+					BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true); // AI 母体变人类 = 业务反转, 必须强制
 
 					// ==========================================
 					// 【v219.1 大厂架构 P0 修复】AI 母体变人类 = 走 Server_SpawnAllWeapons 3 槽位 Spawn
@@ -1193,7 +1237,8 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 				AIChar->bIsMother = false;
 				AIChar->bIsHuman = true;
 				BaseAIC->SetCachedIsMother(false);
-				BaseAIC->SetCachedFactionTag(FFactionTags::Defense());
+				// 【v229.x 大厂架构修复】镜像 line 1073 — AI 母体变人类 = 业务反转, 必须 bForce=true
+				BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true);
 				AIChar->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
 
 				if (!AIChar->IsPendingKillPending() && AIChar->GetLifeSpan() <= 0.0f)
@@ -1274,6 +1319,50 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 	UE_LOG(LogTemp, Log,
 		TEXT("[Spawn] 【v201.10.2】RestartZombieRoundPlayers: 已重启 %d 个 AI 的 BT + 清空 BB."),
 		AIRestartCount);
+
+	// ==========================================
+	// 【v229.x 大厂架构修复 — Bug 2 真根因】刷新 ReplicatedBattleAIEntries
+	// ==========================================
+	//
+	// 根因 (用户 2026.08.16 反馈):
+	//   "进入第二小局,场景里没母体时那个玩家还是在 VB_AttackerTeam 容器里这是错的"
+	//
+	// 触发链:
+	//   1. AI 母体的 AIC.CachedFactionTag = Offense (第一小局母体变异)
+	//   2. RestartZombieRoundPlayers Step 2 AI 路径:
+	//      - 写 BaseAIC->SetCachedFactionTag(Defense) (但单次决策拦截, 详见 line 1073/1212 的 v229.x 修复)
+	//   3. 即使 CachedFactionTag 改成 Defense, ReplicatedBattleAIEntries 里旧 bIsAttacker=true 没刷新
+	//   4. 客户端 GetBattleAIEntries(Offense) 仍能过滤到这个 AI → VB_AttackerTeam
+	//   5. 真人路径: PS->CurrentFactionTag 已 Replicated,客户端 Tab 实时读应当 OK
+	//      但 Server 显式调 PS->OnRep_FactionTag() 让服务器侧 UI (RoomInsidePage 等) 也立即响应
+	//
+	// 修复 (镜像 MutatePawnToMother line 5224 的 v229.x 修复):
+	//   - 末尾立即调 ServerRefreshAllBattleAIEntries → 重写 ReplicatedBattleAIEntries
+	//   - bIsAttacker = (AICFactionTag == Offense()) → 现在 CachedFactionTag=Defense → bIsAttacker=false
+	//   - 客户端 GetBattleAIEntries(Defense) 拿到这个 AI → VB_DefenderTeam ✓
+	//   - 镜像 SpawnAIInternal line 2707 的"AI 列表立即刷新"语义
+	//
+	// 不破坏刀战模式 (大厂原则 — 零耦合):
+	//   - 刀战模式不调 RestartZombieRoundPlayers → 永远不刷新 → 刀战逻辑零影响
+	if (UWorld* LocalWorld2 = GetWorld())
+	{
+		if (ARoomGameState* RoomGS2 = LocalWorld2->GetGameState<ARoomGameState>())
+		{
+			// 【v229.x 修复】全量刷新 — 写入所有 AI 的新 CachedFactionTag (Defense)
+			RoomGS2->ServerRefreshAllBattleAIEntries();
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[Spawn] 【v229.x 修复】RestartZombieRoundPlayers: 已刷新 ReplicatedBattleAIEntries. "
+				     "Tab Scoreboard 将立即把'曾当过母体的 AI'显示在 VB_DefenderTeam (而不是 VB_AttackerTeam)."));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] 【v229.x 修复】RestartZombieRoundPlayers: GameState 不是 ARoomGameState, "
+				     "无法刷新 ReplicatedBattleAIEntries. Tab Scoreboard 仍可能显示在错误阵营. "
+				     "【修复】检查 GM_RoomGameMode.GameStateClass=ARoomGameState."));
+		}
+	}
 
 	// ==========================================
 	// 【v210 大厂架构新增】延迟弹药重置 - 确保武器完全 Attach 后再推送 RPC
@@ -4817,9 +4906,17 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 		}
 
 		// (3) 写 BaseAIController.CachedFactionTag (AI 路径真理源) — 防止 RequestRespawn 又读 Defense
+		//
+		// 【v229.x 修复 — Bug 2 真根因】传 bForce=true:
+		//   - 母体变异 = 跨阵营反转 (Defense → Offense)
+		//   - 否则单次决策会拦截: CachedFactionTag=Defense (已设), NewTag=Offense (新) → bSameValue=false → 拒绝覆盖
+		//   - 结果: CachedFactionTag 永远是 Defense → ServerRefreshBattleAIEntries 读 bIsAttacker=false
+		//           → Tab Scoreboard 的 VB_AttackerTeam 不显示母体
+		//   - 强制覆盖是业务反转的合法需求, 与单次决策的"防回滚"目标不冲突
+		//     (单次决策防的是 Spawn 路径错误回滚, 不是防母体变异业务反转)
 		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(Controller))
 		{
-			BaseAIC->SetCachedFactionTag(MotherFactionTag); // 单一公开 API, 不写 Controller 私有字段
+			BaseAIC->SetCachedFactionTag(MotherFactionTag, /*bForce=*/true); // 母体变异 = 业务反转, 必须强制
 		}
 
 		UE_LOG(LogTemp, Display,
@@ -5181,6 +5278,53 @@ bool URoomSpawnSubsystem::MutatePawnToMother(AController* Controller, const FStr
 
 	// 【v201.6 大厂架构新增】播放母体出生音效
 	NewMotherPawn->Multicast_PlaySpawnSound();
+
+	// ===== 【v229.x 修复】刷新 ReplicatedBattleAIEntries — 让 Tab Scoreboard 立即看到母体 =====
+	//
+	// 根因 (用户 2026.08.16 反馈):
+	//   "现在ai或者玩家变成母体后没进入VB_AttackerTeam容器里"
+	//
+	// 触发链 (AI 母体路径):
+	//   1. AIC 早就在 ReplicatedBattleAIEntries 里 (SpawnAIInternal 时已写入)
+	//   2. ReplicatedBattleAIEntries 里这个 AIC 的 bIsAttacker = false (变异前 = Defense)
+	//   3. Step 5.5 写 AIC.CachedFactionTag = Offense → 客户端 AIC.CachedFactionTag 已 Replicated 同步
+	//   4. **但是 ReplicatedBattleAIEntries 里旧 bIsAttacker=false 没变**
+	//   5. 客户端 GetBattleAIEntries(Offense) 读 ReplicatedBattleAIEntries → 按 bIsAttacker 过滤
+	//      → FilterByPredicate(FactionTagName == Offense.ToString()) 看似按 FactionTagName,
+	//      实际写入时 Entry.FactionTagName = "Faction.Defense" (旧值) → 过滤后空 → Tab 不显示母体
+	//   6. 真人母体路径: PS.CurrentFactionTag=Offense (Step 5.5 同步写),GetPlayersInFaction(Offense)
+	//      应该能找到 — 但 ScoreboardWidget 读 真人 + AI 两个数据源,AI 数据源缺失 → 总快照缺母体
+	//
+	// 大厂原则 — 单一真理源 + 集中调度:
+	//   - MutatePawnToMother = 母体 Pawn 创建唯一入口 → AI 列表立即刷新 = 同一职责
+	//   - 镜像 SpawnAIInternal line 2701-2707 的 ServerRefreshAllBattleAIEntries 调用
+	//   - 0 兜底: GameState 拿不到 → Log Error + 不静默继续 (不影响变异结果)
+	//   - 真人也覆盖: OnRep_CachedFactionTag 链路 + PS->CurrentFactionTag 双写,
+	//     但 ReplicatedBattleAIEntries 不区分真人/AI,这里只写 AI 部分
+	//
+	// 不破坏刀战模式 (大厂原则 — 零耦合):
+	//   - 刀战模式不调本函数 → 永远不刷新 → 刀战逻辑零影响
+	if (UWorld* LocalWorld = GetWorld())
+	{
+		if (ARoomGameState* RoomGS = LocalWorld->GetGameState<ARoomGameState>())
+		{
+			// 【v229.x 修复】全量刷新 — 写入所有阵营的 AI (包括刚变母体的 AI)
+			// 与 SpawnAIInternal 完全对称 (line 2707)
+			RoomGS->ServerRefreshAllBattleAIEntries();
+
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation] 【v229.x 修复】MutatePawnToMother: 已刷新 ReplicatedBattleAIEntries, "
+				     "Tab Scoreboard 将立即把母体显示在 VB_AttackerTeam. Pawn='%s'"),
+				*NewMotherPawn->GetName());
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[MotherMutation] 【v229.x 修复】MutatePawnToMother: GameState 不是 ARoomGameState, "
+				     "无法刷新 ReplicatedBattleAIEntries. Tab Scoreboard 将不显示母体. "
+				     "【修复】检查 GM_RoomGameMode 是否正确设置 GameStateClass=ARoomGameState."));
+		}
+	}
 
 	return true;
 }

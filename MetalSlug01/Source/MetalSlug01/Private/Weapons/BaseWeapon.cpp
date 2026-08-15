@@ -819,8 +819,10 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 			return;
 		}
 
-		// EKillMethod: AI 攻击不区分身体/头 (现阶段), 默认近战武器击杀
-		LastKillMethod = EKillMethod::MeleeWeapon;
+		// 【v229.x v6 大厂架构】KillMethod 由 ResolveKillMethod 统一推导
+		//   旧版硬编码 LastKillMethod = EKillMethod::MeleeWeapon → 主武器击杀也被错配成 Melee
+		//   新版走真理源 this->MeshType (DT_WeaponInfo.MeshType 写入, 已 Replicated)
+		LastKillMethod = ResolveKillMethod(BoneName);
 	}
 	else if (Damage > 0.0f)
 	{
@@ -838,12 +840,14 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 		{
 			FinalDamage = LightDamageBody;
 		}
-		LastKillMethod = EKillMethod::MeleeWeapon;
+		// 【v229.x v6】统一入口 — 不再硬编码 Melee
+		LastKillMethod = ResolveKillMethod(BoneName);
 	}
 	else if (bIsHeavy)
 	{
 		FinalDamage = HeavyDamage;
-		LastKillMethod = EKillMethod::MeleeWeapon;
+		// 【v229.x v6】统一入口 — 不再硬编码 Melee
+		LastKillMethod = ResolveKillMethod(BoneName);
 	}
 	else
 	{
@@ -851,13 +855,13 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 		if (BoneName == FName("head"))
 		{
 			FinalDamage = LightDamageHead;
-			LastKillMethod = EKillMethod::MeleeHeadshot;
 		}
 		else
 		{
 			FinalDamage = LightDamageBody;
-			LastKillMethod = EKillMethod::MeleeWeapon;
 		}
+		// 【v229.x v6】统一入口 — 不再硬编码 Melee (刀/枪按 MeshType 自动区分)
+		LastKillMethod = ResolveKillMethod(BoneName);
 	}
 
 	// 服务器执行伤害
@@ -1009,6 +1013,62 @@ bool ABaseWeapon::IsDissolving() const
 EWeaponMeshType ABaseWeapon::GetMeshType() const
 {
 	return MeshType;
+}
+
+
+/**
+ * ABaseWeapon::ResolveKillMethod — 【v229.x v6 大厂架构】KillMethod 单一真理源
+ *
+ * 根据 MeshType + BoneName 推导 EKillMethod:
+ *   - Melee + head       → MeleeHeadshot
+ *   - Melee + body       → MeleeWeapon
+ *   - Primary + head     → PrimaryHeadshot
+ *   - Primary + body     → PrimaryWeapon
+ *   - Secondary + head   → SecondaryHeadshot
+ *   - Secondary + body   → SecondaryWeapon
+ *   - None               → Log Error + 返回 MeleeWeapon (0 兜底 — 不静默)
+ *
+ * 大厂原则:
+ *   - 单一真理源: KillMethod 推导唯一入口, 旧版 Server_ReportHit 5 处重复赋值集中到这里
+ *   - 数据驱动: 真理源 = this->MeshType (DT_WeaponInfo.MeshType 写入, 已 Replicated)
+ *   - 0 兜底: MeshType==None → Log Error (强制修复 DT 配置) + 默认 MeleeWeapon
+ *
+ * @param BoneName 命中骨骼名 ("head" = 头, 其他/NAME_None = 身体)
+ * @return 推导出的 EKillMethod
+ */
+EKillMethod ABaseWeapon::ResolveKillMethod(FName BoneName) const
+{
+	// 是否爆头 (BoneName = "head" 视为头部; NAME_None/其他 = 身体)
+	const bool bIsHeadshot = (BoneName == FName("head"));
+
+	// 真理源 = this->MeshType (已 Replicated, DT_WeaponInfo.MeshType 写入)
+	const EWeaponMeshType WeaponMeshType = MeshType;
+
+	// 大厂原则 — switch 分支穷举所有合法 MeshType
+	switch (WeaponMeshType)
+	{
+	case EWeaponMeshType::Melee:
+		return bIsHeadshot ? EKillMethod::MeleeHeadshot : EKillMethod::MeleeWeapon;
+
+	case EWeaponMeshType::Primary:
+		return bIsHeadshot ? EKillMethod::PrimaryHeadshot : EKillMethod::PrimaryWeapon;
+
+	case EWeaponMeshType::Secondary:
+		return bIsHeadshot ? EKillMethod::SecondaryHeadshot : EKillMethod::SecondaryWeapon;
+
+	case EWeaponMeshType::None:
+	default:
+		// 0 兜底: 强制 Log Error, 不允许静默用默认
+		//   - MeshType=None 通常意味着 DT_WeaponInfo.MeshType 配错或武器没初始化
+		//   - 默认返回 MeleeWeapon 保证不崩, 但日志已显式告诉策划/程序去哪修
+		UE_LOG(LogTemp, Error,
+			TEXT("[ABaseWeapon::ResolveKillMethod] Weapon=%s MeshType=None (DT_WeaponInfo 未配 MeshType 或武器未初始化). ")
+			TEXT("【大厂 0 兜底】默认返回 MeleeWeapon, 但应修复 DT_WeaponInfo.MeshType 字段. BoneName=%s, bIsHeadshot=%d"),
+			*GetName(),
+			*BoneName.ToString(),
+			bIsHeadshot ? 1 : 0);
+		return EKillMethod::MeleeWeapon;
+	}
 }
 
 

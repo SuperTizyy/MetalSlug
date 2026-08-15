@@ -73,9 +73,20 @@ void UGameHUDWidget::NativeConstruct()
 	Super::NativeConstruct();
 
 	// 初始化击杀图标数据表
-	if (Widget_KillFeed && KillIconDataTable)
+	// 【v229.x v5 大厂 0 兜底】即使没配 KillIconDataTable, 也 Log Error 提示 (而不是静默)
+	if (Widget_KillFeed)
 	{
-		Widget_KillFeed->SetKillIconDataTable(KillIconDataTable);
+		if (KillIconDataTable)
+		{
+			Widget_KillFeed->SetKillIconDataTable(KillIconDataTable);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[GameHUDWidget] NativeConstruct: KillIconDataTable 未配置! ")
+				TEXT("【大厂 0 兜底】必须在 WBP_GameHUDWidget 详情面板 → GameHUD 分类 → ")
+				TEXT("Kill Icon DataTable 字段 配 DT_KillIconInfo. 否则所有击杀消息图标不会显示."));
+		}
 	}
 
 	// 初始化连杀图标数据表
@@ -886,7 +897,19 @@ void UGameHUDWidget::AddKillFeedMessage(const FString& KillerName, const FString
 {
 	if (Widget_KillFeed)
 	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[GameHUDWidget] AddKillFeedMessage: Killer=%s, Victim=%s, Method=%d, Widget_KillFeed 状态=%s"),
+			*KillerName, *VictimName, static_cast<int32>(KillMethod),
+			*GetNameSafe(Widget_KillFeed));
 		Widget_KillFeed->AddKillInfo(KillerName, VictimName, KillMethod);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[GameHUDWidget] AddKillFeedMessage: Widget_KillFeed 为空! ")
+			TEXT("Killer=%s, Victim=%s, Method=%d, 这条消息被丢弃。 ")
+			TEXT("【大厂 0 兜底】检查 WBP_GameHUDWidget 蓝图是否有名为 Widget_KillFeed 的 KillFeedWidget 子控件."),
+			*KillerName, *VictimName, static_cast<int32>(KillMethod));
 	}
 }
 

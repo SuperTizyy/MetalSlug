@@ -232,7 +232,10 @@ void ARoomPlayerState::AddKillScore()
 	if (HasAuthority())
 	{
 		RoomKills += 1;
-		RoomScore += KillScoreValue;
+		// 【v229.x 大厂架构】公式单一真理源: 击杀 +10 分 (FKdaScoring::KillScore)
+		//   旧 (v22-v228): RoomScore += KillScoreValue (= 20) → 与 UI 排名 10 分不一致
+		//   新 (v229.x): 委托 FKdaScoring 单一真理源 — 业务层 = UI 层 = 同一公式
+		RoomScore += FKdaScoring::ComputeStep(1, 0, 0);
 
 		// 【v208 P0 重构】删除 AddTeamKill 调用 — 上移到 PerformKillSettlement 集中调度
 		//   业务语义: GameState 的 AttackerKills/DefenderKills = 被击杀阵营累计击杀数
@@ -246,9 +249,11 @@ void ARoomPlayerState::AddKillScore()
 /**
  * AddAssistScore
  *
- * 服务器专用: 增加助攻得分（+1 助攻 +10 分）
+ * 服务器专用: 增加助攻得分（+1 助攻 +5 分）
  *
  * 【v202.0 大厂架构】RPC 链路审计: 依赖引擎自动 ReplicatedUsing, 不再手动 Broadcast
+ *
+ * 【v229.x 大厂架构】公式单一真理源: FKdaScoring::ComputeStep(0, 1, 0) = 5
  */
 void ARoomPlayerState::AddAssistScore()
 {
@@ -256,7 +261,8 @@ void ARoomPlayerState::AddAssistScore()
 	if (HasAuthority())
 	{
 		RoomAssists += 1;
-		RoomScore += AssistScoreValue;
+		// 【v229.x】单一真理源: 助攻 +5 分
+		RoomScore += FKdaScoring::ComputeStep(0, 1, 0);
 
 		// 【v202.0 大厂架构】删除冗余手动 Broadcast (理由见 AddKillScore 注释)
 	}
@@ -266,9 +272,16 @@ void ARoomPlayerState::AddAssistScore()
 /**
  * AddDeath
  *
- * 服务器专用: 增加死亡次数
+ * 服务器专用: 增加死亡次数 + 死亡扣分
  *
  * 【v202.0 大厂架构】RPC 链路审计: 依赖引擎自动 ReplicatedUsing, 不再手动 Broadcast
+ *
+ * 【v229.x 大厂架构】公式单一真理源:
+ *   - 旧 (v22-v228): RoomDeaths += 1 后, RoomScore 不变 (死亡扣分缺失)
+ *     → KDA 公式不完整 → 排名公式需要 UI 层独立用 K/D/A 重算
+ *   - 新 (v229.x): 死亡扣分由本函数统一累加 RoomScore
+ *     → 业务层 = UI 层 = 同一公式 (单一真理源)
+ *     → 用户规则 2026.08.16 确认: 死亡 -1 分
  */
 void ARoomPlayerState::AddDeath()
 {
@@ -276,6 +289,8 @@ void ARoomPlayerState::AddDeath()
 	if (HasAuthority())
 	{
 		RoomDeaths += 1;
+		// 【v229.x】单一真理源: 死亡 -1 分 (用户规则 2026.08.16)
+		RoomScore += FKdaScoring::ComputeStep(0, 0, 1);
 
 		// 【v202.0 大厂架构】删除冗余手动 Broadcast (理由见 AddKillScore 注释)
 	}

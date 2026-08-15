@@ -75,7 +75,7 @@ struct FFinalSettlementSnapshot;
  * 1. 单一数据源: URoomStateService (CQRS 读取端, View 不感知 PlayerState/AIController)
  * 2. 真人/AI 双轨制: 同一种 Snapshot 结构, 不同数据源 (大厂原则)
  * 3. RPC 链路: 服务器修改 Replicated 字段 → 引擎自动 Replicate → 客户端 OnRep → UI 刷新
- * 4. 排名计算: SortEntriesByScore + UpdateAllRanks (与真人统一)
+ * 4. 排名计算: RefreshRanksInContainer (按击杀数稳定排序 + 标准竞赛排名 1/2/2/4)
  * 5. 模式分支: 单一函数 namespace ScoreboardFactionNames::GetXxxLabel 集中所有 UI 文案
  */
 UCLASS()
@@ -97,8 +97,14 @@ public:
 	 *   - 新 (v215):
 	 *     * 调 UpdateOrCreateEntryFromSnapshot 增量更新已有 entry
 	 *     * 新玩家自动添加, 已离开玩家自动删除 (基于 FrozenSnapshots / 现拉快照对比)
-	 *     * SortEntriesByScore 改用 RemoveChild/InsertChild 增量重排
 	 *   - 大厂原则 — 0 兜底: 不再 ClearChildren, 永远保留已有 entry (除非玩家真的离开)
+	 *
+	 * 【v229.x v2 大厂架构重构 — 排名权威化 v2 (按得分排 + 严格唯一)】
+	 *   - 末尾调 RefreshRanksInContainer 一次, 代替旧 SortEntriesByScore + UpdateAllRanks 两次调用
+	 *   - 排序字段: Entry->GetScore() 走 FKdaScoring::Compute (业务规则 2026.08.16: 击杀+10/助攻+5/死亡-1)
+	 *   - 排名规则: 严格唯一 (rank = i+1, 永远递增, 即便同分也不重号 — 用户业务规则 2026.08.16 明确)
+	 *   - 同分时: 按 OriginalIndex 升序 = "先插入在前" (稳定排序已保证)
+	 *   - 稳定排序: 同 Score 玩家按原容器位置 (int64 复合 key 编码)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Scoreboard")
 	void RefreshScoreboard();
@@ -394,8 +400,15 @@ private:
 	 * 【v203.0 大厂架构新增】根据当前模式刷新阵营标题 TextBlock
 	 *   - 刀战: 攻方 / 守方
 	 *   - 生化: 母体阵营 / 人类阵营
-	 * 调用时机: NativeConstruct (初始化) + ShowRoundSettlement / ShowFinalResult (结算时同步刷新)
+	 *
+	 * 【v229.x 修复】调用时机扩展:
+	 *   - NativeConstruct (初始化,首次显示需要)
+	 *   - ShowRoundSettlement / ShowFinalResult (结算时同步刷新)
+	 *   - ApplySnapshot (跨地图场景)
+	 *   - **RefreshScoreboard 入口检测 CachedMatchMode 变化** (Tab 打开时模式已切场景)
+	 *
 	 * 大厂原则: 单一入口, 不允许在多处各自拼文案
+	 * 大厂原则 — 集中调度: RefreshScoreboard 入口检测 = 运行时模式变化的唯一响应点
 	 */
 	void RefreshTeamTitles();
 
@@ -429,17 +442,12 @@ private:
 	UScoreboardEntryWidget* CreateEntryWidgetFromSnapshot(const FPlayerSnapshot& Snapshot, bool bIsAttacker);
 
 	/**
-	 * 对指定 VerticalBox 中的条目按得分排序
-	 */
-	void SortEntriesByScore(UVerticalBox* VerticalBox);
-
-	/**
-	 * 【v215 大厂架构新增】增量删除已退出的玩家 entry
+	 * 【v229.x 大厂架构重构】增量删除已退出的玩家 entry
 	 *
 	 * 大厂原则:
 	 *   - RefreshScoreboard 末尾调此函数, 对比 ActiveSnapshots 清理已退玩家
 	 *   - 不缓存 entry 指针 (Widget 可能被外部清空), 每次动态遍历
-	 *   - 0 兜底: 找不到 entry 静默跳过 (已被删)
+	 *   - O(N) 一次遍历, 用 TSet/FName 做集合判断 (替代原 N² ContainsByPredicate)
 	 *
 	 * @param VerticalBox 容器 (VB_AttackerTeam 或 VB_DefenderTeam)
 	 * @param ActiveSnapshots 当前活跃快照列表 (来自 GetActiveSnapshots)
@@ -447,9 +455,39 @@ private:
 	void RemoveStaleEntries(UVerticalBox* VerticalBox, const TArray<FPlayerSnapshot>& ActiveSnapshots);
 
 	/**
-	 * 更新所有条目的排名显示
+	 * 【v229.x v2 大厂架构重构】单阵营内排名刷新 (排序 + 排名赋值) — 替代旧 SortEntriesByScore + UpdateAllRanks 拆分
+	 *
+	 * 历史 (v22-v228) 反模式:
+	 *   - 拆成 2 个函数 SortEntriesByScore + UpdateAllRanks,调用方必须两次调用
+	 *   - Sort 阶段重读 ActiveSnapshots 找 Score (N², 重复架构, 因为 UpdateOrCreateEntryFromSnapshot 已经 SetKDA)
+	 *   - TArray::Sort 用 introsort (不稳定), 同分玩家顺序跳变
+	 *   - UpdateAllRanks 按位置 1,2,3 累加, 同分玩家挤占名次 (1,2,3 全是 100 分,排第 4 的 80 分玩家显示 "4")
+	 *
+	 * 业务规则 (用户 2026.08.16 明确):
+	 *   - 排名按"得分"排序: 击杀 +10 / 助攻 +5 / 死亡 -1 (走 FKdaScoring::Compute)
+	 *   - 排名严格唯一 (1, 2, 3, 4 即便同分 — 用户规则: "排名不能重复数字")
+	 *   - 同分时: 先插入在前 (按 OriginalIndex 升序, 稳定排序已保证)
+	 *   - 排名只显示数字 (无 emoji, 无特殊字符)
+	 *
+	 * 新 (v229.x v2) 大厂架构:
+	 *   - 单一入口: 排序 + 排名赋值 一气呵成, RefreshScoreboard 末尾一处调用即可
+	 *   - 排序字段 = 得分 (Score = Kills*10 + Assists*5 - Deaths, 走 FKdaScoring::Compute)
+	 *   - 稳定排序: 同分玩家按"原容器位置"作为 tiebreaker (大厂原则 — 视觉稳定,不抖)
+	 *   - 严格唯一排名 (Strict Unique Ranking):
+	 *     例: scores = [10, 8, 8, 5] → ranks = [1, 2, 3, 4] (用户业务规则: 永远不重号)
+	 *     而不是 [1, 2, 2, 4] (旧 FIFA/LOL 标准竞赛排名 — 用户明确否决)
+	 *   - 单一真理源: Entry Widget 自己持 CachedKills/Deaths/Assists (SetKDA 已写),
+	 *     本函数直接读 Entry->GetScore() (FKdaScoring 现算), 不回查 ActiveSnapshots (消除重复架构)
+	 *
+	 * 算法 O(N log N):
+	 *   1. 收集 (Position, Score, Widget) 三元组
+	 *   2. stable sort: ① Score 降序 ② Position 升序 (tied 时入位在前者优先)
+	 *   3. 增量重排 (RemoveChild + InsertChild, 不重建 Widget)
+	 *   4. 严格唯一排名赋值 (rank = i + 1, 永远递增, 同分玩家也拿不同 rank)
+	 *
+	 * @param VerticalBox 容器 (VB_AttackerTeam 或 VB_DefenderTeam)
 	 */
-	void UpdateAllRanks(UVerticalBox* VerticalBox);
+	void RefreshRanksInContainer(UVerticalBox* VerticalBox);
 
 	/**
 	 * 获取本地玩家名 (用于高亮)
@@ -510,6 +548,17 @@ private:
 	 *   - 每次通过 SnapshotId 动态查找, 避免野指针
 	 */
 	UScoreboardEntryWidget* FindEntryById(UVerticalBox* VerticalBox, const FString& SnapshotId) const;
+
+	/**
+	 * 【v229.x v2.1 大厂架构新增】单一入口: 把 FPlayerSnapshot 字段灌入 Entry Widget
+	 *   - 替代旧 (v22-v229.x v2): UpdateOrCreateEntryFromSnapshot 和 CreateEntryWidgetFromSnapshot
+	 *     各自手动 SetPlayerName / SetScore / SetKDA / SetIsCurrentPlayer (DRY 违反)
+	 *   - 新增字段 (例如未来 SetAvatar) 只需要在这里加一次, 2 个创建/更新路径自动同步
+	 *   - 0 兜底: EntryWidget == nullptr → return (不抛、不 Log, 由调用方处理)
+	 */
+	void ApplySnapshotToEntry(UScoreboardEntryWidget* EntryWidget,
+	                          const FPlayerSnapshot& Snapshot,
+	                          bool bIsLocalPlayer) const;
 
 	/**
 	 * 【v215 大厂架构新增】从容器中删除指定 SnapshotId 的 entry

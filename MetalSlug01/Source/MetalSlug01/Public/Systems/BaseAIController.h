@@ -24,6 +24,7 @@
 #include "Weapons/BaseWeapon.h"     // 【v54.4】GetDefaultWeaponClass 返回 TSoftClassPtr<ABaseWeapon> 需要完整类型
 // 【v202.1 修复】复用 FOnScoreboardDataChanged 类型 (ARoomPlayerState 已 DECLARE, 这里不再重复)
 #include "Systems/Core/RoomPlayerState.h"
+// 【v229.x 大厂架构】KDA 公式单一真理源 (RoomPlayerState 已 include,这里冗余保险)
 #include "BaseAIController.generated.h"
 
 // 前置声明
@@ -196,8 +197,23 @@ public:
 	UFUNCTION(BlueprintPure, Category = "AI|Spawn")
 	FGameplayTag GetCachedFactionTag() const { return CachedFactionTag; }
 
+	/**
+	 * 【v221.1 + v229.x 大厂架构】服务器设置 CachedFactionTag (单一真理源入口)
+	 *
+	 * @param InTag  阵营 Tag (Offense / Defense / 其他)
+	 * @param bForce 强制覆盖 (默认 false = 单次决策, 已设值不覆盖)
+	 *               - false: 单次决策语义, 防止 Spawn 路径错误覆盖母体变异
+	 *               - true:  强制覆盖, 用于业务反转场景 (母体变异 / 母体变人类)
+	 *
+	 * 调用场景:
+	 *   - SpawnAIInternal (新 Spawn): bForce=false (单次决策, 默认)
+	 *   - 关卡预放 AI OnPossess: bForce=false
+	 *   - RequestRespawn: bForce=false (复活读 MotherFactionTag, 不覆盖)
+	 *   - MutatePawnToMother (母体变异): bForce=true (跨阵营修改 Offense ← Defense = 业务反转)
+	 *   - RestartZombieRoundPlayers (母体变人类): bForce=true (跨阵营修改 Defense ← Offense = 业务反转)
+	 */
 	UFUNCTION(BlueprintCallable, Category = "AI|Spawn")
-	void SetCachedFactionTag(const FGameplayTag& InTag);
+	void SetCachedFactionTag(const FGameplayTag& InTag, bool bForce = false);
 
 	/**
 	 * 【v221.1 大厂架构新增】CachedFactionTag 网络同步回调
@@ -492,13 +508,25 @@ public:
 	int32 AIAssists = 0;
 
 	/**
-	 * 【v202.0】AI 击杀分值常量 — 与 ARoomPlayerState::KillScoreValue 对称 (20)
-	 * 真理源: 数据驱动, ConfigSO 配 (本常量作为兜底默认值)
+	 * 【v229.x 大厂架构重构】AI 击杀/助攻/死亡分值常量 — 委托 FKdaScoring 单一真理源
 	 *
-	 * 大厂原则: AI 分数计算与玩家一致, 计分板排序统一
+	 * 旧 (v22-v228): 本类硬编码 KillScoreValue=20 / AssistScoreValue=10
+	 *   - 与 UI 层规则 (10/5) 不一致 → 大厂反模式
+	 *   - 死亡不做操作 → 业务层缺失死亡扣分逻辑
+	 *
+	 * 新 (v229.x): 委托 FKdaScoring 单一真理源
+	 *   - 业务层 (Player + AI) = UI 层 = 同一公式 (10/5/-1)
+	 *   - 死亡 -1 分由 AddDeath 统一处理 (走 FKdaScoring::ComputeStep)
+	 *
+	 * 保留同名常量作为 deprecated alias:
+	 *   - 旧代码引用 KillScoreValue/AssistScoreValue 时仍能编译
+	 *   - 但已弃用 (v229.x 起), 业务新增代码必须直接用 FKdaScoring
 	 */
-	static constexpr int32 KillScoreValue = 20;
-	static constexpr int32 AssistScoreValue = 10;
+	[[deprecated("v229.x: 使用 FKdaScoring::KillScore / FKdaScoring::AssistScore")]]
+	static constexpr int32 KillScoreValue = FKdaScoring::KillScore;
+
+	[[deprecated("v229.x: 使用 FKdaScoring::AssistScore")]]
+	static constexpr int32 AssistScoreValue = FKdaScoring::AssistScore;
 
 	/**
 	 * 【v202.0】计分板数据变化通知 (客户端) — 镜像 ARoomPlayerState::OnRep_ScoreboardData
