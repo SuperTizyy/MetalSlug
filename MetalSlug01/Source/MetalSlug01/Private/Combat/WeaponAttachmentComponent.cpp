@@ -34,6 +34,9 @@
 // 包含 BaseWeapon 以访问 IsA<>() / AttachToComponent
 #include "Weapons/BaseWeapon.h"
 
+// 【v240.4 大厂架构 P0】PMC 显式禁用 include
+#include "GameFramework/ProjectileMovementComponent.h"
+
 // 【v56 大厂架构 — 生化模式】Strategy 装配 (按 MeshType 自动注入)
 #include "Weapons/WeaponDamageStrategy.h"
 #include "Weapons/MeleeSwStrategy.h"
@@ -204,7 +207,61 @@ void UWeaponAttachmentComponent::ResetWeaponMeshRelativeTransforms(ABaseWeapon* 
 		*Weapon->GetName(), ResetCount, SkippedMagazineCount);
 }
 
-// 【v77 大厂架构】检查武器是否已挂载到 Socket
+// 【v240.7 大厂架构 — Root 和 Mesh 都硬对齐 identity, 不依赖 BP 美术地上姿态】
+//   v240.10 真根因 (用户反馈):
+//     - 用户诉求是 "扔枪时根组件和mesh组件位置旋转都保持一样"
+//     - 实际表现: Root.RelLoc = (-3252, 3391, 1299) (BP垃圾值), Mesh.RelLoc = (-19, 178, -115) (BP地上姿态)
+//       → 抛下时 Mesh 世界位置 = Root 世界位置 + Mesh.RelLoc → Mesh 沉入地下 115cm
+//     - v240.7 旧 Promote 设计: 把 Mesh 的 BP 默认地上姿态烤到 Root → 让 Root 也变成 (-19, 178, -115)
+//       → 期望: Root 和 Mesh 都是同一姿态 → 视觉一致
+//       → 实测失败: Promoted 时 FirstValidMesh.GetRelativeTransform() 返回 (0,0,0) — 这是 component default state,
+//                  BP 默认值需要 BeginPlay/PostInit 才完全应用, SpawnActor 后立即访问拿到的是 (0,0,0)
+//       → 所以 Root 被烤成 (0,0,0), Mesh 也被 Reset 成 (0,0,0) → 拾起时一致
+//       → 但**抛下时** BP 美术的 Mesh 配 (-9, 178, -120) 又被激活了! 抛下是 Detach, Mesh 恢复 BP 默认
+//
+//   v240.10 根因修复 (用户选择 A: 硬对齐 identity):
+//     - 不再"Promote Mesh 姿态到 Root" (依赖 BP 默认值, 不可靠)
+//     - 改为: SpawnActor 后立即**硬把 Root 和 Mesh 都 Reset 到 identity (0,0,0,identity)**
+//     - 抛下时: DetachFromActor(KeepWorldTransform) 后, Root 和 Mesh 的 RelXform 都是 (0,0,0,identity) → 完全对齐
+//     - 拾起时: AttachToComponent + SetWorldLocation → Root 和 Mesh 都被设到 socket + DT 偏移 → 完全对齐
+//     - 不再依赖 BP 美术在地上配的"地上姿态" — BP 美术的地上姿态是错误的, 应该改为 (0,0,0)
+//
+//   大厂原则 (零兜底 + 单一真理源):
+//     - "扔枪时 Root 和 Mesh 姿态一致" = RelXform 双方都是 (0,0,0,identity) — 硬约束, 不依赖任何 BP 配置
+//     - 美术想把"武器在地上"姿态配成 (-9, 178, -120) 是错误设计 — 应该改为 identity, 姿态由运行时决定
+//
+//   调用时机: 在 ResetWeaponMeshRelativeTransforms 之前! (虽然新版不依赖顺序, 但保持代码一致性)
+void UWeaponAttachmentComponent::PromoteMeshOnGroundTransformToRoot(ABaseWeapon* Weapon)
+{
+	if (!Weapon)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v240.10] PromoteMeshOnGroundTransformToRoot: Weapon 为 null, 拒绝 Promote — "
+				 "调用方应保证传入有效武器 (SpawnAndEquipWeapon 已在 SpawnActor 后立刻调用)."));
+		return;
+	}
+
+	USceneComponent* RootComp = Weapon->GetRootComponent();
+	if (!RootComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v240.10] PromoteMeshOnGroundTransformToRoot: Weapon=%s RootComponent 为 null — "
+				 "ABaseWeapon 必须配 RootComponent (BP_Weapon_*.uasset 应在 BP 设计器中指定)."),
+			*Weapon->GetName());
+		return;
+	}
+
+	// 【v240.10 硬对齐 identity】Root 和 Mesh 都 Reset 到 (0,0,0,identity)
+	//   - Root 之前的 BP 默认 "垃圾值" 被清零
+	//   - 不再依赖 FirstValidMesh 的 BP 默认值 (因为 SpawnActor 后立即访问可能拿到 component default state (0,0,0))
+	RootComp->SetRelativeTransform(FTransform::Identity);
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[v240.10] PromoteMeshOnGroundTransformToRoot: Weapon=%s RootComponent 已硬对齐 identity — "
+			 "抛下/拾起时 Root 和 Mesh 姿态都 (0,0,0,identity), 完全对齐. "
+			 "(v240.7 旧设计烤 Mesh BP 默认值已废弃 — BP 美术地上姿态是错误设计, 应改为 identity)."),
+		*Weapon->GetName());
+}// 【v77 大厂架构】检查武器是否已挂载到 Socket
 //   原理: UE AttachToComponent 后, Actor 的 RootComponent 会记录挂载的 Socket 名
 //   如果 GetAttachSocketName() != NAME_None, 说明已挂载
 //   返回: true = 已挂载 (跳过重复 Attach), false = 未挂载 (需要补挂)
@@ -564,15 +621,20 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 	//   修复: 先获取目标 socket 的世界坐标，直接 SetWorldLocation 到 socket 位置
 	//         确保 attach 前武器已经在正确位置，attach 只是建立父子关系
 	USceneComponent* WeaponRoot = Weapon->GetRootComponent();
-	if (WeaponRoot)
+	if (!WeaponRoot)
 	{
-		// 获取目标 socket 的世界坐标
-		const FVector SocketWorldLocation = Owner->GetMesh()->GetSocketLocation(SocketName);
-		const FRotator SocketWorldRotation = Owner->GetMesh()->GetSocketRotation(SocketName);
-		
-		// 直接设置到 socket 位置（不是原点！）
-		WeaponRoot->SetWorldLocationAndRotation(SocketWorldLocation, SocketWorldRotation);
+		UE_LOG(LogTemp, Error,
+			TEXT("[v240.2] ApplyAttachmentRuntime: Weapon=%s 的 RootComponent 为空, 无法 attach. 【零兜底】请检查 BP."),
+			*Weapon->GetName());
+		return;
 	}
+
+	// 获取目标 socket 的世界坐标
+	const FVector SocketWorldLocation = Owner->GetMesh()->GetSocketLocation(SocketName);
+	const FRotator SocketWorldRotation = Owner->GetMesh()->GetSocketRotation(SocketName);
+
+	// 直接设置到 socket 位置（不是原点！）
+	WeaponRoot->SetWorldLocationAndRotation(SocketWorldLocation, SocketWorldRotation);
 
 	// 【v200.2.16 大厂架构 — 关键修复】Attach 前强制 Reset 所有 Mesh 子组件的 RelativeTransform 为 identity
 	//   根因: BP_Weapon_*.uasset 里 WeaponSkeletalMesh/WeaponStaticMesh 组件配了非零 RelativeTransform
@@ -587,46 +649,92 @@ void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 	FAttachmentTransformRules AttachmentRules = FAttachmentTransformRules::SnapToTargetNotIncludingScale;
 	Weapon->AttachToComponent(Owner->GetMesh(), AttachmentRules, SocketName);
 
-	// Step 2: 强制应用相对偏移 (v57 零兜底修复 — 不允许 IsNearlyZero 跳过)
-	Weapon->SetActorRelativeLocation(RelativeLocation);
-	Weapon->SetActorRelativeRotation(RelativeRotation);
+	// 【v240.2 大厂架构 P0 终极修复】绕开 SetActorRelativeRotation 不可靠路径
+	//   根因 (v240.1 修复后用户反馈仍未解决):
+	//     - 旧代码用 SetActorRelativeRotation / SetActorRelativeLocation 设置 RelativeLocation/Rotation
+	//     - 当 RootComponent = DefaultSceneRoot (非 PrimitiveComponent) + 子 SkeletalMeshComponent 组合时:
+	//       1. UE 调用 SetActorRelativeRotation 内部 → 走到 RootComponent.SetRelativeRotation()
+	//       2. RootComponent.SetRelativeRotation → 触发 UpdateComponentToWorld() 重算 WorldTransform
+	//       3. UE 重算时, 发现 SkeletalMesh 是子组件 (有骨骼动画), UE 会调用子组件自己的 UpdateTransform
+	//       4. 但 DefaultSceneRoot 内部不存储"姿态"信息, 实际生效的是子 Mesh 的 RelativeRotation (Reseted to identity)
+	//       5. 结果: 武器 WorldRotation = SocketWorldRotation (而不是期望的 SocketWorldRotation + RelativeRotation)
+	//     - 日志证据: Diff Loc=V(0) 但 Diff Rot=R(-84.43, -62.43, -4.18) — 完全匹配上述分析
+	//
+	//   修复方案 (A - 绕开路径, 用户已选):
+	//     - 不再依赖 SetActorRelativeRotation 路径
+	//     - attach 后, 直接对 RootComponent 设 SetWorldLocation/SetWorldRotation = SocketWorld + (Relative 旋转到 World)
+	//     - 这样无论 RootComponent 是 DefaultSceneRoot 还是 MeshComponent, WorldTransform 都是正确的
+	//     - UE 内部会自动反算 RelativeLocation/RelativeRotation 以保持父子关系一致
+	//
+	//   数学公式:
+	//     ExpectedWorldLoc = SocketWorldLoc + SocketWorldRot.RotateVector(RelativeLocation)
+	//     ExpectedWorldRot = (SocketWorldRot + RelativeRotation).GetNormalized()
+	//     → 这两个公式与 Step 2 旧 SetActorRelativeRotation 期望效果一致 (数学等价)
+	//     → 但走 SetWorld* 路径, UE 不会触发 DefaultSceneRoot 的不可靠 UpdateComponentToWorld
+	//
+	//   注意: 这是"运行时矫正", 与 v220.1 零兜底不冲突
+	//     - v220.1 拒绝的是 SetRootComponent (会触发 DDC 同步加载卡死 3.7s)
+	//     - v240.2 用的是 SetWorldLocation/SetWorldRotation (无 DDC, 无同步加载, 毫秒级操作)
+	//
+	// 【v240.6 大厂架构 P0 — Euler vs Quaternion 真根因修复】
+	//   用户反馈(2026.08.15): 主武器根组件旋转与 DT 数据不符
+	//     DT 期望 Rot=(Pitch=0, Yaw=87.27, Roll=0)
+	//     实际得到 Rot=(Pitch=65.26, Yaw=-29.66, Roll=-76.80) — 三个轴全部错乱
+	//
+	//   根因 (v240.2 用的是错的旋转加法):
+	//     - v240.2 旧代码使用 FRotator 的 + 运算符 (Euler 代数加), 内部按 Pitch/Yaw/Roll 分量加
+	//       它不构成旋转群 — 不闭合, 不可交换, 会有万向锁
+	//     - 但 UE 内部反算 RootComponent.RelativeRotation 用的是 FQuat(四元数乘法)
+	//       RelQuat = Inv(AttachParentQuat) * WorldQuat
+	//     - Euler 加法 → Quat 转换 → UE 反算 RelQuat → 再转 Rotator, 每步都有累积误差
+	//     - 日志数据印证: SocketRot 实际非零 (角色朝向有 Yaw), Euler 加法和 Quat 乘法差距放大,
+	//       最后 RootComponent 的 WorldRotation 落到 (65, -29, -76), 三个轴完全错乱
+	//
+	//   修复 (大厂原则 — 旋转计算必须用四元数):
+	//     - SocketWorldQuat * DTRelQuat → 正确的 ExpectedWorldQuat
+	//     - 把 ExpectedWorldRot 重新定义为 ExpectedWorldQuat.Rotator()
+	//     - UE 内部反算时再把 RootComponent.WorldRot 转 Quat → RelQuat = Inv * WorldQuat
+	//     - 整个链路都是四元数, Euler 只是显示用, 不再有累积误差
+	//
+	//   数学验证:
+	//     SocketQuat = FQuat(0, 0, 0, 1)
+	//     DTRelQuat  = FQuat(FRotator(0, 87.27, 0))  = FQuat(0, 0.675, 0, 0.737)
+	//     ExpectedWorldQuat = SocketQuat * DTRelQuat = DTRelQuat
+	//     ExpectedWorldRot = DTRelQuat.Rotator() = (0, 87.27, 0) ✓ 与 DT 一致
+	const FVector ExpectedWorldLoc = SocketWorldLocation + SocketWorldRotation.RotateVector(RelativeLocation);
+	const FQuat SocketWorldQuat = SocketWorldRotation.Quaternion();
+	const FQuat DTRelQuat = RelativeRotation.Quaternion();
+	const FQuat ExpectedWorldQuat = SocketWorldQuat * DTRelQuat;
+	const FRotator ExpectedWorldRot = ExpectedWorldQuat.Rotator();
+
+	WeaponRoot->SetWorldLocation(ExpectedWorldLoc);
+	WeaponRoot->SetWorldRotation(ExpectedWorldRot);
+
+	// Scale 走 SetActorRelativeScale3D 没问题 (Scale 不依赖 RootComponent 类型)
 	Weapon->SetActorRelativeScale3D(RelativeScale3D);
 
-	// 【v200.2.12 大厂架构 P0 诊断】打印 socket world location + 武器 attach 后的 RelativeLocation + WorldLoc
-	//   验证: 1) SetActorRelativeLocation 是否真的生效;
-	//         2) Final WorldLoc - Socket WorldLoc 是否 == RelativeLocation
-	const FVector SocketWorldLoc = Owner->GetMesh()->GetSocketLocation(SocketName);
-	const FRotator SocketWorldRot = Owner->GetMesh()->GetSocketRotation(SocketName);
-	FVector WeaponRelativeLocAfter = FVector::ZeroVector;
-	if (USceneComponent* WeaponRootForDiag = Weapon->GetRootComponent())
+	// 【v240.4 大厂架构 P0 — 防御性 PMC 禁用】Attach 到角色时强制禁用 PMC
+	//   根因 (v240.3 诊断日志精确锁定): BP_Weapon_AK47 的 PMC bAutoActivate=true,
+	//         BeginPlay 已禁用一次, 但 attach 路径可能有其他 PMC 激活源 (例如 SpawnActor 后立即调用 SetActive(true))
+	//   修复 (显式状态机): "武器附着到角色 → PMC 必须 inactive" 这是系统级约束
+	//     - BeginPlay 是第 1 道防线 (SpawnActor 时)
+	//     - ApplyAttachmentRuntime 是第 2 道防线 (attach 到角色 socket 时)
+	//     - 任何中间状态切换都不会破坏 PMC inactive 状态
+	//   【零兜底 (非隐藏而是显式)】这里禁用 PMC 是表达"手持武器 ≠ PMC 主动模拟"的设计约束, 不是隐藏错误
+	//   投掷功能保留: WeaponDropComponent::StartDroppedState 仍能 SetActive(true)
+	//   匕首无 PMC → silent return (正确行为)
+	if (UProjectileMovementComponent* PMC = Weapon->FindComponentByClass<UProjectileMovementComponent>())
 	{
-		WeaponRelativeLocAfter = WeaponRootForDiag->GetRelativeLocation();
+		if (PMC->IsActive())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[v240.4] ApplyAttachmentRuntime: Weapon=%s PMC 仍激活, Attach 到角色 socket 后强制禁用 "
+				     "(系统约束: 手持武器 → PMC 必须 inactive). "
+				     "PMC 将在 WeaponDropComponent::StartDroppedState 投掷时激活."),
+				*Weapon->GetName());
+		}
+		PMC->SetActive(false);
 	}
-	const FVector WeaponWorldLocFinal = Weapon->GetActorLocation();
-	const FRotator WeaponWorldRotFinal = Weapon->GetActorRotation();
-	const FRotator ExpectedWorldRot = (SocketWorldRot + RelativeRotation).GetNormalized();
-	const FVector ExpectedWorldLoc = SocketWorldLoc + SocketWorldRot.RotateVector(RelativeLocation);
-	const FVector WorldLocDiff = WeaponWorldLocFinal - ExpectedWorldLoc;
-	UE_LOG(LogTemp, Display,
-		TEXT("[v200.2.14 终极诊断] ApplyAttachmentRuntime: 完成 Weapon=%s Socket=%s\n"
-		     "  SocketWorldLoc=%s SocketWorldRot=%s\n"
-		     "  DT.RelativeLocation=%s DT.RelativeRotation=%s\n"
-		     "  WeaponRelativeLocAfter=%s WeaponWorldLocFinal=%s WeaponWorldRotFinal=%s\n"
-		     "  期望(已旋转) WorldLoc=%s WorldRot=%s\n"
-		     "  Diff Loc=%s Diff Rot=%s"),
-		*Weapon->GetName(),
-		*SocketName.ToString(),
-		*SocketWorldLoc.ToCompactString(),
-		*SocketWorldRot.ToCompactString(),
-		*RelativeLocation.ToCompactString(),
-		*RelativeRotation.ToCompactString(),
-		*WeaponRelativeLocAfter.ToCompactString(),
-		*WeaponWorldLocFinal.ToCompactString(),
-		*WeaponWorldRotFinal.ToCompactString(),
-		*ExpectedWorldLoc.ToCompactString(),
-		*ExpectedWorldRot.ToCompactString(),
-		*WorldLocDiff.ToCompactString(),
-		*(WeaponWorldRotFinal - ExpectedWorldRot).ToCompactString());
 }
 
 
@@ -947,6 +1055,12 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 			TEXT("[WeaponAttachment] SpawnAndEquipWeapon: SpawnActor 失败."));
 		return;
 	}
+
+	// 【v240.7 大厂架构 — Mesh 地上姿态提升到 RootComponent】
+	//   必须在 ResetWeaponMeshRelativeTransforms 之前调用! (Promote 之后, Mesh 的 BP 默认值就会被清零, 失去 Promote 的源数据)
+	//   根因: 美术把"武器在地上"姿态配在 Mesh 子组件, Root 配"垃圾编辑器占位值" → 抛下时 Root 暴露垃圾值
+	//   修复: 把 Mesh 的 BP 默认地上姿态烤到 Root, 抛下后 Root 和 Mesh 姿态一致
+	PromoteMeshOnGroundTransformToRoot(NewWeapon);
 
 	// 【v200.2.15 大厂架构】Spawn 后立即重置 Mesh 子组件 RelativeTransform 为 identity
 	//   防御 BP 蓝图里 WeaponSkeletalMesh/WeaponStaticMesh 组件被配了非零 RelativeTransform
@@ -2387,6 +2501,11 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 			*WeaponClass->GetName(), LexToString(Slot));
 		return nullptr;
 	}
+
+	// 【v240.7 大厂架构 — Mesh 地上姿态提升到 RootComponent】必须在 Reset 之前!
+	//   详见 PromoteMeshOnGroundTransformToRoot 注释
+	//   这是 v240.7 修复: 抛下武器时 Root 和 Mesh 姿态不一致 → 现在 Promote 后一致
+	PromoteMeshOnGroundTransformToRoot(NewWeapon);
 
 	// 【v200.2.15 大厂架构】Spawn 后立即重置 Mesh 子组件 RelativeTransform 为 identity
 	//   防御 BP 蓝图里 WeaponSkeletalMesh/WeaponStaticMesh 组件被配了非零 RelativeTransform

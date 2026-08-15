@@ -3920,26 +3920,26 @@ Owner->SetLifeSpan(0.1f);
 ---
 
 
-## 21. v206 (2026.08.07) KDA ÀÛ¼ÓÍ³Ò»Èë¿Ú ¡ª Íæ¼Ò/AI Ë«¹ìÖÆ
+## 21. v206 (2026.08.07) KDA ï¿½Û¼ï¿½Í³Ò»ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½/AI Ë«ï¿½ï¿½ï¿½ï¿½
 
-### ÒµÎñ±³¾° (ÓÃ»§ 2026.08.07 ·´À¡)
->  Ö»Ê£Ò»¸öÎÊÌâ Íæ¼ÒÊÇÈËÀà»÷É±ÁË AI Ä¸Ìå ±»»÷É±µÄ AI Ä¸ÌåµÄÐÅÏ¢Àï Text_KDA Ã»ÏÔÊ¾ËÀÍöÊý +1
+### Òµï¿½ñ±³¾ï¿½ (ï¿½Ã»ï¿½ 2026.08.07 ï¿½ï¿½ï¿½ï¿½)
+>  Ö»Ê£Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É±ï¿½ï¿½ AI Ä¸ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½É±ï¿½ï¿½ AI Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½ Text_KDA Ã»ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ +1
 
-### ¸ùÒò (Layer 1 ¡ª KDA ÀÛ¼ÓÎÞÍ³Ò»Èë¿Ú)
+### ï¿½ï¿½ï¿½ï¿½ (Layer 1 ï¿½ï¿½ KDA ï¿½Û¼ï¿½ï¿½ï¿½Í³Ò»ï¿½ï¿½ï¿½)
 
-CombatDeathComponent::PerformKillSettlement Èý¸öÂ·¾¶ (Killer »÷É±·Ö/Victim ËÀÍö·Ö/Assistant Öú¹¥·Ö) È«²¿ÓÃÍ¬Ò»¸ö·´Ä£Ê½:
+CombatDeathComponent::PerformKillSettlement ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½ (Killer ï¿½ï¿½É±ï¿½ï¿½/Victim ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½/Assistant ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½) È«ï¿½ï¿½ï¿½ï¿½Í¬Ò»ï¿½ï¿½ï¿½ï¿½Ä£Ê½:
 
 `cpp
 if (ARoomPlayerState* PS = Victim->GetRoomPlayerState())
 {
- PS->AddDeath(); // ¡û Ö»ÓÐÍæ¼Ò×ßÕâÌõÂ·
+ PS->AddDeath(); // ï¿½ï¿½ Ö»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â·
 }
-// else: ¾²Ä¬Ìø¹ý (AI Ã» PS ¡ú AIDeaths ÓÀÔ¶ 0)
+// else: ï¿½ï¿½Ä¬ï¿½ï¿½ï¿½ï¿½ (AI Ã» PS ï¿½ï¿½ AIDeaths ï¿½ï¿½Ô¶ 0)
 `
 
-### ÐÞ¸´·½°¸ (v206 ¡ª ´ó³§¼Ü¹¹ ¡ª µ¥Ò»ÕæÀíÔ´ + Íæ¼Ò/AI Ë«¹ìÖÆ)
+### ï¿½Þ¸ï¿½ï¿½ï¿½ï¿½ï¿½ (v206 ï¿½ï¿½ ï¿½ó³§¼Ü¹ï¿½ ï¿½ï¿½ ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ô´ + ï¿½ï¿½ï¿½/AI Ë«ï¿½ï¿½ï¿½ï¿½)
 
-ÐÂÔö 3 ¸ö¾²Ì¬ helper µ½ ABaseCharacter:
+ï¿½ï¿½ï¿½ï¿½ 3 ï¿½ï¿½ï¿½ï¿½Ì¬ helper ï¿½ï¿½ ABaseCharacter:
 
 `cpp
 // Public/Characters/BaseCharacter.h
@@ -3948,7 +3948,7 @@ static bool ApplyKillScore(ABaseCharacter* Killer);
 static bool ApplyAssistScore(ABaseCharacter* Assistant);
 `
 
-ÊµÏÖÂß¼­ (Í³Ò»·â×°Íæ¼Ò/AI Ë«¹ìÖÆ):
+Êµï¿½ï¿½ï¿½ß¼ï¿½ (Í³Ò»ï¿½ï¿½×°ï¿½ï¿½ï¿½/AI Ë«ï¿½ï¿½ï¿½ï¿½):
 
 `cpp
 bool ABaseCharacter::ApplyDeathScore(ABaseCharacter* Victim)
@@ -3964,135 +3964,256 @@ bool ABaseCharacter::ApplyDeathScore(ABaseCharacter* Victim)
 
  if (ABaseAIController* AIC = Cast<ABaseAIController>(Victim->GetController()))
  {
- AIC->AddDeath(); // ¡û ¹Ø¼ü: AI Â·¾¶´òÍ¨
+ AIC->AddDeath(); // ï¿½ï¿½ ï¿½Ø¼ï¿½: AI Â·ï¿½ï¿½ï¿½ï¿½Í¨
  return true;
  }
 
- // Áã¶µµ×: ¼È²»ÊÇÍæ¼ÒÒ²²»ÊÇ AI ¡ª ÅäÖÃ´íÎó
- UE_LOG(LogTemp, Error, TEXT(¼ÈÎÞ PS Ò²ÎÞ AIC. ÐÞ¸´: ¼ì²é BP Pawn ÅäÖÃ.));
+ // ï¿½ã¶µï¿½ï¿½: ï¿½È²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò²ï¿½ï¿½ï¿½ï¿½ AI ï¿½ï¿½ ï¿½ï¿½ï¿½Ã´ï¿½ï¿½ï¿½
+ UE_LOG(LogTemp, Error, TEXT(ï¿½ï¿½ï¿½ï¿½ PS Ò²ï¿½ï¿½ AIC. ï¿½Þ¸ï¿½: ï¿½ï¿½ï¿½ BP Pawn ï¿½ï¿½ï¿½ï¿½.));
  return false;
 }
 `
 
-### ¸Ä¶¯Çåµ¥ (v206)
+### ï¿½Ä¶ï¿½ï¿½åµ¥ (v206)
 
 `
 ~ MetalSlug01/Source/MetalSlug01/Public/Characters/BaseCharacter.h
- + 3 ¸ö¾²Ì¬·½·¨ÉùÃ÷ (ApplyDeathScore/ApplyKillScore/ApplyAssistScore)
- + ´ó¶Î×¢ÊÍ½âÊÍ v22-v202 ÀúÊ· bug ºÍ´ó³§Ô­ÔòÂäµØ
+ + 3 ï¿½ï¿½ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ApplyDeathScore/ApplyKillScore/ApplyAssistScore)
+ + ï¿½ï¿½ï¿½×¢ï¿½Í½ï¿½ï¿½ï¿½ v22-v202 ï¿½ï¿½Ê· bug ï¿½Í´ï¿½Ô­ï¿½ï¿½ï¿½ï¿½ï¿½
 
 ~ MetalSlug01/Source/MetalSlug01/Private/Characters/BaseCharacter.cpp
- + 3 ¸ö¾²Ì¬·½·¨ÊµÏÖ (Íæ¼Ò/AI Ë«¹ìÖÆ)
- ~ GrantAssistsToEligiblePlayers ¸ÄÓÃ ApplyAssistScore (Ïû³ý·´Ä£Ê½)
- ~ VictimName/AssistantName ¸ÄÓÃË«¹ìÖÆ (Ïû³ý·´Ä£Ê½: AI ÓÀÔ¶ÏÔÊ¾ Unknown)
+ + 3 ï¿½ï¿½ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ (ï¿½ï¿½ï¿½/AI Ë«ï¿½ï¿½ï¿½ï¿½)
+ ~ GrantAssistsToEligiblePlayers ï¿½ï¿½ï¿½ï¿½ ApplyAssistScore (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£Ê½)
+ ~ VictimName/AssistantName ï¿½ï¿½ï¿½ï¿½Ë«ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£Ê½: AI ï¿½ï¿½Ô¶ï¿½ï¿½Ê¾ Unknown)
 
 ~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
- ~ PerformKillSettlement Killer Â·¾¶: ApplyKillScore
- ~ PerformKillSettlement Victim Â·¾¶: ApplyDeathScore
- ~ KillerName ¸ÄÓÃË«¹ìÖÆ
- ~ É¾³ýÎóµ¼ÈÕÖ¾ ËÀÍö¼ÆÊýÎÞ·¨ÀÛ¼Ó
- ~ AI Killer ÎÞ PS ´íÎóÈÕÖ¾ ¡ú Verbose (ÊÇÔ¤ÆÚ,²»ÊÇ´íÎó)
+ ~ PerformKillSettlement Killer Â·ï¿½ï¿½: ApplyKillScore
+ ~ PerformKillSettlement Victim Â·ï¿½ï¿½: ApplyDeathScore
+ ~ KillerName ï¿½ï¿½ï¿½ï¿½Ë«ï¿½ï¿½ï¿½ï¿½
+ ~ É¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Þ·ï¿½ï¿½Û¼ï¿½
+ ~ AI Killer ï¿½ï¿½ PS ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ ï¿½ï¿½ Verbose (ï¿½ï¿½Ô¤ï¿½ï¿½,ï¿½ï¿½ï¿½Ç´ï¿½ï¿½ï¿½)
 `
 
-### ´ó³§Ô­Ôò¶ÔÕÕ (v206)
+### ï¿½ï¿½Ô­ï¿½ï¿½ï¿½ï¿½ï¿½ (v206)
 
-| Ô­Ôò | ÐÞ¸´Ç° | ÐÞ¸´ºó |
+| Ô­ï¿½ï¿½ | ï¿½Þ¸ï¿½Ç° | ï¿½Þ¸ï¿½ï¿½ï¿½ |
 |---|---|---|
-| µ¥Ò»ÕæÀíÔ´ | 3 ´¦·ÖÉ¢ if/else | 3 ¸ö Apply*Score Í³Ò»Èë¿Ú |
-| ÁãÖØ¸´ | PS/AIC Ë«·ÖÖ§ÔÚ 3 ´¦ÖØ¸´ | Ë«¹ìÖÆ·â×°ÔÚ 3 ¸ö helper ÄÚ |
-| Áã¶µµ× | if (PS) ... else ¾²Ä¬Ìø¹ý | Log Error + return false ÏÔÊ½ |
-| ×ß RPC | PS Ö±½Óµ÷ AddDeath | Í¬ (PS/AIC ÄÚ²¿ÒÑ×ß RPC) |
+| ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ô´ | 3 ï¿½ï¿½ï¿½ï¿½É¢ if/else | 3 ï¿½ï¿½ Apply*Score Í³Ò»ï¿½ï¿½ï¿½ |
+| ï¿½ï¿½ï¿½Ø¸ï¿½ | PS/AIC Ë«ï¿½ï¿½Ö§ï¿½ï¿½ 3 ï¿½ï¿½ï¿½Ø¸ï¿½ | Ë«ï¿½ï¿½ï¿½Æ·ï¿½×°ï¿½ï¿½ 3 ï¿½ï¿½ helper ï¿½ï¿½ |
+| ï¿½ã¶µï¿½ï¿½ | if (PS) ... else ï¿½ï¿½Ä¬ï¿½ï¿½ï¿½ï¿½ | Log Error + return false ï¿½ï¿½Ê½ |
+| ï¿½ï¿½ RPC | PS Ö±ï¿½Óµï¿½ AddDeath | Í¬ (PS/AIC ï¿½Ú²ï¿½ï¿½ï¿½ï¿½ï¿½ RPC) |
 
 ---
 
-## 22. v116.5 (2026.08.07) UnPossess Ê±ÐòÐÞ¸´ ¡ª v116 ¸±×÷ÓÃ¸ùÒò
+## 22. v116.5 (2026.08.07) UnPossess Ê±ï¿½ï¿½ï¿½Þ¸ï¿½ ï¿½ï¿½ v116 ï¿½ï¿½ï¿½ï¿½ï¿½Ã¸ï¿½ï¿½ï¿½
 
-### v116 ÐÞ¸´µÄ¸±×÷ÓÃ (Layer 2 ¡ª Ê±Ðò¾ºÕù)
+### v116 ï¿½Þ¸ï¿½ï¿½Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½ (Layer 2 ï¿½ï¿½ Ê±ï¿½ï¿½ï¿½ï¿½)
 
-v116 (2026.07.31) ÐÞ¸´ÁË AIC ÓëËÀÍö Pawn ½âñî, µ« UnPossess ·ÅÔÚ Die() ÄÚ SetLifeSpan Ö®Ç°.
+v116 (2026.07.31) ï¿½Þ¸ï¿½ï¿½ï¿½ AIC ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Pawn ï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½ UnPossess ï¿½ï¿½ï¿½ï¿½ Die() ï¿½ï¿½ SetLifeSpan Ö®Ç°.
 
-**ÍêÕûÊ±ÐòÁ´ (v116 ÐÞ¸´ºó)**:
+**ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ (v116 ï¿½Þ¸ï¿½ï¿½ï¿½)**:
 
 `
 TakeDamage (CombatDeathComponent):
- 1. HC->ApplyDamage ¡ú OnDeath.Broadcast ¡ú OnHealthComponentDeath ¡ú Die() Í¬²½Á´:
+ 1. HC->ApplyDamage ï¿½ï¿½ OnDeath.Broadcast ï¿½ï¿½ OnHealthComponentDeath ï¿½ï¿½ Die() Í¬ï¿½ï¿½ï¿½ï¿½:
  - v116: UnPossess + SetLifeSpan(0.1f)
- 2. ¡û HC->ApplyDamage ·µ»Ø
- 3. if (Owner->IsDead()) PerformKillSettlement  ¡û ´ËÊ± UnPossess ÒÑ·¢Éú!
- 4. PerformKillSettlement ¡ú ApplyDeathScore(Victim) ¡ú Owner.GetController() = null
- 5. ApplyDeathScore ÎóÅÐ¼ÈÎÞ PS Ò²ÎÞ AIC, ¾Ü¾øÀÛ¼Ó ¡ú AIDeaths ÓÀÔ¶ 0
+ 2. ï¿½ï¿½ HC->ApplyDamage ï¿½ï¿½ï¿½ï¿½
+ 3. if (Owner->IsDead()) PerformKillSettlement  ï¿½ï¿½ ï¿½ï¿½Ê± UnPossess ï¿½Ñ·ï¿½ï¿½ï¿½!
+ 4. PerformKillSettlement ï¿½ï¿½ ApplyDeathScore(Victim) ï¿½ï¿½ Owner.GetController() = null
+ 5. ApplyDeathScore ï¿½ï¿½ï¿½Ð¼ï¿½ï¿½ï¿½ PS Ò²ï¿½ï¿½ AIC, ï¿½Ü¾ï¿½ï¿½Û¼ï¿½ ï¿½ï¿½ AIDeaths ï¿½ï¿½Ô¶ 0
 `
 
-**Session1.txt 2026.08.07 line 4572-4589 Ê±ÐòÖ¤¾Ý**:
+**Session1.txt 2026.08.07 line 4572-4589 Ê±ï¿½ï¿½Ö¤ï¿½ï¿½**:
 
 `
-11:282 [CombatDeathComponent] Die: ¡¾v116¡¿ÒÑ UnPossess AIController ''AIC_AI_SWAT_AI_4''
-11:282 [CombatDeathComponent] Die: ¡¾v116 ÑéÖ¤¡¿SetLifeSpan ºó Controller ÒÑÎª NULL
-11:282 [BaseCharacter] GrantAssistsToEligiblePlayers: Victim 'BP_MuTi_C_0' ¼ÈÎÞ PS Ò²ÎÞ AIC
-11:282 [CombatDeathComponent] PerformKillSettlement: Victim 'BP_MuTi_C_0' ¼ÈÎÞ PS Ò²ÎÞ AIC
-11:282 [BaseCharacter] ApplyDeathScore: Victim 'BP_MuTi_C_0' ¼ÈÎÞ ARoomPlayerState Ò²ÎÞ ABaseAIController
+11:282 [CombatDeathComponent] Die: ï¿½ï¿½v116ï¿½ï¿½ï¿½ï¿½ UnPossess AIController ''AIC_AI_SWAT_AI_4''
+11:282 [CombatDeathComponent] Die: ï¿½ï¿½v116 ï¿½ï¿½Ö¤ï¿½ï¿½SetLifeSpan ï¿½ï¿½ Controller ï¿½ï¿½Îª NULL
+11:282 [BaseCharacter] GrantAssistsToEligiblePlayers: Victim 'BP_MuTi_C_0' ï¿½ï¿½ï¿½ï¿½ PS Ò²ï¿½ï¿½ AIC
+11:282 [CombatDeathComponent] PerformKillSettlement: Victim 'BP_MuTi_C_0' ï¿½ï¿½ï¿½ï¿½ PS Ò²ï¿½ï¿½ AIC
+11:282 [BaseCharacter] ApplyDeathScore: Victim 'BP_MuTi_C_0' ï¿½ï¿½ï¿½ï¿½ ARoomPlayerState Ò²ï¿½ï¿½ ABaseAIController
 `
 
-### ÐÞ¸´·½°¸ (v116.5 ¡ª ´ó³§¼Ü¹¹ ¡ª ¼¯ÖÐµ÷¶È)
+### ï¿½Þ¸ï¿½ï¿½ï¿½ï¿½ï¿½ (v116.5 ï¿½ï¿½ ï¿½ó³§¼Ü¹ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½Ðµï¿½ï¿½ï¿½)
 
-**ºËÐÄË¼Ïë**: UnPossess ±ØÐë·¢ÉúÔÚ PerformKillSettlement Ö®ºó, µ«ÈÔÔÚ Pawn Ïú»ÙÖ®Ç°.
+**ï¿½ï¿½ï¿½ï¿½Ë¼ï¿½ï¿½**: UnPossess ï¿½ï¿½ï¿½ë·¢ï¿½ï¿½ï¿½ï¿½ PerformKillSettlement Ö®ï¿½ï¿½, ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Pawn ï¿½ï¿½ï¿½ï¿½Ö®Ç°.
 
-**Ê±ÐòÐÞ¸´ (v116.5)**:
+**Ê±ï¿½ï¿½ï¿½Þ¸ï¿½ (v116.5)**:
 
 `
 TakeDamage (CombatDeathComponent):
- 1. HC->ApplyDamage ¡ú OnDeath.Broadcast ¡ú OnHealthComponentDeath ¡ú Die() Í¬²½Á´:
- - v116.5: Multicast_Die + ExecuteDeathLocal + SetLifeSpan(0.1f) (²»µ÷ UnPossess)
- 2. ¡û HC->ApplyDamage ·µ»Ø
- 3. if (Owner->IsDead()) PerformKillSettlement  ¡û AIC ÈÔÓÐÐ§ ?
- 4. ApplyKillScore + ApplyDeathScore ¡ú AIC.AddDeath ? ¡¾ÐÞ¸´¹Ø¼ü¡¿
- 5. UnPossess AIC ¡û v116.5 ÐÂÔö (v116 ·À AIC ×Ô¶¯Ïú»Ù)
- ¡ý (0.1s ºó)
-Pawn Ïú»Ù (´ËÊ± AIC ÒÑ UnPossess, v116 ÐÞ¸´ÓÐÐ§)
+ 1. HC->ApplyDamage ï¿½ï¿½ OnDeath.Broadcast ï¿½ï¿½ OnHealthComponentDeath ï¿½ï¿½ Die() Í¬ï¿½ï¿½ï¿½ï¿½:
+ - v116.5: Multicast_Die + ExecuteDeathLocal + SetLifeSpan(0.1f) (ï¿½ï¿½ï¿½ï¿½ UnPossess)
+ 2. ï¿½ï¿½ HC->ApplyDamage ï¿½ï¿½ï¿½ï¿½
+ 3. if (Owner->IsDead()) PerformKillSettlement  ï¿½ï¿½ AIC ï¿½ï¿½ï¿½ï¿½Ð§ ?
+ 4. ApplyKillScore + ApplyDeathScore ï¿½ï¿½ AIC.AddDeath ? ï¿½ï¿½ï¿½Þ¸ï¿½ï¿½Ø¼ï¿½ï¿½ï¿½
+ 5. UnPossess AIC ï¿½ï¿½ v116.5 ï¿½ï¿½ï¿½ï¿½ (v116 ï¿½ï¿½ AIC ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½)
+ ï¿½ï¿½ (0.1s ï¿½ï¿½)
+Pawn ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½Ê± AIC ï¿½ï¿½ UnPossess, v116 ï¿½Þ¸ï¿½ï¿½ï¿½Ð§)
 `
 
-### ¸Ä¶¯Çåµ¥ (v116.5)
+### ï¿½Ä¶ï¿½ï¿½åµ¥ (v116.5)
 
 `
 ~ MetalSlug01/Source/MetalSlug01/Private/Combat/CombatDeathComponent.cpp
- ~ Die(): É¾³ý UnPossess ´úÂë¿é (ÒÆµ½ TakeDamage Ä©Î²)
- ~ Die(): SetLifeSpan ºóÕï¶ÏÈÕÖ¾¸ÄÎª v116.5 °æ±¾
- + TakeDamage: ÔÚ PerformKillSettlement Ö®ºó + Owner.HasAuthority() ÊØÎÀ + IsDead ·ÖÖ§ÄÚ
-  µ÷ UnPossess AIC (µ¥Ò»Èë¿Ú, ¼¯ÖÐµ÷¶È)
+ ~ Die(): É¾ï¿½ï¿½ UnPossess ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½Æµï¿½ TakeDamage Ä©Î²)
+ ~ Die(): SetLifeSpan ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ï¿½ï¿½Îª v116.5 ï¿½æ±¾
+ + TakeDamage: ï¿½ï¿½ PerformKillSettlement Ö®ï¿½ï¿½ + Owner.HasAuthority() ï¿½ï¿½ï¿½ï¿½ + IsDead ï¿½ï¿½Ö§ï¿½ï¿½
+  ï¿½ï¿½ UnPossess AIC (ï¿½ï¿½Ò»ï¿½ï¿½ï¿½, ï¿½ï¿½ï¿½Ðµï¿½ï¿½ï¿½)
 `
 
-### ´ó³§Ô­Ôò¶ÔÕÕ (v116.5)
+### ï¿½ï¿½Ô­ï¿½ï¿½ï¿½ï¿½ï¿½ (v116.5)
 
-| Ô­Ôò | v116 | v116.5 |
+| Ô­ï¿½ï¿½ | v116 | v116.5 |
 |---|---|---|
-| µ¥Ò»ÕæÀíÔ´ | UnPossess ÔÚ Die() ÄÚ | UnPossess ÓÉ TakeDamage Í³Ò»µ÷¶È |
-| ¼¯ÖÐµ÷¶È | ·ÖÉ¢ (Die + TakeDamage) | ¼¯ÖÐ (TakeDamage µ¥Ò»Èë¿Ú) |
-| Ê±ÐòÕýÈ·ÐÔ | UnPossess ÔÚ PerformKillSettlement Ö®Ç° (´í) | UnPossess ÔÚ PerformKillSettlement Ö®ºó (¶Ô) |
-| Áã¶µµ× | (Ã»ÓÐ, Ê±Ðò¾ºÕù) | UnPossess ºó²Å×ß Destroy Á´ |
-| v116 ÐÞ¸´Ð§¹û±£Áô | AIC ²»±»×Ô¶¯Ïú»Ù | Í¬ (AIC ÔÚ Pawn Ïú»ÙÇ°ÒÑ UnPossess) |
+| ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ô´ | UnPossess ï¿½ï¿½ Die() ï¿½ï¿½ | UnPossess ï¿½ï¿½ TakeDamage Í³Ò»ï¿½ï¿½ï¿½ï¿½ |
+| ï¿½ï¿½ï¿½Ðµï¿½ï¿½ï¿½ | ï¿½ï¿½É¢ (Die + TakeDamage) | ï¿½ï¿½ï¿½ï¿½ (TakeDamage ï¿½ï¿½Ò»ï¿½ï¿½ï¿½) |
+| Ê±ï¿½ï¿½ï¿½ï¿½È·ï¿½ï¿½ | UnPossess ï¿½ï¿½ PerformKillSettlement Ö®Ç° (ï¿½ï¿½) | UnPossess ï¿½ï¿½ PerformKillSettlement Ö®ï¿½ï¿½ (ï¿½ï¿½) |
+| ï¿½ã¶µï¿½ï¿½ | (Ã»ï¿½ï¿½, Ê±ï¿½ï¿½ï¿½ï¿½) | UnPossess ï¿½ï¿½ï¿½ï¿½ï¿½ Destroy ï¿½ï¿½ |
+| v116 ï¿½Þ¸ï¿½Ð§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ | AIC ï¿½ï¿½ï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½ | Í¬ (AIC ï¿½ï¿½ Pawn ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ï¿½ UnPossess) |
 
-### ½ÌÑµ×Ü½á (v206 + v116.5)
+### ï¿½ï¿½Ñµï¿½Ü½ï¿½ (v206 + v116.5)
 
-1. **µ¥Ò»ÕæÀíÔ´ÓÀÔ¶ÊÇµÚÒ»Î»**: ÈÎºÎÀÛ¼Ó×´Ì¬±ä¸ü±ØÐëÓÐÎ¨Ò»Èë¿Ú
-2. **Ê±Ðò¾ºÕù¼ì²â**: ÈÎºÎÊÂ¼þÇý¶¯Í¬²½Á´±ØÐë¿¼ÂÇÏÂÓÎµ÷ÓÃ·½ÄÜÄÃµ½µÄ×´Ì¬
-3. **ÐÞ¸´ÐÂ bug Ê±, ±ØÐë»Ø¹éÉóÊÓ¾ÉÐÞ¸´**: v116 ÐÞ¸´ÁË AIC Ïú»Ù, µ«µ¼ÖÂ PerformKillSettlement ÄÃ²»µ½ AIC
-4. **Õï¶ÏÈÕÖ¾ÊÇÐÞ¸´µÄÇ°Ìá**: Ã»ÓÐÊ±ÐòÈÕÖ¾¸ù±¾¿´²»µ½ v116 µÄ¸±×÷ÓÃ
-5. **Áã¶µµ×ÊÇË«ÏòµÄ**: ¼È²»ÄÜÄ¬ÈÏ PS=null Ìø¹ý, Ò²²»ÄÜÒòÎª UnPossess ¾²Ä¬ÍÌµô AIC.AddDeath
+1. **ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ô´ï¿½ï¿½Ô¶ï¿½Çµï¿½Ò»Î»**: ï¿½Îºï¿½ï¿½Û¼ï¿½×´Ì¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¨Ò»ï¿½ï¿½ï¿½
+2. **Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½**: ï¿½Îºï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½Í¬ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ë¿¼ï¿½ï¿½ï¿½ï¿½ï¿½Îµï¿½ï¿½Ã·ï¿½ï¿½ï¿½ï¿½Ãµï¿½ï¿½ï¿½×´Ì¬
+3. **ï¿½Þ¸ï¿½ï¿½ï¿½ bug Ê±, ï¿½ï¿½ï¿½ï¿½Ø¹ï¿½ï¿½ï¿½ï¿½Ó¾ï¿½ï¿½Þ¸ï¿½**: v116 ï¿½Þ¸ï¿½ï¿½ï¿½ AIC ï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ PerformKillSettlement ï¿½Ã²ï¿½ï¿½ï¿½ AIC
+4. **ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾ï¿½ï¿½ï¿½Þ¸ï¿½ï¿½ï¿½Ç°ï¿½ï¿½**: Ã»ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½Ö¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ v116 ï¿½Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½
+5. **ï¿½ã¶µï¿½ï¿½ï¿½ï¿½Ë«ï¿½ï¿½ï¿½**: ï¿½È²ï¿½ï¿½ï¿½Ä¬ï¿½ï¿½ PS=null ï¿½ï¿½ï¿½ï¿½, Ò²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Îª UnPossess ï¿½ï¿½Ä¬ï¿½Ìµï¿½ AIC.AddDeath
 
-### Áª¶¯¹ØÏµ (v206 ? v116.5)
+### ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ïµ (v206 ? v116.5)
 
-- v206 ÐÞ¸´ KDA ÀÛ¼ÓÂ·¾¶ (Ë«¹ìÖÆ), µ«±» v116 Ê±Ðò¾ºÕù×è¶Ï
-- v116.5 ÐÞ¸´Ê±Ðò¾ºÕù, ÈÃ v206 ÐÞ¸´Â·¾¶ÄÜÕýÈ·Ö´ÐÐ
-- Á½Õß±ØÐë**Í¬Ê±´æÔÚ**²ÅÄÜÐÞºÃ ¡ª µ¥¶ÀÐÞÒ»¸ö¶¼²»ÐÐ
+- v206 ï¿½Þ¸ï¿½ KDA ï¿½Û¼ï¿½Â·ï¿½ï¿½ (Ë«ï¿½ï¿½ï¿½ï¿½), ï¿½ï¿½ï¿½ï¿½ v116 Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+- v116.5 ï¿½Þ¸ï¿½Ê±ï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½ v206 ï¿½Þ¸ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È·Ö´ï¿½ï¿½
+- ï¿½ï¿½ï¿½ß±ï¿½ï¿½ï¿½**Í¬Ê±ï¿½ï¿½ï¿½ï¿½**ï¿½ï¿½ï¿½ï¿½ï¿½Þºï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
-### ´ýÓÃ»§ÑéÖ¤ (v206 + v116.5)
+### ï¿½ï¿½ï¿½Ã»ï¿½ï¿½ï¿½Ö¤ (v206 + v116.5)
 
-1. ? UE 5.6 ±à¼­Æ÷±àÒë 0 ´í (ÓÃ»§ÑéÖ¤)
-2. ? Íæ¼ÒÈËÀà»÷É± AI Ä¸Ìå ¡ú AI Ä¸Ìå Text_KDA ËÀÍöÊý +1 ¡¾ÓÃ»§ÒÑÑéÖ¤¡¿
-3. Íæ¼ÒÈËÀà»÷É± AI Ä¸Ìå ¡ú Íæ¼Ò Text_KDA »÷É±Êý +1 (Ò»Ö±Ã»»µ, È·ÈÏÃ»ÆÆ»µ)
-4. AI Ä¸Ìå»÷É±Íæ¼ÒÈËÀà ¡ú Íæ¼ÒËÀÍö +1 + AI Ä¸Ìå»÷É± +1
-5. AI Ä¸ÌåËÀÍöºóÄÜ¸´»î (v116.5 UnPossess Ê±»úµ÷Õû²»Ó°Ïì v116 ·À AIC ×Ô¶¯Ïú»Ù)
-6. Íæ¼ÒËÀÍöºóÄÜ¸´»î (²»¶¯ PlayerController)
+1. ? UE 5.6 ï¿½à¼­ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 0 ï¿½ï¿½ (ï¿½Ã»ï¿½ï¿½ï¿½Ö¤)
+2. ? ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É± AI Ä¸ï¿½ï¿½ ï¿½ï¿½ AI Ä¸ï¿½ï¿½ Text_KDA ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ +1 ï¿½ï¿½ï¿½Ã»ï¿½ï¿½ï¿½ï¿½ï¿½Ö¤ï¿½ï¿½
+3. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É± AI Ä¸ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ Text_KDA ï¿½ï¿½É±ï¿½ï¿½ +1 (Ò»Ö±Ã»ï¿½ï¿½, È·ï¿½ï¿½Ã»ï¿½Æ»ï¿½)
+4. AI Ä¸ï¿½ï¿½ï¿½É±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ +1 + AI Ä¸ï¿½ï¿½ï¿½É± +1
+5. AI Ä¸ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ü¸ï¿½ï¿½ï¿½ (v116.5 UnPossess Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó°ï¿½ï¿½ v116 ï¿½ï¿½ AIC ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½)
+6. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ü¸ï¿½ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ PlayerController)
 
-### ÓÃ»§·´À¡ (2026.08.07)
-> ³É¹¦ÁË ¼ÇÒäÒ»ÏÂ ¸ÄÁËÄÇÃ´³¤Ê±¼äÖÕÓÚÐÞ¸´ÁË
+### ï¿½Ã»ï¿½ï¿½ï¿½ï¿½ï¿½ (2026.08.07)
+> ï¿½É¹ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã´ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Þ¸ï¿½ï¿½ï¿½
+
+---
+
+## 23. v229 (2026.08.15) RewardItemImage / ChestCountText ï¿½ï¿½??ï¿½ï¿½ ï¿½ SSOT ï¿½è·¯ï¿½?ï¿½ï¿½?? + å¤§ï¿½ï¿½ï¿½ï¿½??ï¿½? (å¤§ï¿½ï¿½ï¿½ï¿½?ï¿½?)
+
+### ï¿½ï¿½?ï¿½ Bug (ï¿½ï¿½ 2026.08.15)
+> `WBP_DailyUpgradeRewardPage` ï¿½?? `ReselectRewardButton` ï¿½??ï¿½ï¿½ï¿½?æ­¦ï¿½?ï¿½ï¿½ï¿½ï¿½?ï¿½ `RewardItemImage` ï¿½` `ChestCountText` ï¿½ï¿½??ï¿½ï¿½ï¿½?ï¿½??
+
+### ï¿½??ï¿½ï¿½ (v218 ï¿½??ï¿½?ï¿½?? SSOT ï¿½è·¯ï¿½?ï¿½)
+
+**Bug æ ¹ï¿½?**?**3 ä¸ª Subsystem API ï¿½?ï¿½å¿½ï¿½?ï¿½ï¿½? `CurrentRecord.RewardIconIndex`**
+
+| API | å¤´ï¿½??ä»¶ï¿½ï¿½?? (SSOT ï¿½è·¯) | ï¿½ï¿½?ï¿½ï¿½ | å¯¼ï¿½?ï¿½ bug |
+|---|---|---|---|
+| `GetRewardItemIcons()` | "ï¿½?ï¿½ï¿½??ï¿½?" (ï¿½??æ¡£ï¿½å£°) | **ï¿½ï¿½?ï¿½?? 1 ä¸ª** (Last ItemIcon) | `CachedItemIcons.Num() == 1`, `CachedItemIcons[Index]` ï¿½ç«¯ï¿½?ï¿½??, è·³ `CachedItemIcons[0]` |
+| `GetCurrentRewardItemCount()` | "TreasureBoxItems[RewardIconIndex].ItemCount" | "TreasureBoxItem(BoxID).ItemCount" (**ç¬¬ï¿½?ï¿½**) | `ChestCountText` æ°¸ï¿½ï¿½ç¤º BoxID ç¬¬ 0 ï¿½ ItemCount |
+| `GetReselectRewardOptions()` | "ï¿½ï¿½??é¡¹" | ï¿½ï¿½?? `GetRewardItemIcons()` (ï¿½?ï¿½ç»§ï¿½?ï¿½) | popup "RewardOptions.Num() == 0" ï¿½?ï¿½?ï¿½ï¿½ç«¯ï¿½è§¦ï¿½ï¿½ |
+
+### v218 ï¿½??ï¿½?ï¿½??ï¿½?ï¿½ `Page.UpdateRewardItemImage` ï¿½??ï¿½?
+```cpp
+// ï¿½?ï¿½??: 3 ï¿½ if/else ï¿½ï¿½?ï¿½? + CachedItemIcons[0] ï¿½æ­¥ï¿½?
+if (GameInstance) {
+    if (UpgradeSub) {
+        if (Index in range) SetBrush(Icon[Index]);
+        else                SetBrush(Icon[0]); // ï¿½ï¿½?ï¿½ï¿½æ­¥
+    } else                SetBrush(Icon[0]); // ï¿½?ï¿½ï¿½æ­¥
+} else                    SetBrush(Icon[0]); // ï¿½ï¿½ï¿½æ­¥
+else                        SetVisibility(Hidden);
+```
+**å¤§ï¿½ï¿½ï¿½??ï¿½??**?ï¿½?ï¿½ï¿½æ­¥ï¿½??ï¿½? + `Icon[0]` ï¿½?è®¤ = ï¿½? "GetRewardItemIcons ï¿½ï¿½?ï¿½?? 1 ï¿½ + Index ï¿½ç«¯ï¿½?ï¿½??" ï¿½?ï¿½ SSOT ï¿½è·¯ï¿½?ï¿½ï¿½?æ°¸ï¿½?ï¿½?? (ï¿½äº§ï¿½??ä»»ï¿½? "Bug: ï¿½ï¿½??ï¿½" ï¿½?ï¿½ï¿½).
+
+### v229 ï¿½?ï¿½ï¿½?? (å¤§ï¿½ï¿½ï¿½ï¿½?ï¿½? ï¿½ SSOT + ï¿½ï¿½?ï¿½ï¿½è·¯å¯¹ç§° + ï¿½ï¿½??ï¿½?)
+
+#### API ï¿½??ä¸­è§£ï¿½? (Subsystem)
+```
+UUpgradeActivitySubsystem
+ï¿½??? GetRewardItemIcons()            // ï¿½?ï¿½ï¿½??ï¿½? SSOT (ï¿½?? GetRewardItemIcons + GetReselectRewardOptions)
+ï¿½??? GetReselectRewardOptions()       // ï¿½ï¿½?? GetRewardItemIcons() (v229 ï¿½ï¿½ popup / Page ï¿½?ï¿½å®¹ï¿½ï¿½??)
+ï¿½??? GetCurrentRewardIcon()           // ï¿½ï¿½?ï¿½ï¿½? - ï¿½?ï¿½??ï¿½ï¿½?ï¿½ RewardIconIndex å¯¹ï¿½?ï¿½??ï¿½?ï¿½ï¿½? ItemIcon
+```
+
+#### SSOT ï¿½è·¯å¯¹ç§° (ï¿½ï¿½??ï¿½?ï¿½ä½¿ï¿½?ï¿½ï¿½ï¿½ï¿½?ï¿½ BoxID + Index)
+```
+GetRewardItemIcons()        ï¿½?? GetTreasureBoxItemsByBoxID(BoxID)  ï¿½?? TreasureBoxItems[i].ItemID   ï¿½?? ItemDetail.ItemIcon   (i = 0..N-1)
+GetCurrentRewardItemCount() ï¿½?? GetTreasureBoxItemsByBoxID(BoxID)  ï¿½?? TreasureBoxItems[i].ItemCount (i = RewardIconIndex)
+GetCurrentRewardIcon()      ï¿½?? GetTreasureBoxItemsByBoxID(BoxID)  ï¿½?? TreasureBoxItems[i].ItemID   ï¿½?? ItemDetail.ItemIcon   (i = RewardIconIndex)
+```
+
+#### Page ï¿½ï¿½??ï¿½? (ï¿½?ï¿½ï¿½æ­¥ï¿½?ï¿½ï¿½??)
+```cpp
+// UpdateRewardItemImage: 1. GameInstance? 2. Subsystem? 3. GetCurrentRewardIcon() - ï¿½æ­¥ fail -> Log Error + Hidden
+// OnRewardIconIndexChanged: 1. InitializeRewardItemIcons() (ï¿½ï¿½??ï¿½?ï¿½ï¿½??ï¿½?ï¿½?ï¿½ï¿½?ï¿½) 2. UpdateRewardItemImage 3. UpdateChestCountText
+// UpdateChestCountText: -1 -> Log Error + SetText("")
+```
+
+### å¤§ï¿½ï¿½ï¿½??ï¿½?? (v229 ï¿½ï¿½?)
+
+| ï¿½??ï¿½?? | ï¿½ï¿½? |
+|---|---|
+| **SSOT ï¿½è·¯å¯¹ç§°** | ItemIcon ï¿½?ï¿½ï¿½??ï¿½? / ï¿½ï¿½?ï¿½ï¿½??ä¸­ / ItemCount ï¿½ï¿½??ï¿½?ï¿½èµ°ï¿½ï¿½ï¿½?ï¿½ BoxID + TreasureBoxItems[i] ï¿½, ï¿½ï¿½?è®¸ "ItemCount èµ° Last(), ItemIcon èµ° Index" ï¿½?ï¿½ï¿½è·¯ï¿½??ï¿½?ï¿½ |
+| **ï¿½ï¿½??ï¿½?** | ï¿½æ­¥ fail -> Log Error + ï¿½ï¿½ Hidden/SetText("") (ï¿½ï¿½?è®¸ï¿½æ­¥ / ï¿½?è®¤) |
+| **API ï¿½?ï¿½ï¿½?ï¿½ï¿½??** | `GetReselectRewardOptions` -> ï¿½ï¿½?? `GetRewardItemIcons` (ï¿½æ¬¥ SSOT) |
+| **HeadComment = Implementation** | `GetCurrentRewardItemCount` å¤´ï¿½??ä»¶ï¿½? "TreasureBoxItems[i].ItemCount" -> ï¿½ï¿½ï¿½?ï¿½èµ°ï¿½ï¿½ (v218 å¤´ï¿½??ä»¶ï¿½?å¯¹ï¿½?, ï¿½ï¿½ï¿½?ï¿½ï¿½?; v229 ï¿½) |
+| **é¡¹ï¿½?ï¿½ï¿½ï¿½?ï¿½ï¿½?ï¿½?ï¿½è´£ä»»ï¿½?ï¿½?ä¸ª** | `RewardItemImage` -> `GetCurrentRewardIcon()` ï¿½ï¿½ -> Page ï¿½ï¿½?ï¿½?ï¿½ CachedItemIcons[Index] |
+
+### ï¿½??ä»¶ï¿½?ï¿½?ï¿½ (v229)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Private/Systems/Activity/UpgradeActivitySubsystem.cpp
+ ~ GetRewardItemIcons(): v218 ï¿½?? "1 ï¿½ ItemIcon" -> v229 "ï¿½?ï¿½ï¿½??ï¿½? ItemIcon" (GetTreasureBoxItemsByBoxID -> i=0..N-1 -> ItemDetail.ItemIcon)
+ ~ GetReselectRewardOptions(): ï¿½ï¿½?? GetRewardItemIcons() (ï¿½?ï¿½ç»§ï¿½?ï¿½ -> SSOT)
+ + GetCurrentRewardIcon(): ï¿½?ï¿½ï¿½?, ï¿½ GetCurrentRewardItemCount ï¿½æ ¼å¯¹ç§°
+ ~ GetCurrentRewardItemCount(): GetTreasureBoxItem(BoxID) -> GetTreasureBoxItemsByBoxID(BoxID)[RewardIconIndex] (ï¿½å¤´ï¿½??ä»¶ï¿½ï¿½??ï¿½ï¿½?ï¿½)
+
+~ MetalSlug01/Source/MetalSlug01/Public/Systems/Activity/UpgradeActivitySubsystem.h
+ + GetCurrentRewardIcon() å£°ï¿½?? + SSOT ï¿½è·¯è¯¦è¯´æ³¨ï¿½??
+ ~ GetRewardItemIcons / GetReselectRewardOptions ï¿½?è®½ï¿½?ï¿½??, v229 SSOT + ï¿½ï¿½??ï¿½?
+
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.cpp
+ ~ InitializeRewardItemIcons: 2 ï¿½ï¿½æ­¥ï¿½??ï¿½? -> Log Error + return; ï¿½ï¿½?? v229 "ï¿½?ï¿½ï¿½??ï¿½?" ï¿½?ï¿½?ï¿½
+ ~ UpdateRewardItemImage: 3 ï¿½ï¿½æ­¥ï¿½??ï¿½? + CachedItemIcons[Index] ï¿½æ­¥ -> 2 ï¿½ Log Error + Hidden; CachedItemIcons[Index] -> GetCurrentRewardIcon() ï¿½ï¿½
+ ~ UpdateChestCountText: Log Warning -> Log Error (v229); "ï¿½ï¿½?ï¿½" ï¿½?è®½ï¿½ï¿½
+ ~ OnRewardIconIndexChanged: "ï¿½æ­¥ OK" ï¿½?è®½ -> "v229 ï¿½æ­¥" ï¿½?è®½ + ï¿½ï¿½ CachedItemIcons.Num()
+ ~ OnReselectRewardClicked: "ï¿½?ï¿½è¯¯" -> "v229 SSOT" ï¿½?è®½ + Log Warning + ï¿½å¼¹ï¿½;
+ ~ ï¿½ï¿½??ä»¶ ï¿½3 ï¿½4: API ï¿½??è¡¨ + SSOT è¯´ï¿½??
+```
+
+### UE ï¿½?ï¿½ï¿½ï¿½?ç½® (v229 ï¿½ï¿½ï¿½?é¡»)
+
+```
+1. DT_DailyUpgradeRewardConfigRow -> ActivityID==110 ï¿½?ç½® -> RewardItemIDs[ï¿½ï¿½?ï¿½?ï¿½] = "110" (BoxID)
+2. DT_TreasureBoxItemRow -> BoxID==110 ï¿½?ï¿½?ç½® N (>=2) ï¿½ ItemID (ï¿½ ItemIcon / ItemCount ï¿½ï¿½??, ï¿½?ï¿½?ï¿½ï¿½?ï¿½?ï¿½ v229 ï¿½??ï¿½?ï¿½??)
+3. DT_ItemDetailRow -> ItemID ï¿½?ï¿½?ç½® ItemIcon
+```
+
+### ï¿½?ï¿½ï¿½ï¿½?ï¿½ (v229)
+
+1. UE 5.6 ï¿½?ï¿½ï¿½ï¿½?ï¿½ 0 ï¿½?ï¿½ (ï¿½?ï¿½?ï¿½: GetCurrentRewardIcon å£°ï¿½?? + Subsystem/Page ï¿½ï¿½?ï¿½)
+2. PIE ä¸­:
+ - ï¿½?ï¿½ ReselectRewardButton -> popup å¼¹ï¿½?ï¿½ N ï¿½ï¿½ï¿½??ï¿½ -> ï¿½?ï¿½ï¿½ -> popup ï¿½?ï¿½ï¿½?ï¿½ -> RewardItemImage ï¿½??ï¿½ï¿½ + ChestCountText ï¿½??ï¿½ï¿½ ï¿½??
+ - Tab ï¿½?ï¿½ (SwitchToNextRewardIcon) -> RewardItemImage ï¿½??ï¿½ï¿½ + ChestCountText ï¿½??ï¿½ï¿½ ï¿½??
+ - ï¿½?ï¿½å®¶ï¿½?ï¿½ï¿½?ï¿½ popup RewardItemID ï¿½ï¿½ -> RewardItemImage + ChestCountText ï¿½?ï¿½?ï¿½? ï¿½??
+3. ï¿½?ï¿½ï¿½ï¿½?ï¿½?ï¿½:
+ - `[v229] GetCurrentRewardIcon: BoxID=110 RewardIconIndex=1 ItemID='XX' ï¿½?ï¿½ä¸­.`
+ - `[v229] GetCurrentRewardItemCount: BoxID=110 RewardIconIndex=1 ItemCount=N`
+ - `[v229] UpdateRewardItemImage: GetCurrentRewardIcon() ï¿½?ï¿½??ç©º, ï¿½?ï¿½?ï¿½ RewardItemImage.` (Index ï¿½?ï¿½è¯¯ï¿½?ï¿½?ï¿½)
+
+### ä¸ºï¿½?ï¿½?ï¿½?ï¿½?ä¸ª chat ï¿½å°½ï¿½? (Self-Review)
+
+| ï¿½?ï¿½è¯¯ | æ ¹ï¿½? |
+|---|---|
+| ï¿½?ï¿½?ï¿½??è®¤ä¸º `GetReselectRewardOptions` ä¸º "popup ï¿½??ï¿½" (ï¿½ "popup ï¿½?ï¿½ Page ï¿½ï¿½" ä¹±ï¿½) | popup ï¿½ï¿½?ï¿½ï¿½ï¿½?è¯¥ API, popup ï¿½?ï¿½?ï¿½ï¿½?ï¿½å·±ï¿½? `GetTreasureBoxItemsByBoxID` |
+| ï¿½?ï¿½?ï¿½??å»ºè®® "popup ï¿½ï¿½?ï¿½? ItemIcon ï¿½??è¡¨" | popup ï¿½?ï¿½ï¿½?è´¹ï¿½??ï¿½?ï¿½ `FDailyLoginConfigRow` + BoxID -> `TreasureBoxItemsByBoxID`, ItemIcon ï¿½??è¡¨ï¿½?ï¿½ Page ï¿½?ï¿½ |
+| ï¿½?ï¿½?ï¿½??å¯¹ `ChestCountText` ï¿½å¤§ï¿½ï¿½?ï¿½ä¸º "é¡µç±»ï¿½ï¿½?ï¿½" | ï¿½ï¿½?ï¿½ï¿½? GetCurrentRewardItemCount å¤´ï¿½??ä»¶ï¿½å¯¹ï¿½?, ï¿½ï¿½ï¿½?ï¿½ï¿½? (Bug ï¿½?æ ¹) |
+
+### ï¿½??è®­ (ï¿½?ï¿½ï¿½ï¿½?ï¿½?ï¿½)
+
+1. **HeadComment = Implementation**: ä»»ï¿½? API ï¿½??ï¿½ï¿½??æ¡£ï¿½ï¿½?? + ï¿½ï¿½ï¿½?ï¿½ï¿½å¯¹ï¿½?, ï¿½ï¿½?ï¿½ "Doc says X, Code does Y". v218 ï¿½?? `GetCurrentRewardItemCount` å°±ï¿½?ï¿½ï¿½?æ ·, 3 ä¸ªï¿½??ï¿½?ï¿½?ï¿½ï¿½äººï¿½ï¿½ï¿½?ï¿½.
+2. **é¡¹ï¿½?ï¿½ï¿½?ï¿½ï¿½?ï¿½ï¿½??**: API ï¿½ï¿½? + Doc ï¿½?è®½ï¿½?ï¿½ï¿½ï¿½ "ï¿½?ä¸ªï¿½?ï¿½ï¿½?ï¿½ï¿½?ï¿½??ï¿½?ï¿½?", ï¿½ï¿½?ï¿½ "GetRewardItemIcons -> 1 ï¿½" (v218 Bug).
+3. **ï¿½è·¯å¯¹ç§°**: ï¿½?ä¸ª API ï¿½?ï¿½ï¿½ï¿½ï¿½?ä¸ª SSOT ï¿½è·¯ï¿½?, ï¿½?é¡»ï¿½æ­¥ï¿½ï¿½?, ï¿½ï¿½?ï¿½ ItemIcon ï¿½?ï¿½ï¿½??ï¿½? / ItemCount Last() / ItemIcon Index ï¿½ï¿½??ï¿½??ï¿½?ï¿½.
+4. **ï¿½?ï¿½ï¿½?ï¿½?ï¿½ï¿½ï¿½**: ï¿½ï¿½?ä¸ª API ï¿½?ï¿½ï¿½?ï¿½ï¿½??ï¿½??ä¼¼ "ï¿½?ï¿½?ï¿½ï¿½??ï¿½?ï¿½" ï¿½?, ï¿½?é¡»ï¿½?ï¿½??ï¿½ popup / Page ï¿½ï¿½?ï¿½ï¿½?ï¿½?ï¿½ï¿½?ï¿½, ï¿½?ï¿½?ï¿½ï¿½?ï¿½ "popup/Page ï¿½?ï¿½??ï¿½??ï¿½è¯¥ API ï¿½?". v229 self-review ï¿½??ä¸»ï¿½ï¿½ï¿½?ï¿½å°±ï¿½?ï¿½ï¿½?ï¿½?æ­¥.

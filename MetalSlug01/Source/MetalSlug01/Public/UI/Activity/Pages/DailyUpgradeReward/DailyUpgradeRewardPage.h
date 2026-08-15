@@ -318,9 +318,6 @@ protected:
 	/** 缓存的物品图标数据（全局变量, 用于循环切换�?*/
 	TArray<TSoftObjectPtr<UTexture2D>> CachedItemIcons;
 
-	/** 【Ensure 修复】FixedPrizeWidget �?OnChestClaimRequested 事件是否已绑�?(幂等保护) */
-	bool bIsFixedPrizeWidgetEventBound = false;
-
 	// ==========================================
 	// 6. 事件处理
 	// ==========================================

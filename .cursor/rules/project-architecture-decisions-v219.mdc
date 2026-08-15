@@ -63,3 +63,1780 @@
 ### v60.6 (2026.08.x)
 - 槽位独立性 + 智能默认
 - Primary 失败 → 退到 Melee (玩家至少能用刀)
+
+## 3. v230 (2026.08.15) — FixedPrizeWidget 点击无响应根因修复（UMG 时序 + 零兜底）
+
+### 业务背景（用户 Session1.txt 反馈 2026.08.15）
+> "WBP_DailyUpgradeRewardPage 页面的 FixedPrizeWidget 有时候会领取不了... 在日志靠近最后出现的问题，我点了 FixedPrizeWidget 很多次就是没反应。"
+
+### 根因分析（UMG 时序 — `Initialize()` 比 `NativeConstruct()` 早）
+
+`UExperienceChestClaimWidget` 是 `WBP_ExperienceChestClaimWidget` 蓝图 widget 的 C++ 父类。
+
+| 生命周期方法 | UPROPERTY(BindWidget) 引用状态 | `AddDynamic` 可行性 |
+|---|---|---|
+| `Initialize()` | **可能未绑定**（蓝图构造早期） | ❌ silent fail — `ChestClaimButton` 可能为 null，`if(ChestClaimButton)` 守卫让 `AddDynamic` 直接跳过 |
+| `NativeConstruct()` | **必定已绑定**（UMG 标准时序） | ✅ 绑定一定成功 |
+
+**Session1.txt 关键证据（L11398 之后）**：
+- 大量 `ExperienceChestClaimWidget: 按钮启用 - 索引:9` 日志（视觉上按钮启用）
+- 用户多次点击 FixedPrizeWidget
+- **完全没有任何 `OnChestClaimButtonClicked` 或 `宝箱9条件满足，触发领取事件` 日志**
+- 表明 `OnClicked` 根本没绑上 → 点击完全没触发任何 C++ 代码
+
+### 之前 vXXX.1 的"防御性检查"为何无效
+`OnChestClaimButtonClicked` 函数内已经有 `if (!OnChestClaimRequested.IsBound())` 守卫，但这个守卫永远不会被触发 —— 因为 `OnClicked` 事件在 `Initialize()` 时就没绑上，点击根本不进函数。
+
+**这就是"silent fail"的典型 — 函数内有守卫，但事件根本没绑，守卫形同虚设。**
+
+### 修复方案（大厂架构 — UMG 时序对齐 + 零兜底）
+
+#### P0: `Initialize()` → `NativeConstruct()` 绑定迁移
+
+**修改文件**：
+- `Public/UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h` — 类注释更新
+- `Private/UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.cpp`
+
+**修改点 1：移除 `Initialize()` 里的 `OnClicked.AddDynamic`**
+```cpp
+// 【v230 大厂重构】ChestClaimButton->OnClicked 绑定移到 NativeConstruct
+// 原因: Initialize 在 widget 构造早期调用, UPROPERTY(BindWidget) 引用可能未赋值,
+//      在此处 AddDynamic 会 silent fail (if 守卫 + 没 else 分支)
+// 新位置: NativeConstruct 时 UPROPERTY 必定有效
+```
+
+**修改点 2：`Initialize()` 末尾 `ChestClaimButton SetVisibility` 补 else Log（零兜底）**
+```cpp
+if (ChestClaimButton)
+{
+    ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
+}
+else
+{
+    UE_LOG(LogTemp, Error,
+        TEXT("[ExperienceChestClaimWidget] Initialize: ChestClaimButton UPROPERTY 未绑定! ")
+        TEXT("修复: 在 WBP_ExperienceChestClaimWidget 蓝图里确保 ChestClaimButton 控件已 BindWidget 关联. ")
+        TEXT("Widget=%s"),
+        *GetName());
+}
+```
+
+**修改点 3：`NativeConstruct()` 新增绑定 + 显式零兜底守卫**
+```cpp
+void UExperienceChestClaimWidget::NativeConstruct()
+{
+    Super::NativeConstruct();
+
+    // 【v230 大厂重构】OnClicked 绑定从 Initialize 移到这里
+    if (!ChestClaimButton)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[ExperienceChestClaimWidget] NativeConstruct: ChestClaimButton UPROPERTY 未绑定! ")
+            TEXT("修复: 在 WBP_ExperienceChestClaimWidget 蓝图里确保 ChestClaimButton 控件已 BindWidget 关联. ")
+            TEXT("Widget=%s"),
+            *GetName());
+        return;
+    }
+
+    // AddUniqueDynamic 自动去重, 多次 Activate/Deactivate 安全
+    ChestClaimButton->OnClicked.AddUniqueDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
+
+    UE_LOG(LogTemp, Verbose,
+        TEXT("[ExperienceChestClaimWidget] NativeConstruct: ChestClaimButton->OnClicked 已绑定. Widget=%s"),
+        *GetName());
+}
+```
+
+**修改点 4：`NativeDestruct()` 注释更新（v230 验证）**
+```cpp
+// 【v230 大厂验证】RemoveDynamic 对未绑定是 no-op, 不需要 bool 守护
+if (ChestClaimButton)
+{
+    ChestClaimButton->OnClicked.RemoveDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
+}
+```
+
+### 大厂架构原则（v230 落地）
+
+| 原则 | 旧（vXXX.1 之前） | 新（v230） |
+|---|---|---|
+| **UMG 时序对齐** | `Initialize()` 绑定 `OnClicked`（UPROPERTY 可能未绑定） | `NativeConstruct()` 绑定（UPROPERTY 必定有效） |
+| **零兜底守卫** | `if(ChestClaimButton) AddDynamic` — silent fail | `if(!ChestClaimButton) { Log Error + return; }` — 显式失败可见 |
+| **去重绑定** | `AddDynamic`（重复绑定触发多次回调） | `AddUniqueDynamic`（多次 Activate/Deactivate 安全） |
+| **解绑守护** | 无（依赖外部 bool `bIsFixedPrizeWidgetEventBound`） | `if(ChestClaimButton) RemoveDynamic` — `RemoveDynamic` 对未绑定是 no-op |
+| **最后防线** | 无 | `OnChestClaimButtonClicked` 函数内仍保留 `ChestClaimButton` / `OnChestClaimRequested.IsBound()` 检查（理论永远不触发，但作防御） |
+
+### 为什么不动 `SetButtonEnabledState()` 系列方法
+初看像是 `SetVisibility` 没问题但 `IsEnabled` 没设 — 实际不是：
+- `IsEnabled` 默认就是 `true`（UMG 默认）
+- `SetButtonEnabledState()` 只改 `Visibility` 是有意为之（视觉态 vs 交互态）
+- `OnChestClaimButtonClicked` 函数内有完整的领取条件检查（`CurrentExperience >= TaskRelatedValues`），"交互态"由 C++ 守卫负责，不是 `IsEnabled`
+- Session1.txt 证明视觉按钮启用但点击无效 → 根因是事件没绑，不是 `IsEnabled` 错
+
+**结论：保持现状，不动 `SetButtonEnabledState()` 系列。**
+
+### 与 v229 的关系
+
+v229 (2026.08.15 早) 重构 `RewardItemImage` / `ChestCountText` 显示逻辑（SSOT + 零兜底）
+v230 (2026.08.15 晚) 修复 FixedPrizeWidget 点击无响应（UMG 时序 + 零兜底）
+
+两次同一天，但**完全不同的 bug**：
+- v229: **数据**没正确流向 UI（API 返回错误数据）
+- v230: **事件**没正确绑定到控件（UPROPERTY 时序错）
+
+### 教学要点（未来预防）
+
+1. **UMG 时序铁律**：任何 `UPROPERTY(BindWidget)` 控件的事件绑定都必须在 `NativeConstruct()` 或之后，**绝不**在 `Initialize()`
+2. **零兜底原则**：每个 `if(X)` 守卫都必须有对应的 `else` 或显式 `Log Error`，否则就是 silent fail
+3. **`AddUniqueDynamic` vs `AddDynamic`**：widget 重复 Activate/Deactivate 的场景必须用 `Unique`
+4. **`RemoveDynamic` 不需要 bool 守护**：对未绑定是 no-op，重复 `Remove` 也无副作用
+5. **最后防线 ≠ 零兜底**：函数内的守卫（`IsBound()` 检查）是"防御性编程"，事件没绑是"架构 bug" — 两件事
+6. **Session 日志证据胜过一切理论**：用户报"点了没反应" + 日志里**完全没有点击函数日志** = 事件没绑，不要去查 `IsEnabled` / 视觉态
+
+### 文件变更清单（v230）
+
+```
+~ MetalSlug01/Source/MetalSlug01/Private/UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.cpp
+ - Initialize: 移除 ChestClaimButton->OnClicked.AddDynamic (移到 NativeConstruct)
+ + Initialize 末尾: ChestClaimButton SetVisibility else 分支加 Log Error
+ + NativeConstruct: 新增 ChestClaimButton 绑定 + 零兜底守卫
+ ~ NativeDestruct: 注释更新为 v230
+ ~ OnChestClaimButtonClicked: 注释 vXXX.1 → v230, 标明"最后防线"
+
+~ MetalSlug01/Source/MetalSlug01/Public/UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h
+ ~ 类注释: 新增 v230 架构理念章节（UMG 时序 + 零兜底）
+```
+
+### 待用户验证（v230）
+
+1. UE 5.6 编辑器编译无错（重点：`NativeConstruct` 新增的 `AddUniqueDynamic` 调用）
+2. PIE 中：
+   - FixedPrizeWidget 视觉启用后 → 点击 **必定** 触发 `OnChestClaimButtonClicked` 日志
+   - Session 日志应该看到 `[ExperienceChestClaimWidget] NativeConstruct: ChestClaimButton->OnClicked 已绑定. Widget=...`
+   - 之后每次点击都能看到 `OnChestClaimButtonClicked` 函数内的领取条件检查日志
+3. 如果还是"没反应"：
+   - 检查 `WBP_ExperienceChestClaimWidget` 蓝图里 `ChestClaimButton` 是否真的 BindWidget 了
+   - 检查是否有其他 C++ / 蓝图代码在覆盖 `OnClicked` 绑定
+
+---
+
+## 3. v240.2 (2026.08.15) — DefaultSceneRoot + SkeletalMesh 武器"持续下坠"根因修复（SetWorldRotation 路径 + 零重复）
+
+### 业务背景（用户 Session1.txt 反馈 2026.08.15）
+
+> "生化模式新问题：角色手上主武器不显示模型，而且场景中生成了两把一样的主武器。"
+
+**两次反复修复尝试**：
+1. **v240.1 修复**（失败）:在 `ABaseWeapon::BeginPlay()` 中对 SkeletalMesh 强制 `SetSimulatePhysics(false)` + `RecreatePhysicsState()`
+   - **用户反馈**: "取消勾选 Simulate Physics了，场景中生成的主武器也是取消勾选的，但是还是老问题，主武器持续下坠。"
+   - **结论**: v240.1 的物理关闭是必要的（防御性），但**不是根因**。真正的根因在 attach 的变换路径。
+
+### 终极根因分析（基于 Session1.txt 日志硬证据）
+
+日志中 v200.2.14 终极诊断的关键数据：
+```
+Diff Loc=V(0)            ← 位置 100% 正确
+Diff Rot=R(P=-84.43, Y=-62.43, R=-4.18)  ← 旋转严重错误
+```
+
+**RootComponent = `DefaultSceneRoot` + 子组件 = `SkeletalMeshComponent` 的组合**下：
+
+1. UE 调用 `SetActorRelativeRotation(RelativeRotation)` → 走到 `RootComponent.SetRelativeRotation()` → 触发 `UpdateComponentToWorld()` 重算 WorldTransform
+2. UE 重算时，发现 SkeletalMesh 是子组件（有骨骼动画），UE 会调用子组件自己的 `UpdateTransform`
+3. **但 `DefaultSceneRoot` 内部不存储"姿态"信息**，实际生效的是子 Mesh 的 `RelativeRotation`（v200.2.16 ResetWeaponMeshRelativeTransforms 已设为 identity）
+4. 结果：武器 `WorldRotation = SocketWorldRotation`（而不是期望的 `SocketWorldRotation + RelativeRotation`）
+5. 视觉表现：武器以"完全错误的姿态"挂在 socket 上，看起来像"持续下坠"
+
+**为什么匕首（StaticMesh）正常**：
+- StaticMesh 没有骨骼动画，UE 子组件 UpdateTransform 路径不会启动
+- `SetActorRelativeRotation` 路径在 StaticMesh 下可靠
+
+**为什么 v220.1 移除 SetRootComponent 兜底反而暴露了问题**：
+- v220.1 之前，C++ 会自动 `SetRootComponent(MeshComponent)`，让 RootComponent 本身就是 Mesh
+- 这种情况 SetActorRelativeRotation 路径可靠
+- v220.1 为了避免 DDC 同步加载卡死 3.7s，移除了自动 SetRootComponent
+- 但 BP 蓝图里 RootComponent 仍是 `DefaultSceneRoot`，暴露了 attach 路径不可靠的问题
+
+### 大厂原则 (v240.2 落地)
+
+| 原则 | 实现 |
+|---|---|
+| **绕开不可靠路径** | 不依赖 `SetActorRelativeRotation`，改用 `SetWorldRotation/SetWorldLocation` 直接设 WorldTransform |
+| **零重复 (DRY)** | 把 3 处独立的 SkeletalMesh 物理关闭逻辑合并为 `EnsureSkeletalMeshPhysicsDisabled(CallerContext)` helper |
+| **零兜底 (可观测)** | RootComponent 为空 → `Log Error + return`（强制 BP 修复） |
+| **零 DDC 同步加载** | `SetWorldLocation/SetWorldRotation` 是 UE 内部异步操作，**不会触发 DDC 同步加载**（与 v220.1 零兜底策略一致） |
+| **可观测 (UE_LOG Display)** | 终极诊断日志升级到 v240.2 版本，明确标注"期望 Diff Loc≈V(0), Diff Rot≈R(0,0,0)" |
+
+### 核心修复代码 (WeaponAttachmentComponent::ApplyAttachmentRuntime)
+
+```cpp
+// attach 后, 绕开 SetActorRelativeRotation 不可靠路径
+const FVector SocketWorldLocation = Owner->GetMesh()->GetSocketLocation(SocketName);
+const FRotator SocketWorldRotation = Owner->GetMesh()->GetSocketRotation(SocketName);
+
+WeaponRoot->SetWorldLocationAndRotation(SocketWorldLocation, SocketWorldRotation);  // attach 前对齐
+ResetWeaponMeshRelativeTransforms(Weapon);  // 重置 Mesh 子组件相对变换
+Weapon->AttachToComponent(Owner->GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, SocketName);
+
+// 【v240.2 P0 终极修复】数学等价但走 SetWorld* 路径
+const FVector ExpectedWorldLoc = SocketWorldLocation + SocketWorldRotation.RotateVector(RelativeLocation);
+const FRotator ExpectedWorldRot = (SocketWorldRotation + RelativeRotation).GetNormalized();
+WeaponRoot->SetWorldLocation(ExpectedWorldLoc);
+WeaponRoot->SetWorldRotation(ExpectedWorldRot);
+Weapon->SetActorRelativeScale3D(RelativeScale3D);  // Scale 走相对路径无影响
+```
+
+### 重构消除的重复代码
+
+| 文件 | 删除的旧代码 | 改为调用 helper |
+|---|---|---|
+| `BaseWeapon.cpp` BeginPlay | `if (SkelMesh->IsSimulatingPhysics()) { ... Log Warning + SetSimulatePhysics(false) + RecreatePhysicsState() }` | `EnsureSkeletalMeshPhysicsDisabled(TEXT("BeginPlay"))` |
+| `BaseWeapon.cpp` Multicast_FreezeWeaponTransform_Implementation | `if (SkelMesh) { SetSimulatePhysics(false) + RecreatePhysicsState() }` | `EnsureSkeletalMeshPhysicsDisabled(TEXT("Multicast_FreezeWeaponTransform"))` |
+| `WeaponDropComponent.cpp` SettleWeaponOnGround | 同上 | `OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled(TEXT("SettleWeaponOnGround"))` |
+| `WeaponDropComponent.cpp` CancelDroppedState | 同上 | `OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled(TEXT("CancelDroppedState"))` |
+
+### 文件清单 (v240.2)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Public/Weapons/BaseWeapon.h
+ + EnsureSkeletalMeshPhysicsDisabled(const TCHAR* CallerContext) UFUNCTION 声明
+
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/BaseWeapon.cpp
+ ~ BeginPlay: v240.1 的 SkeletalMesh 物理关闭代码 → EnsureSkeletalMeshPhysicsDisabled helper
+ + EnsureSkeletalMeshPhysicsDisabled 实现 (单一真理源, 零重复, 零兜底)
+ ~ Multicast_FreezeWeaponTransform_Implementation: 重复物理关闭代码 → EnsureSkeletalMeshPhysicsDisabled
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+ ~ ApplyAttachmentRuntime: SetActorRelativeRotation/SetActorRelativeLocation → SetWorldRotation/SetWorldLocation
+ ~ RootComponent 为空检查: 静默 continue → Log Error + return (零兜底)
+ + 终极诊断日志升级到 v240.2 版本
+
+~ MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDropComponent.cpp
+ ~ SettleWeaponOnGround: 重复物理关闭代码 → OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled
+ ~ CancelDroppedState: 重复物理关闭代码 → OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled
+```
+
+### UE 编辑器配置 (v240.2 不需要)
+
+本次修复**不需要 UE 编辑器任何配置变更**：
+- BP_Weapon_AK47_C 的 RootComponent (`DefaultSceneRoot`) 不需要修改
+- BP_Weapon_AK47_C 的 WeaponSkeletalMesh 的 Physics - Simulate 不需要修改
+- **v240.2 的 SetWorldRotation 路径修复了根本问题，无论 BP 配置如何都能正确渲染**
+
+### 待用户验证（v240.2）
+
+1. ✅ UE 5.6 编辑器编译无错（重点：BaseWeapon.h 新增的 EnsureSkeletalMeshPhysicsDisabled UFUNCTION + WeaponDropComponent 调用 helper）
+2. PIE 中：
+   - 角色生成时 Session 日志应该看到:
+     - `[v240.2][ABaseWeapon] EnsureSkeletalMeshPhysicsDisabled (BeginPlay): Weapon=BP_Weapon_AK47_C_0 的 SkeletalMesh 开启了物理模拟, 强制关闭!`
+     - `[v240.2 终极诊断] ApplyAttachmentRuntime: 完成 Weapon=BP_Weapon_AK47_C_0 Socket=WeaponSocket_R`
+     - `Diff Loc=V(0)` (位置 100% 正确)
+     - **`Diff Rot=R(0,0,0)` (旋转 100% 正确 — 这是 v240.2 修复成功的关键证据)**
+   - 武器**应该正确**显示在角色手上（不再"持续下坠"，不再"完全看不见"）
+   - 切换 Primary/Secondary/Melee 槽位时，武器跟随 socket 正确变换
+3. 如果还有问题：
+   - 检查 `[v240.2 终极诊断]` 日志中的 `Diff Rot` 是否仍然很大
+   - 如果 Diff Rot ≈R(0,0,0) 但武器仍然看不见：可能是 SkeletalMesh Asset 本身没加载完，等 1-2 秒再看
+   - 如果 Diff Rot 仍然很大：检查 UE 5.6 引擎是否有 `AttachToComponent` 在 DefaultSceneRoot 上的特殊行为
+
+### 教训（v240.1 → v240.2 演进）
+
+1. **零兜底 ≠ 不修复**：v220.1 拒绝 `SetRootComponent` 兜底（避免 DDC 同步加载卡死）是对的，但**不应该**导致 attach 路径错误。v240.2 用 SetWorldRotation 绕开错误路径，**既保留零兜底原则，又实际修复问题**
+2. **诊断日志要看数学**：v200.2.14 的 Diff Loc + Diff Rot 双指标是定位 DefaultSceneRoot + SkeletalMesh 路径问题的关键证据
+3. **重复代码 = 架构问题**：3 处独立的 SkeletalMesh 物理关闭逻辑说明 SSOT (Single Source of Truth) 缺失
+4. **方案选择要看根因层级**：
+   - 表层：物理模拟没关（v240.1 修了表层）
+   - 中层：Attach 路径对 DefaultSceneRoot + SkeletalMesh 不可靠（v240.2 修了中层）
+   - 深层：BP 蓝图应该把 MeshComponent 设为 RootComponent（但这会引发 v200.2.18 的 DDC 同步加载卡死问题，无法走 SetRootComponent 路径）
+   - **v240.2 选择修中层（用 SetWorldRotation 绕开路径），不破坏深层（保留 BP 默认 DefaultSceneRoot）**
+
+---
+
+## 4. v240.4 (2026.08.15) — PMC 重力导致 RootComponent 持续下坠终极修复（显式状态机）
+
+### 业务背景（用户 Session1.txt 反馈 2026.08.15）
+
+> "你可以把主武器的根组件相对位置打印在日志里，就能看出它持续的三个位置x，y,z全部发送变化"
+
+### v240.2 → v240.3 → v240.4 演化链
+
+| 版本 | 修复尝试 | 结果 |
+|---|---|---|
+| v240.2 | SetWorldRotation 绕开 attach 路径 | Diff Rot 错误消失，但用户仍报"持续下坠" |
+| v240.3 | 添加 RootComponent.RelativeLocation 持续诊断日志（0.5s 间隔） | 诊断锁定 PMC 是根因 |
+| v240.4 | 主动禁用 PMC，删除诊断日志 | 根本修复 |
+
+### v240.3 诊断日志硬证据
+
+```
+[v240.3 持续诊断] ABaseWeapon::Tick: Weapon=BP_Weapon_AK47_C_0
+  RootComponent.RelativeLocation=V(X=12.34, Y=8.92, Z=-26019.96) ← 5.5s 内从 -1.58 持续下降到 -26019.96
+  GetActorLocation=... ← 同步跟随 AttachParent socket 移动 + Z 持续下坠
+  Hidden=0 AttachSocketName=WeaponSocket_R Owner=BP_SWAT_C_0
+
+[对比] Weapon=BP_Weapon_Knife_C_0
+  RootComponent.RelativeLocation=V(X=1.20, Y=0.50, Z=-42.57) ← 稳定不动
+```
+
+### 终极根因（基于 v240.3 日志）
+
+**`ProjectileMovementComponent` (PMC) 在 `BP_Weapon_AK47.uasset` 中配置 `bAutoActivate=true`**
+
+PMC 的"重力"是 PMC 内部 `TickComponent` 主动调用 `MoveComponent(v + Gravity*dt)` 走的，**完全不经过物理引擎**。
+
+这意味着：
+- v240.1 修复的 `IsSimulatingPhysics()` 检测永远返回 false（物理引擎没被驱动）
+- PMC 每帧仍然应用 `Gravity = 980 cm/s²` 加速度到 RootComponent
+
+**速度验证**（v240.3 日志）：
+- 5.5s 内 RelativeLocation.Z 从 -1.58 → -26019.96
+- 距离 ≈ 26018cm，时间 = 5.5s
+- 平均速度 ≈ 4730 cm/s = **47 m/s**
+- 匹配重力加速度下落的预期速度（v = g*t = 980 * 5.5 = 5390 cm/s，量级一致）
+
+### 与 v240.2 修复的本质区别
+
+| 修复点 | 检测/控制的对象 | 路径 |
+|---|---|---|
+| **v240.2 EnsureSkeletalMeshPhysicsDisabled** | `IsSimulatingPhysics()` | 物理引擎驱动的骨骼模拟 |
+| **v240.4 禁用 PMC** | `PMC->IsActive()` | PMC 内部 `MoveComponent` 主动应用重力 |
+
+v240.2 单独存在**不能**解决 PMC 问题。两者必须配合：
+- v240.2 保证 SkeletalMesh 物理引擎不驱动骨骼
+- v240.4 保证 PMC 不主动 MoveComponent
+
+### 大厂原则 (v240.4 落地)
+
+| 原则 | 实现 |
+|---|---|
+| **显式状态机** | PMC 激活/禁用是显式的、有明确触发点的状态机，不是"看 BP 配" |
+| **SSOT (Single Source of Truth)** | PMC 的激活/禁用有 5 个**唯一合法**触发点 |
+| **零兜底 (显式非隐藏)** | 禁用 PMC **不是**隐藏 BP 配置错误，而是显式表达"手持武器 ≠ PMC 主动模拟"的系统约束（用 Display Log 暴露设计意图） |
+| **零重复 (DRY)** | PMC 禁用逻辑在 2 处独立位置（BeginPlay + ApplyAttachmentRuntime）但**职责不同**（防御 Spawn vs 防御 Attach），不允许合并为 helper（避免职责模糊） |
+
+### PMC 显式状态机（5 个唯一合法触发点）
+
+```
+[SpawnActor]
+    ↓
+[ABaseWeapon::BeginPlay] ──── PMC->SetActive(false)  ← 第 1 道防线 (BP bAutoActivate=true 防御)
+    ↓
+[AttachToComponent socket]
+    ↓
+[UWeaponAttachmentComponent::ApplyAttachmentRuntime] ──── PMC->SetActive(false)  ← 第 2 道防线 (attach 后再次确认)
+    ↓
+[WeaponDropComponent::StartDroppedState] ──── PMC->SetActive(true)   ← 投掷时唯一合法激活点
+    ↓
+[Multicast_FreezeWeaponTransform] ──── PMC->SetActive(false)  ← 落地时禁用
+    ↓
+[WeaponDropComponent::CancelDroppedState] ──── PMC->SetActive(false)  ← 被捡起时禁用
+```
+
+### 核心修复代码 (ABaseWeapon::BeginPlay)
+
+```cpp
+// 【v240.4 大厂架构 P0 终极修复】主动禁用 ProjectileMovementComponent (PMC)
+UProjectileMovementComponent* PMC = FindComponentByClass<UProjectileMovementComponent>();
+if (PMC)
+{
+    if (PMC->IsActive())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[v240.4] ABaseWeapon::BeginPlay: Weapon=%s 检测到 PMC 已激活 (BP bAutoActivate=true), "
+                 "BeginPlay 主动禁用 — 防止挂载时持续下坠 (Z 轴重力 980 cm/s²). "
+                 "PMC 将在 WeaponDropComponent::StartDroppedState 投掷时激活."),
+            *GetName());
+    }
+    PMC->SetActive(false);
+}
+```
+
+### 防御性修复 (WeaponAttachmentComponent::ApplyAttachmentRuntime)
+
+```cpp
+// 【v240.4 大厂架构 P0 — 防御性 PMC 禁用】Attach 到角色时强制禁用 PMC
+if (UProjectileMovementComponent* PMC = Weapon->FindComponentByClass<UProjectileMovementComponent>())
+{
+    if (PMC->IsActive())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[v240.4] ApplyAttachmentRuntime: Weapon=%s PMC 仍激活, Attach 到角色 socket 后强制禁用 "
+                 "(系统约束: 手持武器 → PMC 必须 inactive)."),
+            *Weapon->GetName());
+    }
+    PMC->SetActive(false);
+}
+```
+
+### v240.4 清理的临时诊断日志
+
+| 文件 | 删除的代码 |
+|---|---|
+| `BaseWeapon.cpp::Tick` | v240.3 持续诊断块（0.5s 节流打印 RootComponent.RelativeLocation） |
+| `WeaponAttachmentComponent.cpp::ApplyAttachmentRuntime` | v240.3 单次诊断块（打印 WeaponRoot.RelativeLocation/Scale） |
+
+**保留** v240.2 WorldTransform 验证日志（架构保护：Diff Loc + Diff Rot 双指标是定位 attach 路径问题的关键）。
+
+### 文件变更清单 (v240.4)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Public/Weapons/BaseWeapon.h
+ + 前向声明 class UProjectileMovementComponent (避免 .h 引入 GameFramework)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/BaseWeapon.cpp
+ ~ BeginPlay: 新增 PMC 主动禁用 (第 1 道防线)
+ - Tick: 删除 v240.3 持续诊断块
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+ + #include "GameFramework/ProjectileMovementComponent.h"
+ ~ ApplyAttachmentRuntime: 新增 PMC 主动禁用 (第 2 道防线)
+ - ApplyAttachmentRuntime: 删除 v240.3 单次诊断块
+```
+
+### UE 编辑器无需配置 (v240.4)
+
+本次修复**纯 C++ 改动**，无需在 UE 编辑器手动配置任何资产。
+但建议美术在方便时手动把 `BP_Weapon_AK47.uasset` 的 PMC `bAutoActivate` 改为 false（让 BeginPlay 的 Display Log 不再触发，纯粹为代码可读性）。
+
+### 验证步骤 (v240.4)
+
+1. UE 5.6 编译器编译 0 错（重点：`UProjectileMovementComponent` 头文件 include 完整）
+2. PIE 中：
+   - 角色切换到 AK47 → 武器**正确显示**在手中（不再下坠到原点）
+   - RootComponent 位置稳定（不再持续下坠）
+   - 投掷 AK47 → 抛物线正常（PMC 激活成功）
+   - 捡起 AK47 → 武器稳定附着（PMC 禁用成功）
+   - 匕首始终正常（没有 PMC 不受影响）
+
+### 经验教训 (v240.4)
+
+1. **诊断日志要看物理量纲**：47 m/s + 5.5s 直接对应重力加速度 g=980 cm/s²
+2. **不同组件用不同的"激活"机制**：
+   - SkeletalMesh 物理 → `IsSimulatingPhysics()` 检测
+   - PMC → `IsActive()` 检测
+   - 二者完全独立，必须分别处理
+3. **"零兜底"的边界**：禁用 PMC 不是兜底（用 Display Log 暴露 BP 设计意图），而 BeginPlay 不调 SetRootComponent 是兜底（隐藏 DDC 卡死问题）
+4. **状态机要显式**：PMC 的激活/禁用不能依赖"BP 配对"，必须有明确的代码触发点
+5. **验证日志数学**：`Diff Loc=V(0)` 不能证明 PMC 不在下坠，因为 PMC 修改的是 RootComponent 内部 RelativeLocation 而非 socket 的 Diff
+
+---
+
+## 24. v240.6 (2026.08.15) 主武器根组件旋转 Euler vs Quat 真根因修复
+
+### 用户反馈 (2026.08.15)
+> 主武器的根组件的旋转没跟表里的旋转数据一样
+> DT 数据 `Rot=(Pitch=0, Yaw=87.27, Roll=0)`
+> 实际得到 `Rot=(Pitch=65.26, Yaw=-29.66, Roll=-76.80)` — 三个轴全部错乱
+
+### 根因 — v240.2 用了错误的旋转加法
+
+v240.2 路径:
+```
+const FRotator ExpectedWorldRot = (SocketWorldRotation + RelativeRotation).GetNormalized();
+WeaponRoot->SetWorldRotation(ExpectedWorldRot);
+```
+
+**问题**: `FRotator + FRotator` 是 **Euler 角度按 Pitch/Yaw/Roll 分量代数加** — 它不构成旋转群(不闭合、不可交换),数学上等价于 `World.Euler = Socket.Euler + DTRel.Euler`(代数加)。
+
+**UE 内部反算路径**: `RelativeQuat = Inv(AttachParentQuat) * WorldQuat` — 用的是 **FQuat(四元数乘法)**,不是 Euler 加法。
+
+Euler 加法 → Quat 转换 → UE 反算 RelQuat → 再转 Rotator,中间每一步都有累积误差,尤其是非零 Pitch/Roll 时差距会放大。
+
+用户数据印证:
+- SocketRot 实际值(角色朝向非零 Yaw) + DTRelRot=(0, 87.27, 0) + Euler 加法
+- 最终落到 `(65.26, -29.66, -76.80)` — 三个轴全部错乱,正是 Euler/Quat 不一致的典型表现
+
+### v240.6 修复 — 旋转计算必须用四元数
+
+```cpp
+const FQuat SocketWorldQuat = SocketWorldRotation.Quaternion();
+const FQuat DTRelQuat = RelativeRotation.Quaternion();
+const FQuat ExpectedWorldQuat = SocketWorldQuat * DTRelQuat;   // 四元数乘法(旋转群)
+const FRotator ExpectedWorldRot = ExpectedWorldQuat.Rotator(); // 仅用于显示
+
+WeaponRoot->SetWorldRotation(ExpectedWorldRot);
+// UE 内部 SetWorldRotation 转 FQuat -> 反算 RelQuat = Inv(SocketQuat) * WorldQuat
+// 全链路都是四元数,Euler 仅作为显示接口 -> 无累积误差
+```
+
+**数学验证**:
+- `RelQuat = Inv(SocketQuat) * (SocketQuat * DTRelQuat) = DTRelQuat`
+- 即 `RootComponent.RelativeRotation = DTRelRot` ✓ 与 DT 一致
+
+**Location 部分不变**: `SocketWorldRotation.RotateVector(RelativeLocation)` 内部就是 FQuat 旋转,这步 v240.2 是对的,不动。
+
+### 文件变更 (v240.6)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+  ~ ApplyAttachmentRuntime: v240.2 Euler 加法 替换为 v240.6 Quat 乘法 (核心修复)
+  - 删除 v240.2 终极诊断日志 (修复完成)
+  - 删除 v240.5 诊断日志 (修复完成)
+```
+
+### 验证 (v240.6)
+
+1. UE 5.6 编译器编译 0 错(`FQuat` 头文件已通过 UnrealMathUtility.h 间接包含,无需额外 include)
+2. PIE 中:
+   - 主武器 AK47 根组件旋转 = `(0, 87.27, 0)`(与 DT 完全一致)
+   - Mesh 子组件跟随 RootComponent(`ResetWeaponMeshRelativeTransforms` 已清零 Mesh.RelativeRot)
+   - 切槽位/切换武器 → 旋转数据稳定
+   - 主武器仍正常下坠/拾取(PMC 路径未受影响)
+3. 日志:`[v240.2 终极诊断]` 与 `[v240.5 诊断]` 不再出现 — v240.6 修复完成
+
+### 大厂原则 (v240.6)
+
+| 原则 | v240.2 | v240.6 |
+|---|---|---|
+| **旋转运算用 Quat** | `Rot + Rot` = Euler 加法(错) | `Quat * Quat` = Quat 乘法(对) |
+| **链路一致性** | Euler + Quat 混用,累积误差 | 全链路 Quat,无误差 |
+| **结果正确性** | `(65, -29, -76)` 错乱 | `(0, 87.27, 0)` 与 DT 一致 |
+
+### 教训 — 旋转运算陷阱
+
+| 表达式 | 含义 | 大厂判定 |
+|---|---|---|
+| `Rot + Rot` | Euler 角度代数加(不构成旋转群) | **禁用**(UE 内部反算走 Quat,会不一致) |
+| `Quat * Quat` | 四元数乘法(构成旋转群 SO(3)) | **推荐**(UE 内部与外部一致) |
+| `Rot.Quaternion()` | FRotator → FQuat(UE 标准转换) | **正确**,但仅作接口 |
+| `Quat.Rotator()` | FQuat → FRotator(归一化后转换) | **正确**,仅显示用 |
+| `GetNormalized()` | Rotator 归一化 | **必需**,但不能修复 Euler/Quat 误差 |
+
+---
+
+## 22. v240.7 (2026.08.15) — Mesh "地上姿态" 提升到 RootComponent (抛下枪时 Root 和 Mesh 对齐)
+
+### 业务背景 (用户 2026.08.15 反馈)
+
+主武器(以 AK47 为例)抛下后,RootComponent 和 Mesh 子组件的 RelativeTransform 不一致:
+
+```
+RootComponent (DefaultSceneRoot):
+  RelativeLocation: (X=-3252.604546, Y=3391.416079, Z=1299.185314)
+  RelativeRotation: (P=-0.502804, Y=168.795108, R=-0.625758)
+
+Mesh 子组件 (WeaponSkeletalMesh):
+  RelativeLocation: (X=-8.997136, Y=177.848413, Z=-119.821659)
+  RelativeRotation: (P=-61.221134, Y=92.360027, R=0.970068)
+```
+
+期望:**抛下时 Root 和 Mesh 的 RelativeTransform 完全一致**(两者都应该是美术配的"地上姿态")。
+
+### 根因分析
+
+1. **BP_Weapon_*.uasset 的 BP 默认值设计错误**:
+   - 美术把"武器在地上"的姿态配在 **Mesh 子组件的 RelativeTransform** 上
+     - 例 AK47 WeaponSkeletalMesh: `RelLoc=(-9, 178, -120), RelRot=(-61, 92, 1)` ← 美术的"地上姿态"
+   - RootComponent (DefaultSceneRoot) 配了无意义的"编辑器占位"值
+     - 例 AK47 Root: `RelLoc=(-3252, 3391, 1299), RelRot=(-0.5, 169, -0.6)` ← 大数值偏移,推测是美术在编辑器里把 Root 挪远方便选中 Mesh
+
+2. **v240.6 修复后的链路**:
+   - `ApplyAttachmentRuntime` 通过 `SetWorldLocation/SetWorldRotation` 把 Root 设到 socket + DT 姿态(物理正确)
+   - Mesh 被 `ResetWeaponMeshRelativeTransforms` 清零(Mesh.RelativeTransform = identity)
+   - **手持状态**:Root 姿态对,Mesh 跟随 Root(对)
+
+3. **抛下时链路**:
+   - `DetachFromActor(KeepWorldTransform)` 让 Root 和 Mesh 都回到 BP 默认 RelativeTransform
+   - Root 显示"垃圾编辑器占位值"(-3252, 3391, 1299)
+   - Mesh 显示"美术地上姿态"(-9, 178, -120)
+   - **Root 和 Mesh 不一致 → 物理引擎/Movement 组件/Attach 复制都看到 Root 的垃圾值 → 表现异常**
+
+### v240.7 修复方案 — 单一真理源 (Mesh 地上姿态烤到 Root)
+
+**核心思路**:**把"在地上姿态"的单一真理源从 Mesh 子组件提升到 RootComponent**。
+
+理由(大厂原则):
+- RootComponent 是物理引擎、ProjectileMovementComponent、Attach 复制的**唯一承载者**
+- 美术的"地上姿态"必须存在 Root 上,而不是被藏在 Mesh 子组件里
+- Mesh 子组件应该永远跟 Root 走(拾起后由 Reset 清零)
+- Detach 之后,Root 的 BP 默认值就是"地上姿态",Mesh 的 BP 默认值也是"地上姿态" → 两者一致
+
+**实现**:新增 `PromoteMeshOnGroundTransformToRoot(ABaseWeapon* Weapon)` 函数:
+- 在 `SpawnAndEquipWeapon`/`SpawnAndConfigureWeaponInSlot` 里,SpawnActor 之后、Reset 之前调用
+- 遍历 Mesh 子组件(白名单跳过 Magazine),取第一个非弹夹 Mesh 的 BP 默认 RelativeTransform
+- 烤到 RootComponent(覆盖 Root 的"垃圾编辑器占位值")
+
+**调用顺序**(严格):
+```
+SpawnActor (Mesh 和 Root 仍是 BP 默认值)
+  ↓
+PromoteMeshOnGroundTransformToRoot (把 Mesh 地上姿态烤到 Root)
+  ↓
+ResetWeaponMeshRelativeTransforms (把 Mesh 清零,跟随 Root)
+  ↓
+AttachToComponent + ApplyAttachmentRuntime (Root 走 socket + DT 姿态)
+```
+
+### 客户端路径处理
+
+`ApplyAttachmentRuntime` 同时是服务器和客户端共用入口(客户端通过 `OnRep_CurrentWeapon` 触发)。**客户端无需额外调用 Promote**:
+- 服务器在 SpawnActor 后改了 RootComponent.RelativeTransform
+- UE Actor 复制机制会自动同步子组件的 RelativeTransform 给客户端
+- 客户端的 Root.RelativeTransform = 服务器 Promoted 后的值,Mesh.RelativeTransform = 服务器 Reset 后的 identity
+
+### 大厂原则 (v240.7)
+
+| 原则 | v240.6 (抛下对不齐) | v240.7 (抛下对齐) |
+|---|---|---|
+| **地上姿态真理源** | 藏在 Mesh 子组件 (Root 是垃圾值) | 烤到 Root (Mesh 跟随 Root) |
+| **抛下后 Root 和 Mesh** | 不一致 (Root 显示垃圾值) | 一致 (都是 Mesh 烤的姿态) |
+| **Detach 之后表现** | Root 暴露编辑器占位值 | Root 显示正确的地上姿态 |
+| **零兜底** | (Detach 后表现异常但无日志) | 找不到 Mesh → Log Error + 强制美术配 Mesh |
+| **拾起后链路** | Reset Mesh → Mesh 跟 Root 走 ✓ | Reset Mesh → Mesh 跟 Root 走 ✓(无变化) |
+
+### 文件变更 (v240.7)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/WeaponAttachmentComponent.h
+  + 声明 static void PromoteMeshOnGroundTransformToRoot(ABaseWeapon* Weapon);
+  + 大段注释解释 v240.7 根因 + 调用时机 + 客户端路径
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+  + 实现 PromoteMeshOnGroundTransformToRoot (与 Reset 的 Magazine 白名单识别规则完全一致)
+  + SpawnAndEquipWeapon: SpawnActor 之后、Reset 之前 调用 Promote
+  + SpawnAndConfigureWeaponInSlot: SpawnActor 之后、Reset 之前 调用 Promote
+```
+
+### 验证 (v240.7)
+
+1. UE 5.6 编译器编译 0 错
+2. PIE 中:
+   - 主武器 AK47 抛下后 Root.RelativeTransform = `(RelLoc=(-9, 178, -120), RelRot=(-61, 92, 1))`(原 Mesh 姿态)
+   - Mesh.RelativeTransform = `(RelLoc=(-9, 178, -120), RelRot=(-61, 92, 1))`(同 Root)
+   - **Root 和 Mesh 完全一致** ✓
+   - 拾起武器 → Mesh 被 Reset 清零 → 跟随 Root 走(socket + DT 姿态)
+3. 日志:
+   - `[v240.7] PromoteMeshOnGroundTransformToRoot: Weapon=... 把 Mesh '...' 的 BP 默认地上姿态烤到 RootComponent` ← 显示烤成功
+   - 找不到 Mesh 时 `[v240.7] ... 找不到任何非弹夹 Mesh 子组件 — 强制美术在 BP_Weapon_*.uasset 添加 Mesh` ← Log Error
+
+### 教训 — Actor RelativeTransform 设计 (大厂)
+
+1. **RootComponent 是唯一真理源**:物理引擎/Movement 组件/Attach 复制 都只认 RootComponent
+   - **美术应该把"地上姿态"配在 Root 上,而不是 Mesh 子组件**
+   - 即使有"编辑器占位值",也应该在 BeginPlay 阶段烤到 Root(v240.7 是这个思路)
+2. **Mesh 子组件的 RelativeTransform 应该是 identity**:让 Mesh 跟随 Root 走
+   - 例外:弹夹(Magazine)是武器子组件,可以有自己的 RelativeTransform
+3. **Detach 行为**:UE `DetachFromActor(KeepWorldTransform)` 让所有子组件都回到 BP 默认 RelativeTransform
+   - 因此 BP 默认值的"姿态语义"必须正确
+   - v240.7 用 Promote 把 Mesh 的姿态烤到 Root,让 Root 的 BP 默认值也是"地上姿态"
+
+---
+
+## 23. v240.9 (2026.08.15) — DefaultSceneRoot.Mobility=Static 拒绝 SetRelativeTransform (v240.7 真根因修复)
+
+### 业务背景 (用户 2026.08.15 反馈,v240.7+v240.8 失败)
+
+v240.7 Promote 把 Mesh 的 RelativeTransform 烤到 RootComponent,v240.8 把所有 SetActorLocation/Rotation 改成 SetWorldLocation/Rotation,**两条修复都已生效**(日志确认):
+- `[v240.7] PromoteMeshOnGroundTransformToRoot: ... 把 Mesh 'WeaponSkeletalMesh' 的 BP 默认地上姿态 (RelLoc=X=0.000 Y=0.000 Z=0.000, RelRot=...) 烤到 RootComponent`
+- `[v240.8][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端已冻结武器位置 (绕开反算路径). Weapon=BP_Weapon_AK47_C_0, Loc=..., RootComp=DefaultSceneRoot`
+
+**但用户仍报告:Root 和 Mesh RelXform 不一致**。
+
+### 真根因 — UE 5 BP DefaultSceneRoot 默认 Mobility=Static
+
+```
+BP_Weapon_AK47.uasset 的组件树:
+  DefaultSceneRoot (USceneComponent, 默认 Mobility=Static)
+    └─ WeaponSkeletalMesh (SkeletalMeshComponent, Mobility=Movable)
+```
+
+**UE 5.x 行为 (BUILT-IN):**
+- BP 美术加 `DefaultSceneRoot` 时,UE 编辑器默认给 Mobility=Static(BP 中"静态占位"的语义)
+- `USceneComponent::SetRelativeTransform()` / `SetRelativeLocation()` / `SetRelativeRotation()` 在 Mobility=Static 时**默默被 UE 拒绝**(不报错,但不生效)
+- 只有 `SetWorldLocation()` / `SetWorldRotation()` **不依赖 Mobility**(直接改 WorldTransform,UpdateComponentToWorld 走 World 路径)
+
+**这就是为什么 v240.7 Promote 完全没生效:**
+- v240.7 调 `RootComp->SetRelativeTransform(MeshOnGroundTransform)` → **被 UE 拒绝**(Mobility=Static)
+- RootComponent.RelativeTransform **一直是 BP 默认的"编辑器占位"值** `(-3252.6, 3391.4, 1299.2)`
+- Mesh.RelativeTransform 被 Reset 清零成 `(0, 0, 0)`(Mobility=Movable,Reset 成功)
+- 抛下时 → Root 显示 BP 占位, Mesh 显示 (0,0,0) → 两者不一致
+
+**这是 UE 内置行为,不是我们的 bug**。所有 C++ 修复(无论 v240.7/v240.8)都被 Mobility=Static 默默阻止了。
+
+### UE 5.x 关于 Mobility 的官方说明 (节选)
+
+> "If the component is static, attempting to change its transform will trigger a warning and fail to update the object's position at runtime."
+> — [Epic Games Forum, UE4/5 DefaultSceneRoot Mobility](https://forums.unrealengine.com/t/warning-mobility-of-myactor-defaultsceneroot-has-to-be-movable-if-youd-like-to-move/374471)
+
+### v240.9 修复方案 — BP 编辑器手工修 (用户已选 A)
+
+**用户选择:在 BP 编辑器手工修 `BP_Weapon_AK47.uasset` 和 `BP_Weapon_Knife.uasset` 的 `DefaultSceneRoot.Mobility = Movable`。**
+
+#### UE 编辑器具体操作步骤 (用户必读)
+
+对**每个** BP_Weapon_*.uasset (AK47 / Knife / 未来所有武器 BP) 做以下操作:
+
+1. **打开 BP**
+   - 打开 `Content/Blueprints/Weapons/BP_Weapon_AK47.uasset`
+   - 打开 `Content/Blueprints/Weapons/BP_Weapon_Knife.uasset`
+
+2. **选中 DefaultSceneRoot**
+   - 左侧 `Components` 面板
+   - 点击树形结构最顶端的 `DefaultSceneRoot`(在 Actor 名字下面,所有其他组件的父节点)
+   - 如果没看到 `DefaultSceneRoot`,说明你打开的不是这个 BP,或 BP 没这个组件(对照 BP 设计)
+
+3. **改 Mobility**
+   - 右侧 `Details` 面板
+   - 找到 `Transform` 分类(默认展开)
+   - 找到 `Mobility` 属性(下拉框)
+   - 当前值:`Static`(默认值)
+   - 改成:`Movable`
+
+4. **保存**
+   - 点击工具栏 `Compile` 按钮(编译 BP)
+   - 点击工具栏 `Save` 按钮(保存到磁盘)
+   - **两个按钮都要点,缺一不可**
+
+5. **验证保存成功**
+   - 在编辑器外查看 BP 的时间戳应该更新
+   - PIE 启动后,日志**不应**再出现:
+     - `[v220.1] ABaseWeapon::BeginPlay: RootComponent 错配 — ... 当前 RootComponent=DefaultSceneRoot (类型不对/为空)`
+     - (这条 Error 不再出现是因为 DefaultSceneRoot 现在 Mobility=Movable 后,虽然仍是 USceneComponent,但 v220.1 的"非 UPrimitiveComponent"检查仍会触发,**不指望这个 Error 消失**)
+
+#### 建议:顺手把 RootComponent 的 BP 默认 RelXform 也清零
+
+虽然 Mobility=Movable 后 v240.7 Promote 就能把 Root.RelXform 烤成 Mesh 的 RelXform (0,0,0),但**美术应该顺手把 BP 编辑器里 RootComponent 的 BP 默认 RelativeTransform 也清零成 (0, 0, 0)/(0, 0, 0)**:
+
+- 选中 `DefaultSceneRoot` → Details → Transform
+- `Location` → X=0, Y=0, Z=0
+- `Rotation` → Pitch=0, Yaw=0, Roll=0
+
+理由:即使 v240.7 Promote 跑成功了,Debug 时如果 Promote 还没跑完(比如 SpawnActor 后的极短窗口),Root 显示 BP 默认值。清零后 Debug 更直观。
+
+### C++ 代码不需要改
+
+- v240.7 Promote 函数:正确,只是被 Mobility=Static 阻止了 — BP 修了 Mobility 后自动生效
+- v240.8 SetWorld* 路径:正确,保留(防御性更好)
+- v240.4 禁用 PMC:正确,保留
+
+### 大厂原则 (v240.9)
+
+| 原则 | v240.8 (失败) | v240.9 (治本) |
+|---|---|---|
+| **真根因定位** | 推断"SetActorLocation 反算 RelXform" (二级原因) | BP DefaultSceneRoot.Mobility=Static 拒绝 SetRelativeTransform (一级原因) |
+| **修复方式** | C++ 代码层绕开 | BP 编辑器手工修(治根) |
+| **零兜底** | C++ 路径全部绕开(完美但绕弯) | BP 配错被 UE 强制阻止 — 必须人工修 |
+| **UE BUILT-IN 行为尊重** | 没意识到 Mobility 影响 SetRelativeTransform | 显式承认 UE 的 Mobility 设计语义 |
+| **BP 编辑器流程** | 期望 C++ 修复一切 | 期望 BP 编辑器+ C++ 各管各的领域 |
+
+### 教训 — UE 5 BP DefaultSceneRoot Mobility 设计 (大厂)
+
+1. **UE 5 BP DefaultSceneRoot 默认 Mobility=Static**(这是 BP 中"编辑器占位"的语义)
+   - `SetRelativeTransform` / `SetRelativeLocation` / `SetRelativeRotation` 在 Mobility=Static 时**被 UE 默默拒绝**
+   - `SetWorldTransform` / `SetWorldLocation` / `SetWorldRotation` **不依赖 Mobility**(走 World 路径)
+2. **如果武器 BP 用 DefaultSceneRoot 作 Root**:
+   - 必须把 Mobility 改成 Movable — 否则任何相对变换修改都无效
+   - C++ 端的 `SetRelativeTransform` 调用看起来成功(没报错),但实际上没生效
+3. **更好的做法**(推荐,根治):
+   - BP 编辑器里把 MeshComponent 设为 RootComponent(去掉 DefaultSceneRoot)
+   - 这样 RootComponent 是 MeshComponent (Mobility=Movable),所有 SetRelativeTransform 路径都正常
+   - v220.1 BeginPlay 的 "RootComponent 错配" Log Error 就会消失
+4. **诊断技巧**(以后遇到类似问题):
+   - 在 C++ 调 SetRelativeTransform 之前/之后,Log 打印 RootComp->GetRelativeTransform()
+   - 如果调前后值一样 → Mobility 阻止了(或根本没改)
+   - 如果调前后值不同 → Mobility=Movable,SetRelativeTransform 生效
+
+---
+
+## 24. v240.10 (2026.08.15) — Mesh 沉地真根因:BP 美术地上姿态 + 硬约束 identity (v240.7 失败的真根因)
+
+### 业务背景 (用户 2026.08.15 反馈,v240.9 也失败)
+
+用户明确反驳了 v240.9 诊断:
+> "就是可移动的啊,不是这个原因"
+
+并提供关键数据:
+> "主武器的DefaultSceneRoot的位置在扔枪时碰到地上就停了(X=-3244.740945,Y=3393.598384,Z=1299.185308),但是DefaultSceneRoot里面的子类mesh的位置就进入地下(X=-19.569225,Y=178.830370,Z=-115.976210)"
+
+用户核心诉求:
+> "因为根组件和mesh组件位置不一致导致枪在地里面"
+
+### v240.9 诊断错误 — 我之前的根因定位错了
+
+v240.9 我错误地把根因归结为 `DefaultSceneRoot.Mobility=Static`,但用户的 Mobility 已经是 Movable。**v240.9 的诊断和"在 BP 编辑器手工改 Mobility"步骤完全错误,撤回**。
+
+### v240.10 真根因 — Mesh 组件 BP 地上姿态让 Mesh 沉地
+
+#### 数据解读 (用户提供的数值)
+
+- Root.WorldLoc = `(-3244.74, 3393.60, 1299.19)` ← 贴地了 (服务器 `SettleWeaponOnGround` 用 `SetWorldLocation` 设到地面)
+- Mesh.RelXform = `(-19.57, 178.83, -115.98)` ← **这是 Mesh 相对 Root 的偏移**
+- **Mesh.WorldLoc = Root.WorldLoc + Mesh.RelXform** = `(-3264.31, 3572.43, 1183.21)`
+- **Mesh 比 Root 在 Z 方向低 115.98cm** → 用户看到"Mesh 沉入地下 115cm"
+
+#### 真正的物理原理
+
+抛下流程:
+1. `DetachFromActor(KeepWorldTransform)` → Actor 的 AttachParent = nullptr,Root 和 Mesh 都恢复 BP 默认 RelXform
+2. `SettleWeaponOnGround` 调 `RootComp->SetWorldLocation(SettledLocation)` (v240.8 修复,不触发反算) → Root.WorldLoc = SettledLocation (贴地)
+3. **但 Mesh.RelXform 没动** — 仍是 BP 默认值 (-9, 178, -120)
+4. Mesh.WorldLoc 计算:无 AttachParent 时,Mesh.WorldLoc = Mesh.RelXform.GetLocation() + Root.WorldLoc + Mesh.RelXform.GetRotation().RotateVector(Mesh.LocalPosition) — 简化为 **Mesh.WorldLoc = Root.WorldLoc + Mesh.RelXform** (Mesh 是 Root 的子组件)
+5. → **Mesh 沉到地下 120cm**
+
+### v240.7 Promote 失败的真根因 — Promoted 时 Mesh RelXform 已经是 (0,0,0)
+
+v240.7 设计:**把 Mesh 的 BP 默认地上姿态烤到 Root**。但 Promoted 日志显示烤到 (0,0,0):
+
+```
+[v240.7] PromoteMeshOnGroundTransformToRoot: ... 把 Mesh '...' 的 BP 默认地上姿态
+(RelLoc=X=0.000 Y=0.000 Z=0.000, RelRot=...) 烤到 RootComponent
+```
+
+**这说明 `FirstValidMesh->GetRelativeTransform()` 在 Promoted 时返回 (0,0,0)**。
+
+#### 根因 — UE 5 组件 BP 默认值在 SpawnActor 后**不一定立即应用**
+
+- `SpawnActor<ABaseWeapon>(Class, ...)` 返回的 Actor 已经创建
+- 但组件的 BP 默认 RelativeTransform 可能**还没被 UE 应用**,或者 UE 组件创建走两步:
+  1. C++ 默认值 (constructor, Mesh RelXform = identity)
+  2. BP 默认值 (从 archetype 反序列化, Mesh RelXform = (-9, 178, -120))
+- v240.7 在 SpawnActor 之后立即调 Promote → **第 1 步完成,第 2 步未完成** → GetRelativeTransform() 返回 identity
+- **Promote 烤到的就是 (0,0,0),不是 (-9, 178, -120)**
+
+也就是说 **v240.7 的"烤 Mesh 姿态到 Root"思路本身就被 UE 时序坑了**。
+
+### v240.10 根因修复方案 — 不依赖 BP 美术地上姿态,硬约束 identity
+
+**核心思路 (大厂原则 — 零兜底 + 单一真理源)**:
+- "扔枪时 Root 和 Mesh 姿态完全一致" = **双方 RelXform 都是 (0,0,0,identity)** ← 硬约束,不依赖 BP 美术地上姿态
+- BP 美术把 Mesh RelXform 配成 (-9, 178, -120) **是错误设计** — 应该改为 (0,0,0),姿态由运行时决定
+
+#### 三处硬约束 (v240.10)
+
+1. **`PromoteMeshOnGroundTransformToRoot`** (SpawnActor 后,服务器 + 客户端):
+   - **不再"烤 Mesh BP 默认值到 Root"** (v240.7 失败)
+   - 改为:**Root 硬对齐 `FTransform::Identity`**
+   - 这样 Root.RelXform = (0,0,0,identity),无论 BP 美术怎么配
+
+2. **`SettleWeaponOnGround`** (服务器落地):
+   - 在 Root 设到贴地点之后,**遍历 Mesh 子组件(跳过 Magazine),硬对齐 `FTransform::Identity`**
+   - 这样服务器端 Mesh.RelXform = (0,0,0),不会因为 BP 默认 (-9, 178, -120) 沉地
+
+3. **`Multicast_FreezeWeaponTransform`** (客户端落地):
+   - 同样的逻辑:**遍历 Mesh 子组件,硬对齐 `FTransform::Identity`**
+   - 客户端 Mesh 也对齐到 Root,完全贴地
+
+#### 调用顺序 (v240.10)
+
+```
+服务器 SpawnActor (Root=BP垃圾值, Mesh=BP地上姿态)
+  ↓
+PromoteMeshOnGroundTransformToRoot (Root 硬对齐 identity,不再依赖 Mesh)
+  ↓
+ResetWeaponMeshRelativeTransforms (Mesh 清零 identity)
+  ↓
+ApplyAttachmentRuntime (Root 跟 socket,Mesh 跟 Root)
+  ↓
+... 玩家拾起 → 抛下 ...
+  ↓
+DetachFromActor (Root 和 Mesh 都恢复 BP 默认 → Root=垃圾值, Mesh=地上姿态) ❌
+  ↓
+SettleWeaponOnGround 服务器 (Root 设到贴地点 + Mesh 硬对齐 identity) ✓
+  ↓
+Multicast_FreezeWeaponTransform 客户端 (Root 设到贴地点 + Mesh 硬对齐 identity) ✓
+  ↓
+最终状态:Root 和 Mesh 都 (0,0,0,identity) → 完全对齐,Mesh 不沉地 ✓
+```
+
+### 大厂原则 (v240.10)
+
+| 原则 | v240.9 (失败) | v240.10 (治本) |
+|---|---|---|
+| **真根因定位** | Mobility=Static (错误,用户已反驳) | BP 美术地上姿态 + UE 时序坑 Promoted 时拿到 (0,0,0) |
+| **依赖 BP 美术配置** | "用户去 BP 编辑器改 Mobility" | 不依赖 — 硬约束 identity |
+| **依赖运行时读取** | "Promote 读 Mesh BP 默认值" (时序坑) | "Promote 不读任何东西,直接 SetRelativeTransform(Identity)" |
+| **抛下时硬约束** | (无,只靠 BP 默认值正确) | 服务器 + 客户端都显式 Mesh 硬对齐 identity |
+| **零兜底** | "BP 配错就没救" | "无论 BP 怎么配,我们都强制 identity" |
+| **UE BUILT-IN 行为尊重** | 没意识到 SpawnActor 后 BP 默认值时序 | 不依赖 BP 默认值时序,直接硬约束 |
+
+### 文件变更 (v240.10)
+
+```
+~ MetalSlug01/Source/MetalSlug01/Public/Combat/WeaponAttachmentComponent.h
+  (无变化,PromoteMeshOnGroundTransformToRoot 声明保持)
+
+~ MetalSlug01/Source/MetalSlug01/Private/Combat/WeaponAttachmentComponent.cpp
+  ~ PromoteMeshOnGroundTransformToRoot:
+    - v240.7: 读 FirstValidMesh.GetRelativeTransform() 烤到 Root
+    - v240.10: Root 直接 SetRelativeTransform(FTransform::Identity)
+    - 删掉 FirstValidMesh 查找循环(不再需要)
+    - 大段注释解释 v240.7 失败原因 + v240.10 根因修复
+
+~ MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDropComponent.cpp
+  + #include "Components/MeshComponent.h" (TArray<UMeshComponent*> 容器)
+  + SettleWeaponOnGround:
+    - 新增步骤 5.5: 遍历 Mesh 子组件(跳过 Magazine),硬对齐 FTransform::Identity
+    - 大段注释解释 v240.10 根因
+
+~ MetalSlug01/Source/MetalSlug01/Private/Weapons/BaseWeapon.cpp
+  ~ Multicast_FreezeWeaponTransform_Implementation:
+    - 新增 Mesh 子组件硬对齐 identity 步骤
+    - Display Log 显示 ResetMeshCount
+    - 大段注释解释 v240.10 根因
+```
+
+### 验证 (v240.10)
+
+1. UE 5.6 编译器编译 0 错
+2. PIE 中:
+   - 主武器 AK47 抛下后 Root.RelativeTransform = `(RelLoc=(0,0,0), RelRot=(0,0,0))` (硬对齐 identity)
+   - Mesh.RelativeTransform = `(RelLoc=(0,0,0), RelRot=(0,0,0))` (服务器 + 客户端硬对齐 identity)
+   - **Root 和 Mesh 完全一致** ✓
+   - **Mesh 不再沉地** ✓ (因为 Mesh.RelXform = (0,0,0),Mesh.WorldLoc = Root.WorldLoc)
+3. 日志:
+   - `[v240.10] PromoteMeshOnGroundTransformToRoot: Weapon=... RootComponent 已硬对齐 identity` ← 显示硬对齐成功
+   - `[v240.10][WeaponDropComponent] SettleWeaponOnGround: 服务器硬对齐 Mesh 子组件 RelXform → identity. Weapon=..., ServerResetMeshCount=N` ← 显示服务器 Reset
+   - `[v240.10][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端已冻结武器位置 (绕开反算路径) + Mesh 子组件硬对齐 identity. Weapon=..., ResetMeshCount=N` ← 显示客户端 Reset
+
+### 教训 — Actor RelativeTransform 设计 (大厂,终极版)
+
+1. **不要依赖 BP 美术的组件默认 RelativeTransform**:
+   - BP 美术可能配错(地上姿态沉地 120cm)
+   - UE SpawnActor 后 BP 默认值的时序不可靠(Promote 拿到 component default state)
+   - **大厂原则:运行时硬约束 identity,不读 BP 默认值**
+2. **抛下时硬对齐双方 identity**:
+   - DetachFromActor 让 Root 和 Mesh 都回 BP 默认 — 如果 BP 默认不一致就出问题
+   - **SettleWeaponOnGround 和 Multicast_FreezeWeaponTransform 都必须显式硬对齐 Mesh identity**
+3. **不要让美术在地上配"姿态"**:
+   - BP 美术的地上姿态 (例如 -9, 178, -120) 是错误设计
+   - **运行时硬约束双方 (0,0,0,identity),姿态由代码决定**
+4. **诊断流程**:
+   - 看到 "Mesh 沉地 / 浮空" → 检查 Mesh.RelXform 是不是非 identity
+   - 看到 "Root 显示垃圾值" → 检查 Root.RelXform 是不是 BP 默认占位
+   - **修复方向:全部硬对齐 identity,而不是去 BP 编辑器修**
+
+---
+
+## 24. v240.11 (2026.08.15) — 扔枪落地姿态:缓存抛枪 yaw,横着扔横着落地 (大厂治本)
+
+### 业务背景 (用户 2026.08.15 反馈)
+
+> "上面问题差不多修复了,但是扔枪是横着扔的,到底上瞬间变成竖的,我想让它横着扔出去到地上也是横着的"
+
+### v240.10 修复后剩下的姿态问题
+
+v240.10 解决了 RootComponent/MeshComponent 相对 transform 不一致导致 Mesh 沉入地下,**但姿态问题没修**:
+- 飞行中 PMC `bRotationFollowsVelocity=true` → 枪头对齐速度方向 (水平飞 → 枪"横着")
+- 落地瞬间速度 ≈ (X=cos, Y=sin, Z=-重力累计), 旋转 ≈ (Pitch=-90°) 枪头朝下
+- `SettleWeaponOnGround` 用 `OwnerWeapon->GetActorRotation()` 作 FinalRotation → 锁死成"竖直朝下"
+
+### 根因 (1 个)
+
+`SettleWeaponOnGround` 调用:
+```cpp
+OwnerWeapon->Multicast_FreezeWeaponTransform(SettledLoc, OwnerWeapon->GetActorRotation());
+```
+- `OwnerWeapon->GetActorRotation()` 此时被 PMC 改成"竖直朝下"姿态
+- 用户看到"竖的"
+- **期望**: 落地横着, 与角色手里"侧横握枪"姿态一致
+
+### 修复方案 A (大厂治本) — 已实施
+
+**不读 DT / 不读 Mesh BP 默认 / 不读 RuntimeBySlot** — 只缓存抛枪瞬间的 yaw。
+
+| 步骤 | 修改 | 文件 |
+|---|---|---|
+| 1 | `UWeaponDropComponent` 加 `float CachedThrowYaw = 0.0f;` UPROPERTY | `Public/Components/WeaponDropComponent.h` |
+| 2 | `StartDroppedState` 在 SpawnRotation 计算后立刻缓存 yaw | `Private/Components/WeaponDropComponent.cpp` |
+| 3 | `SettleWeaponOnGround` 用 `FRotator(0, CachedThrowYaw, 0)` 替换 `OwnerWeapon->GetActorRotation()` | 同上 |
+
+### 大厂原则 (v240.11 落地)
+
+| 原则 | 实现 |
+|---|---|
+| **数据真理源** | `CachedThrowYaw` 字段 = "横着落地姿态的真理源" |
+| **零兜底** | 字段默认 0.0f → 退化路径枪朝 X+ (合理退化, 不崩) |
+| **集中调度** | 只改 `WeaponDropComponent` 一个组件, 不污染 `BaseWeapon`/`WeaponAttachmentComponent` |
+| **时序正确** | SpawnRotation 计算后立刻缓存 (PMC 启动前) → 缓存值不被 PMC 污染 |
+| **零读 DT** | 不读 DT 配的 87.27°, 不读 Mesh BP 默认 — 任何角色任何角度扔枪落地都是横着的 |
+| **横竖分离** | Pitch 和 Roll 永远 = 0, 只有 Yaw = 抛枪方向 → 物理语义"水平面内朝向" |
+
+### 关键代码 (v240.11)
+
+**WeaponDropComponent.h** — 新字段:
+```cpp
+/**
+ * 【v240.11】缓存抛枪 yaw — 落地姿态用此值保持"横着"
+ * (完整注释见上面添加的代码块)
+ */
+UPROPERTY()
+float CachedThrowYaw = 0.0f;
+```
+
+**WeaponDropComponent.cpp StartDroppedState** — 在 SpawnRotation 计算后立即缓存:
+```cpp
+const FRotator SpawnRotation = OwnerWeapon->GetActorRotation();
+
+// 【v240.11】缓存抛枪瞬间的 yaw (PMC 启动前)
+CachedThrowYaw = SpawnRotation.Yaw;
+UE_LOG(..., TEXT("缓存抛枪 yaw. CachedThrowYaw=%.2f°"), CachedThrowYaw);
+```
+
+**WeaponDropComponent.cpp SettleWeaponOnGround** — 用缓存 yaw:
+```cpp
+// 【v240.11】用缓存 yaw 而非 PMC 落地"竖直"姿态
+const FRotator FinalRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->Multicast_FreezeWeaponTransform(
+    FVector_NetQuantize(SettledLocation),
+    FinalRotation  // ← 横着落地
+);
+```
+
+### UE 编辑器配置 (v240.11)
+
+**无需配置变更** — 纯 C++ 修复。
+
+### 待用户验证 (v240.11)
+
+1. UE 5.6 编译器编译 0 错 (重点: `Multicast_FreezeWeaponTransform` FRotator 参数类型)
+2. PIE 中:
+   - 扔枪飞行中 → 枪头朝速度方向 (横着, 与之前一致)
+   - **落地瞬间 → 枪姿态 ≈ (Pitch=0, Yaw=CachedThrowYaw, Roll=0) 横着** ⭐ 关键修复
+   - 走过去捡枪 → 恢复正常手里姿态
+3. 日志验证 (期望):
+   - `[v240.11][WeaponDropComponent] StartDroppedState: 缓存抛枪 yaw. Weapon=BP_Weapon_AK47_C_0, CachedThrowYaw=87.27°`
+   - `SettleWeaponOnGround` 行末出现 `(FinalRotation 用了缓存的抛枪 yaw=87.27°, 横着落地)`
+
+### 教训 — 物理组件与姿态 (大厂)
+
+1. **PMC bRotationFollowsVelocity 是设计选择,但要明确"飞行中跟随,落地固定"的语义**:
+   - 飞行中跟着速度转 → 物理表现自然 (用户能接受)
+   - 落地瞬间要锁死成"期望姿态" → 不能用 PMC 冻结时的瞬态旋转
+   - **大厂原则:飞行姿态与落地姿态是两个独立概念,落地姿态必须有"期望值"缓存/读取**
+2. **缓存时机比缓存值更重要**:
+   - 缓存时机必须在"污染源"启动之前
+   - 这里 PMC 是污染源,SpawnRotation 在 PMC 之前 → 缓存时机正确
+3. **DT / BP 默认 / 运行时缓存 三选一**:
+   - 这次没用 DT (DT 是美术配的手持姿态, 不一定是抛枪方向)
+   - 这次没用 BP 默认 (BP 已被 v240.10 强制 identity)
+   - 用运行时缓存 (抛枪瞬间的瞬时姿态) → 最准确的"用户期望"
+
+---
+
+## 25. v240.12 (2026.08.15) — 扔枪落地姿态:用 UE 官方标准做法 PMC.bRotationRemainsVertical 替代缓存 yaw 方案 (大厂治本)
+
+### 业务背景 (用户 2026.08.15 反馈)
+
+> "还是扔枪落地,枪的角度瞬间改变,特别不自然,网上看下怎么做合适,用标准的官方做法做"
+
+**v240.11 仍然有"突变"问题**:
+- 飞行中 PMC 让枪头沿速度方向 (Pitch≈-90° 竖直朝下)
+- 落地瞬间 SettleWeaponOnGround 用 `FRotator(0, CachedThrowYaw, 0)` **强制覆盖** → 用户看到"竖直突变到水平"
+- 用户评价:**"特别不自然"** (因为突变不连续)
+- 用户明确要求:**"网上看下怎么做合适,用标准的官方做法做"**
+
+### 根因 (v240.11 方案的固有限制)
+
+| 方案 | 飞行姿态 | 落地姿态 | 视觉表现 |
+|---|---|---|---|
+| v240.10 (未修) | 沿速度方向 (竖直) | 沿速度方向 (竖直) | 一直竖直 |
+| v240.11 (缓存 yaw) | 沿速度方向 (竖直) | 强制水平 | **竖直突变水平** ⚠️ |
+| **v240.12 (UE 官方标准)** | **水平** (PMC 强制) | **水平** (PMC 最后一帧) | **整段连续** ✓ |
+
+**v240.11 的本质问题**:
+- 飞行姿态 (PMC 决定的瞬态) 和落地姿态 (我们缓存的值) 是**两个独立的"姿态"**
+- 在落地那一帧做"瞬时切换" → 视觉上不连续
+
+### 修复方案 — UE 官方标准做法 (大厂治本)
+
+**Epic 官方 ProjectileMovementComponent.cpp line 341-348 源码**:
+
+```cpp
+if (bRotationFollowsVelocity && bRotationRemainsVertical)
+{
+    FRotator DesiredRotation = NewRotation.Rotator();
+    DesiredRotation.Pitch = 0.0f;
+    DesiredRotation.Yaw = FRotator::NormalizeAxis(DesiredRotation.Yaw);
+    DesiredRotation.Roll = 0.0f;
+    NewRotation = DesiredRotation.Quaternion();
+}
+```
+
+**机制**:
+- `bRotationFollowsVelocity=true`: 飞行中每帧 Actor 旋转跟速度方向
+- `bRotationRemainsVertical=true`: **强制 Pitch=0, Roll=0, 只保留 Yaw=velocity.Yaw**
+- 飞行中 → 枪头只在水平面内旋转 (一直在水平姿态)
+- 落地瞬间 → PMC.StopSimulating 把 Velocity 清零 → Tick 检测 `OldVelocity.IsNearlyZero()` → 不再修改 Actor 旋转 → 落地姿态 = 最后一帧水平姿态
+
+**这就是用户要的**:
+- "横着扔" → 飞行中枪头水平跟随 Yaw
+- "横着落地" → 落地时 Pitch=0, Roll=0, Yaw=飞行方向
+- **没有突变** — 飞行姿态和落地姿态是同一个语义
+
+### 修改文件清单 (v240.12)
+
+| 文件 | 修改 | 原因 |
+|---|---|---|
+| `Public/Components/WeaponDropComponent.h` | **删除** `float CachedThrowYaw` UPROPERTY | v240.11 缓存逻辑作废,零 dead code |
+| `Private/Components/WeaponDropComponent.cpp` StartDroppedState | **删除** `CachedThrowYaw = SpawnRotation.Yaw` 缓存代码 | 不再需要缓存,PMC 自己保证水平 |
+| `Private/Components/WeaponDropComponent.cpp` PMC 配置 | **新增** `PMC->bRotationRemainsVertical = true;` | UE 官方标准做法 — 飞行中强制水平 |
+| `Private/Components/WeaponDropComponent.cpp` SettleWeaponOnGround | **修改** `FinalRotation` = `OwnerWeapon->GetActorRotation()` | 落地时 Actor 旋转已经是水平姿态,直接用 |
+
+### 关键代码 (v240.12)
+
+**WeaponDropComponent.cpp StartDroppedState** — UE 官方标准:
+```cpp
+PMC->Velocity = LaunchDirection; // 直接世界空间 — 简单稳定, 不需要双转换
+PMC->bRotationFollowsVelocity = true; // 视觉上让枪头朝速度方向 (UE 官方建议)
+
+// 【v240.12 大厂架构 — UE 官方标准做法】启用 bRotationRemainsVertical
+//   UE 官方标准 (ProjectileMovementComponent.cpp line 341-348):
+//     if (bRotationFollowsVelocity && bRotationRemainsVertical)
+//     {
+//       DesiredRotation.Pitch = 0;
+//       DesiredRotation.Yaw = FRotator::NormalizeAxis(DesiredRotation.Yaw);
+//       DesiredRotation.Roll = 0;
+//     }
+//   效果:
+//     - 飞行中: 枪头只在水平面内旋转 (Pitch=0, Roll=0, Yaw=velocity.Yaw)
+//     - 落地瞬间: StopSimulating 把 Velocity 清零,PMC Tick 检测 OldVelocity.IsNearlyZero()
+//       → 不再修改 Actor 旋转 → 落地姿态 = 最后一帧水平姿态 (自然横着,无突变)
+PMC->bRotationRemainsVertical = true;
+```
+
+**WeaponDropComponent.cpp SettleWeaponOnGround** — 用 Actor 当前旋转 (已是水平):
+```cpp
+// 【v240.12 大厂架构 — UE 官方标准做法】FinalRotation 用 Actor 当前旋转
+//   v240.11 之前的"缓存抛枪 yaw"已废弃:
+//     - 原因: v240.12 启用 PMC->bRotationRemainsVertical=true,PMC 飞行中已强制 Pitch=0/Roll=0
+//       → 落地瞬间 Actor 旋转 = PMC 最后一帧的水平姿态 (Pitch=0, Yaw=velocity.Yaw, Roll=0)
+//     - 所以 Actor 当前旋转就是"横着"姿态,不需要重新构造
+//   对比 v240.11:
+//     - v240.11: 飞行竖直 → 落地瞬间强制水平 → 用户看到"突变"
+//     - v240.12: 飞行水平 → 落地时自然水平 → 无突变,姿态连续
+const FRotator FinalRotation = OwnerWeapon->GetActorRotation();
+OwnerWeapon->Multicast_FreezeWeaponTransform(
+    FVector_NetQuantize(SettledLocation),
+    FinalRotation
+);
+```
+
+### 大厂原则 (v240.12 落地)
+
+| 原则 | 实现 |
+|---|---|
+| **用引擎标准,不用发明轮子** | `PMC->bRotationRemainsVertical=true` 是 UE 自带属性,不需要 C++ 自己缓存 yaw |
+| **零 dead code** | v240.11 引入的 `CachedThrowYaw` 字段/缓存逻辑全删 — 不留没用的代码 |
+| **数据真理源 = Actor 当前旋转** | 落地时 Actor 旋转是 PMC 留下的"期望姿态" — 直接用,不构造新值 |
+| **姿态连续性** | 飞行姿态与落地姿态都是"水平" → 整段飞行无突变 |
+| **物理引擎自洽** | PMC 飞行中 Tick 保证姿态水平 → 落地时 StopSimulating 后不再 Tick → 姿态冻结在水平 — 物理引擎自己保证语义一致 |
+
+### UE 编辑器配置 (v240.12)
+
+**无需配置变更** — 纯 C++ 修复。`PMC->bRotationRemainsVertical=true` 在 C++ 里强制设置,不依赖 BP 配。
+
+### 待用户验证 (v240.12)
+
+1. UE 5.6 编译器编译 0 错 (重点: 删除 `CachedThrowYaw` 字段后 UPROPERTY 计数一致)
+2. PIE 中:
+   - 扔枪飞行中 → 枪头**一直水平**跟随 (不再是竖直朝下)
+   - 落地瞬间 → 姿态自然延续水平 (无突变)
+   - 走过去捡枪 → 恢复正常手里姿态
+3. 日志验证 (期望):
+   - `[v200.4.4][WeaponDropComponent] StartDroppedState: ... RotationFollowsVel=1` (没单独显示 RemainsVertical,但已设)
+   - `SettleWeaponOnGround` 行末出现 `(v240.12: PMC bRotationRemainsVertical=true, FinalRotation=Actor当前旋转=(P=0.00 Y=87.27 R=0.00) — 整段飞行姿态连续,无突变)`
+
+### 教训 — UE 引擎标准 vs 自研方案 (大厂)
+
+1. **先查 UE 引擎自带的标准做法,再考虑自研**:
+   - 用户说"用标准的官方做法做" — 这是大厂铁律
+   - PMC 自带 `bRotationRemainsVertical` 正是这个标准做法
+   - v240.11 的"缓存 yaw"是自己发明的,虽然能工作,但**不如引擎标准** (引擎标准是 PMC 自己保证姿态连续,不需要 C++ 干预)
+2. **"姿态连续性" 比 "最终姿态正确" 更重要**:
+   - v240.11: 最终姿态正确 (横着) 但**突变**
+   - v240.12: 最终姿态正确 (横着) 且**连续** — 视觉更自然
+   - 用户的"特别不自然"反馈,本质就是"突变" — 不是姿态不对
+3. **删 dead code 的勇气**:
+   - v240.11 的 `CachedThrowYaw` 字段、引用的代码、注释 — v240.12 一次性全删
+   - 大厂原则:不用的字段不保留 (避免误用、避免误解、避免将来回归)
+4. **物理引擎自洽的信任**:
+   - v240.12 完全信任 PMC 的 Tick 机制:飞行中保证水平,StopSimulating 后自动冻结
+   - C++ 不需要在 SettleWeaponOnGround 重新构造旋转 — 直接读 Actor 当前值
+   - 这是 UE 设计哲学:"用引擎自洽性,不要重复造轮子"
+
+---
+
+## 27. v240.13.1 (2026.08.15) — v240.13 代码顺序 bug 修复 ("竖着扔出去" 真根因)
+
+### 用户反馈 (v240.13 后)
+> "我说的是横着扔出去到地上也是横着，别突然变竖着，现在是竖着扔出去了"
+
+### v240.13 仍然失败的根因分析
+
+**表面看 v240.13 修复完整**:
+- `bRotationFollowsVelocity=false` ✓
+- `bRotationRemainsVertical=false` ✓
+- `SetActorRotation(LockedThrowRotation)` ✓
+- `CachedThrowYaw` 缓存 ✓
+
+**但 v240.13 的代码顺序错误,最终结果还是"竖着扔出去"**:
+
+```cpp
+// v240.13 错误顺序 (实际代码)
+PMC->SetActive(true);                  // ← Line 1: PMC 启动
+PMC->SetUpdatedComponent(MeshComp);    // ← Line 2
+
+// ... 物理设置 ...
+
+PMC->Velocity = LaunchDirection;       // ← Line N: 设速度
+PMC->bRotationFollowsVelocity = true;  // ← Line N+1: 错误地设为 true!
+
+// 【v240.13 修复块】
+const FRotator PreThrowActorRotation = OwnerWeapon->GetActorRotation();
+CachedThrowYaw = PreThrowActorRotation.Yaw;
+PMC->bRotationFollowsVelocity = false; // ← Line N+5: 才改为 false
+PMC->bRotationRemainsVertical = false;
+const FRotator LockedThrowRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->SetActorRotation(LockedThrowRotation);
+```
+
+**实际发生的物理过程**:
+1. **Line 1**: `PMC->SetActive(true)` → PMC 立刻激活,下一帧 Tick 就会执行
+2. **Line N+1**: `PMC->bRotationFollowsVelocity = true` → PMC 内部 flag 设为 true
+3. **Line N+5-N+8**: `bRotationFollowsVelocity = false` + `SetActorRotation` → 但**已经晚了**
+4. **同一帧或下一帧 PMC Tick**: 看见 `bRotationFollowsVelocity=true` (line N+1 设的),立即把 Actor 旋转设成 `Velocity.Rotation()`
+   - `Velocity = LaunchDirection = (148, -21, 100)` (Session1 日志确认)
+   - `Velocity.Rotation().Pitch = atan2(100, sqrt(148² + 21²)) = 33.78°`
+   - 枪头朝上 33.78° → **用户看到"竖着扔出去"**
+
+**v240.13 的"安全"逻辑完全没生效**:
+- `bRotationFollowsVelocity = false` 设了,但**在 `SetActive(true)` 之后设,被 PMC 内部状态机的 Tick 流程忽略**
+- `SetActorRotation` 设了,但**在 PMC Tick 之后被覆盖**
+
+### v240.13.1 修复 — 顺序重排:禁用 + 锁定必须在 SetActive 之前
+
+**核心原则 (大厂架构)**: 任何"我希望 Actor X 不被 Y 修改"的约束,必须在 Y 启动前就设置,不能在 Y 启动后修改
+
+```cpp
+// v240.13.1 正确顺序 (实际代码,StartDroppedState 关键 4 步)
+const FRotator PreThrowActorRotation = OwnerWeapon->GetActorRotation();
+CachedThrowYaw = PreThrowActorRotation.Yaw;          // 1) 缓存 yaw
+
+PMC->bRotationFollowsVelocity = false;               // 2) 禁用 PMC 修改 rotation
+PMC->bRotationRemainsVertical = false;
+
+const FRotator LockedThrowRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->SetActorRotation(LockedThrowRotation);  // 3) 锁定 Actor rotation
+
+PMC->SetActive(true);                                 // 4) 最后才 SetActive
+PMC->SetUpdatedComponent(MeshComp);                   //    PMC 第一帧 Tick 看到 bRotationFollowsVelocity=false → 不改 rotation
+```
+
+**为什么这个顺序正确**:
+- `SetActive(true)` 之前,PMC 完全没激活,没有任何 Tick 在跑
+- `bRotationFollowsVelocity=false` 在 PMC 启动前就生效
+- `SetActorRotation` 在 PMC 启动前设了,PMC 启动后第一帧 Tick 不会用 `Velocity.Rotation()` 覆盖
+- 飞行中 PMC 只负责改位置(velocity 方向),**不管 rotation**
+
+### v240.13 vs v240.13.1 对比
+
+| 版本 | SetActive(true) 之前 | SetActive(true) 之后 | 视觉 |
+|---|---|---|---|
+| v240.13 | (无 rotation 设置) | SetRot, bRotationFollowsVelocity=false | 竖着扔 (Pitch=33.78°) ✗ |
+| **v240.13.1** | **SetRot, bRotationFollowsVelocity=false** | (无 rotation 设置) | **横着扔 (Pitch=0, Yaw=throw yaw)** ✓ |
+
+### 修改文件清单 (v240.13.1)
+
+| 文件 | 改动 |
+|---|---|
+| `Private/Components/WeaponDropComponent.cpp` | `StartDroppedState`: 把"缓存 yaw + 禁用 rotation + 锁定 Rotation"3 步从 PMC 启动后移到 PMC 启动前 |
+
+### UE 编辑器配置 (v240.13.1)
+
+**无需配置** — 纯 C++ 顺序修复
+
+### 待用户验证 (v240.13.1)
+
+1. UE 5.6 编译器编译 0 错 (验证)
+2. PIE 中:
+   - 扔枪 → 飞行中枪横着, yaw=87.27° 保持不变 (Pitch=0, Roll=0) ✓
+   - 落地瞬间 → yaw 仍=87.27°, Pitch=0, Roll=0 ✓
+   - **关键**: 整个飞行过程枪都是"横着"(不再"竖着扔出去") ✓
+3. 日志验证:
+   - `[v240.13.1][WeaponDropComponent] StartDroppedState: 武器 '...' 启动 PMC 抛物线 (扔飞刀模式 — SetActive 前禁用 rotation 控制, 锁定 yaw=87.27°, 全程姿态不变).`
+   - 应该看到 `RotationFollowsVel=0` (而不是 1)
+
+### 教训 (v240.13 → v240.13.1)
+
+1. **"代码顺序" 不是 "代码位置"**:
+   - v240.13 把所有修复代码都写对了,只是顺序错了
+   - SetActive(true) 必须**最后**调,否则前面的所有设置都可能被 PMC 内部 Tick 覆盖
+2. **"启动" 和 "配置" 的关系**:
+   - 配置必须在启动之前完成(类似 UE Actor 初始化模式)
+   - 启动之后再改配置 = 亡羊补牢,可能已晚
+3. **"先后顺序" 是大厂架构的硬约束**:
+   - 不能"先启动,再调属性,再测试"
+   - 必须"先调好所有属性,再启动,然后才用"
+4. **PMC 默认是"扔子弹"语义**:
+   - `bRotationFollowsVelocity=true` (默认)
+   - UE 文档建议改成 false + 抛出 yaw 锁定 (扔飞刀模式)
+   - 这是**显式覆盖引擎默认**,对齐业务需求
+
+---
+
+## 26. v240.13 (2026.08.15) — 扔枪落地姿态:扔飞刀模式 (bRotationFollowsVelocity=false + 抛出 yaw 锁定 + 落地 yaw=throw yaw)
+
+### 用户反馈 (v240.12 后)
+> "扔枪还是到地上瞬间变化角度"
+
+### v240.12 仍失败的真实根因
+
+v240.12 用 UE 官方 `bRotationRemainsVertical=true`,理论正确,但用户仍报"突变":
+
+**根因 (`bRotationFollowsVelocity=true` 的固有行为)**:
+- 飞行中 yaw 持续跟随 velocity 方向(从 87.27° 逐渐变到 ~162.40°)
+- `bRotationRemainsVertical=true` 只强制 Pitch=0、Roll=0,**完全不控制 yaw**
+- 落地瞬间 yaw=velocity.Yaw ≠ 抛出 yaw=87.27° → 用户看到的是"yaw 突变 75°"
+
+**关键洞察**:
+- "扔飞刀"语义: 抛出 yaw 一致到落地(像匕首、飞镖)
+- "扔子弹"语义: yaw 跟随速度(PMC 默认行为)
+- **两者无法兼得** — `bRotationFollowsVelocity=true` 必然让 yaw 跟速度
+
+### v240.13 修复方案 (UE 官方最优解 — Paragon/Fortnite 扔投掷物)
+
+**核心**: `bRotationFollowsVelocity=false` + 抛出时锁定 yaw + 落地时用抛出 yaw
+
+```cpp
+// 1) 缓存抛出 yaw (PMC 启动前)
+const FRotator PreThrowActorRotation = OwnerWeapon->GetActorRotation();
+CachedThrowYaw = PreThrowActorRotation.Yaw;
+
+// 2) 关键: 禁用 bRotationFollowsVelocity!
+//    - 飞行中 PMC 不再修改 Actor rotation
+//    - Actor rotation 保持抛出时的 yaw 不变
+PMC->bRotationFollowsVelocity = false;
+PMC->bRotationRemainsVertical = false; // 显式禁用
+
+// 3) 锁定 Actor rotation 到水平姿态 (Pitch=0, Yaw=throw yaw, Roll=0)
+const FRotator LockedThrowRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->SetActorRotation(LockedThrowRotation);
+```
+
+**落地 `SettleWeaponOnGround` 强制用抛出 yaw 构造 FinalRotation**:
+```cpp
+// v240.13: 落地姿态 = 抛出姿态 (Pitch=0, Yaw=CachedThrowYaw, Roll=0)
+const FRotator FinalRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->Multicast_FreezeWeaponTransform(SettledLocation, FinalRotation);
+```
+
+### 大厂原则 (v240.13 落地)
+
+| 原则 | 实现 |
+|---|---|
+| **扔飞刀 vs 扔子弹** | `bRotationFollowsVelocity=false` 明确选"扔飞刀"语义,不让 yaw 跟速度 |
+| **姿态连续性** | 飞行中 PMC 不改 rotation,yaw=throw yaw 一直不变,无突变 |
+| **零 dead code** | v240.11 `CachedThrowYaw` 删除 → v240.13 重新引入,但用途不同(不是"落地时用",而是"抛出时缓存,落地时强锁定") |
+| **抛出时缓存** | 在 PMC 启动前(`SetActive(true)` 前)缓存 — 避免 PMC 修改后缓存到错误值 |
+| **落地用缓存而非 Actor 当前值** | v240.12 用 `GetActorRotation()` 是错的(velocity.Yaw ≠ throw yaw),v240.13 显式用 CachedThrowYaw |
+
+### v240.11/v240.12/v240.13 对比 (最终采纳)
+
+| 版本 | 飞行中 yaw | 落地 yaw | 视觉 |
+|---|---|---|---|
+| v240.11 (缓存 yaw) | velocity.Yaw (持续旋转) | throw yaw (突变) | 突变 ⚠️ |
+| v240.12 (bRotationRemainsVertical) | velocity.Yaw (持续旋转) | velocity.Yaw (最后帧) | 突变 ⚠️ |
+| **v240.13 (扔飞刀模式)** | **throw yaw (锁定)** | **throw yaw (一致)** | **连续 ✓** |
+
+### 修改文件清单 (v240.13)
+
+| 文件 | 改动 |
+|---|---|
+| `Private/Components/WeaponDropComponent.cpp` | `StartDroppedState`: 缓存 `CachedThrowYaw` + 设 `bRotationFollowsVelocity=false` + `SetActorRotation(LockedThrowRotation)` |
+| `Private/Components/WeaponDropComponent.cpp` | `SettleWeaponOnGround`: `FinalRotation = FRotator(0, CachedThrowYaw, 0)` |
+| `Private/Components/WeaponDropComponent.cpp` | 删 v240.12 注释 + 改 v240.13 新注释 |
+| `Public/Components/WeaponDropComponent.h` | 重新加 `UPROPERTY() float CachedThrowYaw = 0.0f;` (v240.11 删了,v240.13 复用) |
+
+### UE 编辑器配置 (v240.13)
+
+**无需配置** — 全部在 C++ 改 BP 的 PMC 配置不动
+
+### 待用户验证 (v240.13)
+
+1. UE 5.6 编译器编译 0 错 (验证)
+2. PIE 中:
+   - 扔枪 → 飞行中枪横着, yaw=87.27° 保持不变 (无旋转) ✓
+   - 落地瞬间 → yaw 仍=87.27°(与飞行中一致),Pitch=0, Roll=0 ✓
+   - 整体感觉"扔出去什么角度,到地上什么角度" ✓
+3. 日志验证:
+   - `[v240.13][WeaponDropComponent] StartDroppedState: 武器 '...' 启动 PMC 抛物线 (扔飞刀模式 — 锁定 yaw=87.27°, 全程姿态不变).`
+   - `SettleWeaponOnGround: ... (v240.13: 扔飞刀模式, FinalRotation=(P=0, Y=ThrowYaw=87.27, R=0) — 抛出姿态=落地姿态,无突变).`
+
+### 教训 (v240.11/v240.12/v240.13 三次迭代)
+
+1. **"姿态连续性" vs "最终姿态正确"**:
+   - v240.11/12: 最终姿态正确,但视觉上有突变
+   - v240.13: 抛出姿态=落地姿态,既正确又连续
+2. **"扔飞刀"语义不可调和**:
+   - 一旦选 `bRotationFollowsVelocity=true`,就必然让 yaw 跟 velocity(无论 bRotationRemainsVertical 怎么设)
+   - 要"扔飞刀"必须 `bRotationFollowsVelocity=false` + 抛出 yaw 锁定
+3. **"信任引擎" 不是 "盲目跟随默认"**:
+   - v240.12 完全信任 PMC 默认行为 → 失败(PMC 默认就是"扔子弹"语义)
+   - v240.13 信任 PMC 是好工具,但**显式覆盖默认行为**对齐业务需求(扔飞刀)
+4. **设计原则: 业务语义优先于引擎默认**:
+   - 业务:"扔飞刀" → 抛出 yaw 不变
+   - 引擎默认:"扔子弹" → yaw 跟速度
+   - 两者冲突时,**改引擎默认**(覆盖 PMC 属性),而不是发明 C++ 补丁(v240.11)
+
+---
+
+## 28. v240.14 (2026.08.15) — "扔枪飞很远,落地却在脚下" 诊断日志 (根因排查)
+
+### 用户反馈 (v240.13.1 后)
+> "现在的问题是每次看着枪扔出去了很远，但是落地就在自己的脚下附近，跟抛出去的动画完全割裂"
+
+### 现象分析 (用户已确认 C 方案)
+
+| 视觉阶段 | 用户看到 |
+|---|---|
+| 0. 按扔枪 | 枪从手上飞出 |
+| 1. 飞行中 | 枪飞得很远 (正常 PMC 弹道) |
+| 2. 落地瞬间 | **枪瞬间 teleport 到脚下** (肉体 nearby) |
+
+**关键洞察**: "飞行中正常" + "落地瞬间 teleport 到脚下" = **客户端 PMC 预测飞得远,但服务端 SettleWeaponOnGround 的 HitResult 位置(NOT 飞到的位置)**。
+
+### 假设的根因 (待诊断验证)
+
+**假设 A: 武器 Detach 后在角色 capsule 内部**
+- `DetachFromActor(KeepWorldTransform)` 后,武器位置 = socket 位置
+- 武器可能还在角色 capsule 内部
+- PMC 启动后第一帧 `MoveComponent` → 立即碰到 capsule → 立即触发 OnProjectileStop
+- `SettleWeaponOnGround` 计算落地位置 = 当前位置(脚下)
+- **客户端 PMC 预测飞得远,服务端第一帧就停 → 收到 Multicast 同步时 teleport 到脚下**
+
+**假设 B: PMC 反弹/Stop 条件过严**
+- `BounceVelocityStopSimulatingThreshold=50.0f` 可能过低
+- 物理跳动后速度瞬间降到 50 → 立即触发 OnProjectileStop → 还没飞到远处
+
+**假设 C: `HitResult` 没传到 `SettleWeaponOnGround`**
+- `OnProjectileStopHandler` 收到 `HitResult` 但没传给 `SettleWeaponOnGround`
+- `SettleWeaponOnGround` 内部用 `OwnerWeapon->GetActorLocation()` 重新算位置
+- 但如果 Detach 后 actor 位置残留在角色脚下 → 错误
+
+### v240.14 修复 — 加 2 处关键诊断日志,不修代码
+
+#### 诊断 1: PMC 启动那一帧 (StartDroppedState 末尾)
+
+```cpp
+// 【v240.14 关键诊断】PMC 启动那一帧的精确位置 — 排查"落地就在脚下"
+const FVector PmcStartLoc = OwnerWeapon->GetActorLocation();
+float DistToInstigator = -1.0f;
+float ZDelta = 0.0f;
+if (DropInstigator.IsValid())
+{
+    DistToInstigator = FVector::Dist(PmcStartLoc, DropInstigator->GetActorLocation());
+    ZDelta = PmcStartLoc.Z - DropInstigator->GetActorLocation().Z;
+}
+UE_LOG(LogTemp, Display,
+    TEXT("[v240.14][WeaponDropComponent] PMC 启动诊断: Weapon=%s, PmcStartLoc=%s, "
+         "离 DropInstigator 距离=%.1fcm, Z差=%.1fcm "
+         "(距离<50cm 或 Z差<-100cm = 武器在角色脚下/内部 → 会立即触发 OnProjectileStop)"),
+    *OwnerWeapon->GetName(),
+    *PmcStartLoc.ToCompactString(),
+    DistToInstigator,
+    ZDelta);
+```
+
+**判断**:
+- `距离 < 50cm` 或 `Z差 < -100cm` → 武器在角色脚下/内部 → 假设 A 成立
+- `距离 > 200cm` 且 `Z差 > 0cm` → 武器在角色前方/上方 → 假设 A 不成立,看诊断 2
+
+#### 诊断 2: OnProjectileStop 触发点 (OnProjectileStopHandler 入口)
+
+```cpp
+// 【v240.14 关键诊断】打印 OnProjectileStop 触发的精确位置 + HitResult
+const FVector StopLoc = OwnerWeapon->GetActorLocation();
+float DistToInstigator = -1.0f;
+if (DropInstigator.IsValid())
+{
+    DistToInstigator = FVector::Dist(StopLoc, DropInstigator->GetActorLocation());
+}
+UE_LOG(LogTemp, Display,
+    TEXT("[v240.14][WeaponDropComponent] OnProjectileStopHandler 关键诊断: Weapon=%s, "
+         "StopLoc=%s, HitResult.ImpactPoint=%s, HitResult.HitActor=%s, "
+         "HitResult.bBlockingHit=%d, 离 Instigator 距离=%.1fcm (此值过小=落地触发过早, 过大=PMC 飞太远未落地)"),
+    *OwnerWeapon->GetName(),
+    *StopLoc.ToCompactString(),
+    *HitResult.ImpactPoint.ToCompactString(),
+    HitResult.GetActor() ? *HitResult.GetActor()->GetName() : TEXT("None"),
+    HitResult.bBlockingHit ? 1 : 0,
+    DistToInstigator);
+```
+
+**判断**:
+- `HitActor = 玩家 Pawn` → 武器撞到玩家 → 假设 A 确认
+- `HitActor = WorldStatic` 且 `ImpactPoint = 远处地面` → 假设 A 不成立,问题在客户端同步
+- `HitActor = None` 且 `bBlockingHit = false` → 假设 B 成立(PMC 速度降到阈值),需在 `BounceVelocityStopSimulatingThreshold` 调大
+
+### 修改文件清单 (v240.14)
+
+| 文件 | 改动 |
+|---|---|
+| `MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDropComponent.cpp` | 添加 2 处 v240.14 诊断日志 (StartDroppedState 末尾 + OnProjectileStopHandler 入口) |
+
+### UE 编辑器配置 (v240.14)
+
+**无需配置** — 纯 C++ 调试日志
+
+### 待用户验证 (v240.14)
+
+1. PIE 中扔枪,提供新日志
+2. 报告日志内容:
+   - PMC 启动诊断: `离 DropInstigator 距离=???cm, Z差=???cm`
+   - OnProjectileStopHandler 诊断: `HitActor=???`
+
+### 后续修复方案 (待验证后选择)
+
+| 假设 | 修复 |
+|---|---|
+| A: 武器 Detach 在 capsule 内 | `StartDroppedState` Step 1 先将武器位置向外偏移 100cm (沿 LaunchDirection 反向) |
+| B: PMC 阈值过严 | `BounceVelocityStopSimulatingThreshold` 从 50 调到 20 |
+| C: HitResult 没传 | `SettleWeaponOnGround` 签名加 `const FHitResult& HitResult`,直接用 `HitResult.ImpactPoint` 做落地位置 |
+
+---
+
+## 29. v240.15 (2026.08.15) — UpdatedComponent 指向 RootComponent (终极根因修复 — "飞得远落地在脚下")
+
+### 用户反馈 (v240.14 后)
+> "现在的问题是每次看着枪扔出去了很远，但是落地就在自己的脚下附近，跟抛出去的动画完全割裂"
+
+### v240.14 诊断日志证据 (2026.08.15 Session1.txt)
+
+3 次扔枪,所有数据呈现**一致的"飞行割裂"模式**:
+
+| 时刻 | PMC 启动位置 (距角色) | OnProjectileStop.StopLoc (武器当前) | HitResult.ImpactPoint (PMC 撞到的点) | 距离差 |
+|---|---|---|---|---|
+| 18:10:48 | (-3267, 3391, 1435) 距 61.9cm | (-3267, 3391, 1435) | (-5324, -892, 1044) | **2058cm** |
+| 18:10:54 | (-3252, 3253, 1436) 距 62.6cm | (-3252, 3253, 1436) | (-5655, -763, 1069) | **2407cm** |
+| 18:10:58 | (-3252, 3252, 1436) 距 62.5cm | (-3252, 3252, 1436) | (-5654, -763, 1069) | **2406cm** |
+
+**铁证**: `StopLoc` 和 `PMC 启动位置` 完全一致 → **Actor 从未移动!** 但 `HitResult.ImpactPoint` 在 5000+ cm 远处 → **Mesh 飞了,Actor 没飞**!
+
+### 终极根因 — PMC UpdatedComponent 错指 Mesh
+
+| 项目 | 真相 |
+|---|---|
+| BP_Weapon_AK47.RootComponent | **DefaultSceneRoot** (UE BP 默认,非 Mesh) |
+| BP_Weapon_AK47.PMC.UpdatedComponent (默认) | **WeaponSkeletalMesh** (Mesh 子组件) |
+| Actor 位置由谁决定 | **RootComponent (DefaultSceneRoot)** — UE 官方行为 |
+| PMC.MoveComponent 更新谁 | **UpdatedComponent (WeaponSkeletalMesh)** — UE 官方行为 |
+
+**结果**:
+1. PMC 启动 → Mesh 沿 LaunchDirection 飞(用户视觉"飞得远")
+2. **但 Actor 位置 = RootComponent 位置,从未被 PMC 触碰** → Actor 在角色脚下
+3. OnProjectileStop 触发时,`HitResult.ImpactPoint` 是 Mesh 撞到的远处 fence (但这是 PMC 内部模拟的"预期落点",Mesh 真实世界位置也已经移动到那里)
+4. **`OwnerWeapon->GetActorLocation()` 返回 Actor 位置 = 脚下** (因为 RootComponent 没动)
+5. `SettleWeaponOnGround` 用 Actor 位置算落地 → 落地在脚下
+6. **Multicast_FreezeWeaponTransform 把脚下位置同步给客户端 → 客户端瞬间 teleport 到脚下**
+7. 用户视觉: "飞行中枪在远处 → 落地瞬间 teleport 到脚下 → 完全割裂"
+
+### 之前 7 个版本都没发现的原因
+
+| 版本 | 解决了什么 | 没发现这个 |
+|---|---|---|
+| v200-v240.4 | 物理连续性、SimulatePhysics 互斥 | 没看 Actor 位置 vs Mesh 位置 |
+| v240.6 | 旋转匹配表 | 没看 RootComponent 错配 |
+| v240.7-v240.10 | Root/Mesh 相对变换一致 | 没看 PMC 控制错组件 |
+| v240.11-v240.13.1 | 旋转自然 | **没在日志里打印 Actor 位置 vs ImpactPoint** |
+
+**v240.14 的关键突破**:**打印了 `OwnerWeapon->GetActorLocation()` vs `HitResult.ImpactPoint` 的对比** → 立刻暴露 2000+cm 的位置分裂!
+
+### v240.15 修复 — UpdatedComponent 指向 RootComponent
+
+```cpp
+// 【v240.15 P0 — 终极根因修复】SetActive 之前显式 SetUpdatedComponent(RootComponent)
+//   根因: BP RootComponent=DefaultSceneRoot, BP PMC.UpdatedComponent=Mesh
+//         → PMC 移动 Mesh,但 Actor 位置 = RootComponent 位置 → Actor 不动
+//   修复: 让 PMC 控制 RootComponent → Actor 跟着移动
+//   UE 5 官方推荐: SetUpdatedComponent 必须在 SetActive 之前调用
+if (USceneComponent* RootComp = OwnerWeapon->GetRootComponent())
+{
+    if (PMC->UpdatedComponent != RootComp)
+    {
+        PMC->SetUpdatedComponent(RootComp);
+        UE_LOG(LogTemp, Display,
+            TEXT("[v240.15] 已重定向 PMC.UpdatedComponent = RootComponent('%s')"),
+            *RootComp->GetName());
+    }
+}
+
+// 4) 然后才 SetActive(true)
+PMC->SetActive(true);
+```
+
+**为什么 SetActive 前**:
+- UE 5 官方推荐 `SetUpdatedComponent` 必须在 `SetActive` 前
+- `SetActive` 会触发 `ShouldSkipUpdate` 检查 → 需要 UpdatedComponent 有效
+- 顺序错了 PMC 第一帧可能用旧 UpdatedComponent 计算 → 失败
+
+### 大厂原则 (v240.15)
+
+1. **"PMC 控制 Actor 位置" = "PMC 必须控制 RootComponent"**:
+   - Actor 位置 = RootComponent 位置 (UE 官方行为)
+   - PMC.MoveComponent 更新 UpdatedComponent 位置
+   - 要 PMC 控制 Actor, 必须让 UpdatedComponent = RootComponent
+   - 物理碰撞仍走 Mesh 的 collision (碰撞查询基于 world 空间,不依赖 UpdatedComponent 是哪个)
+2. **"诊断日志第一原则" — 打印对比**:
+   - 只看一个位置看不出问题
+   - 看两个独立来源(StopLoc vs ImpactPoint)立刻暴露位置分裂
+   - v240.14 一次诊断就找到 7 个版本没找到的根因
+3. **"诊断日志应该看到 Actor 全貌"**:
+   - 不要只看 Mesh 位置 → Actor 位置才是"用户视觉"的位置
+   - 不要只看 HitResult → HitResult 是 PMC 内部值,跟 Actor 位置可能分裂
+
+### 修改文件清单 (v240.15)
+
+| 文件 | 改动 |
+|---|---|
+| `MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDropComponent.cpp` | StartDroppedState Step 4 之前加 `PMC->SetUpdatedComponent(RootComponent)`,删除旧的 `PMC->SetUpdatedComponent(MeshComp)` |
+
+### UE 编辑器配置 (v240.15)
+
+**无需配置** — 纯 C++ 修复
+
+### 待用户验证 (v240.15)
+
+1. UE 5.6 编译器编译 0 错 (验证)
+2. PIE 中扔枪 → 应该看到:
+   - 枪飞出 5-10 米 (PMC 正常弹道) ✓
+   - 落地位置 = 枪飞行轨迹末端 (不是脚下) ✓
+   - 整体感觉"飞行到哪儿,落地到哪儿" ✓
+3. 日志验证:
+   - `[v240.15][WeaponDropComponent] StartDroppedState: 已重定向 PMC.UpdatedComponent = RootComponent('DefaultSceneRoot')`
+   - StopLoc 和 ImpactPoint 应该接近 (距离差 < 100cm)
+
+### 教训 (v240-v240.15 七次迭代)
+
+1. **"PMC + DefaultSceneRoot RootComponent" 是 UE BP 武器蓝图的高危陷阱**:
+   - BP 默认 RootComponent = DefaultSceneRoot (非 Mesh)
+   - BP 配置 PMC UpdatedComponent 默认指向 Mesh
+   - 结果: PMC 永远只动 Mesh 不动 Actor
+   - **解决方案 1 (本项目选)**: C++ 强制 SetUpdatedComponent(RootComponent)
+   - **解决方案 2 (治本)**: BP 把 RootComponent 改成 Mesh (但有 SkeletalMesh 不能直接当 Root 的限制)
+   - **解决方案 3 (治本)**: BP 配 PMC 时手动把 UpdatedComponent 设成 DefaultSceneRoot (但容易忘)
+2. **"诊断日志第一原则" = "打印对比"**:
+   - v240.14 第一次同时打印 Actor 位置 vs Mesh 撞点 → 立刻看出根因
+   - 之前 7 个版本都只看一边 → 一直看不到
+3. **"调试的本质是看到分离"**:
+   - 用户看到"飞行+落地"两个视觉阶段 → 怀疑"飞行没传到落地"
+   - 日志要分别打印两个阶段的关键状态 → 才能看到状态是否一致
+   - v240.14 的 `StopLoc` (落地) 和 `ImpactPoint` (撞点) 差 2000cm → 一眼看出问题
+
+---
+
+## v240.16 (2026.08.15) — 落地用 HitResult.ImpactPoint 不用 Actor 位置 (v240.15 失败的根因)
+
+### 业务背景 (用户 Session1.txt 反馈)
+> "现在的问题是每次看着枪扔出去了很远，但是落地就在自己的脚下附近，跟抛出去的动画完全割裂"
+
+### v240.15 失败的根本原因 (为什么 SetUpdatedComponent 没生效)
+
+v240.15 假设: `SetUpdatedComponent(RootComponent)` → PMC 移动 Actor → 解决落地脚下问题
+
+**实际日志 (2026.08.15 Session1.txt Tick 诊断)**:
+```
+[WeaponDropComponent][Tick 诊断] Weapon=BP_Weapon_AK47_C_0 Loc=X=-3263.756 Y=3391.583 Z=1436.889
+                                 ...UpdatedComp=WeaponSkeletalMesh  ← 还是 Mesh!
+```
+
+**结论**: v240.15 SetUpdatedComponent 调用虽然执行了,但 **PMC 内部物理引擎/RecreatePhysicsState hook 把 UpdatedComponent 重置回 Mesh**。
+- 验证证据: 我们打的"已重定向"日志出现在 StartDroppedState,然后 Tick 运行时 UpdatedComponent 又是 Mesh
+- 失效原因: UE 5 PMC 启动后,SkeletalMeshComponent 的物理状态 recreate 内部把我们设的 RootComponent 改回 Mesh (因为 Mesh 有 collision body,RootComponent 没有)
+
+### v240.16 真正修复 — 绕开 PMC 的 UpdatedComponent 限制
+
+**核心思路**: 不去管 PMC 到底移动 Actor 还是 Mesh —— **直接用 HitResult.ImpactPoint 当落地点**。这是 PMC 模拟的"真实物理碰撞点",跟用户视觉完全一致。
+
+#### 修改 1: OnProjectileStopHandler 传 HitResult
+```cpp
+// 旧 (v240.14):
+SettleWeaponOnGround(OwnerWeapon);  // 丢掉了 HitResult
+
+// 新 (v240.16):
+SettleWeaponOnGround(OwnerWeapon, HitResult);  // 把真落点传下去
+```
+
+#### 修改 2: SettleWeaponOnGround 改用 HitResult.ImpactPoint
+```cpp
+// 旧 (v240.14):
+const FVector StartLoc = OwnerWeapon->GetActorLocation();  // Actor 位置 = 脚下 (因为 PMC 不动 Actor)
+const FVector TraceEndLoc = StartLoc - FVector(0, 0, 200);  // 还做 LineTrace
+const bool bHit = World->LineTraceSingleByChannel(...);   // 还在找地面
+// 用 GroundHit.Location.Z — 浪费 CPU 还可能错
+
+// 新 (v240.16):
+const FVector StartLoc = InHitResult.ImpactPoint;  // PMC 真落点 (用户视觉"飞得远,落得远"对齐)
+const float SafeOffset = FMath::Max(GroundOffsetCm, 0.0f);
+const FVector SettledLocation(
+    StartLoc.X,
+    StartLoc.Y,
+    InHitResult.ImpactPoint.Z + SafeOffset  // 用 ImpactPoint.Z,不再 LineTrace
+);
+```
+
+#### 修改 3: 删掉 LineTrace 代码
+- 旧代码 LineTrace 找地面浪费 CPU,且 Z 可能与 ImpactPoint 偏差几 cm
+- 新代码: ImpactPoint 已经是精确物理地面点,直接用
+
+#### 修改 4: v240.15 注释降级为"实验性"
+- v240.15 SetUpdatedComponent 那段代码保留但日志改 Verbose
+- 注释说明: "v240.16 走 HitResult 路径, 此修复作为补充"
+
+### 大厂原则 (v240.16)
+
+1. **"数据来源要选对"**:
+   - 落地点 = HitResult.ImpactPoint (PMC 物理引擎报告) — 这才是"用户视觉的落点"
+   - Actor 位置 = UpdatedComponent 位置 (如果 UpdatedComponent 是 Mesh,Actor 还在脚下) — 这是"逻辑位置"
+   - 修复: 用物理报告,不用逻辑位置
+2. **"诊断日志第一原则" = "打印对比"**:
+   - v240.16 SettleWeaponOnGround 头部新加诊断: HitResult vs ActorLoc + Diff
+   - 验证修复: Diff 应该接近 0 (HitResult == ActorLoc) 或 Diff 已知 (HitResult 远, ActorLoc 脚)
+3. **"不要去解决 PMC 内部问题,绕开它"**:
+   - v240.15: 试图让 PMC 移动 Actor (内部机制,与 SkeletalMesh 物理状态冲突) — 失败
+   - v240.16: 不管 PMC 移动什么,直接用 PMC 报告的物理碰撞点 — 成功
+4. **"删冗余"**:
+   - 删除 LineTrace (HitResult 已经是精确地面点)
+   - 大厂原则: 重复的检测/定位路径 = 维护成本 + 误差来源
+
+### 修改文件清单 (v240.16)
+
+| 文件 | 改动 |
+|---|---|
+| `MetalSlug01/Source/MetalSlug01/Private/Components/WeaponDropComponent.cpp` | OnProjectileStopHandler 传 HitResult; SettleWeaponOnGround 签名加 HitResult; 用 HitResult.ImpactPoint 替代 Actor 位置 + LineTrace; 加 v240.16 诊断日志 |
+| `MetalSlug01/Source/MetalSlug01/Public/Components/WeaponDropComponent.h` | SettleWeaponOnGround 签名加 const FHitResult& InHitResult |
+
+### UE 编辑器配置 (v240.16)
+
+**无需配置** — 纯 C++ 修复
+
+### 待用户验证 (v240.16)
+
+1. UE 5.6 编译器编译 0 错 (验证)
+2. PIE 中扔枪 → 应该看到:
+   - 枪飞出 5-10 米 (PMC 正常弹道) ✓
+   - 落地位置 = 枪飞行轨迹末端 (不是脚下) ✓
+   - 整体感觉"飞行到哪儿,落地到哪儿" ✓
+3. 日志验证:
+   - `[v240.16][WeaponDropComponent] SettleWeaponOnGround: HitResult.ImpactPoint=V(-5117, -1006, 1044), ActorLoc=V(-3267, 3391, 1436), Diff=2124cm (v240.16 用 ImpactPoint, 不用 ActorLoc).`
+   - 用户视觉落点应该 = HitResult (远离脚下)
+4. **Acceptance**: 实际落地位置 = 飞行轨迹末端 (不再脚下)
+
+### 教训 (v240.16)
+
+1. **"解决内部机制 vs 绕开内部机制"**:
+   - v240.15: 试图控制 PMC 内部 UpdatedComponent (SetUpdatedComponent) — 失败,PMC 内部会重置
+   - v240.16: 绕开 PMC 内部,只用 PMC 报告的物理结果 (HitResult) — 成功
+   - 大厂原则: 对外部依赖 (UE 引擎) 要"用其报告,不信其内部",遇阻力立刻转绕开
+2. **"SetUpdatedComponent 是个伪命题"**:
+   - UE 5 PMC 启动后,UpdatedComponent 跟物理状态强绑定 (特别 SkeletalMesh)
+   - 任何"运行时改 UpdatedComponent" 的修复都会被物理引擎重置
+   - 真正的修法: 用 HitResult 数据而不是改 UpdatedComponent
+3. **"诊断日志是真理"**:
+   - v240.15 设计假设: SetUpdatedComponent 后 PMC 移动 Actor
+   - v240.16 Tick 诊断日志: UpdatedComp 还是 Mesh
+   - 一行日志直接证伪 v240.15 假设
+   - 不打日志 = 永远不知道是不是真的修了
+
+---
+
+

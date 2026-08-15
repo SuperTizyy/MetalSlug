@@ -14,6 +14,7 @@
 // 前向声明 (放在 .generated.h 之后)
 class UWeaponDissolveComponent;
 class UWeaponFireComponent;
+class UProjectileMovementComponent; // 【v240.4 大厂架构 P0】PMC 显式禁用 (前向声明避免 .h 引入 GameFramework)
 
 // UE 自动生成的头文件 (.generated.h 必须最后)
 #include "BaseWeapon.generated.h"
@@ -434,6 +435,31 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Weapon|Components")
 	UMeshComponent* GetMeshComponent() const;
+
+	/**
+	 * EnsureSkeletalMeshPhysicsDisabled — 【v240.2 大厂架构 P0 修复】统一封装
+	 *
+	 * 对所有 SkeletalMesh 武器强制关闭物理模拟 + 重置 PhysicsState.
+	 *
+	 * 根因:
+	 *   - BP_Weapon_AK47_C 默认勾选 "Simulate Physics" (美术/策划配置失误)
+	 *   - UE 物理引擎驱动 SkeletalMesh 骨骼 + 影响 RootComponent 运动
+	 *   - 当 RootComponent 是 DefaultSceneRoot (非 Mesh) 时:
+	 *     物理引擎把 SkeletalMesh 当作自由刚体 → 武器"持续下坠"
+	 *
+	 * 大厂原则 (单一真理源 + 零重复):
+	 *   - 3 处独立调用: BaseWeapon::BeginPlay / Multicast_FreezeWeaponTransform /
+	 *                   WeaponDropComponent::CancelDroppedState
+	 *   - 统一封装到一个 helper, 避免重复代码/重复 Log
+	 *   - Log Error 而非 Warning: 配置错必须显式化, 强制美术/策划修复 BP
+	 *
+	 * 调用方: BaseWeapon::BeginPlay / Multicast_FreezeWeaponTransform_Implementation
+	 *
+	 * 注意: 这是 C++ 内部 helper, 不暴露给蓝图 — 因为参数 CallerContext 是 const TCHAR* (UE 内部字面量类型),
+	 *       UFUNCTION 不支持 TCHAR* 参数 (UHT 报"Unable to find 'class', 'delegate', 'enum', or 'struct' with name 'TCHAR'").
+	 *       这是纯 C++ 调用语义, BP 调用没有意义 (BP 端没有"CallerContext"概念).
+	 */
+	void EnsureSkeletalMeshPhysicsDisabled(const TCHAR* CallerContext);
 
 	/**
 	 * GetAttachedCharacter — 获取挂载武器的 ABaseCharacter (单一真理源)

@@ -22,6 +22,7 @@
 #include "GameFramework/Character.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h" // 【v200.2.2】用于 RecreatePhysicsState
+#include "Components/MeshComponent.h" // 【v240.10】TArray<UMeshComponent*> 容器
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -166,11 +167,14 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		*MeshComp->GetName(),
 		*OwnerWeapon->GetActorLocation().ToString());
 
-	// 【v200.3 Epic 官方】捕获初始掉落位置 (必须在物理设置之前!)
-	//   原因: SetSimulatePhysics 后 GetActorLocation 可能返回碰撞后的位置
-	//   → 需要掉落开始时的世界坐标，传给 Multicast_DropWeapon
-	const FVector SpawnLocation = OwnerWeapon->GetActorLocation();
-	const FRotator SpawnRotation = OwnerWeapon->GetActorRotation();
+// 【v200.3 Epic 官方】捕获初始掉落位置 (必须在物理设置之前!)
+//   原因: SetSimulatePhysics 后 GetActorLocation 可能返回碰撞后的位置
+//   → 需要掉落开始时的世界坐标，传给 Multicast_DropWeapon
+const FVector SpawnLocation = OwnerWeapon->GetActorLocation();
+const FRotator SpawnRotation = OwnerWeapon->GetActorRotation();
+//
+// 【v240.13 大厂架构 — UE 官方最优解:扔飞刀模式】
+//   根因 (v240.11/v240.12 都没解决的):
 
 	// 【v200 大厂架构关键】先从角色上分离武器
 	// 如果武器仍然附加在角色上，设置 SimulatePhysics 可能无效
@@ -397,8 +401,48 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		//   - 需要转换: LocalVel = WorldToLocal(LaunchDirection) → SetVelocityInLocalSpace(LocalVel)
 		//   - 然后 PMC 内部再做 LocalToWorld → 还原成 LaunchDirection (世界坐标)
 
+		// 【v240.13.1 P0 — 必须在 PMC.SetActive 之前就禁用 rotation 控制 + 锁定 rotation!】
+		//   根因 (v240.13 失败的真根因):
+		//     - v240.13 代码顺序错误: SetActive(true) → Velocity=... → bRotationFollowsVelocity=false → SetActorRotation
+		//     - PMC 第一帧 Tick 看到 bRotationFollowsVelocity=true(默认),立即把 Actor 旋转设成 Velocity.Rotation()
+		//     - Velocity = LaunchDirection = (148, -21, 100) → Velocity.Rotation().Pitch = atan2(100, sqrt(148²+21²)) = 33.8°
+		//     - 枪头朝上(Pitch=33.8°)→ 用户看到"竖着扔出去"
+		//   修复 (必须在 SetActive 之前):
+		//     1. 缓存 CachedThrowYaw (PMC 启动前的 yaw)
+		//     2. 设 bRotationFollowsVelocity=false (防止 PMC Tick 修改 rotation)
+		//     3. 设 SetActorRotation((0, throw_yaw, 0)) (锁定水平姿态)
+		//   大厂原则: 任何"我希望 Actor 不被 X 修改"的约束,必须在 X 启动前就设置,不能在 X 启动后修改
+
+		// 1) 缓存抛出 yaw (PMC 启动前)
+		const FRotator PreThrowActorRotation = OwnerWeapon->GetActorRotation();
+		CachedThrowYaw = PreThrowActorRotation.Yaw;
+
+		// 2) 禁用 bRotationFollowsVelocity
+		PMC->bRotationFollowsVelocity = false;
+		PMC->bRotationRemainsVertical = false; // 显式禁用
+
+		// 3) 把 Actor rotation 锁定到水平姿态 (Pitch=0, Yaw=throw yaw, Roll=0)
+		const FRotator LockedThrowRotation(0.0f, CachedThrowYaw, 0.0f);
+		OwnerWeapon->SetActorRotation(LockedThrowRotation);
+
+		// 【v240.15 实验性修复 — 有保留】SetUpdatedComponent(RootComponent)
+		//   尝试让 PMC 直接移动 Actor RootComponent(从而移动 Actor)
+		//   结果 (2026.08.15 Session1.txt): PMC 内部物理引擎/RecreatePhysicsState 会重置 UpdatedComponent
+		//         实际 Tick 时 UpdatedComp 仍是 WeaponSkeletalMesh (Tick 诊断日志确认)
+		//   因此这条路无效,但保留无害(因真正的修复 v240.16 走另一路径: 用 HitResult.ImpactPoint 直接定位)
+		if (USceneComponent* RootComp = OwnerWeapon->GetRootComponent())
+		{
+			if (PMC->UpdatedComponent != RootComp)
+			{
+				PMC->SetUpdatedComponent(RootComp);
+				UE_LOG(LogTemp, Verbose,
+					TEXT("[v240.15][WeaponDropComponent] StartDroppedState: 尝试重定向 PMC.UpdatedComponent = RootComponent('%s'). (v240.16 走 HitResult 路径, 此修复作为补充)."),
+					*RootComp->GetName());
+			}
+		}
+
+		// 4) 然后才 SetActive(true) — PMC 第一帧 Tick 看到 bRotationFollowsVelocity=false → 不改 rotation
 		PMC->SetActive(true);
-		PMC->SetUpdatedComponent(MeshComp); // UE 5 官方推荐: 重新指向更新组件
 
 		// 【v200.4.5 P0 修复 — 终极根因】UE PMC 与 SimulatePhysics 互斥!
 		//   UE 官方文档 (Movement Components):
@@ -453,7 +497,7 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		//            实际应该是 v_z = 100 - 980*4 = -3820 cm/s, z = 起始 - 7000cm
 		//            → 武器根本没在 Tick! 或 Tick 没应用重力!
 		PMC->Velocity = LaunchDirection; // 直接世界空间 — 简单稳定, 不需要双转换
-		PMC->bRotationFollowsVelocity = true; // 视觉上让枪头朝速度方向 (UE 官方建议)
+		// bRotationFollowsVelocity 已在 SetActive 之前设为 false (v240.13.1 关键修复)
 
 		PMC->BounceVelocityStopSimulatingThreshold = ProjectileStopVelocityThreshold;
 		PMC->ProjectileGravityScale = 1.0f; // 【v200.4.4】UE 默认重力缩放, 防止 BP 子类设了 0 → 武器不落
@@ -464,15 +508,38 @@ void UWeaponDropComponent::StartDroppedState(ABaseCharacter* InDropInstigator)
 		PMC->OnProjectileStop.RemoveDynamic(this, &UWeaponDropComponent::OnProjectileStopHandler);
 		PMC->OnProjectileStop.AddDynamic(this, &UWeaponDropComponent::OnProjectileStopHandler);
 
+UE_LOG(LogTemp, Display,
+		TEXT("[v240.13.1][WeaponDropComponent] StartDroppedState: 武器 '%s' 启动 PMC 抛物线 (扔飞刀模式 — SetActive 前禁用 rotation 控制, 锁定 yaw=%.2f°, 全程姿态不变). ")
+		TEXT("WorldVelocity=%s, MaxSpeed=%.1f, InitialSpeed=%.1f, RotationFollowsVel=%d, StopThreshold=%.1f"),
+		*OwnerWeapon->GetName(),
+		CachedThrowYaw,
+		*LaunchDirection.ToCompactString(),
+		PMC->MaxSpeed,
+		PMC->InitialSpeed,
+		PMC->bRotationFollowsVelocity ? 1 : 0,
+		ProjectileStopVelocityThreshold);
+
+	// 【v240.14 关键诊断】PMC 启动那一帧的精确位置 — 排查"落地就在脚下"
+	//   目的: 如果 PMC 启动时武器已经在角色脚下 → 必然立即触发 OnProjectileStop
+	//   如果 PMC 启动时武器在 50+cm 外 → 问题在 PMC 飞行中
+	{
+		const FVector PmcStartLoc = OwnerWeapon->GetActorLocation();
+		float DistToInstigator = -1.0f;
+		float ZDelta = 0.0f;
+		if (DropInstigator.IsValid())
+		{
+			DistToInstigator = FVector::Dist(PmcStartLoc, DropInstigator->GetActorLocation());
+			ZDelta = PmcStartLoc.Z - DropInstigator->GetActorLocation().Z;
+		}
 		UE_LOG(LogTemp, Display,
-			TEXT("[v200.4.4][WeaponDropComponent] StartDroppedState: 武器 '%s' 启动 PMC 抛物线 (世界速度). ")
-			TEXT("WorldVelocity=%s, MaxSpeed=%.1f, InitialSpeed=%.1f, RotationFollowsVel=%d, StopThreshold=%.1f"),
+			TEXT("[v240.14][WeaponDropComponent] PMC 启动诊断: Weapon=%s, PmcStartLoc=%s, "
+			     "离 DropInstigator 距离=%.1fcm, Z差=%.1fcm "
+			     "(距离<50cm 或 Z差<-100cm = 武器在角色脚下/内部 → 会立即触发 OnProjectileStop)"),
 			*OwnerWeapon->GetName(),
-			*LaunchDirection.ToCompactString(),
-			PMC->MaxSpeed,
-			PMC->InitialSpeed,
-			PMC->bRotationFollowsVelocity ? 1 : 0,
-			ProjectileStopVelocityThreshold);
+			*PmcStartLoc.ToCompactString(),
+			DistToInstigator,
+			ZDelta);
+	}
 	}
 	else
 	{
@@ -596,13 +663,40 @@ void UWeaponDropComponent::OnProjectileStopHandler(const FHitResult& HitResult)
 		return;
 	}
 
+	// 【v240.14 关键诊断】打印 OnProjectileStop 触发的精确位置 + HitResult
+	//   目的: 排查"飞行看着远,落地却在脚下" — 用户 2026.08.15 反馈
+	//   重点: HitActor / HitLocation / 时间戳 + 离 DropInstigator 的距离
+	const FVector StopLoc = OwnerWeapon->GetActorLocation();
+	float DistToInstigator = -1.0f;
+	if (DropInstigator.IsValid())
+	{
+		DistToInstigator = FVector::Dist(StopLoc, DropInstigator->GetActorLocation());
+	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[v240.14][WeaponDropComponent] OnProjectileStopHandler 关键诊断: Weapon=%s, "
+		     "StopLoc=%s, HitResult.ImpactPoint=%s, HitResult.HitActor=%s, "
+		     "HitResult.bBlockingHit=%d, 离 Instigator 距离=%.1fcm (此值过小=落地触发过早, 过大=PMC 飞太远未落地)"),
+		*OwnerWeapon->GetName(),
+		*StopLoc.ToCompactString(),
+		*HitResult.ImpactPoint.ToCompactString(),
+		HitResult.GetActor() ? *HitResult.GetActor()->GetName() : TEXT("None"),
+		HitResult.bBlockingHit ? 1 : 0,
+		DistToInstigator);
+
 	UE_LOG(LogTemp, Display,
 		TEXT("[v200.4][WeaponDropComponent] OnProjectileStopHandler: PMC 触发落地. Weapon=%s, HitLocation=%s"),
 		*OwnerWeapon->GetName(),
 		*HitResult.ImpactPoint.ToCompactString());
 
 	// 转发到 SettleWeaponOnGround (单一沉淀入口)
-	SettleWeaponOnGround(OwnerWeapon);
+	// 【v240.16 P0】传递 HitResult — PMC 模拟的"预期落点" ≠ Actor 当前世界位置!
+	//   根因: BP RootComponent=DefaultSceneRoot + PMC.UpdatedComponent=Mesh
+	//         → PMC 移动 Mesh(用户视觉"飞得远") 但不移动 Actor(RootComponent)
+	//         → Actor 仍在角色脚下,但 HitResult.ImpactPoint 在远处真实地面
+	//   旧代码用 OwnerWeapon->GetActorLocation() 当 StartLoc → 落在脚下
+	//   新代码用 HitResult.ImpactPoint 当 StartLoc → 落在真实地面
+	//   大厂原则: 落地点 = PMC 报告的物理碰撞点(单一真理源),不用 Actor 位置
+	SettleWeaponOnGround(OwnerWeapon, HitResult);
 }
 
 // ==========================================
@@ -622,7 +716,7 @@ void UWeaponDropComponent::OnProjectileStopHandler(const FHitResult& HitResult)
 //   - GroundOffsetCm <= 0 → 使用硬编码 1.0 (避免配置错导致负穿透)
 //
 // ==========================================
-void UWeaponDropComponent::SettleWeaponOnGround(ABaseWeapon* OwnerWeapon)
+void UWeaponDropComponent::SettleWeaponOnGround(ABaseWeapon* OwnerWeapon, const FHitResult& InHitResult)
 {
 	if (!IsValid(OwnerWeapon))
 	{
@@ -675,81 +769,116 @@ void UWeaponDropComponent::SettleWeaponOnGround(ABaseWeapon* OwnerWeapon)
 	}
 
 	// 2. 关闭物理引擎
-	UMeshComponent* MeshComp = Cast<UMeshComponent>(OwnerWeapon->GetMeshComponent());
-	if (MeshComp && MeshComp->IsSimulatingPhysics())
+	//   - 【v240.2 大厂架构】委托 EnsureSkeletalMeshPhysicsDisabled 统一处理 (单一真理源, 零重复)
+	if (UMeshComponent* MeshComp = Cast<UMeshComponent>(OwnerWeapon->GetMeshComponent()))
 	{
-		MeshComp->SetSimulatePhysics(false);
-
-		// 【v200.3.6 关键】停止物理后必须 RecreatePhysicsState
-		// 否则 SkeletalMesh 的 Physics Body Transform 不会同步到 Component
-		if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
+		if (MeshComp->IsSimulatingPhysics())
 		{
-			SkelMesh->RecreatePhysicsState();
+			OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled(TEXT("SettleWeaponOnGround"));
 		}
 	}
 
-	// 3. LineTrace 找地面 (UE 5 大厂标准 — 用 PMC HitResult 优先, 没 HitResult 时本地 trace)
-	const FVector StartLoc = OwnerWeapon->GetActorLocation();
-	const FVector TraceEndLoc = StartLoc - FVector(0.0f, 0.0f, 200.0f); // 200cm (比 500cm 短, 因为 OnProjectileStop 时武器已经接近地面)
+	// 【v240.16 关键诊断】HitResult vs Actor 位置
+	//   验证 v240.16 修复: 用 HitResult.ImpactPoint(真落点)而不是 Actor 位置(脚下)
+	UE_LOG(LogTemp, Display,
+		TEXT("[v240.16][WeaponDropComponent] SettleWeaponOnGround: HitResult.ImpactPoint=%s, ActorLoc=%s, Diff=%.1fcm (v240.16 用 ImpactPoint, 不用 ActorLoc)."),
+		*InHitResult.ImpactPoint.ToCompactString(),
+		*OwnerWeapon->GetActorLocation().ToCompactString(),
+		FVector::Dist(InHitResult.ImpactPoint, OwnerWeapon->GetActorLocation()));
 
-	FHitResult GroundHit;
-	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(WeaponSettle), false, OwnerWeapon);
-	QueryParams.bTraceComplex = false;
-
-	const bool bHit = World->LineTraceSingleByChannel(
-		GroundHit,
-		StartLoc,
-		TraceEndLoc,
-		ECC_WorldStatic,
-		QueryParams
-	);
-
-	if (!bHit)
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[v200.4][WeaponDropComponent] SettleWeaponOnGround: 武器 '%s' 向下 200cm 没找到地面 (位置=%s). 跳过贴齐, 武器保留当前位置."),
-			*OwnerWeapon->GetName(),
-			*StartLoc.ToCompactString());
-		return;
-	}
-
-	// 4. 计算贴齐位置 (GroundZ + GroundOffsetCm)
+	// 3. 落地点 = PMC HitResult.ImpactPoint (v240.16)
+	//   旧代码: LineTrace 找地面 + 用 Actor 位置(根部)
+	//   新代码: 直接用 HitResult.ImpactPoint — 这是 PMC 模拟的"真实物理碰撞点"
+	//     大厂原则: 落地点 = PMC 报告的物理碰撞点(单一真理源)
+	//     不要再做 LineTrace(浪费 CPU,还可能找到错的地面)
+	const FVector StartLoc = InHitResult.ImpactPoint;
 	const float SafeOffset = FMath::Max(GroundOffsetCm, 0.0f);
 	const FVector SettledLocation(
 		StartLoc.X,
 		StartLoc.Y,
-		GroundHit.Location.Z + SafeOffset
+		InHitResult.ImpactPoint.Z + SafeOffset
 	);
-
 	const float DeltaZ = SettledLocation.Z - StartLoc.Z;
 
-	// 5. TeleportPhysics 模式 SetActorLocation — 关闭物理后不需要 TeleportPhysics
-	//    (v200.3.13 用 TeleportPhysics 是因为还 simulate physics, v200.4 已关闭)
-	OwnerWeapon->SetActorLocation(
-		SettledLocation,
-		false,
-		nullptr,
-		ETeleportType::TeleportPhysics  // 保留 TeleportPhysics 防御性 — 即使物理残留也能 teleport
-	);
+	// 4. 【v240.8 大厂架构 P0】服务器冻结位置 — 用 RootComponent->SetWorldLocation 绕开反算路径
+	//   根因: SetActorLocation 对 DetachFromActor 后的 Actor 会触发反算 RelativeTransform
+	//         → Root.RelativeLocation 变成 WorldLocation → 后续运行时显示 Root 和 Mesh 不一致
+	//   修复: 直接对 RootComponent 设 WorldLocation, 不修改 RelativeTransform
+	//   (与 v240.7 Promote + v240.8 Multicast_FreezeWeaponTransform 共同构成"在地上姿态"完整链路)
+	USceneComponent* WeaponRoot = OwnerWeapon->GetRootComponent();
+	if (WeaponRoot)
+	{
+		WeaponRoot->SetWorldLocation(
+			SettledLocation,
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics  // 保留 TeleportPhysics 防御性
+		);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v240.8][WeaponDropComponent] SettleWeaponOnGround: OwnerWeapon=%s RootComponent 为空 — 无法 SetWorldLocation. "
+			     "BP_Weapon_*.uasset 必须配 RootComponent."),
+			*OwnerWeapon->GetName());
+	}
 
-	// 6. 【关键 v200.4】Multicast 通知客户端冻结
-	//    ReplicateMovement 复制 Actor.Location 但不复制 PMC/物理状态
-	//    必须显式 Multicast 通知客户端关闭本地 PMC + 关闭物理 + SetActorLocation
-	OwnerWeapon->Multicast_FreezeWeaponTransform(
-		FVector_NetQuantize(SettledLocation),
-		OwnerWeapon->GetActorRotation()
-	);
+	// 5. 【v240.10 大厂架构 P0】服务器硬对齐 Mesh RelXform → identity
+	//   根因:
+	//     - BP_Weapon_AK47 的 Mesh 组件 BP 默认 RelXform = (-9, 178, -120) (美术在地上配的"地上姿态")
+	//     - 即便 Root 已贴地, Mesh.WorldLoc = Root.WorldLoc + Mesh.RelXform (无 AttachParent)
+	//     - → Mesh 沉入地下 120cm (用户反馈)
+	//   修复 (服务器端权威):
+	//     - 显式把所有非弹夹 Mesh 子组件的 RelativeTransform 设为 identity
+	//     - 这样 Mesh.WorldLoc = Root.WorldLoc → 完全贴地
+	//     - 与客户端 Multicast_FreezeWeaponTransform (v240.10) 共同构成 "抛下时 Root 和 Mesh 完全对齐" 的硬约束
+	{
+		TArray<UMeshComponent*> MeshComps;
+		OwnerWeapon->GetComponents<UMeshComponent*>(MeshComps);
+		int32 ServerResetMeshCount = 0;
+		for (UMeshComponent* MeshComp : MeshComps)
+		{
+			if (!MeshComp) continue;
+			if (MeshComp->GetName().Contains(TEXT("Magazine")))
+			{
+				continue; // 跳过弹夹
+			}
+			MeshComp->SetRelativeTransform(FTransform::Identity);
+			++ServerResetMeshCount;
+		}
+		UE_LOG(LogTemp, Display,
+			TEXT("[v240.10][WeaponDropComponent] SettleWeaponOnGround: 服务器硬对齐 Mesh 子组件 RelXform → identity. Weapon=%s, ServerResetMeshCount=%d"),
+			*OwnerWeapon->GetName(),
+			ServerResetMeshCount);
+	}
 
-	UE_LOG(LogTemp, Display,
-		TEXT("[v200.4][WeaponDropComponent] SettleWeaponOnGround: 武器 '%s' 落地沉淀完成. ")
-		TEXT("原位置=%s, 冻结位置=%s, 地面 Z=%.2f, DeltaZ=%.2fcm (GroundOffsetCm=%.2f). ")
-		TEXT("已 Multicast 通知客户端冻结."),
-		*OwnerWeapon->GetName(),
-		*StartLoc.ToCompactString(),
-		*SettledLocation.ToCompactString(),
-		GroundHit.Location.Z,
-		DeltaZ,
-		SafeOffset);
+// 6. 【v240.13 大厂架构 — 扔飞刀模式落地】FinalRotation 用抛出 yaw 强制水平姿态
+//   v240.11 (缓存 yaw) / v240.12 (UE 标准 bRotationRemainsVertical) 都被用户反馈"突变"
+//   v240.13 根因分析:
+//     - PMC 飞行中无论 bRotationFollowsVelocity 怎么设,落地瞬间 Pitch 可能被物理引擎/重力影响而倾斜
+//     - 用户的根本诉求: "横着扔出去到地上也是横着的" — 即从抛出到落地全程 Pitch=0/Roll=0/Yaw=抛出 yaw
+//   修复: 不再依赖 Actor 当前旋转,在 SettleWeaponOnGround 显式构造 FinalRotation:
+//     - Pitch = 0 (水平)
+//     - Yaw = CachedThrowYaw (抛出 yaw)
+//     - Roll = 0 (水平)
+//   这样落地姿态 = 抛出姿态 — 完全一致,无突变
+const FRotator FinalRotation(0.0f, CachedThrowYaw, 0.0f);
+OwnerWeapon->Multicast_FreezeWeaponTransform(
+	FVector_NetQuantize(SettledLocation),
+	FinalRotation
+);
+
+UE_LOG(LogTemp, Display,
+	TEXT("[v200.4][WeaponDropComponent] SettleWeaponOnGround: 武器 '%s' 落地沉淀完成. ")
+	TEXT("HitResult.ImpactPoint=%s, 冻结位置=%s, 地面 Z=%.2f, DeltaZ=%.2fcm (GroundOffsetCm=%.2f). ")
+	TEXT("已 Multicast 通知客户端冻结 (v240.13: 扔飞刀模式, FinalRotation=(P=0, Y=ThrowYaw=%.2f, R=0) — 抛出姿态=落地姿态,无突变)."),
+	*OwnerWeapon->GetName(),
+	*StartLoc.ToCompactString(),
+	*SettledLocation.ToCompactString(),
+	InHitResult.ImpactPoint.Z,
+	DeltaZ,
+	SafeOffset,
+	CachedThrowYaw);
 }
 
 // ==========================================
@@ -851,17 +980,11 @@ bool UWeaponDropComponent::CancelDroppedState(ABaseCharacter* Picker)
 
 	if (MeshComp->IsSimulatingPhysics())
 	{
-		MeshComp->SetSimulatePhysics(false);
-
-		// 【v200.3.6 关键】停止物理后必须 RecreatePhysicsState
-		// 否则 SkeletalMesh 的 Physics Body Transform 不会同步到 Component
-		if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
-		{
-			SkelMesh->RecreatePhysicsState();
-		}
+		// 【v240.2 大厂架构】委托 EnsureSkeletalMeshPhysicsDisabled 统一处理 (单一真理源, 零重复)
+		OwnerWeapon->EnsureSkeletalMeshPhysicsDisabled(TEXT("CancelDroppedState"));
 
 		UE_LOG(LogTemp, Display,
-			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: RecreatePhysicsState 完成. Weapon=%s Location=%s"),
+			TEXT("[v200.3.6][WeaponDropComponent] CancelDroppedState: 物理停止完成. Weapon=%s Location=%s"),
 			*OwnerWeapon->GetName(),
 			*OwnerWeapon->GetActorLocation().ToCompactString());
 	}

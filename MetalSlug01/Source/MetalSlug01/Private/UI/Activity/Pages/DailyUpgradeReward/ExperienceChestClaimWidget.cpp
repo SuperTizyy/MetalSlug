@@ -31,10 +31,16 @@
 /**
  * UExperienceChestClaimWidget::Initialize
  *
+ * 大厂架构 (v230 重构):
  * 1. 默认值: ChestCount=5 / Exp=0 / Max=100
- * 2. 绑定 ChestClaimButton
- * 3. 调用所有 Update* 初始化 UI
+ * 2. 零兜底: Initialize 不再绑定 ChestClaimButton->OnClicked (UMG 时序问题)
+ *    - Initialize 在 widget 构造早期调用, 此时 UPROPERTY(BindWidget) 引用可能未绑定
+ *    - 绑定移到 NativeConstruct (那时 UPROPERTY 必定有效)
+ * 3. 调用所有 Update* 初始化 UI (视觉态, 不含事件绑定)
  * 4. 默认 Visible
+ *
+ * ⚠️ 零兜底原则:
+ *  - ChestClaimButton 控件未绑定: Log Error + 不调 SetVisibility (避免静默吞错)
  */
 bool UExperienceChestClaimWidget::Initialize()
 {
@@ -48,11 +54,10 @@ bool UExperienceChestClaimWidget::Initialize()
 	CurrentExperience = 0;
 	MaxExperience = 100;
 
-	// 绑定按钮点击事件
-	if (ChestClaimButton)
-	{
-		ChestClaimButton->OnClicked.AddDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
-	}
+	// 【v230 大厂重构】ChestClaimButton->OnClicked 绑定移到 NativeConstruct
+	// 原因: Initialize 在 widget 构造早期调用, UPROPERTY(BindWidget) 引用可能未赋值,
+	//      在此处 AddDynamic 会 silent fail (if 守卫 + 没 else 分支)
+	// 新位置: NativeConstruct 时 UPROPERTY 必定有效
 
 	// 初始化 UI 显示
 	UpdateChestCount();
@@ -74,6 +79,15 @@ bool UExperienceChestClaimWidget::Initialize()
 	{
 		ChestClaimButton->SetVisibility(ESlateVisibility::Visible);
 	}
+	else
+	{
+		// 【v230 零兜底】显式 Log Error, 不再 silent fallback
+		UE_LOG(LogTemp, Error,
+			TEXT("[ExperienceChestClaimWidget] Initialize: ChestClaimButton UPROPERTY 未绑定! ")
+			TEXT("修复: 在 WBP_ExperienceChestClaimWidget 蓝图里确保 ChestClaimButton 控件已 BindWidget 关联. ")
+			TEXT("Widget=%s"),
+			*GetName());
+	}
 
 	return true;
 }
@@ -81,17 +95,43 @@ bool UExperienceChestClaimWidget::Initialize()
 
 /**
  * UExperienceChestClaimWidget::NativeConstruct
+ *
+ * 大厂架构 (v230 新增):
+ * - 在此绑定 ChestClaimButton->OnClicked (UMG 时序正确, UPROPERTY 必定有效)
+ * - 使用 AddUniqueDynamic 自动去重 (多次 Activate/Deactivate 安全)
+ * - 零兜底: ChestClaimButton 为 null 时 Log Error + return (不 silent 吞错)
  */
 void UExperienceChestClaimWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
+
+	// 【v230 大厂重构】OnClicked 绑定从 Initialize 移到这里
+	// 原因: UMG 标准模式 — NativeConstruct 比 Initialize 晚, UPROPERTY(BindWidget) 已填好
+	if (!ChestClaimButton)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[ExperienceChestClaimWidget] NativeConstruct: ChestClaimButton UPROPERTY 未绑定! ")
+			TEXT("修复: 在 WBP_ExperienceChestClaimWidget 蓝图里确保 ChestClaimButton 控件已 BindWidget 关联. ")
+			TEXT("Widget=%s"),
+			*GetName());
+		return;
+	}
+
+	// AddUniqueDynamic 自动去重, 多次调用安全
+	ChestClaimButton->OnClicked.AddUniqueDynamic(this, &UExperienceChestClaimWidget::OnChestClaimButtonClicked);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[ExperienceChestClaimWidget] NativeConstruct: ChestClaimButton->OnClicked 已绑定. Widget=%s"),
+		*GetName());
 }
 
 
 /**
  * UExperienceChestClaimWidget::NativeDestruct
  *
- * 解绑按钮事件
+ * 大厂架构 (v230 验证):
+ * - 解绑 ChestClaimButton->OnClicked
+ * - RemoveDynamic 对未绑定是 no-op, 不需要 bool 守护
  */
 void UExperienceChestClaimWidget::NativeDestruct()
 {
@@ -117,17 +157,21 @@ void UExperienceChestClaimWidget::NativeDestruct()
  * 3. 校验 ChestClaimStatus[TargetIndex] != 1
  * 4. 校验 CurrentExperience >= TaskRelatedValues[TargetIndex]
  * 5. 广播 OnChestClaimRequested(TargetIndex)
+ *
+ * ⚠️ 零兜底 (v230):
+ * - ChestClaimButton / OnChestClaimRequested 任一为 null, 立即 Log Error + return
+ *   (理论上 v230 在 NativeConstruct 绑定后这两个守卫永远不应触发, 但作为最后防线保留)
  */
 void UExperienceChestClaimWidget::OnChestClaimButtonClicked()
 {
-	// 【vXXX.1 防御性检查】按钮本身是否有效
+	// 【v230 防御性检查 - 最后防线】按钮本身是否有效
 	if (!ChestClaimButton)
 	{
 		UE_LOG(LogTemp, Error, TEXT("ExperienceChestClaimWidget: ChestClaimButton未绑定！请检查蓝图是否正确绑定 ChestClaimButton 控件。Widget=%s"), *GetName());
 		return;
 	}
 
-	// 【vXXX.1 防御性检查】回调是否已绑定到父页面
+	// 【v230 防御性检查 - 最后防线】回调是否已绑定到父页面
 	if (!OnChestClaimRequested.IsBound())
 	{
 		UE_LOG(LogTemp, Error, TEXT("ExperienceChestClaimWidget: OnChestClaimRequested事件未绑定！请检查蓝图或C++代码是否正确绑定了OnChestClaimRequested事件。Widget=%s, ChestIndex=%d"),

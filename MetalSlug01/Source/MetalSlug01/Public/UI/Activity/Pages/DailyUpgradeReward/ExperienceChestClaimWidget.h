@@ -42,6 +42,10 @@ class USizeBox;
  * 3. 委托通信: OnChestClaimRequested(ChestIndex) 通知父级
  * 4. 复用: FixedPrizeWidget 也用此类, 通过 ChestIndex 区分
  * 5. 防御链: 多次空指针检查 + 多种降级状态
+ * 6. UMG 时序: ChestClaimButton->OnClicked 绑定必须在 NativeConstruct (v230)
+ *    - Initialize 时 UPROPERTY(BindWidget) 引用可能未赋值 → silent fail
+ *    - NativeConstruct 时 UPROPERTY 必定有效 → 绑定必定成功
+ * 7. 零兜底: 控件为 null 必须 Log Error + return, 不 silent 吞错
  *
  * 关联:
  * - 上级: UDailyUpgradeRewardPage（创建/管理）

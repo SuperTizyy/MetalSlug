@@ -318,20 +318,40 @@ public:
     bool CanClaimTask(int32 TaskIndex) const;
 
     /**
-     * @brief 获取重选奖励选项数据
-     * @return 奖励选项的ItemIcon数组
+     * @brief 获取可选奖励 ItemIcon 全集合 (大厂重构 v229 SSOT - 零兜底)
+     * @details SSOT 链路:
+     *   MainConfig.RewardItemIDs.Last() → BoxID
+     *   → UActivitySubsystem::GetTreasureBoxItemsByBoxID(BoxID)
+     *   → 对每条 TreasureBoxItem 查 ItemDetail.ItemIcon 入数组
+     *
+     *   此返回值是 DailyUpgradeRewardPage::CachedItemIcons 的唯一来源,
+     *   数组大小 N == popup 候选卡数 == RewardIconIndex 合法范围 [0, N)。
+     *
+     * @return ItemIcon 全集合数组; 任何失败返回空数组 + Log Error (调用方必须显式处理).
      */
     TArray<TSoftObjectPtr<UTexture2D>> GetReselectRewardOptions();
 
     /**
-     * @brief 获取奖励物品图标数据
-     * @details 按照指定逻辑获取RewardItemImage控件所需的图标数据：
-     * 1. 找到UpgradeRewardSaveRecord动态表中RecordDate最大的数据
-     * 2. 取其中的RewardIconIndex字段数据
-     * 3. 通过表关联获取对应的ItemIcon数据
-     * @return 奖励物品图标数组
+     * @brief 获取奖励物品图标数据 (大厂重构 v229 - 与 GetReselectRewardOptions 合并 SSOT, 零兜底)
+     * @details 旧版返回 1 个图标是 bug, v229 改造为返回全集合 (SSOT 与 GetReselectRewardOptions 一致).
+     * @return 奖励物品图标全集合数组
      */
     TArray<TSoftObjectPtr<UTexture2D>> GetRewardItemIcons();
+
+    /**
+     * @brief 获取当前选中的 ItemIcon (大厂重构 v229 新增 - 零兜底)
+     * @details SSOT 链路 (与 GetCurrentRewardItemCount 严格对称):
+     *   MainConfig.RewardItemIDs.Last() → BoxID
+     *   → GetTreasureBoxItemsByBoxID(BoxID)[CurrentRecord.RewardIconIndex].ItemID
+     *   → GetItemDetail(ItemID).ItemIcon
+     *
+     *   是 RewardItemImage 控件显示图标的唯一合法来源;
+     *   旧版 GetRewardItemIcons() 因为忽略 RewardIconIndex, 永远是第 0 张图标, 故 RewardItemImage 不刷新.
+     *
+     * @return 当前选中 ItemDetail 的 ItemIcon; 任何失败返回空指针 + Log Error (调用方必须显式处理).
+     */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Upgrade Activity")
+    TSoftObjectPtr<UTexture2D> GetCurrentRewardIcon() const;
     	
     /**
      * @brief 获取宝箱图标数据

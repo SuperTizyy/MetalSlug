@@ -230,7 +230,7 @@ protected:
 	 *   - SetActorLocation (TeleportPhysics): 服务器冻结位置
 	 *   - Multicast_FreezeWeaponTransform: 客户端同步冻结 (ReplicateMovement 不复制 PMC 状态)
 	 */
-	void SettleWeaponOnGround(ABaseWeapon* OwnerWeapon);
+	void SettleWeaponOnGround(ABaseWeapon* OwnerWeapon, const FHitResult& InHitResult);
 
 	/**
 	 * 【v200.4 大厂架构】PMC OnProjectileStop 回调处理器
@@ -378,6 +378,18 @@ protected:
 	FTimerHandle DropPositionTimerHandle;
 
 	/**
+	 * 【v240.13 大厂架构 — 扔飞刀模式】抛出瞬间的武器 yaw (度)
+	 *   - 在 StartDroppedState 中, PMC 启动前缓存 OwnerWeapon->GetActorRotation().Yaw
+	 *   - 飞行中 PMC 不修改 Actor rotation (bRotationFollowsVelocity=false)
+	 *   - 落地时 SettleWeaponOnGround 用此值构造 FinalRotation=(P=0, Y=ThrowYaw, R=0)
+	 *     → 抛出姿态 = 落地姿态,无 yaw 突变
+	 *   - 不用 bRotationFollowsVelocity=true + bRotationRemainsVertical=true
+	 *     因为前者必然让 yaw 跟 velocity (87°→162°),落地瞬间仍有视觉突变
+	 */
+	UPROPERTY()
+	float CachedThrowYaw = 0.0f;
+
+	/**
 	 * 【v200.3.13 配置】地面贴齐抬升的安全距离 (cm)
 	 *   - 太小 (< 0.5cm): 可能仍然有微小 penetration (浮点精度)
 	 *   - 太大 (> 5cm): 视觉上"漂浮"在地面上方
@@ -405,7 +417,7 @@ protected:
 	UPROPERTY()
 	bool bWasSimulatingPhysics = false;
 
-	/**
+/**
 	 * 掉落前的碰撞预设名称 (用于恢复)
 	 */
 	UPROPERTY()

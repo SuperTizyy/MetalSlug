@@ -765,6 +765,36 @@ protected:
 	static void ResetWeaponMeshRelativeTransforms(ABaseWeapon* Weapon);
 
 	/**
+	 * 【v240.7 大厂架构 — Mesh "地上姿态" 提升到 RootComponent】
+	 *
+	 *   根因:
+	 *     - BP_Weapon_*.uasset 里美术把"武器在地上"的姿态配在 Mesh 子组件的 RelativeTransform 上
+	 *       (例如 BP_Weapon_AK47 的 WeaponSkeletalMesh 配了 RelLoc=(-9, 178, -120) / RelRot=(-61, 92, 1))
+	 *     - RootComponent (DefaultSceneRoot) 配了无意义的"编辑器占位"值
+	 *       (例如 AK47 的 Root 配了 RelLoc=(-3252, 3391, 1299) / RelRot=(-0.5, 169, -0.6))
+	 *     - ApplyAttachmentRuntime 通过 SetWorldLocation/SetWorldRotation (v240.6) 把 Root 设到 socket + DT 姿态
+	 *     - DetachFromActor(KeepWorldTransform) 让两个组件都回到 BP 默认 RelativeTransform
+	 *       → Root 的"垃圾值"暴露 → 武器在地上时 Root 和 Mesh 看起来对不齐
+	 *
+	 *   大厂原则 (单一真理源 — "在地上姿态 = RootComponent.RelativeTransform"):
+	 *     - RootComponent 是物理引擎/Movement 组件/Attach 复制的唯一承载者
+	 *     - 美术设计的"地上姿态"必须提升到 Root,而不是保留在 Mesh 子组件上
+	 *     - 抛下后 Root 和 Mesh 的 RelativeTransform 一致 (都是美术配的 Mesh 姿态)
+	 *     - 拾起后 ResetWeaponMeshRelativeTransforms 把 Mesh 清零,Mesh 跟随 Root 走
+	 *
+	 *   调用时机 (在 ResetWeaponMeshRelativeTransforms 之前!):
+	 *     - SpawnActor 之后, Mesh 仍是 BP 默认值 → 立即 Promote → 立即 Reset
+	 *
+	 *   【零兜底 (非"隐藏错误"而是"显式状态归位")】
+	 *     - RootComponent 必须是 USceneComponent, 不能为空 (BeginPlay 零兜底检查已保证)
+	 *     - 必须至少有一个非弹夹 Mesh 子组件 (没找到 → Log Error, 不继续 — 强制美术配 Mesh)
+	 *
+	 *   客户端路径:
+	 *     - 服务器改 Root.RelativeTransform → Actor 复制同步给客户端 → 客户端无需额外处理
+	 */
+	static void PromoteMeshOnGroundTransformToRoot(ABaseWeapon* Weapon);
+
+	/**
 	 * 【v78 大厂架构】数组索引 → 槽位类型
 	 *
 	 * 映射: 0→Primary, 1→Secondary, 2→Melee, 其他→None

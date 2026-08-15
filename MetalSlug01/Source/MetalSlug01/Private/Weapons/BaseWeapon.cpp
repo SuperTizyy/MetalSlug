@@ -307,6 +307,15 @@ void ABaseWeapon::BeginPlay()
 	{
 		WeaponMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		WeaponMesh->SetCollisionResponseToAllChannels(ECR_Ignore);
+
+		// 【v240.2 大厂架构 P0 修复】SkeletalMesh 物理模拟导致 DefaultSceneRoot 下坠
+		//   根因: BP_Weapon_AK47_C 中 WeaponSkeletalMesh 被配置为"模拟物理"
+		//         UE 物理引擎驱动 SkeletalMesh 骨骼动画
+		//         而 DefaultSceneRoot 作为 RootComponent 会跟随骨骼运动 → 垂直下坠
+		//   表现: AK47 武器完全看不见 (Diff Rot 达到 47°)
+		//   匕首正常的原因: StaticMesh 没有开启物理模拟
+		//   修复: 委托 EnsureSkeletalMeshPhysicsDisabled 统一处理 (单一真理源, 零重复)
+		EnsureSkeletalMeshPhysicsDisabled(TEXT("BeginPlay"));
 	}
 	else
 	{
@@ -315,6 +324,100 @@ void ABaseWeapon::BeginPlay()
 			     "【v83 警告】修复: 在 BP 蓝图的 Components 面板添加 StaticMeshComponent (近战) 或 SkeletalMeshComponent (枪械)."),
 			*GetName());
 	}
+
+	// 【v240.4 大厂架构 P0 终极修复】主动禁用 ProjectileMovementComponent (PMC)
+	//   根因 (v240.3 诊断日志精确锁定):
+	//     - BP_Weapon_AK47.uasset 配了 ProjectileMovementComponent, bAutoActivate=true
+	//     - SpawnActor 后 PMC 立即 Active, 每帧 TickComponent 主动应用 Gravity*dt 修改 RootComponent 位置
+	//     - 日志证据: AK47 RootComponent.RelativeLocation.Z 在 5.5s 内从 -1.58 持续下降到 -26019.96 (≈47 m/s, 匹配 g=980 cm/s² 重力加速度)
+	//     - 匕首正常原因: BP_Weapon_Knife 没有 PMC → 稳定 Z=-42.57
+	//   与 v240.2 EnsureSkeletalMeshPhysicsDisabled 的本质区别:
+	//     - v240.2 关闭的是"物理引擎驱动的骨骼模拟" (IsSimulatingPhysics() 路径)
+	//     - PMC 的"重力"是 PMC 内部主动 MoveComponent 走的, 完全不经过物理引擎 → IsSimulatingPhysics() 永远 false
+	//     - 所以 v240.2 单独存在不能解决 PMC 问题
+	//
+	//   修复 (单一真理源 + 显式状态机):
+	//     - BeginPlay 默认禁用 PMC, 保证武器 SpawnActor → 默认"手持/挂在角色身上"状态 → PMC 必须 inactive
+	//     - 后续投掷时由 WeaponDropComponent::StartDroppedState 显式激活 PMC (唯一合法激活点)
+	//     - 落地时由 Multicast_FreezeWeaponTransform 显式禁用 PMC (合法禁用点)
+	//     - 捡起时由 WeaponDropComponent::CancelDroppedState 显式禁用 PMC (合法禁用点)
+	//     - BeginPlay 是第 4 个合法禁用点 (防止 BP 配错 bAutoActivate=true)
+	//
+	//   【大厂原则 — 零兜底 (非"隐藏错误"而是"显式状态机")】
+	//     - 这里禁用 PMC 不是"隐藏 BP 配错", 而是显式表达"手持武器 → PMC inactive"的系统约束
+	//     - PMC bAutoActivate=true 配置错会通过 Display Log 暴露 (与 Warning/Error 区分, 表明是设计意图而非异常)
+	//     - 投掷功能 100% 保留 (StartDroppedState 仍能激活 PMC)
+	//   【匕首的 silent return】
+	//     - BP_Weapon_Knife 没有 PMC → FindComponentByClass 返回 null → 不 Log
+	//     - 这是正确行为, 不是兜底
+	UProjectileMovementComponent* PMC = FindComponentByClass<UProjectileMovementComponent>();
+	if (PMC)
+	{
+		if (PMC->IsActive())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[v240.4] ABaseWeapon::BeginPlay: Weapon=%s 检测到 PMC 已激活 (BP bAutoActivate=true), "
+				     "BeginPlay 主动禁用 — 防止挂载时持续下坠 (Z 轴重力 980 cm/s²). "
+				     "PMC 将在 WeaponDropComponent::StartDroppedState 投掷时激活."),
+				*GetName());
+		}
+		PMC->SetActive(false);
+	}
+}
+
+
+/**
+ * EnsureSkeletalMeshPhysicsDisabled — 【v240.2 大厂架构 P0】SkeletalMesh 物理强制关闭
+ *
+ * 调用方:
+ *   - BaseWeapon::BeginPlay (默认防御)
+ *   - BaseWeapon::Multicast_FreezeWeaponTransform_Implementation (落地时防御)
+ *   - WeaponDropComponent::CancelDroppedState (取消投掷状态时防御)
+ *
+ * 大厂原则 (单一真理源 + 零重复):
+ *   - 3 处独立的 SkeletalMesh 物理关闭逻辑合并为一个 helper
+ *   - 避免 3 处重复的 IsSimulatingPhysics + SetSimulatePhysics + RecreatePhysicsState
+ *   - 避免 3 处重复的 Log (Warning/Error)
+ *   - 统一 Log Error 而非 Warning (配置错必须显式化, 强制美术/策划修复 BP)
+ *
+ * 大厂原则 (零兜底):
+ *   - 强制关闭物理模拟 = "运行时"兜底, 但**不是**隐藏的同步加载 (SetRootComponent 那种)
+ *   - SetSimulatePhysics + RecreatePhysicsState 都是 UE 异步操作, 不会引发 DDC 同步加载
+ *   - 与 v220.1 的零兜底策略不冲突
+ */
+void ABaseWeapon::EnsureSkeletalMeshPhysicsDisabled(const TCHAR* CallerContext)
+{
+	if (!GetMeshComponent())
+	{
+		// 没 Mesh 组件的情况由 BeginPlay 单独处理 (Log Warning), 这里 silent return
+		return;
+	}
+
+	UMeshComponent* MeshComp = GetMeshComponent();
+
+	// 只对 SkeletalMesh 处理 (StaticMesh 没有物理引擎驱动的骨骼)
+	USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp);
+	if (!SkelMesh)
+	{
+		return; // StaticMesh 不需要处理
+	}
+
+	if (!SkelMesh->IsSimulatingPhysics())
+	{
+		return; // 已经关闭, 不重复 Log
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[v240.2][ABaseWeapon] EnsureSkeletalMeshPhysicsDisabled (%s): Weapon=%s 的 SkeletalMesh 开启了物理模拟, 强制关闭! ")
+		TEXT("根因: BP 蓝图中 WeaponSkeletalMesh 的 Physics - Simulate 勾选了. ")
+		TEXT("修复: 在 BP_%s 的 Components 面板取消 WeaponSkeletalMesh 的 Simulate Physics. ")
+		TEXT("【v240.2 大厂架构】已强制关闭物理模拟防止 DefaultSceneRoot 下坠."),
+		CallerContext,
+		*GetName(),
+		*GetClass()->GetName());
+
+	SkelMesh->SetSimulatePhysics(false);
+	SkelMesh->RecreatePhysicsState();
 }
 
 
@@ -1453,34 +1556,93 @@ void ABaseWeapon::Multicast_FreezeWeaponTransform_Implementation(FVector_NetQuan
 
 	// 2. 关闭物理引擎 (如果还在跑)
 	//   - 服务器已关闭, 但客户端可能仍 simulate (理论上不会, 防御性)
+	//   - 【v240.2 大厂架构】委托 EnsureSkeletalMeshPhysicsDisabled 统一处理 (单一真理源, 零重复)
 	if (UMeshComponent* MeshComp = GetMeshComponent())
 	{
 		if (MeshComp->IsSimulatingPhysics())
 		{
-			MeshComp->SetSimulatePhysics(false);
-			if (USkeletalMeshComponent* SkelMesh = Cast<USkeletalMeshComponent>(MeshComp))
-			{
-				SkelMesh->RecreatePhysicsState();
-			}
+			EnsureSkeletalMeshPhysicsDisabled(TEXT("Multicast_FreezeWeaponTransform"));
 		}
 	}
 
-	// 3. 【关键】写死客户端武器到精确贴齐位置
-	//   - 服务器 ReplicateMovement 会持续同步 Location, 但客户端 PMC 关闭前可能插值错误
-	//   - 显式 SetActorLocation + TeleportPhysics 立即对齐, 防止客户端插值
-	//   - 这是 UE 大厂标准做法 (Lyra/Paragon/ShooterGame 都这么做)
-	SetActorLocationAndRotation(
-		FVector(FinalLocation),
-		FinalRotation,
-		false,                       // 不 sweep
-		nullptr,                     // 无 out hit
-		ETeleportType::TeleportPhysics  // 物理 teleport
-	);
+	// 3. 【v240.8 大厂架构 P0 — SetActorLocationAndRotation 反算污染 RelativeTransform 真根因修复】
+	//
+	//   根因 (v240.7 修复后用户反馈仍未解决):
+	//     - v240.7 Promote 把 Mesh 的 BP 默认 RelXform 烤到 Root (默认 (0,0,0))
+	//     - v240.7 Reset 把 Mesh 子组件清零 (现在 Mesh=(0,0,0))
+	//     - 抛下 → DetachFromActor(KeepWorldTransform) → Root 和 Mesh 都 RelXform=(0,0,0)
+	//     - 服务器 SettleWeaponOnGround 调 SetActorLocation(SettledLocation) (line 724)
+	//       → UE 反算: RelativeLocation = (WorldLoc - ParentWorldLoc) = SettledLocation - 0 = SettledLocation ❌
+	//     - Multicast_FreezeWeaponTransform 调 SetActorLocationAndRotation(FinalLoc, FinalRot)
+	//       → 同样反算 → 客户端 Root.RelativeLocation = FinalLoc ❌
+	//     - 结果: Root 显示 WorldLoc 值 (-3258, 3196, 1299), Mesh 还是 (0,0,0) → "不一致" 完全就是 UE 的反算
+	//
+	//   修复 (绕开反算路径):
+	//     - 直接调 RootComponent->SetWorldLocation + SetWorldRotation
+	//     - UE 这两个 API 只改 WorldTransform,**不触发反算 RelativeTransform**
+	//     - 抛下后 Root.RelativeTransform 保持 (0,0,0) (Promote 后值)
+	//     - Mesh.RelativeTransform 保持 (0,0,0) (Reset 后值)
+	//     - 两者保持一致 — 真正的"在地上姿态"
+	//
+	//   【大厂原则 — 单一真理源 + 显式状态机】
+	//     - "抛下后 Root 和 Mesh 都是 (0,0,0)" 是 v240.7 建立的"在地上姿态"约定
+	//     - Multicast_FreezeWeaponTransform 必须遵守这个约定, 不能用 SetActor* 触发反算
+	//     - 服务器 Spawn 路径: SettleWeaponOnGround 也应该用 SetWorldLocation (而不是 SetActorLocation)
+	//
+	//   拾起路径 (CancelDroppedState):
+	//     - 拾起时 AttachToComponent(socket) → UE 自动重算 RelativeTransform
+	//     - 拾起后 ApplyAttachmentRuntime 走 SetWorld* 路径 → Root 和 Mesh 一起到 socket + DT 偏移
+	//     - 不受本修复影响
+	USceneComponent* RootComp = GetRootComponent();
+	if (!RootComp)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v240.8] Multicast_FreezeWeaponTransform: RootComponent 为空! 无法冻结位置 — Weapon=%s. "
+			     "请检查 BP_Weapon_*.uasset 的 Components 面板是否设了 RootComponent."),
+			*GetName());
+		return;
+	}
+
+	// 【v240.8 关键】直接设 WorldTransform, 不触发反算 RelativeTransform
+	//   - 抛下后 AttachParent = nullptr (DetachFromActor 后)
+	//   - WorldTransform 设置不影响 RelativeTransform (AttachParent=nullptr 时两者数值上相同)
+	//   - 但通过 SetWorld* 显式设置, UE 内部不会调用 UpdateComponentToWorld 反算
+	//   - 配合 v240.7 Promote: Root 保持 (0,0,0), Mesh 保持 (0,0,0) — 两者一致
+	RootComp->SetWorldLocation(FVector(FinalLocation), false, nullptr, ETeleportType::TeleportPhysics);
+	RootComp->SetWorldRotation(FinalRotation, false, nullptr, ETeleportType::TeleportPhysics);
+
+	// 【v240.10 大厂架构 P0 — 抛下后强制 Mesh RelXform 对齐 Root】
+	//   根因:
+	//     - BP_Weapon_AK47 的 Mesh 组件 BP 默认 RelXform = (-9, 178, -120) (美术在地上配的"地上姿态")
+	//     - DetachFromActor(KeepWorldTransform) 后 Mesh 恢复 BP 默认 → Mesh.WorldLoc = Root.WorldLoc + Mesh.RelXform
+	//     - 即使 Root 已贴地, Mesh 也因为自己的 BP 默认 RelXform 偏移 -120cm 而沉入地下
+	//     - 用户反馈: "Mesh 进入地下 (-19, 178, -115)"
+	//   修复 (硬约束):
+	//     - 抛下后, 显式把所有非弹夹 Mesh 子组件的 RelativeTransform 设为 identity
+	//     - Mesh.WorldLoc = Root.WorldLoc + identity = Root.WorldLoc → 完全贴地
+	//     - 与 v240.10 Promote 共同构成 "抛下时 Root 和 Mesh 都 (0,0,0,identity)" 硬约束
+	TArray<UMeshComponent*> MeshComps;
+	GetComponents<UMeshComponent*>(MeshComps);
+	int32 ResetMeshCount = 0;
+	for (UMeshComponent* MeshComp : MeshComps)
+	{
+		if (!MeshComp) continue;
+		// 跳过弹夹 — 与 Promote/Reset 白名单一致
+		if (MeshComp->GetName().Contains(TEXT("Magazine")))
+		{
+			continue;
+		}
+		// 硬对齐 identity — 这是大厂原则: "扔枪时 Root 和 Mesh 姿态完全一致"
+		MeshComp->SetRelativeTransform(FTransform::Identity);
+		++ResetMeshCount;
+	}
 
 	UE_LOG(LogTemp, Display,
-		TEXT("[v200.4][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端已冻结武器位置. Weapon=%s, Loc=%s"),
+		TEXT("[v240.10][BaseWeapon] Multicast_FreezeWeaponTransform: 客户端已冻结武器位置 (绕开反算路径) + Mesh 子组件硬对齐 identity. Weapon=%s, Loc=%s, RootComp=%s, ResetMeshCount=%d"),
 		*GetName(),
-		*FVector(FinalLocation).ToCompactString());
+		*FVector(FinalLocation).ToCompactString(),
+		*RootComp->GetName(),
+		ResetMeshCount);
 }
 	//   - 服务器 CancelDroppedState: SetSimulatePhysics(false) + AttachToComponent
 	//   - 客户端: ReplicateMovement 收到 attach transform, 自动恢复物理状态 (false)

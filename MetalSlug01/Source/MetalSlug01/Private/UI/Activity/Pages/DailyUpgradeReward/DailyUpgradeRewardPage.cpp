@@ -23,12 +23,16 @@
  *   - NativeDestruct: 解绑 ReselectRewardButton（保留 Subsystem 订阅, 让缓存页可继续接收事件）
  *
  * §3. 奖励物品图标 (InitializeRewardItemIcons / UpdateRewardItemImage / SwitchToNext/PreviousRewardIcon)
- *   - CachedItemIcons: 全局缓存, 用于循环切换
- *   - 依赖 Subsystem: GetRewardItemIcons / GetCurrentRewardIconIndex
- *   - 编辑器预览模式下静默返回
+ *   - CachedItemIcons: 全集合缓存, 用于循环切换 (SwitchToNext/Previous 在 Page 内部完成, 不广播)
+ *   - 依赖 Subsystem (SSOT):
+ *       GetRewardItemIcons()              → 全集合 (用于 CachedItemIcons 与 SwitchToNext 循环边界)
+ *       GetCurrentRewardIcon()            → 单项 (按 RewardIconIndex 查 ItemIcon, RewardItemImage 显示入口)
+ *       GetCurrentRewardIconIndex()       → 当前选中索引 (供 SwitchToNext/Previous 模运算)
+ *   - 编辑器预览模式静默返回
  *
- * §4. 宝箱数量 (UpdateChestCountText)
- *   - 格式: "X{count}" - 拼接 X 前缀
+ * §4. 宝箱数量 (UpdateChestCountText) - 大厂重构 v229 SSOT
+ *   - 数据源: Subsystem->GetCurrentRewardItemCount() (按 RewardIconIndex 查 TreasureBoxItem.ItemCount)
+ *   - 格式: "X{count}" - 拼接 X 前缀; 失败 (-1) 清空 + Log Error (零兜底)
  *
  * §5. 经验宝箱控件列表 (InitializeExperienceChestWidgets)
  *   - 动态创建 ExperienceChestClaimWidget（刨除最后一个索引）
@@ -420,11 +424,10 @@ void UDailyUpgradeRewardPage::NativeDestruct()
 			this, &UDailyUpgradeRewardPage::OnResetAllActivityClicked);
 	}
 
-	// 【Ensure 修复】解绑 FixedPrizeWidget 事件 + 重置幂等标志
-	if (FixedPrizeWidget && bIsFixedPrizeWidgetEventBound)
+	// 解绑 FixedPrizeWidget 事件 (RemoveDynamic 对未绑定是 no-op, 不需要 bool 守护)
+	if (FixedPrizeWidget)
 	{
 		FixedPrizeWidget->OnChestClaimRequested.RemoveDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
-		bIsFixedPrizeWidgetEventBound = false;
 	}
 
 	// 改造: 解除 ViewModel 绑定
@@ -449,94 +452,100 @@ void UDailyUpgradeRewardPage::NativeDestruct()
  */
 void UDailyUpgradeRewardPage::InitializeRewardItemIcons()
 {
-	// 检查是否为编辑器预览模式
+	// 1. 编辑器预览模式: 静默返回 (UI 蓝图预览, 没有 GameInstance)
+	//    大厂原则 - 仅对"明确无运行环境"豁免, 其余任何失败必须 Log Error
 	if (!GetWorld() || !GetWorld()->IsGameWorld())
 	{
-		return; // 静默返回，不输出日志
+		return;
 	}
 
-	// 全局变量存储ItemIcon数据
 	CachedItemIcons.Empty();
 
-	// 1. 通过GameInstance获取UpgradeActivitySubsystem
+	// 2. 拿 Subsystem
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
-		// 在编辑器预览模式下静默处理
-		UpdateRewardItemImage();
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] InitializeRewardItemIcons: GetGameInstance() 为 null, RewardItemImage 无法刷新."));
 		return;
 	}
 
 	UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
 	if (!UpgradeSub)
 	{
-		// 在编辑器预览模式下静默处理
-		UpdateRewardItemImage();
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] InitializeRewardItemIcons: 拿不到 UUpgradeActivitySubsystem, RewardItemImage 无法刷新."));
 		return;
 	}
 
-	// 2. 调用Subsystem方法获取奖励物品图标数据
+	// 3. 拿全集合 ItemIcons (SSOT 链路: MainConfig.RewardItemIDs.Last() → BoxID → GetTreasureBoxItemsByBoxID → ItemIcons)
+	//    v229 改造: GetRewardItemIcons 已重写为"全集合", 数组大小 = popup 候选卡数
 	CachedItemIcons = UpgradeSub->GetRewardItemIcons();
-	
-	// 3. 更新RewardItemImage显示
+	UE_LOG(LogTemp, Log,
+		TEXT("[v229] InitializeRewardItemIcons: 全集合 ItemIcons=%d 个"), CachedItemIcons.Num());
+
+	// 4. 更新 RewardItemImage 显示 (由它自己查当前 RewardIconIndex, 失败 Log Error, 不再静默兜底)
 	UpdateRewardItemImage();
 }
 
 /**
- * @brief 更新奖励物品图像显示
- * @details 将缓存的ItemIcon数据显示到RewardItemImage控件上
- * 主要功能：
- * 1. 检查RewardItemImage控件是否存在
- * 2. 如果有缓存的图标，则显示当前索引的图标
- * 3. 如果没有缓存图标，则隐藏控件
- * @note 使用SetBrushFromSoftTexture支持异步资源加载
+ * @brief 更新奖励物品图像显示 (大厂重构 v229 - 零兜底)
+ * @details SSOT 链路:
+ *   1. 拿 GameInstance / UpgradeSub / GetCurrentRewardIcon() (新 API - 按 RewardIconIndex 查 ItemIcon)
+ *   2. SetBrushFromSoftTexture 写入控件
+ *   3. 任何一步失败: Log Error + SetVisibility(Hidden) (不显示残影, 不兜底默认)
+ *
+ * @note 大厂原则 - 零兜底: 旧版三层 if/else fallback (CachedItemIcons[0]) 是反模式.
+ *       因为它会让"GetRewardItemIcons 只返回 1 项 + Index 越界"这种 bug 永远显示同一张图,
+ *       掩盖了 SSOT 链路错位. 现在直接调 GetCurrentRewardIcon(), 任何失败显式记录.
  */
 void UDailyUpgradeRewardPage::UpdateRewardItemImage()
 {
 	if (!RewardItemImage)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateRewardItemImage: RewardItemImage 控件为空 (BP 未绑定或 GC 释放)."));
 		return;
 	}
 
-	if (CachedItemIcons.Num() > 0)
+	// 1. 编辑器预览模式: 直接隐藏
+	if (!GetWorld() || !GetWorld()->IsGameWorld())
 	{
-		// 通过GameInstance获取UpgradeActivitySubsystem来获取当前索引
-		UGameInstance* GameInstance = GetGameInstance();
-		if (GameInstance)
-		{
-			UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
-			if (UpgradeSub)
-			{
-				int32 CurrentIndex = UpgradeSub->GetCurrentRewardIconIndex();
-				
-				// 确保索引在有效范围内
-				if (CurrentIndex >= 0 && CurrentIndex < CachedItemIcons.Num())
-				{
-					RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[CurrentIndex]);	
-				}
-				else
-				{
-					// 索引超出范围，显示第一个图标
-					RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-				}
-			}
-			else
-			{
-				// 无法获取Subsystem，显示第一个图标
-				RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-			}
-		}
-		else
-		{
-			// 无法获取GameInstance，显示第一个图标
-			RewardItemImage->SetBrushFromSoftTexture(CachedItemIcons[0]);
-		}
-	}
-	else
-	{
-		// 在编辑器预览模式下静默处理，不输出日志
 		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
+		return;
 	}
+
+	UGameInstance* GameInstance = GetGameInstance();
+	if (!GameInstance)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateRewardItemImage: GetGameInstance() 为 null, 隐藏 RewardItemImage."));
+		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
+		return;
+	}
+
+	UUpgradeActivitySubsystem* UpgradeSub = GameInstance->GetSubsystem<UUpgradeActivitySubsystem>();
+	if (!UpgradeSub)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateRewardItemImage: 拿不到 UUpgradeActivitySubsystem, 隐藏 RewardItemImage."));
+		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
+		return;
+	}
+
+	// 2. 直接调 GetCurrentRewardIcon() (按 RewardIconIndex 查 ItemIcon - SSOT 唯一入口)
+	const TSoftObjectPtr<UTexture2D> CurrentIcon = UpgradeSub->GetCurrentRewardIcon();
+	if (CurrentIcon.IsNull())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateRewardItemImage: GetCurrentRewardIcon() 返回空, 隐藏 RewardItemImage."));
+		RewardItemImage->SetVisibility(ESlateVisibility::Hidden);
+		return;
+	}
+
+	// 3. 写入
+	RewardItemImage->SetBrushFromSoftTexture(CurrentIcon);
+	RewardItemImage->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 }
 
 /**
@@ -610,14 +619,14 @@ void UDailyUpgradeRewardPage::SwitchToPreviousRewardIcon()
 }
 
 /**
- * @brief 更新宝箱数量显示文本 (页面级 ChestCountText)
- * @details 🔧【v218 大厂原则 SSOT】联动 popup 选中:
- *          - 数据源: UUpgradeActivitySubsystem::GetCurrentRewardItemCount()
- *          - 链路: MainConfig.RewardItemIDs.Last() → BoxID → TreasureBoxItems[CurrentRewardIconIndex].ItemCount
- *          - 与 WBP_RewardOptionCardWidget::RewardText 显示的 ItemCount 完全一致
- *          - 事件: 订阅 OnRewardIconIndexChanged, popup 选中卡片后自动同步
- *          - 零兜底: API 返回 -1 (查不到任何一步) → 显示空字符串 + Log Error
- * @note 在编辑器预览模式下会静默返回
+ * @brief 更新宝箱数量显示文本 (页面级 ChestCountText) - 大厂重构 v229 零兜底
+ * @details SSOT 链路 (与 WBP_RewardOptionCardWidget::RewardText 完全一致):
+ *   MainConfig.RewardItemIDs.Last() → BoxID
+ *   → GetTreasureBoxItemsByBoxID(BoxID)[CurrentRecord.RewardIconIndex].ItemCount
+ *
+ *   事件: 订阅 OnRewardIconIndexChanged, popup 选中卡片后自动同步
+ *   零兜底: API 返回 -1 (查不到任何一步) → 清空文本 + 已经在 Subsystem 内 Log Error
+ * @note 编辑器预览模式静默返回 (无 GameInstance)
  */
 void UDailyUpgradeRewardPage::UpdateChestCountText()
 {
@@ -626,17 +635,18 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 		return;
 	}
 
-	// 检查是否为编辑器预览模式
+	// 编辑器预览模式静默返回 (大厂原则 - 仅对"明确无运行环境"豁免)
 	if (!GetWorld() || !GetWorld()->IsGameWorld())
 	{
-		return; // 静默返回，不输出日志
+		return;
 	}
 
 	UGameInstance* GameInstance = GetGameInstance();
 	if (!GameInstance)
 	{
 		ChestCountText->SetText(FText::FromString(TEXT("")));
-		UE_LOG(LogTemp, Error, TEXT("[v218] UpdateChestCountText: 无法获取GameInstance, 清空 ChestCountText"));
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateChestCountText: GetGameInstance() 为 null, 清空 ChestCountText."));
 		return;
 	}
 
@@ -644,16 +654,19 @@ void UDailyUpgradeRewardPage::UpdateChestCountText()
 	if (!Sub)
 	{
 		ChestCountText->SetText(FText::FromString(TEXT("")));
-		UE_LOG(LogTemp, Error, TEXT("[v218] UpdateChestCountText: 无法获取UpgradeActivitySubsystem, 清空 ChestCountText"));
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateChestCountText: 拿不到 UUpgradeActivitySubsystem, 清空 ChestCountText."));
 		return;
 	}
 
-	// 🔧【v218 SSOT】读 GetCurrentRewardItemCount (与 popup RewardText 同步)
+	// v229 SSOT: GetCurrentRewardItemCount 已按 [RewardIconIndex] 查 ItemCount (不再查 Last())
 	const int32 ItemCount = Sub->GetCurrentRewardItemCount();
 	if (ItemCount < 0)
 	{
-		// API 内部已 Log Error 给出具体失败点, 此处按"无可用值"显式清空 (零兜底: 不显示假数据)
+		// Subsystem 内已 Log Error 给出具体失败点; 此处按"无可用值"显式清空 (零兜底: 不显示假数据)
 		ChestCountText->SetText(FText::FromString(TEXT("")));
+		UE_LOG(LogTemp, Error,
+			TEXT("[v229] UpdateChestCountText: GetCurrentRewardItemCount 返回 -1 (无可用 ItemCount), 清空 ChestCountText."));
 		return;
 	}
 
@@ -1478,10 +1491,13 @@ void UDailyUpgradeRewardPage::OnReselectRewardClicked()
 		return;
 	}
 	
+	// v229 SSOT: GetReselectRewardOptions 已与 GetRewardItemIcons 合并, 返回全集合 ItemIcon
+	// (旧的"返回 1 个图标"是 bug, 已修复)
 	TArray<TSoftObjectPtr<UTexture2D>> RewardOptions = UpgradeSub->GetReselectRewardOptions();
 	if (RewardOptions.Num() == 0)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("DailyUpgradeRewardPage: 没有可重选的奖励选项"));
+		UE_LOG(LogTemp, Warning,
+			TEXT("[v229] DailyUpgradeRewardPage: GetReselectRewardOptions 返回空数组 (Subsystem 已 Log Error). 不弹窗."));
 		return;
 	}
 	
@@ -1662,16 +1678,20 @@ void UDailyUpgradeRewardPage::OnRewardIconIndexChanged(int32 NewIndex)
 {
 	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 接收到奖励图标索引更新事件，新索引: %d"), NewIndex);
 
-	// 重新初始化奖励图标数据
+	// 【v229 大厂重构 - 零兜底】
+	// 1. 重拉全集合缓存 (确保 SwitchToNext/PreviousRewardIcon 循环切换的合法范围与 Subsystem 一致;
+	//    ItemIcons 全集合本身通常不变, 但 NewIndex 可能从 popup 越界来, 这里做强制同步)
 	InitializeRewardItemIcons();
 
-	// 更新奖励物品图像显示
+	// 2. 刷新 RewardItemImage (内部走 GetCurrentRewardIcon() SSOT, 不再读 CachedItemIcons[Index])
 	UpdateRewardItemImage();
 
-	// 🔧【v218 SSOT 联动】popup 选中 WBP_RewardOptionCardWidget → 同步 ChestCountText
+	// 3. 【v218 SSOT 联动】popup 选中 WBP_RewardOptionCardWidget → 同步 ChestCountText
+	//    v229 改造: GetCurrentRewardItemCount 已按 RewardIconIndex 查 ItemCount (与 ItemIcon 同源)
 	UpdateChestCountText();
 
-	UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: 奖励图标索引更新完成"));
+	UE_LOG(LogTemp, Log, TEXT("[v229] DailyUpgradeRewardPage: 奖励图标索引更新完成 (NewIndex=%d, CachedItemIcons.Num()=%d)"),
+		NewIndex, CachedItemIcons.Num());
 }
 
 /**
@@ -2274,17 +2294,12 @@ void UDailyUpgradeRewardPage::InitializeFixedPrizeWidget()
 	
 	// 更新钻石图标颜色
 	FixedPrizeWidget->UpdateDiamondIconColor();
-	
+
 	// 更新经验文本颜色 - 这里会根据CurrentExperience和TaskRelatedValues值判断颜色
 	FixedPrizeWidget->UpdateExperienceTextColor();
-	
-	// 🔧【Ensure 修复】幂等保护: 避免 NativeConstruct + RefreshUI 双路径触发重复绑定
-	if (!bIsFixedPrizeWidgetEventBound)
-	{
-		FixedPrizeWidget->OnChestClaimRequested.AddDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
-		bIsFixedPrizeWidgetEventBound = true;
-		UE_LOG(LogTemp, Log, TEXT("DailyUpgradeRewardPage: FixedPrizeWidget事件首次绑定完成"));
-	}
+
+	// AddUniqueDynamic 自动去重, 多次调用(NativeConstruct + RefreshUI)安全
+	FixedPrizeWidget->OnChestClaimRequested.AddUniqueDynamic(this, &UDailyUpgradeRewardPage::HandleChestClaimRequest);
 	
 	// 设置FixedPrizeWidget的宝箱数量文本
 	FString ChestCount = Sub->GetFixedPrizeChestCount();

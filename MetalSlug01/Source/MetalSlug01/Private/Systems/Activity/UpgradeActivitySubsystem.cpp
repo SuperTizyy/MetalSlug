@@ -1260,64 +1260,202 @@ bool UUpgradeActivitySubsystem::IsValidIndex(int32 Index, int32 MaxSize) const
  * 5. 返回可用于UI显示的纹理资源数组
  * @note 这是重选奖励功能的数据提供核心接口
  */
+/**
+ * @brief 获取可选奖励 ItemIcon 全集合 (大厂重构 v229 - 已与 GetRewardItemIcons 合并为 SSOT)
+ * @details 旧版误用: 旧 GetReselectRewardOptions 名字误导, 看似"可选项", 实际只返回 1 个图标.
+ *          v229 改造: 全集合 SSOT 来自 GetRewardItemIcons (BoxID 下所有 TreasureBoxItem 的 ItemIcon).
+ *          保留此 API 是为了与 popup CreateRewardCardsForBox 的调用契约保持一致 (popup 期望 N 个候选项);
+ *          popup 不应再用 ItemIcon 列表, 而是用 GetCurrentReselectOptions() (从 popup 内部读).
+ * @return ItemIcon 全集合数组; 任何失败 Log Error 返回空数组.
+ */
 TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetReselectRewardOptions()
 {
-    // 改造: 与 GetRewardItemIcons 几乎完全相同 (仅一个取全集/取单个)
-    // 委托调用, 取全集合版本
+    // 大厂重构 v229: 与 GetRewardItemIcons 是同一个 SSOT 链路的两个名字 (popup / Page 双向桥接).
     return GetRewardItemIcons();
 }
 
 /**
- * @brief 获取奖励物品图标数据
- * @details 按照指定逻辑获取RewardItemImage控件所需的图标数据：
- * 1. 找到UpgradeRewardSaveRecord动态表中RecordDate最大的数据
- * 2. 取其中的RewardIconIndex字段数据
- * 3. 通过表关联获取对应的ItemIcon数据
- * @return 奖励物品图标数组
+ * @brief 获取当前选中的 ItemIcon
+ * @details 大厂原则 SSOT 链路 (与 GetCurrentRewardItemCount 严格对称):
+ *   MainConfig.RewardItemIDs.Last() → BoxID
+ *   → UActivitySubsystem::GetTreasureBoxItemsByBoxID(BoxID)
+ *   → TreasureBoxItems[CurrentRecord.RewardIconIndex].ItemID
+ *   → UActivitySubsystem::GetItemDetail(ItemID).ItemIcon
+ *
+ * @return 当前选中 ItemDetail 的 ItemIcon; 任何一步失败返回空指针 + Log Error (调用方必须显式处理).
+ */
+TSoftObjectPtr<UTexture2D> UUpgradeActivitySubsystem::GetCurrentRewardIcon() const
+{
+    TSoftObjectPtr<UTexture2D> EmptyIcon;
+
+    // 1. 取 MainConfig (FixedPrize 域, GetActivityConfig 合法用途 - 见头文件 SSOT 注释)
+    const FDailyUpgradeRewardConfigRow* Config = const_cast<UUpgradeActivitySubsystem*>(this)->GetActivityConfig();
+    if (!Config || Config->RewardItemIDs.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: 找不到 MainConfig 或 RewardItemIDs 为空, 返回空."));
+        return EmptyIcon;
+    }
+
+    // 2. 解析 BoxID (与 GetCurrentRewardItemCount / GetReselectRewardItemIcons 严格一致)
+    const int32 BoxID = FCString::Atoi(*Config->RewardItemIDs.Last());
+    if (BoxID <= 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回空."),
+            *Config->RewardItemIDs.Last());
+        return EmptyIcon;
+    }
+
+    // 3. 拿 ActivitySub
+    UActivitySubsystem* ActivitySub = GetActivitySub(this);
+    if (!ActivitySub)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: 拿不到 UActivitySubsystem, 返回空."));
+        return EmptyIcon;
+    }
+
+    // 4. 拿 TreasureBoxItems 全集合 (SSOT 唯一合法来源)
+    //    注意: ActivitySubsystem 返回 TArray<const FTreasureBoxItemRow*> (值类型 + const 元素, 与 popup 同型)
+    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+    if (TreasureBoxItems.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: BoxID=%d 查不到任何 TreasureBoxItem, 返回空."), BoxID);
+        return EmptyIcon;
+    }
+
+    // 5. 按 RewardIconIndex 选具体那一条
+    const int32 RewardIconIndex = CurrentRecord.RewardIconIndex;
+    if (RewardIconIndex < 0 || RewardIconIndex >= TreasureBoxItems.Num())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: RewardIconIndex=%d 越界 [0,%d). 返回空."),
+            RewardIconIndex, TreasureBoxItems.Num());
+        return EmptyIcon;
+    }
+
+    const FTreasureBoxItemRow* TreasureBoxItem = TreasureBoxItems[RewardIconIndex];
+    if (!TreasureBoxItem)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: TreasureBoxItems[%d] 为 null (BoxID=%d). 返回空."),
+            RewardIconIndex, BoxID);
+        return EmptyIcon;
+    }
+
+    // 6. 查 ItemIcon (TreasureBoxItem->ItemID 是 int32, 不是 FName - 必须用 %d, 不能用 * 解引用)
+    const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
+    if (!ItemDetail)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: ItemID=%d 查不到 ItemDetail, 返回空."),
+            TreasureBoxItem->ItemID);
+        return EmptyIcon;
+    }
+
+    if (ItemDetail->ItemIcon.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardIcon: ItemDetail ItemID=%d 的 ItemIcon 为空, 返回空."),
+            TreasureBoxItem->ItemID);
+        return EmptyIcon;
+    }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[v229] GetCurrentRewardIcon: BoxID=%d RewardIconIndex=%d ItemID=%d 命中."),
+        BoxID, RewardIconIndex, TreasureBoxItem->ItemID);
+
+    return ItemDetail->ItemIcon;
+}
+
+/**
+ * @brief 获取可选奖励卡片对应的 ItemIcon 全集合 (大厂重构 v229 SSOT)
+ * @details 大厂原则 SSOT 链路:
+ *   MainConfig.RewardItemIDs.Last() → BoxID
+ *   → UActivitySubsystem::GetTreasureBoxItemsByBoxID(BoxID)
+ *   → 对每一条 TreasureBoxItem 查 ItemDetail.ItemIcon → 入数组
+ *
+ * @return 全集合 ItemIcon 数组; 任何一步失败返回空数组 + Log Error (调用方必须显式处理).
  */
 TArray<TSoftObjectPtr<UTexture2D>> UUpgradeActivitySubsystem::GetRewardItemIcons()
 {
     TArray<TSoftObjectPtr<UTexture2D>> Result;
 
-    // 1. 获取活动配置数据
+    // 1. 取 MainConfig (FixedPrize 域, GetActivityConfig 合法用途)
     const FDailyUpgradeRewardConfigRow* Config = GetActivityConfig();
     if (!Config || Config->RewardItemIDs.Num() == 0)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetRewardItemIcons: 找不到 MainConfig 或 RewardItemIDs 为空, 返回空数组."));
         return Result;
     }
 
-    // 2. 获取当前记录的奖励图标索引
-    int32 CurrentIconIndex = CurrentRecord.RewardIconIndex;
-    // 3. 获取最后一个RewardItemID作为BoxID
-    FString LastRewardItemID = Config->RewardItemIDs.Last();
-    int32 BoxID = FCString::Atoi(*LastRewardItemID);
-
+    // 2. 解析 BoxID (全集合源)
+    const int32 BoxID = FCString::Atoi(*Config->RewardItemIDs.Last());
     if (BoxID <= 0)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetRewardItemIcons: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回空数组."),
+            *Config->RewardItemIDs.Last());
         return Result;
     }
 
-    // 改造: 通过统一 helper 获取 ActivitySubsystem
+    // 3. 拿 ActivitySub
     UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetRewardItemIcons: 拿不到 UActivitySubsystem, 返回空数组."));
         return Result;
     }
 
-    // 5. 根据BoxID通过单条查询获取TreasureBoxItemRow数据 (避免 GetTreasureBoxItemsByBoxID 的遍历失效问题)
-    // 原因: GetTreasureBoxItem 使用 FindRowByIdSafe 防御性查询，稳定性更高
-    const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
-    if (!TreasureBoxItem)
+    // 4. 拿 TreasureBoxItems 全集合 (SSOT 唯一合法来源)
+    //    注意: ActivitySubsystem 返回 TArray<const FTreasureBoxItemRow*> (值类型 + const 元素)
+    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+    if (TreasureBoxItems.Num() == 0)
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetRewardItemIcons: BoxID=%d 查不到任何 TreasureBoxItem, 返回空数组."), BoxID);
         return Result;
     }
 
-    // 6. 通过ItemID关联ItemDetailRow表获取ItemIcon数据
-    const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
-    if (ItemDetail && !ItemDetail->ItemIcon.IsNull())
+    // 5. 对每条 TreasureBoxItem 查 ItemIcon
+    for (int32 i = 0; i < TreasureBoxItems.Num(); ++i)
     {
+        const FTreasureBoxItemRow* TreasureBoxItem = TreasureBoxItems[i];
+        if (!TreasureBoxItem)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[v229] GetRewardItemIcons: TreasureBoxItems[%d] 为 null (BoxID=%d), 跳过."),
+                i, BoxID);
+            continue;
+        }
+
+        const FItemDetailRow* ItemDetail = ActivitySub->GetItemDetail(TreasureBoxItem->ItemID);
+        if (!ItemDetail)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[v229] GetRewardItemIcons: ItemID=%d 查不到 ItemDetail, 跳过."),
+                TreasureBoxItem->ItemID);
+            continue;
+        }
+
+        if (ItemDetail->ItemIcon.IsNull())
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[v229] GetRewardItemIcons: ItemDetail ItemID=%d 的 ItemIcon 为空, 跳过."),
+                TreasureBoxItem->ItemID);
+            continue;
+        }
+
         Result.Add(ItemDetail->ItemIcon);
     }
+
+    UE_LOG(LogTemp, Log,
+        TEXT("[v229] GetRewardItemIcons: BoxID=%d 候选 ItemIcons=%d 个"),
+        BoxID, Result.Num());
 
     return Result;
 }
@@ -1417,7 +1555,7 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardItemCount() const
     if (!Config || Config->RewardItemIDs.Num() == 0)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: 找不到 MainConfig 或 RewardItemIDs 为空, 返回 -1."));
+            TEXT("[v229] GetCurrentRewardItemCount: 找不到 MainConfig 或 RewardItemIDs 为空, 返回 -1."));
         return -1;
     }
 
@@ -1429,44 +1567,64 @@ int32 UUpgradeActivitySubsystem::GetCurrentRewardItemCount() const
         if (i < Config->RewardItemIDs.Num() - 1) RewardItemIDsStr += TEXT(", ");
     }
     UE_LOG(LogTemp, Log,
-        TEXT("[v218] GetCurrentRewardItemCount: RewardItemIDs.Num()=%d, 内容=[%s], Last()='%s'"),
+        TEXT("[v229] GetCurrentRewardItemCount: RewardItemIDs.Num()=%d, 内容=[%s], Last()='%s'"),
         Config->RewardItemIDs.Num(), *RewardItemIDsStr, *Config->RewardItemIDs.Last());
 
-    // 2. 最后一个 RewardItemID 即 BoxID (与 GetRewardItemIcons / UpdateRewardIconIndexAndSave 保持一致)
+    // 2. 最后一个 RewardItemID 即 BoxID (与 GetRewardItemIcons / GetCurrentRewardIcon / UpdateRewardIconIndexAndSave 保持一致)
     const FString LastRewardItemID = Config->RewardItemIDs.Last();
     const int32 BoxID = FCString::Atoi(*LastRewardItemID);
-    
+
     UE_LOG(LogTemp, Log,
-        TEXT("[v218] GetCurrentRewardItemCount: 解析 BoxID=%d (LastRewardItemID='%s')"), BoxID, *LastRewardItemID);
-    
+        TEXT("[v229] GetCurrentRewardItemCount: 解析 BoxID=%d (LastRewardItemID='%s')"), BoxID, *LastRewardItemID);
+
     if (BoxID <= 0)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回 -1."),
+            TEXT("[v229] GetCurrentRewardItemCount: BoxID 解析失败 (RewardItemIDs.Last()='%s'). 返回 -1."),
             *LastRewardItemID);
         return -1;
     }
 
-    // 3. 拿 TreasureBoxItems
+    // 3. 拿 TreasureBoxItems (全集合 - GetTreasureBoxItemsByBoxID 是 SSOT 链路的唯一合法来源)
     UActivitySubsystem* ActivitySub = GetActivitySub(this);
     if (!ActivitySub)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: 拿不到 UActivitySubsystem, 返回 -1."));
+            TEXT("[v229] GetCurrentRewardItemCount: 拿不到 UActivitySubsystem, 返回 -1."));
         return -1;
     }
 
-    // 3. 通过 GetTreasureBoxItem 单条查询获取 ItemCount (避免 GetTreasureBoxItemsByBoxID 的遍历失效问题)
-    // 原因: GetTreasureBoxItem 使用 FindRowByIdSafe 防御性查询，稳定性更高
-    const FTreasureBoxItemRow* TreasureBoxItem = ActivitySub->GetTreasureBoxItem(BoxID);
+    TArray<const FTreasureBoxItemRow*> TreasureBoxItems = ActivitySub->GetTreasureBoxItemsByBoxID(BoxID);
+    if (TreasureBoxItems.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardItemCount: BoxID=%d 查不到任何 TreasureBoxItem, 返回 -1."), BoxID);
+        return -1;
+    }
+
+    // 4. 按 RewardIconIndex 选具体那一条 (大厂原则 - 头部注释声明的 SSOT 链路)
+    const int32 RewardIconIndex = CurrentRecord.RewardIconIndex;
+    if (RewardIconIndex < 0 || RewardIconIndex >= TreasureBoxItems.Num())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[v229] GetCurrentRewardItemCount: RewardIconIndex=%d 越界 [0,%d). 返回 -1."),
+            RewardIconIndex, TreasureBoxItems.Num());
+        return -1;
+    }
+
+    const FTreasureBoxItemRow* TreasureBoxItem = TreasureBoxItems[RewardIconIndex];
     if (!TreasureBoxItem)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[v218] GetCurrentRewardItemCount: BoxID=%d 查不到 TreasureBoxItem, 返回 -1."), BoxID);
+            TEXT("[v229] GetCurrentRewardItemCount: TreasureBoxItems[%d] 为 null (BoxID=%d). 返回 -1."),
+            RewardIconIndex, BoxID);
         return -1;
     }
 
-    // 4. 返回 ItemCount
+    UE_LOG(LogTemp, Log,
+        TEXT("[v229] GetCurrentRewardItemCount: BoxID=%d RewardIconIndex=%d ItemCount=%d"),
+        BoxID, RewardIconIndex, TreasureBoxItem->ItemCount);
+
     return TreasureBoxItem->ItemCount;
 }
 
