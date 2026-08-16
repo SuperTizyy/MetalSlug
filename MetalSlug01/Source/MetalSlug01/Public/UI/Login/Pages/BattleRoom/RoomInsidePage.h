@@ -717,11 +717,46 @@ private:
 	// 14. 记忆上次确认添加的 AI 配置
 	// ==========================================
 
-	/** 记忆上次确认添加的 AI 角色名称 */
-	FString LastConfirmedAICharacter;
+	/**
+	 * 【v237.P5.2 大厂重构 — 单一真理源 + 镜像武器】ComboBox_AICharacter 当前选中的 RowName
+	 *
+	 * 大厂原则 (职责对称):
+	 *   - ComboBox_AICharacter 默认按 RowName = "AI" + 数字 过滤 (AI 角色真理源 = RowName 业务代号)
+	 *   - UI 不存显示名 (CharacterName.ToString) 作跨会话状态 — 显示名可能重复/改名, 语义不稳定
+	 *   - 上次选择用 RowName (DT 主键, 唯一不重复) 恢复
+	 *   - 跟 ComboBox_AIWeapon 的 LastConfirmedAIWeaponRowName 形状完全对称
+	 */
+	FString LastConfirmedAICharacterRowName;
 
-	/** 记忆上次确认添加的 AI 武器名称 */
-	FString LastConfirmedAIWeapon;
+	/** 【v236 2026.08.17 大厂重构 — 单一真理源】记忆上次确认添加的 AI 武器 RowName (FName.ToString) */
+	FString LastConfirmedAIWeaponRowName;
+
+	/**
+	 * 【v236 大厂重构】AI 武器 ComboBox 选项与 DT_WeaponInfo RowName 的 1:1 映射
+	 *
+	 * ComboBoxString 没有"显示文本 vs 数据值"分离能力 (内嵌只存 showable string),
+	 * 所以 UI 自己维护索引 → RowName 的映射表:
+	 *   - ComboBox_AIWeapon->GetSelectedIndex() → AllWeaponRowNames[Index] → 拿到 RowName
+	 *   - 这是 RequestAddAI 武器参数的**唯一真理源**
+	 *   - 与 PopulateAIPanelData 填充 ComboBox 顺序严格一致
+	 *
+	 * 单一真理源 + 零兜底:
+	 *   - ComboBox.Rebuild 后必须清空重建, 否则索引错位
+	 *   - 任何"自动添加武器"逻辑禁止绕过这个映射表
+	 */
+	UPROPERTY(Transient)
+	TArray<FName> AllWeaponRowNames;
+
+	/**
+	 * 【v237 大厂重构 — 单一真理源】ComboBox_AICharacter 选项列表 → RowName 映射 (索引对齐)
+	 *
+	 * 与 AllWeaponRowNames 镜像:
+	 *   - ComboBox_AICharacter.GetSelectedIndex() → AllAICharacterRowNames[Index] → FName RowName
+	 *   - 这是 RequestAddAI 角色参数的**唯一真理源**
+	 *   - 与 ComboBox_AIWeapon 形状完全对称 (命名 / 类型 / 索引语义)
+	 */
+	UPROPERTY(Transient)
+	TArray<FName> AllAICharacterRowNames;
 
 	/** 记忆上次确认添加的队伍 */
 	FString LastConfirmedAITeam;

@@ -2300,16 +2300,20 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 	//   - 在循环外净化一次 (循环内复用净化后的值), 避免重复 Log
 	//
 	// 净化策略:
-	//   - Melee 模式 + WeaponID 是 Primary/Secondary → 清空 + 用业务默认 Melee (JZ001)
+	//   - Melee 模式 + AI 选了 Melee 武器 → 放行 (无需净化)
+	//   - Melee 模式 + AI 选了非 Melee 武器 → 显式拒绝 (PurifyAIWeaponForMeleeMode 清空 InOutAIWeaponID)
 	//   - 非 Melee 模式 → 0 行为变更
 	FString PurifiedWeaponID = Request.WeaponID;
 	FString PurifiedMeleeDefaultID;
 	const bool bAIPurified = PurifyAIWeaponForMeleeMode(Request.Mode, PurifiedWeaponID, PurifiedMeleeDefaultID);
 	if (bAIPurified && !PurifiedMeleeDefaultID.IsEmpty())
 	{
-		// 净化生效: 用业务默认 Melee (JZ001) 替代原 Primary/Secondary
+		// 净化生效: AI 选了 Melee 武器, 用它 (PurifyAIWeaponForMeleeMode 返回 false)
+		// 注意: v237 后 bAIPurified=true 且 PurifiedMeleeDefaultID 非空 只在"查不到 WeaponDT/Row"时发生, 不在此分支处理
 		PurifiedWeaponID = PurifiedMeleeDefaultID;
 	}
+	// v237 修复: 如果 AI 选了非 Melee 武器, PurifyAIWeaponForMeleeMode 已清空 PurifiedWeaponID,
+	// 后续 Spawn 链路会检测到空 ID → Log Error + 拒绝 Spawn (显式报错, 不静默兜底)
 
 	// 4. 循环 Spawn
 	int32 SpawnedCount = 0;
@@ -3700,31 +3704,44 @@ bool URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode(
 		return false;
 	}
 
-	// 1. Melee 模式: AI 必须只拿 Melee 武器
+	// 1. Melee 模式: AI 武器必须显式合规
 	//
-	// 业务背景 (用户 2026.08.09):
-	//   "AI 强制只拿 Melee 武器" — 即使 AI Profile 配了 Primary/Secondary, 刀战模式也强制覆盖
+	// 【v237 2026.08.17 大厂重构 — 删除强制替换反模式】
 	//
-	// 净化策略:
-	//   - InOutAIWeaponID 为空 → 默认放过 (Spawn 路径会用 ConfigSO 兜底, 决策权给上游)
-	//   - InOutAIWeaponID 查 DT_WeaponInfo, 读 MeshType
-	//     - Melee → 保留 (已经合法)
-	//     - Primary / Secondary → 清空 + 输出业务默认 Melee (JZ001)
-	//     - 查不到 (DT 配置错) → 清空 (零兜底)
+	// 旧设计 (v213 反模式):
+	//   - AI 选了非 Melee 武器 → 静默清空 + 替换为业务默认 Melee (JZ001)
+	//   - "静默篡改用户意图" — 大厂反模式 (违反零兜底原则)
 	//
-	// 返回值含义:
-	//   - true = 有净化动作 (原值被清空), 上游应使用 OutMeleeDefaultID 作为 Melee 武器
-	//   - false = 无需净化 (已经合法 / 非 Melee 模式)
+	// 新设计 (v237):
+	//   - AI 选了 Melee 武器 → 直接用 (无需净化)
+	//   - AI 选了非 Melee 武器 → 显式拒绝, 强制策划在 UI 层过滤
+	//   - AI 没选武器 → 放行 (Spawn 链路兜底)
+	//   - WeaponDT 查不到 → 显式拒绝, 强制修复配置
+	//
+	// 业务决策:
+	//   - UI 层负责按模式过滤武器列表 (刀战模式只显示 Melee)
+	//   - 如果 UI 过滤失效 (Bug/配置错), 服务层显式报错
+	//   - 大厂原则: 配置错 → 显式报错, 不静默兜底
+
+	// 【v237 P1 修复 — 删除了"AI 选了非 Melee → 强制替换为 JZ001"的反模式分支】
+
+	// 空武器 ID → 放行 (Spawn 链路会做兜底或报错)
 	if (InOutAIWeaponID.IsEmpty())
 	{
 		return false;
 	}
 
-	UWorld* World = nullptr;
-	if (GEngine && GEngine->GetWorldContexts().Num() > 0)
-	{
-		World = GEngine->GetWorldContexts()[0].World();
-	}
+	// 【v237.1 P1 修复 — 改用 GetWorld() 替代 GEngine->GetWorldContexts()[0]】
+	//
+	// 根因:
+	//   - GEngine->GetWorldContexts()[0] 在 PIE 模式下可能拿到错误的 World
+	//   - 导致 GetAuthGameMode<ARoomGameMode>() 返回 nullptr
+	//   - WeaponDT 变成空 → 所有 AI 武器 ID 被清空 → AI 拒绝 Spawn
+	//
+	// 修复:
+	//   - PurifyAIWeaponForMeleeMode 从 static 改为成员方法 (UFUNCTION BlueprintCallable)
+	//   - 使用 UWorldSubsystem::GetWorld() 获取正确的 World (PIE 安全)
+	UWorld* World = GetWorld();
 
 	UDataTable* WeaponDT = nullptr;
 	if (World)
@@ -3735,17 +3752,16 @@ bool URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode(
 		}
 	}
 
-	// 查不到 WeaponDT → 清空 (零兜底, 强制修复配置)
+	// WeaponDT 查不到 → 显式拒绝 (零兜底 — 强制修复配置)
 	if (!WeaponDT)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] 【v213】PurifyAIWeaponForMeleeMode: GM->WeaponDataTable 为空. "
-			     "【零兜底】无法识别 AI WeaponID='%s' 是否是 Melee 类型, 强制清空. "
+			TEXT("[Spawn] 【v237】PurifyAIWeaponForMeleeMode: GM->WeaponDataTable 为空. "
+			     "【零兜底】无法识别 AI WeaponID='%s' 是否是 Melee 类型. "
 			     "修复: BP_GM_RoomGameMode.uasset → ClassDefaults → WeaponDataTable 必须配 DT_WeaponInfo."),
 			*InOutAIWeaponID);
-		InOutAIWeaponID.Empty();
-		OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
-		return true;
+		InOutAIWeaponID.Empty(); // 显式清空, 让 Spawn 链路拒绝生成
+		return true; // 返回 true = 有净化动作(拒绝), 上游不应继续 Spawn
 	}
 
 	static const FString Ctx(TEXT("URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode"));
@@ -3753,29 +3769,38 @@ bool URoomSpawnSubsystem::PurifyAIWeaponForMeleeMode(
 	if (!Row)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] 【v213】PurifyAIWeaponForMeleeMode: DT_WeaponInfo 找不到 RowName='%s'. "
-			     "【零兜底】无法识别武器类型, 清空 (Melee 模式不允许非 Melee). "
-			     "修复: 在 DT_WeaponInfo 添加 RowName='%s' 的行."),
+			TEXT("[Spawn] 【v237】PurifyAIWeaponForMeleeMode: DT_WeaponInfo 找不到 RowName='%s'. "
+			     "【零兜底】无法识别武器类型. 修复: 在 DT_WeaponInfo 添加 RowName='%s' 的行."),
 			*InOutAIWeaponID, *InOutAIWeaponID);
-		InOutAIWeaponID.Empty();
-		OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
+		InOutAIWeaponID.Empty(); // 显式清空, 让 Spawn 链路拒绝生成
 		return true;
 	}
 
-	// 检查 MeshType — 只有 Melee 合法
+	// 检查 MeshType — Melee 类型直接放行
 	if (Row->MeshType == EWeaponMeshType::Melee)
 	{
-		return false; // 已经合法, 无需净化
+		return false; // 已经是 Melee, 无需净化, 使用 AI 选择
 	}
 
-	UE_LOG(LogTemp, Display,
-		TEXT("[Spawn] 【v213】刀战模式 AI WeaponID 净化: 原 WeaponID='%s' (MeshType=%d) 是非 Melee 类型, "
-		     "强制清空. AI 改拿业务默认 Melee='%s'."),
-		*InOutAIWeaponID, static_cast<int32>(Row->MeshType), *FRoomLoadoutDefaults::MeleeDefaultRowName);
+	// 【v237 P1 核心修复 — 非 Melee 类型显式拒绝, 不再静默替换】
+	//
+	// 旧 (v213 反模式): 非 Melee → 强制清空 + 替换为 JZ001
+	// 新 (v237): 非 Melee → 显式拒绝 + 强制策划在 UI 层过滤
+	//
+	// 拒绝理由:
+	//   1. 刀战模式 AI 只能拿近战武器 (用户业务需求)
+	//   2. UI 应该按模式过滤武器列表 (刀战模式只显示 Melee)
+	//   3. 如果用户选了非 Melee 且 UI 没过滤 → 这是配置错, 必须报错
+	//
+	UE_LOG(LogTemp, Error,
+		TEXT("[Spawn] 【v237】刀战模式 AI 选了非 Melee 武器: WeaponID='%s' (MeshType=%d). "
+		     "【v237 零兜底】显式拒绝. "
+		     "修复: 1) 在 WBP_RoomInsidePage 的 PopulateAIPanelData 中按模式过滤武器列表 (刀战模式只显示 Melee 类型); "
+		     "2) 或在 DT_WeaponInfo 中删除该武器行的 Melee 模式显示配置."),
+		*InOutAIWeaponID, static_cast<int32>(Row->MeshType));
 
-	InOutAIWeaponID.Empty();
-	OutMeleeDefaultID = FRoomLoadoutDefaults::MeleeDefaultRowName;
-	return true;
+	InOutAIWeaponID.Empty(); // 显式清空, 让 Spawn 链路拒绝生成
+	return true; // 返回 true = 有净化动作(拒绝), 上游不应继续 Spawn
 }
 
 bool URoomSpawnSubsystem::ShouldPurifyForMeleeMode(ERoomMatchMode Mode)

@@ -276,13 +276,17 @@ public:
 	 *
 	 * 业务规则 (用户 2026.08.03):
 	 *   - AirdropIntervalTimer 到期时调此函数
-	 *   - 调 AirdropSubsystem::SpawnAirdropAtAllPoints (生成新空投 + 清理旧空投)
+	 *   - 调 AirdropSubsystem::DestroyAllExistingPickups (清理上一轮空投) + SpawnAirdropAtAllPoints (生成新空投)
 	 *   - 然后调 NotifyAirdropArrivalCompleted (启动下一轮倒计时, 等待下次降临)
 	 *
 	 * 大厂原则 — 单一入口:
 	 *   - 倒计时"到期"= 服务器业务事件 (不是 UI 事件)
 	 *   - UI 倒计时显示: GameState.OnRep_AirdropCountdownState 客户端被动渲染
-	 *   - 业务触发: 服务器 SetTimer 到期 → 本函数 → AirdropSubsystem.SpawnAirdropAtAllPoints
+	 *   - 业务触发: 服务器 SetTimer 到期 → 本函数 → AirdropSubsystem.DestroyAllExistingPickups + SpawnAirdropAtAllPoints
+	 *
+	 * 【v2xx 大厂架构重构】单一职责 — 拆为显式两步:
+	 *   - 旧版 (v117) 反模式: SpawnAirdropAtAllPoints 内部 Step 1 偷偷清理 → 隐藏清理时机
+	 *   - 新版 (v2xx): 清理 + 生成 显式调用, 调用方决定清理时机与逻辑
 	 *
 	 * 大厂原则 — 镜像 v93.1 MotherMutationTimerHandle:
 	 *   - StartAirdropCountdown 末尾 SetTimer(Duration) → 到期调本函数
@@ -368,7 +372,8 @@ protected:
 	 *
 	 * 大厂原则 — 镜像 MotherMutationTimerHandle:
 	 *   - StartAirdropCountdown 末尾 SetTimer(AirdropIntervalSeconds) → 到期调 OnAirdropIntervalExpired
-	 *   - OnAirdropIntervalExpired 调 AirdropSubsystem::SpawnAirdropAtAllPoints + NotifyAirdropArrivalCompleted
+	 *   - OnAirdropIntervalExpired 调 AirdropSubsystem::DestroyAllExistingPickups + SpawnAirdropAtAllPoints + NotifyAirdropArrivalCompleted
+	 *   - 【v2xx 重构】清理和生成拆为两步显式调用 (旧版 Spawn 函数内部隐藏清理 → 反模式已修复)
 	 *   - ResetMotherMutationCountdown 内部一并 ClearTimer 防残留
 	 *   - 重复启动: ClearTimer 旧的再 SetTimer 新的
 	 */

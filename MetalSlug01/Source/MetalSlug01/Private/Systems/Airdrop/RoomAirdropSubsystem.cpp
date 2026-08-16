@@ -49,7 +49,25 @@ bool URoomAirdropSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 
 
 // ==========================================
-// 【v117 单一入口】在所有预设点生成新一批空投
+// 【v2xx 大厂架构重构】单一职责 — 在所有预设点生成新空投
+// ==========================================
+//
+// 业务规则 (用户 2026.08.03):
+//   - 遍历 GameMode.AirDropPointTags 匹配的所有 Actor (= BP_AirDropPoint 关卡实例)
+//   - 在每个 PointActor 世界坐标 + (0, 0, AirDropPickupDropHeight) 处 SpawnActor
+//   - 账本 = TrackedPickups (本 Subsystem 唯一真理源)
+//   - 通过 Multicast_PlayDropSound 推客户端音效
+//
+// 大厂原则 — 单一职责 (v2xx 修复):
+//   - 本函数只 Spawn, 不清理 (旧版 v117-v201 反模式已修复)
+//   - 清理 = 调用方决策 (集中调度, 不耦合逻辑)
+//   - 调用方: URoomLifecycleSubsystem::OnAirdropIntervalExpired (空投降临轮换)
+//
+// 大厂原则 — 零兜底:
+//   - 配置缺 → Log Error + return 0 (强制策划修复)
+//   - SpawnActor 失败 → Log Error + continue (不阻塞后续点位)
+//   - DropSound 字段为空 → Log Warning + 跳过 (业务可容忍)
+//
 // ==========================================
 
 int32 URoomAirdropSubsystem::SpawnAirdropAtAllPoints()
@@ -175,10 +193,35 @@ int32 URoomAirdropSubsystem::SpawnAirdropAtAllPoints()
 		return 0;
 	}
 
-	// Step 1: 业务规则 — 先清理上一轮空投 (没被吃的统一销毁)
-	DestroyAllExistingPickups();
+	// ==========================================
+	// 【v2xx 大厂架构重构】单一职责 — 本函数只 Spawn, 不清理
+	// ==========================================
+	//
+	// 旧版 (v117-v201) 反模式:
+	//   - SpawnAirdropAtAllPoints 内部 Step 1 调 DestroyAllExistingPickups()
+	//   - 看似"原子化"实则职责错位 (SRP 违反) — Spawn 函数偷偷清理
+	//   - 隐藏清理时机 — 调用方以为只是 Spawn, 不知空投被清了
+	//   - 注释声称的"HandleZombieRoundEnd 兜底清理 / GameMode::HandleMatchTimeOut 兜底清理"
+	//     实际调用方根本不存在 → 小局结束空投残留 → 用户报告 bug
+	//
+	// 新版 (v2xx) 单一职责 + 显式优于隐式:
+	//   - 本函数只 Spawn 新空投
+	//   - 清理 = 调用方决策 (目前 2 个调用方):
+	//     1. FinishZombieRound (小局结束, 走 URoomLifecycleSubsystem)
+	//     2. OnAirdropIntervalExpired (空投降临轮换, 走 URoomLifecycleSubsystem)
+	//   - 清理函数: DestroyAllExistingPickups (账本统一管理, 单一真理源)
+	//
+	// 大厂原则 — 零重复架构:
+	//   - 不在 Spawn 函数内耦合清理 (那会变成"逻辑炸弹")
+	//   - 不需要新增"强制清理" / "可选清理" 等新 API (避免接口膨胀)
+	//
+	// 大厂原则 — 调用方职责完整:
+	//   - 调用方必须按业务需要决定是否先调 DestroyAllExistingPickups
+	//   - 当前 OnAirdropIntervalExpired 路径: 清理 + 生成 连续执行 (v2xx 注释说明)
+	//
+	// 性能口径: 移除内部清理后, 本函数纯 Spawn 循环, 性能不变
 
-	// Step 2: 遍历所有匹配点位生成新空投
+	// 遍历所有匹配点位生成新空投
 	const float DropHeight = GameMode->AirDropPickupDropHeight;
 	int32 SuccessCount = 0;
 	int32 FailCount = 0;

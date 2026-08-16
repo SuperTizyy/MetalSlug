@@ -28,15 +28,64 @@ AMeleeAIController::AMeleeAIController()
 	// 【v54 重构】不需要 CreateDefaultSubobject RuntimeConfig — 已由 Base 处理
 }
 
-// OnPossess：关卡预放 AI 自动注入默认 Config
+// OnPossess: 区分"大厅 AI" vs "关卡预放 AI"
+//
+// 【v236 2026.08.17 大厂架构重构】运行时检测 Pawn 状态, 区分两种 Spawn 来源
+//
+// 历史 Bug 链:
+//   1. 大厅 AI 路径: SpawnAIInternal → AIPawn->SetSpawnLoadout(CharID, WeaponID) → AIC->Possess(AIPawn)
+//      → 触发 OnPossess → 走 SetupMeleeAI(DefaultMeleeConfig)
+//      → SetMeleeConfig 内部 RequestWeaponSpawn(LevelPlacedWeaponClass = **ConfigSO 默认武器**)
+//      → **默认武器先于大厅武器生成, 污染 Pawn 状态**
+//   2. SpawnAIInternal 后续逻辑: AIPawn->RequestWeaponSpawn(大厅武器 Class) 才覆盖默认武器
+//      但如果 RequestWeaponSpawn 走幂等检查 (CurrentWeapon != null → 跳过), 大厅武器永远覆盖失败
+//      → 玩家看到 AI 拿的是 ConfigSO 默认武器, 不是 UI 选的大厅武器
+//
+// v236 修复 (单一真理源 + 零兜底):
+//   - 运行时真理源: Pawn->GetSpawnWeaponID() (由 SetSpawnLoadout 写入)
+//   - 大厅 AI: SpawnAIInternal 在 Possess 之前已调 SetSpawnLoadout → Pawn.SpawnWeaponID != ""
+//     → 走大厅路径 (跳过 SetupMeleeAI, 由 SpawnAIInternal 后续逻辑统一管)
+//   - 关卡预放 AI: 关卡加载自动 Possess → Pawn.SpawnWeaponID == ""
+//     → 走 SetupMeleeAI(DefaultMeleeConfig) (关卡预放 AI 唯一初始化入口)
+//   - 与 v40.3/v54.4/v56 链路保持一致: 不增加新字段, 复用现有运行时真理源
+//
+// 大厂原则落地:
+//   - 单一真理源: Pawn.SpawnWeaponID 是 Spawn 来源的**唯一标记** (ConfigSO 真理源在 Pawn 不写)
+//   - 零兜底: 不允许"Pawn.SpawnWeaponID 为空时走默认 ConfigSO" (这是反模式, 制造 ConfigSO 默认武器)
+//   - 职责分离: OnPossess 只管"初始化决策", 不管武器 Spawn
+//   - 抗时序竞争: 检测点放在 Super::OnPossess 之后, Pawn 已 Possess, 可读字段
 void AMeleeAIController::OnPossess(APawn* InPawn)
 {
-	// 调用父类 OnPossess（RuntimeConfig 初始化）
+	// 调用父类 OnPossess (RuntimeConfig 初始化, 阵营处理等)
 	Super::OnPossess(InPawn);
 
-	// 【v54 重构】关卡预放 AI 路径
-	//   - 大厅 AI 路径由 SpawnAIInternal 在 Possess 之后调 InitializeFromConfig, 不需要这里
-	//   - 关卡预放 AI 没有 Spawn 调用方, 必须由 OnPossess 兜底注入 DefaultMeleeConfig
+	// 【v236 运行时真理源检测】通过 Pawn->GetSpawnWeaponID() 区分 Spawn 来源
+	//   - 大厅 AI: SpawnAIInternal 在 Possess 之前已 SetSpawnLoadout → Pawn.SpawnWeaponID != ""
+	//   - 关卡预放 AI: 关卡加载自动 Possess → Pawn.SpawnWeaponID == ""
+	ABaseCharacter* BaseChar = Cast<ABaseCharacter>(InPawn);
+	const bool bIsLobbyAI = (BaseChar && !BaseChar->GetSpawnWeaponID().IsEmpty());
+
+	if (bIsLobbyAI)
+	{
+		// ============================================================
+		// 【v236 大厅 AI 路径】完全跳过 SetupMeleeAI
+		//   - 真理源已由 SpawnAIInternal 在 Possess 之前准备好
+		//   - SpawnAIInternal 后续逻辑会调 RequestWeaponSpawn(大厅武器 Class)
+		//   - 这里不能做任何"武器生成"或"BT 启动"操作, 否则会与 SpawnAIInternal 重复
+		// ============================================================
+		UE_LOG(LogTemp, Log,
+			TEXT("[MeleeAI] OnPossess: 大厅 AI 路径 (Pawn=%s, SpawnWeaponID='%s'), 跳过 SetupMeleeAI. "
+				 "真理源由 SpawnAIInternal 管理."),
+			*GetNameSafe(InPawn), *BaseChar->GetSpawnWeaponID());
+		return;
+	}
+
+	// ============================================================
+	// 【关卡预放 AI 路径】走 SetupMeleeAI(DefaultMeleeConfig) 初始化
+	//   - ConfigSO 真理源: DefaultMeleeConfig.LevelPlacedWeaponClass (默认武器 BP)
+	//   - ConfigSO 真理源: DefaultMeleeConfig.LevelPlacedBehaviorTree (默认 BT)
+	//   - 与 v54.4 链路一致: 单一入口 SetMeleeConfig → RequestWeaponSpawn(Class)
+	// ============================================================
 	if (!DefaultMeleeConfig)
 	{
 		// 显式报错 (大厂原则 — 零兜底)
@@ -47,11 +96,11 @@ void AMeleeAIController::OnPossess(APawn* InPawn)
 		return;
 	}
 
-	UE_LOG(LogTemp, Warning,
-		TEXT("[%s] >>> AMeleeAIController::OnPossess ENTERED (DefaultMeleeConfig=%s, InPawn=%s)"),
+	UE_LOG(LogTemp, Log,
+		TEXT("[%s] >>> AMeleeAIController::OnPossess (关卡预放 AI 路径, DefaultMeleeConfig=%s, InPawn=%s)"),
 		*GetName(), *DefaultMeleeConfig->GetName(), *GetNameSafe(InPawn));
 
-	// 调用 SetupMeleeAI 走 ConfigSO 入口
+	// 调用 SetupMeleeAI 走 ConfigSO 入口 (关卡预放 AI 唯一初始化入口)
 	SetupMeleeAI(DefaultMeleeConfig);
 }
 

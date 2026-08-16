@@ -684,8 +684,8 @@ public:
 	 * @param OutMeleeDefaultID [out] 如果输入被清空 (AI 强制只拿 Melee), 返回业务默认 Melee ID (JZ001)
 	 * @return true=有净化动作 (Melee 模式 + 原值不是 Melee), false=无需净化
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Room|Spawn|Purification", meta = (DisplayName = "v213 Purify AI Weapon For Melee Mode"))
-	static bool PurifyAIWeaponForMeleeMode(
+	UFUNCTION(BlueprintCallable, Category = "RoomSpawn")
+	bool PurifyAIWeaponForMeleeMode(
 		ERoomMatchMode Mode,
 		FString& InOutAIWeaponID,
 		FString& OutMeleeDefaultID);

@@ -59,26 +59,6 @@ ARoomGameMode* URoomService::GetRoomGameMode() const
 	return Cast<ARoomGameMode>(World->GetAuthGameMode());
 }
 
-/**
- * 【v49 大厂架构 — 单一真理源】反查 CharacterName → DT_CharacterInfo RowName
- *
- * 业务场景:
- *   UI ComboBox_AICharacter 显示 "斯沃特AI" (FCharacterInfo.CharacterName)
- *   但 SpawnAIInternal 需要 DT_CharacterInfo 的 RowName 才能查 CharacterBlueprint
- *   → 必须反查
- *
- * 大厂原则 (零兜底):
- *   - 找不到精确匹配 → Log Error + return NAME_None
- *   - 调用方必须显式拒绝入队, 强制修复 DT 配置
- *   - 不允许 fallback 到 "CharacterName 当 RowName" — 那是大厂反模式
- */
-// 【v51 大厂重构 — 已删除】ResolveCharacterInfoRowName 函数已被完全删除
-//
-// 删除原因 (真理源整合):
-//   - 旧 (v49): UI 选 CharacterName → 调本函数反查 RowName → SpawnAIInternal 又反查 PawnClass
-//   - 两端反查, 反查路径不清晰
-//   - 新 (v51): RequestAddAI 一次性反查全部字段 (RowName + AIPawnClass + WeaponID)
-//   - 反查路径只有一条, 完全消除反查分散
 
 FString URoomService::GetCurrentAccountName() const
 {
@@ -159,36 +139,32 @@ void URoomService::RequestSendChatMessage(const FString& Message)
 	}
 }
 
-void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName, const FString& WeaponName, int32 Count)
+void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterRowName, const FString& WeaponRowName, int32 Count)
 {
 	if (Count <= 0)
 	{
 		return;
 	}
 
-	// 【v51 大厂架构重构 — 单一真理源 + 零兜底】
+	// 【v236 2026.08.17 大厂架构重构 — 单一真理源 + 零兜底 + 消除武器反查循环】
 	//
-	// 真理源链路 (您设计的):
-	//   UI ComboBox_AICharacter 选 CharacterName (FCharacterInfo.CharacterName)
-	//      ↓ 反查 DT_CharacterInfo[CharacterName]
-	//   拿 RowName + CharacterBlueprint (TSoftClassPtr<ABaseCharacter>)
-	//      ↓ LoadSynchronous → AIPawnClass (BP 强类型)
-	//   一并写入 Request
+	// 旧版 (v51) 反模式:
+	//   - UI ComboBox_AIWeapon 存 WeaponName (FText.ToString())
+	//   - Service 收到 WeaponName, 遍历 DT_WeaponInfo 反查 RowName (O(N) 循环)
+	//   - 反查失败 → 静默拒绝入队 (玩家不知道为啥)
+	//   - 反查成功但 WeaponName 不唯一 → 拿到错误的 RowName
 	//
-	//   UI ComboBox_AIWeapon 选 WeaponName (FWeaponInfo.WeaponName)
-	//      ↓ 反查 DT_WeaponInfo[WeaponName]
-	//   拿 WeaponID (RowName)
-	//   写入 Request.WeaponID
+	// 新版 (v236) — 单一真理源:
+	//   - UI ComboBox_AIWeapon 存 RowName (FName)
+	//   - Service 直接拿 RowName, **零反查**, 零循环
+	//   - 真理源链路: DT_WeaponInfo RowName ←→ ComboBox 选项 (1:1 映射)
+	//   - 零兜底: WeaponRowName 为空 → Log Error + 拒绝入队
 	//
-	// 旧 (v49) 反模式:
-	//   - UI 传 CharacterName → 反查 RowName → SpawnAIInternal 又反查 PawnClass
-	//   - UI 传 WeaponName (字段名错叫 WeaponID) → SpawnAIInternal 反查 WeaponID
-	//   - 两端反查, 反查路径不清晰
-	//
-	// 新 (v51):
-	//   - RoomService 一次反查全做完 (RowName + PawnClass + WeaponID)
-	//   - SpawnAIInternal 不再反查 (单一真理源)
-	//   - 字段命名修正: 第二个参数实质是 WeaponName (UI 显示名)
+	// 大厂原则落地:
+	//   - 单一真理源: UI 端存 RowName (强类型 ID), 不存 FText 显示名
+	//   - 零循环: Service 端不做 O(N) 反查 (DT_WeaponInfo.FindRow(FName) 是 O(1))
+	//   - 零兜底: 任一字段为空 → 立即 Log Error 强制修复
+	//   - DRY: 反查逻辑只在 UI 端 (`PopulateAIPanelData` 填充 ComboBox 时一次性建立 RowName 映射)
 
 	ARoomGameMode* GM = GetRoomGameMode();
 	if (!GM)
@@ -199,23 +175,33 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName
 		return;
 	}
 
-	// 1. 反查 DT_CharacterInfo → 拿 RowName + CharacterBlueprint + ConfigSoftRef (真理源完整传递)
+	// 1. 【v237.P5 大厂重构 — 单一真理源】O(1) 查 DT_CharacterInfo → 拿 RowName + CharacterBlueprint + ConfigSO
 	//
-	// 【v54.2 大厂架构重构】
-	//   - 旧 (v54.1): 反查只拿 RowName + CharacterBlueprint, ConfigSO 走 SpawnAIInternal fallback
-	//     后果: ConfigSO 在 Possess 之后才注入, SpawnInvincibilitySeconds 等真理分散在多处
-	//   - 新 (v54.2): UI 阶段一次性拿全 (CharacterInfoRowName + AIPawnClass + ConfigSO)
-	//     好处: SpawnAIInternal 入口就拿到 Config, 所有派生计算真理源统一
+	// 单一真理源链 (与武器 v236 形状完全对称):
+	//   - UI ComboBox_AICharacter.GetSelectedIndex() → AllAICharacterRowNames[Index] → RowName (FString)
+	//   - 本函数第一参数 CharacterRowName 已经是 DT RowName (强类型, DT 主键)
+	//   - FindRow<FCharacterInfo>(FName) O(1) 直接拿行, 零字符串模糊匹配, 零循环
 	//
+	// 历史与修正:
+	//   - 旧 (v54.2): "CharacterName.ToString() == CharacterName" 循环反查
+	//     后果: O(N) 性能 + 显示名重复风险 (重命名 DT 行为) + 与武器路径不对称 (重复架构)
+	//   - 新 (v237.P5): "FindRow<FCharacterInfo>(FName)" O(1) 直接拿
+	//     好处: 与武器 v236 路径完全对称 + 真理源单一 (DT RowName 主键) + 性能 O(1)
+	//
+	// 大厂原则 (零兜底 — 任何空字段都拒绝入队):
+	//   - CharacterRowName 为空 → Log Error + 拒绝入队
+	//   - CharacterDataTable 未配置 → Log Error + 拒绝入队
+	//   - DT 找不到 RowName 行 → Log Error + 拒绝入队
+	//   - RowName 行的 CharacterBlueprint / ConfigSoftRef 任一为空 → Log Error + 拒绝入队
 	FName CharacterInfoRowName = NAME_None;
 	TSubclassOf<ABaseCharacter> AIPawnClass = nullptr;
 	TObjectPtr<UAIBehaviorConfigSO> ResolvedConfig = nullptr;
 
-	if (CharacterName.IsEmpty())
+	if (CharacterRowName.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomService::RequestAddAI] CharacterName 为空, 拒绝入队. "
-			     "【v51 零兜底】UI ComboBox_AICharacter 必须选角色."));
+			TEXT("[RoomService::RequestAddAI] CharacterRowName 为空, 拒绝入队. "
+			     "【v237.P5 零兜底】UI ComboBox_AICharacter 必须显式选择 AI 角色."));
 		return;
 	}
 
@@ -227,61 +213,54 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName
 		return;
 	}
 
+	// 【v237.P5 单一真理源 — O(1) FindRow(FName)】直接用 RowName 查 DT, 零反查循环
 	static const FString Ctx(TEXT("RoomService.RequestAddAI.Character"));
+	const FName CharacterRowNameAsName(*CharacterRowName);
+	if (FCharacterInfo* Row = GM->CharacterDataTable->FindRow<FCharacterInfo>(CharacterRowNameAsName, Ctx))
 	{
-		TArray<FName> RowNames = GM->CharacterDataTable->GetRowNames();
-		for (const FName& RowName : RowNames)
+		CharacterInfoRowName = CharacterRowNameAsName; // UI 已验证过, 这里一致
+		// 【v51 关键】同步拿 PawnClass, 不让 SpawnAIInternal 二次反查
+		if (!Row->CharacterBlueprint.IsNull())
 		{
-			if (FCharacterInfo* Row = GM->CharacterDataTable->FindRow<FCharacterInfo>(RowName, Ctx))
-			{
-				if (Row->CharacterName.ToString() == CharacterName)
-				{
-					CharacterInfoRowName = RowName;
-					// 【v51 关键】同步拿 PawnClass, 不让 SpawnAIInternal 二次反查
-					if (!Row->CharacterBlueprint.IsNull())
-					{
-						AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
-					}
-					// 【v54.2 关键】同步拿 ConfigSO (真理源完整传递)
-					//   - 用户决策 2026.07.16: "SpawnInvincibilitySeconds 是所有 AI 的字段"
-					//   - 必须 UI 阶段拿到 Config, SpawnAIInternal 才有真理源
-					if (!Row->ConfigSoftRef.IsNull())
-					{
-						ResolvedConfig = Row->ConfigSoftRef.LoadSynchronous();
-					}
-					break;
-				}
-			}
+			AIPawnClass = Row->CharacterBlueprint.LoadSynchronous();
+		}
+		// 【v54.2 关键】同步拿 ConfigSO (真理源完整传递)
+		if (!Row->ConfigSoftRef.IsNull())
+		{
+			ResolvedConfig = Row->ConfigSoftRef.LoadSynchronous();
 		}
 	}
 
 	if (CharacterInfoRowName.IsNone() || !AIPawnClass || !ResolvedConfig)
 	{
-		// 【v54.2 大厂原则 — 零兜底】三个字段 (RowName / AIPawnClass / ConfigSO) 任一为空都拒绝入队
+		// 【v237.P5 大厂原则 — 零兜底】三个字段 (RowName / AIPawnClass / ConfigSO) 任一为空都拒绝入队
 		const FString AIPawnClassName = AIPawnClass ? AIPawnClass->GetName() : FString(TEXT("<null>"));
 		const FString ConfigName = ResolvedConfig ? ResolvedConfig->GetName() : FString(TEXT("<null>"));
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomService::RequestAddAI] DT_CharacterInfo 行校验失败 (CharacterName='%s'). "
+			TEXT("[RoomService::RequestAddAI] DT_CharacterInfo 行校验失败 (CharacterRowName='%s'). "
 			     "RowName='%s', AIPawnClass='%s', ConfigSO='%s'. "
-			     "【v54.2 零兜底】任一字段为空都拒绝入队. "
+			     "【v237.P5 零兜底】任一字段为空都拒绝入队. "
 			     "【修复路径1】DT_CharacterInfo 行 CharacterBlueprint 字段必须配 BP_*. "
 			     "【修复路径2】DT_CharacterInfo 行 ConfigSoftRef 字段必须配 DA_AIBehaviorConfig_*.uasset. "
-			     "【修复路径3】检查 UI ComboBox_AICharacter 选项源与 DT_CharacterInfo 是否一一对应."),
-			*CharacterName,
+			     "【修复路径3】检查 RoomInsidePage::PopulateAIPanelData 过滤规则是否漏掉有效 RowName."),
+			*CharacterRowName,
 			*CharacterInfoRowName.ToString(),
 			*AIPawnClassName,
 			*ConfigName);
 		return;
 	}
-	// 2. 反查 DT_WeaponInfo → 拿 WeaponID (RowName)
-	//    WeaponID 是字符串 (与 DT_WeaponInfo RowName 一致), 不需要 Class 强类型
-	//    Class 在武器挂载时由 WeaponAttachmentComponent 内部 DT_WeaponInfo → WeaponBlueprint 反查
-	FString WeaponID;
-	if (WeaponName.IsEmpty())
+	// 2. 【v236 大厂重构 — 删除武器反查循环, 改用 FindRow(FName) O(1) 验证】
+	//   真理源: WeaponRowName 已经是 DT_WeaponInfo RowName (由 UI 端建立映射)
+	//   验证: 直接用 WeaponRowName 查 DT_WeaponInfo → 必须存在 (UI 已验证, 这里做最终一致性校验)
+	const FString WeaponID = WeaponRowName; // 【v236 单一真理源】UI 直接传 RowName, Service 不再二次反查
+
+	if (WeaponID.IsEmpty())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomService::RequestAddAI] WeaponName 为空, 拒绝入队. "
-			     "【v51 零兜底】UI ComboBox_AIWeapon 必须选武器."));
+			TEXT("[RoomService::RequestAddAI] WeaponRowName 为空, 拒绝入队. "
+			     "【v236 零兜底】UI ComboBox_AIWeapon 必须显式选择武器. "
+			     "【修复】检查 RoomInsidePage::PopulateAIPanelData 是否正确传递 RowName, "
+			     "而非 FText.ToString() 显示名."));
 		return;
 	}
 
@@ -294,29 +273,17 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterName
 	}
 
 	static const FString WCtx(TEXT("RoomService.RequestAddAI.Weapon"));
+	const FName WeaponRowNameAsName(*WeaponRowName);
+	const FWeaponInfo* WeaponRow = GM->WeaponDataTable->FindRow<FWeaponInfo>(WeaponRowNameAsName, WCtx);
+	if (!WeaponRow)
 	{
-		TArray<FName> RowNames = GM->WeaponDataTable->GetRowNames();
-		for (const FName& RowName : RowNames)
-		{
-			if (FWeaponInfo* Row = GM->WeaponDataTable->FindRow<FWeaponInfo>(RowName, WCtx))
-			{
-				if (Row->WeaponName.ToString() == WeaponName)
-				{
-					WeaponID = RowName.ToString();
-					break;
-				}
-			}
-		}
-	}
-
-	if (WeaponID.IsEmpty())
-	{
+		// 【v236 零兜底】UI 传的 RowName 在 DT_WeaponInfo 查不到 — UI/数据不一致, 必须修复
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomService::RequestAddAI] DT_WeaponInfo 找不到 WeaponName='%s' 的有效行. "
-			     "【v51 零兜底】拒绝入队. "
-			     "【修复路径1】打开 DT_WeaponInfo — 添加 WeaponName='%s' 的行. "
-			     "【修复路径2】检查 UI ComboBox_AIWeapon 选项源与 DT_WeaponInfo 是否一一对应."),
-			*WeaponName, *WeaponName);
+			TEXT("[RoomService::RequestAddAI] DT_WeaponInfo 找不到 RowName='%s' 的有效行. "
+			     "【v236 零兜底】拒绝入队. "
+			     "【修复路径1】打开 DT_WeaponInfo — 添加 RowName='%s' 的行. "
+			     "【修复路径2】检查 RoomInsidePage::PopulateAIPanelData 是否正确建立 RowName 映射."),
+		*WeaponRowName, *WeaponRowName);
 		return;
 	}
 

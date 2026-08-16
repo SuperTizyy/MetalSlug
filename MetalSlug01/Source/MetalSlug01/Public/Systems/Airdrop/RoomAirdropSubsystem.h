@@ -12,6 +12,10 @@
 //   - 只有人类可以吃掉空投, 母体走过去无视 (业务层判定, 不污染 CollisionProfile)
 //   - 被吃掉的人类玩家主武器所有弹药恢复全满 (弹夹 + 总子弹容量)
 //
+// 业务规则 (用户 2026.08.17 明确):
+//   - 每小局结束, 场景里没被吃掉的空投必须销毁 (v2xx 修复)
+//   - 防止"空投残留"干扰下一小局视觉 / 玩家走位
+//
 // 大厂原则 — 单一真理源:
 //   - 空投点位:        ARoomGameMode::AirDropPoints              (策划在 BP 配置)
 //   - 空投蓝图类:      ARoomGameMode::AirDropPickupClass         (策划在 BP 配置)
@@ -24,23 +28,36 @@
 //   - AAirdropPickup:          管"碰撞响应/被谁吃/RPC 自销毁" (单一 Actor 自治)
 //   - UWeaponFireComponent:    管"弹药全满" (单一真理源, v117 新增 Server_RefillAmmo)
 //   - URoomLifecycleSubsystem: 管"倒计时到期 = 触发空投降临" (v117 新增 AirdropIntervalTimerHandle)
+//   - URoomLifecycleSubsystem: 管"小局结束 = 清理未消化空投" (v2xx 新增, FinishZombieRound 集中调度)
+//
+// 大厂原则 — 单一职责 (v2xx 重构):
+//   - SpawnAirdropAtAllPoints: 只 Spawn, 不清理 (旧版 v117 反模式已修复)
+//   - DestroyAllExistingPickups: 只清理, 不生成 (账本 = 单一真理源, 调用方决策时机)
+//   - 调用方决策:
+//     - FinishZombieRound (小局结束, 用户 2026.08.17 业务规则)
+//     - OnAirdropIntervalExpired (空投降临轮换, 用户 2026.08.03 业务规则)
 //
 // 大厂原则 — 零兜底:
 //   - 缺空投点位/类/高度配置 → Log Error + 拒绝 Spawn (强制策划修复)
 //   - 母体碰到 → Verbose 日志 + 跳过 (业务规则, 不是兜底)
 //   - 死亡人类碰到 → Verbose + 跳过 (死人不能吃)
 //   - 没主武器/没 FireComp → Log Error + 不静默吃空投 (强制修复武器 Spawn 链路)
+//   - AirdropSubsystem 不可用 → 上游 (LifecycleSubsystem) Log Error + 显式化
 //
 // 大厂原则 — 不破坏刀战:
 //   - ShouldCreateSubsystem 镜像 v31.5 风格 — 不在刀战模式 (EWorldType 兼容 + GameWorld)
 //   - GameMode.AirDropPoints / AirDropPickupClass 留空 → 整个 Subsystem 等同不工作
+//   - 刀战模式永不调用本 Subsystem (LifecycleSubsystem 模式守卫)
 //
 // 调用链:
 //   LifecycleSubsystem::StartAirdropCountdown → SetTimer(AirdropInterval) → 到期调
-//   LifecycleSubsystem::OnAirdropIntervalExpired → AirdropSubsystem::SpawnAirdropAtAllPoints
-//     ├─ DestroyAllExistingPickups() (账本里的 + World 里残留的)
-//     ├─ 遍历 AirDropPoints 生成 Pickup
+//   LifecycleSubsystem::OnAirdropIntervalExpired
+//     ├─ [v2xx] DestroyAllExistingPickups (清理, 显式)
+//     ├─ [v2xx] SpawnAirdropAtAllPoints (生成, 显式)
 //     └─ NotifyAirdropArrivalCompleted 继续下一轮倒计时
+//
+//   LifecycleSubsystem::FinishZombieRound (小局结束)
+//     └─ [v2xx 新增] DestroyAllExistingPickups (清理, 单一入口)
 //
 // ==========================================
 
@@ -81,20 +98,33 @@ public:
 	virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 
 	/**
-	 * 【v117 单一入口】服务器公开 API — 在所有预设点生成新一批空投
+	 * 【v2xx 大厂架构重构】服务器公开 API — 在所有预设点生成新一批空投
 	 *
-	 * 调用方: URoomLifecycleSubsystem::OnAirdropIntervalExpired (SetTimer 到期回调)
+	 * 调用方 (唯一, 1 个, 大厂原则 — 集中调度):
+	 *   - URoomLifecycleSubsystem::OnAirdropIntervalExpired (空投降临倒计时到期)
+	 *     → 走 AirdropIntervalTimer 到期 → 调本函数生成新空投
+	 *
+	 * 单一职责 (v2xx 大厂原则):
+	 *   - 本函数只 Spawn 新空投, 不清理旧空投
+	 *   - 旧版 (v117-v201) 反模式: 内部 Step 1 调 DestroyAllExistingPickups → 职责错位
+	 *   - 新版: 清理 = 调用方决策 (OnAirdropIntervalExpired / FinishZombieRound 各自决定)
+	 *   - 调用方示例 (OnAirdropIntervalExpired):
+	 *       AirdropSys->DestroyAllExistingPickups();   // 清旧
+	 *       AirdropSys->SpawnAirdropAtAllPoints();     // 生新
 	 *
 	 * 业务规则 (用户 2026.08.03):
-	 *   1. 先 DestroyAllExistingPickups() 把上一轮空投清掉
-	 *   2. 然后遍历 GameMode.AirDropPoints 生成新空投
-	 *   3. 生成坐标 = 点位 Actor 的世界坐标 + (0, 0, AirDropPickupDropHeight)
+	 *   - 遍历 GameMode.AirDropPoints 匹配 Tag 的 Actor 列表
+	 *   - 生成坐标 = 点位 Actor 世界坐标 + (0, 0, AirDropPickupDropHeight)
+	 *   - 账本 = TrackedPickups (本 Subsystem 唯一真理源)
+	 *   - 生成后通过 Multicast_PlayDropSound 推客户端音效
 	 *
 	 * 大厂原则 — 零兜底:
-	 *   - World / GameState / GameMode 为空 → Log Error + return
-	 *   - AirDropPoints 为空数组 → Log Warning + return (业务禁用, 不静默)
-	 *   - AirDropPickupClass 未配 → Log Error + return
+	 *   - World / GameState / GameMode 为空 → Log Error + return 0
+	 *   - 非生化模式 → 静默 Log (业务禁用, 不报错)
+	 *   - AirDropPoints 为空数组 → Log Warning + return 0 (业务禁用, 不静默)
+	 *   - AirDropPickupClass 未配 → Log Error + return 0
 	 *   - 单个点位 SpawnActor 失败 → Log Error + continue (不阻塞后续点位)
+	 *   - DropSound 字段为空 → Log Warning + 跳过音效 (业务可容忍)
 	 *
 	 * @return 成功生成数量 (供调用方日志)
 	 */
@@ -102,17 +132,32 @@ public:
 	int32 SpawnAirdropAtAllPoints();
 
 	/**
-	 * 【v117 单一入口】清理当前所有未消化的空投
+	 * 【v2xx 大厂架构重构】清理当前所有未消化的空投
 	 *
-	 * 调用方:
-	 *   - SpawnAirdropAtAllPoints 第 1 步 (新空投生成前)
-	 *   - HandleZombieRoundEnd (本局结束, 兜底清理)
-	 *   - GameMode::HandleMatchTimeOut (整场比赛结束, 兜底清理)
+	 * 调用方 (唯一, 2 个, 大厂原则 — 集中调度):
+	 *   1. URoomLifecycleSubsystem::FinishZombieRound (小局结束, 用户 2026.08.17 业务规则)
+	 *      → 走 OnMatchTimerTick (倒计时归零 / 提前结束) → 触发小局结算
+	 *   2. URoomLifecycleSubsystem::OnAirdropIntervalExpired (空投降临轮换)
+	 *      → 走 AirdropIntervalTimer 到期 → 清理旧空投 + 生成新空投
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - 清理 = 单一入口, 不允许"顺带清理"嵌入 Spawn 内部 (v117-v201 反模式)
+	 *   - 业务调用方决策清理时机, AirdropSubsystem 只负责执行
+	 *   - 跨越账号者 AirdropSubsystem 内部, 账本 = TrackedPickups (弱引用)
 	 *
 	 * 大厂原则 — 显式清理:
-	 *   - 遍历 TrackedPickups (账本) 调 Destroy()
-	 *   - 清空账本
+	 *   - 拷贝待销毁清单 → 清空账本 → 逐个 Destroy (防 v117 断言崩)
 	 *   - 不依赖 GC, 立即销毁
+	 *   - 不静默容忍 IsActorBeingDestroyed (同帧二次 Destroy 跳过)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - AirdropSubsystem 不可用 (World 为空等) → 已在调用方日志化, 本函数不重复防御
+	 *   - 账本为空 → 清理是 no-op (有 Log 体现, 不算静默)
+	 *
+	 * 不破坏既有调用方:
+	 *   - 旧版 (v117) 的"HandlerZombieRoundEnd 兜底清理 / GameMode::HandleMatchTimeOut 兜底清理"
+	 *     注释完全是谎言 (调用方根本不存在, 导致小局结束空投残留)
+	 *   - v2xx 改为"集中调度 + 显式清理", 注释与实现 100% 对齐
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Airdrop")
 	void DestroyAllExistingPickups();

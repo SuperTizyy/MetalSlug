@@ -222,6 +222,25 @@ void AAirdropPickup::Handle_OverlapBegin(UPrimitiveComponent* OverlappedComponen
 		TEXT("[AirdropPickup] %s 被 %s 吃掉! 主武器 %s 弹药已全满."),
 		*GetName(), *OtherChar->GetName(), *CurrentWeapon->GetName());
 
+	// 【v2xx 大厂架构新增】播放"被吃掉"音效 — 镜像 v118 生成音效 RPC 模式
+	//   - 时序: 必须在 Destroy() 之前, 否则 Actor 已销毁, Multicast 参数序列化失败
+	//   - 业务可独立配置 (PickupSound 字段), 不复用 DropSound (语义不同)
+	//   - 大厂原则 — 零兜底: PickupSound 为空 → Log Warning + 跳过 (与 DropSound 同策略, 业务可容忍)
+	if (PickupSound)
+	{
+		Multicast_PlayPickupSound(
+			PickupSound,
+			PickupSoundVolumeMultiplier,
+			PickupSoundPitchMultiplier);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[AirdropPickup] Handle_OverlapBegin: 空投 %s PickupSound 字段为空, 跳过拾取音效播放. "
+			     "【修复】在 BP_AirdropPickup 蓝图 → Class Defaults → Airdrop → Pickup Sound 字段拖入 Sound 资产."),
+			*GetName());
+	}
+
 	// 7. 销毁空投 + 通知 Subsystem 从账本移除
 	//   - Destroy() 会同步触发 EndPlay → NotifyPickupDestroyed → 账本清理
 	//   - 显式 NotifyPickupDestroyed 是为了: 如果 Destroy 因某种原因延迟, 账本不会留
@@ -287,6 +306,64 @@ void AAirdropPickup::Multicast_PlayDropSound_Implementation(USoundBase* InSound,
 
 	UE_LOG(LogTemp, Verbose,
 		TEXT("[AirdropPickup] Multicast_PlayDropSound: 播放空投音效 — Sound=%s VolMul=%.2f PitchMul=%.2f Loc=%s"),
+		*InSound->GetName(),
+		VolumeMul,
+		PitchMul,
+		*PlayLocation.ToString());
+}
+
+
+// ==========================================
+// 【v2xx 大厂架构新增】音效 RPC — 镜像 Multicast_PlayDropSound 完整对称设计
+// ==========================================
+//
+// 为什么不复用 Multicast_PlayDropSound:
+//   - 语义不同: 生成 (Drop) vs 拾取 (Pickup)
+//   - 业务独立: 策划可能配不同音效资产 (生成 = 重型空投落地, 拾取 = 武器弹药补给)
+//   - 强制复用 = 隐式耦合, 业务调整时互相影响
+//
+// 大厂原则 — DRY 不是"机械复用", 而是"结构对称":
+//   - 函数实现 ≈ 100% 相同 (差异仅: 注释里说明是"拾取"音效 + Log tag)
+//   - 不抽出 helper 函数 (会让两个 RPC 都增加 1 层调用, 性能无意义)
+//   - 直接复制实现, 注释里明确"镜像 Multicast_PlayDropSound"
+//   - 这是 v117-v2xx 一直用的模式 (Multicast_PlayFireMontage / Multicast_PlayReloadMontage 也镜像)
+
+void AAirdropPickup::Multicast_PlayPickupSound_Implementation(USoundBase* InSound, float VolumeMul, float PitchMul)
+{
+	// 大厂原则 — 零兜底: Sound 字段为空 → 强制修复 BP_AirdropPickup
+	if (!InSound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[AirdropPickup] Multicast_PlayPickupSound_Implementation: InSound 为空 — 拒绝播放. "
+			     "Pickup=%s. "
+			     "【v2xx 大厂原则 — 零兜底】服务器已校验 PickupSound 字段, 客户端再次校验防 RPC 序列化异常."),
+			*GetName());
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[AirdropPickup] Multicast_PlayPickupSound_Implementation: World 无效 — 拒绝播放. Pickup=%s."),
+			*GetName());
+		return;
+	}
+
+	// 大厂原则 — 单点播放: 用 Actor 当前位置
+	//   - 拾取时位置 = 空投落地点 (物理已落定), 音效位置准确
+	const FVector PlayLocation = GetActorLocation();
+
+	// UE 5.6 标准 API: PlaySoundAtLocation (本地播放, 不跨进程)
+	UGameplayStatics::PlaySoundAtLocation(
+		this,
+		InSound,
+		PlayLocation,
+		VolumeMul,
+		PitchMul);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[AirdropPickup] Multicast_PlayPickupSound: 播放拾取音效 — Sound=%s VolMul=%.2f PitchMul=%.2f Loc=%s"),
 		*InSound->GetName(),
 		VolumeMul,
 		PitchMul,

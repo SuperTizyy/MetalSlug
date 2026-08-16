@@ -893,6 +893,81 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Zombie")
 	FOnRoundWinnerUpdated OnZombieRoundSoundReceived;
 
+	// ==========================================
+	// 【v2xx 大厂架构新增】刀战模式本局结算音效 RPC 链路 (镜像 ZombieRound Sound 链路)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.17 明确):
+	//   - 刀战倒计时归零 → FinishMeleeMatch 判定 → 调本 RPC 推所有客户端
+	//   - 服务器从 GM 配的 MeleeAttackerWinSound / MeleeDefenderWinSound / MeleeDrawSound 查表
+	//   - 转 FSoftObjectPath → Multicast RPC → 客户端 LoadSynchronous + PlaySound2D
+	//
+	// 大厂原则 — 模式分离 (镜像 v218 MeleeWinner vs EZombieRoundWinner 分离):
+	//   - 不复用 MulticastPlayZombieRoundSound (参数枚举是 EZombieRoundWinner,语义不适用刀战"攻 vs 守")
+	//   - 不复用 HandleZombieRoundSoundReceived (Broadcast 委托类型不同, UI 调用方需按模式区分)
+	//   - 不复用 OnZombieRoundSoundReceived (委托签名是 EZombieRoundWinner,刀战用 EMeleeWinner)
+	//
+	// 大厂原则 — RPC 纯数据 (镜像 v210.4):
+	//   - 不传 USoundBase* (UE 5.6 GC 误删 + Replicated 裸指针不可靠, 已确认 v210.2/v210.3 路径均失效)
+	//   - 传 FSoftObjectPath (UE 5.6 标准 Replicate 资产路径方式, GC 安全, 跨网络稳定)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 音效资产只在 GM 配 (策划唯一配置点), GS 不复制不缓存
+	//
+	// 大厂原则 — 零兜底:
+	//   - SoundPath 为空 → Log Error, 强制修复 GM BP 配置
+	//   - LoadSynchronous 失败 → Log Error
+
+	/**
+	 * 【v2xx 大厂架构新增】服务器 → 所有客户端的刀战本局结算音效 RPC
+	 *
+	 * @param InMeleeWinner  刀战本局赢家 (Attacker / Defender / Draw, 不允许 None)
+	 * @param InSoundPath    对应音效的软引用路径 (服务器从 GM 字段取出, 客户端 LoadSynchronous)
+	 *
+	 * 调用方:
+	 *   - URoomLifecycleSubsystem::FinishMeleeMatch (本局结束唯一入口)
+	 *
+	 * 不破坏生化模式:
+	 *   - 生化永不调本函数, RPC 永远不发
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastPlayMeleeMatchSound(EMeleeWinner InMeleeWinner, const FSoftObjectPath& InSoundPath);
+
+	/**
+	 * 【v2xx 大厂架构新增】刀战本局音效 RPC 内部实现
+	 *   - 服务器 + 客户端都执行 (UE 5.6 NetMulticast Reliable 在 Listen Server 上服务器自身也会触发 _Implementation)
+	 *   - 内部 LoadSynchronous 加载 SoundPath → PlaySound2D
+	 *   - 加载失败 → Log Error (零兜底, 强制修复 BP 资产配置)
+	 *
+	 * 大厂原则 — 独立实现 (不允许复用 PlayZombieRoundSoundFromPath_Implementation):
+	 *   - 委托 Broadcast 类型不同 (OnMeleeMatchSoundReceived 走 EMeleeWinner, 非 EZombieRoundWinner)
+	 *   - 错误日志 / 调用方 / 配置字段完全不同 (模式分离)
+	 *   - 镜像实现路径仅是"行为模式"镜像, 不是"代码复用"
+	 */
+	void PlayMeleeMatchSoundFromPath_Implementation(EMeleeWinner InMeleeWinner, const FSoftObjectPath& InSoundPath);
+
+	/**
+	 * 【v2xx 大厂架构新增】客户端拿到刀战本局音效 RPC 时的回调 (由 _Implementation 内部 Broadcast)
+	 *
+	 * 大厂原则 — 职责拆分 (镜像 HandleZombieRoundSoundReceived):
+	 *   - 只负责接收 MeleeWinner + Broadcast OnMeleeMatchSoundReceived
+	 *   - 不查 GameMode, 不耦合音效加载/播放 (已在 PlayMeleeMatchSoundFromPath_Implementation 完成)
+	 */
+	void HandleMeleeMatchSoundReceived(EMeleeWinner InMeleeWinner);
+
+	/**
+	 * 【v2xx 大厂架构新增】UI 监听的刀战本局音效广播委托 (Multicast RPC 收到后推送)
+	 *
+	 * 大厂原则 — 委托类型独立 (镜像 v218 FOnMeleeWinnerUpdated vs FOnRoundWinnerUpdated 分离):
+	 *   - 不复用 OnZombieRoundSoundReceived (签名是 EZombieRoundWinner, 刀战用 EMeleeWinner)
+	 *   - UGameHUDWidget 订阅后可按模式区分处理 (例如区分"小局结束" vs "本局结束" UI 反馈)
+	 *
+	 * 大厂原则 — 公开层级 (镜像 OnZombieRoundSoundReceived):
+	 *   - 必须 UPROPERTY(BlueprintAssignable) 在 public 区, 否则 UE 5.6 生成 AddDynamic 不可访问
+	 */
+	UPROPERTY(BlueprintAssignable, Category = "Room|Settlement|Melee")
+	FOnMeleeWinnerUpdated OnMeleeMatchSoundReceived;
+
 	/**
 	 * 【v218 大厂架构新增】刀战模式本局赢家 (与生化 RoundWinner 分离,语义更清晰)
 	 *

@@ -457,6 +457,47 @@ bool URoomLifecycleSubsystem::FinishZombieRound()
 		return false;
 	}
 
+	// 【v2xx 大厂架构 — 单一入口 + 单一职责】Zombie 模式守卫之后, 集中调度"小局结束"业务收尾
+	//
+	// 业务规则 (用户 2026.08.17 明确): 生化模式每小局结束, 把场景中没被吃掉的空投全销毁
+	//
+	// 为什么放在模式守卫之后:
+	//   - 万一 Melee 模式误调 (业务bug), 上一模式残留空投 (账本为空即可) 不会被错误清理
+	//   - 模式守卫是"业务前置校验", 是业务前提, 一切后续业务必须在其身后
+	//
+	// 为什么放在 FinishZombieRound 而非 HandleZombieRoundEnd:
+	//   - FinishZombieRound 是"小局结束"业务的单一入口 (v134 确立)
+	//   - HandleZombieRoundEnd 还要负责 StartNextZombieRound 调度, 不该承担空投清理
+	//   - 涵盖全部结束路径: 倒计时归零 / 提前结束 (无存活人类) / 外部强制结算
+	//
+	// 旧版 (v117-v201) 反模式 — 清理隐藏在 Spawn 内部:
+	//   - SpawnAirdropAtAllPoints 内部 Step 1 "顺带清理" → 隐藏清理时机
+	//   - 小局结束路径 (HandleZombieRoundEnd / FinishZombieRound) 完全不清理 → 旧空投堆叠
+	//   - 注释里说"HandleZombieRoundEnd 兜底清理" → 实际调用方不存在
+	//   - 注释里说"GameMode::HandleMatchTimeOut 兜底清理" → 实际调用方不存在
+	//
+	// 新版 (v2xx) 单一职责 + 显式优于隐式:
+	//   - SpawnAirdropAtAllPoints 只 Spawn (移除其内部清理步骤)
+	//   - 清理时机 = 业务调度方决定 (这里是 FinishZombieRound)
+	//   - AirdropSubsystem::DestroyAllExistingPickups 仍是单一真理源 (账本 / 清理逻辑)
+	//   - 调用方只有 2 个: FinishZombieRound (小局结束) + OnAirdropIntervalExpired (空投降临轮换)
+	//
+	// 大厂原则 — 零兜底:
+	//   - AirdropSubsystem 不可用 → Log Error + 继续后续业务 (不退化)
+	//   - 账本为空 → 清理是 no-op (DestroyAllExistingPickups 内部有日志)
+	//   - 强制修复: 不可用 = WorldSubsystem 创建时机错, 业务日志显式化
+	if (URoomAirdropSubsystem* AirdropSys = URoomAirdropSubsystem::Get(this))
+	{
+		AirdropSys->DestroyAllExistingPickups();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomLifecycle] FinishZombieRound: URoomAirdropSubsystem 不可用, 跳过空投清理. "
+			     "【v2xx 强制修复】空投会残留到下一小局. "
+			     "【修复】检查 ARoomGameMode::InjectSubsystemConfigs 或 WorldSubsystem 创建时机."));
+	}
+
 	// 【v210.1 大厂架构增强日志】诊断第二小局及后续小局音效问题
 	UE_LOG(LogTemp, Log,
 		TEXT("[RoomLifecycle] FinishZombieRound: 小局结算入口检查. RoundWinner=%d (期望 None), CurrentRound=%d"),
@@ -679,6 +720,56 @@ bool URoomLifecycleSubsystem::FinishMeleeMatch()
 		RoomGS->AttackerTotalKills,
 		RoomGS->DefenderTotalKills,
 		EZombieRoundWinner::None); // 显式 None — 刀战语义不适用 EZombieRoundWinner, UI 用 MeleeWinner 显示
+
+	// 步骤 4.5: 广播刀战本局结算音效 (镜像 FinishZombieRound 步骤 4)
+	//   - 大厂原则 — RPC 纯数据: 传 FSoftObjectPath 而非 USoundBase* (UE 5.6 GC 安全 + Replicated 标准)
+	//   - 大厂原则 — 单一真理源: 音效资产只在 GM 配置 (策划唯一配置点), GS 不缓存
+	//   - 大厂原则 — 模式分离: 不复用 MulticastPlayZombieRoundSound (参数枚举不匹配, 镜像 v218 MeleeWinner vs EZombieRoundWinner 分离)
+	//   - 大厂原则 — 零兜底: GM 查表若 3 个字段都空 → 服务器 SoundPath 为空 → 客户端 Log Error 强制修复 BP 配置
+	{
+		// 【v2xx】复用外层 World (避免 C4456 声明隐藏, 镜像 FinishZombieRound 步骤 4)
+		//   - 服务器从 GM 配置 (单一真理源) 拿 USoundBase*, 转 FSoftObjectPath
+		//   → 服务器不缓存音效到 GS, InitGameState 不参与
+		//   → 客户端 Implementation LoadSynchronous 加载 + PlaySound2D
+		ARoomGameMode* GM = World->GetAuthGameMode<ARoomGameMode>();
+		USoundBase* SelectedSound = nullptr;
+		if (GM)
+		{
+			switch (NewWinner)
+			{
+				case EMeleeWinner::Attacker:
+					SelectedSound = GM->MeleeAttackerWinSound;
+					break;
+				case EMeleeWinner::Defender:
+					SelectedSound = GM->MeleeDefenderWinSound;
+					break;
+				case EMeleeWinner::Draw:
+					SelectedSound = GM->MeleeDrawSound;
+					break;
+				default:
+					// EMeleeWinner::None 不允许进入本函数 (步骤 1 已确保 NewWinner ∈ {Attacker, Defender, Draw})
+					UE_LOG(LogTemp, Error,
+						TEXT("[RoomLifecycle] FinishMeleeMatch: NewWinner 为 None, 不可能进入音效查表分支. "
+						     "【根因排查】步骤 1 判定逻辑可能被破坏, 检查 AttackerTotalKills vs DefenderTotalKills 比较链."));
+					break;
+			}
+		}
+		else
+		{
+			// 服务器侧 GM 为 nullptr — 配置错 (GM_RoomGameMode BP 未应用)
+			// 不允许静默跳过, 传空 SoundPath 让客户端 Log Error 显式失败
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomLifecycle] FinishMeleeMatch: GM (AuthGameMode) 为空. "
+				     "【修复】检查 World Settings → GameMode Override 是否设了 GM_RoomGameMode BP. "
+				     "【业务后果】刀战本局音效未播放, 业务不阻塞."));
+		}
+
+		const FSoftObjectPath SoundPath = SelectedSound
+			? FSoftObjectPath(SelectedSound)
+			: FSoftObjectPath(); // 故意传空路径 → 客户端 Log Error (零兜底, 强制修复 BP 配置)
+		RoomGS->MulticastPlayMeleeMatchSound(NewWinner, SoundPath);
+		//   - 已绑定: UGameHUDWidget::OnMeleeMatchSoundReceived (Multicast RPC 触发 → 客户端 Implementation 加载并播放)
+	}
 
 	// 步骤 5: 延迟 3s 后切图到 L_Login 结算页
 	RoomGS->ScheduleFinalSettlement(3.0f);
@@ -1081,12 +1172,18 @@ void URoomLifecycleSubsystem::OnAirdropIntervalExpired()
 		TEXT("[RoomLifecycle] OnAirdropIntervalExpired: 空投降临倒计时到期, 触发空投生成 + 清理旧空投."));
 
 	// 大厂原则 — 单一入口: 委托 AirdropSubsystem 处理 "销毁旧 + 生成新"
+	//   - 旧版 (v117-v201) 反模式: SpawnAirdropAtAllPoints 内部 Step 1 偷偷清理
+	//   - 新版 (v2xx) 显式两步: 先清理, 再生成 — 单一职责, 调用方决定清理时机
 	if (URoomAirdropSubsystem* AirdropSys = URoomAirdropSubsystem::Get(this))
 	{
+		// 步骤 A: 清理上一轮空投 (账本统一管理, 走单一真理源)
+		AirdropSys->DestroyAllExistingPickups();
+
+		// 步骤 B: 在所有预设点生成新空投
 		const int32 SpawnedCount = AirdropSys->SpawnAirdropAtAllPoints();
 
 		UE_LOG(LogTemp, Log,
-			TEXT("[RoomLifecycle] OnAirdropIntervalExpired: 本轮共生成 %d 个空投, 现在启动下一轮倒计时."),
+			TEXT("[RoomLifecycle] OnAirdropIntervalExpired: 清理旧空投 + 生成新空投 %d 个, 现在启动下一轮倒计时."),
 			SpawnedCount);
 	}
 	else

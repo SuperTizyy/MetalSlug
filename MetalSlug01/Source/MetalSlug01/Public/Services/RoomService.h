@@ -70,7 +70,7 @@ public:
 	void RequestSendChatMessage(const FString& Message);
 
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
-	void RequestAddAI(bool bToAttackTeam, const FString& CharacterName, const FString& WeaponID, int32 Count);
+	void RequestAddAI(bool bToAttackTeam, const FString& CharacterRowName, const FString& WeaponRowName, int32 Count);
 
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestSelectLoadout(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);

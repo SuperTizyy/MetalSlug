@@ -1583,29 +1583,148 @@ void URoomInsidePage::UpdateInventoryHighlightUI(int32 BackpackSlot)
 void URoomInsidePage::PopulateAIPanelData()
 {
 	// 填充 AI 角色选择下拉框
+	//
+	// 【v237 大厂重构 — 单一真理源 + AI 过滤 + 镜像武器】
+	//
+	// 根因:
+	//   - 旧实现 GetAllRows<FCharacterInfo>() 全量加入 ComboBox_AICharacter (无过滤)
+	//   - DT_CharacterList 里既有玩家 (SWAT/SWAT02) 也有 AI (AI001/AI002...)
+	//   - 用户报告: "ComboBox_AICharacter 控件只显示 rowname=AIxxxx 的选项, 不能有其他选项"
+	//
+	// 修复:
+	//   1. 真理源 = RowName 业务代号 "AI" + 数字 (e.g. AI001/AI002) 【v237.P5.3 用户 2026.08.17 确认】
+	//   2. 行级过滤: 3 层校验 StartsWith("AI") + Len>=4 + IsDigit 逐位 → 进入 ComboBox; 不满足 → 跳过 + Verbose 日志
+	//   3. GetRowNames() (镜像武器) 替代 GetAllRows() (避免顺序不一致陷阱)
+	//   4. 索引映射: AllAICharacterRowNames[Index] ↔ ComboBox.GetOptionAt(Index), 1:1
+	//   5. 默认选中: SetSelectedIndex(INDEX_NONE) 清 BP 默认 → 上次选择恢复 → 否则 index 0
 	if (ComboBox_AICharacter && CharacterDataTable)
 	{
 		ComboBox_AICharacter->ClearOptions();
+		AllAICharacterRowNames.Reset(); // 【v237 大厂重构】镜像武器: 每次重建 ComboBox 必须同步清映射数组
 
-		TArray<FCharacterInfo*> AllCharacters;
-		CharacterDataTable->GetAllRows<FCharacterInfo>(TEXT("AIPanelContext"), AllCharacters);
+		const TArray<FName> RowNames = CharacterDataTable->GetRowNames();
+		static const FString Ctx(TEXT("RoomInsidePage.PopulateAIPanelData.Character"));
 
-		for (FCharacterInfo* CharInfo : AllCharacters)
+		int32 FilteredOutCount = 0;
+
+		for (const FName& RowName : RowNames)
 		{
-			if (CharInfo)
+			if (RowName.IsNone())
 			{
+				continue;
+			}
+
+			const FString RowNameStr = RowName.ToString();
+
+			// 【v237.P5.3 大厂原则 — AI 真理源 = RowName 业务代号 "AI" + 数字 (e.g. AI001/AI002)】
+			//
+			// 历史与修正 (3 次迭代):
+			//   - v237.P5.0: StartsWith("AI_")          → 0 行命中 (项目无下划线)
+			//   - v237.P5.1: MatchesWildcard("AI[0-9]*") → 0 行命中 (UE MatchesWildcard 不支持 [0-9] 字符集!
+			//     UE 文档+源码:FString::MatchesWildcard 只支持 * 和 ? 两个通配符, [0-9] 被当作字面字符)
+			//   - v237.P5.2 (用户纠正): AI 必须紧跟数字 → RowName 实际是 "AI001" 格式
+			//   - v237.P5.3 (当前): StartsWith("AI") + Len() >= 4 + IsDigit 逐位校验
+			//
+			// 校验规则 (3 层全部满足才算 AI):
+			//   1. RowName 以 "AI" 开头 (前缀真理源)
+			//   2. RowName 长度 >= 4 (AI + 至少 1 位数字)
+			//   3. 从第 3 位 (index 2) 起所有字符都是数字 (FChar::IsDigit, 跨平台 Unicode 数字)
+			//
+			// 大厂原则 (零兜底, 单一真理源):
+			//   - 真理源 = DT_CharacterInfo RowName 前缀 "AI" + 数字部分 (用户主确认 2026.08.17)
+			//   - 不引入 bIsAICharacter 字段 (零 DT 配置改动)
+			//   - 不依赖 MatchesWildcard 通配符 (UE 5.6 字符集不支持)
+			//   - 行为可预测: 新 AI 角色起名 "AI003/AI004" → 自动纳入 ComboBox
+			//   - 玩家 RowName (JS001/MT001/SWAT_AI 等) 不会误命中:
+			//     - "JS001": StartsWith("AI") 失败 → 排除
+			//     - "MT001": StartsWith("AI") 失败 → 排除
+			//     - "SWAT_AI": StartsWith("AI") 失败 (SWAT 前缀) → 排除
+			//     - "AI001": 3 层全过 → 命中 ✓
+			{
+				bool bIsAI = false;
+				if (RowNameStr.StartsWith(TEXT("AI")) && RowNameStr.Len() >= 4)
+				{
+					bIsAI = true;
+					for (int32 i = 2; i < RowNameStr.Len(); ++i)
+					{
+						if (!FChar::IsDigit(RowNameStr[i]))
+						{
+							bIsAI = false;
+							break;
+						}
+					}
+				}
+
+				if (!bIsAI)
+				{
+					UE_LOG(LogTemp, Verbose,
+						TEXT("[RoomInsidePage] ComboBox_AICharacter 过滤掉非 AI 角色 RowName='%s' (不满足 'AI + 数字' 3 层校验 — 玩家/母体行)"),
+						*RowNameStr);
+					++FilteredOutCount;
+					continue;
+				}
+			}
+
+			if (FCharacterInfo* CharInfo = CharacterDataTable->FindRow<FCharacterInfo>(RowName, Ctx))
+			{
+				if (CharInfo->CharacterName.IsEmpty())
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("[RoomInsidePage] ComboBox_AICharacter: RowName='%s' 的 CharacterName 为空, 仍加入列表 (用 RowName 作显示)。修复: 打开 DT_CharacterList 配置 CharacterName 字段。"),
+						*RowNameStr);
+				}
+
+				// 显示 CharacterName, 但 RowName 存映射表 — UI 真理源分离 (镜像武器 v236)
 				ComboBox_AICharacter->AddOption(CharInfo->CharacterName.ToString());
+				AllAICharacterRowNames.Add(RowName);
+			}
+			else
+			{
+				// 【v237 零兜底】RowName 在 DT 里查不到 — 配置错, 显式报错
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] ComboBox_AICharacter: RowName='%s' 在 CharacterDataTable 中查不到 (类型不匹配或行不存在)。过滤掉。"),
+					*RowNameStr);
+				++FilteredOutCount;
 			}
 		}
 
-		// 恢复上次选择的角色
-		if (!LastConfirmedAICharacter.IsEmpty() && ComboBox_AICharacter->FindOptionIndex(LastConfirmedAICharacter) != -1)
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomInsidePage] ComboBox_AICharacter 重建完成: 总行=%d, AI 角色=%d, 过滤掉=%d"),
+			RowNames.Num(), AllAICharacterRowNames.Num(), FilteredOutCount);
+
+		// 恢复上次选择 (按 RowName 恢复, 不能用 FindOptionIndex 因为 ComboBox 存的是显示名)
+		int32 SelectedIndex = INDEX_NONE;
+		if (!LastConfirmedAICharacterRowName.IsEmpty())
 		{
-			ComboBox_AICharacter->SetSelectedOption(LastConfirmedAICharacter);
+			SelectedIndex = AllAICharacterRowNames.IndexOfByPredicate([&](const FName& RowName) {
+				return RowName.ToString() == LastConfirmedAICharacterRowName;
+			});
 		}
-		else if (ComboBox_AICharacter->GetOptionCount() > 0)
+
+		// 【v237 P4 修复 — 重建 ComboBox 强制清空 BP 蓝图默认值】
+		//
+		// 镜像 ComboBox_AIWeapon:
+		//   - UComboBoxString 字段在 BP 蓝图编辑器中默认 SelectedIndex = 0
+		//   - 重建选项后, 强制 SelectedIndex = INDEX_NONE, 避免 BP 默认索引指向不存在的位置
+		ComboBox_AICharacter->SetSelectedIndex(INDEX_NONE);
+
+		// 【v237 业务决策】默认选中规则 (镜像武器):
+		//   - 有上次选择 → 恢复上次选择 (RowName 在过滤列表内)
+		//   - 无上次选择 → 默认选中过滤后列表的第 0 行
+		if (SelectedIndex == INDEX_NONE && ComboBox_AICharacter->GetOptionCount() > 0)
 		{
-			ComboBox_AICharacter->SetSelectedIndex(0);
+			SelectedIndex = 0;
+		}
+
+		if (SelectedIndex != INDEX_NONE && ComboBox_AICharacter->GetOptionCount() > 0)
+		{
+			ComboBox_AICharacter->SetSelectedIndex(SelectedIndex);
+		}
+		else if (AllAICharacterRowNames.Num() == 0)
+		{
+			// 【v237 零兜底】过滤后 0 行 AI 角色 — 配置错必须显式化
+			UE_LOG(LogTemp, Error,
+				TEXT("[RoomInsidePage] ComboBox_AICharacter 过滤后 0 行 AI 角色! 检查 DT_CharacterList: 必须至少有一行 RowName 以 'AI' 开头并紧跟数字 (如 'AI001'/'AI002'). 否则 RequestAddAI 无法选择角色, 玩家无法添加 AI."));
 		}
 	}
 
@@ -1613,26 +1732,149 @@ void URoomInsidePage::PopulateAIPanelData()
 	if (ComboBox_AIWeapon && WeaponDataTable)
 	{
 		ComboBox_AIWeapon->ClearOptions();
+		AllWeaponRowNames.Reset(); // 【v236 大厂重构】每次重建 ComboBox 必须同步清映射数组
 
-		TArray<FWeaponInfo*> AllWeapons;
-		WeaponDataTable->GetAllRows<FWeaponInfo>(TEXT("AIPanelContext"), AllWeapons);
+		// 【v237 大厂重构 — 单一真理源】使用 GetRowNames() 遍历而非 GetAllRows()
+		// 原因: GetAllRows() 和 GetRowNames() 返回顺序可能不一致, 只有 RowName ↔ Row 一一对应 1:1 映射才能保证索引正确
+		const TArray<FName> RowNames = WeaponDataTable->GetRowNames();
+		static const FString WCtx(TEXT("RoomInsidePage.PopulateAIPanelData.Weapon"));
 
-		for (FWeaponInfo* WeaponData : AllWeapons)
+		// 【v237 P3 修复 — UI 层按模式过滤武器列表】
+		//
+		// 业务背景:
+		//   - 刀战模式 (Melee): AI 只能拿近战武器 (非近战武器 → 服务层显式拒绝)
+		//   - 生化模式 (Zombie): AI 可以拿任意武器
+		//
+		// 职责划分:
+		//   - UI 层: 按模式过滤武器列表, 只显示合法武器 (刀战模式只显示 Melee)
+		//   - 服务层: 如果传入非法武器 ID, 显式报错 (已修复 PurifyAIWeaponForMeleeMode)
+		//
+		// 大厂原则 (单一职责 + 零兜底):
+		//   - UI 负责过滤, 服务层负责校验 (分离关注点)
+		//   - 如果过滤失效 (配置错), 服务层会显式报错, 不静默兜底
+		ERoomMatchMode CurrentMode = ERoomMatchMode::None;
+		if (UWorld* World = GetWorld())
 		{
-			if (WeaponData)
+			if (ARoomGameState* GS = World->GetGameState<ARoomGameState>())
 			{
+				CurrentMode = GS->CurrentMatchMode;
+			}
+		}
+		const bool bIsMeleeMode = (CurrentMode == ERoomMatchMode::Melee);
+
+		// 【v237.P6 大厂重构 — 母体专属武器过滤】
+		//
+		// 业务真相 (用户 2026.08.17 反馈):
+		//   - ComboBox_AIWeapon 出现 RowName="MT001" 的行数据 - 错误
+		//   - "MT001" 是母体 (MuTi) 在 DT_CharacterInfo / DT_WeaponInfo 共享的 RowName
+		//   - 母体武器 MT001 仅供 CharacterIconComponent.RefreshCharacterIcon 在母体 Pawn 身上查图标使用
+		//   - 普通 AI 不能选 (玩家也如此)
+		//
+		// 真理源 (单一真理源 — 客户端可读, 无需 GM):
+		//   - FWeaponInfo.MeshType (DT 行自带, 客户端可读)
+		//   - MeshType = EWeaponMeshType::None ⇒ 母体专属 / 未配置 (不算可拿武器)
+		//   - MeshType ∈ {Melee, Primary, Secondary} ⇒ 玩家/AI 可拿武器
+		//
+		// 为什么不用 `MT001` 字符串过滤:
+		//   - 硬编码字符串 = 大厂反模式 (v90 明确指出: "业务层硬编码散落")
+		//   - 改名 MT001 → 必须改两处 (DT + cpp), 容易漂移
+		//   - 客户端访问不到 GM.MotherCharacterRowName (RoomGameMode 字段不复制)
+		//   - 唯一真理源 = DT. MeshType (结构性数据, 客户端可读, 改名自动跟进)
+		//
+		// 为什么不用 `GM->MotherCharacterRowName`:
+		//   - RoomGameMode 字段不会被复制到客户端 (本函数在客户端 UI 跑)
+		//   - 客户端 World->GetAuthGameMode() 返回 null 是正常情况
+		//   - 用 MeshType 字段是结构性真理源, 客户端/server/MCP 都可读
+		//
+		// 大厂原则 (零兜底 — 项目内已有 5+ 处 "MeshType==None = 配置错" 校验):
+		//   - SpawnAndConfigureWeaponInSlot: MeshType=None → 拒绝 Spawn
+		//   - Server_SwitchToWeaponSlot: MeshType=None → 警告切不到武器
+		//   - ResolveKillMethod: MeshType=None → Log Error + 默认 Melee
+		//   - InitializeWeaponFireConfigFromClass: MeshType=None → 强制修复 DT
+		//   - 共识: MeshType=None 不是"合法武器类型", 不应进入 AI 武器 ComboBox
+		//
+		// 排除武器的真理源 (按优先级):
+		//   1. MeshType == None → 母体专属 / 未配置 → 排除 (新 v237.P6)
+		//   2. 刀战模式 + MeshType != Melee → 排除 (已有 v237 P3)
+		int32 FilteredOutCount = 0;
+
+		for (const FName& RowName : RowNames)
+		{
+			FWeaponInfo* WeaponData = WeaponDataTable->FindRow<FWeaponInfo>(RowName, WCtx);
+			if (WeaponData && !RowName.IsNone())
+			{
+				// 【v237.P6 母体专属武器过滤】真理源 = MeshType 字段
+				//
+				// 母体专属武器 MT001 是图标专用, 不是可拿武器类
+				//   → DT 配置 MeshType=None (项目内 5+ 处已建立此约束)
+				//   → 客户端 / Server 都能直接读,无需 GM/Replicated 字段
+				if (WeaponData->MeshType == EWeaponMeshType::None)
+				{
+					UE_LOG(LogTemp, Display,
+						TEXT("[RoomInsidePage] ComboBox_AIWeapon 过滤掉母体专属/未配武器 RowName='%s' (MeshType=None, 仅用于图标显示, 不可被持有). "
+						     "【v237.P6 零兜底】不允许静默fallback — ComboBox 不显示非可拿武器."),
+						*RowName.ToString());
+					++FilteredOutCount;
+					continue; // 跳过母体专属 / 未配武器
+				}
+
+				// 【v237 P3 过滤逻辑】刀战模式只显示 Melee 类型
+				if (bIsMeleeMode && WeaponData->MeshType != EWeaponMeshType::Melee)
+				{
+					UE_LOG(LogTemp, Verbose,
+						TEXT("[RoomInsidePage] ComboBox_AIWeapon 过滤掉非近战武器 RowName='%s' (刀战模式, MeshType=%d)"),
+						*RowName.ToString(),
+						static_cast<int32>(WeaponData->MeshType));
+					++FilteredOutCount;
+					continue; // 跳过非近战武器 (刀战模式不允许)
+				}
+
+				// 显示 WeaponName (FText), 但 RowName 存映射表 — UI 真理源分离
 				ComboBox_AIWeapon->AddOption(WeaponData->WeaponName.ToString());
+				AllWeaponRowNames.Add(RowName);
 			}
 		}
 
-		// 恢复上次选择的武器
-		if (!LastConfirmedAIWeapon.IsEmpty() && ComboBox_AIWeapon->FindOptionIndex(LastConfirmedAIWeapon) != -1)
+		UE_LOG(LogTemp, Display,
+			TEXT("[RoomInsidePage] ComboBox_AIWeapon 重建完成: 总行=%d, 武器=%d, 过滤掉=%d (含刀战模式限制 + 母体专属排除)"),
+			RowNames.Num(), AllWeaponRowNames.Num(), FilteredOutCount);
+
+		// 恢复上次选择的武器 (按 RowName 恢复, 不能用 FindOptionIndex 因为存的是显示名)
+		int32 SelectedIndex = INDEX_NONE;
+		if (!LastConfirmedAIWeaponRowName.IsEmpty())
 		{
-			ComboBox_AIWeapon->SetSelectedOption(LastConfirmedAIWeapon);
+			SelectedIndex = AllWeaponRowNames.IndexOfByPredicate([&](const FName& RowName) {
+				return RowName.ToString() == LastConfirmedAIWeaponRowName;
+			});
 		}
-		else if (ComboBox_AIWeapon->GetOptionCount() > 0)
+
+		// 【v237 P4 修复 — 重建 ComboBox 强制清空 BP 蓝图默认值】
+		//
+		// 根因:
+		//   - UComboBoxString 字段在 BP 蓝图编辑器中默认 SelectedIndex = 0
+		//   - 但 BP 默认的索引 0 对应的是**完整 WeaponDataTable 的第 0 行**(可能是 Primary/Secondary 武器)
+		//   - 当刀战模式过滤后, ComboBox 选项列表是过滤后的子集, 但 BP 默认索引 0 已经"消失"
+		//   - 用户看到"刀战模式里默认显示的不是近战武器"
+		//
+		// 修复:
+		//   - 重建选项后, 强制 SelectedIndex = INDEX_NONE
+		//   - 然后**重新计算默认选中的索引** — 优先恢复上次选择,否则选中第一个 (过滤后的第 0 行)
+		//   - 大厂原则: UI 状态必须显式, 重建选项后必须重新决定默认值
+		ComboBox_AIWeapon->SetSelectedIndex(INDEX_NONE);
+
+		// 【v237 业务决策】默认选中规则:
+		//   - 有上次选择 → 恢复上次选择 (RowName 在过滤列表内)
+		//   - 无上次选择 → 默认选中过滤后列表的第 0 行 (用户需要这个体验)
+		//   - 刀战模式下, 第 0 行就是第一个近战武器 (已经过滤过了)
+		if (SelectedIndex == INDEX_NONE && ComboBox_AIWeapon->GetOptionCount() > 0)
 		{
-			ComboBox_AIWeapon->SetSelectedIndex(0);
+			// 业务需求: 默认显示一个 (选中第一个近战武器)
+			SelectedIndex = 0;
+		}
+
+		if (SelectedIndex != INDEX_NONE && ComboBox_AIWeapon->GetOptionCount() > 0)
+		{
+			ComboBox_AIWeapon->SetSelectedIndex(SelectedIndex);
 		}
 	}
 
@@ -1714,17 +1956,54 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 {
 	if (!ComboBox_AICharacter || !ComboBox_AIWeapon || !ComboBox_AITeam || !Input_AICount) return;
 
-	// 获取 AI 配置
-	FString SelectedChar = ComboBox_AICharacter->GetSelectedOption();
-	FString SelectedWeapon = ComboBox_AIWeapon->GetSelectedOption();
-	FString SelectedTeam = ComboBox_AITeam->GetSelectedOption();
-
-	// 【v47 大厂原则 - 零兜底】武器选择不能为空
-	if (SelectedWeapon.IsEmpty())
+	// =====================================================
+	// 【v237 大厂重构 — 单一真理源 + 镜像武器】AI 角色 / 武器参数提取
+	//
+	// 旧 (反模式 — 与武器路径不一致):
+	//   FString SelectedChar = ComboBox_AICharacter->GetSelectedOption(); // 拿显示名
+	//   → Service 端要再反查 DT_CharacterList 把显示名转 RowName → O(N) + 唯一性风险
+	//
+	// 新 (零反查 — 与 ComboBox_AIWeapon 路径完全对称):
+	//   GetSelectedIndex() → AllAICharacterRowNames[Index] → RowName 直接拿
+	// =====================================================
+	// 获取 AI 角色 RowName: 通过 ComboBox Index + AllAICharacterRowNames 映射 (单一真理源)
+	int32 SelectedCharIndex = ComboBox_AICharacter->GetSelectedIndex();
+	FString SelectedCharRowName;
+	if (AllAICharacterRowNames.IsValidIndex(SelectedCharIndex))
 	{
+		SelectedCharRowName = AllAICharacterRowNames[SelectedCharIndex].ToString();
+	}
+	else
+	{
+		// 【v237 零兜底】没有选中 AI 角色 → 拒绝入队 (不允许默认分配)
 		UE_LOG(LogTemp, Error,
-			TEXT("[RoomInsidePage] OnConfirmAddAIClicked: 武器选择为空! "
-				"ComboBox_AIWeapon 必须选择一个武器. 拒绝入队."));
+			TEXT("[RoomInsidePage] OnConfirmAddAIClicked: AI 角色未选中 (SelectedIndex=%d, AllAICharacterRowNames.Num=%d). "
+			     "【v237 零兜底】拒绝入队. 用户必须显式选择 AI 角色."),
+			SelectedCharIndex, AllAICharacterRowNames.Num());
+		if (Text_AddAIHint)
+		{
+			Text_AddAIHint->SetText(FText::FromString(TEXT("错误: 请选择 AI 角色")));
+			Text_AddAIHint->SetVisibility(ESlateVisibility::Visible);
+		}
+		return;
+	}
+
+	// 【v236 大厂重构 — 单一真理源】从显示名 → RowName: 通过 ComboBox 当前 Index + AllWeaponRowNames 映射
+	//   旧 (反模式): GetSelectedOption() 拿显示名 → Service 端反查 DT_WeaponInfo → O(N) 循环 + 唯一性风险
+	//   新 (零反查): GetSelectedIndex() → AllWeaponRowNames[Index] → RowName 直接
+	int32 SelectedWeaponIndex = ComboBox_AIWeapon->GetSelectedIndex();
+	FString SelectedWeaponRowName;
+	if (AllWeaponRowNames.IsValidIndex(SelectedWeaponIndex))
+	{
+		SelectedWeaponRowName = AllWeaponRowNames[SelectedWeaponIndex].ToString();
+	}
+	else
+	{
+		// 【v236 零兜底】没有选中武器 → 拒绝入队 (不允许默认分配)
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomInsidePage] OnConfirmAddAIClicked: 武器未选中 (SelectedIndex=%d, AllWeaponRowNames.Num=%d). "
+			     "【v236 零兜底】拒绝入队. 用户必须显式选择武器."),
+			SelectedWeaponIndex, AllWeaponRowNames.Num());
 		if (Text_AddAIHint)
 		{
 			Text_AddAIHint->SetText(FText::FromString(TEXT("错误: 请选择武器")));
@@ -1732,15 +2011,16 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 		}
 		return;
 	}
+	FString SelectedTeam = ComboBox_AITeam->GetSelectedOption();
 
 	FString CountStr = Input_AICount->GetText().ToString();
 	int32 RequestedAICount = FCString::Atoi(*CountStr);
 
 	if (RequestedAICount <= 0) RequestedAICount = 1;
 
-	// 保存当前配置，下次打开时恢复
-	LastConfirmedAICharacter = SelectedChar;
-	LastConfirmedAIWeapon = SelectedWeapon;
+	// 保存当前配置，下次打开时恢复 (镜像武器 — 全部存 RowName, 不存显示名)
+	LastConfirmedAICharacterRowName = SelectedCharRowName; // 【v237 大厂重构】存 RowName 而非显示名
+	LastConfirmedAIWeaponRowName = SelectedWeaponRowName; // 【v236 大厂重构】存 RowName 而非显示名
 	LastConfirmedAITeam = SelectedTeam;
 
 	// 确定目标队伍容器
@@ -1774,12 +2054,12 @@ void URoomInsidePage::OnConfirmAddAIClicked()
 		bool bIsAttackTeam = SelectedTeam.Contains(TEXT("攻方"));
 		if (URoomService* RoomService = URoomService::Get(this))
 		{
-			RoomService->RequestAddAI(bIsAttackTeam, SelectedChar, SelectedWeapon, ActualAddCount);
+			RoomService->RequestAddAI(bIsAttackTeam, SelectedCharRowName, SelectedWeaponRowName, ActualAddCount); // 【v237 大厂重构】角色也传 RowName, 与武器形状对称 (单一真理源)
 		}
 
 		if (GEngine)
 		{
-			FString DebugMsg = FString::Printf(TEXT("已向服务器请求往%s添加 %d 名AI (武器: %s)"), *SelectedTeam, ActualAddCount, *SelectedWeapon);
+			FString DebugMsg = FString::Printf(TEXT("已向服务器请求往%s添加 %d 名AI (武器 RowName: %s)"), *SelectedTeam, ActualAddCount, *SelectedWeaponRowName); // 【v236】显示 RowName 而非显示名
 			GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Green, DebugMsg);
 		}
 

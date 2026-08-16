@@ -151,6 +151,79 @@ public:
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_PlayDropSound(USoundBase* InSound, float VolumeMul, float PitchMul);
 
+	// ==========================================
+	// 音效 — 空投被人类吃掉时播放 (镜像 DropSound 配置, 与生成音效完全对称)
+	// ==========================================
+
+	/**
+	 * 【v2xx 大厂架构新增】空投被吃掉音效 (策划在 BP_AirdropPickup 蓝图挂 Sound 资产)
+	 *
+	 * 业务规则 (用户 2026.08.17 明确):
+	 *   - 生化模式下, 空投被人类吃掉时播放"拾取音效"
+	 *   - 给玩家"吃到补给"的正反馈, 与 DropSound (生成音效) 对称设计
+	 *
+	 * 大厂原则 — 配置零代码:
+	 *   - Sound 资产由策划在 BP_AirdropPickup → Class Defaults → Airdrop → Pickup Sound 字段挂入
+	 *   - 不在 C++ 硬编码 USoundBase 引用 (违反 DRY)
+	 *
+	 * 大厂原则 — 镜像 DropSound 字段 (v2xx 重构, 零重复架构):
+	 *   - DropSound: 生成时播放 → Multicast_PlayDropSound
+	 *   - PickupSound: 拾取时播放 → Multicast_PlayPickupSound
+	 *   - 两个字段 + 两个 RPC + 两个 VolumeMultiplier + 两个 PitchMultiplier 镜像对称
+	 *   - 业务可独立调音量/音高 (生成 vs 拾取 节奏不同)
+	 *
+	 * 大厂原则 — USoundBase* 跨 RPC 边界:
+	 *   - UE 5.6 自动按 Soft Reference 解析 (客户端 BeginPlay 时按需加载)
+	 *   - PickupSound 字段为空 → Multicast_PlayPickupSound 立即返回 (服务器已校验过)
+	 *   - 客户端 InSound 为 null → Log Error + return (强制修复 BP)
+	 *
+	 * 不与 DropSound 复用:
+	 *   - 语义不同 (生成 vs 拾取)
+	 *   - 业务可能需要不同音效资产 (生成 = 重型空投落地, 拾取 = 武器弹药补给)
+	 *   - 强制复用 = 隐式耦合, 业务调整时互相影响
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Airdrop|Sound")
+	TObjectPtr<USoundBase> PickupSound;
+
+	/**
+	 * 【v2xx 大厂架构新增】空投被吃掉音效音量倍率 (策划可调)
+	 *
+	 * 大厂原则 — 镜像 DropSoundVolumeMultiplier (v2xx 重构):
+	 *   - 字段命名 + 默认值 (1.0) + Clamp 范围 完全镜像
+	 *   - 业务可独立调音量 (拾取音效能压低一点, 避免抢戏主武器音效)
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Airdrop|Sound", meta = (ClampMin = "0.0", ClampMax = "5.0"))
+	float PickupSoundVolumeMultiplier = 1.0f;
+
+	/**
+	 * 【v2xx 大厂架构新增】空投被吃掉音效音高倍率 (策划可调)
+	 *
+	 * 大厂原则 — 镜像 DropSoundPitchMultiplier (v2xx 重构):
+	 *   - 字段命名 + 默认值 (1.0) + Clamp 范围 完全镜像
+	 *   - 业务可独立调音高 (拾取音效能高一点, 给正反馈)
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Airdrop|Sound", meta = (ClampMin = "0.1", ClampMax = "3.0"))
+	float PickupSoundPitchMultiplier = 1.0f;
+
+	/**
+	 * 【v2xx 大厂架构新增】Multicast RPC — 服务器权威, 所有客户端播放空投被吃掉音效
+	 *
+	 * 大厂原则 — RPC 单一入口 (镜像 Multicast_PlayDropSound):
+	 *   - 服务器 Handle_OverlapBegin 校验通过 → 调弹药全满 → 立即调本 RPC
+	 *   - Implementation 内调 UGameplayStatics::PlaySoundAtLocation
+	 *   - 时序保证: RPC 必须在 Destroy() 之前调用, 否则 Actor 已销毁, RPC 参数序列化失败
+	 *
+	 * 大厂原则 — RPC 必须在 Actor 上:
+	 *   - Component 上的方法无法触发 RPC 序列化 (UE 硬约束)
+	 *   - 直接在 AAirdropPickup 上声明 Multicast (镜像 Multicast_PlayDropSound)
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - InSound 字段为空 → Log Error + return (强制修复 BP)
+	 *   - World 无效 → Log Error + return
+	 */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_PlayPickupSound(USoundBase* InSound, float VolumeMul, float PitchMul);
+
 protected:
 	// ==========================================
 	// 组件 — 由 BP_AirdropPickup 蓝图添加, 这里只声明运行时查找

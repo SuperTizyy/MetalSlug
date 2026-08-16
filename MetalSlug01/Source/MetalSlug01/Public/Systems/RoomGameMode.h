@@ -883,6 +883,64 @@ public:
 	TObjectPtr<USoundBase> ZombieMotherWinSound = nullptr;
 
 	// ==========================================
+	// 【v2xx 大厂架构新增】刀战模式本局结算音效 (3 种结果 — 与 EMeleeWinner 一一对应)
+	// ==========================================
+	//
+	// 业务规则 (用户 2026.08.17 明确):
+	//   - 刀战倒计时归零 → FinishMeleeMatch 判定 → 写 MeleeWinner (Attacker / Defender / Draw)
+	//   - 服务器从 GM 配的 3 个字段中查表 → 转 FSoftObjectPath → Multicast RPC 推所有客户端
+	//   - 客户端 LoadSynchronous 加载 + PlaySound2D (镜像 v210.4 ZombieRound 链路)
+	//
+	// 大厂原则 — 单一真理源:
+	//   - 音效资产只在 GM 配 (策划唯一配置点), GS 不复制不缓存
+	//   - 与 ZombieHumanWinSound / ZombieMotherWinSound 完全对称 (单一真理源 + 单一 RPC 链路)
+	//
+	// 大厂原则 — 模式分离 (镜像 v218 MeleeWinner vs EZombieRoundWinner 分离):
+	//   - 3 个新字段专用于刀战模式, 生化模式永不触发
+	//   - 不复用 ZombieHumanWinSound / ZombieMotherWinSound (语义不同, EMeleeWinner 枚举空间独立)
+	//
+	// 大厂原则 — 零兜底:
+	//   - FinishMeleeMatch 查表若任一字段为空 → 服务器侧 FSoftObjectPath 为空 → 客户端 Log Error 强制修复 BP 配置
+	//   - 与 v210.4 ZeroData Error 路径完全一致, 不允许静默跳过
+	//
+	// 不破坏生化模式:
+	//   - 3 个字段仅在 Melee 模式下使用, 生化完全不触发
+	//   - 策划在 GM_RoomGameMode BP Class Defaults 配 (默认 null, 业务可禁用)
+
+	/**
+	 * 刀战模式: 攻方阵营赢得本局时, 所有客户端 (攻方 + 守方) 统一播放的音效
+	 *
+	 * 业务规则:
+	 *   - 全体播同一个音效, 不按客户端阵营分发 (镜像 ZombieHumanWinSound 业务规则)
+	 *   - 触发条件: EMeleeWinner::Attacker
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|MeleeMatch",
+		meta = (DisplayName = "Melee Attacker Win Sound (全玩家播放, 攻方赢时)"))
+	TObjectPtr<USoundBase> MeleeAttackerWinSound = nullptr;
+
+	/**
+	 * 刀战模式: 守方阵营赢得本局时, 所有客户端 (攻方 + 守方) 统一播放的音效
+	 *
+	 * 业务规则:
+	 *   - 全体播同一个音效, 不按客户端阵营分发
+	 *   - 触发条件: EMeleeWinner::Defender
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|MeleeMatch",
+		meta = (DisplayName = "Melee Defender Win Sound (全玩家播放, 守方赢时)"))
+	TObjectPtr<USoundBase> MeleeDefenderWinSound = nullptr;
+
+	/**
+	 * 刀战模式: 平局时, 全体客户端统一播放的音效
+	 *
+	 * 业务规则:
+	 *   - 全体播同一个音效, 不按客户端阵营分发
+	 *   - 触发条件: EMeleeWinner::Draw (AttackerTotalKills == DefenderTotalKills)
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MetalSlug|Match|MeleeMatch",
+		meta = (DisplayName = "Melee Draw Sound (全玩家播放, 平局时)"))
+	TObjectPtr<USoundBase> MeleeDrawSound = nullptr;
+
+	// ==========================================
 	// 【v134 大厂架构新增 → v210.4 已废弃】生化为零参数查表 (供 GameHUDWidget 在 OnRep_RoundWinner 时调用)
 	// ==========================================
 	//

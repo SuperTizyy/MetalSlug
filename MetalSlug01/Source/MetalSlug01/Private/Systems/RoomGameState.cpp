@@ -2331,3 +2331,132 @@ void ARoomGameState::HandleZombieRoundSoundReceived(EZombieRoundWinner InRoundWi
 }
 
 
+// ==========================================
+// 【v2xx 大厂架构新增】刀战模式本局结算音效 RPC 实现 (镜像 ZombieRound Sound 链路)
+// ==========================================
+// 大厂原则 — 模式分离 (与 ZombieRound Sound 链路完全独立):
+//   - 不复用 MulticastPlayZombieRoundSound_Implementation (枚举类型不匹配 + 委托类型不同)
+//   - 不复用 PlayZombieRoundSoundFromPath_Implementation (委托 Broadcast 不同)
+//   - 不复用 HandleZombieRoundSoundReceived (签名 + 委托不同)
+//   - 镜像仅是"行为模式"镜像, 实现完全独立 (代码层面零复用,符合"单一职责 + 零重复架构"大厂原则)
+
+/**
+ * MulticastPlayMeleeMatchSound (NetMulticast, 服务器 → 所有客户端)
+ *
+ * 【v2xx 大厂架构新增】刀战模式本局结算音效 RPC
+ *
+ * 业务规则 (用户 2026.08.17 明确):
+ *   - 每局结束, 服务器推 1 次 RPC 到所有客户端
+ *   - 服务器从 GM 配置 (单一真理源) 拿 USoundBase*, 转 FSoftObjectPath
+ *   - 客户端 Implementation 调 LoadSynchronous() 加载 Sound + PlaySound2D
+ *
+ * 大厂原则 — RPC 纯数据 (镜像 v210.4 ZombieRound Sound):
+ *   - 不传 USoundBase* (UE 5.6 GC 误删 + Replicated 裸指针不可靠)
+ *   - 传 FSoftObjectPath (UE 5.6 标准 Replicate 资产路径方式, GC 安全, 跨网络稳定)
+ *
+ * 大厂原则 — 单一真理源:
+ *   - 音效资产只在 GM 配 (策划唯一配置点), GS 不复制不缓存
+ *
+ * 大厂原则 — 零兜底:
+ *   - SoundPath 为空 → Log Error, 强制修复 GM BP 配置
+ *
+ * 调用方:
+ *   - URoomLifecycleSubsystem::FinishMeleeMatch (本局结束唯一入口)
+ *
+ * 不破坏生化模式:
+ *   - 刀战永不调本函数, RPC 永远不发 (FinishZombieRound 走 MulticastPlayZombieRoundSound)
+ */
+void ARoomGameState::MulticastPlayMeleeMatchSound_Implementation(EMeleeWinner InMeleeWinner, const FSoftObjectPath& InSoundPath)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] 【v2xx】MulticastPlayMeleeMatchSound_Implementation: 客户端/服务器收到刀战音效 RPC. "
+		     "InMeleeWinner=%d, InSoundPath=%s"),
+		static_cast<int32>(InMeleeWinner),
+		*InSoundPath.ToString());
+
+	// UE 5.6 行为: NetMulticast Reliable 在 Listen Server 上服务器自身也会触发 _Implementation
+	//   - 服务器调 MulticastPlayMeleeMatchSound → 所有连接客户端 + 服务器自身都跑 _Implementation
+	//   - 因此不需要单独"服务器手动 Broadcast"
+	PlayMeleeMatchSoundFromPath_Implementation(InMeleeWinner, InSoundPath);
+}
+
+
+/**
+ * PlayMeleeMatchSoundFromPath_Implementation (RPC 内部实现)
+ *
+ * 【v2xx 大厂架构新增】从 FSoftObjectPath 加载 USoundBase + 广播给 UI
+ *
+ * 大厂原则 — 零兜底:
+ *   - SoundPath 为空 → Log Error, 不静默跳过
+ *   - LoadSynchronous 失败 → Log Error
+ *
+ * 大厂原则 — 与 ZombieRound 实现完全独立 (不调用 PlayZombieRoundSoundFromPath_Implementation):
+ *   - 委托 Broadcast 类型不同 (OnMeleeMatchSoundReceived 走 EMeleeWinner, 非 EZombieRoundWinner)
+ *   - 错误日志引导 BP 修复路径不同 (MeleeAttackerWinSound / DefenderWinSound / DrawSound 字段)
+ *
+ * 调用方:
+ *   - MulticastPlayMeleeMatchSound_Implementation (RPC 触发)
+ */
+void ARoomGameState::PlayMeleeMatchSoundFromPath_Implementation(EMeleeWinner InMeleeWinner, const FSoftObjectPath& InSoundPath)
+{
+	// 【v2xx 零兜底】SoundPath 必须有效
+	if (InSoundPath.IsNull())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] 【v2xx】PlayMeleeMatchSoundFromPath_Implementation: InSoundPath 为空. "
+			     "【修复】检查 GM_RoomGameMode BP Class Defaults → MetalSlug|Match|MeleeMatch → "
+			     "MeleeAttackerWinSound / MeleeDefenderWinSound / MeleeDrawSound 字段. "
+			     "【业务后果】刀战本局音效未播放, 业务不阻塞."));
+		return;
+	}
+
+	// 【v2xx】同步加载音效资产
+	USoundBase* LoadedSound = Cast<USoundBase>(InSoundPath.TryLoad());
+	if (!LoadedSound)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameState] 【v2xx】PlayMeleeMatchSoundFromPath_Implementation: LoadSynchronous 失败. "
+			     "InSoundPath=%s. 【修复】检查资产路径是否正确, 资产是否存在."),
+			*InSoundPath.ToString());
+		return;
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] 【v2xx】PlayMeleeMatchSoundFromPath_Implementation: 音效加载成功. "
+		     "LoadedSound=%s, InMeleeWinner=%d"),
+		*LoadedSound->GetName(),
+		static_cast<int32>(InMeleeWinner));
+
+	// 【v2xx】直接在本机播放音效 (服务器 + 所有客户端都执行)
+	//   - UE 5.6 PlaySound2D 在无 PIE / 无 PlayerController 时也能跑 (有 World 即可)
+	if (UWorld* World = GetWorld())
+	{
+		UGameplayStatics::PlaySound2D(World, LoadedSound);
+	}
+
+	// 【v2xx】同时广播给 UI (HUD 可以监听这个事件做额外效果, 比如震屏 / 全屏闪烁)
+	HandleMeleeMatchSoundReceived(InMeleeWinner);
+}
+
+
+/**
+ * HandleMeleeMatchSoundReceived (RPC Implementation 内部调用)
+ *
+ * 【v2xx 大厂架构新增】职责拆分:
+ *   - 接收 MeleeWinner, Broadcast OnMeleeMatchSoundReceived
+ *   - UGameHUDWidget 订阅后可做额外 UI 反馈 (例如区分"小局结束" vs "本局结束")
+ *
+ * 大厂原则 — 单一职责 (镜像 HandleZombieRoundSoundReceived):
+ *   - 不在本函数内查 GameMode (避免耦合, 音效加载/播放已在 PlayMeleeMatchSoundFromPath_Implementation 完成)
+ *   - 不复用 HandleZombieRoundSoundReceived (委托签名不同: EMeleeWinner vs EZombieRoundWinner)
+ */
+void ARoomGameState::HandleMeleeMatchSoundReceived(EMeleeWinner InMeleeWinner)
+{
+	UE_LOG(LogTemp, Log,
+		TEXT("[RoomGameState] HandleMeleeMatchSoundReceived: Broadcast OnMeleeMatchSoundReceived, InMeleeWinner=%d"),
+		static_cast<int32>(InMeleeWinner));
+
+	OnMeleeMatchSoundReceived.Broadcast(InMeleeWinner);
+}
+
+

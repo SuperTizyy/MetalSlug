@@ -1017,13 +1017,38 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 		return;
 	}
 
-	// 【幂等性检查】防止重复生成武器
+	// 【v236 2026.08.17 大厂重构 — 删除幂等检查反模式】, 改为"先清理再生成"
+	//
+	// 旧 (v22-v235) 反模式:
+	//   - if (IsValid(CurrentWeapon)) { Log 静默跳过; return; }
+	//   - 后果: 调用方传新 WeaponClass 进来, 想换武器 → 静默被"已有武器"拦截 → 新武器永远换不上
+	//   - 正是造成本 bug 链的根因之一: 大厅 AI 的 ConfigSO 默认武器先于大厅武器生成
+	//     → SpawnAndEquipWeapon 看到 CurrentWeapon 已有 → 拒绝后续的大厅武器
+	//
+	// 新 (v236) — 单一真理源 + 职责分离:
+	//   - 调用方传 WeaponClass 进来 = **明示意图**: "我要这个武器"
+	//   - 旧武器 = 当前 Component 的历史状态, 必须清空才能换新
+	//   - 销毁旧武器是 SpawnAndEquipWeapon 的隐含职责 (赋值/覆盖 = 单一真理源)
+	//   - 调用方如果想"先销毁再 Spawn", 应自己先 Destroy() (见 SpawnAIInternal Step 4f)
+	//   - 当前实现先 Destroy() 旧武器, 再 Spawn 新武器, 保证全局只有一个 CurrentWeapon
+	//
+	// 大厂原则落地:
+	//   - 零静默: 不允许"输入什么就跳过" 这种 Lazy 路径
+	//   - 单一真理源: CurrentWeapon 全局唯一, 不允许"多武器并存"
+	//   - 职责分离: 销毁旧武器 → SpawnAndEquipWeapon 职责 (不甩给调用方)
+	//   - 显式优于隐式: 重复生成武器 = 显式 Log Warning 让调用方知道
 	if (IsValid(CurrentWeapon))
 	{
-		UE_LOG(LogTemp, Log,
-			TEXT("[WeaponAttachment] SpawnAndEquipWeapon: 已有武器 %s, 跳过生成 — WeaponClass=%s"),
-			*CurrentWeapon->GetName(), *WeaponClass->GetName());
-		return;
+		UE_LOG(LogTemp, Warning,
+			TEXT("[WeaponAttachment] SpawnAndEquipWeapon: 当前已有武器 %s, 收到新 WeaponClass=%s. "
+			     "【v236 大厂重构】先销毁旧武器再生成新武器, 保证 CurrentWeapon 全局唯一. "
+			     "【调用方协作】RequestWeaponSpawn 是覆盖语义, 调用方应明确意识到这是替换. "
+			     "Pawn=%s"),
+			*CurrentWeapon->GetName(), *WeaponClass->GetName(), *Owner->GetName());
+
+		// 销毁旧武器 (大厂原则 - 单一真理源: 一个 Pawn 同时只能持有 1 个 CurrentWeapon)
+		CurrentWeapon->Destroy();
+		CurrentWeapon = nullptr;
 	}
 
 	UE_LOG(LogTemp, Log,
@@ -2243,6 +2268,41 @@ void UWeaponAttachmentComponent::Server_SpawnAllWeapons(TSubclassOf<ABaseWeapon>
 		*GetNameSafe(PrimaryClass),
 		*GetNameSafe(SecondaryClass),
 		*GetNameSafe(MeleeClass));
+
+	// 【v236 2026.08.17 大厂重构 — 显式清理旧武器, 避免泄漏】
+	//
+	// 旧 (v60.6) 反模式:
+	//   - WeaponsInSlot.Reset() 只清空 TArray 引用, 不 Destroy 旧武器 Actor
+	//   - 后果: 玩家死而复生 / 切槽位重生成时, 旧武器 Actor 留在内存
+	//   - 内存泄漏 + 旧武器仍然可能干扰场景 (SetActorHiddenInGame 没被设)
+	//
+	// 新 (v236) — 单一真理源 + 零泄漏:
+	//   - 先 Destroy 旧武器 (统一幂等 — 不跳过, 不静默)
+	//   - 然后 Reset + SetNum(3) — 数组状态显式清空
+	//   - 销毁旧 CurrentWeapon 也必须显式, 避免 Active 状态与数组状态不一致
+	//
+	// 大厂原则落地:
+	//   - 零内存泄漏: 显式 Destroy > 静默 Reset
+	//   - 状态一致性: 数组和 CurrentWeapon 必须同步清理
+	//   - 抗重复调用: 多次调 Server_SpawnAllWeapons 不会泄漏
+	if (CurrentWeapon)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("[WeaponAttachment] Server_SpawnAllWeapons: 清理旧 CurrentWeapon=%s (Pawn=%s)"),
+			*CurrentWeapon->GetName(), *Owner->GetName());
+		CurrentWeapon->Destroy();
+		CurrentWeapon = nullptr;
+	}
+	for (ABaseWeapon* OldWeapon : WeaponsInSlot)
+	{
+		if (IsValid(OldWeapon))
+		{
+			UE_LOG(LogTemp, Log,
+				TEXT("[WeaponAttachment] Server_SpawnAllWeapons: 清理旧槽位武器=%s (Pawn=%s)"),
+				*OldWeapon->GetName(), *Owner->GetName());
+			OldWeapon->Destroy();
+		}
+	}
 
 	// 初始化数组 (大厂原则: 显式 > 隐式)
 	//   3 个槽位固定 size: [0]=Primary, [1]=Secondary, [2]=Melee
