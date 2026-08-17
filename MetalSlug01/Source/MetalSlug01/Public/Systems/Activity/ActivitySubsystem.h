@@ -3,13 +3,16 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/PlatformProcess.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Data/Tables/DailyLoginTableRow.h"
 #include "Data/Tables/ActivityTableRow.h"
 #include "Data/Tables/ItemTableRow.h"
 #include "Data/ActivitySaveGame.h"
 #include "Systems/Activity/RedDotManager.h"
-#include "Tools/DailyLoginSaveModifier.h"
+// 必须在 ActivityDataTableService.h 之前 include, TObjectPtr<UActivityDataTableService> 需要完整类型
+// 否则 UHT 会报 "incomplete type" 错误
+#include "Systems/Activity/ActivityDataTableService.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 #include "ActivitySubsystem.generated.h"
 
@@ -62,6 +65,13 @@ public:
 	/** 获取红点管理器 */
 	URedDotManager* GetRedDotManager() const;
 
+	/**
+	 * @brief 获取活动 DataTable 服务 (v231: 单一真理源 + GC 安全)
+	 * @return DataTable 服务实例 (生命周期 = GameInstance)
+	 * @note 任何 DataTable 访问必须走本服务, 严禁子系统再持有 CachedConfigTable
+	 */
+	UActivityDataTableService* GetDataTableService() const { return DataTableService; }
+
 	/** 获取所有导航项 */
 	TArray<const FActivityInfoRow*> GetAllNavItems() const;
 
@@ -74,11 +84,17 @@ public:
 	/** 保存玩家记录 */
 	void SavePlayerRecord(int32 ActivityID);
 		
-	/** 获取每日登录配置 */
-	TArray<FDailyLoginConfigRow*> GetDailyLoginConfigs(int32 ActivityID) const;
+	/**
+	 * @brief 获取每日登录配置 (返回 const 视图, 不可修改 DataTable 内部数据)
+	 * v231: 从源头消除 reinterpret_cast 兑底 — 返回类型签 const T*, 杜绝调用方意外修改
+	 */
+	const TArray<const FDailyLoginConfigRow*> GetDailyLoginConfigs(int32 ActivityID) const;
 
-	/** 根据天数获取奖励 */
-	TArray<FDailyLoginConfigRow*> GetRewardsByDay(int32 ActivityID, int32 Day) const;
+	/**
+	 * @brief 根据天数获取奖励 (返回 const 视图)
+	 * v231: 同上, 返回类型签 const T*
+	 */
+	const TArray<const FDailyLoginConfigRow*> GetRewardsByDay(int32 ActivityID, int32 Day) const;
 
 	/** 尝试领取奖励 */
 	bool TryClaimReward(int32 ActivityID, int32 DayIndex);
@@ -191,6 +207,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Save Modifier")
 	bool ResetPlayerRecord(int32 ActivityID, bool bAutoSave = true);
 
+	// ==================== 存档配置 (v233 进程隔离) ====================
+
+	/**
+	 * @brief 构建进程隔离的存档槽位名
+	 * @param ActivityID 活动 ID
+	 * @return 进程隔离槽位名: "DailyLogin_<ActivityID>_<PID>"
+	 *
+	 * 【v233 修复】
+	 * 旧实现: "DailyLogin_<ActivityID>" → 双开时所有窗口写同一 .sav
+	 * 新实现: "DailyLogin_<ActivityID>_<PID>" → 每个游戏窗口独立文件, 天然隔离
+	 */
+	FString BuildSaveSlotName(int32 ActivityID) const;
+
 public:
 	// ================= 事件 =================
 
@@ -203,9 +232,20 @@ private:
 	// ================= Track 持有 =================
 
 	// ================= 管理器持有 =================
-		
+
 	UPROPERTY()
 	URedDotManager* RedDotManager = nullptr;
+
+	// ================= DataTable 服务持有 (v231) =================
+
+	/**
+	 * @brief 活动 DataTable 服务 (强引用 + GC 安全)
+	 * @details 由 Initialize 创建, Deinitialize 释放
+	 *          任何 DataTable 访问必须走 DataTableService->GetService(), 严禁子系统再持有 CachedConfigTable
+	 */
+	UPROPERTY()
+	TObjectPtr<UActivityDataTableService> DataTableService = nullptr;
+
 	// ================= SaveGame 缓存 =================
 		
 	UPROPERTY()

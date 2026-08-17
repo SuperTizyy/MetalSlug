@@ -19,6 +19,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/PlatformProcess.h"
 #include "UObject/Object.h"
 #include "Logs/MetalSlugLogChannels.h"
 #include "ActivitySaveModifierBase.generated.h"
@@ -86,6 +87,17 @@ protected:
 	//       导致 bIsInitialized 永远 = false, 整套系统失效
 	// 修复: 基类持有, InitializeBase 实际赋值, 子类直接继承使用
 	// ==========================================
+
+	// 【v233 修复】进程隔离存档槽位名构建
+	// 旧: "DailyLogin_<ActivityID>" → 双开时所有窗口写同一 .sav
+	// 新: "DailyLogin_<ActivityID>_<PID>" → 每个游戏窗口独立文件
+	FString BuildIsolatedSaveSlotName(const TCHAR* BaseFormat, int32 Arg) const
+	{
+		// 将 BaseFormat 中的 "%d" 替换为实际数字,再拼接 PID
+		FString Base = BaseFormat;
+		Base.ReplaceInline(TEXT("%d"), *FString::FromInt(Arg), ESearchCase::CaseSensitive);
+		return FString::Printf(TEXT("%s_%d"), *Base, FPlatformProcess::GetCurrentProcessId());
+	}
 
 	/**
 	 * 世界上下文对象 (弱引用, 防止阻挡 GC)

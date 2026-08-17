@@ -842,9 +842,20 @@ bool URoomLifecycleSubsystem::StartNextZombieRound()
 	// 重新启动比赛计时器 (使用与首局相同的 ZombieMatchDurationSeconds, 重置 MatchEndTime)
 	StartMatchTimer();
 
+	// 【v230 大厂架构新增】小局转换守卫 — 防止母体突变时序竞态
+	//   根因: OnRoundTransitionTimerExpired → StartNextZombieRound → RestartZombieRoundPlayers 正在执行时
+	//   旧的 MotherMutationTimerHandle 回调可能触发 → 把人类又变回母体
+	//   修复: 在 RestartZombieRoundPlayers 之前设置守卫 → HandleCountdownExpired 拒绝触发
+	//   守卫关闭: RestartZombieRoundPlayers 末尾会调 SetRoundTransitionGuard(false)
+	if (URoomMotherMutationSubsystem* MutationSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MutationSys->SetRoundTransitionGuard(true);
+	}
+
 	// 【v201 大厂架构新增】小局结束后重新分配所有人类玩家到 HumanSurvivor 复活点
 	//   - 必须在 StartMatchTimer 之后调用 (确保计时器重新开始)
 	//   - 必须在 StartMotherMutationCountdown 之前调用 (确保新回合开始时玩家在新位置)
+	//   - 必须在 SetRoundTransitionGuard(true) 之后调用 (确保守卫先开启)
 	if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
 	{
 		SpawnSys->RestartZombieRoundPlayers();
@@ -858,6 +869,7 @@ bool URoomLifecycleSubsystem::StartNextZombieRound()
 	}
 
 	// 【v92 大厂架构】新回合开始, 重启母体变异倒计时 (玩家/AI 重置为人类, 重新走 8s 变异倒计时)
+	// 【v230 大厂架构修复】守卫在 RestartZombieRoundPlayers 末尾关闭
 	StartMotherMutationCountdown();
 
 	return true;

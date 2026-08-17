@@ -3748,15 +3748,59 @@ bool ABaseCharacter::ApplyAssistScore(ABaseCharacter* Assistant)
  * PlayFootstepSound
  *
  * 播放脚步声（供 AnimNotify 或其他系统调用）
- * 【2026-06-15 重构】: 逻辑已迁移到 FootstepComponent::PlayFootstep
+ * 【v241 大厂架构重构】: 走 Multicast RPC, 让所有客户端听到带距离衰减的脚步声
+ *   - 旧版 (v22-v240): 服务器 → FootstepComponent.PlayFootstep → PlaySoundAtLocation 没传 Attenuation
+ *     → 任何距离都听得到同样响度 — 这是 bug 的根因
+ *   - 新版 (v241): 服务器 → Multicast_PlayFootstep → 所有客户端 Implementation → FootstepComponent.PlayFootstep
+ *     → PlaySoundAtLocation 传 BP 配置的 FootstepAttenuation → 距离衰减由 BP 资产决定
+ *
  * @param Location 播放位置
  */
 void ABaseCharacter::PlayFootstepSound(FVector Location)
 {
-	// 【v39 修复】用 ResolveFootstepComponent 而非裸字段访问
+	// ==========================================
+	// 路径分歧 (v241)
+	// ==========================================
+	//
+	// 客户端 AnimNotify 触发 → 直接本地播放 (已在自己的机器上, 无需 RPC)
+	// 服务器 AnimNotify 触发 → 需 Multicast 让其他客户端听到
+	//
+	// UE 5.6 判定: HasAuthority() 为 true 表示服务器
+	//
+	// 大厂原则 (零兜底):
+	//   - 这两条路径 **不能合并** — 客户端走本地根因是"避免 1 帧 RPC 延迟造成脚步声乱序"
+	//   - 服务器走 RPC 根因是"其他客户端必须在自己机器上 Play, 距离衰减才能正确"
+	//
+	if (HasAuthority())
+	{
+		// 服务器权威: 触发 Multicast → 自己 + 所有远端客户端都播放
+		Multicast_PlayFootstep(FVector_NetQuantize(Location));
+	}
+	else
+	{
+		// 客户端本地: 直接播放 (自己的 AnimBP 触发, 不需要 RPC 回环)
+		if (UFootstepComponent* FC = ResolveFootstepComponent())
+		{
+			FC->PlayFootstep(this, Location);
+		}
+	}
+}
+
+
+/**
+ * Multicast_PlayFootstep_Implementation
+ * 【v241】所有客户端 (含服务器自己) 在本地播放带距离衰减的脚步声
+ *
+ * 大厂原则:
+ *   - 距离衰减由 BP 配置的 FootstepAttenuation 决定 (Single Source of Truth)
+ *   - Component 内部校验有效性, 错误 Log Error (零兜底)
+ *   - 音量曲线在世界各客户端一致: 因为曲线在资产里, 不是运行时计算
+ */
+void ABaseCharacter::Multicast_PlayFootstep_Implementation(FVector_NetQuantize Location)
+{
 	if (UFootstepComponent* FC = ResolveFootstepComponent())
 	{
-		FC->PlayFootstep(this, Location);
+		FC->PlayFootstep(this, FVector(Location));
 	}
 }
 

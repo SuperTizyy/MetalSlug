@@ -50,6 +50,8 @@
 
 // 引入活动 DataTable 集中加载服务 (启动期一次性检查所有表)
 #include "Data/FActivityDataTableService.h"
+#include "Systems/Activity/ActivitySubsystem.h" // v231: UActivitySubsystem 完整定义
+#include "Systems/Activity/ActivityDataTableService.h" // v231: UActivityDataTableService 完整定义
 
 // ============== 生命周期 ==============
 
@@ -61,21 +63,37 @@ void UGameFlowSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// 设计: 故意不在这里直接调 GetMissingTables (那样只会检查未访问过的表)
 	//       而是逐个 Get 一遍, 确保所有活动 DT 都被加载
 	UE_LOG(LogGameFlow, Log, TEXT("[GameFlow] 启动: 预加载活动 DataTable..."));
-	const TArray<FName> Missing = FActivityDataTableService::GetMissingTables();
-	if (Missing.Num() > 0)
+	UActivitySubsystem* ActivitySub = GetGameInstance() ? GetGameInstance()->GetSubsystem<UActivitySubsystem>() : nullptr;
+	if (!ActivitySub || !ActivitySub->GetDataTableService())
 	{
-		// 改造: TArray<FName> 不能直接 FString::Join, 改用手动拼接
-		FString MissingList;
-		for (const FName& ID : Missing)
+		UE_LOG(LogGameFlow, Error,
+			TEXT("[GameFlow] ActivitySubsystem 或 DataTableService 未初始化, 跳过预加载 (GameFlow 自身初始化早于 Activity?)"));
+	}
+	else
+	{
+		FActivityDataTableService& Service = ActivitySub->GetDataTableService()->GetService();
+		// 主动触发每张表加载 (Service.Get() 内部强引用缓存, 首次调用 LoadObject)
+		Service.Get(ActivityDataTable::ActivityInfo);
+		Service.Get(ActivityDataTable::DailyLoginConfig);
+		Service.Get(ActivityDataTable::ItemDetail);
+		Service.Get(ActivityDataTable::TreasureBoxItem);
+		Service.Get(ActivityDataTable::DailyUpgradeReward);
+
+		const TArray<FName> Missing = Service.GetMissingTables();
+		if (Missing.Num() > 0)
 		{
-			if (!MissingList.IsEmpty())
+			FString MissingList;
+			for (const FName& ID : Missing)
 			{
-				MissingList += TEXT(", ");
+				if (!MissingList.IsEmpty())
+				{
+					MissingList += TEXT(", ");
+				}
+				MissingList += ID.ToString();
 			}
-			MissingList += ID.ToString();
+			UE_LOG(LogGameFlow, Error, TEXT("[GameFlow] 缺失 %d 张活动 DataTable: %s"),
+				Missing.Num(), *MissingList);
 		}
-		UE_LOG(LogGameFlow, Error, TEXT("[GameFlow] 缺失 %d 张活动 DataTable: %s"),
-			Missing.Num(), *MissingList);
 	}
 
 	// ==========================================
@@ -254,8 +272,9 @@ void UGameFlowSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UGameFlowSubsystem::Deinitialize()
 {
-	// 清理活动表缓存 (GC 友好)
-	FActivityDataTableService::Shutdown();
+	// v231: 删除 FActivityDataTableService::Shutdown() 调用 — 重复架构 + 反模式
+	// ActivitySubsystem::Deinitialize 已负责释放 DataTableService, 强引用随之析构
+	// 不需要 GameFlow 再额外清理 (ActivitySubsystem 比 GameFlowSubsystem 后 Deinitialize, 自动清理链路已覆盖)
 
 	// 【P0】解绑全局 PostLoadMapWithWorld 委托, 防止野指针回调
 	if (PostLoadMapHandle.IsValid())

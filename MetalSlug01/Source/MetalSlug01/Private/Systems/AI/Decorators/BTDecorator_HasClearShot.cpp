@@ -27,6 +27,18 @@
 #include "DrawDebugHelpers.h"
 #endif
 
+// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
+// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
+static TAutoConsoleVariable<int32> CVarShowTraceDebug(
+	TEXT("g.MetalSlug.ShowTraceDebug"),
+	0,
+	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
+	TEXT("0 = hide all trace debug visuals (default)\n")
+	TEXT("1 = show all trace debug visuals\n")
+	TEXT("Affects: BaseWeapon::Multicast_PlayFireTraceVisual, BTDecorator_HasClearShot, RangedLineStrategy"),
+	ECVF_Default
+);
+
 namespace HasClearShotPrivate
 {
 	/** ObserverLocation = AI 眼睛位置 (业界共识:UE 5.3 forum 推荐) */
@@ -209,7 +221,8 @@ bool UBTDecorator_HasClearShot::CalculateRawConditionValue(
 		TargetSight->CanBeSeenFrom(Context, SeenLocation, LoSChecks, AsyncChecks, SightStrength);
 
 #if ENABLE_DRAW_DEBUG
-	if (bDrawDebugTrace)
+	// 【v241 大厂架构】受全局 CVar g.MetalSlug.ShowTraceDebug 控制 — 默认 0 (关闭)
+	if (bDrawDebugTrace && CVarShowTraceDebug.GetValueOnGameThread() != 0)
 	{
 		const FColor LineColor = (Result == UAISense_Sight::EVisibilityResult::Visible)
 			? FColor::Green

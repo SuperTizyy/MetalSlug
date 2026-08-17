@@ -249,6 +249,42 @@ protected:
 	TArray<TWeakObjectPtr<ABaseCharacter>> MotherCharacters;
 
 	/**
+	 * 【v230 大厂架构新增】小局转换守卫 — 防止突变时序竞态
+	 *
+	 * 根因 (用户 2026.08.18 反馈):
+	 *   "偶尔有时候进入新的小局，会有母体出现，没有把所有母体全部变成人类"
+	 *
+	 * 触发链:
+	 *   1. OnRoundTransitionTimerExpired → StartNextZombieRound → RestartZombieRoundPlayers
+	 *   2. RestartZombieRoundPlayers 把所有母体变人类
+	 *   3. 但如果旧的 MotherMutationTimerHandle 回调在上述步骤之间触发
+	 *   4. HandleCountdownExpired → MutateCharacterToMother → 把人类变母体
+	 *   5. 结果: 小局开始时母体出现
+	 *
+	 * 修复:
+	 *   - bIsInRoundTransition=true 在 RestartZombieRoundPlayers 开头设置
+	 *   - HandleCountdownExpired 入口检查 bIsInRoundTransition=true → Log Error + return
+	 *   - RestartZombieRoundPlayers 末尾设置 bIsInRoundTransition=false
+	 *
+	 * 大厂原则 — 零兜底:
+	 *   - bIsInRoundTransition=false 时 HandleCountdownExpired 才执行
+	 *   - 不允许"竞态发生时静默跳过"
+	 */
+	UPROPERTY(Transient)
+	bool bIsInRoundTransition = false;
+
+public:
+	/**
+	 * 【v230 大厂架构新增】设置小局转换守卫
+	 */
+	void SetRoundTransitionGuard(bool bInTransition);
+
+	/**
+	 * 【v230 大厂架构新增】检查小局转换守卫 (用于调试)
+	 */
+	bool IsInRoundTransition() const { return bIsInRoundTransition; }
+
+	/**
 	 * 【重入守卫 — 服务器本地】本子系统内"已触发变异" 标记
 	 *
 	 * 大厂原则 — 多层防御:

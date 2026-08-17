@@ -91,6 +91,15 @@ void URoomMotherMutationSubsystem::InitializeSubsystem(ARoomGameMode* InGameMode
 }
 
 
+void URoomMotherMutationSubsystem::SetRoundTransitionGuard(bool bInTransition)
+{
+	bIsInRoundTransition = bInTransition;
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v230】SetRoundTransitionGuard: bIsInRoundTransition=%s."),
+		bInTransition ? TEXT("true") : TEXT("false"));
+}
+
+
 // ==========================================
 // 【服务器权威入口 — 倒计时到期回调】
 // ==========================================
@@ -105,6 +114,98 @@ void URoomMotherMutationSubsystem::HandleCountdownExpired()
 			TEXT("[MotherMutation] HandleCountdownExpired: World 为空, 拒绝触发变异."));
 		return;
 	}
+
+	// 【v230 大厂架构新增】小局转换守卫 — 防止时序竞态
+	//   根因: OnRoundTransitionTimerExpired → StartNextZombieRound → RestartZombieRoundPlayers 正在执行时
+	//   旧的 MotherMutationTimerHandle 回调可能触发 → 把人类又变回母体
+	//   修复: bIsInRoundTransition=true 时拒绝触发变异
+	if (bIsInRoundTransition)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[MotherMutation] 【v230-严重】HandleCountdownExpired: bIsInRoundTransition=true, 拒绝触发变异. "
+			     "【根因排查】母体变异倒计时在小局转换期间被触发 — RestartZombieRoundPlayers 应在末尾关闭 bIsInRoundTransition. "
+			     "请检查 URoomSpawnSubsystem::RestartZombieRoundPlayers 末尾是否调用 SetRoundTransitionGuard(false)."));
+		return;
+	}
+
+	// ==========================================
+	// 【v230 大厂架构新增】诊断快照 — 追踪所有母体状态变化
+	// ==========================================
+	//
+	// 目的: 当用户反馈"小局开始时有母体出现"时, 从日志里完整还原时序
+	//   - 此时 bIsInRoundTransition 已关闭 (守卫正常), 但仍有母体出现
+	//   - 说明根因不在时序竞态, 而是 RestartZombieRoundPlayers 本身的逻辑问题
+	//
+	// 日志格式:
+	//   [MotherMutation] 【v230 诊断】HandleCountdownExpired 入口快照:
+	//   - 当前时间: XX.XXs
+	//   - 母体账本 MotherCharacters: N 个
+	//   - 现场人类候选 (TActorIterator): M 个
+	//   - bMotherMutationFired_Local: true/false
+	//   - GameState.MotherMutationHasFired: true/false
+	//   - 母体 Pawn 详情: [Pawn名, bIsMother, FactionTag]
+	//
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v230 诊断】HandleCountdownExpired 入口快照:"));
+
+	// 【v230 诊断】使用局部 RoomGS 指针 (作用域仅限此诊断块)
+	if (ARoomGameState* DiagRoomGS = World ? World->GetGameState<ARoomGameState>() : nullptr)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation]   - 当前局时间: %.2fs, MotherMutationHasFired=%s, Remaining=%ds"),
+			DiagRoomGS->GetServerWorldTimeSeconds(),
+			DiagRoomGS->MotherMutationHasFired ? TEXT("true") : TEXT("false"),
+			DiagRoomGS->GetMotherMutationRemainingSeconds());
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation]   - bMotherMutationFired_Local=%s, bIsInRoundTransition=%s"),
+		bMotherMutationFired_Local ? TEXT("true") : TEXT("false"),
+		bIsInRoundTransition ? TEXT("true") : TEXT("false"));
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation]   - 母体账本 MotherCharacters.Num()=%d"), MotherCharacters.Num());
+
+	// 遍历母体账本, 打印每个母体 Pawn 的详细信息
+	for (int32 i = 0; i < MotherCharacters.Num(); ++i)
+	{
+		if (ABaseCharacter* Mother = MotherCharacters[i].Get())
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation]   - 母体账本[%d]: Pawn='%s' bIsMother=%s FactionTag='%s' Dead=%s"),
+				i,
+				*Mother->GetName(),
+				Mother->bIsMother ? TEXT("true") : TEXT("false"),
+				*Mother->FactionTag.GetTagName().ToString(),
+				Mother->IsDead() ? TEXT("true") : TEXT("false"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Display,
+				TEXT("[MotherMutation]   - 母体账本[%d]: 已销毁 (WeakPtr 过期)"), i);
+		}
+	}
+
+	// 打印现场人类候选数量 (用 TActorIterator, 与 GetEligibleHumanTargets 同步)
+	int32 LiveHumanCount = 0;
+	int32 LiveMotherCount = 0;
+	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	{
+		ABaseCharacter* Char = *It;
+		if (!Char || Char->IsPendingKillPending()) continue;
+		if (Char->IsDead()) continue;
+		if (Char->bIsMother || Char->GetClass()->GetName().Contains(TEXT("MuTi")))
+		{
+			++LiveMotherCount;
+		}
+		else
+		{
+			++LiveHumanCount;
+		}
+	}
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation]   - 现场状态 (TActorIterator): 活人类=%d, 活母体=%d"),
+		LiveHumanCount, LiveMotherCount);
 
 	// 【v117.4 大厂架构修复】RAII 守卫 — 不论后续 return 路径如何, 都必须:
 	//   1. 清空 GameState.MotherMutationStartTime/Duration (避免 UI 闸门挡空投倒计时)
@@ -508,6 +609,33 @@ TArray<ABaseCharacter*> URoomMotherMutationSubsystem::FilterCandidatesByPolicy(
 
 bool URoomMotherMutationSubsystem::MutateCharacterToMother(ABaseCharacter* Target)
 {
+	// ==========================================
+	// 【v230 大厂架构新增】变异触发诊断快照
+	// ==========================================
+	//
+	// 目的: 记录每次"小局开始时突然有母体出现"的问题
+	//   - 触发链: HandleCountdownExpired → GetEligibleHumanTargets → SelectRandomTarget → MutateCharacterToMother
+	//   - 此快照记录变异触发时刻的全部状态
+	//
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation] 【v230 诊断】MutateCharacterToMother 触发! Target='%s'"),
+		Target ? *Target->GetName() : TEXT("<null>"));
+
+	if (Target)
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("[MotherMutation]   - Target 状态: bIsMother=%s bIsHuman=%s Dead=%s FactionTag='%s'"),
+			Target->bIsMother ? TEXT("true") : TEXT("false"),
+			Target->bIsHuman ? TEXT("true") : TEXT("false"),
+			Target->IsDead() ? TEXT("true") : TEXT("false"),
+			*Target->FactionTag.GetTagName().ToString());
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[MotherMutation]   - 触发时状态: bIsInRoundTransition=%s bMotherMutationFired_Local=%s"),
+		bIsInRoundTransition ? TEXT("true") : TEXT("false"),
+		bMotherMutationFired_Local ? TEXT("true") : TEXT("false"));
+
 	// 大厂原则 — 显式优于隐式: 入参校验全开
 	if (!Target)
 	{

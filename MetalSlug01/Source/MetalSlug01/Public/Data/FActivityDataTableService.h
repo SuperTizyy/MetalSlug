@@ -1,28 +1,35 @@
 // ==========================================
-// 活动 DataTable 集中加载服务
+// 活动 DataTable 集中加载服务 (v231 重构 — 大厂架构)
 // ==========================================
-// 目的: 消除散落在 7+ 个 .cpp 中的硬编码 /Game/UI/Activity/Data/DT_xxx 路径
+// 目的: 消除散落的硬编码 /Game/UI/Activity/Data/... 路径
 //
-// 优势:
-//   1. 单一职责: 所有活动表加载/缓存逻辑集中
-//   2. 路径集中: 资产路径改一次, 全局生效
-//   3. 错误聚合: 启动期一次性检查所有表是否加载成功
-//   4. 性能: 首次访问 LoadSynchronous, 后续直接返回缓存
-//   5. 可测试: 提供 ReloadAll() 用于调试期强制重新加载
+// v231 重构要点(根治静态 TMap 野指针崩溃):
+//   1. 静态服务 → 实例服务,由 UActivityDataTableService(UObject 子对象)持有生命周期
+//   2. TMap<FName, TObjectPtr<UDataTable>> → TMap<FName, TStrongObjectPtr<UDataTable>>
+//      - TStrongObjectPtr 内部调 AddToRoot,GC 永远不会回收,野指针问题彻底消失
+//   3. 移除一切"防御性 IsValid"—— 强引用保证指针永远有效,再校验是反模式
+//   4. 模板实现仍然在 .h(GetRowsSafe / FindRowByIdSafe),避免编译期耦合
+//   5. 单一真理源:任何 DataTable 访问必须走本 Service,不允许子系统再持有 CachedConfigTable
 //
-// 注意事项:
-//   - 当前实现: 同步加载。后续可改为 FStreamableManager 异步
-//   - 当前实现: 全局 static 缓存。如未来支持多 GameInstance 需改为 WorldSubsystem
+// 调用约定:
+//   - 调用方通过 UActivitySubsystem::GetDataTableService() 获取本服务实例
+//   - 调用方拿到指针后无需判空(Subsystem 由 UGameInstance 持有,生命周期 = GameInstance)
+//
+// 未来可扩展:
+//   - 异步加载(FStreamableManager 替代 LoadObject)
+//   - 进度回报(OnAllTablesLoaded 委托,UI 可订阅启动期进度)
 // ==========================================
 #pragma once
 
 #include "CoreMinimal.h"
 #include "UObject/NameTypes.h"
+#include "UObject/StrongObjectPtr.h"
+#include "UObject/Object.h"
 #include "Templates/SubclassOf.h"
-#include "Engine/DataTable.h"  // ⚠️ 模板实现需要 UDataTable 完整定义 (模板必须在 .h 中可见)
-#include "Logging/LogMacros.h"  // ⚠️ 模板函数中用到 UE_LOG, 需要 LogMacros.h
+#include "Engine/DataTable.h" // 模板实现需要 UDataTable 完整定义
+#include "Logging/LogMacros.h"
 
-class UObject;
+class UDataTableService;
 
 // 活动 DataTable 标识符 (避免各处散落 FName 字面量)
 namespace ActivityDataTable
@@ -36,94 +43,103 @@ namespace ActivityDataTable
 
 /**
  * @struct FActivityDataTableService
- * @brief 活动 DataTable 集中加载器 (静态工具类)
- * @details 内部以 TMap<FName, UDataTable*> 缓存加载结果
+ * @brief 活动 DataTable 集中加载器 (实例服务, 由调用方持有生命周期)
+ * @details 内部以 TMap<FName, TStrongObjectPtr<UDataTable>> 缓存加载结果
+ *
+ * 设计原则 (v231):
+ *   - 强引用保证 GC 安全: TStrongObjectPtr 内部 AddToRoot,GC 永不回收
+ *   - 零 IsValid 防御: 强引用保证 RawPtr 永远有效,再校验是反模式
+ *   - 零兜底: 失败立即 Log Error + return nullptr,无静默默认
+ *   - 单一真理源: 任何 DataTable 访问必须走本 Service
+ *
+ * 生命周期 (v231):
+ *   - 由 UActivitySubsystem::DataTableService (UObject 子对象) 持有
+ *   - UObject 子对象随 UActivitySubsystem 一同 GC, 内部 TStrongObjectPtr 自动析构
+ *   - 不需要手动 Shutdown
  */
 struct METALSLUG01_API FActivityDataTableService
 {
-	public:
+public:
 	FActivityDataTableService() = default;
 	~FActivityDataTableService() = default;
 
-	/**
-	 * @brief 内部缓存访问 (供 cpp 实现使用)
-	 */
-	static TMap<FName, TObjectPtr<UDataTable>>& GetCache();
+	// 禁止拷贝/移动: TStrongObjectPtr 与 UObject GC 体系绑定, 拷贝会让多个 Service 持有同一对象的引用
+	FActivityDataTableService(const FActivityDataTableService&) = delete;
+	FActivityDataTableService& operator=(const FActivityDataTableService&) = delete;
 
 	/**
-	 * @brief 根据表 ID 获取 DataTable (首次访问同步加载, 后续命中缓存)
+	 * @brief 根据表 ID 获取 DataTable (首次访问同步加载, 后续命中强引用缓存)
 	 * @param TableID 活动 DataTable 标识 (见 ActivityDataTable 命名空间)
 	 * @return 加载成功返回 UDataTable*; 失败返回 nullptr
+	 *
+	 * 行为合约 (v231):
+	 *   - 永远不返回失效指针(强引用保证)
+	 *   - 加载失败时 Log Error + return nullptr,绝不静默
+	 *   - 路径: /Game/UI/Activity/Data/<TableID>.<TableID>
 	 */
-	static UDataTable* Get(FName TableID);
+	UDataTable* Get(FName TableID);
 
 	/**
 	 * @brief 强制重新加载所有缓存的 DataTable (调试用, 修改 .uasset 后想立即生效)
+	 * @details Release 旧引用 → DropRoot → 重新 LoadObject + AddToRoot
 	 */
-	static void ReloadAll();
+	void ReloadAll();
 
 	/**
-	 * @brief 检查所有已知表是否都已成功加载 (启动期完整性检查)
+	 * @brief 检查所有已知表是否都已成功加载
 	 * @return 缺失的表 ID 列表 (空表示全部加载成功)
 	 */
-	static TArray<FName> GetMissingTables();
+	TArray<FName> GetMissingTables() const;
 
 	/**
-	 * @brief 关闭子系统时清理缓存 (GC 友好)
+	 * @brief 防御性遍历 DataTable 所有行 (使用 GetRowNames + FindRow 安全路径)
+	 * @tparam T 行 struct 类型
+	 * @tparam Predicate 谓词回调: bool(const T& Row) -> 是否收集该行
+	 *
+	 * 单一真理源: 外部调用方(包括 ActivitySubsystem / UpgradeActivitySubsystem)
+	 *            必须通过 Service 实例调用本方法, 严禁子系统自己再持有 DataTable 缓存
 	 */
-	static void Shutdown();
+	template <typename T, typename Predicate>
+	TArray<const T*> GetRowsSafe(FName TableID, Predicate Pred);
 
-/**
- * @brief 防御性遍历 DataTable 所有行 (使用 GetRowNames + FindRow 安全路径)
- *
- * ⚠️ 为什么不直接用 DataTable->GetAllRows<T>()?
- *   原因 (2026-08-10 v4 崩溃): 在 DataTable 资产热刷新/编辑器重载/GC 之后,
- *   `RowMap` 里的 `uint8*` 数据指针会变成 dangling,GetAllRows 内部的
- *   `OutRowArray.Reserve(...)` 调用会访问到已被 GC 释放的内存,导致
- *   EXCEPTION_ACCESS_VIOLATION (崩溃地址 0x0 或 0xffffffffffffffff)。
- *   修复策略: 用 GetRowNames + FindRow 单条查询路径,避开 GetAllRows
- *   内部潜在的 dangling RowMap 问题。
- *
- * @tparam T 行 struct 类型 (如 FActivityInfoRow)
- * @tparam Predicate 谓词回调: bool(const T& Row) -> 是否收集该行
- * @param TableID 活动 DataTable 标识
- * @param Predicate 用于过滤/收集行的回调
- * @return 匹配谓词的行指针数组 (永远不包含 nullptr)
- */
-template <typename T, typename Predicate>
-static TArray<const T*> GetRowsSafe(FName TableID, Predicate Pred);
-
-/**
- * @brief 防御性查找单个行 (按 ID 谓词)
- *
- * @tparam T 行 struct 类型
- * @param TableID 活动 DataTable 标识
- * @param IdExtractor 从行结构提取 ID 的 lambda
- * @param TargetId 要查找的 ID
- * @return 匹配的行指针,未找到返回 nullptr
- */
-template <typename T, typename IdExtractor>
-static const T* FindRowByIdSafe(FName TableID, IdExtractor Extractor, int32 TargetId);
+	/**
+	 * @brief 防御性查找单个行 (按 ID 谓词)
+	 */
+	template <typename T, typename IdExtractor>
+	const T* FindRowByIdSafe(FName TableID, IdExtractor Extractor, int32 TargetId);
 
 private:
+	/**
+	 * @brief 强引用缓存容器
+	 * @details TStrongObjectPtr 内部调 AddToRoot, GC 永不回收这些 DataTable
+	 *          即使 DataTable 资产被 UE 视为"未引用", GC 也不会回收
+	 */
+	TMap<FName, TStrongObjectPtr<UDataTable>> Cache;
+
+	/**
+	 * @brief 释放单个 DataTable 的强引用
+	 */
+	void ReleaseTable(FName TableID);
+
 	/**
 	 * @brief 单个表的实际加载实现
 	 * @details 集中处理路径拼接 + LoadObject + 错误日志
 	 */
-	static UDataTable* LoadTableInternal(FName TableID);
+	UDataTable* LoadTableInternal(FName TableID);
 
 	/**
-	 * @brief 构建资源的绝对路径 (注意 UE 资源路径必须带 .AssetName 后缀)
+	 * @brief 构建资源的绝对路径 (UE 资源路径必须带 .AssetName 后缀)
 	 */
 	static FString BuildAssetPath(FName TableID);
 };
 
 // ============================================================
-// 防御性遍历/查找 Helper 实现 (v4 崩溃防御 — 2026-08-10)
+// 模板实现 (v231)
 // ⚠️ 必须放在 .h 末尾 (因为是 template, 调用方需要看见实现代码)
 //
-// 目的: 用 GetRowNames + FindRow<T> 单条路径代替 GetAllRows<T>,
-//       避开 RowMap 中 dangling uint8* 指针导致的访问冲突。
+// v231 改进:
+//   - 委托给 Service.Get(TableID) — 强引用保证返回值必然非空或 nullptr
+//   - 失败行为: Log Error + return 空容器,无兜底
 // ============================================================
 
 template <typename T, typename Predicate>
@@ -131,26 +147,14 @@ TArray<const T*> FActivityDataTableService::GetRowsSafe(FName TableID, Predicate
 {
 	TArray<const T*> Result;
 
-	// 1. Get() 内部已带 IsValid 防御 (ConfigTable + RowStruct 双重校验)
 	UDataTable* Table = Get(TableID);
-
-	// 2. 兜底再校验一次 (Get 已保证, 双保险)
-	if (!IsValid(Table))
+	if (!Table)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[ActivityDT] GetRowsSafe: '%s' DataTable 失效, 返回空数组"), *TableID.ToString());
+		UE_LOG(LogTemp, Error,
+			TEXT("[ActivityDT] GetRowsSafe: '%s' DataTable 加载失败, 返回空数组"), *TableID.ToString());
 		return Result;
 	}
 
-	const UScriptStruct* RowStruct = Table->GetRowStruct();
-	if (!IsValid(RowStruct))
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[ActivityDT] GetRowsSafe: '%s' RowStruct 失效, 返回空数组"), *TableID.ToString());
-		return Result;
-	}
-
-	// 3. 用 GetRowNames + FindRow 单条路径 (避开 GetAllRows 内部潜在 dangling)
 	static const FString ContextString(TEXT("FActivityDataTableService::GetRowsSafe"));
 	const TArray<FName> RowNames = Table->GetRowNames();
 	Result.Reserve(RowNames.Num());
@@ -170,65 +174,28 @@ TArray<const T*> FActivityDataTableService::GetRowsSafe(FName TableID, Predicate
 template <typename T, typename IdExtractor>
 const T* FActivityDataTableService::FindRowByIdSafe(FName TableID, IdExtractor Extractor, int32 TargetId)
 {
-	// 1. Get() 内部已带 IsValid 防御
 	UDataTable* Table = Get(TableID);
-
-	// 2. 兜底再校验
-	if (!IsValid(Table))
+	if (!Table)
 	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[ActivityDT] FindRowByIdSafe: '%s' DataTable 失效, 返回 nullptr"), *TableID.ToString());
+		UE_LOG(LogTemp, Error,
+			TEXT("[ActivityDT] FindRowByIdSafe: '%s' DataTable 加载失败, 返回 nullptr"), *TableID.ToString());
 		return nullptr;
 	}
 
-	const UScriptStruct* RowStruct = Table->GetRowStruct();
-	if (!IsValid(RowStruct))
-	{
-		UE_LOG(LogTemp, Warning,
-			TEXT("[ActivityDT] FindRowByIdSafe: '%s' RowStruct 失效, 返回 nullptr"), *TableID.ToString());
-		return nullptr;
-	}
-
-	// 🔍【诊断日志】打印查找目标
-	UE_LOG(LogTemp, Log,
-		TEXT("[ActivityDT] FindRowByIdSafe: TableID='%s', TargetId=%d, RowStruct='%s'"),
-		*TableID.ToString(), TargetId, *RowStruct->GetName());
-
-	// 3. GetRowNames + FindRow 单条路径
 	static const FString ContextString(TEXT("FActivityDataTableService::FindRowByIdSafe"));
 	const TArray<FName> RowNames = Table->GetRowNames();
-
-	UE_LOG(LogTemp, Log,
-		TEXT("[ActivityDT] FindRowByIdSafe: 遍历 %d 行..."), RowNames.Num());
 
 	for (const FName& RowName : RowNames)
 	{
 		const T* Row = Table->FindRow<T>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
-		if (Row)
+		if (Row && Extractor(*Row) == TargetId)
 		{
-			// 🔍【诊断日志】打印每一行的 ID 值
-			const int32 RowId = Extractor(*Row);
-			UE_LOG(LogTemp, Log,
-				TEXT("[ActivityDT] FindRowByIdSafe: RowName='%s', RowId=%d, Match=%d"),
-				*RowName.ToString(), RowId, (RowId == TargetId) ? 1 : 0);
-			
-			if (RowId == TargetId)
-			{
-				UE_LOG(LogTemp, Log,
-					TEXT("[ActivityDT] FindRowByIdSafe: ✅ 匹配成功! TargetId=%d, RowName='%s'"),
-					TargetId, *RowName.ToString());
-				return Row;
-			}
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[ActivityDT] FindRowByIdSafe: RowName='%s' FindRow 返回 nullptr"), *RowName.ToString());
+			return Row;
 		}
 	}
 
 	UE_LOG(LogTemp, Warning,
-		TEXT("[ActivityDT] FindRowByIdSafe: '%s' 遍历完成, 未找到 TargetId=%d"),
-		*TableID.ToString(), TargetId);
+		TEXT("[ActivityDT] FindRowByIdSafe: '%s' 遍历 %d 行未找到 TargetId=%d"),
+		*TableID.ToString(), RowNames.Num(), TargetId);
 	return nullptr;
 }

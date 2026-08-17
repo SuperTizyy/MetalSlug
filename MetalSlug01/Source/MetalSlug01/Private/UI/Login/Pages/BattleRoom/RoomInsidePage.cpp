@@ -282,6 +282,29 @@ void URoomInsidePage::NativeConstruct()
 			// 遍历数据表，填充下拉框选项
 			for (const FName& RowName : RowNames)
 			{
+				const FString RowNameStr = RowName.ToString();
+
+				// 【v238 修复】玩家角色只显示 JSxxx 格式（JS + 数字，如 JS001/JS002）
+				// 过滤掉 AI001/AI002（AI 角色）、MT001（母体）、SWAT 等其他角色
+				bool bIsPlayerChar = false;
+				if (RowNameStr.StartsWith(TEXT("JS")) && RowNameStr.Len() >= 4)
+				{
+					bIsPlayerChar = true;
+					for (int32 i = 2; i < RowNameStr.Len(); ++i)
+					{
+						if (!FChar::IsDigit(RowNameStr[i]))
+						{
+							bIsPlayerChar = false;
+							break;
+						}
+					}
+				}
+
+				if (!bIsPlayerChar)
+				{
+					continue;
+				}
+
 				FCharacterInfo* Info = CharacterDataTable->FindRow<FCharacterInfo>(RowName, ContextString);
 				if (Info && !Info->CharacterName.IsEmpty())
 				{
@@ -308,6 +331,18 @@ void URoomInsidePage::NativeConstruct()
 			int32 FoundIndex = CachedCharacterIDs.IndexOfByKey(FName(*SavedCharacterID));
 			UE_LOG(LogTemp, Warning, TEXT("[Room] NativeConstruct: SavedCharID='%s', FoundIndex=%d, CachedCount=%d"),
 				*SavedCharacterID, FoundIndex, CachedCharacterIDs.Num());
+
+			// 【v238 零兜底】过滤后 0 个玩家角色 — 配置错必须显式报错
+			if (CachedCharacterIDs.IsEmpty())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomInsidePage] ComboBox_CharacterSelect 过滤后 0 个玩家角色! "
+					     "检查 DT_CharacterInfo: 必须至少有一行 RowName 以 'JS' 开头并紧跟数字 (如 'JS001'/'JS002'). "
+					     "否则玩家无法选择角色."));
+				ComboBox_CharacterSelect->AddOption(TEXT("无可用角色(配置缺失)"));
+				ComboBox_CharacterSelect->SetIsEnabled(false);
+				return;
+			}
 
 			FString CharIDToSync = TEXT("");
 			if (FoundIndex != INDEX_NONE)

@@ -16,6 +16,7 @@ class UProgressBar;
 class UTextBlock;
 class UImage;
 class UHorizontalBox;
+class UOverlay;
 class UTexture2D;
 class UMotherSkillComponent;
 
@@ -259,15 +260,24 @@ private:
 	UTextBlock* Text_ACEValue;
 
 	// ==========================================
-	// 【v119 大厂架构新增】母体加速技能冷却控件 (仅母体显示)
+	// 【v238 大厂架构重构】母体加速技能冷却控件 (仅母体显示)
 	// ==========================================
 
 	/**
-	 * 母体加速技能图标 — 仅母体可见
+	 * 母体技能图标覆层 — 控制整个母体技能区域的显隐
+	 *
+	 * 职责: 替代 Image_MotherSkillIcon 控制显隐
+	 *       Overlay 包含 Image_MotherSkillIcon 及相关子控件
 	 *
 	 * 显隐规则:
-	 *   - 母体 (bIsMother=true) → 显示
-	 *   - 非母体 (bIsMother=false) → 隐藏
+	 *   - 母体 (bIsMother=true) → 显示 Overlay (含冷却遮罩 + 技能图标)
+	 *   - 非母体 (bIsMother=false) → 隐藏 Overlay
+	 */
+	UPROPERTY(meta = (BindWidget))
+	UOverlay* Overlay_MotherSkillIcon;
+
+	/**
+	 * 母体加速技能图标 — 仅母体可见 (现在是 Overlay 的子控件)
 	 *
 	 * 冷却显示:
 	 *   - CooldownRemaining > 0 → 显示冷却倒计时 (Image 作为遮罩 + Text 显示秒数)

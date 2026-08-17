@@ -235,7 +235,7 @@ void UDailyLoginPage::RefreshRewardList()
 				NewItem->OnRewardClicked.AddDynamic(this, &UDailyLoginPage::HandleRewardClick);
 
 				// 获取当天的奖励配置，检查是否为特殊奖励
-				TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, i);
+				TArray<const FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, i);
 				bool bIsSpecial = false;
 
 				// 检查当天是否有任一奖励被标记为特殊奖励
@@ -319,7 +319,7 @@ void UDailyLoginPage::RefreshRewardList()
 			}
 
 			// 获取大奖项天数的奖励配置（基于 IsSpecialReward 字段）
-			TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, 8);
+			TArray<const FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, 8);
 			bool bIsSpecial = false;
 			for (auto* RewardRow : Rewards)
 			{
@@ -452,7 +452,7 @@ void UDailyLoginPage::OnBigRewardClicked()
 	{
 		for (int32 Day = 1; Day <= ActivityInfo->TotalDays; ++Day)
 		{
-			TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, Day);
+			TArray<const FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, Day);
 			for (auto* Reward : Rewards)
 			{
 				if (Reward && Reward->bIsSpecialReward)
@@ -483,13 +483,13 @@ void UDailyLoginPage::OnBigRewardClicked()
 	}
 
 	// 4. 获取指针数组 (TArray<FDailyLoginConfigRow*>)
-	TArray<FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, SpecialDayIndex);
+	TArray<const FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, SpecialDayIndex);
 	// UE_LOG(LogTemp, Warning, TEXT("获取到 %d 个奖励配置指针"), OptionPtrs.Num());
 
 	// 5. 【核心修改】转换为值数组 (TArray<FDailyLoginConfigRow>)
 	// 因为你的 InitSelection 接收的是引用/值，不支持直接传指针数组
 	TArray<FDailyLoginConfigRow> ValueOptions;
-	for (FDailyLoginConfigRow* Ptr : OptionPtrs)
+	for (const FDailyLoginConfigRow* Ptr : OptionPtrs)
 	{
 		if (Ptr)
 		{
@@ -654,9 +654,9 @@ void UDailyLoginPage::OpenTreasureBox(int32 DayIndex)
 	}
 
 	// 获取当前天数的奖励配置数据
-	TArray<FDailyLoginConfigRow*> CurrentDayRewards = ActivitySub->GetRewardsByDay(101, CurrentDayIndex);
+	TArray<const FDailyLoginConfigRow*> CurrentDayRewards = ActivitySub->GetRewardsByDay(101, CurrentDayIndex);
 	TArray<FDailyLoginConfigRow> ValueOptions;
-	for (FDailyLoginConfigRow* Ptr : CurrentDayRewards)
+	for (const FDailyLoginConfigRow* Ptr : CurrentDayRewards)
 	{
 		if (Ptr)
 		{
@@ -974,12 +974,12 @@ void UDailyLoginPage::ShowRewardOptionPopup(int32 DayIndex)
 	UE_LOG(LogTemp, Warning, TEXT("设置当前处理天数: %d"), CurrentProcessingDay);
 
 	// 3. 获取指针数组 (TArray<FDailyLoginConfigRow*>)
-	TArray<FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, DayIndex);
+	TArray<const FDailyLoginConfigRow*> OptionPtrs = ActivitySub->GetRewardsByDay(101, DayIndex);
 	UE_LOG(LogTemp, Warning, TEXT("获取到 %d 个奖励配置指针"), OptionPtrs.Num());
 
 	// 4. 转换为值数组 (TArray<FDailyLoginConfigRow>)
 	TArray<FDailyLoginConfigRow> ValueOptions;
-	for (FDailyLoginConfigRow* Ptr : OptionPtrs)
+	for (const FDailyLoginConfigRow* Ptr : OptionPtrs)
 	{
 		if (Ptr)
 		{
@@ -1112,7 +1112,7 @@ void UDailyLoginPage::HandleRewardClick(int32 DayIndex, ELoginRewardType RewardT
 	bool bIsSpecialReward = false;
 	if (ActivitySub)
 	{
-		TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, DayIndex);
+		TArray<const FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, DayIndex);
 		for (auto* Reward : Rewards)
 		{
 			if (Reward && Reward->bIsSpecialReward)

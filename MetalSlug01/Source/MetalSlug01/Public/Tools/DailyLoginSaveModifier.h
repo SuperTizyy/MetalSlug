@@ -113,10 +113,10 @@ public:
 
 	// ==================== 基类接口实现 ====================
 
-	/** Slot 名格式: DailyLogin_{ActivityID} */
+	/** 【v233 进程隔离】槽位名格式: "DailyLogin_<ActivityID>_<PID>" */
 	virtual FString GetSaveSlotName(int32 ActivityID) const
 	{
-		return FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+		return BuildIsolatedSaveSlotName(TEXT("DailyLogin_%d"), ActivityID);
 	}
 
 	// ==================== 数据修改接口 ====================

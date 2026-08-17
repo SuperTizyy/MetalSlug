@@ -398,7 +398,7 @@ bool UDailyLoginSaveModifier::SaveActivityRecord(int32 ActivityID)
 		return false;
 	}
 
-	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	FString SaveSlotName = GetSaveSlotName(ActivityID);
 	bool bSuccess = UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
 
 	if (bSuccess)
@@ -456,7 +456,7 @@ bool UDailyLoginSaveModifier::LoadActivityRecord(int32 ActivityID)
 		return false;
 	}
 
-	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	FString SaveSlotName = GetSaveSlotName(ActivityID);
 	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
@@ -485,7 +485,7 @@ UActivitySaveGame* UDailyLoginSaveModifier::GetOrCreateSaveGame(int32 ActivityID
 	}
 
 	// 尝试加载现有存档
-	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	FString SaveSlotName = GetSaveSlotName(ActivityID);
 	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);

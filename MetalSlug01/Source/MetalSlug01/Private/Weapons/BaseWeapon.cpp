@@ -15,6 +15,18 @@
 // 引入武器模型类型枚举 (v61.2 — DT_WeaponInfo 真理源)
 #include "Data/Tables/WeaponTableRow.h"
 
+// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
+// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
+static TAutoConsoleVariable<int32> CVarShowTraceDebug(
+	TEXT("g.MetalSlug.ShowTraceDebug"),
+	0,
+	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
+	TEXT("0 = hide all trace debug visuals (default)\n")
+	TEXT("1 = show all trace debug visuals\n")
+	TEXT("Affects: BaseWeapon::Multicast_PlayFireTraceVisual, BTDecorator_HasClearShot, RangedLineStrategy"),
+	ECVF_Default
+);
+
 // 引入 Mesh 组件基类 (GetMeshComponent 返回 UMeshComponent*)
 #include "Components/MeshComponent.h"
 // 引入 SkeletalMesh 组件 (ResolveMagazineSkeletalMesh 返回类型)
@@ -1422,6 +1434,14 @@ void ABaseWeapon::Multicast_PlayFireTraceVisual_Implementation(FVector StartLoc,
 			TEXT("[BaseWeapon] ★ Multicast_PlayFireTraceVisual_Implementation: World 无效! Weapon=%s. "
 			     "【v208.6 诊断】"),
 			*GetName());
+		return;
+	}
+
+	// 【v241 大厂架构】trace debug 可视化统一开关 — CVar 默认 0 (关闭)
+	// 用户要求 "关闭所有射线检测的射线显示" — 所有 DrawDebug* 都受这个 CVar 控制
+	// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭
+	if (CVarShowTraceDebug.GetValueOnGameThread() == 0)
+	{
 		return;
 	}
 

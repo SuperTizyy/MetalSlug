@@ -29,6 +29,20 @@ UUpgradeActivitySaveModifier::UUpgradeActivitySaveModifier()
 	// 本类额外清空 TargetSubsystem
 }
 
+// 【v232 进程隔离】从 OwningSubsystem 取真正的槽位名 (已含进程 ID 后缀)
+FString UUpgradeActivitySaveModifier::GetSaveSlotName(int32 /*ActivityID*/) const
+{
+	if (TargetSubsystem)
+	{
+		return TargetSubsystem->SaveSlotName;
+	}
+	// 零兜底: 找不到子系统 → Log Error → 拒绝静默 fallback
+	UE_LOG(LogTemp, Error,
+		TEXT("[v232] UpgradeActivitySaveModifier: TargetSubsystem 为空, 无法获取存档槽位."
+			 " 修复: 确保 InitializeModifier 已传入有效 Subsystem"));
+	return FString(); // 返回空字符串让 SaveGameToSlot 失败, 显式报错而非静默
+}
+
 bool UUpgradeActivitySaveModifier::InitializeModifier(UObject* WorldContext, UUpgradeActivitySubsystem* Subsystem)
 {
 	// 【2026-06-15 修复】: 委托给基类 (基类会实际赋值 WorldContext 并置 IsInitialized()=true)
@@ -644,7 +658,7 @@ bool UUpgradeActivitySaveModifier::SaveAllRecords()
 	bool bAllSuccess = true;
 
 	// 🔧 这是唯一的实际磁盘保存操作
-	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
+	FString SaveSlotName = GetSaveSlotName(0);
 	bool bSuccess = UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
 
 	if (bSuccess)
@@ -696,7 +710,7 @@ bool UUpgradeActivitySaveModifier::LoadRecord(int32 RecordDate)
 	}
 
 	// 使用与Subsystem一致的存档槽位
-	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
+	FString SaveSlotName = GetSaveSlotName(0);
 	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);
@@ -725,7 +739,7 @@ UActivitySaveGame* UUpgradeActivitySaveModifier::GetOrCreateSaveGame(int32 Recor
 	}
 
 	// 尝试加载现有存档 - 使用与Subsystem一致的存档槽位
-	FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
+	FString SaveSlotName = GetSaveSlotName(0);
 	UActivitySaveGame* LoadedSaveGame = Cast<UActivitySaveGame>(
 		UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0)
 	);

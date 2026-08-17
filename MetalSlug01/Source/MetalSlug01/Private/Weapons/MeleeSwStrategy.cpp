@@ -48,6 +48,18 @@
 #include "Engine/World.h"             // 【v97.0】UWorld
 #include "GameplayTagContainer.h"     // 【v97.0】FGameplayTag
 
+// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
+// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
+static TAutoConsoleVariable<int32> CVarShowTraceDebug(
+	TEXT("g.MetalSlug.ShowTraceDebug"),
+	0,
+	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
+	TEXT("0 = hide all trace debug visuals (default)\n")
+	TEXT("1 = show all trace debug visuals\n")
+	TEXT("Affects: BaseWeapon, BTDecorator_HasClearShot, RangedLineStrategy, MeleeSwStrategy"),
+	ECVF_Default
+);
+
 
 // 【v75 单一真理源】Socket 名称常量定义 — 与 .h 声明一一对应
 const FName UMeleeSwStrategy::SocketName_TraceStart = FName(TEXT("TraceStart"));
@@ -576,21 +588,28 @@ void UMeleeSwStrategy::TickDetection(ABaseWeapon* Weapon, float DeltaTime)
 	//   - 母体路径: 用 OwnerChar->HasAuthority() 判断 (OwnerChar 是 ABaseCharacter, 永远非空)
 	//   - 刀战路径: 用 Weapon->HasAuthority() (原有逻辑)
 	// ============================================================
+	// 【v241 大厂架构】DebugDrawMode 单一真理源 = (CVar 打开 && HasAuthority)
+	// 旧 (v96.x-v240): HasAuthority() 单独决定 — 默认画线, 用户看到射线
+	// 新 (v241): 受 CVar g.MetalSlug.ShowTraceDebug 控制 — 默认 None (关闭, 用户要求)
+	const bool bShowDebugTrace = (CVarShowTraceDebug.GetValueOnGameThread() != 0);
 	EDrawDebugTrace::Type DebugDrawMode = EDrawDebugTrace::None;
-	if (bUseOwnerMesh)
+	if (bShowDebugTrace)
 	{
-		// 【母体路径】OwnerChar 永远非空 (TickDetection 入口已校验 ActiveOwner)
-		if (OwnerChar && OwnerChar->HasAuthority())
+		if (bUseOwnerMesh)
 		{
-			DebugDrawMode = EDrawDebugTrace::ForDuration;
+			// 【母体路径】OwnerChar 永远非空 (TickDetection 入口已校验 ActiveOwner)
+			if (OwnerChar && OwnerChar->HasAuthority())
+			{
+				DebugDrawMode = EDrawDebugTrace::ForDuration;
+			}
 		}
-	}
-	else
-	{
-		// 【刀战路径】原有逻辑
-		if (Weapon && Weapon->HasAuthority())
+		else
 		{
-			DebugDrawMode = EDrawDebugTrace::ForDuration;
+			// 【刀战路径】原有逻辑
+			if (Weapon && Weapon->HasAuthority())
+			{
+				DebugDrawMode = EDrawDebugTrace::ForDuration;
+			}
 		}
 	}
 

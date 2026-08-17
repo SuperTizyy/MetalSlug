@@ -1,5 +1,6 @@
 #include "Systems/Activity/ActivitySubsystem.h"
 #include "Systems/Activity/RedDotManager.h"
+#include "Systems/Activity/ActivityDataTableService.h" // v231: UActivityDataTableService 定义
 #include "Tools/DailyLoginSaveModifier.h"
 #include "Kismet/GameplayStatics.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口 (替代硬编码路径)
@@ -14,6 +15,10 @@ void UActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// ================= 初始化管理器 =================
 	RedDotManager = NewObject<URedDotManager>(this);
 
+	// ================= 初始化 DataTable 服务 (v231: 强引用 GC 安全) =================
+	// 必须在 RedDotManager 之后, 因为后续会有 DataTable 访问
+	DataTableService = UActivityDataTableService::Create(this);
+
 	// ================= 初始化动态存档修改器 =================
 	SaveModifier = NewObject<UDailyLoginSaveModifier>(this);
 	SaveModifier->InitializeModifier(this);
@@ -26,6 +31,9 @@ void UActivitySubsystem::Deinitialize()
 {
 	// Subsystem 销毁时，管理器会随 GC 自动回收
 	RedDotManager = nullptr;
+
+	// 释放 DataTable 服务 (UPROPERTY 引用清空, 内部 TStrongObjectPtr 随之析构, RemoveFromRoot)
+	DataTableService = nullptr;
 
 	// 清理动态存档修改器
 	if (SaveModifier)
@@ -95,9 +103,9 @@ URedDotManager* UActivitySubsystem::GetRedDotManager() const
 
 TArray<const FActivityInfoRow*> UActivitySubsystem::GetAllNavItems() const
 {
-	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
-	// (避开 GetAllRows 内部 RowMap dangling 指针导致的崩溃 v4 - 2026-08-10)
-	return FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+	// v231 改造: 通过 UActivityDataTableService 走实例方法 (强引用 GC 安全)
+	// 旧版 static 调用已删除, 零兜底 — Service 必然存活
+	return DataTableService->GetService().GetRowsSafe<FActivityInfoRow>(
 		ActivityDataTable::ActivityInfo,
 		[](const FActivityInfoRow& Row) { return true; } // 不过滤,收集所有行
 	);
@@ -105,18 +113,23 @@ TArray<const FActivityInfoRow*> UActivitySubsystem::GetAllNavItems() const
 
 const FActivityInfoRow* UActivitySubsystem::GetActivityInfo(int32 ActivityID) const
 {
-	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
-	return FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+	// v231 改造: 通过 Service 实例方法
+	return DataTableService->GetService().FindRowByIdSafe<FActivityInfoRow>(
 		ActivityDataTable::ActivityInfo,
 		[](const FActivityInfoRow& Row) { return Row.ActivityID; },
 		ActivityID
 	);
 }
 
+FString UActivitySubsystem::BuildSaveSlotName(int32 ActivityID) const
+{
+	return FString::Printf(TEXT("DailyLogin_%d_%d"), ActivityID, FPlatformProcess::GetCurrentProcessId());
+}
+
 FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
 {
 	// 从SaveGame系统获取或创建玩家记录
-	FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+	FString SaveSlotName = BuildSaveSlotName(ActivityID);
 	
 	// 尝试加载现有存档
 	UActivitySaveGame* SaveGameInstance = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, 0));
@@ -150,7 +163,7 @@ FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
 		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 新记录初始状态 - Progress=%d, CurrentClaimCount=%d"), NewRecord.Progress, NewRecord.CurrentClaimCount);
 		
 		// 立即保存新创建的记录，确保.sav文件被创建
-		FString NewSaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+		FString NewSaveSlotName = BuildSaveSlotName(ActivityID);
 		UGameplayStatics::SaveGameToSlot(SaveGameInstance, NewSaveSlotName, 0);
 		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 主动保存新创建的记录到磁盘"));
 	}
@@ -165,7 +178,7 @@ void UActivitySubsystem::SavePlayerRecord(int32 ActivityID)
 {
 	if (CachedSaveGame)
 	{
-		FString SaveSlotName = FString::Printf(TEXT("DailyLogin_%d"), ActivityID);
+		FString SaveSlotName = BuildSaveSlotName(ActivityID);
 		UGameplayStatics::SaveGameToSlot(CachedSaveGame, SaveSlotName, 0);
 		UE_LOG(LogTemp, Warning, TEXT("ActivitySubsystem: 成功保存ActivityID=%d的玩家记录"), ActivityID);
 	}
@@ -175,30 +188,26 @@ void UActivitySubsystem::SavePlayerRecord(int32 ActivityID)
 	}
 }
 
-TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetDailyLoginConfigs(int32 ActivityID) const
+const TArray<const FDailyLoginConfigRow*> UActivitySubsystem::GetDailyLoginConfigs(int32 ActivityID) const
 {
-	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
-	// ⚠️ helper 返回 TArray<const T*>, 但头文件声明为 TArray<T*>
-	//    const_cast 是因为本函数对外契约是"只读访问", 不应该有 mutating 调用方
-	//    历史上 DailyLoginDayItemWidget / DailyLoginPage 10+ 处都用 TArray<T*>, 改头文件牵涉广
-	TArray<const FDailyLoginConfigRow*> ConstRows = FActivityDataTableService::GetRowsSafe<FDailyLoginConfigRow>(
+	// v231: 改返回 const T*, 从源头消除 reinterpret_cast 兜底
+	// 强引用 GC 安全 + Service 单一真理源
+	return DataTableService->GetService().GetRowsSafe<FDailyLoginConfigRow>(
 		ActivityDataTable::DailyLoginConfig,
 		[ActivityID](const FDailyLoginConfigRow& Row) { return Row.ActivityID == ActivityID; }
 	);
-	return *reinterpret_cast<TArray<FDailyLoginConfigRow*>*>(&ConstRows);
 }
 
-TArray<FDailyLoginConfigRow*> UActivitySubsystem::GetRewardsByDay(int32 ActivityID, int32 Day) const
+const TArray<const FDailyLoginConfigRow*> UActivitySubsystem::GetRewardsByDay(int32 ActivityID, int32 Day) const
 {
-	// 改造: 通过 FActivityDataTableService::GetRowsSafe 防御性遍历
-	TArray<const FDailyLoginConfigRow*> ConstRows = FActivityDataTableService::GetRowsSafe<FDailyLoginConfigRow>(
+	// v231: 改返回 const T*, 从源头消除 reinterpret_cast 兜底
+	return DataTableService->GetService().GetRowsSafe<FDailyLoginConfigRow>(
 		ActivityDataTable::DailyLoginConfig,
 		[ActivityID, Day](const FDailyLoginConfigRow& Row)
 		{
 			return Row.ActivityID == ActivityID && Row.DayIndex == Day;
 		}
 	);
-	return *reinterpret_cast<TArray<FDailyLoginConfigRow*>*>(&ConstRows);
 }
 
 bool UActivitySubsystem::TryClaimReward(int32 ActivityID, int32 DayIndex)
@@ -294,8 +303,8 @@ bool UActivitySubsystem::TryClaimMultipleRewards(int32 ActivityID, const TArray<
 
 const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 {
-	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
-	return FActivityDataTableService::FindRowByIdSafe<FItemDetailRow>(
+	// v231 改造: 通过 Service 实例方法 (强引用 GC 安全)
+	return DataTableService->GetService().FindRowByIdSafe<FItemDetailRow>(
 		ActivityDataTable::ItemDetail,
 		[](const FItemDetailRow& Row) { return Row.ItemID; },
 		ItemID
@@ -304,8 +313,8 @@ const FItemDetailRow* UActivitySubsystem::GetItemDetail(int32 ItemID) const
 
 const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) const
 {
-	// 改造: 通过 FActivityDataTableService::FindRowByIdSafe 防御性查找
-	return FActivityDataTableService::FindRowByIdSafe<FTreasureBoxItemRow>(
+	// v231 改造: 通过 Service 实例方法
+	return DataTableService->GetService().FindRowByIdSafe<FTreasureBoxItemRow>(
 		ActivityDataTable::TreasureBoxItem,
 		[](const FTreasureBoxItemRow& Row) { return Row.BoxID; },
 		BoxID
@@ -314,53 +323,12 @@ const FTreasureBoxItemRow* UActivitySubsystem::GetTreasureBoxItem(int32 BoxID) c
 
 TArray<const FTreasureBoxItemRow*> UActivitySubsystem::GetTreasureBoxItemsByBoxID(int32 BoxID) const
 {
-	// 改造: 走 FActivityDataTableService (Get 内部已加 IsValid 防御 + 失效重载)
-	UDataTable* ConfigTable = FActivityDataTableService::Get(ActivityDataTable::TreasureBoxItem);
-
-	// ⚠️【防崩溃 v3 — 三层防御】
-	// 崩溃历史:
-	//   v1 (2026-08-09): GetRowMap() + reinterpret_cast → Pair.Value = 0xffffffffffffffff
-	//   v2 (2026-08-10): GetAllRows<T>() 内部 UStruct::IsChildOf() → RowStruct->SuperStruct = 0xffffffffffffffff
-	//   根因分析: FActivityDataTableService::GetCache() 静态 TMap 中的 TObjectPtr<UDataTable>
-	//             在 DataTable 资产重载/GC/编辑器热刷新后可能持有失效指针
-	//   修复: 三层防御全部到位
-	//     1. FActivityDataTableService::Get() 内部加 IsValid 校验 + 失效时自动重载 (核心修复)
-	//     2. 本函数再加 ConfigTable + RowStruct 双重 IsValid 防御 (兜底)
-	//     3. 用 FindRow<T>() 单条查询, 避免 GetAllRows 内部的 IsChildOf 整表类型校验
-	TArray<const FTreasureBoxItemRow*> Result;
-
-	// 防御 1: ConfigTable 必须有效 (FActivityDataTableService::Get 已保证, 双保险)
-	if (!IsValid(ConfigTable))
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[ActivitySubsystem] GetTreasureBoxItemsByBoxID: ConfigTable 失效 (BoxID=%d)"),
-			BoxID);
-		return Result;
-	}
-
-	// 防御 2: RowStruct 必须有效 (DataTable 资产重载后此字段可能失效)
-	const UScriptStruct* RowStruct = ConfigTable->GetRowStruct();
-	if (!IsValid(RowStruct))
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("[ActivitySubsystem] GetTreasureBoxItemsByBoxID: ConfigTable->RowStruct 失效 (BoxID=%d, ConfigTable=%p, RowStruct=%p)"),
-			BoxID, ConfigTable, RowStruct);
-		return Result;
-	}
-
-	// 防御 3: 用 GetRowNames + FindRow 路径, 避免 GetAllRows 的 IsChildOf 整表类型校验
-	static const FString ContextString(TEXT("ActivitySubsystem"));
-	const TArray<FName> RowNames = ConfigTable->GetRowNames();
-	for (const FName& RowName : RowNames)
-	{
-		const FTreasureBoxItemRow* Row = ConfigTable->FindRow<FTreasureBoxItemRow>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
-		if (Row && Row->BoxID == BoxID)
-		{
-			Result.Add(Row);
-		}
-	}
-
-	return Result;
+	// v231 重构: 直接调 Service.GetRowsSafe, 复用 SSOT 真理源
+	// 旧版手写 GetRowNames + FindRow + 三层 IsValid 防御全部删除 — 强引用保证 GC 安全
+	return DataTableService->GetService().GetRowsSafe<FTreasureBoxItemRow>(
+		ActivityDataTable::TreasureBoxItem,
+		[BoxID](const FTreasureBoxItemRow& Row) { return Row.BoxID == BoxID; }
+	);
 }
 
 // ==================== 动态存档修改器接口实现 ====================

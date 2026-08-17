@@ -1579,7 +1579,9 @@ void UGameHUDWidget::TryBindToCharacterEvents()
 			}
 		}
 
-		// 【v121 大厂架构新增】母体技能图标显隐快照补发
+		// 【v238 重构说明】母体技能图标显隐快照补发
+		// v238 后: SetMotherSkillIconVisibility 控制 Overlay_MotherSkillIcon 而非 Image_MotherSkillIcon
+		// 行为不变：母体显示，非母体隐藏
 		// 根因: HUD 订阅成功时，CharacterIconComponent 可能还没有触发 OnMotherSkillCooldownChanged
 		//        → 非母体的技能图标可能一直显示
 		// 修复: HUD 订阅成功后主动设置技能图标显隐（非母体=隐藏，母体=显示）

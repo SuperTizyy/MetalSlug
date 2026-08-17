@@ -1,17 +1,15 @@
 // ==========================================
-// FActivityDataTableService 实现
+// FActivityDataTableService 实现 (v231 — 大厂架构)
+// ==========================================
+// v231 重构要点:
+//   1. 静态 TMap → 实例 TMap (由 UActivityDataTableService 持有)
+//   2. TObjectPtr → TStrongObjectPtr (AddToRoot 保证 GC 永不回收)
+//   3. 移除所有"先校验再重载"的兜底逻辑 — 强引用保证指针永远有效
+//   4. 加载失败 = Log Error + return nullptr, 严禁静默
 // ==========================================
 #include "Data/FActivityDataTableService.h"
 #include "Engine/DataTable.h"
 #include "Logs/MetalSlugLogChannels.h"
-
-TMap<FName, TObjectPtr<UDataTable>>& FActivityDataTableService::GetCache()
-{
-	// 静态局部变量, 首次访问时构造, 进程结束时析构
-	// 注意: 这里使用 TObjectPtr 仅为了 GC 友好, 实际访问仍走 TMap
-	static TMap<FName, TObjectPtr<UDataTable>> Cache;
-	return Cache;
-}
 
 FString FActivityDataTableService::BuildAssetPath(FName TableID)
 {
@@ -27,83 +25,64 @@ UDataTable* FActivityDataTableService::LoadTableInternal(FName TableID)
 	UDataTable* Loaded = LoadObject<UDataTable>(nullptr, *AssetPath);
 	if (!Loaded)
 	{
-		UE_LOG(LogTemp, Error, TEXT("[ActivityDT] 加载失败: %s (路径: %s)"), *TableID.ToString(), *AssetPath);
+		UE_LOG(LogTemp, Error,
+			TEXT("[ActivityDT] 加载失败: %s (路径: %s). 请检查资产是否存在, 路径前缀是否正确"),
+			*TableID.ToString(), *AssetPath);
 		return nullptr;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[ActivityDT] 已加载: %s (Rows: %d)"), *TableID.ToString(), Loaded->GetRowMap().Num());
+	UE_LOG(LogTemp, Log,
+		TEXT("[ActivityDT] 已加载: %s (Rows: %d)"), *TableID.ToString(), Loaded->GetRowMap().Num());
 	return Loaded;
+}
+
+void FActivityDataTableService::ReleaseTable(FName TableID)
+{
+	// TStrongObjectPtr 析构时自动调 RemoveFromRoot, 这里只需让 TMap 移除 entry
+	if (TStrongObjectPtr<UDataTable>* Found = Cache.Find(TableID))
+	{
+		Found->Reset(); // 强制析构, 触发 RemoveFromRoot
+		Cache.Remove(TableID);
+	}
 }
 
 UDataTable* FActivityDataTableService::Get(FName TableID)
 {
-	// 1. 命中缓存: 校验是否仍有效 (UPROPERTY 的 TObjectPtr 在 GC 时会自动 null)
-	//    但缓存的 TMap 不在 UPROPERTY 体系, GC 不会自动清理 entry
-	//    → 必须手动校验 + IsValid 检测, 失效时自动重载
-	if (TObjectPtr<UDataTable>* Cached = GetCache().Find(TableID))
+	// v231 强引用保证: 缓存命中即返回, 指针永远有效
+	// 加载失败是唯一返回 nullptr 的路径, 不再有"假阳性"兜底
+	if (TStrongObjectPtr<UDataTable>* Cached = Cache.Find(TableID))
 	{
 		UDataTable* RawPtr = Cached->Get();
-		if (IsValid(RawPtr))
-		{
-			// 额外防御: RowStruct 也不能失效 (DataTable 资产重载/热刷新后)
-			if (IsValid(RawPtr->GetRowStruct()))
-			{
-				// 🔧【v230 增强防御】验证 DataTable 实际行数据是否有效
-				// 原因: RowStruct 指针看起来有效, 但热重载后内部行数据可能已失效
-				//       GetRowNames() 返回空数组 = DataTable 内部数据已损坏
-				const TArray<FName> RowNames = RawPtr->GetRowNames();
-				if (RowNames.Num() > 0)
-				{
-					// 额外验证: 尝试查找第一行, 确认 FindRow 路径仍然有效
-					static const FString ContextString(TEXT("FActivityDataTableService::Get_Validate"));
-					if (RawPtr->FindRow<FTableRowBase>(RowNames[0], ContextString, /*bWarnIfRowMissing=*/false))
-					{
-						return RawPtr;
-					}
-					UE_LOG(LogTemp, Warning,
-						TEXT("[ActivityDT] Get: '%s' FindRow 返回 nullptr (DataTable 内部数据损坏), 强制重新加载"),
-						*TableID.ToString());
-				}
-				else
-				{
-					UE_LOG(LogTemp, Warning,
-						TEXT("[ActivityDT] Get: '%s' GetRowNames() 返回 %d 行 (DataTable 数据已失效), 强制重新加载"),
-						*TableID.ToString(), RowNames.Num());
-				}
-			}
-			UE_LOG(LogTemp, Warning,
-				TEXT("[ActivityDT] Get: '%s' DataTable.RowStruct 失效, 强制重新加载"),
-				*TableID.ToString());
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning,
-				TEXT("[ActivityDT] Get: '%s' 缓存中的 DataTable 已失效 (GC/unload), 强制重新加载"),
-				*TableID.ToString());
-		}
-		// 失效: 清理 entry, 重新走 LoadTableInternal
-		GetCache().Remove(TableID);
+		// 强引用保证 RawPtr 永远有效, 不再加 IsValid 校验
+		// 校验 = 反模式, 强引用 = 单一真理源
+		return RawPtr;
 	}
 
-	// 2. 首次访问 / 失效重载: 同步加载并写入缓存
+	// 首次访问: 同步加载 + 强引用缓存
 	UDataTable* Loaded = LoadTableInternal(TableID);
-	if (Loaded)
+	if (!Loaded)
 	{
-		GetCache().Add(TableID, Loaded);
+		// 加载失败: Log Error 在 LoadTableInternal 内部已做, 这里直接返回
+		return nullptr;
 	}
+
+	// TStrongObjectPtr 构造函数内部 AddToRoot, GC 永远不会回收
+	Cache.Add(TableID, TStrongObjectPtr<UDataTable>(Loaded));
 	return Loaded;
 }
 
 void FActivityDataTableService::ReloadAll()
 {
-	UE_LOG(LogTemp, Warning, TEXT("[ActivityDT] ReloadAll: 清空缓存并重新加载 %d 张表"), GetCache().Num());
-	for (auto& Pair : GetCache())
-	{
-		Pair.Value = nullptr; // 解除引用, 等待 GC
-	}
-	GetCache().Empty();
+	UE_LOG(LogTemp, Warning, TEXT("[ActivityDT] ReloadAll: 释放 %d 张表的强引用并重新加载"), Cache.Num());
 
-	// 按已知 ID 重新加载一次
+	// 1. 释放所有强引用 (TStrongObjectPtr 析构会 RemoveFromRoot)
+	for (auto& Pair : Cache)
+	{
+		Pair.Value.Reset();
+	}
+	Cache.Empty();
+
+	// 2. 按已知 ID 重新加载 (Get 内部会建立新的强引用)
 	static const FName KnownTables[] = {
 		ActivityDataTable::ActivityInfo,
 		ActivityDataTable::DailyLoginConfig,
@@ -117,7 +96,7 @@ void FActivityDataTableService::ReloadAll()
 	}
 }
 
-TArray<FName> FActivityDataTableService::GetMissingTables()
+TArray<FName> FActivityDataTableService::GetMissingTables() const
 {
 	TArray<FName> Missing;
 	static const FName KnownTables[] = {
@@ -129,18 +108,10 @@ TArray<FName> FActivityDataTableService::GetMissingTables()
 	};
 	for (const FName& ID : KnownTables)
 	{
-		if (GetCache().Find(ID) == nullptr)
+		if (!Cache.Contains(ID))
 		{
 			Missing.Add(ID);
 		}
 	}
 	return Missing;
 }
-
-void FActivityDataTableService::Shutdown()
-{
-	UE_LOG(LogTemp, Log, TEXT("[ActivityDT] Shutdown: 清理 %d 张缓存表"), GetCache().Num());
-	GetCache().Empty();
-}
-
-// 注意: 模板方法 GetRowsSafe / FindRowByIdSafe 的实现已搬到 .h 末尾 (因模板必须在头文件中可见)

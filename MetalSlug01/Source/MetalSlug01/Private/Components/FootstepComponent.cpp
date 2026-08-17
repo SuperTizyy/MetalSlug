@@ -1,116 +1,91 @@
 // ==========================================
-// UFootstepComponent 实现 【2026-06-15 重构: 完整迁移 BaseCharacter 脚步逻辑】
+// UFootstepComponent 实现
+// 职责: 播放带距离衰减的脚步音效. 单一真理源 (FootstepSound + FootstepAttenuation) 在 BP 配置.
+// 这是 UE 5.6 标准做法 — 大厂项目 (Lyra): 距离衰减配置在 SoundAttenuation 资产, 不在 C++ 兜底.
 // ==========================================
 #include "Components/FootstepComponent.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
-#include "Kismet/KismetMathLibrary.h"
 #include "Logs/MetalSlugLogChannels.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "Engine/World.h"
-
-/** 脚步声全局音量缩放 CVar（控制台命令: g.FootstepVolume） */
-static TAutoConsoleVariable<float> CVarFootstepVolume(
-	TEXT("g.FootstepVolume"),
-	1.0f,
-	TEXT("Footstep volume multiplier (0.0 to 2.0).\n")
-	TEXT("Default: 1.0"),
-	ECVF_Default
-);
+#include "Sound/SoundAttenuation.h"
 
 UFootstepComponent::UFootstepComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
 }
 
-
 void UFootstepComponent::PlayFootstep(ACharacter* OwnerChar, const FVector& Location)
 {
-	// 【P1 修复】安全校验：优先用 OwnerChar 的 World，而非 Component 自己的 World
-	// Component 的 World 在某些边缘情况下可能为空（如 AI 重生时）
+	// 【v241 零兜底】Owner 链校验
 	UWorld* World = OwnerChar ? OwnerChar->GetWorld() : GetWorld();
 	if (!World || !OwnerChar)
 	{
 		return;
 	}
 
-	// 读取全局音量 CVar
-	float CVarVolume = CVarFootstepVolume.GetValueOnGameThread();
-	if (CVarVolume <= 0.0f)
+	// 【v241 零兜底】FootstepSound 缺失 = BP 没配 — Log Error + 拒绝播放
+	if (!FootstepSound)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[FootstepComponent][v241] PlayFootstep: FootstepSound 未配置! "
+			     "Owner=%s. 【零兜底】必须修复 BP Components.Footstep.FootstepSound."),
+			*OwnerChar->GetName());
 		return;
 	}
 
-	// 根据 Owner 当前状态选择脚步声资源
-	USoundBase* SoundToPlay = nullptr;
-
-	if (OwnerChar->bIsCrouched && CrouchFootstepSound)
+	// 【v241 零兜底】FootstepAttenuation 缺失 = BP 没配 — Log Error + 拒绝播放
+	// 这是缺失距离衰减的根因 — 修复路径: BP 里配 SA_Footstep / SA_MotherFootstep 资产
+	if (!FootstepAttenuation)
 	{
-		SoundToPlay = CrouchFootstepSound;
-	}
-	else
-	{
-		// 根据速度判断行走/奔跑
-		const float Speed = OwnerChar->GetVelocity().Length();
-		const float MaxWalkSpeed = OwnerChar->GetCharacterMovement()
-			? OwnerChar->GetCharacterMovement()->MaxWalkSpeed
-			: 600.0f;
-
-		if (Speed > MaxWalkSpeed && RunFootstepSound)
-		{
-			SoundToPlay = RunFootstepSound;
-		}
-		else if (WalkFootstepSound)
-		{
-			SoundToPlay = WalkFootstepSound;
-		}
-	}
-
-	if (!SoundToPlay)
-	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[FootstepComponent][v241] PlayFootstep: FootstepAttenuation 未配置! "
+			     "Owner=%s. 【零兜底】必须修复 BP Components.Footstep.FootstepAttenuation. "
+			     "【缺失距离衰减的根因】没有这个资产, 脚步声无视距离, 任何距离都一样响. "
+			     "【修复】UE 内容浏览器 → 右键 → Sounds → Sound Attenuation → 创建 SA_Footstep 配置 Falloff Distance. "
+			     "然后拖到 BP Components.Footstep.FootstepAttenuation 字段."),
+			*OwnerChar->GetName());
 		return;
 	}
 
-	// 地面检测: LineTrace 获取物理材质（可扩展为不同地面不同音效）
-	FHitResult HitResult;
-	FVector TraceStart = Location + FVector(0.0f, 0.0f, TraceStartOffset);
-	FVector TraceEnd = Location - FVector(0.0f, 0.0f, TraceDistance);
+	// 【v241 移除】CVarFootstepVolume 兜底 — 距离衰减由 BP 配置的 SoundAttenuation 资产决定
+	// 旧 CVar 是"运行时调全局音量" 的反模式 — 真正的"音量衰减"是 BP 资产的责任
 
-	FCollisionQueryParams QueryParams;
-	QueryParams.bReturnPhysicalMaterial = true;
-	QueryParams.AddIgnoredActor(OwnerChar);
+	// 【v241 移除】Crouch/Run/Walk 分支判断 — 旧三选一是反模式 (走/Walk 状态本质都是同一类声音)
+	// 脚步声音量衰减由 SoundAttenuation 决定, 移动状态由骨骼动画节奏决定 (AnimNotify 频率)
 
-	// 【P2 修复】使用 TraceChannel 而非盲选通道，确保能命中地面
-	// 若追踪失败（AI 在空中或地形特殊），SoundToPlay 已在上面确定，仍然播放音效
-	if (World->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, FootstepTraceChannel, QueryParams))
-	{
-		if (UPhysicalMaterial* PhysMat = HitResult.PhysMaterial.Get())
-		{
-			UE_LOG(LogTemp, VeryVerbose, TEXT("[FootstepComponent] Surface=%s"),
-				*PhysMat->GetName());
-		}
-	}
-	else
-	{
-		// 追踪失败时记录调试信息，但仍然播放脚步声（避免 AI 完全没声音）
-		UE_LOG(LogTemp, VeryVerbose, TEXT("[FootstepComponent] 地面追踪失败 Loc=(%.1f, %.1f, %.1f), 仍播放脚步声"),
-			Location.X, Location.Y, Location.Z);
-	}
+	// 【v241 移除】地面 LineTrace 物理材质查询 — 旧逻辑只 Log Verbose, 没有任何业务用途
+	// 如果未来需要"不同地面不同音效", 应该在 BP 加 MetaSounds Switch 节点, 而不是 C++ 模板化
 
-	// 随机音高变化（0.9~1.1，更自然的听感）
-	const float PitchMultiplier = UKismetMathLibrary::RandomFloatInRange(0.9f, 1.1f);
+	// 随机音高变化 (0.9~1.1) — 听感更自然, 与距离衰减无关
+	const float PitchMultiplier = FMath::FRandRange(0.9f, 1.1f);
 
-	// 在指定位置播放音效
+	// 【v241 核心修复】带距离衰减的播放
+	// PlaySoundAtLocation 的"含 FRotator" 重载:
+	//   (World, Sound, Location, Rotation, VolumeMul, PitchMul, StartTime, Attenuation, Concurrency, Owner, InitialParams)
+	// FootstepAttenuation 是 BP 配置的资产, 距离衰减曲线由它决定
+	const float FinalVolume = FootstepVolumeMultiplier;
 	UGameplayStatics::PlaySoundAtLocation(
 		World,
-		SoundToPlay,
+		FootstepSound,
 		Location,
 		FRotator::ZeroRotator,
-		CVarVolume,
-		PitchMultiplier
+		FinalVolume,
+		PitchMultiplier,
+		/*StartTime=*/0.0f,
+		/*AttenuationSettings=*/FootstepAttenuation,
+		/*ConcurrencySettings=*/nullptr,
+		/*OwningActor=*/nullptr,
+		/*InitialParams=*/nullptr
 	);
 
-	UE_LOG(LogTemp, Log, TEXT("[FootstepComponent] 播放脚步声: Loc=(%.1f, %.1f, %.1f), Crouch=%d"),
-		Location.X, Location.Y, Location.Z, OwnerChar->bIsCrouched);
+	const FString AttenuationName = FootstepAttenuation->GetName();
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[FootstepComponent][v241] 播放脚步声: Loc=(%.1f, %.1f, %.1f), Crouch=%d, VolMul=%.2f, Attenuation=%s"),
+		Location.X, Location.Y, Location.Z,
+		OwnerChar->bIsCrouched ? 1 : 0,
+		FinalVolume,
+		*AttenuationName);
 }

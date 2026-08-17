@@ -7,6 +7,7 @@
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
 #include "Components/Image.h"
+#include "Components/Overlay.h"
 #include "Components/HorizontalBox.h"
 #include "Characters/BaseCharacter.h"
 // 【2026-07-01 P0】新增: 主动从 CharacterEvents 缓存拉取头像
@@ -540,31 +541,35 @@ void UPlayerStatusWidget::SetSkillCooldown(int32 SkillIndex, float CooldownPerce
 /**
  * UPlayerStatusWidget::SetMotherSkillIconVisibility
  *
- * 【v121 大厂架构新增】设置母体技能图标显隐
+ * 【v238 大厂架构重构】设置母体技能图标显隐 — 控制 Overlay 而非 Image
  *
  * @param bIsMother 是否为母体 (true=显示, false=隐藏)
  *
  * 显隐规则:
- *   - 母体 (bIsMother=true) → 显示技能图标
- *   - 非母体 (bIsMother=false) → 隐藏技能图标
+ *   - 母体 (bIsMother=true) → 显示 Overlay (含技能图标及所有子控件)
+ *   - 非母体 (bIsMother=false) → 隐藏 Overlay
+ *
+ * 架构说明 (v238 重构):
+ *   - 之前直接控制 Image_MotherSkillIcon，显隐逻辑散落
+ *   - v238 改用 Overlay 包裹整个母体技能区域，集中控制
+ *   - Overlay 包含 Image_MotherSkillIcon + 冷却遮罩 + 相关文本等子控件
  *
  * 设计原则 — 零兜底:
- *   - 非母体时主动隐藏, 不依赖"默认隐藏" (避免 BP 蓝图中误设为显示)
- *   - 每次状态变化都显式设置, 不依赖上一次状态
+ *   - 非母体时主动隐藏 Overlay，不依赖"默认隐藏"
+ *   - 每次状态变化都显式设置，不依赖上一次状态
  */
 void UPlayerStatusWidget::SetMotherSkillIconVisibility(bool bIsMother)
 {
-	// 【v121.2 修复】使用更保守的检查方式
-	// 根因: IsValid() 对某些"半有效"对象返回 true，但对象实际已无效，导致崩溃 0x18
-	// 解决方案: 双重检查 + 防御性调用 + try-catch
-	if (!Image_MotherSkillIcon || !Image_MotherSkillIcon->IsValidLowLevel())
+	// 【v238 重构】检查 Overlay 而非 Image
+	if (!Overlay_MotherSkillIcon || !Overlay_MotherSkillIcon->IsValidLowLevel())
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: Image_MotherSkillIcon 未绑定或无效!"));
+			TEXT("[PlayerStatus] SetMotherSkillIconVisibility: Overlay_MotherSkillIcon 未绑定或无效! "
+			     "检查 WBP_PlayerStatusWidget 是否添加了 Overlay_MotherSkillIcon 覆层控件。"));
 		return;
 	}
 
-	// 二次检查: 确保对象在游戏线程上
+	// 确保在游戏线程上
 	if (!IsInGameThread())
 	{
 		UE_LOG(LogTemp, Warning,
@@ -572,12 +577,11 @@ void UPlayerStatusWidget::SetMotherSkillIconVisibility(bool bIsMother)
 		return;
 	}
 
-	// 设置显隐 (防御性调用)
+	// 设置 Overlay 显隐
 	ESlateVisibility TargetVisibility = bIsMother ? ESlateVisibility::Visible : ESlateVisibility::Hidden;
-	Image_MotherSkillIcon->SetVisibility(TargetVisibility);
+	Overlay_MotherSkillIcon->SetVisibility(TargetVisibility);
 
-	// 【v121.2 修复】防御性日志输出
-	// 崩溃发生在 GetOwningPlayerPawn()->GetName()，需要检查返回值有效性
+	// 日志输出
 	if (APawn* OwningPawn = GetOwningPlayerPawn())
 	{
 		UE_LOG(LogTemp, Display,
@@ -615,7 +619,8 @@ void UPlayerStatusWidget::SetMotherSkillIconVisibility(bool bIsMother)
  */
 void UPlayerStatusWidget::UpdateMotherSkillCooldownProgress()
 {
-	// 【v121.3 修复】使用更保守的检查方式
+	// 【v238 重构】检查 Image 而非直接用 — Overlay 控制显隐，Image 只负责材质
+	// 注意：即便 Image 无效，只要 Overlay 存在，NativeTick 每帧仍会尝试更新材质（但不会崩溃）
 	if (!Image_MotherSkillIcon || !Image_MotherSkillIcon->IsValidLowLevel())
 	{
 		UE_LOG(LogTemp, Error,

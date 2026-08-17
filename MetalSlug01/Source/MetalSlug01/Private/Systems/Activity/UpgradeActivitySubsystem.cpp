@@ -22,6 +22,7 @@
 #include "Misc/DateTime.h"
 #include "Tools/UpgradeActivitySaveModifier.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口
+#include "Systems/Activity/ActivityDataTableService.h" // v231: UActivityDataTableService 完整定义
 #include "Logs/MetalSlugLogChannels.h"
 
 namespace
@@ -32,6 +33,31 @@ namespace
 		if (!WorldContext) return nullptr;
 		UGameInstance* GI = WorldContext->GetWorld() ? WorldContext->GetWorld()->GetGameInstance() : nullptr;
 		return GI ? GI->GetSubsystem<UActivitySubsystem>() : nullptr;
+	}
+
+	// v231: 集中获取 DataTableService 实例 — 唯一真理源
+	// 替代旧版多处重复的 CachedConfigTable 持有
+	// 调用方: GetService() 内部 Get() 强引用保证 GC 安全
+	// 失败处理: 返回 nullptr 让调用方 Log Error + 拒绝继续 (零兜底)
+	FActivityDataTableService* GetDTService(const UObject* WorldContext)
+	{
+		UActivitySubsystem* ActivitySub = GetActivitySub(WorldContext);
+		if (!ActivitySub) return nullptr;
+		UActivityDataTableService* DTService = ActivitySub->GetDataTableService();
+		return DTService ? &DTService->GetService() : nullptr;
+	}
+
+	// v231: GameInstanceSubsystem 上下文直接获取 (Initialize 阶段 World 不可用)
+	// 严仅限 UGameInstanceSubsystem 的派生类调用 — 通过 this->GetGameInstance() 拿到 owner
+	FActivityDataTableService* GetDTServiceFromSubsystem(const UGameInstanceSubsystem* Subsystem)
+	{
+		if (!Subsystem) return nullptr;
+		UGameInstance* GI = Subsystem->GetGameInstance();
+		if (!GI) return nullptr;
+		UActivitySubsystem* ActivitySub = GI->GetSubsystem<UActivitySubsystem>();
+		if (!ActivitySub) return nullptr;
+		UActivityDataTableService* DTService = ActivitySub->GetDataTableService();
+		return DTService ? &DTService->GetService() : nullptr;
 	}
 }
 
@@ -45,45 +71,47 @@ namespace
  */
 void UUpgradeActivitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
-    Super::Initialize(Collection);
+	Super::Initialize(Collection);
 
-    // 1. 预加载配置表 - 走 FActivityDataTableService 统一管理
-    CachedConfigTable = FActivityDataTableService::Get(ActivityDataTable::DailyUpgradeReward);
+	// v231: 配置表预加载改走 GetDTService() — 强引用保证 GC 安全
+	// 旧版 CachedConfigTable 重复缓存已删除, 严禁再持有
+	// Initialize 阶段 World 不可用 (UseSubsystemObject<>::Initialize 时 World 未创建), 用 SysContext 路径
+	(void)GetDTServiceFromSubsystem(this);
 
-    // 2. 检查并创建初始记录 - 确保系统有最新的记录
-    if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
-    {
-        UActivitySaveGame* Loaded = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
-        if (Loaded && Loaded->UpgradeRewardRecords.Num() > 0)
-        {
-            // 存档存在且包含记录，加载最新的记录（不管RecordDate是多少）
-            ReloadLatestRecord();
-        }
-        else
-        {
-            // 存档存在但没有记录数据，创建第一天记录
-            CreateTodayRecord();
-            SaveStatus(); // 立即保存到磁盘
-        }
-    }
-    else
-    {
-        // 完全没有存档，创建全新的第一天记录
-        CreateTodayRecord();
-        SaveStatus(); // 立即保存到磁盘
-    }
+	// 2. 检查并创建初始记录 - 确保系统有最新的记录
+	if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
+	{
+		UActivitySaveGame* Loaded = Cast<UActivitySaveGame>(UGameplayStatics::LoadGameFromSlot(SaveSlotName, SaveUserIndex));
+		if (Loaded && Loaded->UpgradeRewardRecords.Num() > 0)
+		{
+			// 存档存在且包含记录，加载最新的记录（不管RecordDate是多少）
+			ReloadLatestRecord();
+		}
+		else
+		{
+			// 存档存在但没有记录数据，创建第一天记录
+			CreateTodayRecord();
+			SaveStatus(); // 立即保存到磁盘
+		}
+	}
+	else
+	{
+		// 完全没有存档，创建全新的第一天记录
+		CreateTodayRecord();
+		SaveStatus(); // 立即保存到磁盘
+	}
 
-    // 3. 初始化升级活动存档修改器
-    SaveModifier = NewObject<UUpgradeActivitySaveModifier>(this);
-    if (GetWorld())
-    {
-    	SaveModifier->InitializeModifier(GetWorld(), this);  // 传入World和自身作为Subsystem
-    }
-    else
-    {
-    	SaveModifier->InitializeModifier(nullptr, this);  // 传入nullptr和自身作为Subsystem
-    }
-    SaveModifier->RegisterConsoleCommands();
+	// 3. 初始化升级活动存档修改器
+	SaveModifier = NewObject<UUpgradeActivitySaveModifier>(this);
+	if (GetWorld())
+	{
+		SaveModifier->InitializeModifier(GetWorld(), this);  // 传入World和自身作为Subsystem
+	}
+	else
+	{
+		SaveModifier->InitializeModifier(nullptr, this);  // 传入nullptr和自身作为Subsystem
+	}
+	SaveModifier->RegisterConsoleCommands();
 }
 
 /**
@@ -239,65 +267,56 @@ void UUpgradeActivitySubsystem::ReloadLatestRecord()
  */
 const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetActivityConfig()
 {
-    if (!CachedConfigTable)
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("[UUpgradeActivitySubsystem] GetActivityConfig: CachedConfigTable 为空, 无法查找 ActivityID=110."));
-        return nullptr;
-    }
-    static const FString ContextString(TEXT("UpgradeSubsystem"));
-
-    // 🔧【v230 热重载修复】改用 GetRowNames() + FindRow() 路径
-    // 原因: GetRowMap() 在热重载后可能返回失效指针，导致 Row->ActivityID 访问崩溃或数据错误
-    // 这与 DT_TreasureBoxItem 的 FindRowByIdSafe 使用相同的安全路径
-    const TArray<FName> RowNames = CachedConfigTable->GetRowNames();
-    for (const FName& RowName : RowNames)
-    {
-        FDailyUpgradeRewardConfigRow* Row = CachedConfigTable->FindRow<FDailyUpgradeRewardConfigRow>(RowName, ContextString, /*bWarnIfRowMissing=*/false);
-        if (Row && Row->ActivityID == 110)
-        {
-            // 找到目标活动配置
-            return Row;
-        }
-    }
-    UE_LOG(LogTemp, Error,
-        TEXT("[UUpgradeActivitySubsystem] GetActivityConfig: 遍历 %d 行未找到 ActivityID=110."),
-        RowNames.Num());
-    return nullptr;
+	// v231: 改走 Service.FindRowByIdSafe — 强引用 GC 安全 + 单一真理源
+	// 旧版 IsValid + 遍历 + reinterpret_cast 全部删除
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySubsystem] GetActivityConfig: DataTableService 未初始化, 无法查找 ActivityID=110."));
+		return nullptr;
+	}
+	return Service->FindRowByIdSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[](const FDailyUpgradeRewardConfigRow& Row) { return Row.ActivityID; },
+		110
+	);
 }
 
 const FUpgradeRewardSaveRecord* UUpgradeActivitySubsystem::GetRecordByDate(int32 RecordDate) const
 {
-    if (AllRecords.Contains(RecordDate))
-    {
-        return &AllRecords[RecordDate];
-    }
-    return nullptr;
+	if (AllRecords.Contains(RecordDate))
+	{
+		return &AllRecords[RecordDate];
+	}
+	return nullptr;
 }
 
 void UUpgradeActivitySubsystem::AddOrUpdateRecord(int32 RecordDate, const FUpgradeRewardSaveRecord& Record)
 {
-    AllRecords.Add(RecordDate, Record);
+	AllRecords.Add(RecordDate, Record);
 
 }
 
 const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetConfigRowForDay(const FString& DayIdentifier) const
 {
-    if (!CachedConfigTable)
-    {
-        return nullptr;
-    }
-
-    // 遍历配置表查找指定的 DayIdentifier
-    for (auto& Pair : CachedConfigTable->GetRowMap())
-    {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 102 && Row->DayIdentifier == DayIdentifier)
-        {
-            return Row;
-        }
-    }
-    return nullptr;
+	// v231: 改走 Service.GetRowsSafe — 强引用 GC 安全 + 单一真理源
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySubsystem] GetConfigRowForDay: DataTableService 未初始化, DayIdentifier=%s"),
+			*DayIdentifier);
+		return nullptr;
+	}
+	const TArray<const FDailyUpgradeRewardConfigRow*> Rows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[&DayIdentifier](const FDailyUpgradeRewardConfigRow& Row)
+		{
+			return Row.ActivityID == 102 && Row.DayIdentifier == DayIdentifier;
+		}
+	);
+	return Rows.Num() > 0 ? Rows[0] : nullptr;
 }
 
 /**
@@ -980,48 +999,50 @@ FName UUpgradeActivitySubsystem::GetConfigTablePath() const
  */
 const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetExtraConfigForDay1()
 {
-    if (!CachedConfigTable) return nullptr;
-    static const FString ContextString(TEXT("UpgradeSubsystem_Extra"));
-
-    // 遍历配置表查找目标活动
-    for (auto& Pair : CachedConfigTable->GetRowMap())
-    {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 102 && Row->DayIdentifier == TEXT("day1")) 
-        {
-            // 找到目标额外配置
-            return Row;
-        }
-    }
-    return nullptr;
+	// v231: 改走 Service.GetRowsSafe — 强引用 GC 安全 + 单一真理源
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[UUpgradeActivitySubsystem] GetExtraConfigForDay1: DataTableService 未初始化"));
+		return nullptr;
+	}
+	const TArray<const FDailyUpgradeRewardConfigRow*> Rows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[](const FDailyUpgradeRewardConfigRow& Row)
+		{
+			return Row.ActivityID == 102 && Row.DayIdentifier == TEXT("day1");
+		}
+	);
+	return Rows.Num() > 0 ? Rows[0] : nullptr;
 }
 
 TArray<FString> UUpgradeActivitySubsystem::GetDailyTaskDescriptions()
 {
-    TArray<FString> Result;
+	TArray<FString> Result;
 
-    // 检查配置表是否已加载
-    if (!CachedConfigTable)
-    {
-        return Result;
-    }
+	// v231: 改走 Service.GetRowsSafe — 强引用 GC 安全 + 单一真理源
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[UUpgradeActivitySubsystem] GetDailyTaskDescriptions: DataTableService 未初始化"));
+		return Result;
+	}
+	const TArray<const FDailyUpgradeRewardConfigRow*> Rows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[](const FDailyUpgradeRewardConfigRow& Row) { return Row.ActivityID == 102; }
+	);
+	Result.Reserve(Rows.Num());
+	for (const FDailyUpgradeRewardConfigRow* Row : Rows)
+	{
+		Result.Add(Row->DayIdentifier);
+	}
 
-    // 收集所有ActivityID=102的DayIdentifier字段
-    for (auto& Pair : CachedConfigTable->GetRowMap())
-    {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 102)
-        {
-            Result.Add(Row->DayIdentifier);
-        }
-    }
+	// 按字典序排序确保day1, day2, day3...的顺序
+	Result.Sort([](const FString& A, const FString& B) {
+		return A.Compare(B) < 0;
+	});
 
-    // 按字典序排序确保day1, day2, day3...的顺序
-    Result.Sort([](const FString& A, const FString& B) {
-        return A.Compare(B) < 0;
-    });
-
-    return Result;
+	return Result;
 }
 
 int32 UUpgradeActivitySubsystem::GetMaxRecordDate() const
@@ -1124,29 +1145,29 @@ TArray<bool> UUpgradeActivitySubsystem::GetDailyTaskLockStates() const
 
 TArray<FString> UUpgradeActivitySubsystem::GetProcessedTaskDescriptionsForDay(const FString& DayIdentifier) const
 {
-    TArray<FString> Result;
+	TArray<FString> Result;
 
-    // 🔧 核心业务逻辑：查找指定 DayIdentifier 的配置行
-    if (!CachedConfigTable)
-    {
-        return Result;
-    }
-
-    const FDailyUpgradeRewardConfigRow* ConfigRow = nullptr;
-    for (auto& Pair : CachedConfigTable->GetRowMap())
-    {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 102 && Row->DayIdentifier == DayIdentifier)
-        {
-            ConfigRow = Row;
-            break;
-        }
-    }
-
-    if (!ConfigRow)
-    {
-        return Result;
-    }
+	// v231: 服务层拉配置 + 业务逻辑处理
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySubsystem] GetProcessedTaskDescriptionsForDay: DataTableService 未初始化, DayIdentifier=%s"),
+			*DayIdentifier);
+		return Result;
+	}
+	const TArray<const FDailyUpgradeRewardConfigRow*> Rows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[&DayIdentifier](const FDailyUpgradeRewardConfigRow& Row)
+		{
+			return Row.ActivityID == 102 && Row.DayIdentifier == DayIdentifier;
+		}
+	);
+	const FDailyUpgradeRewardConfigRow* ConfigRow = Rows.Num() > 0 ? Rows[0] : nullptr;
+	if (!ConfigRow)
+	{
+		return Result;
+	}
 
     // 🔧 核心业务逻辑：获取指定天数的 TaskCompleteCounts（从内存数据）
     int32 DayNumber = FCString::Atoi(*DayIdentifier.RightChop(3)); // 从 "day1" 提取数字 1
@@ -1217,23 +1238,25 @@ TArray<FString> UUpgradeActivitySubsystem::GetProcessedTaskDescriptionsForCurren
  */
 const FDailyUpgradeRewardConfigRow* UUpgradeActivitySubsystem::GetExtraConfigForSpecificDay(int32 DayNumber)
 {
-    if (!CachedConfigTable) return nullptr;
-    static const FString ContextString(TEXT("UpgradeSubsystem_SpecificDay"));
+	// v231: 改走 Service.GetRowsSafe — 强引用 GC 安全 + 单一真理源
+	const FString TargetDayIdentifier = FString::Printf(TEXT("day%d"), DayNumber);
 
-    // 构造目标DayIdentifier
-    FString TargetDayIdentifier = FString::Printf(TEXT("day%d"), DayNumber);
-
-    // 遍历配置表查找目标活动
-    for (auto& Pair : CachedConfigTable->GetRowMap())
-    {
-        FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-        if (Row && Row->ActivityID == 102 && Row->DayIdentifier == TargetDayIdentifier) 
-        {
-            // 找到目标额外配置
-            return Row;
-        }
-    }
-    return nullptr;
+	FActivityDataTableService* Service = GetDTService(this);
+	if (!Service)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[UUpgradeActivitySubsystem] GetExtraConfigForSpecificDay: DataTableService 未初始化, DayNumber=%d"),
+			DayNumber);
+		return nullptr;
+	}
+	const TArray<const FDailyUpgradeRewardConfigRow*> Rows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+		ActivityDataTable::DailyUpgradeReward,
+		[&TargetDayIdentifier](const FDailyUpgradeRewardConfigRow& Row)
+		{
+			return Row.ActivityID == 102 && Row.DayIdentifier == TargetDayIdentifier;
+		}
+	);
+	return Rows.Num() > 0 ? Rows[0] : nullptr;
 }
 
 /**
@@ -2094,27 +2117,28 @@ int32 UUpgradeActivitySubsystem::GetTargetChestIndexForCurrentExperience() const
 TArray<UTexture2D*> UUpgradeActivitySubsystem::GetRewardIconsForDay(const FString& DayIdentifier) const
 {
     TArray<UTexture2D*> Result;
-    
+
     // 1. 获取配置行
     const FDailyUpgradeRewardConfigRow* ConfigRow = GetConfigRowForDay(DayIdentifier);
     if (!ConfigRow)
     {
         UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetRewardIconsForDay: 未找到配置数据 - Day:%s"), *DayIdentifier);
-        
-        // 调试：输出所有可用的DayIdentifier
-        if (CachedConfigTable)
+
+        // 调试：输出所有可用的DayIdentifier (v231: 改走 Service 强引用访问)
+        FActivityDataTableService* Service = GetDTService(this);
+        if (Service)
         {
+            const TArray<const FDailyUpgradeRewardConfigRow*> AllRows = Service->GetRowsSafe<FDailyUpgradeRewardConfigRow>(
+                ActivityDataTable::DailyUpgradeReward,
+                [](const FDailyUpgradeRewardConfigRow& Row) { return Row.ActivityID == 102; }
+            );
             UE_LOG(LogTemp, Warning, TEXT("UUpgradeActivitySubsystem::GetRewardIconsForDay: 可用的配置行:"));
-            for (auto& Pair : CachedConfigTable->GetRowMap())
+            for (const FDailyUpgradeRewardConfigRow* Row : AllRows)
             {
-                FDailyUpgradeRewardConfigRow* Row = (FDailyUpgradeRewardConfigRow*)Pair.Value;
-                if (Row && Row->ActivityID == 102)
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("  - DayIdentifier: %s, ActivityID: %d"), *Row->DayIdentifier, Row->ActivityID);
-                }
+                UE_LOG(LogTemp, Warning, TEXT("  - DayIdentifier: %s, ActivityID: %d"), *Row->DayIdentifier, Row->ActivityID);
             }
         }
-        
+
         return Result;
     }
     

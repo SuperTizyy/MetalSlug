@@ -1,13 +1,20 @@
 // ==========================================
-// 脚步音效 Component 【2026-06-15 重构: 完整迁移 BaseCharacter 脚步逻辑】
-// 目的: BaseCharacter 的脚步物理检测与音效播放全部下沉到本 Component
-// 优势:
-//   1. 音效资源自治: Crouch/Run/Walk 三种脚步声在 Component 内配置
-//   2. 音量 CVar 绑定: 通过 g.FootstepVolume 控制全局缩放
-//   3. 地面检测: LineTrace 获取物理材质，可扩展不同地面不同音效
-//   4. 随机音高: 0.9~1.1 随机变化，更自然的脚步听感
-// 调用链: AnimNotify → BaseCharacter::PlayFootstepSound(Location)
-//                          → FootstepComponent->PlayFootstep(OwnerChar, Location)
+// 脚步音效 Component
+// 职责单一:
+//   本 Component 只负责"音效资源选择 + 距离衰减播放",
+//   不做任何网络复制、网络状态管理 — 那是 BaseCharacter::Multicast_PlayFootstep 的事.
+//
+// 调用链 (重构后):
+//   AnimNotify → BaseCharacter::PlayFootstepSound(Location)
+//                → 服务器: 自己直接播放 (ListenServer / Dedicated)
+//                → Multicast_PlayFootstep RPC → 所有客户端 Implementation
+//                → FootstepComponent->PlayFootstep(SoundAttr, Location)
+//                → UGameplayStatics::PlaySoundAtLocation 走 BP 配置的 Attenuation
+//
+// 大厂原则:
+//   - 单一真理源: 距离衰减参数 (USoundAttenuation) 必须在 BP 配置, 不允许 CVar 兜底
+//   - 零兜底: 没配 Attenuation → Log Error + 不播放
+//   - 职责单一: Component 只管"放音", 不管"网络同步"
 // ==========================================
 #pragma once
 
@@ -16,6 +23,7 @@
 #include "FootstepComponent.generated.h"
 
 class USoundBase;
+class USoundAttenuation;
 class ACharacter;
 
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
@@ -27,10 +35,14 @@ public:
 	UFootstepComponent();
 
 	/**
-	 * 播放一次脚步音效
-	 * 由 BaseCharacter::PlayFootstepSound(Location) 委托调用
-	 * @param OwnerChar Owner 角色引用（用于获取速度/下蹲状态）
-	 * @param Location 脚步播放位置
+	 * 播放一次脚步音效（带距离衰减）
+	 *
+	 * @param OwnerChar  Owner 角色引用（用于获取速度/下蹲状态 + 决定是否播放）
+	 * @param Location   脚步播放位置
+	 *
+	 * 大厂原则:
+	 *   - 必有 FootstepAttenuation (BP 配置) — 否则 Log Error + 不播放
+	 *   - 必有 FootstepSound (BP 配置) — 否则 Log Error + 不播放
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Footstep")
 	void PlayFootstep(ACharacter* OwnerChar, const FVector& Location);
@@ -49,15 +61,30 @@ protected:
 	TEnumAsByte<ECollisionChannel> FootstepTraceChannel = ECC_PhysicsBody;
 
 public:
-	/** 下蹲时的脚步声资源 */
+	/**
+	 * 脚步声音距离衰减资产 (单一真理源)
+	 * 【v241 大厂架构】脚步声整体音量曲线由此资产决定
+	 *   - 必须在 BP 配置 (BP_BaseCharacter / BP_GruntAI / BP_MuTi)
+	 *   - 缺失 → Log Error + 不播放 (零兜底)
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Audio")
-	TObjectPtr<USoundBase> CrouchFootstepSound = nullptr;
+	TObjectPtr<USoundAttenuation> FootstepAttenuation = nullptr;
 
-	/** 奔跑时的脚步声资源 */
+	/**
+	 * 脚步声音资源 (单一真理源)
+	 * 【v241 大厂架构】脚步声 = 脚步声音资源 (一套) × 距离衰减曲线
+	 *   - 必须在 BP 配置 (BP_BaseCharacter / BP_GruntAI / BP_MuTi)
+	 *   - 缺失 → Log Error + 不播放 (零兜底)
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Audio")
-	TObjectPtr<USoundBase> RunFootstepSound = nullptr;
+	TObjectPtr<USoundBase> FootstepSound = nullptr;
 
-	/** 行走时的脚步声资源 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Audio")
-	TObjectPtr<USoundBase> WalkFootstepSound = nullptr;
+	/**
+	 * 全局音量缩放 (BP 配置, 不是运行时 CVar)
+	 * 【v241 修复】替换原 CVarFootstepVolume 兜底
+	 *   - 默认 1.0
+	 *   - 调整不会改动 BP
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Footstep|Audio", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float FootstepVolumeMultiplier = 1.0f;
 };

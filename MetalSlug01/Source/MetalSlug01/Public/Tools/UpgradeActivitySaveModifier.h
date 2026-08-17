@@ -80,11 +80,12 @@ public:
 
 	// ==================== 基类接口实现 ====================
 
-	/** Slot 名固定 UpgradeReward_SaveSlot (与 UpgradeActivitySubsystem 共用) */
-	virtual FString GetSaveSlotName(int32 /*ActivityID*/) const
-	{
-		return TEXT("UpgradeReward_SaveSlot");
-	}
+	/**
+	 * 【v232 修复: 进程隔离】
+	 * 旧: 硬编码返回 "UpgradeReward_SaveSlot" → 双开时所有窗口写同一 .sav
+	 * 新: 读取 OwningSubsystem->SaveSlotName (已在 .h 层用 FPlatformProcess::GetCurrentProcessId() 隔离)
+	 */
+	virtual FString GetSaveSlotName(int32 /*ActivityID*/) const;
 
 	// ==================== 数据修改接口 ====================
 

@@ -120,7 +120,7 @@ void UDailyLoginDayItemWidget::Init(int32 InDayIndex, int32 InCurrentProgress, E
 	// 2. 加载奖励图标（直接操作 RewardIconImage / RewardCountText）
 	if (ActivitySubsystem)
 	{
-		TArray<FDailyLoginConfigRow*> Rewards = ActivitySubsystem->GetRewardsByDay(101, DayIndex);
+		TArray<const FDailyLoginConfigRow*> Rewards = ActivitySubsystem->GetRewardsByDay(101, DayIndex);
 		UE_LOG(LogTemp, Warning, TEXT("Init: 自动加载第%d天奖励图标，奖励数量: %d"), DayIndex, Rewards.Num());
 
 		if (Rewards.Num() > 0 && Rewards[0])
@@ -270,7 +270,7 @@ void UDailyLoginDayItemWidget::OnClaimButtonClicked()
 		if (UActivitySubsystem* ActivitySub = GI->GetSubsystem<UActivitySubsystem>())
 		{
 			// 获取对应天数的奖励信息
-			TArray<FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, DayIndex);
+			TArray<const FDailyLoginConfigRow*> Rewards = ActivitySub->GetRewardsByDay(101, DayIndex);
 
 			if (Rewards.Num() > 0)
 			{

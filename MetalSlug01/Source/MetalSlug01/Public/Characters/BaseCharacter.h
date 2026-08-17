@@ -517,6 +517,25 @@ public:
 	//   迁移: 旧调用点 ARoomGameMode::SpawnAIInternal 改用 FFactionTags::AttitudeBetween / IsSameSide
 
 	/**
+	 * 【v241 大厂架构新增】脚步声同步 RPC
+	 *
+	 * 服务器在收到 AnimNotify 触发时调用 → 所有客户端播放带距离衰减的脚步声
+	 *
+	 * 触发场景:
+	 *   - AnimNotify_Footstep 在客户端 AnimInstance 触发 (本地音效)
+	 *   - 服务器端 AnimInstance 触发脚步声时, 调此 RPC → 所有客户端 (含自己) 播放
+	 *
+	 * 大厂原则:
+	 *   - 单一入口: 所有"其他客户端听到" 的脚步声都走这条 RPC
+	 *   - 距离衰减: FootstepComponent::PlayFootstep 内部用 BP 配置的 USoundAttenuation
+	 *   - 零兜底: 没配 FootstepSound/FootstepAttenuation → Component 内部 Log Error + 不播放
+	 *
+	 * @param Location 脚步位置 (世界空间)
+	 */
+	UFUNCTION(NetMulticast, Unreliable) // Unreliable: 脚步声不丢一发无所谓
+	void Multicast_PlayFootstep(FVector_NetQuantize Location);
+
+	/**
 	 * 【v100.1 大厂架构 — 母体待机回血音 RPC】服务器调 → 所有客户端播放循环音
 	 *
 	 * 业务规则 (用户 2026.07.26):

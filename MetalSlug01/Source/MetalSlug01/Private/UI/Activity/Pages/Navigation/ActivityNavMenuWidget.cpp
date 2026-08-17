@@ -5,6 +5,7 @@
 // ==========================================
 #include "UI/Activity/Pages/Navigation/ActivityNavMenuWidget.h"
 #include "Systems/Activity/ActivitySubsystem.h"
+#include "Systems/Activity/ActivityDataTableService.h" // v231: UActivityDataTableService 完整定义
 #include "Systems/Music/MusicManagerSubsystem.h"
 #include "Data/ActivitySaveGame.h"
 #include "Components/Button.h"
@@ -17,6 +18,46 @@
 #include "Blueprint/UserWidget.h"
 #include "Data/FActivityDataTableService.h" // 活动表统一加载入口
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardPage.h"
+
+namespace
+{
+	// v231: 集中获取 DataTableService 实例 (ActivityNavMenuWidget 上下文专用)
+	// 替代旧版散落的 FActivityDataTableService::Get 静态调用 — 静态调用野指针崩溃的根因
+	FActivityDataTableService& GetDTService(const UObject* WorldContext)
+	{
+		static FActivityDataTableService* CachedPtr = nullptr;
+		UActivitySubsystem* ActivitySub = nullptr;
+
+		if (WorldContext)
+		{
+			if (UGameInstance* GI = WorldContext->GetWorld() ? WorldContext->GetWorld()->GetGameInstance() : nullptr)
+			{
+				ActivitySub = GI->GetSubsystem<UActivitySubsystem>();
+			}
+		}
+
+		if (!ActivitySub)
+		{
+			// 兜底: 跨 World 查找 (编辑器 PIE 经常 WorldContext 不对)
+			if (GEngine)
+			{
+				for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+				{
+					if (UGameInstance* GI = Ctx.OwningGameInstance)
+					{
+						ActivitySub = GI->GetSubsystem<UActivitySubsystem>();
+						if (ActivitySub) break;
+					}
+				}
+			}
+		}
+
+		checkf(ActivitySub && ActivitySub->GetDataTableService(),
+			TEXT("GetDTService (ActivityNavMenuWidget): ActivitySubsystem 或 DataTableService 未初始化"));
+
+		return ActivitySub->GetDataTableService()->GetService();
+	}
+}
 
 
 // ==========================================
@@ -263,7 +304,7 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 
 		// 从 DataTable 获取完整的活动信息
 		// 改造: 走 FActivityDataTableService, 避免硬编码路径
-		UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+		UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 		if (!ActivityInfoTable)
 		{
@@ -291,7 +332,7 @@ UActivityNavButton* UActivityNavMenuWidget::CreateNavItemButton(const FActivityN
 			if (!ActivityInfo)
 			{
 				ActivityInfo = const_cast<FActivityInfoRow*>(
-					FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+					GetDTService(this).FindRowByIdSafe<FActivityInfoRow>(
 						ActivityDataTable::ActivityInfo,
 						[](const FActivityInfoRow& Row) { return Row.ActivityID; },
 						TargetActivityId
@@ -678,7 +719,7 @@ void UActivityNavMenuWidget::LoadNavItemsFromDataTable()
 
 	// 先尝试直接加载 DataTable
 	// 改造: 走 FActivityDataTableService, 避免硬编码路径
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+	UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 	if (!ActivityInfoTable)
 	{
@@ -690,7 +731,7 @@ void UActivityNavMenuWidget::LoadNavItemsFromDataTable()
 
 
 	// 用 GetRowsSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
-	const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+	const TArray<const FActivityInfoRow*> AllRows = GetDTService(this).GetRowsSafe<FActivityInfoRow>(
 		ActivityDataTable::ActivityInfo,
 		[](const FActivityInfoRow& Row) { return Row.ActivityType == EActivityType::CategoryHeader; }
 	);
@@ -742,7 +783,7 @@ void UActivityNavMenuWidget::LoadAllActivityItemsFromDataTable()
 
 	// 直接加载 DataTable
 	// 改造: 走 FActivityDataTableService
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+	UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 	if (!ActivityInfoTable)
 	{
@@ -753,7 +794,7 @@ void UActivityNavMenuWidget::LoadAllActivityItemsFromDataTable()
 
 
 	// 用 GetRowsSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
-	const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+	const TArray<const FActivityInfoRow*> AllRows = GetDTService(this).GetRowsSafe<FActivityInfoRow>(
 		ActivityDataTable::ActivityInfo,
 		[](const FActivityInfoRow& Row) { return true; } // 不过滤, 收集所有行
 	);
@@ -802,7 +843,7 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 
 	// 加载活动信息数据表
 	// 改造: 走 FActivityDataTableService
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+	UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 	if (ActivityInfoTable)
 	{
@@ -820,7 +861,7 @@ FText UActivityNavMenuWidget::GetActivityDisplayName(FName ActivityId)
 		if (!ActivityInfo)
 		{
 			ActivityInfo = const_cast<FActivityInfoRow*>(
-				FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+				GetDTService(this).FindRowByIdSafe<FActivityInfoRow>(
 					ActivityDataTable::ActivityInfo,
 					[](const FActivityInfoRow& Row) { return Row.ActivityID; },
 					TargetActivityId
@@ -852,13 +893,13 @@ FName UActivityNavMenuWidget::GetDefaultSelectedActivityId()
 {
 	// 从 DataTable 中查找设置了 bIsDefaultSelected=true 的活动，返回其活动 ID
 	// 改造: 走 FActivityDataTableService
-	UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+	UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 	if (ActivityInfoTable)
 	{
 		// 用 FindRowByIdSafe 防御性遍历 (避开 GetAllRows 崩溃 v4 - 2026-08-10)
 		// 仅查找 bIsDefaultSelected 为 true 的第一行
-		const TArray<const FActivityInfoRow*> AllRows = FActivityDataTableService::GetRowsSafe<FActivityInfoRow>(
+		const TArray<const FActivityInfoRow*> AllRows = GetDTService(this).GetRowsSafe<FActivityInfoRow>(
 			ActivityDataTable::ActivityInfo,
 			[](const FActivityInfoRow& Row) { return Row.bIsDefaultSelected; }
 		);
@@ -1009,7 +1050,7 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 	{
 		// 直接从 DataTable 加载活动配置，获取 TargetPageClass
 		// 改造: 走 FActivityDataTableService
-		UDataTable* ActivityInfoTable = FActivityDataTableService::Get(ActivityDataTable::ActivityInfo);
+		UDataTable* ActivityInfoTable = GetDTService(this).Get(ActivityDataTable::ActivityInfo);
 
 		if (!ActivityInfoTable)
 		{
@@ -1036,7 +1077,7 @@ void UActivityNavMenuWidget::SwitchToActivityPage(FName ActivityId)
 			int32 TargetActivityId = FCString::Atoi(*ActivityId.ToString());
 
 			FActivityInfoRow* TargetConfig = const_cast<FActivityInfoRow*>(
-				FActivityDataTableService::FindRowByIdSafe<FActivityInfoRow>(
+				GetDTService(this).FindRowByIdSafe<FActivityInfoRow>(
 					ActivityDataTable::ActivityInfo,
 					[](const FActivityInfoRow& Row) { return Row.ActivityID; },
 					TargetActivityId

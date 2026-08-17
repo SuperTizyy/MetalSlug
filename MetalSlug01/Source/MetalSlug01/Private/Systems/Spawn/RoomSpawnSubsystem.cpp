@@ -619,20 +619,45 @@ AActor* URoomSpawnSubsystem::GetAvailableHumanSurvivorSpawnPoint(AController* Oc
  *   - AI: 读 BaseAIC.GetCachedAIPawnClass() → 销毁母体 BP → 重新生成人类 BP
  *   - 单一真理源: AIC 复用, SetCachedIsMother(false) + SetCachedFactionTag(Defense)
  *   - 激活移动锁定 + 无敌期闪烁 + 出生音效 (镜像玩家)
+ *
+ * 【v230 大厂架构修复】分两阶段遍历 AI 解决 TActorIterator 竞态问题
+ *
+ *   根因 (用户 2026.08.18 反馈):
+ *     "偶尔有时候进入新的小局，会有母体出现，没有把所有母体全部变成人类"
+ *
+ *   触发链:
+ *     1. RestartZombieRoundPlayers 使用 TActorIterator<ABaseCharacter> 遍历所有角色
+ *     2. 第一帧迭代捕获母体 Pawn (AIChar = 母体 Pawn)
+ *     3. Destroy() + Spawn 新人类 Pawn → 新 Pawn 立即被添加到世界
+ *     4. 下一帧迭代时 TActorIterator 捕获新人类 Pawn
+ *     5. 新人类 Pawn 的 bIsMother=false, Class 不含 "MuTi" → bNeedsDemutation=false
+ *     6. 但 AIChar 变量仍指向旧 Pawn (已在 PendingKill), 状态被错误设置
+ *     7. 结果: 新人类 Pawn 的阵营/CachedIsMother 没有被正确重置
+ *
+ *   修复方案:
+ *     - 阶段 1: 遍历所有 AI, 收集需要销毁重生的母体 Pawn 列表 (不在这帧处理)
+ *     - 阶段 2: 遍历收集到的母体 Pawn 列表, 执行销毁重生 (新 Spawn 的 Pawn 不会在本循环中被处理)
+ *     - 阶段 3: 遍历所有 AI, 处理"已经是人类"的 Pawn (排除新 Spawn 的)
+ *
+ *   大厂原则 — 单一真理源:
+ *     - 用 AIController 作为唯一标识符 (跨 Pawn 生命周期不变)
+ *     - 不依赖 Pawn 指针作为循环遍历的 key
+ *
+ *   大厂原则 — 零兜底:
+ *     - 阶段 1/2/3 任何失败都有明确日志
+ *     - 不允许静默跳过任何失败
  */
 void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 {
 	UE_LOG(LogTemp, Log,
-		TEXT("[Spawn] 【v201.1】RestartZombieRoundPlayers: 开始重新分配所有玩家和 AI 到 HumanSurvivor 复活点."));
+		TEXT("[Spawn] 【v230】RestartZombieRoundPlayers ENTER: 开始重新分配所有玩家和 AI 到 HumanSurvivor 复活点."));
 
 	// 确保复活点已扫描
 	ScanAndCachePlayerStarts(false);
-
-	// 【v201.1】人类幸存者复活点为空 → Log Error + return
 	if (HumanSurvivorSpawnPoints.Num() == 0)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[Spawn] 【v201.1】RestartZombieRoundPlayers: HumanSurvivorSpawnPoints 为空!"));
+			TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: HumanSurvivorSpawnPoints 为空!"));
 		return;
 	}
 
@@ -641,6 +666,41 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 	{
 		return;
 	}
+
+	// ==========================================
+	// 【v240 大厂架构修复】小局转换时必须清空占用池
+	// ==========================================
+	//
+	// 根因 (用户 2026.08.18 反馈):
+	//   "进入新的小局, 母体并没变人类, 且没有重新到出生点复活."
+	//
+	// 触发链:
+	//   1. 第一小局: 玩家和 AI 占用 HumanSurvivor 复活点 (OccupiedSpawnPoints 被填满)
+	//   2. MutateCharacterToMother: 部分 AI 变异为母体, 占用 MotherSpawnPoints (独立池)
+	//   3. 小局结束时 HandleCountdownExpired → StartNextZombieRound → RestartZombieRoundPlayers
+	//   4. 阶段 2a 收集母体 AI → GetAvailableHumanSurvivorSpawnPoint → OccupiedSpawnPoints 仍满 → 全部失败
+	//   5. 9 个母体 AI "无法分配复活点, 跳过" → 保持母体状态 → 玩家看到母体没变
+	//
+	// 根因分析:
+	//   - OccupiedSpawnPoints 和 OccupiedSpawnByController 存储的是"上一小局的占用状态"
+	//   - 新小局开始时所有角色都要重新分配, 不能继承旧占用
+	//   - HumanSurvivorSpawnPoints 本身不需要清 (它是 BP 的 PlayerStart 列表, 不是运行时占用池)
+	//
+	// 修复:
+	//   - 在 RestartZombieRoundPlayers 开始时显式清空 OccupiedSpawnPoints + OccupiedSpawnByController
+	//   - OccupancyOwner 映射也被清空 — 旧的 Controller→SpawnPoint 映射在新小局完全无效
+	//
+	// 大厂原则 — 零兜底:
+	//   - 不清空 → 必然失败 (0 兜底空间)
+	//   - 清空 → 强制重新分配
+	//
+	UE_LOG(LogTemp, Log,
+		TEXT("[Spawn] 【v240 修复】RestartZombieRoundPlayers: 清空占用池. "
+		     "OccupiedSpawnPoints.Num()=%d → 0, OccupiedSpawnByController.Num()=%d → 0."),
+		OccupiedSpawnPoints.Num(), OccupiedSpawnByController.Num());
+
+	OccupiedSpawnPoints.Empty();
+	OccupiedSpawnByController.Empty();
 
 	int32 PlayerAssignedCount = 0;
 	int32 AIAssignedCount = 0;
@@ -958,24 +1018,259 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 		}
 	}
 
-	// ===== Step 2: 处理所有 AI =====
-	for (TActorIterator<ABaseCharacter> It(World); It; ++It)
+	// ===== Step 2: 【v230 大厂架构修复】分两阶段处理 AI 母体变人类 =====
+	//
+	// 根因: TActorIterator 在遍历过程中 Destroy + Spawn 会导致迭代器捕获新 Spawn 的 Pawn
+	// 修复: 分两阶段遍历
+	//
+	// 阶段 2a: 收集需要销毁重生的母体 AI 信息
+	//   - 用 TMap<AIController*, FPendingDemuteInfo> 存储 (AIController 是唯一标识符)
+	//   - 只收集, 不处理 (处理在阶段 2b)
+	//   - 只对母体 Pawn 收集 (bIsMother=true OR Class 含 "MuTi")
+	//
+	TMap<TWeakObjectPtr<AController>, FPendingDemuteInfo> PendingMotherDemuteMap;
 	{
-		ABaseCharacter* AIChar = *It;
-		if (!AIChar)
+		int32 MotherCount = 0;
+		for (TActorIterator<ABaseCharacter> It(World); It; ++It)
 		{
-			continue;
+			ABaseCharacter* AIChar = *It;
+			if (!AIChar)
+			{
+				continue;
+			}
+
+			// 只处理 AI Pawn (有 AIController 的)
+			ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIChar->GetController());
+			if (!BaseAIC)
+			{
+				continue;
+			}
+
+			// 【v230 修复】双判断: bIsMother 标志 OR Pawn Class 是 BP_MuTi 派生
+			const bool bIsMother = AIChar->bIsMother ||
+				AIChar->GetClass()->GetName().Contains(TEXT("MuTi"));
+
+			if (bIsMother)
+			{
+				// 分配复活点
+				AActor* SpawnPoint = GetAvailableHumanSurvivorSpawnPoint(BaseAIC);
+				if (!SpawnPoint)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: AI '%s' 是母体但无法分配复活点, 跳过."),
+						*AIChar->GetName());
+					continue;
+				}
+
+				// 收集信息 (不处理!)
+				FPendingDemuteInfo Info;
+				Info.OldPawn = AIChar;
+				Info.SpawnLoc = SpawnPoint->GetActorLocation();
+				Info.SpawnRot = SpawnPoint->GetActorRotation();
+				Info.HumanWeaponID = BaseAIC->GetCachedWeaponID();
+				PendingMotherDemuteMap.Add(TWeakObjectPtr<AController>(BaseAIC), Info);
+				++MotherCount;
+
+				UE_LOG(LogTemp, Display,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 收集母体 AI '%s' (Pawn='%s', WeaponID='%s'), 将在阶段 2b 处理."),
+					*BaseAIC->GetName(), *AIChar->GetName(), *Info.HumanWeaponID);
+			}
 		}
 
-		// 只处理 AI Pawn (有 AIController 的)
-		AController* AIC = Cast<AController>(AIChar->GetOwner());
-		if (!AIC || AIC->IsPlayerController())
+		UE_LOG(LogTemp, Log,
+			TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2a 完成, 收集到 %d 个母体 AI 需要变人类."),
+			MotherCount);
+	}
+
+	// 阶段 2b: 处理收集到的母体 AI (在新 Pawn Spawn 之后再遍历, 避免 TActorIterator 竞态)
+	{
+		int32 DemutedCount = 0;
+		for (const auto& Pair : PendingMotherDemuteMap)
 		{
-			continue;
+			ABaseAIController* BaseAIC = Cast<ABaseAIController>(Pair.Key.Get());
+			if (!BaseAIC)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: AIController 已销毁, 跳过."),
+					*BaseAIC->GetName());
+				continue;
+			}
+
+			const FPendingDemuteInfo& Info = Pair.Value;
+
+			// 再次检查 Pawn 是否仍是母体 (可能在收集和处理之间发生了变化)
+			if (!Info.OldPawn.IsValid() || Info.OldPawn->IsPendingKillPending())
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: OldPawn 已销毁, 跳过 AIController '%s'."),
+					*BaseAIC->GetName());
+				continue;
+			}
+
+			const bool bIsStillMother = Info.OldPawn->bIsMother ||
+				Info.OldPawn->GetClass()->GetName().Contains(TEXT("MuTi"));
+
+			if (!bIsStillMother)
+			{
+				UE_LOG(LogTemp, Display,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: Pawn '%s' 不再是母体, 跳过 AIController '%s'."),
+					*Info.OldPawn->GetName(), *BaseAIC->GetName());
+				continue;
+			}
+
+			// 释放旧的复活点占用
+			ReleaseSpawnPointByController(BaseAIC);
+
+			// 读取 AI 原始人类 CharID
+			TSubclassOf<ABaseCharacter> CachedHumanClass = BaseAIC->GetCachedAIPawnClass();
+
+			// 人类武器 ID (已在阶段 2a 收集)
+			FString HumanWeaponID = Info.HumanWeaponID;
+			if (HumanWeaponID.IsEmpty())
+			{
+				HumanWeaponID = Info.OldPawn->GetSpawnWeaponID();
+				UE_LOG(LogTemp, Warning,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: AIC '%s' CachedWeaponID 为空, 回退到 Pawn 字段 '%s'."),
+					*BaseAIC->GetName(), *HumanWeaponID);
+			}
+
+			// 销毁旧 Pawn (UnPossess + Destroy)
+			BaseAIC->UnPossess();
+			Info.OldPawn->Destroy();
+
+			// 用人类 BP 重新生成
+			ABaseCharacter* NewHumanPawn = nullptr;
+			UClass* LoadClass = nullptr;
+
+			if (CachedHumanClass)
+			{
+				LoadClass = CachedHumanClass.Get();
+			}
+			else if (CharacterDataTable)
+			{
+				// Fallback: 查 DT_CharacterInfo 找第一个非母体 BP
+				static const FString CharCtx(TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.AI.Demutate.v230"));
+				TArray<FName> RowNames = CharacterDataTable->GetRowNames();
+				for (const FName& RowName : RowNames)
+				{
+					if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(RowName, CharCtx))
+					{
+						if (!Row->CharacterBlueprint.IsNull())
+						{
+							UClass* BlueprintClass = Row->CharacterBlueprint.LoadSynchronous();
+							if (BlueprintClass && !BlueprintClass->GetName().Contains(TEXT("MuTi")))
+							{
+								LoadClass = BlueprintClass;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			if (!LoadClass)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: 无法找到人类 Pawn Class, AIController='%s'."),
+					*BaseAIC->GetName());
+				continue;
+			}
+
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+			NewHumanPawn = World->SpawnActor<ABaseCharacter>(LoadClass, FTransform(Info.SpawnRot, Info.SpawnLoc), SpawnParams);
+
+			if (!NewHumanPawn)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b: SpawnActor 失败, AIController='%s'."),
+					*BaseAIC->GetName());
+				continue;
+			}
+
+			// 【v230】写 SpawnLoadout
+			NewHumanPawn->SetSpawnLoadout(TEXT(""), HumanWeaponID);
+
+			// 同步阵营 = Defense (人类)
+			NewHumanPawn->FactionTag = FFactionTags::Defense();
+			NewHumanPawn->bIsMother = false;
+			NewHumanPawn->bIsHuman = true;
+			NewHumanPawn->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
+
+			// Possess + 状态清零
+			BaseAIC->Possess(NewHumanPawn);
+			BaseAIC->SetCachedIsMother(false);
+			BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true);
+
+			// 武器 Spawn (3 槽位)
+			FString AIPrimaryID = HumanWeaponID;
+			FString AISecondaryID;
+			FString AIMeleeID = FRoomLoadoutDefaults::MeleeDefaultRowName;
+
+			TSubclassOf<ABaseWeapon> AIPrimaryClass = !AIPrimaryID.IsEmpty() ? ResolveWeaponClassFromID(AIPrimaryID) : nullptr;
+			TSubclassOf<ABaseWeapon> AIMeleeClass = !AIMeleeID.IsEmpty() ? ResolveWeaponClassFromID(AIMeleeID) : nullptr;
+
+			if (UWeaponAttachmentComponent* AIWeaponAttachComp = NewHumanPawn->FindComponentByClass<UWeaponAttachmentComponent>())
+			{
+				AIWeaponAttachComp->Server_SpawnAllWeapons(AIPrimaryClass, nullptr, AIMeleeClass);
+			}
+
+			// 应用 AI Config (MaxWalkSpeed/血量等)
+			ApplyAICharacterConfigToCharacter(NewHumanPawn);
+
+			// 激活移动锁定 + 无敌期闪烁
+			NewHumanPawn->ActivateSpawnInvincibility();
+			if (UHealthComponent* HC = NewHumanPawn->ResolveHealthComponent())
+			{
+				HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
+			}
+
+			// 播放出生音效
+			NewHumanPawn->Multicast_PlaySpawnSound();
+
+			// 刷新头像
+			NewHumanPawn->RefreshCharacterIcon();
+
+			// 弹药全满
+			if (UWeaponFireComponent* FireComp = NewHumanPawn->FindComponentByClass<UWeaponFireComponent>())
+			{
+				FireComp->Server_RefillAmmo();
+			}
+
+			++DemutedCount;
+			UE_LOG(LogTemp, Log,
+				TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b 完成, AI '%s' 已从母体变为人类 (NewPawn='%s')."),
+				*BaseAIC->GetName(), *NewHumanPawn->GetName());
 		}
 
-		if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
+		UE_LOG(LogTemp, Log,
+			TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2b 完成, 共 %d 个 AI 母体变人类."),
+			DemutedCount);
+	}
+
+	// 阶段 2c: 处理"已经是人类"的 AI (遍历时排除阶段 2a 收集的母体 Pawn)
+	{
+		int32 HumanProcessedCount = 0;
+		for (TActorIterator<ABaseCharacter> It(World); It; ++It)
 		{
+			ABaseCharacter* AIChar = *It;
+			if (!AIChar || AIChar->IsPendingKillPending())
+			{
+				continue;
+			}
+
+			ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIChar->GetController());
+			if (!BaseAIC)
+			{
+				continue;
+			}
+
+			// 跳过母体 (已由阶段 2b 处理)
+			if (AIChar->bIsMother || AIChar->GetClass()->GetName().Contains(TEXT("MuTi")))
+			{
+				continue;
+			}
+
 			// 释放旧的复活点占用
 			ReleaseSpawnPointByController(BaseAIC);
 
@@ -989,288 +1284,39 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 			FVector SpawnLoc = NewSpawnPoint->GetActorLocation();
 			FRotator SpawnRot = NewSpawnPoint->GetActorRotation();
 
-			// 【v201.7 大厂架构新增】母体 AI 变人类 = 销毁母体 Pawn + 重新生成人类 Pawn
-			// 根因: 单纯改 bIsMother=false 不会改变 Pawn 的外观/Class — 母体 BP 还在身上
-			// 修复: 读取 CachedAIPawnClass → 查 DT_CharacterInfo → 重新生成人类 Pawn + AIController 复用
-			//
-			// 【v201.8 修复】双判断: bIsMother 标志 OR Pawn Class 是 BP_MuTi 派生都触发
-			// 根因: TActorIterator 遍历拿到 Pawn 时, bIsMother 标志可能在某些情况下被旧逻辑改为 false (旧 v201.1 仅改标志不销毁)
-			// 但实际 Class 还是 BP_MuTi (母体 BP), 必须销毁重生才能变人类外观
-			const bool bNeedsDemutation = AIChar->bIsMother ||
-				AIChar->GetClass()->GetName().Contains(TEXT("MuTi"));
+			// 同步状态 + 传送
+			AIChar->FactionTag = FFactionTags::Defense();
+			AIChar->bIsMother = false;
+			AIChar->bIsHuman = true;
+			BaseAIC->SetCachedIsMother(false);
+			BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true);
+			AIChar->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
 
-			if (bNeedsDemutation)
+			AIChar->SetActorLocationAndRotation(SpawnLoc, SpawnRot);
+
+			// 激活移动锁定 + 无敌期闪烁
+			AIChar->ActivateSpawnInvincibility();
+			if (UHealthComponent* HC = AIChar->ResolveHealthComponent())
 			{
-				UE_LOG(LogTemp, Log,
-					TEXT("[Spawn] 【v201.8】AI Pawn '%s' (Class=%s, bIsMother=%d) 需要变人类, 将销毁并重新生成."),
-					*AIChar->GetName(), *AIChar->GetClass()->GetName(), AIChar->bIsMother ? 1 : 0);
-
-				// 读取 AI 原始人类 CharID (从 AIC 缓存)
-				TSubclassOf<ABaseCharacter> CachedHumanClass = BaseAIC->GetCachedAIPawnClass();
-
-				// 【v201.11 大厂架构修复】从 AIC 缓存读武器 ID (真理源)
-				//   - 旧 (v201.10): AIChar->GetSpawnWeaponID() — 读的是**旧母体 Pawn** 的字段, 母体 BP 没配武器 → 永远空
-				//   - 用户反馈 (2026.08.06): "AI 母体变人类后没有武器"
-				//   - 根因链: 母体 Pawn (BP_MuTi_C) 没 SetSpawnLoadout → 字段空 → 新生成的人类 Pawn 也没武器
-				//   - 修复: 从 AIC 缓存读 CachedWeaponID (与 CachedAIPawnClass 同源)
-				FString HumanWeaponID = BaseAIC->GetCachedWeaponID();
-				if (HumanWeaponID.IsEmpty())
-				{
-					// 【兜底】如果 AIC 缓存空, 才回退到旧 Pawn 字段 (兼容老路径)
-					HumanWeaponID = AIChar->GetSpawnWeaponID();
-					UE_LOG(LogTemp, Warning,
-						TEXT("[Spawn] 【v201.11】AIC CachedWeaponID 为空, 回退到旧 Pawn 字段 (Pawn=%s, WeaponID='%s'). "
-							 "【修复】检查 AIC 初始化时是否调 SetCachedWeaponID."),
-						*AIChar->GetName(), *HumanWeaponID);
-				}
-
-				// 记录旧 Pawn 位置供 fallback
-				const FVector FallbackLoc = SpawnLoc;
-				const FRotator FallbackRot = SpawnRot;
-
-				// 销毁旧 Pawn (UnPossess + Destroy)
-				BaseAIC->UnPossess();
-				AIChar->Destroy();
-
-				// 用人类 BP 重新生成 — 多级 fallback (优先级 A>B>C>D)
-				//   A. BaseAIC.GetCachedAIPawnClass() — 关卡预放 AI 路径已写入
-				//   B. BaseAIC.GetCachedCharacterInfoRowName() — 从 RowName 查 DT_CharacterInfo
-				//   C. AIChar 旧 Class 名(如果不是 MuTi) → 备用
-				//   D. 实在找不到 → Log Error, 旧 Pawn 已销毁将无法复活 (零兜底)
-				ABaseCharacter* NewHumanPawn = nullptr;
-				UClass* LoadClass = nullptr;
-
-				if (CachedHumanClass)
-				{
-					LoadClass = CachedHumanClass.Get();
-				}
-				else if (CharacterDataTable)
-				{
-					// Fallback B: 查 CharacterDataTable — 用 AI Profile 行名
-					static const FString CharCtx(TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.AI.Demutate"));
-					TArray<FName> RowNames = CharacterDataTable->GetRowNames();
-					for (const FName& RowName : RowNames)
-					{
-						if (FCharacterInfo* Row = CharacterDataTable->FindRow<FCharacterInfo>(RowName, CharCtx))
-						{
-							if (!Row->CharacterBlueprint.IsNull())
-							{
-								UClass* BlueprintClass = Row->CharacterBlueprint.LoadSynchronous();
-								if (BlueprintClass && !BlueprintClass->GetName().Contains(TEXT("MuTi")))
-								{
-									LoadClass = BlueprintClass;
-									UE_LOG(LogTemp, Log,
-										TEXT("[Spawn] 【v201.8】AI 母体变人类: 通过 DT_CharacterInfo Row='%s' → Class=%s (Fallback B 命中)."),
-										*RowName.ToString(), *BlueprintClass->GetName());
-									break;
-								}
-							}
-						}
-					}
-				}
-
-				if (LoadClass)
-				{
-					FActorSpawnParameters SpawnParams;
-					SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-					NewHumanPawn = World->SpawnActor<ABaseCharacter>(LoadClass, FTransform(FallbackRot, FallbackLoc), SpawnParams);
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[Spawn] 【v201.8】AI 母体变人类失败: CachedAIPawnClass 为空 + DT_CharacterInfo 也找不到非 MuTi 的 BP. "
-							 "Controller='%s', 旧 Pawn='%s' 已被销毁, AIController 当前无 Pawn."),
-						*BaseAIC->GetName(), *AIChar->GetName());
-				}
-
-			if (NewHumanPawn)
-			{
-				// 【v201.8】写 SpawnLoadout — 这里的 CharID 必须用 AI 的原始 CharacterID
-				// 根因: AI Profile 里的 CharacterRowName (例如 SWAT_AI_C) 才能生成正确的人类 BP
-				NewHumanPawn->SetSpawnLoadout(TEXT(""), HumanWeaponID);
-
-					// 同步阵营 = Defense (人类)
-					NewHumanPawn->FactionTag = FFactionTags::Defense();
-					NewHumanPawn->bIsMother = false;
-					NewHumanPawn->bIsHuman = true;
-					NewHumanPawn->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
-
-					// Possess + 状态清零
-					BaseAIC->Possess(NewHumanPawn);
-					BaseAIC->SetCachedIsMother(false);
-					// 【v229.x 大厂架构修复 — Bug 2 真根因】传 bForce=true
-					//
-					// 根因 (用户 2026.08.16 反馈):
-					//   "进入第二小局,场景里没母体时那个玩家还是在 VB_AttackerTeam 容器里这是错的"
-					//
-					// 触发链 (AI 母体变人类):
-					//   1. AI 母体的 AIC.CachedFactionTag = Offense (v229.x 已允许跨阵营写入)
-					//   2. 旧版 RestartZombieRoundPlayers 调 SetCachedFactionTag(Defense) 不带 bForce
-					//   3. SetCachedFactionTag 单次决策拦截: CachedFactionTag=Offense (已设), NewTag=Defense → bSameValue=false → 拒绝覆盖
-					//   4. CachedFactionTag 永远是 Offense → ServerRefreshBattleAIEntries 读 bIsAttacker=true
-					//   5. 客户端 GetBattleAIEntries(Offense) 仍拿到这个 AI → VB_AttackerTeam (错)
-					//
-					// 修复: 母体变人类 = 跨阵营反转 (Offense → Defense), 必须传 bForce=true
-					//   - 这是业务反转场景 (与母体变异对称)
-					//   - 与单次决策的"防 Spawn 路径错误回滚"目标不冲突
-					//   - 镜像 MutatePawnToMother line 4830 的 bForce=true 修复
-					BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true); // AI 母体变人类 = 业务反转, 必须强制
-
-					// ==========================================
-					// 【v219.1 大厂架构 P0 修复】AI 母体变人类 = 走 Server_SpawnAllWeapons 3 槽位 Spawn
-					// ==========================================
-					//
-					// 业务背景 (Session1.txt 2026.08.09 用户反馈):
-					//   AI 与玩家走完全相同的母体变人类路径, 必须用相同的修复方案
-					//
-					// 根因 (与玩家路径完全对称):
-					//   - 旧代码 RequestWeaponSpawn 只生成 1 把武器 → WeaponsInSlot 空数组 → 无法切槽位
-					//
-					// 大厂原则 — 镜像玩家路径 (v219.1 P0 镜像修复):
-					//   - 与玩家分支**完全相同的代码结构** (不写 AI 专属简化版)
-					//   - Primary 走 AIC.CachedWeaponID (真理源, v201.11 已修复)
-					//   - Secondary AI 不持副武器 → 留空
-					//   - Melee 用业务默认 FRoomLoadoutDefaults::MeleeDefaultRowName (JZ001) 兜底
-					// ==========================================
-
-					// AI 路径读取 3 把武器的 RowName
-					FString AIPrimaryID = HumanWeaponID; // 已在 line 870 读出 (AIC.CachedWeaponID)
-					FString AISecondaryID; // AI 默认无副武器
-					FString AIMeleeID = FRoomLoadoutDefaults::MeleeDefaultRowName; // AI 业务默认 Melee
-
-					// Melee 业务默认验证 (与玩家路径对称)
-					if (WeaponDataTable && !WeaponDataTable->FindRow<FWeaponInfo>(FName(*AIMeleeID), TEXT("RoomSpawnSubsystem::RestartZombieRoundPlayers.AI.Demutate.MeleeDefault")))
-					{
-						UE_LOG(LogTemp, Error,
-							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — DT_WeaponInfo 找不到 RowName='%s' (AI 业务默认 Melee). "
-							     "【v212 零兜底】AI 将无近战武器. "
-							     "修复: 1) DT_WeaponInfo 添加 RowName='%s' 的行; "
-							     "2) 修改 FRoomLoadoutDefaults::MeleeDefaultRowName."),
-							*BaseAIC->GetName(), *AIMeleeID, *AIMeleeID);
-						AIMeleeID.Empty();
-					}
-
-					// 字符串→强类型
-					TSubclassOf<ABaseWeapon> AIPrimaryClass = nullptr;
-					TSubclassOf<ABaseWeapon> AISecondaryClass = nullptr;
-					TSubclassOf<ABaseWeapon> AIMeleeClass = nullptr;
-
-					if (!AIPrimaryID.IsEmpty())
-					{
-						AIPrimaryClass = ResolveWeaponClassFromID(AIPrimaryID);
-					}
-					if (!AIMeleeID.IsEmpty())
-					{
-						AIMeleeClass = ResolveWeaponClassFromID(AIMeleeID);
-					}
-
-					// 【v52 + v213+ 零兜底 + 刀战模式条件豁免】
-					//   生化模式 (母体变人类): AI 主武器必须有 (人类 AI 必须能打) → 配置错 Log Error
-					//   刀战模式: 不走这里 (RestartZombieRoundPlayers 仅在 Zombie 模式调用)
-					//   不 return — Server_SpawnAllWeapons nullptr 安全, 与玩家路径对称
-					if (!AIPrimaryClass)
-					{
-						UE_LOG(LogTemp, Error,
-							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — AIPrimaryID='%s' 无法反查为 WeaponClass. "
-							     "【v52 零兜底】生化模式 AI 主武器必须有, 请检查 DT_WeaponInfo 是否有 RowName='%s' 的行."),
-							*BaseAIC->GetName(), *AIPrimaryID, *AIPrimaryID);
-					}
-
-					UE_LOG(LogTemp, Display,
-						TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI 母体变人类 — 触发 3 槽位 Spawn. Primary=%s Melee=%s (Pawn=%s, AIC=%s). "
-						     "【v219.1 P0 修复】AI 母体变人类必须走 Server_SpawnAllWeapons, 否则 WeaponsInSlot 空数组导致无法切槽位."),
-						*AIPrimaryID, *AIMeleeID,
-						*NewHumanPawn->GetName(), *BaseAIC->GetName());
-
-					// 走 3 槽位 Spawn (服务器权威, 与玩家路径完全对称)
-					if (UWeaponAttachmentComponent* AIWeaponAttachComp = NewHumanPawn->FindComponentByClass<UWeaponAttachmentComponent>())
-					{
-						AIWeaponAttachComp->Server_SpawnAllWeapons(AIPrimaryClass, AISecondaryClass, AIMeleeClass);
-					}
-					else
-					{
-						UE_LOG(LogTemp, Error,
-							TEXT("[Spawn] 【v219.1】RestartZombieRoundPlayers: AI '%s' 母体变人类 — NewPawn '%s' 没有 UWeaponAttachmentComponent. "
-							     "【v52 零兜底】必须挂载 WeaponAttachment 组件."),
-							*BaseAIC->GetName(), *NewHumanPawn->GetName());
-					}
-
-					// 【v201.9 大厂架构新增】应用 AI Config (MaxWalkSpeed/血量等)
-					// 根因: 销毁母体 BP → 重新生成人类 BP 后, MaxWalkSpeed=0 → AI 不动
-					// 修复: 调 ApplyAICharacterConfigToCharacter 设置 MaxWalkSpeed (从 PlayerConfigAsset 读)
-					ApplyAICharacterConfigToCharacter(NewHumanPawn);
-
-					// 激活移动锁定 + 无敌期闪烁
-					NewHumanPawn->ActivateSpawnInvincibility();
-					if (UHealthComponent* HC = NewHumanPawn->ResolveHealthComponent())
-					{
-						HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
-					}
-
-					// 播放出生音效
-					NewHumanPawn->Multicast_PlaySpawnSound();
-
-					// 刷新头像
-					NewHumanPawn->RefreshCharacterIcon();
-
-					// 【v208.5 大厂架构新增】每小局弹药全满 (AI 路径)
-					if (UWeaponFireComponent* FireComp = NewHumanPawn->FindComponentByClass<UWeaponFireComponent>())
-					{
-						FireComp->Server_RefillAmmo();
-					}
-
-					UE_LOG(LogTemp, Log,
-						TEXT("[Spawn] 【v201.7】AI 已从母体变为人类: NewPawn='%s'."),
-						*NewHumanPawn->GetName());
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[Spawn] 【v201.7】AI 从母体变人类失败: CachedAIPawnClass 为空, Controller='%s'."),
-						*BaseAIC->GetName());
-				}
+				HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
 			}
-			else
+
+			// 播放出生音效
+			AIChar->Multicast_PlaySpawnSound();
+
+			// 弹药全满
+			if (UWeaponFireComponent* FireComp = AIChar->FindComponentByClass<UWeaponFireComponent>())
 			{
-				// 已经是人类, 仅同步状态 + 传送
-				AIChar->FactionTag = FFactionTags::Defense();
-				AIChar->bIsMother = false;
-				AIChar->bIsHuman = true;
-				BaseAIC->SetCachedIsMother(false);
-				// 【v229.x 大厂架构修复】镜像 line 1073 — AI 母体变人类 = 业务反转, 必须 bForce=true
-				BaseAIC->SetCachedFactionTag(FFactionTags::Defense(), /*bForce=*/true);
-				AIChar->SetGenericTeamId(FFactionTags::ToGenericTeamId(FFactionTags::Defense()));
-
-				if (!AIChar->IsPendingKillPending() && AIChar->GetLifeSpan() <= 0.0f)
-				{
-					AIChar->SetActorLocationAndRotation(SpawnLoc, SpawnRot);
-					++AIAssignedCount;
-
-					// 激活移动锁定 + 无敌期闪烁
-					AIChar->ActivateSpawnInvincibility();
-					if (UHealthComponent* HC = AIChar->ResolveHealthComponent())
-					{
-						HC->ActivateRespawnMovementLock(RespawnDelaySeconds);
-					}
-
-					// 播放出生音效
-					AIChar->Multicast_PlaySpawnSound();
-
-					// 【v208.6 大厂架构修复】每小局弹药全满 (AI 非母体路径)
-					//   根因: 旧代码只在"母体变人类"分支调用 Server_RefillAmmo
-					//         "已经是人类"分支漏掉了弹药重置
-					//   修复: AI 人类路径也必须调用 Server_RefillAmmo
-					if (UWeaponFireComponent* FireComp = AIChar->FindComponentByClass<UWeaponFireComponent>())
-					{
-						FireComp->Server_RefillAmmo();
-					}
-
-					UE_LOG(LogTemp, Log,
-						TEXT("[Spawn] 【v208.6】AI '%s' 已被分配到 HumanSurvivor 复活点, bIsMother=false."),
-						*AIChar->GetName());
-				}
+				FireComp->Server_RefillAmmo();
 			}
+
+			++HumanProcessedCount;
+			++AIAssignedCount;
 		}
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[Spawn] 【v230】RestartZombieRoundPlayers: 阶段 2c 完成, %d 个 AI 人类已传送."),
+			HumanProcessedCount);
 	}
 
 	UE_LOG(LogTemp, Log,
@@ -1386,6 +1432,32 @@ void URoomSpawnSubsystem::RestartZombieRoundPlayers()
 		&URoomSpawnSubsystem::OnDelayedAmmoRefill,
 		0.1f,  // 0.1s 延迟, 确保武器完全 Attach
 		false);
+
+	// ==========================================
+	// 【v230 大厂架构新增】小局转换守卫关闭
+	// ==========================================
+	//
+	// 根因: OnRoundTransitionTimerExpired → StartNextZombieRound → SetRoundTransitionGuard(true)
+	//   → RestartZombieRoundPlayers 执行 → ... → 这里关闭守卫
+	//   → StartMotherMutationCountdown() 在 StartNextZombieRound 末尾调用
+	//   → HandleCountdownExpired 现在可以正常触发
+	//
+	// 重要: SetRoundTransitionGuard(false) 必须在 RestartZombieRoundPlayers 所有逻辑完成之后
+	//   否则旧的 MotherMutationTimerHandle 回调在最后一个阶段完成前触发 → 竞态仍存在
+	//
+	// 大厂原则 — 零兜底:
+	//   - MutationSys 不可用 → Log Error + 强制报告 (这是架构缺陷, 不能静默跳过)
+	if (URoomMotherMutationSubsystem* MutationSys = URoomMotherMutationSubsystem::Get(this))
+	{
+		MutationSys->SetRoundTransitionGuard(false);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v230 严重】RestartZombieRoundPlayers: URoomMotherMutationSubsystem 不可用, "
+			     "无法关闭 bIsInRoundTransition 守卫! 下一小局突变可能再次发生竞态. "
+			     "【修复】检查 ARoomGameMode::InjectSubsystemConfigs."));
+	}
 }
 
 void URoomSpawnSubsystem::OnDelayedAmmoRefill()

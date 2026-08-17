@@ -29,6 +29,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/PlatformProcess.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Data/Tables/UpgradeRewardTableRow.h"
 #include "Data/Tables/DailyLoginTableRow.h"
@@ -590,17 +591,18 @@ private:
     /** 升级活动存档修改器 */
     UPROPERTY()
     UUpgradeActivitySaveModifier* SaveModifier;
-    
-    /** 缓存的配置表 */
-    UPROPERTY()
-    UDataTable* CachedConfigTable;
 
-    /** 存档槽名称 */
-    const FString SaveSlotName = TEXT("UpgradeReward_SaveSlot");
+    // 【v232 修复: 进程隔离】
+    // 旧实现: 固定字符串 "UpgradeReward_SaveSlot" → 双开时所有窗口写同一 .sav, 互相覆盖
+    // 新实现: 进程 ID 后缀 "UpgradeReward_SaveSlot_<PID>" → 每个游戏窗口独立文件, 天然隔离
+    // 借鉴: LocalAccountStore 的 LocalClientGuid 隔离模式 (LocalAccountStore.h line 24-25)
+public:
+    const FString SaveSlotName = FString::Printf(TEXT("UpgradeReward_SaveSlot_%d"), FPlatformProcess::GetCurrentProcessId());
 
     /** 存档用户索引 */
     const int32 SaveUserIndex = 0;
 
+private:
     // ==================== 私有方法 ====================
     
     /**

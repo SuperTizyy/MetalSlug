@@ -46,6 +46,18 @@
 #include "Engine/World.h"             // 【v97.0】UWorld
 #include "GameplayTagContainer.h"     // 【v97.0】FGameplayTag
 
+// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
+// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
+static TAutoConsoleVariable<int32> CVarShowTraceDebug(
+	TEXT("g.MetalSlug.ShowTraceDebug"),
+	0,
+	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
+	TEXT("0 = hide all trace debug visuals (default)\n")
+	TEXT("1 = show all trace debug visuals\n")
+	TEXT("Affects: BaseWeapon::Multicast_PlayFireTraceVisual, BTDecorator_HasClearShot, RangedLineStrategy"),
+	ECVF_Default
+);
+
 
 URangedLineStrategy::URangedLineStrategy()
 {
@@ -491,6 +503,12 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 	// → 现在改成 true: Mesh 三角面(皮肤精度)参与 trace
 	// → 全身任何部位都能被精确命中 (与 Body 大小无关,与 Mutant Mesh 顶点/三角面精度相关)
 	// → 符合 CS:GO/Apex/Valorant 大厂标准 (现代射击游戏都用 per-vertex trace)
+	// 【v241 大厂架构】受全局 CVar g.MetalSlug.ShowTraceDebug 控制 — 默认 0 (关闭)
+	const EDrawDebugTrace::Type DebugDrawMode =
+		(CVarShowTraceDebug.GetValueOnGameThread() != 0)
+			? EDrawDebugTrace::ForDuration
+			: EDrawDebugTrace::None;
+
 	const bool bHit = UKismetSystemLibrary::LineTraceMulti(
 		Weapon,
 		RayOrigin,     // 起点: v109 大厂镜像 — 玩家=相机+TAL+MuzzleOffset, AI=GetAimRayFromCrosshairOrEyes 已算 Muzzle Socket
@@ -498,7 +516,7 @@ bool URangedLineStrategy::PerformSingleShot(ABaseWeapon* Weapon,
 		UEngineTypes::ConvertToTraceType(ECC_Visibility),
 		true,          // 【v99.3 关键】bTraceComplex=true — Mesh 三角面 + 物理 Body 都参与 trace
 		IgnoreActors,
-		EDrawDebugTrace::ForDuration,
+		DebugDrawMode, // 【v241】受 CVar 控制 — 默认 None (关闭)
 		HitResults,
 		true,
 		FLinearColor::Red,       // TraceColor: 未命中

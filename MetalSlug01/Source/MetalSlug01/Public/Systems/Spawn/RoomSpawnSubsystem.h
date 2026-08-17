@@ -70,6 +70,31 @@ class METALSLUG01_API URoomSpawnSubsystem : public UWorldSubsystem
 
 public:
 	// ==========================================
+	// 【v230 大厂架构新增】AI 母体变人类分阶段处理数据结构
+	// ==========================================
+	//
+	// 根因 (用户 2026.08.18 反馈):
+	//   "偶尔有时候进入新的小局，会有母体出现，没有把所有母体全部变成人类"
+	//
+	// 触发链:
+	//   1. RestartZombieRoundPlayers 使用 TActorIterator 遍历所有角色
+	//   2. 遍历中 Destroy + Spawn 导致迭代器捕获新 Spawn 的 Pawn
+	//   3. 新 Spawn 的 Pawn 在本循环中被错误处理
+	//
+	// 修复: 分两阶段遍历
+	//   阶段 2a: 收集需要销毁重生的母体 AI 信息 (AIController 作为唯一标识符)
+	//   阶段 2b: 执行销毁重生 (新 Spawn 的 Pawn 不在本循环中被处理)
+	//   阶段 2c: 处理"已经是人类"的 AI
+	//
+	struct FPendingDemuteInfo
+	{
+		TWeakObjectPtr<class ABaseCharacter> OldPawn;    // 旧母体 Pawn
+		FVector SpawnLoc;                                // 新 Spawn 位置
+		FRotator SpawnRot;                               // 新 Spawn 旋转
+		FString HumanWeaponID;                           // 人类武器 ID
+	};
+
+	// ==========================================
 	// 生命周期
 	// ==========================================
 
