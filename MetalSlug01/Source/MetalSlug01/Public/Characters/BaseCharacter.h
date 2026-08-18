@@ -2282,6 +2282,35 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Combat|Attachment")
 	const FString& GetSpawnWeaponID() const;
 
+	/**
+	 * 【v241 大厂架构新增】获取当前角色的 RowName (FName)
+	 *
+	 * 设计动机:
+	 *   - WeaponFireComponent 按 CharacterRowName 查 Montage Map (TMap<FName, UAnimMontage*>)
+	 *   - 调用方需要拿到当前角色的 RowName (FName 类型, 用于 TMap key)
+	 *   - CharacterID 在项目里是 FString 类型, 散落在 PlayerState 和 WeaponAttachmentComponent
+	 *   - 这里统一封装, 调用方零感知
+	 *
+	 * 真理源链 (按优先级):
+	 *   1. 玩家: ARoomPlayerState::SelectedCharacterID (Replicated FString) → FName(*str)
+	 *   2. AI:   WeaponAttachmentComponent->CharacterID (Replicated FString) → FName(*str)
+	 *   3. 都拿不到 → 返回 NAME_None (调用方应 Log Error)
+	 *
+	 * 母体处理:
+	 *   - 母体复用 SelectedCharacterID (玩家 CharID 在死亡时会被 RoomSpawnSubsystem 替换)
+	 *   - 母体走"玩家"分支 (因为母体本质上是 PossessedBy 玩家控制)
+	 *   - AI 母体分支由 MutatePawnToMother 处理 CharID 写入
+	 *
+	 * 大厂原则:
+	 *   - 单一真理源: CharacterID 真理源在 PlayerState / WeaponAttachmentComponent, 本函数只读不写
+	 *   - 不缓存: 缓存失效 = 隐性兜底 (与 v40.6 AIAttackComponent 同模式)
+	 *   - 零兜底: 拿不到 RowName 返回 NAME_None, 不静默 fallback 到 "SWAT" 或其他默认
+	 *
+	 * @return 角色 RowName (FName), 失败返回 NAME_None
+	 */
+	UFUNCTION(BlueprintPure, Category = "Combat|Identity")
+	FName GetCharacterRowName() const;
+
 protected:
 
 	/**

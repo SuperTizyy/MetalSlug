@@ -3,7 +3,19 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// KillStreakWidget 头文件 — 连杀图标组件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UKillStreakWidget — 连杀数图标 + 计时器
+//   2. 数据驱动: KillStreakIconDataTable + KillStreakConfig 由 GameHUDWidget 注入
+//   3. 5 秒超时: ShowKillStreakTimeout() → 重置为单人击杀图标 (0 兜底)
+//   4. 单一职责: 只管连杀 UI, 不持有配置资产引用
+//
+// 大厂原则 (v41 大厂架构):
+//   - 数据驱动: 所有参数通过 SetKillStreakConfig / SetKillStreakIconDataTable 注入
+//   - 0 兜底: 超时后必须显示单人击杀图标, 不能静默消失
+//   - 单一职责: 连杀 UI 逻辑
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

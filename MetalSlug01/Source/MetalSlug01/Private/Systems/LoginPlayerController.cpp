@@ -1,10 +1,7 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
-// ==========================================
-// 头文件包含区
-// ==========================================
-// 引入本控制器头文件
-#include "Systems/LoginPlayerController.h"
+// 文件作用: ALoginPlayerController 实现 — 登录地图极简 PC, 仅做硬件配置
+// 大厂架构: 0 UI 编排, 委托 UIViewService 监听 OnStateChanged 拉起 UI (单一职责)
 
 // ==========================================
 // 【P0 架构清理 2026.06.28】
@@ -39,6 +36,8 @@
  *
  * 现在: BeginPlay 仅做硬件初始化, 不参与 UI 拉起编排。
  */
+#include "Systems/LoginPlayerController.h"
+
 void ALoginPlayerController::BeginPlay()
 {
 	Super::BeginPlay();

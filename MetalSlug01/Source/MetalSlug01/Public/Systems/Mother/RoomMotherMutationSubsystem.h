@@ -1,7 +1,36 @@
 // Copyright (c) 2026. All Rights Reserved.
-// URoomMotherMutationSubsystem — 生化模式母体变异业务权威调度
+
+/**
+ * @file RoomMotherMutationSubsystem.h
+ * @brief 生化模式母体变异子系统 — 服务器权威调度
+ *
+ * 职责边界 (大厂原则):
+ *   - 唯一负责: 倒计时到期 → 选母体 → 触发变异
+ *   - 不负责: 倒计时显示 (URoomLifecycleSubsystem + ARoomGameState)
+ *   - 不负责: Pawn 生成/销毁 (URoomSpawnSubsystem 唯一真理源)
+ *   - 不负责: 阵营系统 (FFactionTags 单一真理源)
+ *
+ * RPC 边界:
+ *   - 服务器: 本 Subsystem 在 GameMode 中执行 HasAuthority 校验后, 通过 Multicast_PlayMutationFX 广播
+ *   - 客户端: 只被动接收
+ */
 
 #pragma once
+
+/**
+ * @file RoomMotherMutationSubsystem.h
+ * @brief 生化模式母体变异子系统 — 服务器权威调度
+ *
+ * 职责边界 (大厂原则):
+ *   - 唯一负责: 倒计时到期 → 选母体 → 触发变异
+ *   - 不负责: 倒计时显示 (URoomLifecycleSubsystem + ARoomGameState)
+ *   - 不负责: Pawn 生成/销毁 (URoomSpawnSubsystem 唯一真理源)
+ *   - 不负责: 阵营系统 (FFactionTags 单一真理源)
+ *
+ * RPC 边界:
+ *   - 服务器: 本 Subsystem 在 GameMode 中执行 HasAuthority 校验后, 通过 Multicast_PlayMutationFX 广播
+ *   - 客户端: 只被动接收
+ */
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"

@@ -1,5 +1,21 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ==========================================
+// KillFeedWidget 实现 — 击杀信息组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UKillFeedWidget — 击杀信息列表容器
+//   2. 4 个 AddKillInfo 重载 → 单一入口 InsertKillMessageWidget
+//   3. 系统消息: AddSystemMessage → KillerName 空, VictimName = 消息内容
+//   4. 5 秒消失: 由 Entry 子控件 MessageLifetime Timer 管理 (真理源在子控件)
+//
+// 大厂原则 (v229.x v8 大厂重构):
+//   - 单一入口: InsertKillMessageWidget 替代 4 个 AddKillInfo 重复架构
+//   - 父控件职责: 只管容器布局, 不参与 Entry 生命周期
+//   - 0 兜底: KillFeedEntryWidgetClass 未配 → Log Error + return nullptr
+//   - 对齐: 新插入子控件 HorizontalAlignment = HAlign_Right
+// ==========================================
 #include "UI/Game/Widgets/KillFeedWidget.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"

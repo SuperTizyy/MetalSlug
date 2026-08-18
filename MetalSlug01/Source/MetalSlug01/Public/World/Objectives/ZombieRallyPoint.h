@@ -27,6 +27,31 @@
 #include "ZombieRallyPoint.generated.h"
 
 /**
+ * @file ZombieRallyPoint.h
+ * @brief 生化模式 AI 集合点 Actor — 人类玩家守卫的据点定义
+ *
+ * 大厂架构定位:
+ *   - 单一职责: 仅作为"集合点"数据容器 (PointID + 半径配置), 不持有任何运行时业务状态
+ *   - 真理源: PointID (字符串) — URoomZombieRallySubsystem 用这个作为账本 key
+ *   - 自动注册: BeginPlay → URoomZombieRallySubsystem::RegisterRallyPoint; EndPlay → 自动注销
+ *   - 与 PlayerStart 严格分离: 集合点 ≠ 出生点, 语义不同, 账本不同
+ *
+ * 设计动机:
+ *   - 复用 ATargetPoint (UE 内置 SceneComponent + Sprite), 避免重复造轮子
+ *   - 字段最小化: 只暴露 PointID / PopulationRadius / ArrivalRadiusOverride, 不暴露运行时账本
+ *   - 不持任何业务数据: "谁在我这里" / "当前锁定数" 等都归 Subsystem 账本管理
+ *
+ * 零兜底:
+ *   - PointID 必须唯一 + 非空 (重复/空 → Subsystem::RegisterRallyPoint 拒绝 + Log Error)
+ *   - PopulationRadius 必须 > 0 (<=0 → Subsystem 拒绝注册)
+ *
+ * 编辑器配置:
+ *   - 在地图里放置 BP_ZombieRallyPoint 子类, 拖入地图关键防御位置
+ *   - 必填: PointID (唯一 ID) + PopulationRadius (统计半径)
+ *   - 可选: ArrivalRadiusOverride (单点覆盖, 0 = 用 ConfigSO 默认值)
+ */
+
+/**
  * 生化模式集合点 — AI 守卫的人类据点
  *
  * 大厂原则:
@@ -36,6 +61,11 @@
  *
  * 必填 (零兜底):
  *   - PointID 必须唯一 + 非空 (重复/空 → Subsystem 拒绝注册)
+ *
+ * 数据流:
+ *   - 写入: 编辑器配置 PointID / PopulationRadius / ArrivalRadiusOverride
+ *   - 读取: URoomZombieRallySubsystem 通过 RegisterRallyPoint 读取所有字段
+ *   - 不复制: 纯服务器数据, 客户端不需要单独配置 (服务器权威)
  */
 UCLASS(Blueprintable)
 class METALSLUG01_API AZombieRallyPoint : public ATargetPoint

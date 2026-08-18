@@ -3,6 +3,20 @@
 // ==========================================
 // 头文件包含说明
 // ==========================================
+/**
+ * @file AccountRoomAuthority.h
+ * @brief 房主端账号在线状态权威表 — 房间内多账号管理
+ *
+ * 大厂原则 — 单一真理源:
+ *   - ListenServer 上每个玩家的在线状态由本类唯一管理
+ *   - Key = Username, Value = FAccountSessionState (SessionId + PC 指针 + 时间戳)
+ *   - 用于重连判定 / 强踢 / 心跳扫描
+ *
+ * 调用方:
+ *   - ARoomPlayerController::Server_HandleLoginRequest (注册)
+ *   - ARoomPlayerController::Server_HandleLogoutRequest (注销)
+ *   - 定时器定期调 SweepDeadSessions (心跳扫描)
+ */
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
 #include "Interfaces/OnlineSessionInterface.h"

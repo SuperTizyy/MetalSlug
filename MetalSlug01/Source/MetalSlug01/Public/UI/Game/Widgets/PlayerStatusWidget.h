@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// PlayerStatusWidget 头文件 — 角色状态组件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UPlayerStatusWidget — 玩家头部状态栏 (血量/能量/头像/技能)
+//   2. 血条颜色随百分比变化: 绿/黄/红
+//   3. AC 值 + ACE 排名颜色 (白/金/灰)
+//   4. 主动拉取初始值: NativeConstruct 时拉取解决 UI 晚创建
+//
+// 大厂原则:
+//   - 主动拉取: PullInitialDataFromCharacter 解决 UI 创建晚于 Pawn 数据的问题
+//   - 数据驱动: AC/ACE 排名通过枚举控制颜色, BP 不堆逻辑
+//   - 防御性: BindWidget 调用前空指针检查
+//   - 样式可配: 字体/颜色全部由 WBP 蓝图配置
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

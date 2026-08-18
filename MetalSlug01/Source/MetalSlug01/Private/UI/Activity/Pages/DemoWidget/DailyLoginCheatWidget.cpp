@@ -1,7 +1,18 @@
 ﻿// 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// DailyLoginCheatWidget 实现 — 每日登录调试小工具
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDailyLoginCheatWidget — 调试用所有 UI 逻辑
+//   2. 1 个输入框 + 1 个按钮 (极简)
+//   3. 主动拉刷新: NotifyMainPageRefresh 直接定位主页面
+//
+// 大厂原则:
+//   - 调试面板: 与正式 UI 分离, 发布版可剔除
+//   - 主动拉刷新: NotifyMainPageRefresh
+//   - 极简: 仅 1 个输入框 + 1 个按钮
 // ==========================================
 #include "UI/Activity/Pages/DemoWidget/DailyLoginCheatWidget.h"
 #include "Components/EditableText.h"

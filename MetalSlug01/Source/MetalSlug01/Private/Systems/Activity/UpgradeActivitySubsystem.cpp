@@ -151,6 +151,18 @@ void UUpgradeActivitySubsystem::LoadStatus()
     ReloadLatestRecord();
 }
 
+/**
+ * @brief 从磁盘存档加载所有升级奖励记录到 AllRecords 并设置 CurrentRecord
+ *
+ * 加载流程:
+ * 1. 检查存档槽位是否存在 — 不存在则 CreateTodayRecord 兜底
+ * 2. 加载存档 — UpgradeRewardRecords 为空则 CreateTodayRecord 兜底
+ * 3. 复制所有记录到内存 AllRecords 映射
+ * 4. 找 CreatedTime 最大的记录作为 CurrentRecord(大厂原则:单一活跃记录真源)
+ * 5. v228: 同步 GlobalChestClaimStatus(全局宝箱领取状态,跨天共享)
+ *
+ * 这是存档加载的单一真理源入口,不允许在别处直接读 SaveGame
+ */
 void UUpgradeActivitySubsystem::ReloadLatestRecord()
 {
     if (UGameplayStatics::DoesSaveGameExist(SaveSlotName, SaveUserIndex))
@@ -292,6 +304,14 @@ const FUpgradeRewardSaveRecord* UUpgradeActivitySubsystem::GetRecordByDate(int32
 	return nullptr;
 }
 
+/**
+ * @brief 添加或更新指定日期的升级奖励记录(纯内存操作,需手动调用 SaveToDisk)
+ * @param RecordDate 记录日期(通常 1-7)
+ * @param Record 升级奖励存档记录
+ *
+ * 写入 AllRecords 映射, 不会自动持久化 — 调用方需在适当时机调 SaveToDisk
+ * 重复的 RecordDate 会被覆盖
+ */
 void UUpgradeActivitySubsystem::AddOrUpdateRecord(int32 RecordDate, const FUpgradeRewardSaveRecord& Record)
 {
 	AllRecords.Add(RecordDate, Record);
@@ -1045,6 +1065,15 @@ TArray<FString> UUpgradeActivitySubsystem::GetDailyTaskDescriptions()
 	return Result;
 }
 
+/**
+ * @brief 查找 AllRecords 中最大 RecordDate(1-7 区间)
+ * @return 最大日期, clamp 到 [1,7]; 全部为空时返回 1
+ *
+ * 双层兜底:
+ * 1. 优先读内存 AllRecords(快路径,无 IO)
+ * 2. 内存为空才读磁盘存档(慢路径,用于冷启动场景)
+ * 返回值始终 clamp 到 [1,7], 防止配置错导致返回 0/8+ 触发 UI 越界
+ */
 int32 UUpgradeActivitySubsystem::GetMaxRecordDate() const
 {
     // 🔧 优先从内存数据 AllRecords 中获取最大RecordDate
@@ -1950,6 +1979,16 @@ int32 UUpgradeActivitySubsystem::GetCurrentExperience() const
     return CurrentRecord.CurrentExperience;
 }
 
+/**
+ * @brief 判断是否应高亮显示"固定奖励"图标
+ * @return true = 经验值达标且最后一档宝箱未领取(可点)
+ *
+ * 大厂原则 SSOT (v228):
+ * - 经验值条件: CurrentExperience >= LastTaskValue (Config->TaskRelatedValues 最后元素)
+ * - 领取状态条件: GlobalChestClaimStatus 最后索引 == 0(全局真源,非 per-day)
+ *
+ * Config 空或 TaskRelatedValues 为空时返回 false(零兜底)
+ */
 bool UUpgradeActivitySubsystem::ShouldShowFixedPrizeHighlight()
 {
     // 获取TaskRelatedValues数组

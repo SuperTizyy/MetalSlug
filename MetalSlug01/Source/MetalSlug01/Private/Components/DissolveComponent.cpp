@@ -16,6 +16,12 @@ UDissolveComponent::UDissolveComponent()
 }
 
 
+/**
+ * UDissolveComponent::BeginPlay
+ *
+ * 初始化:依赖外部 (BaseCharacter::ExecuteDeathLocal) 主动调 StartDissolveEffect
+ * 启动溶解 — Component 本身不订阅 OnDeath, 避免重复触发.
+ */
 void UDissolveComponent::BeginPlay()
 {
 	Super::BeginPlay();
@@ -37,6 +43,12 @@ void UDissolveComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 }
 
 
+/**
+ * UDissolveComponent::OnOwnerDeath
+ *
+ * 死亡回调入口 — 由 Owner Character 在 OnHealthComponentDeath 时调用,
+ * 立即启动溶解 (无延迟, 满足 2026-07-01 P0 重构要求).
+ */
 void UDissolveComponent::OnOwnerDeath()
 {
 	// 【2026-07-01 P0 重构】立即启动溶解, 不用任何延迟

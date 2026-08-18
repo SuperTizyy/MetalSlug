@@ -43,6 +43,11 @@ UWeaponFireComponent::UWeaponFireComponent()
 }
 
 
+/**
+ * @brief BeginPlay — 武器开火组件初始化入口
+ *
+ * 当前实现仅调父类 (保留扩展点, 如订阅弹药事件等)
+ */
 void UWeaponFireComponent::BeginPlay()
 {
 	Super::BeginPlay();
@@ -76,9 +81,11 @@ void UWeaponFireComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 	DOREPLIFETIME(UWeaponFireComponent, bIsReloading);
 	DOREPLIFETIME(UWeaponFireComponent, bIsFiring);
 
-	// v82 修复: 蒙太奇必须 Replicated (客户端 Multicast_PlayFireMontage_Implementation 靠它播放)
-	DOREPLIFETIME(UWeaponFireComponent, FireMontageHip);
-	DOREPLIFETIME(UWeaponFireComponent, ReloadMontageHip);
+	// v82 → v241: 蒙太奇必须 Replicated (客户端 Multicast_PlayFireMontage_Implementation 靠它播放)
+	//   - v82 单值字段 FireMontageHip → v241 TMap<FName, UAnimMontage*> FireMontageHipByCharacter
+	//   - Replicated TMap 自动按 Map 项同步 (UE 5.6 原生支持)
+	DOREPLIFETIME(UWeaponFireComponent, FireMontageHipByCharacter);
+	DOREPLIFETIME(UWeaponFireComponent, ReloadMontageHipByCharacter);
 }
 
 
@@ -117,6 +124,12 @@ void UWeaponFireComponent::OnRep_CurrentAmmo()
 }
 
 
+/**
+ * @brief 客户端 bIsReloading 复制回调 — 收到服务器 Replicated 字段时广播
+ *
+ * 客户端专用, 服务器主动调 Multicast RPC. 触发 OnReloadStateChanged 委托,
+ * 订阅方 (HUD) 据此显示换弹 UI/蒙太奇.
+ */
 void UWeaponFireComponent::OnRep_IsReloading()
 {
 	OnReloadStateChanged.Broadcast(bIsReloading);
@@ -224,13 +237,22 @@ void UWeaponFireComponent::InitializeFromWeaponConfig(const FWeaponInfo& InWeapo
 	//   - 一次性写入, 后续不变 (DT 改了需要重启游戏, 这是用户决策)
 	InitialReserveAmmo = InWeaponConfig.ReserveAmmo;
 
-	// 缓存蒙太奇 (Replicated 自动同步到客户端 — v82 修复)
-	//   旧版 (v70-v81) 注释错误: "蒙太奇资源客户端直接从 BP 资产加载"
-	//   实际: FireMontageHip 来源于 DT_WeaponInfo, 不是 BP 子对象默认属性
-	//   → 客户端拿不到 → Multicast_PlayFireMontage 永远 "FireMontage 为空"
-	//   新版: 字段 Replicated, 服务器写入后客户端自动同步
-	FireMontageHip = InWeaponConfig.FireMontageHip;
-	ReloadMontageHip = InWeaponConfig.ReloadMontageHip;
+	// 【v241.1 大厂架构 — 按角色查表】缓存蒙太奇 (Replicated 自动同步到客户端 — v82 修复)
+	//   - v241 (旧): TMap<FName, UAnimMontage*> — ❌ UE 5.6 不支持 Replicated TMap (编译报错)
+	//   - v241.1 (新): TArray<FAnimMontageByCharacterEntry> — ✅ UE 5.6 Replicated TArray<FStruct> 支持
+	//     → 服务器 InitializeFromWeaponConfig 从 DT 复制到本字段 (Replicated)
+	//     → 客户端 OnRep 自动同步 → Multicast_PlayFireMontage_Implementation 遍历数组找到匹配
+	//
+	// 大厂原则 — 单一真理源:
+	//   - DT_WeaponInfo.FireMontageHipByCharacter 是唯一真理源 (策划在 DT 编辑器里配)
+	//   - 服务器 InitializeFromWeaponConfig 从 DT 复制到本字段 (Replicated)
+	//   - 客户端 OnRep 自动同步 → Multicast_PlayFireMontage_Implementation 拿到正确 Montage
+	//
+	// 大厂原则 — 零兜底:
+	//   - DT 数组配错 (空数组 / 缺某角色) → 后续 GetFireMontageHip 会 Log Error, 强制修复 DT
+	//   - 这里不校验数组内容 (DT 配错由调用方显式报错, 这里只复制)
+	FireMontageHipByCharacter = InWeaponConfig.FireMontageHipByCharacter;
+	ReloadMontageHipByCharacter = InWeaponConfig.ReloadMontageHipByCharacter;
 
 	// 初始化弹药 (满弹匣)
 	CurrentAmmo = MagazineSize;
@@ -384,6 +406,12 @@ void UWeaponFireComponent::StartFire(const FVector& ClientRayOrigin, const FVect
 }
 
 
+/**
+ * @brief 停止连射入口 — 由 InputAction 释放时调用
+ *
+ * 服务器权威: 客户端调用会短路 (避免本地状态与服务器冲突)
+ * 副作用: bIsFiring=false + 关闭 Component Tick
+ */
 void UWeaponFireComponent::StopFire()
 {
 	ABaseWeapon* Weapon = ResolveOwnerWeapon();
@@ -874,6 +902,241 @@ ABaseWeapon* UWeaponFireComponent::ResolveOwnerWeapon() const
 	}
 
 	return Weapon;
+}
+
+
+// ==========================================
+// 【v241 大厂架构新增】按角色查表 — 蒙太奇选择器
+// ==========================================
+
+/**
+ * ResolveAttachedCharacterRowName — 解析当前持有武器的角色的 RowName (FName)
+ *
+ * 真理源链:
+ *   - 玩家: ARoomPlayerState::SelectedCharacterID (Replicated FString) → FName(*str)
+ *   - AI:   UWeaponAttachmentComponent::CharacterID (Replicated FString) → FName(*str)
+ *   - 母体: 复用玩家 SelectedCharacterID (母体死亡/复活流程由 RoomSpawnSubsystem 处理)
+ *
+ * 大厂原则 (v40.6 同模式):
+ *   - 不缓存 — 缓存失效 = 隐性兜底 = 隐藏 bug
+ *   - 每次按需 GetOwner/PlayerState/WeaponAttachmentComponent, 保证拿到最新值
+ *
+ * 零兜底:
+ *   - Owner Weapon 无效 → return NAME_None
+ *   - GetAttachedCharacter 返回 nullptr → return NAME_None
+ *   - PlayerState 和 WeaponAttachment 都拿不到 CharacterID → return NAME_None
+ *   - CharacterID 是空字符串 → return NAME_None
+ *   - 不静默 fallback (如 "SWAT"), 强制调用方处理 NAME_None 情况
+ *
+ * @return 角色 RowName (FName), 失败返回 NAME_None
+ */
+FName UWeaponFireComponent::ResolveAttachedCharacterRowName() const
+{
+	// Step 1: 拿 Owner Weapon
+	ABaseWeapon* Weapon = ResolveOwnerWeapon();
+	if (!Weapon)
+	{
+		return NAME_None;
+	}
+
+	// Step 2: 拿挂载的 Character (Replicated Attach 关系, 服务器/客户端都能拿到)
+	ABaseCharacter* Character = Weapon->GetAttachedCharacter();
+	if (!Character)
+	{
+		return NAME_None;
+	}
+
+	// Step 3: 直接委托 Character 自己暴露 RowName (单一真理源封装)
+	//   - 玩家路径: Character 内部从 PlayerState 读
+	//   - AI 路径: Character 内部从 WeaponAttachmentComponent 读
+	return Character->GetCharacterRowName();
+}
+
+
+/**
+ * GetFireMontageHipByRow — 按显式 CharacterRowName 查数组
+ *
+ * 内部 helper — GetFireMontageHip() 调它查表
+ * 也可以被外部显式调用 (蓝图测试/特殊场景)
+ *
+ * v241.1 实现说明:
+ *   - 旧版 (v241): TMap.Find(CharacterRowName) O(1)
+ *   - 新版 (v241.1): TArray 遍历 O(N), N 通常 < 10 (角色总数) — UE 5.6 硬限制的妥协
+ *
+ * 零兜底:
+ *   - CharacterRowName 是 NAME_None → Log Error + return nullptr
+ *   - 数组为空 → Log Error + return nullptr (DT 配错)
+ *   - 数组没有匹配项 → Log Error + return nullptr (DT 配错, 强制策划补对应角色 Montage)
+ *
+ * @param CharacterRowName 角色 RowName (如 "SWAT", "CosmoBunnyGirl" — 跟 DT 数组 Key 一致)
+ * @return 对应 Fire Montage, 失败返回 nullptr
+ */
+UAnimMontage* UWeaponFireComponent::GetFireMontageHipByRow(FName CharacterRowName) const
+{
+	// 零兜底: RowName 无效
+	if (CharacterRowName.IsNone())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] GetFireMontageHipByRow: CharacterRowName 是 NAME_None. "
+			     "【修复】1) 检查 Owner Character 的 PlayerState->SelectedCharacterID 是否非空 "
+			     "2) AI 路径检查 WeaponAttachmentComponent->CharacterID 是否写入 "
+			     "3) BP_BaseCharacter 蓝图是否正确配 SpawnLoadout"));
+		return nullptr;
+	}
+
+	// 零兜底: 数组为空
+	if (FireMontageHipByCharacter.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] GetFireMontageHipByRow: FireMontageHipByCharacter 数组为空. "
+			     "WeaponRow=%s CharacterRowName=%s. "
+			     "【修复】DT_WeaponInfo 行 '%s' 的 FireMontageHipByCharacter 数组必须按角色配 (CharacterRowName + Montage)."),
+			*CachedWeaponRowName.ToString(),
+			*CharacterRowName.ToString(),
+			*CachedWeaponRowName.ToString());
+		return nullptr;
+	}
+
+	// 遍历数组查找匹配 (v241.1 — UE 5.6 不支持 TMap Replicated, 改用 TArray<FStruct>)
+	for (const FAnimMontageByCharacterEntry& Entry : FireMontageHipByCharacter)
+	{
+		if (Entry.CharacterRowName == CharacterRowName)
+		{
+			if (!Entry.Montage)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[WeaponFireComponent] GetFireMontageHipByRow: 找到 CharacterRowName='%s' 项, 但 Montage 为空. "
+					     "WeaponRow=%s. 【修复】DT_WeaponInfo 行 '%s' 给该角色配的 Montage 不能为空."),
+					*CharacterRowName.ToString(),
+					*CachedWeaponRowName.ToString(),
+					*CachedWeaponRowName.ToString());
+				return nullptr;
+			}
+			return Entry.Montage;
+		}
+	}
+
+	// 零兜底: 数组没有该 RowName — 列出已配置的 Keys 帮助策划调试
+	FString ConfiguredKeys;
+	for (const FAnimMontageByCharacterEntry& Entry : FireMontageHipByCharacter)
+	{
+		if (!ConfiguredKeys.IsEmpty()) ConfiguredKeys += TEXT(",");
+		ConfiguredKeys += Entry.CharacterRowName.ToString();
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[WeaponFireComponent] GetFireMontageHipByRow: 数组没有 CharacterRowName='%s' 的项. "
+		     "WeaponRow=%s 数组已配置的 CharacterRowNames=[%s]. "
+		     "【修复】DT_WeaponInfo 行 '%s' 的 FireMontageHipByCharacter 数组必须包含 CharacterRowName='%s' 的行. "
+		     "如果该角色确实没有这个武器的动画, 请加一行 CharacterRowName='%s' + Montage=nullptr 而不是省略."),
+		*CharacterRowName.ToString(),
+		*CachedWeaponRowName.ToString(),
+		*ConfiguredKeys,
+		*CachedWeaponRowName.ToString(),
+		*CharacterRowName.ToString(),
+		*CharacterRowName.ToString());
+	return nullptr;
+}
+
+
+/**
+ * GetReloadMontageHipByRow — 换弹蒙太奇查表 (与 GetFireMontageHipByRow 同模式 — v241.1)
+ *
+ * @param CharacterRowName 角色 RowName
+ * @return 对应 Reload Montage, 失败返回 nullptr
+ */
+UAnimMontage* UWeaponFireComponent::GetReloadMontageHipByRow(FName CharacterRowName) const
+{
+	// 零兜底: RowName 无效
+	if (CharacterRowName.IsNone())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] GetReloadMontageHipByRow: CharacterRowName 是 NAME_None. "
+			     "【修复】检查 Owner Character 的 PlayerState->SelectedCharacterID / WeaponAttachmentComponent->CharacterID"));
+		return nullptr;
+	}
+
+	// 零兜底: 数组为空
+	if (ReloadMontageHipByCharacter.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponFireComponent] GetReloadMontageHipByRow: ReloadMontageHipByCharacter 数组为空. "
+			     "WeaponRow=%s CharacterRowName=%s. "
+			     "【修复】DT_WeaponInfo 行 '%s' 的 ReloadMontageHipByCharacter 数组必须按角色配."),
+			*CachedWeaponRowName.ToString(),
+			*CharacterRowName.ToString(),
+			*CachedWeaponRowName.ToString());
+		return nullptr;
+	}
+
+	// 遍历数组查找匹配 (v241.1)
+	for (const FAnimMontageByCharacterEntry& Entry : ReloadMontageHipByCharacter)
+	{
+		if (Entry.CharacterRowName == CharacterRowName)
+		{
+			if (!Entry.Montage)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[WeaponFireComponent] GetReloadMontageHipByRow: 找到 CharacterRowName='%s' 项, 但 Montage 为空. "
+					     "WeaponRow=%s. 【修复】DT_WeaponInfo 行 '%s' 给该角色配的 Montage 不能为空."),
+					*CharacterRowName.ToString(),
+					*CachedWeaponRowName.ToString(),
+					*CachedWeaponRowName.ToString());
+				return nullptr;
+			}
+			return Entry.Montage;
+		}
+	}
+
+	// 零兜底: 数组没有该 RowName
+	FString ConfiguredKeys;
+	for (const FAnimMontageByCharacterEntry& Entry : ReloadMontageHipByCharacter)
+	{
+		if (!ConfiguredKeys.IsEmpty()) ConfiguredKeys += TEXT(",");
+		ConfiguredKeys += Entry.CharacterRowName.ToString();
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("[WeaponFireComponent] GetReloadMontageHipByRow: 数组没有 CharacterRowName='%s' 的项. "
+		     "WeaponRow=%s 数组已配置的 CharacterRowNames=[%s]. "
+		     "【修复】DT_WeaponInfo 行 '%s' 的 ReloadMontageHipByCharacter 数组必须包含 CharacterRowName='%s' 的行."),
+		*CharacterRowName.ToString(),
+		*CachedWeaponRowName.ToString(),
+		*ConfiguredKeys,
+		*CachedWeaponRowName.ToString(),
+		*CharacterRowName.ToString());
+	return nullptr;
+}
+
+
+/**
+ * GetFireMontageHip — 蓝图/C++ 标准入口, 按 Owner Character 自动查表
+ *
+ * 调用方: ABaseWeapon::Multicast_PlayFireMontage_Implementation
+ *
+ * 大厂原则 — 调用方零感知:
+ *   - 蓝图调用方代码不变 (BlueprintPure 无参)
+ *   - 内部自动走 ResolveAttachedCharacterRowName + GetFireMontageHipByRow
+ *   - 失败 Log Error + return nullptr (上层会跳过 Montage_Play)
+ *
+ * @return 对应当前持有者的 Fire Montage, 失败返回 nullptr
+ */
+UAnimMontage* UWeaponFireComponent::GetFireMontageHip() const
+{
+	const FName CharacterRowName = ResolveAttachedCharacterRowName();
+	return GetFireMontageHipByRow(CharacterRowName);
+}
+
+
+/**
+ * GetReloadMontageHip — 蓝图/C++ 标准入口, 按 Owner Character 自动查表
+ *
+ * 调用方: ABaseWeapon::Multicast_PlayReloadMontage_Implementation
+ */
+UAnimMontage* UWeaponFireComponent::GetReloadMontageHip() const
+{
+	const FName CharacterRowName = ResolveAttachedCharacterRowName();
+	return GetReloadMontageHipByRow(CharacterRowName);
 }
 
 // ==========================================

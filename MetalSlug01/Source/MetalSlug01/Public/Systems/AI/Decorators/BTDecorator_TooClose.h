@@ -30,6 +30,7 @@ class METALSLUG01_API UBTDecorator_TooClose : public UBTDecorator
 public:
 	UBTDecorator_TooClose();
 
+	/** @brief BT 编辑器静态描述 (显示 DistanceKey + AttackRangeKey) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 距离 BB Key — 派生量, Service 0.1s 写入 */

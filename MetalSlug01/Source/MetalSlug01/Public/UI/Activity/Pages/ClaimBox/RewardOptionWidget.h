@@ -3,7 +3,18 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// RewardOptionWidget 头文件 — 奖励选项 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 URewardOptionWidget — 每日登录/升级奖励领取选项弹窗
+//   2. 双委托: FOnStoreToBag / FOnOpenNow
+//   3. 防重复调用: bStoreClickedHandled / bOpenClickedHandled
+//
+// 架构理念:
+//   - 双委托: 玩家点击"放入背包"或"立即打开"时通知上层页面
+//   - 防重复: 已点击后禁用二次点击, 避免业务重复触发
+//   - 防御性: StoreBtn / OpenBtn 不存在 → Log Error
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

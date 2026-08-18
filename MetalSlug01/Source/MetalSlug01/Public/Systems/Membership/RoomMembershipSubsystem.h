@@ -5,6 +5,9 @@
 // ==========================================
 // URoomMembershipSubsystem — 房间成员管理子系统
 //
+// @file RoomMembershipSubsystem.h
+// @brief 房间成员管理 — 入队/换队/踢人/房主/准备
+//
 // 【2026.07.11 v31 大厂架构重构】从 RoomGameMode 拆出
 //
 // 设计原则:

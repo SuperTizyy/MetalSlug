@@ -1,6 +1,24 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
+// EscMenuWidget 实现 — 对战 ESC 菜单面板
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UEscMenuWidget — ESC 菜单的按钮点击逻辑
+//   2. Initialize 绑定两个按钮的点击事件
+//   3. NativeConstruct 初始化防连点状态
+//   4. OnResumeClicked / OnExitClicked 按钮回调
+//   5. ResetExitButtonState 防连点机制
+//   6. ResumeGame / QuitGame / ReturnToLobby / GetRoomPlayerController 辅助函数
+//
+// 关键架构:
+//   - 状态机分离: Widget 只管 UI, Pause/InputMode 由 RoomPlayerController 管理
+//   - 防连点: bIsExitProcessing + ExitCooldownTime (默认 1.0s)
+//   - 防御性: PlayerController 拿不到时降级 QuitGame
+// ==========================================
+
+// ==========================================
 // 头文件包含区
 // ==========================================
 #include "UI/Game/Widgets/EscMenuWidget.h"

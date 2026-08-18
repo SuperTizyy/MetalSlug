@@ -1,7 +1,18 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// ActivityConfirmPopupWidget 实现 — 活动奖励确认弹窗
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UActivityConfirmPopupWidget — 活动奖励确认弹窗所有 UI 逻辑
+//   2. 动态创建 3 张 RewardOptionCard 卡片
+//   3. PendingSelectedIndex 跟踪用户选择
+//
+// 大厂原则:
+//   - 双层委托: 卡片选中通过 OnRewardCardSelected 广播
+//   - 复用: 各活动可共用此弹窗
+//   - 防御性: 防御卡片创建/绑定失败
 // ==========================================
 #include "UI/Activity/Pages/SelectMultiplePopup/ActivityConfirmPopupWidget.h"
 #include "Components/Button.h"

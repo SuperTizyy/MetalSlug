@@ -12,6 +12,11 @@
  * @class ULocalAccountStore
  * @brief L0 存储层 - 本地账号存档的纯 IO 封装
  *
+ * 文件功能总览:
+ *   - 物理 IO 接口: LoadDataFromDisk / FlushToDisk / ReloadFromDisk
+ *   - 内存查询接口: GetAccounts / GetPlayerProfile / GetCurrentAccountName
+ *   - 客户端身份: GetLocalClientIdentity(基于 GUID 的存档槽位)
+ *
  * 【大厂架构原则：Storage Layer 三大铁律】
  * 1) 单一职责: 只做 Load/Save 的物理 IO，不做任何业务校验。
  * 2) 进程唯一: 一个进程（一个客户端窗口）一个 Store 实例，

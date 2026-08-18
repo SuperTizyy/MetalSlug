@@ -5,6 +5,9 @@
 // ==========================================
 // URoomSpawnSubsystem — 房间生成子系统
 //
+// @file RoomSpawnSubsystem.h
+// @brief 房间生成子系统 — Pawn 生成/出生点分配唯一入口
+//
 // 【2026.07.11 v31 大厂架构重构】从 RoomGameMode 拆出
 //
 // 设计原则:
@@ -382,19 +385,118 @@ public:
 	 *   - 通过 Controller 反查上次 Spawn 时的 PlayerStart, 精准释放
 	 *   - 不会误清空其他玩家的占用
 	 */
+	// ==========================================
+	// 【v242 大厂架构重构】占点 + 映射登记单一入口
+	// ==========================================
+
+	/**
+	 * @brief 原子占点 + 映射登记 (单一入口, v242 P0 修复)
+	 *
+	 * 大厂原则 — 零兜底 + 单一入口:
+	 *   - 所有占用出生点逻辑必须走这里
+	 *   - 同时维护 OccupiedSpawnPoints (数组) + OccupiedSpawnByController (Map)
+	 *   - 两表一致性保证: 总是同时 Add,Always Remove
+	 *
+	 * 入参校验 (零兜底):
+	 *   - SpawnPoint == nullptr → Log Error + return false
+	 *   - OccupancyOwner == nullptr → Log Error + return false (首次 Spawn 必须等 AIC 创建后调)
+	 *
+	 * 重复占点防御:
+	 *   - Controller 已占过其他点 → 撤销旧映射,重新占新点
+	 *   - SpawnPoint 已被占 → Log Error + return false (双重占点 bug)
+	 *
+	 * @param SpawnPoint 要占用的出生点 (不能为 nullptr)
+	 * @param OccupancyOwner 占点 Controller (不能为 nullptr)
+	 * @return true 占点成功,false 占点失败
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	bool ClaimSpawnPointAndRegisterMapping(APlayerStart* SpawnPoint, AController* OccupancyOwner);
+
+	/**
+	 * @brief 【v242 零兜底 — 精准释放】按 Controller 反查释放其占用的出生点
+	 *
+	 * 调用方: CombatDeathComponent::ExecuteDeathLocal (死亡链路必经)
+	 *
+	 * 大厂原则 — 细粒度 > 粗粒度:
+	 *   - 旧版 ReleaseSpawnPoint(AActor*) 在多玩家同帧死亡时会误清空
+	 *   - 新版按 Controller 精准释放,互不干扰
+	 *
+	 * 双表一致性: 同时维护 OccupiedSpawnPoints + OccupiedSpawnByController
+	 *
+	 * @param Controller 已死的玩家/AI Controller (nullptr → no-op)
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
 	void ReleaseSpawnPointByController(AController* Controller);
 
 	/**
-	 * @brief 释放出生点
+	 * @brief 【v246 大厂架构】释放所有出生点占用 — 语义化入口
+	 *
+	 * 用途:
+	 *   - ARoomGameMode::ResetAllSpawnPointOccupancy() 转发壳内部使用
+	 *   - 任何需要"清空所有占用"的合法场景 (如整局重置)
+	 *
+	 * 大厂原则 — 暴露行为, 不暴露数据结构:
+	 *   - 内部复制 OccupiedSpawnByController keys, 逐个调 ReleaseSpawnPointByController
+	 *   - 调用方 (RoomGameMode) 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+	 *   - 隐藏实现细节, 后续重构 TMap → TArray 时不影响调用方
+	 *
+	 * 双表一致性保证:
+	 *   - ReleaseSpawnPointByController 内部已维护 OccupiedSpawnPoints + OccupiedSpawnByController 双表一致
+	 *   - 本函数循环调用 ReleaseSpawnPointByController, 双表自动一致
+	 *
+	 * 零兜底:
+	 *   - OccupiedSpawnByController 已为空 → no-op (合法)
+	 *   - Controller 已 Destroy (TWeakObjectPtr.Get() 返回 nullptr) → 跳过 (不报错)
+	 *
+	 * @return 实际释放的 Controller 数量 (0 = 无占用)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	int32 ReleaseAllSpawnPointOccupancy();
+
+	/**
+	 * @brief 【v246 大厂架构】按出生点释放所有占用此点的 Controller — 语义化入口
+	 *
+	 * 用途:
+	 *   - ARoomGameMode::ReleaseSpawnPoint(AActor*) 转发壳内部使用
+	 *   - 任何需要"释放此出生点所有占用"的合法场景 (如玩家放弃某点)
+	 *
+	 * 大厂原则 — 暴露行为, 不暴露数据结构:
+	 *   - 内部反查 OccupiedSpawnByController, 找到所有映射此 PlayerStart 的 Controller
+	 *   - 调 ReleaseSpawnPointByController 精准释放每个
+	 *   - 调用方 (RoomGameMode) 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+	 *
+	 * 双表一致性保证:
+	 *   - ReleaseSpawnPointByController 内部已维护 OccupiedSpawnPoints + OccupiedSpawnByController 双表一致
+	 *
+	 * 零兜底:
+	 *   - PlayerStart 为空 → Log Warning + return 0
+	 *   - PlayerStart 不是 APlayerStart → Log Warning + return 0
+	 *   - 反查无 Controller 占用此点 → return 0 (合法)
+	 *
+	 * @param PlayerStart 要释放的出生点
+	 * @return 实际释放的 Controller 数量 (0 = 无占用)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	int32 ReleaseSpawnPointBySpawnPoint(AActor* PlayerStart);
+
+	/**
+	 * @brief 释放出生点
+	 *
+	 * 【v242 ZERO-FALLBACK 重构】DEPRECATED — 走 ReleaseSpawnPointByController 精准释放
+	 *   保留只是为了兼容旧 BP 调用方,不再用于新代码
+	 */
+	UE_DEPRECATED(5.6, "【v242 零兜底】ReleaseSpawnPoint(AActor*) 是粗粒度接口, 请改用 ReleaseSpawnPointByController(AController*) 精准释放.")
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn", meta = (DeprecatedFunction, DeprecationMessage = "【v242 零兜底】请改用 ReleaseSpawnPointByController(AController*) 精准释放, 避免多玩家同帧死亡误清空."))
 	void ReleaseSpawnPoint(AActor* PlayerStart);
 
 	/**
 	 * @brief 重置所有出生点占用 (每回合/每局开始)
+	 *
+	 * 【v242 ZERO-FALLBACK 重构】DEPRECATED — 走精细化释放入口
+	 *   保留只是为了兼容旧 BP 调用方,不再用于新代码
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
+	UE_DEPRECATED(5.6, "【v242 零兜底】ResetAllSpawnPointOccupancy 是粗粒度接口, 请改用 ReleaseSpawnPointByController 精准释放每个 Controller.")
+	UFUNCTION(BlueprintCallable, Category = "Room|Spawn", meta = (DeprecatedFunction, DeprecationMessage = "【v242 零兜底】请改用 ReleaseSpawnPointByController 精细化释放, 避免多玩家同帧死亡误清空."))
 	void ResetAllSpawnPointOccupancy();
 
 	// ==========================================
@@ -430,12 +532,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Room|Spawn")
 	int32 QueueAIForBattleSpawn(const FAISpawnRequest& Request);
 
+	/**
+	 * @brief 按阵营拉取大厅占位 AI 列表 (UI 显示用)
+	 *
+	 * 大厂原则 — 单一真理源:
+	 *   - UI 只读 PendingAIQueue, 不直接读 SpawnActor 后的 Pawn (AI 大厅阶段不生成 Pawn, 走 v28)
+	 */
 	UFUNCTION(BlueprintPure, Category = "Room|Spawn")
 	TArray<FPendingAIEntry> GetPendingAIInFaction(FGameplayTag FactionTag) const;
 
+	/**
+	 * @brief 返回 PendingAIQueue 的常量引用 (供序列化/调试)
+	 */
 	UFUNCTION(BlueprintPure, Category = "Room|Spawn")
 	TArray<FPendingAIEntry> GetAllPendingAI() const { return PendingAIQueue; }
 
+	/**
+	 * @brief 按 DisplayName 检查是否在大厅占位队列中 (大厂原则 — 字段驱动判定, 不用 StartsWith)
+	 */
 	UFUNCTION(BlueprintPure, Category = "Room|Spawn")
 	bool IsPendingAIByName(const FString& DisplayName) const;
 

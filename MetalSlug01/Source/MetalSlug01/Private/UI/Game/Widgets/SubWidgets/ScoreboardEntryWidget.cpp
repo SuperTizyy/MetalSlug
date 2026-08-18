@@ -1,7 +1,24 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// ScoreboardEntryWidget 实现 — 计分板条目子控件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UScoreboardEntryWidget — 单条计分板信息的展示
+//   2. 排名/玩家名/得分/KDA/当前玩家高亮
+//   3. KDA 公式单一真理源: FKdaScoring::Compute
+//
+// 大厂原则 (v229.x 大厂重构):
+//   - 排名显示: 严格只显示数字, 无 emoji (用户业务规则 2026.08.16)
+//   - K/D/A: 缓存到字段供 GetScore 现算, 不缓存 CachedScore (避免飘移)
+//   - 颜色分层: K/D ≥ 2 绿 / ≥ 1 白 / < 1 红 (视觉强化, 不影响文本)
+//   - 0 兜底: TextBlock 未绑 → 静默跳过 (BindWidget 可选)
+//
+// KDA 公式 (业务层 = UI 层 同一真理源):
+//   Score = Kills*10 + Assists*5 - Deaths
+//   旧 (v22-v228) 反模式: 缓存 CachedScore = Kills*20 + Assists*10 (字段飘移 + 业务公式不一致)
+//   新 (v229.x): 每次 GetScore 现算
 // ==========================================
 #include "UI/Game/Widgets/SubWidgets/ScoreboardEntryWidget.h"
 #include "Components/TextBlock.h"

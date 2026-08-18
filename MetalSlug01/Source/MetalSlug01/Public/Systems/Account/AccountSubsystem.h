@@ -1,3 +1,26 @@
+// ========================================================================
+// AccountSubsystem.h — 本地账号会话层头文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 声明 UAccountSubsystem 类(继承 UGameInstanceSubsystem)
+//   - 提供会话层 API: SetCurrentUser / GetCurrentLoggedInUser / ClearSession
+//   - 提供会话 Token: GetSessionToken (启动时生成, 全程不变)
+//   - 保留 bIsReturningFromRoom (UI 跳转逻辑仍在用)
+//   - 保留 MockLoginForTesting (开发期跳过登录页)
+//
+// 大厂架构角色 — Session Layer (与 Persistence 分离):
+//   - 旧实现把"会话状态" (bIsOnline) 写进账号档案, 混了 Session 和 Persistence 两层
+//   - 新实现把 bIsOnline 彻底迁移到本 Subsystem 的内存字段
+//   - 本类不再做 Load/Save, 不再做账号注册/校验
+//   - 只负责:维护当前客户端的"已登录账号" + "会话 Token" + "返回登录清理"
+//
+// 双开隔离根因修复:
+//   - 旧实现每次 Login 都 LoadDataFromDisk + SaveDataToDisk 全表, 双开覆盖
+//   - 新实现:每个客户端只关心自己当前登录了谁, 不再做跨进程"互踢"
+//   - 互踢能力应该由真正的后端服务提供, 而不是单机 SaveGame
+// ========================================================================
+
 // ==========================================
 // 头文件包含说明
 // ==========================================

@@ -1,5 +1,27 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ==========================================
+// GameHUDWidget 头文件 — 游戏主 HUD 组件 (战斗中的根 Widget)
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UGameHUDWidget 类 — 继承 UUserWidget
+//   2. 聚合所有战斗子 Widget: PlayerStatus/WeaponPanel/MatchInfo/KillFeed/Chat/KillStreak/Scoreboard/Crosshair/EscMenu/RespawnProgress
+//   3. 接受 Controller/Character/GameState 事件并广播到子 Widget
+//
+// 设计理念 (大厂原则 - 委托驱动 + 容器化):
+//   1. 委托驱动: 大量使用 AddDynamic 订阅 GameState 事件 (单一订阅点)
+//   2. 重试绑定: GameState 还未生成时定时器重试 5 次 (解决时序问题)
+//   3. 容器化: 所有子 Widget 都是 BindWidgetOptional, 强耦合由蓝图控制
+//   4. 单一入口: 所有外部调用 (Controller/Character) 通过本类接口进入
+//
+// 架构演变:
+//   v216: Border_SettlementOverlay/Button_ReturnToLobby 已迁移到 UScoreboardWidget (跨地图)
+//   v218: Text_GameOver 保留在 GameHUDWidget (战斗内瞬时反馈)
+//   v134: 新增 UpdateTeamWinCountsText (生化模式小局胜局数)
+//   v201: 新增 OnShowZombieRoundBriefResult (生化小局结果)
+// ==========================================
+
 #pragma once
 
 // ==========================================

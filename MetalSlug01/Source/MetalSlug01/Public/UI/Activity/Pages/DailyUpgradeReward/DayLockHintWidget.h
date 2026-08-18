@@ -3,7 +3,19 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// DayLockHintWidget 头文件 — 天数锁提示 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UDayLockHintWidget — 天数锁定状态的奖励预览
+//   2. 限时奖励图标 + 任务奖励图标
+//   3. 当天未解锁时, 显示"明天可领"等提示
+//
+// 架构理念:
+//   - 数据驱动: DayIdentifier 从 UUpgradeActivitySubsystem 取数据
+//   - 双容器: 限时奖励 + 任务奖励 分离显示
+//   - 复用: 每个天一份
+//   - 依赖: 强依赖 UUpgradeActivitySubsystem
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

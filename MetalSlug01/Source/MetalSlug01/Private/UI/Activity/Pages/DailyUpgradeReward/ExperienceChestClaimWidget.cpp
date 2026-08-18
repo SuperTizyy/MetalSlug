@@ -11,7 +11,18 @@
  */
 
 // ==========================================
-// 头文件包含区
+// ExperienceChestClaimWidget 实现 — 经验宝箱领取 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UExperienceChestClaimWidget — 经验宝箱所有 UI 逻辑
+//   2. 5 种状态机: Enabled / Disabled / Claimed / FixedPrizeEnabled / FixedPrizeClaimed
+//   3. Initialize 不绑事件 (UMG 时序问题), 事件绑定在 NativeConstruct
+//
+// 大厂原则 (v230 重构):
+//   - UMG 时序: ChestClaimButton->OnClicked 绑定必须在 NativeConstruct
+//   - 零兜底: 控件为 null 必须 Log Error + 不调 SetVisibility
+//   - 状态机: 单一职责 helper (Apply*UI)
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/ExperienceChestClaimWidget.h"
 #include "Components/Button.h"

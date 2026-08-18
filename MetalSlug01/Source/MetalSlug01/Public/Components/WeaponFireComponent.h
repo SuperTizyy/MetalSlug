@@ -39,6 +39,8 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Data/Enums/CombatEnums.h"
+// 【v241.1】TArray<FStruct> 作为 UPROPERTY Replicated 需要 struct 完整定义
+#include "Data/Tables/WeaponTableRow.h"  // 提供 FAnimMontageByCharacterEntry 完整定义
 #include "WeaponFireComponent.generated.h"
 
 class ABaseWeapon;
@@ -195,9 +197,21 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
 	int32 GetCurrentAmmo() const { return CurrentAmmo; }
 
+	/**
+	 * @brief 弹匣容量 (DT 真理源, Replicated)
+	 *
+	 * HUD 显示 "弹匣 30 / 弹匣容量" 中分母部分
+	 * 不变量: 永远不会变,武器生成时 InitializeFromWeaponConfig 写入一次
+	 */
 	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
 	int32 GetMagazineSize() const { return MagazineSize; }
 
+	/**
+	 * @brief 备用弹药 (DT 真理源, Replicated)
+	 *
+	 * HUD 显示总弹药数 (弹匣 + 备用), 换弹时从 ReserveAmmo 取弹
+	 * 补给时 (Server_RefillAmmo) 恢复到 InitialReserveAmmo, 不恢复到 ReserveAmmo
+	 */
 	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
 	int32 GetReserveAmmo() const { return ReserveAmmo; }
 
@@ -254,15 +268,67 @@ public:
 	// 蒙太奇查询 (供 ABaseWeapon::Multicast_PlayXxxMontage_Implementation 调用)
 	// ==========================================
 	//
-	// 大厂原则 - 封装边界:
-	//   - 蒙太奇字段保持 protected (内部写, 外部只读)
-	//   - ABaseWeapon 通过这些 getter 拿蒙太奇引用 (避免穿透到组件字段)
+	// 【v241 大厂架构 — 按角色查表】
+	//   - 旧版 (v60-v240): GetFireMontageHip/GetReloadMontageHip 返回单值字段
+	//     → 同一武器在所有角色播同一 Montage → Skeleton 不兼容角色静默失败
+	//   - 新版 (v241): 内部按 Owner Character 的 RowName 查 TMap
+	//     → 不同角色播各自的 Montage → 全部角色都有动画
+	//
+	//   蓝图调用方零改动 (BlueprintPure 无参), 内部自动走查表
+	//   C++ 调用方零改动 (返回值类型不变), 内部按 Owner Character 查 Map
+	//
+	// 大厂原则 - 单一真理源:
+	//   - DT_WeaponInfo.FireMontageHipByCharacter/ReloadMontageHipByCharacter 是唯一真理源
+	//   - 字段 FireMontageHipByCharacter/ReloadMontageHipByCharacter 是 Replicated 镜像
+	//   - 查询时按 Owner Character RowName 查 Map
+	//
+	// 大厂原则 - 零兜底:
+	//   - Map 为空 → Log Error + return nullptr
+	//   - 找不到对应 CharacterRowName → Log Error + return nullptr (不静默 fallback)
+	//   - Owner Weapon 无效 / GetAttachedCharacter 返回 nullptr → Log Error + return nullptr
 
+	/**
+	 * 【v241 大厂架构】按当前持有武器的角色自动查表, 返回对应的开火蒙太奇
+	 *
+	 * 调用方: ABaseWeapon::Multicast_PlayFireMontage_Implementation (服务器/客户端)
+	 *
+	 * @return 对应角色 Skeleton 的 Fire Montage, 找不到返回 nullptr
+	 */
 	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
-	UAnimMontage* GetFireMontageHip() const { return FireMontageHip; }
+	UAnimMontage* GetFireMontageHip() const;
 
+	/**
+	 * 【v241 大厂架构】按当前持有武器的角色自动查表, 返回对应的换弹蒙太奇
+	 *
+	 * 调用方: ABaseWeapon::Multicast_PlayReloadMontage_Implementation (服务器/客户端)
+	 *
+	 * @return 对应角色 Skeleton 的 Reload Montage, 找不到返回 nullptr
+	 */
 	UFUNCTION(BlueprintPure, Category = "Weapon|Fire")
-	UAnimMontage* GetReloadMontageHip() const { return ReloadMontageHip; }
+	UAnimMontage* GetReloadMontageHip() const;
+
+	/**
+	 * 【v241 大厂架构】按 CharacterRowName 显式查表 (供调试/测试/特殊场景使用)
+	 *
+	 * 正常流程不需要直接调这个 — 用 GetFireMontageHip() 会自动按 Owner Character 查询
+	 * 此接口存在是因为:
+	 *   - 蓝图测试可以手动指定 RowName 验证 Map 配置
+	 *   - 未来支持"换弹时武器持有者切换"等场景需要手动指定
+	 *
+	 * @param CharacterRowName 角色 RowName (如 "SWAT", "CosmoBunnyGirl" — 跟 DT 数组 Key 一致)
+	 * @return 对应的 Fire Montage, 找不到返回 nullptr (并 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Fire")
+	UAnimMontage* GetFireMontageHipByRow(FName CharacterRowName) const;
+
+	/**
+	 * 【v241 大厂架构】按 CharacterRowName 显式查表 (换弹蒙太奇版本)
+	 *
+	 * @param CharacterRowName 角色 RowName
+	 * @return 对应的 Reload Montage, 找不到返回 nullptr (并 Log Error)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Fire")
+	UAnimMontage* GetReloadMontageHipByRow(FName CharacterRowName) const;
 
 	// ==========================================
 	// 事件订阅 (供 HUD / 客户端 UI)
@@ -409,31 +475,38 @@ protected:
 	FName CachedWeaponRowName;
 
 	// ==========================================
-	// 蒙太奇缓存 (服务器写入, Replicated 给所有客户端 — v82 修复)
+	// 【v241.1 大厂架构】蒙太奇缓存 — 按角色 Skeleton 区分 (Replicated)
 	// ==========================================
 
 	/**
-	 * 腰射状态下的开火蒙太奇 (从 DT 读)
+	 * 【v241.1 架构修复】按角色查询的开火蒙太奇 (TArray<FAnimMontageByCharacterEntry>)
 	 *
-	 * 【v82 客户端武器可用性修复】Replicated:
-	 *   - 旧版 (v70-v81) 注释错误: "不复制, 蒙太奇资源客户端直接从 BP 资产加载"
-	 *   - 实际: DT_WeaponInfo 中的 FireMontage_Ironsights 是策划在 DataTable 配的字段,
-	 *           不是 BP 子对象的默认属性, 客户端不会自动加载
-	 *   - 客户端 Multicast_PlayFireMontage_Implementation 调 GetFireMontageHip() → nullptr
-	 *   - → Multicast_PlayFireMontage 全部 Log "FireMontage 为空"
-	 *   - → 远端玩家开火 fire 动画永远不播
+	 * 设计动机 (修复 v82 的"单值字段错位"问题):
+	 *   - 旧版 (v60-v240): FireMontageHip 是 TObjectPtr<UAnimMontage> (单值)
+	 *   - 跨 Skeleton 播放 Montage 会静默失败 (UE Montage_Play 不报错, 但不播)
+	 *   - BP_CosmoBunnyGirl 用 SWAT 配的 Montage → 武器有但身上没动画 (用户看不到)
 	 *
-	 *   - 新版 (v82): FireMontageHip Replicated → 服务器写入 → 客户端自动同步
-	 *   - 客户端 Multicast_PlayFireMontage_Implementation 拿到正确 FireMontage → 播放
+	 * 新版 (v241.1) — 按角色查表:
+	 *   - TArray<FAnimMontageByCharacterEntry> (UE 5.6 不支持 Replicated TMap, 改用 TArray<FStruct>)
+	 *   - 服务器 InitializeFromWeaponConfig 从 DT 复制 → 客户端 OnRep 自动同步
+	 *   - 查询时 GetFireMontageHip() 拿 Owner Character 的 RowName → 遍历数组找匹配
+	 *
+	 * 真理源: DT_WeaponInfo::FireMontageHipByCharacter (策划在 DataTable 编辑器里配 — UE 自动展开表格)
+	 * 调用方: ABaseWeapon::Multicast_PlayFireMontage_Implementation → GetFireMontageHip()
+	 *
+	 * v82 兼容注释保留:
+	 *   - 旧版 (v70-v81): "不复制, 蒙太奇资源客户端直接从 BP 资产加载" — 错的
+	 *   - 新版 (v82 → v241.1): 字段 Replicated → 服务器写入 → 客户端自动同步
+	 *     → TArray<FStruct> Replicated 同步整个数组, 客户端遍历查找
 	 */
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
-	TObjectPtr<UAnimMontage> FireMontageHip;
+	TArray<FAnimMontageByCharacterEntry> FireMontageHipByCharacter;
 
 	/**
-	 * 腰射状态下的换弹蒙太奇 (与 FireMontageHip 同模式 — v82 修复)
+	 * 【v241.1 架构修复】按角色查询的换弹蒙太奇 (与 FireMontageHipByCharacter 同模式)
 	 */
 	UPROPERTY(Replicated, VisibleAnywhere, BlueprintReadOnly, Category = "Weapon|Fire")
-	TObjectPtr<UAnimMontage> ReloadMontageHip;
+	TArray<FAnimMontageByCharacterEntry> ReloadMontageHipByCharacter;
 
 	// ==========================================
 	// 网络同步
@@ -512,4 +585,24 @@ protected:
 	 * 大厂原则: 不缓存, 与 v40.6 AIAttackComponent 同模式
 	 */
 	ABaseWeapon* ResolveOwnerWeapon() const;
+
+	/**
+	 * 【v241.1 大厂架构】解析当前持有武器的角色的 RowName (FName)
+	 *
+	 * 真理源链 (按优先级, 与 ABaseCharacter::GetCharacterRowName 一致):
+	 *   1. 玩家路径: Weapon->GetAttachedCharacter()->PlayerState->SelectedCharacterID
+	 *   2. AI 路径:   Weapon->GetAttachedCharacter()->WeaponAttachmentComponent->CharacterID
+	 *   3. 都拿不到 → 返回 NAME_None (调用方处理)
+	 *
+	 * 大厂原则:
+	 *   - 不缓存 (与 v40.6 同模式)
+	 *   - 每次按需 GetOwner/GetAttachedCharacter/PlayerState/WeaponAttachment
+	 *
+	 * 零兜底:
+	 *   - 任何中间环节失败 → 返回 NAME_None (调用方 GetFireMontageHipByRow 会 Log Error)
+	 *   - 不静默 fallback 到 "SWAT" 或其他默认
+	 *
+	 * @return 角色 RowName (FName), 失败返回 NAME_None
+	 */
+	FName ResolveAttachedCharacterRowName() const;
 };

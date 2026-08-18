@@ -54,6 +54,10 @@ UBTTask_PlayAttackMontage::UBTTask_PlayAttackMontage()
 	NodeName = TEXT("Play Attack Montage");
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示 v40.4 大厂重构的纯原子化攻击触发
+ * @return 多行描述,展示 v133.1 ExplicitMontage 优先级 + AttackType/ComboIndex + Resolver 链 + 副作用集中
+ */
 FString UBTTask_PlayAttackMontage::GetStaticDescription() const
 {
 	// 【v133.1】描述展示当前配置的 4 个参数 + 锁定状态

@@ -95,6 +95,7 @@ class METALSLUG01_API UBTTask_MoveToFacingTarget : public UBTTaskNode
 public:
 	UBTTask_MoveToFacingTarget();
 
+	/** @brief BT 编辑器静态描述 (显示 AcceptanceRadius + MaxWaitTime + 智能避障参数) */
 	virtual FString GetStaticDescription() const override;
 
 	/**
@@ -196,6 +197,7 @@ protected:
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp,
 		uint8* NodeMemory) override;
 
+	/** @brief Tick: 异步等 MoveTo 到达 / 超时, 满足条件恢复 Movement 设置并 Succeeded */
 	virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
 		float DeltaSeconds) override;
 
@@ -243,7 +245,9 @@ private:
 		const AAIController& AIC,
 		EBTNodeResult::Type& OutResult) const;
 
+	/** @brief 启动面向移动 (异步): 朝向 + 智能避障规划 + MoveToLocation(Dest) */
 	bool StartMoveTo(UBehaviorTreeComponent& OwnerComp, const FVector& Dest);
+	/** @brief Tick 检查: 到达 AcceptanceRadius 或超 MaxWaitTime → 恢复 Movement + FinishLatentTask */
 	void CheckArrival(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory);
 
 	/**

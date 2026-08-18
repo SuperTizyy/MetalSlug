@@ -48,17 +48,8 @@
 #include "Engine/World.h"             // 【v97.0】UWorld
 #include "GameplayTagContainer.h"     // 【v97.0】FGameplayTag
 
-// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
-// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
-static TAutoConsoleVariable<int32> CVarShowTraceDebug(
-	TEXT("g.MetalSlug.ShowTraceDebug"),
-	0,
-	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
-	TEXT("0 = hide all trace debug visuals (default)\n")
-	TEXT("1 = show all trace debug visuals\n")
-	TEXT("Affects: BaseWeapon, BTDecorator_HasClearShot, RangedLineStrategy, MeleeSwStrategy"),
-	ECVF_Default
-);
+// 【v241.1 大厂架构】trace debug 可视化统一开关 — 见 Debug/MetalSlugDebugCVars.h
+#include "Debug/MetalSlugDebugCVars.h"
 
 
 // 【v75 单一真理源】Socket 名称常量定义 — 与 .h 声明一一对应

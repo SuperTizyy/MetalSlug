@@ -28,6 +28,7 @@ class METALSLUG01_API UBTTask_PlayDeath : public UBTTaskNode
 public:
 	UBTTask_PlayDeath();
 
+	/** @brief BT 编辑器静态描述 (显示 "死亡 + 销毁") */
 	virtual FString GetStaticDescription() const override;
 
 protected:

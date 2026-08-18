@@ -1,9 +1,11 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
-// ==========================================
-// 头文件包含区
-// ==========================================
-// 【UE规范】本控制器头文件必须第一个引入
+// 文件作用: ARoomPlayerController 实现 — 房间玩家控制器,UE 5.6 RPC 编排核心
+// 大厂架构角色:
+//   - 客户端 RPC 中转站 (Client_* / Server_* RPC 入口)
+//   - Enhanced Input 系统绑定 (Tab 计分板 / ESC 菜单 / T 聊天)
+//   - 死亡复活定时器 (挂在 Controller 上,不随 Pawn 销毁失效)
+
 #include "Systems/RoomPlayerController.h"
 
 // 引入账号在线状态权威表（RoomPlayerController.h 只有前向声明，此处需要完整定义）

@@ -35,6 +35,7 @@ class METALSLUG01_API UBTService_UpdateWeaponAmmo : public UBTService
 public:
 	UBTService_UpdateWeaponAmmo();
 
+	/** @brief BT 编辑器静态描述 (显示 4 个 Ammo Key + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** BB.CurrentAmmo (Int) */
@@ -54,6 +55,7 @@ public:
 	FBlackboardKeySelector bIsReloadingKey;
 
 protected:
+	/** @brief Tick: 派生 4 类事实到 BB (身份 + 人数), 切换时清理 TargetActor/NearestXxx */
 	virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
 		float DeltaSeconds) override;
 };

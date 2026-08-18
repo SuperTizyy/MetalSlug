@@ -35,6 +35,7 @@ class METALSLUG01_API UBTService_RefreshTarget : public UBTService
 public:
 	UBTService_RefreshTarget();
 
+	/** @brief BT 编辑器静态描述 (显示 TargetKey + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 目标 BB Key */

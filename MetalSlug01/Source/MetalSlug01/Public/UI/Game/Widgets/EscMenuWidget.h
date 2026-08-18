@@ -3,6 +3,26 @@
 #pragma once
 
 // ==========================================
+// EscMenuWidget 头文件 — 对战 ESC 菜单面板
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UEscMenuWidget — 战斗中按 ESC 键呼出的菜单
+//   2. 提供"继续游戏"和"退出游戏"两个选项
+//   3. 退出: 返回大厅或完全退出 (降级方案)
+//
+// 设计理念 (大厂原则 - 防连点 + 职责分离):
+//   1. 防连点机制: bIsExitProcessing + ExitCooldownTime (默认 1.0s)
+//   2. 状态机分离: Widget 只管 UI, Pause/InputMode 由 RoomPlayerController 管理
+//   3. 防御性: PlayerController 拿不到时降级 QuitGame
+//   4. 注意: 显示/隐藏由 WBP_GameHUD 通过 SetVisibility 控制
+//
+// 大厂对应:
+//   - Lyra: UCommonPauseWidget
+//   - Fortnite: 通用 ESC 暂停菜单
+// ==========================================
+
+// ==========================================
 // 头文件包含说明
 // ==========================================
 #include "CoreMinimal.h"

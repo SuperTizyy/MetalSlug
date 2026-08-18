@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// GameMenuPage 实现 — 游戏主菜单页面
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UGameMenuPage — 游戏主菜单所有 UI 逻辑
+//   2. 按钮点击 → 跳转各子页面 (单人/多人/排行榜/活动/退出登录)
+//
+// 大厂原则:
+//   - 单一职责: 主菜单只做入口跳转
+//   - 跳转走 Subsystem: UGameFlowSubsystem->TransitToState(MainLobby)
+//   - 容错: BindWidgetOptional 让 BP 控件可缺失
+//   - 防呆: 先 RemoveAll 再 AddDynamic (避免重复绑定)
+//   - 音乐: MusicManagerSubsystem 管理 BGM
 // ==========================================
 // 包含当前类的头文件
 #include "UI/Login/Pages/GameMenuPage.h"

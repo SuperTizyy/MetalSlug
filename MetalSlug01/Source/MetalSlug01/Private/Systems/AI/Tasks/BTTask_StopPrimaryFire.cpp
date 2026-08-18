@@ -21,6 +21,10 @@ UBTTask_StopPrimaryFire::UBTTask_StopPrimaryFire()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示主武器停火调用镜像玩家 IA_Fire Released
+ * @return 多行描述,展示全自动停止连射 + 半自动 no-op 语义
+ */
 FString UBTTask_StopPrimaryFire::GetStaticDescription() const
 {
 	return TEXT("调 CurrentWeapon->Server_StopFire (镜像玩家 IA_Fire Released)\n"

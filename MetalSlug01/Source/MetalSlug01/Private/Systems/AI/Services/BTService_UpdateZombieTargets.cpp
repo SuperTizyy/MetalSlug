@@ -33,6 +33,10 @@ UBTService_UpdateZombieTargets::UBTService_UpdateZombieTargets()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示母体/人类目标选择频率与身份分支
+ * @return 多行描述,展示 Interval/3 个目标 BB Key/未知身份 Pre-Mutation 写入 HomeLocation
+ */
 FString UBTService_UpdateZombieTargets::GetStaticDescription() const
 {
 	return FString::Printf(
@@ -58,6 +62,21 @@ namespace
 }
 
 
+/**
+ * @brief Service 周期 Tick — 按身份选最近存活目标写入 BB
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory Service 节点内存(本类未使用)
+ * @param DeltaSeconds 距上次 Tick 的间隔秒
+ *
+ * 流程:
+ *   1. 派生 PrimaryFireRange(ConfigSO)→ 写 BB
+ *   2. 母体 → 扫描全角色选最近存活人类,写 BB.NearestHumanTarget + TargetActor
+ *   3. 人类 → 扫描母体账本选最近存活母体,写 BB.NearestMotherTarget + TargetActor
+ *   4. 未知身份 → 清 3 个目标 Key,写 BB.HomeLocation(原地应急),实际移动由 BT_SelectRallyPoint 驱动
+ *
+ * 零兜底:Subsystem 缺失立即清 BB + Log Error,不允许 fallback.
+ * v117/v118 大重构:未知身份不再"原地不动",Pre-Mutation 期间由 BT 驱动移动.
+ */
 void UBTService_UpdateZombieTargets::TickNode(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {

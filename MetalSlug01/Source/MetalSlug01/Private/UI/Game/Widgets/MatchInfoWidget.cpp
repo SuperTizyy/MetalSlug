@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// MatchInfoWidget 实现 — 比赛信息组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UMatchInfoWidget — 比赛信息面板所有 UI 逻辑
+//   2. 攻/守方人数 + 倒计时 + 总局数 + 模式分支
+//   3. 母体变异倒计时数字音效 (TArray 映射, 找不到 Log Error)
+//
+// 大厂原则 (v92/v134/v222 大厂重构):
+//   - 防御性: BindWidget 失败 → Log Error 报告 + 跳过
+//   - 显式优于隐式: 模式分支 (ERoomMatchMode) 刀战/生化 UI 差异
+//   - cpp include 完整: 不依赖 transitive (v40.5.1 教训)
+//   - 0 兜底: 音效映射缺失 → 显式 Log Error + 拒绝播放
 // ==========================================
 #include "UI/Game/Widgets/MatchInfoWidget.h"
 #include "Components/TextBlock.h"

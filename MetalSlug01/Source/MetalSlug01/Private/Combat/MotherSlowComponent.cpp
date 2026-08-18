@@ -35,6 +35,12 @@ void UMotherSlowComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		World->GetTimerManager().ClearTimer(SlowTimerHandle);
 	}
 
+	// 【v244 P0 大厂架构 — 缓存清理移到 EndPlay (镜像 MotherSkillComponent)】
+	// Pawn 销毁时清缓存, 防止残留到下一个生命周期
+	// 为什么不放 DeactivateSlow: DeactivateSlow 是慢速状态退出, Pawn 没销毁, 缓存仍有用 (下次激活不再重新缓存)
+	// 为什么放 EndPlay: 这是 Pawn 生命周期终点, 缓存失去意义
+	CachedBaseMaxWalkSpeed = 0.0f;
+
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -201,10 +207,23 @@ void UMotherSlowComponent::DeactivateSlow()
 	bIsSlowed = false;
 	SlowExpiresAtWorldTime = 0.0f;
 
-	// 3. 【v133.5.1 修复】清缓存 — 死亡时强制 DeactivateSlow 后, 必须清缓存,
-	//    否则下一次复活第一次激活时, 缓存的还是"上次的原速度" 但 Pawn 已经重生过
-	//    实际不会出错 (激活前会重新缓存), 但清掉更干净
-	CachedBaseMaxWalkSpeed = 0.0f;
+	// 3. 【v244 P0 大厂架构 — 移除清缓存 (与 MotherSkillComponent 完全对称)】
+	//
+	// 旧版 (v133.5.1 ~ v243) 反模式:
+	//   - DeactivateSlow 内 CachedBaseMaxWalkSpeed = 0.0f
+	//   - 后果: 母体第二次被击中 → 缓存是 600 (退化默认) 而不是真实母体速度
+	//         → 还原路径用缓存 600 → 永远"恢复不了正常母体的速度"
+	//
+	// 大厂原则 (镜像 MotherSkillComponent v121.3 注释 "不清 CachedBaseMaxWalkSpeed"):
+	//   - CachedBaseMaxWalkSpeed 是 Pawn 生命周期内的"原速度真理源" (替代 AI 路径没有 MaxWalkSpeed 真理源)
+	//   - DeactivateSlow 是慢速状态退出, 不应销毁 Pawn 级真理源
+	//   - 缓存只在 Pawn 销毁时清 (EndPlay 内, 镜像 MotherSkillComponent)
+	//
+	// 缓存生命周期 (v244 大厂架构):
+	//   - ActivateSlow: 第一次激活时缓存 (CachedBaseMaxWalkSpeed == 0 → 设值)
+	//   - DeactivateSlow: 不动缓存 (与 MotherSkillComponent 镜像)
+	//   - EndPlay (Pawn 销毁): 清缓存 (防御型设计, 防止残留)
+	//   - ExecuteDeathLocal 第 0 步 DeactivateSlow: 不动缓存 (Pawn 没销毁, 复用)
 
 	// 4. 服务器主动 Broadcast (客户端 OnRep 也会 Broadcast)
 	if (bWasSlowed)
@@ -212,15 +231,15 @@ void UMotherSlowComponent::DeactivateSlow()
 		OnSlowStateChanged.Broadcast();
 
 		UE_LOG(LogTemp, Display,
-			TEXT("[MotherSlowComponent] DeactivateSlow: 已取消慢速. Owner=%s (bWasSlowed=true, 已 Broadcast)"),
-			*OwnerActor->GetName());
+			TEXT("[MotherSlowComponent] DeactivateSlow: 已取消慢速. Owner=%s (bWasSlowed=true, 已 Broadcast, 缓存保留=%.1f)"),
+			*OwnerActor->GetName(), CachedBaseMaxWalkSpeed);
 	}
 	else
 	{
 		// 【v133.5.3 修复】即使 bWasSlowed=false 也要 Log, 便于排查"永远不消退" bug
 		UE_LOG(LogTemp, Verbose,
-			TEXT("[MotherSlowComponent] DeactivateSlow: 已取消慢速(无需 Broadcast). Owner=%s (bWasSlowed=false — 之前已 deactivated, 重复调用)"),
-			*OwnerActor->GetName());
+			TEXT("[MotherSlowComponent] DeactivateSlow: 已取消慢速(无需 Broadcast). Owner=%s (bWasSlowed=false — 之前已 deactivated, 重复调用, 缓存=%.1f)"),
+			*OwnerActor->GetName(), CachedBaseMaxWalkSpeed);
 	}
 }
 

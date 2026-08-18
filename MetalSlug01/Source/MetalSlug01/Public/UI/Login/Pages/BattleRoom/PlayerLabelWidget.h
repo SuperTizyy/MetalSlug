@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// PlayerLabelWidget 头文件 — 房间内的单个玩家条目 UI
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UPlayerLabelWidget — 房间内单个玩家条目 Widget
+//   2. 显示玩家名 + 准备状态 + 是否房主/AI
+//   3. 房主可见"踢人"按钮, 点击调 PC->Server_KickPlayer
+//
+// 架构理念:
+//   - 单一职责: 只是 UI 列表项, 数据由 RoomInsidePage 注入
+//   - 状态机: SetReadyState / SetAsHost / SetAsAI / ApplyIdentity 切换
+//   - 绝对防御: SetAsHost 时无论权限如何都隐藏踢人按钮 (防自踢)
+//   - Model-View 分离: CachedPlayerName 是数据源, 控件只是 View 表现
+//   - 房主/AI 身份永久化: bIsHostEntry/bIsAIEntry 阻止 SetReadyState 反向恢复
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

@@ -17,6 +17,24 @@
 class UUserWidget;
 
 /**
+ * @file LoginPlayerController.h
+ * @brief 登录地图玩家控制器 (ALoginPlayerController) — 极简版, 仅做 PC 硬件初始化
+ *
+ * 大厂架构角色:
+ *   - 仅负责 "PC 硬件配置" (鼠标 / 输入模式)
+ *   - UI 编排完全由 UIViewService 接管 (单一职责 + 事件驱动)
+ *   - 不订阅 OnStateChanged / 不延迟拉起 UI / 不主动 ShowPanel
+ *
+ * 与其他组件的关系:
+ *   - 上游: UGameFlowSubsystem 状态机
+ *   - 下游: UUIViewService 自动 ShowPanel (由状态变化触发)
+ *
+ * 历史修复 (2026.06.28):
+ *   - 之前: LoginPC::BeginPlay 延迟 0.2s ShowPanel → 退房后 LANRoomPage 被旧值 Login 覆盖
+ *   - 现在: LoginPC 完全不参与 UI 拉起, 由 UIViewService 监听 OnStateChanged 自动 ShowPanel
+ */
+
+/**
  * @class ALoginPlayerController
  * @brief 登录地图的玩家控制器 (极简版)
  *

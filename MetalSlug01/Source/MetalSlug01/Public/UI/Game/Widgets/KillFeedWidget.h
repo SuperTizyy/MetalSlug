@@ -3,7 +3,19 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// KillFeedWidget 头文件 — 击杀信息组件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UKillFeedWidget — 击杀消息列表容器
+//   2. 4 个 AddKillInfo 重载 + 系统消息 API
+//   3. 单一入口: InsertKillMessageWidget 集中所有新增逻辑
+//   4. 5 秒消失: 由 Entry 子控件自己管理 Timer (v229.x v8 真理源迁移)
+//
+// 大厂原则:
+//   - 单一入口: InsertKillMessageWidget 替代 4 个 AddKillInfo 复制粘贴
+//   - 父控件职责: 只管容器布局, 不参与 Entry 生命周期
+//   - 数据驱动: KillFeedEntryWidgetClass 由 GameHUDWidget 注入
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

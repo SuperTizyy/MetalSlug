@@ -65,6 +65,12 @@ UBTDecorator_BlackboardCompare::UBTDecorator_BlackboardCompare()
 	KeyB.AddObjectFilter(this, GET_MEMBER_NAME_CHECKED(UBTDecorator_BlackboardCompare, KeyB), AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 编辑器中显示的节点描述 (BB.KeyA Op Right)
+ * @return 形如 "BB.DistanceToTarget > 200.00" 的字符串, 显示在节点标题下方
+ *
+ * 大厂原则: 调试/可视化辅助, 不参与决策. 仅用于编辑器节点展示.
+ */
 FString UBTDecorator_BlackboardCompare::GetStaticDescription() const
 {
 	// 把 Op 翻成符号 — 与 BTDecorator_HPThreshold 风格一致
@@ -115,6 +121,16 @@ FString UBTDecorator_BlackboardCompare::GetStaticDescription() const
 		*RightStr);
 }
 
+/**
+ * @brief BT 单次决策入口 — 按 BB Key 类型分发比较 KeyA 与右侧(常量或 KeyB)
+ * @param OwnerComp BT 组件引用, 用于获取 BB / AIController
+ * @param NodeMemory Decorator 节点内存(本类未使用, 因没设 bUsesOwnMemory)
+ * @return 比较结果 true=放行分支 / false=拒绝
+ *
+ * 单点决策: 无 Tick / 无 BecameRelevant, 装饰器家族一致行为.
+ * 三层零兜底: KeyA 必须配 → KeyB 在 Key 模式下必须配 → 类型必须匹配.
+ * 任何错配 Log Error + return false, 显式失败绝不静默 fallback.
+ */
 bool UBTDecorator_BlackboardCompare::CalculateRawConditionValue(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
 {
@@ -373,6 +389,12 @@ bool UBTDecorator_BlackboardCompare::CompareFloat(float A, float B) const
 	return false;
 }
 
+/**
+ * @brief Int 类型比较 — 根据 Op 决定比较方式 (6 种 Op 全支持)
+ * @param A 左侧 BB Int 值 / KeyA
+ * @param B 右侧 Int 值 / KeyB / 常量
+ * @return 比较结果, 未定义 Op 默认 false
+ */
 bool UBTDecorator_BlackboardCompare::CompareInt(int32 A, int32 B) const
 {
 	switch (Op)
@@ -387,6 +409,12 @@ bool UBTDecorator_BlackboardCompare::CompareInt(int32 A, int32 B) const
 	return false;
 }
 
+/**
+ * @brief Bool 类型比较 — 仅支持 == / != (其他 Op 在 Bool 语义上无意义)
+ * @param A 左侧 BB Bool 值 / KeyA
+ * @param B 右侧 Bool 值 / KeyB / 常量
+ * @return 比较结果, 除 ==/!= 外的 Op 静默返回 false (类型语义决定, 非兜底)
+ */
 bool UBTDecorator_BlackboardCompare::CompareBool(bool A, bool B) const
 {
 	// Bool 仅 ==/!= 有意义; 其他 Op 静默返回 false
@@ -399,6 +427,12 @@ bool UBTDecorator_BlackboardCompare::CompareBool(bool A, bool B) const
 	}
 }
 
+/**
+ * @brief Vector 类型比较 — 分量逐项比较, X/Y/Z 均满足才返回 true
+ * @param A 左侧 BB Vector 值 / KeyA
+ * @param B 右侧 Vector 值 / KeyB / 常量
+ * @return 比较结果, Equal 用 UE 等价容差(0.0001), 其他严格分量比较
+ */
 bool UBTDecorator_BlackboardCompare::CompareVector(const FVector& A, const FVector& B) const
 {
 	switch (Op)
@@ -413,6 +447,12 @@ bool UBTDecorator_BlackboardCompare::CompareVector(const FVector& A, const FVect
 	return false;
 }
 
+/**
+ * @brief String 类型比较 — 用 FString::Compare 字典序比较 (区分大小写)
+ * @param A 左侧 BB String 值 / KeyA
+ * @param B 右侧 String 值 / KeyB / 常量
+ * @return 比较结果, Compare(B)<0 表示 A 字典序在前
+ */
 bool UBTDecorator_BlackboardCompare::CompareString(const FString& A, const FString& B) const
 {
 	switch (Op)
@@ -427,6 +467,12 @@ bool UBTDecorator_BlackboardCompare::CompareString(const FString& A, const FStri
 	return false;
 }
 
+/**
+ * @brief Object 类型比较 — 仅指针相等比较 (引用同一对象才视为相等)
+ * @param A 左侧 BB Object 指针 / KeyA
+ * @param B 右侧 Object 指针 / KeyB / 常量
+ * @return 比较结果, 除 ==/!= 外的 Op 静默返回 false (指针无大小语义)
+ */
 bool UBTDecorator_BlackboardCompare::CompareObject(UObject* A, UObject* B) const
 {
 	// Object 仅 ==/!= 有意义 (指针相等); 其他 Op 静默 false

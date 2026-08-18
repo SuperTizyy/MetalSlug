@@ -321,6 +321,13 @@ float UMotherSkillComponent::GetSkillActiveRemainingSeconds() const
 	return 0.0f;
 }
 
+/**
+ * @brief 获取技能冷却剩余秒数 (用于 HUD 进度条)
+ * @return 剩余秒数 (≤0 = 已就绪)
+ *
+ * 真理源: SkillCooldownEndTime (Replicated 字段, 服务器写入)
+ * 用 World->GetTimeSeconds 而非 GameState: 与 HealthComponent 对齐, 单机/ListenServer 通用
+ */
 float UMotherSkillComponent::GetSkillCooldownRemainingSeconds() const
 {
 	if (UWorld* World = GetWorld())

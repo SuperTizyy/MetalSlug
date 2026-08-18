@@ -28,6 +28,38 @@
 // UE 自动生成的头文件（必须放在最后一行）
 #include "RoomGameMode.generated.h"
 
+/**
+ * @file RoomGameMode.h
+ * @brief 房间大厅的专属 GameMode 类声明（仅在服务器/房主端运行）
+ *
+ * 本文件是大厂架构"集中调度层"的根节点，业务职责包括：
+ *   1. 阵营管理（Offense/Defense/HumanSurvivor）— 通用身份，玩家和 AI 共用
+ *   2. 房间状态机（WaitingInRoom → BattleInProgress → RoundEnded）
+ *   3. 玩家管理（加入/换队/准备/踢人/聊天/转房主）
+ *   4. AI 大厅入队（QueueAIForBattleSpawn — 占位不生成）
+ *   5. 比赛流程控制（开始/倒计时/结算）
+ *   6. 数据表注入（CharacterDataTable/WeaponDataTable 等）
+ *   7. 配置单一真理源（音效/挂载配置/母体参数）
+ *
+ * @section 架构角色
+ *   - 真理源：策划在 BP_GM_RoomGameMode 配置，所有运行时数据单向流入 Subsystem
+ *   - 委派层：本类大部分方法已委派到 URoomSpawnSubsystem / URoomLifecycleSubsystem /
+ *             URoomMembershipSubsystem / URoomTargetingSubsystem / URoomMotherMutationSubsystem
+ *   - 严禁反模式：禁止在本类实现业务逻辑（违反"单一入口"原则）
+ *
+ * @section 历史演进（按版本倒序）
+ *   - v54 (2026.07.16)：UAIProfileAsset 整个类删除，关卡预放 AI 走 ConfigSO
+ *   - v55 (2026.07.16)：DefaultControllerClass 删除，禁止 GM 全局兜底
+ *   - v50 (2026.07.16)：PendingAIQueue 字段迁到 URoomSpawnSubsystem
+ *   - v37 (2026.07.12)：WeaponAttachmentDataTable 单一真理源迁移到 GM
+ *   - v31.5 (2026.07.12)：4 个 RoomSubsystem 拆出，零兜底重构
+ *   - v30 (2026.07.11)：出生点占用强制 Log Error（不允许默认归 Attack）
+ *   - v28 (2026.07.11)：AI 大厅入队（QueueAIForBattleSpawn）替代立刻 Spawn
+ *   - v9 (2026.07.07)：启动期单元自检 + 距离决策函数重构
+ *
+ * @author YiYuan (大厂架构落地)
+ */
+
 // ==========================================
 // 前置声明（避免头文件互相包含）
 // ==========================================
@@ -40,19 +72,35 @@ class AAirdropPickup;       // 空投 Pickup (v117)
 
 /**
  * @class ARoomGameMode
- * @brief 房间大厅的专属 GameMode（只在服务器/房主端运行）
+ * @brief 房间大厅的专属 GameMode（仅在服务器/房主端运行）
  *
- * 职责说明:
- * - 管理权威的攻守方名单，并广播给所有人
- * - 处理玩家加入/换队/准备/踢人/聊天
- * - 控制比赛开始、倒计时、回合结束
- * - 负责所有玩家和 AI 的 3D 角色生成与武器派发
- * - 维护出生点池、目标仇恨分配
+ * 单一职责:
+ *   - 作为房间业务的"集中调度层"，所有玩家/AI 操作、比赛流程都从这里出发
+ *   - 作为策划配置的"真理源面板"，编辑器 BP_GM_RoomGameMode 是唯一配置入口
+ *   - 不持有运行时业务状态（已迁到 Subsystem），是"薄壳"
+ *
+ * 大厂架构角色:
+ *   - **配置真理源**：DataTable / DataAsset / ModeRules / 音效资产都在 GM 配
+ *   - **数据流向**：GameMode (配置) → Subsystem (运行时副本) → 业务执行
+ *   - **委派层**：本类绝大多数方法转发到对应 Subsystem（不在 GM 内实现业务逻辑）
+ *
+ * 与其他组件的关系:
+ *   - 继承自 AGameModeBase（UE 框架层）
+ *   - 组合 URoomLifecycleSubsystem (流程控制) / URoomSpawnSubsystem (生成) /
+ *           URoomMembershipSubsystem (成员管理) / URoomTargetingSubsystem (仇恨) /
+ *           URoomMotherMutationSubsystem (母体变异)
+ *   - 不与 PlayerController 直接耦合，玩家操作通过 RPC 上行
  *
  * 架构理念:
- * 1. 利用 UE 原生 PlayerState + ReplicatedUsing 实现数据自动同步
- * 2. 避免手写广播，最大化利用引擎自带的复制机制
- * 3. 攻守方名单/AI 名单/准备状态全部走 PlayerState 数组
+ *   1. 利用 UE 原生 PlayerState + ReplicatedUsing 实现数据自动同步
+ *   2. 避免手写广播，最大化利用引擎自带的复制机制
+ *   3. 攻守方名单/AI 名单/准备状态全部走 PlayerState 数组
+ *
+ * 大厂原则落地:
+ *   - **单一真理源**：每个配置只有一个 GameMode 字段（如 WeaponAttachmentDataTable）
+ *   - **零兜底**：所有"默认值兜底"已被消除，配错显式 Log Error 强制修复
+ *   - **职责对等**：玩家和 AI 走同一链路（如 RequestRespawn 共用入口）
+ *   - **集中调度**：死亡/复活/换队都从 GameMode 单一入口出发
  */
 UCLASS()
 class METALSLUG01_API ARoomGameMode : public AGameModeBase
@@ -134,8 +182,17 @@ public:
 	static const FName TAG_Faction_HumanSurvivor;
 
 	/**
-	 * 构造函数: 在 GameMode 被加载时调用
+	 * @brief 构造函数: 在 GameMode 被加载时调用
+	 *
 	 * 目的: 配置默认的玩家类、控制器类、HUD 类等
+	 *
+	 * 大厂原则:
+	 *   - **测试开关默认开启**：bSkipRoomPhaseForTesting = true 让开发期进图直接开打
+	 *   - **关闭无缝漫游**：bUseSeamlessTravel = false 避免局域网测试 Spawn 时序错乱
+	 *   - **引擎框架类绑定**：PlayerStateClass/PlayerControllerClass/HUDClass 必须显式指定
+	 *   - **启动期自检**：ABaseAIController::SelfTestArrivalDecision() 检测 v9 距离决策函数的 12 个状态组合
+	 *
+	 * @param ObjectInitializer UE 对象初始化器（UE 反射系统必须）
 	 */
 	ARoomGameMode(const FObjectInitializer& ObjectInitializer);
 
@@ -1230,14 +1287,22 @@ public:
 	 * @param PlayerStart 要释放的出生点
 	 *
 	 * 【v39】新增更精准的 ReleaseSpawnPointByController 接口 (推荐使用)
+	 *
+	 * 【v242 零兜底】本接口已 UE_DEPRECATED — 粗粒度接口, 多玩家同帧死亡会误清空.
+	 *              新代码必须走 ReleaseSpawnPointByController(AController*) 精准释放.
 	 */
-	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	UE_DEPRECATED(5.6, "【v242 零兜底】ReleaseSpawnPoint(AActor*) 是粗粒度接口, 请改用 ReleaseSpawnPointByController(AController*) 精准释放.")
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn", meta = (DeprecatedFunction, DeprecationMessage = "【v242 零兜底】请改用 ReleaseSpawnPointByController(AController*) 精准释放."))
 	void ReleaseSpawnPoint(class AActor* PlayerStart);
 
 	/**
 	 * @brief 强制重置所有出生点的占用状态（在每回合/每局开始时调用）
+	 *
+	 * 【v242 零兜底】本接口已 UE_DEPRECATED — 粗粒度, 多玩家同帧死亡会误清空.
+	 *              新代码必须走 ReleaseSpawnPointByController(AController*) 精细化释放.
 	 */
-	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn")
+	UE_DEPRECATED(5.6, "【v242 零兜底】ResetAllSpawnPointOccupancy 是粗粒度接口, 请改用 ReleaseSpawnPointByController 精细化释放每个 Controller.")
+	UFUNCTION(BlueprintCallable, Category = "MetalSlug|Spawn", meta = (DeprecatedFunction, DeprecationMessage = "【v242 零兜底】请改用 ReleaseSpawnPointByController 精细化释放, 避免多玩家同帧死亡误清空."))
 	void ResetAllSpawnPointOccupancy();
 
 	/**

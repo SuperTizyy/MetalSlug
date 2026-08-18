@@ -1,6 +1,7 @@
 // ==========================================
 // 头文件包含区
 // ==========================================
+// 引入 LocalAccountStore 类声明
 #include "Systems/Account/LocalAccountStore.h"
 // UE 提供的 SaveGame 静态工具
 #include "Kismet/GameplayStatics.h"
@@ -41,6 +42,12 @@ void ULocalAccountStore::Initialize(FSubsystemCollectionBase& Collection)
 		*SlotName, Cache ? Cache->AccountRecords.Num() : 0);
 }
 
+/**
+ * @brief 子系统销毁时的兜底落盘 — 确保内存修改持久化
+ *
+ * 如果 Cache 存在未写盘的改动, 强制 FlushToDisk 一次
+ * 防止 PIE 突然关闭 / 客户端异常退出导致偏好丢失
+ */
 void ULocalAccountStore::Deinitialize()
 {
 	// 子系统销毁时, 如果内存里有未落盘改动, 兜底写一次

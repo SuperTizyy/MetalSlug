@@ -1,7 +1,24 @@
 // Copyright (c) 2026.
 //
-// FactionTags.cpp — 阵营 Tag 体系实现
+// ========================================================================
+// FactionTags.cpp — 阵营 Tag 体系实现文件
+// ========================================================================
 //
+// 文件功能总览:
+//   - 注册 Native GameplayTag(Faction.Offense / Faction.Defense)
+//   - 实现 FFactionTags 结构体的全部静态 API
+//   - 实现 CanDamage 扣血授权守卫 (大厂架构 - 单一节流点)
+//
+// 大厂原则:
+//   - 零兜底: 所有无效阵营路径都 Log Error,绝不允许静默返回默认值
+//   - 显式优于默认: OppositeOf / AttitudeBetween / FromGenericTeamId 失败均显式报错
+//   - 友军伤害守卫: 所有扣血路径(Server_ReportHit / TakeDamage / AIAttack)
+//     必须先调 CanDamage,同阵营拒绝扣血
+//
+// ========================================================================
+// FactionTags.cpp — 阵营 Tag 体系实现
+// ========================================================================
+
 #include "Data/Faction/FactionTags.h"
 #include "GameplayTagsManager.h"
 #include "Logging/LogMacros.h"
@@ -26,6 +43,13 @@ FGameplayTag FFactionTags::Defense()
 	return FactionTags::TAG_Faction_Defense;
 }
 
+/**
+ * @brief 严格判定 Tag 是否等于 Faction.Offense (用 == 而非 MatchesTag)
+ * @param Tag 待校验的阵营 Tag
+ * @return true = 是攻方,false = 不是(包括 Defense/EmptyTag/子 Tag)
+ *
+ * 设计意图:用 == 严格匹配,避免 Faction.Offense.X 子 Tag 误判为 Offense
+ */
 bool FFactionTags::IsOffense(const FGameplayTag& Tag)
 {
 	// 严格匹配 — 用 == 而非 MatchesTag, 避免 Faction.Offense.X 子 Tag 误判
@@ -37,11 +61,27 @@ bool FFactionTags::IsDefense(const FGameplayTag& Tag)
 	return Tag == Defense();
 }
 
+/**
+ * @brief 校验 Tag 是否为有效阵营 (Offense 或 Defense)
+ * @param Tag 待校验的阵营 Tag
+ * @return true = 有效阵营 (Offense/Defense),false = 无效
+ *
+ * 大厂原则:这是阵营校验的"真理入口",AttitudeBetween / CanDamage / OppositeOf 都依赖此函数
+ * 不允许任何宽松匹配,空 Tag 和未知 Tag 都视为无效
+ */
 bool FFactionTags::IsValidFaction(const FGameplayTag& Tag)
 {
 	return IsOffense(Tag) || IsDefense(Tag);
 }
 
+/**
+ * @brief 判定两个阵营 Tag 是否属于同一方
+ * @param A 阵营 Tag A
+ * @param B 阵营 Tag B
+ * @return true = 同阵营 (A==B 且均有效),false = 异阵营或任一无效
+ *
+ * 边界:任一 Tag 无效 → 返回 false (不算同阵营),调用方必须先 check IsValidFaction
+ */
 bool FFactionTags::IsSameSide(const FGameplayTag& A, const FGameplayTag& B)
 {
 	if (!IsValidFaction(A) || !IsValidFaction(B))
@@ -52,6 +92,15 @@ bool FFactionTags::IsSameSide(const FGameplayTag& A, const FGameplayTag& B)
 	return A == B;
 }
 
+/**
+ * @brief 判定两个阵营 Tag 是否属于敌对双方
+ * @param A 阵营 Tag A
+ * @param B 阵营 Tag B
+ * @return true = 异阵营 (A!=B 且均有效),false = 同阵营或任一无效
+ *
+ * 与 IsSameSide 互补:IsSameSide(A,B) XOR IsOppositeSide(A,B) (均有效时)
+ * 边界:任一 Tag 无效 → 返回 false (不算敌对),与 IsSameSide 行为对称
+ */
 bool FFactionTags::IsOppositeSide(const FGameplayTag& A, const FGameplayTag& B)
 {
 	if (!IsValidFaction(A) || !IsValidFaction(B))
@@ -93,6 +142,19 @@ ETeamAttitude::Type FFactionTags::AttitudeBetween(const FGameplayTag& Self, cons
 	return IsSameSide(Self, Other) ? ETeamAttitude::Friendly : ETeamAttitude::Hostile;
 }
 
+/**
+ * @brief 扣血授权守卫 — 检查攻击者能否对受击者造成伤害
+ * @param AttackerFaction 攻击者阵营 Tag
+ * @param VictimFaction 受击者阵营 Tag
+ * @param Context 调用方上下文(用于日志定位,允许 nullptr)
+ * @param AttackerName 攻击者名称(日志用)
+ * @param VictimName 受击者名称(日志用)
+ * @return true = 允许扣血,false = 拒绝(同阵营/任一无效)
+ *
+ * 大厂原则 - 单一节流点:所有扣血路径必须先调此函数 (Server_ReportHit/TakeDamage/AIAttack)
+ * 三层守卫:阵营无效 → 拒绝;同阵营 → 拒绝(用户核心需求:队友之间不能有队伤);异阵营 → 通过
+ * 零兜底:任何无效路径都 Log Error 强制修复,不允许静默 fallback
+ */
 bool FFactionTags::CanDamage(
 	const FGameplayTag& AttackerFaction,
 	const FGameplayTag& VictimFaction,

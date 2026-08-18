@@ -1,10 +1,28 @@
-// ==========================================
-// URoomStateService.h
-// ==========================================
-// 房间状态查询门面（View 唯一调用入口）
-// 职责: 为 View 层屏蔽 RoomGameState/RoomPlayerState 的细节
-// 架构: L2 Service Layer（CQRS - 读取端，与 URoomService 写入端互补）
-// ==========================================
+// ========================================================================
+// RoomStateService.h — 房间状态查询门面头文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 声明 FOnPlayerSnapshotsChangedDelegate (玩家快照变更事件委托)
+//   - 声明 FPlayerSnapshot (玩家状态 POJO 快照, View 唯一数据结构)
+//   - 声明 FMatchSnapshot (比赛状态 POJO 快照)
+//   - 声明 URoomStateService 类(继承 UGameInstanceSubsystem),
+//     提供房间状态的查询门面(CQRS 读取端)
+//
+// 大厂架构角色 — CQRS 读取端:
+//   - URoomService:写入端(业务编排/RPC 路由)
+//   - URoomStateService:读取端(聚合快照/隐藏 PlayerState/GameState 细节)
+//   - 大厂对应:Riot GameDataService / Lyra ULyraPlayerStateExtensions
+//
+// v215 大厂架构:事件驱动刷新(替代 Tick 拉取)
+//   - View (UScoreboardWidget) 订阅 OnPlayerSnapshotsChanged 事件
+//   - 数据源(PS/AIC/GS)变更时主动通知, 比 0.5s Tick 拉取延迟低 N 倍
+//
+// v28/v29 真人/AI 双数据流分离:
+//   - 真人走 GS->PlayerArray (UE 引擎自动 add)
+//   - AI 占位走 GM->GetPendingAIInFaction (用户入队写入)
+//   - UI 自己合并两条数据流,不依赖 GetFactionSnapshots 合并函数
+// ========================================================================
 
 #pragma once
 

@@ -32,6 +32,10 @@ UBTTask_PickCirclePoint::UBTTask_PickCirclePoint()
 		GET_MEMBER_NAME_CHECKED(UBTTask_PickCirclePoint, CirclePointKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示 v40.9.1 环绕选点算法语义
+ * @return 多行描述,展示 bOrbitSelf=true(绕自己)/false(绕目标)/ConfigSO 真理源 + 失败 Failed
+ */
 FString UBTTask_PickCirclePoint::GetStaticDescription() const
 {
 	return TEXT("【v40.9.1 攻击后环绕原子】\n"

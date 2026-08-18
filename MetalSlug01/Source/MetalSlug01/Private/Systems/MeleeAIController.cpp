@@ -1,5 +1,8 @@
 // Copyright (c) 2026.
 //
+// 文件作用: AMeleeAIController 实现 — 关卡预放 AI 控制器 (Level-Placed 路径唯一入口)
+// v54.4 重构后: 移除 UAIProfileAsset 中间层, 直接接 UAIBehaviorConfigSO
+//
 // 【v54.4 大厂架构重构】MeleeAIController 简化 — 直接接 UAIBehaviorConfigSO
 //
 // 【v54.4 职责明确】单一职责: 只处理「关卡预放 AI」路径的入口

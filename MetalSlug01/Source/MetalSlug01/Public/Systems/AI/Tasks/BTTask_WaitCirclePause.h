@@ -34,8 +34,11 @@ class METALSLUG01_API UBTTask_WaitCirclePause : public UBTTaskNode
 public:
 	UBTTask_WaitCirclePause();
 
+	/** @brief BT 编辑器静态描述 (显示 CirclePauseSeconds 来源 ConfigSO) */
 	virtual FString GetStaticDescription() const override;
+	/** @brief ExecuteTask 返回 InProgress, TickTask 累计 ElapsedSeconds >= TargetSeconds → Succeeded */
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+	/** @brief Tick: 累加 ElapsedSeconds, 达到 TargetSeconds 调 FinishLatentTask(Succeeded) */
 	virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
 	virtual EBTNodeResult::Type AbortTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
 

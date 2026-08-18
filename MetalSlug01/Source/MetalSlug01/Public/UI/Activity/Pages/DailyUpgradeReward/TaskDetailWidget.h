@@ -3,7 +3,18 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// TaskDetailWidget 头文件 — 任务明细 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UTaskDetailWidget — 单个任务的详细信息 Widget
+//   2. 任务需求说明 + 奖励展示 + 领取状态 + 领取按钮 + 提示
+//
+// 架构理念:
+//   - 数据驱动: DayIdentifier + TaskIndex 路由
+//   - 无参包装: HandleClaimButtonClickWrapper 用于委托绑定
+//   - 双按钮: ClaimButton + ClaimHintText 状态联动
+//   - 复用: 每个任务一个 UTaskDetailWidget 实例
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

@@ -41,6 +41,10 @@ UBTService_UpdateDistance::UBTService_UpdateDistance()
 		GET_MEMBER_NAME_CHECKED(UBTService_UpdateDistance, AttackRangeKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示距离/有目标/攻击范围派生
+ * @return 多行描述,展示 Interval 频率与 3 个 BB Key 派生语义
+ */
 FString UBTService_UpdateDistance::GetStaticDescription() const
 {
 	return FString::Printf(
@@ -51,6 +55,18 @@ FString UBTService_UpdateDistance::GetStaticDescription() const
 		Interval);
 }
 
+/**
+ * @brief Service 周期 Tick — 每 0.1s 派生 BB.Distance / BB.bHasTarget / BB.AttackRange
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory Service 节点内存(本类未使用)
+ * @param DeltaSeconds 距上次 Tick 的间隔秒
+ *
+ * 大厂架构定位:本 Service 只派生世界事实,不参与决策(决策交给 Decorator).
+ * 三组 BB Key:TargetActor(读) / DistanceToTarget + bHasTarget(派生) / AttackRange(派生 ConfigSO).
+ * 零目标时 Distance=-1 / bHasTarget=false, BT 装饰器看到 -1 立即拒判.
+ *
+ * v40.5 P0 节点级可观测性:Verbose Log 默认隐藏;用户反馈"AI 静止"时开启即可看到决策数据.
+ */
 void UBTService_UpdateDistance::TickNode(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {

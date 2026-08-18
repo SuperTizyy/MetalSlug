@@ -26,6 +26,10 @@ UBTDecorator_TooClose::UBTDecorator_TooClose()
 		GET_MEMBER_NAME_CHECKED(UBTDecorator_TooClose, AttackRangeKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 显示太近判定表达式
+ * @return 多行描述,包含 BB Key 与 "距离 < AR" 判断
+ */
 FString UBTDecorator_TooClose::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("太近? (%s < %s)\n"

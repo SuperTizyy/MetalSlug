@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// DailyLoginPage 头文件 — 每日登录活动页面
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UDailyLoginPage — 每日登录奖励页面
+//   2. 显示第 1-7 天普通奖励 + 第 8 天大奖
+//   3. 全领取/单天领取入口 + 礼包/宝箱选项弹窗
+//
+// 架构理念:
+//   - 数据驱动: UActivitySubsystem 提供 Record + Rewards (单一真理源)
+//   - 双入口: 普通点击 → ShowClaimSuccessPopup / 宝箱点击 → ShowRewardOptionPopup
+//   - 防重入: static bool 防止同一事件多次触发
+//   - 解耦: OnActivityDataChanged.AddDynamic 监听 Subsystem 刷新
+//   - 大项分离: 第 8 天大奖单独显示在 BigRewardItem 控件中
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

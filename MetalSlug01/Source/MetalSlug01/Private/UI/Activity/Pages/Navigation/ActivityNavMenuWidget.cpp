@@ -1,7 +1,18 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// ActivityNavMenuWidget 实现 — 活动导航菜单组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UActivityNavMenuWidget — 活动中心左侧导航所有 UI 逻辑
+//   2. 动态创建 NavButton + 页面缓存/切换 + 30s 红点刷新
+//
+// 大厂原则:
+//   - 页面缓存: TMap<FName, TWeakObjectPtr<UUserWidget>> 避免重复创建
+//   - 数据驱动: DT_ActivityInfoRow 是单一数据源
+//   - 防御性: 多级降级 (DataTable/Subsystem/测试数据)
+//   - v231 修复: GetDTService 集中静态指针, 避免野指针崩溃
 // ==========================================
 #include "UI/Activity/Pages/Navigation/ActivityNavMenuWidget.h"
 #include "Systems/Activity/ActivitySubsystem.h"

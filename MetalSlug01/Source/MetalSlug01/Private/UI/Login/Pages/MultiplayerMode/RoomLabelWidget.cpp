@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// RoomLabelWidget 实现 — 房间列表中的单个房间条目 UI
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 URoomLabelWidget — 房间条目所有 UI 逻辑
+//   2. 房间名 + 玩家数 + 状态显示
+//   3. 高亮切换 + 点击广播 OnRoomSelected
+//
+// 大厂原则:
+//   - 委托反通知: 点击时主动广播
+//   - 状态机: SetHighlight / SetRoomState 单一职责
+//   - Model-View 分离: CachedRoomName 是数据源, View 内部缓存
+//   - 防御性: GetRoomName 时做空指针保护
 // ==========================================
 #include "UI/Login/Pages/MultiplayerMode/RoomLabelWidget.h"
 // 包含按钮和文本框的头文件

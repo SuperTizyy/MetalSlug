@@ -69,6 +69,12 @@ UBTService_ReflexRallyChange::UBTService_ReflexRallyChange()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示反射式换点的两个条件与关键参数
+ * @return 多行描述,展示触发半径/威胁半径/换点逻辑/首次选点/频率
+ *
+ * 仅用于 BT 编辑器可视化, 不参与运行时决策.
+ */
 FString UBTService_ReflexRallyChange::GetStaticDescription() const
 {
 	return FString::Printf(
@@ -84,6 +90,22 @@ FString UBTService_ReflexRallyChange::GetStaticDescription() const
 }
 
 
+/**
+ * @brief Service 周期 Tick 入口 — 派生配置 + 检验两条件 + 触发换点
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory Service 节点内存(本类未使用)
+ * @param DeltaSeconds 距上次 Tick 的间隔秒
+ *
+ * 6 个阶段:
+ *   1. 派生 ConfigSO 配置 (override > 0 用 BT 字段; 否则用 ConfigSO 真理源)
+ *   2.5 v123 出生即选:BB.LockedRallyPoint 为空 → 立即锁最近点(修复出生永远 null)
+ *   2. 条件 1 — AI 距任意集合点 ≤ TriggerRadius (v122 根因修复)
+ *   3. 条件 2 — AI 附近 ThreatRadius 范围内存在存活母体
+ *   4. 两条件都满足 → 反射式换点 (PerformReflexChange)
+ *
+ * 高频路径(默认 0.2s), 大厂原则: 不满足条件 Verbose 日志(默认隐藏), 触发 Display 一次性日志.
+ * 零兜底: BB/AIC/Subsystem/ConfigSO 任一无效 → 立即 Log Error + return.
+ */
 void UBTService_ReflexRallyChange::TickNode(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {
@@ -308,6 +330,12 @@ void UBTService_ReflexRallyChange::TickNode(
 // Private Helpers
 // ============================================================
 
+/**
+ * @brief 计算两个 Actor 之间的平面距离平方(忽略 Z 轴)
+ * @param A 起点位置
+ * @param B 终点位置
+ * @return (DX*DX + DY*DY) — 用于"附近"判定时排除楼层差异
+ */
 float UBTService_ReflexRallyChange::ComputeFlatDistanceSq(const FVector& A, const FVector& B)
 {
 	// 平面距离平方 (Z 轴忽略) — 与 URoomZombieRallySubsystem::ComputeFlatDistanceSq 镜像
@@ -318,6 +346,18 @@ float UBTService_ReflexRallyChange::ComputeFlatDistanceSq(const FVector& A, cons
 }
 
 
+/**
+ * @brief 条件 1 检测 — AI 距任意集合点是否 ≤ TriggerRadius
+ * @param SelfPawn AI Pawn
+ * @param RallySys 账本真理源 (URoomZombieRallySubsystem)
+ * @param BB BT 黑板,用于读 BB.Key(本函数内未读)
+ * @param TriggerRadius 触发半径(cm)
+ * @param OutPointID [out] 命中的最近集合点 PointID
+ * @return 找到 ≤ 半径的集合点 → true,OutPointID 写入最近点 ID
+ *
+ * v122 根因修复:遍历账本全部集合点(不是 BB 锁点),找到最近一个 ≤ 半径.
+ * 账本空 / RallySys null → false(条件不满足,不是配置错).
+ */
 bool UBTService_ReflexRallyChange::CheckRallyPointProximity(
 	ABaseCharacter* SelfPawn, URoomZombieRallySubsystem* RallySys,
 	UBlackboardComponent* BB, float TriggerRadius, FString& OutPointID) const
@@ -378,6 +418,15 @@ bool UBTService_ReflexRallyChange::CheckRallyPointProximity(
 }
 
 
+/**
+ * @brief 条件 2 检测 — AI 附近 ThreatRadius 范围内是否存在存活母体
+ * @param SelfPawn AI Pawn(已校验未死)
+ * @param MotherSys 母体账本真理源 (URoomMotherMutationSubsystem)
+ * @param ThreatRadius 威胁半径(cm)
+ * @return 任一存活母体在威胁半径内 → true(条件 2 满足)
+ *
+ * 死亡母体 / TWeakObjectPtr 失效跳过;遍历完无命中 → false.
+ */
 bool UBTService_ReflexRallyChange::CheckMotherThreatProximity(
 	ABaseCharacter* SelfPawn, URoomMotherMutationSubsystem* MotherSys, float ThreatRadius) const
 {

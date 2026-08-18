@@ -32,6 +32,7 @@ class METALSLUG01_API UBTTask_ReloadPrimaryWeapon : public UBTTaskNode
 public:
 	UBTTask_ReloadPrimaryWeapon();
 
+	/** @brief BT 编辑器静态描述 (显示 "主武器换弹") */
 	virtual FString GetStaticDescription() const override;
 
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;

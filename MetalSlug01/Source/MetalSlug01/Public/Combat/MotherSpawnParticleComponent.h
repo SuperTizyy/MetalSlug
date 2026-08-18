@@ -143,6 +143,12 @@ public:
 	FName AttachSocketName = NAME_None;
 
 protected:
+	/**
+	 * @brief UE 组件注销时强制 StopSpawnParticle + 清 Timer (防御性清理)
+	 *
+	 * 任何原因 (Level 卸载 / Owner 销毁 / PIE 结束) 都会触发本回调
+	 * 关键: 必须在 EndPlay 停止粒子,否则 UE GC 会持有 particle 引用导致 GC 抖动
+	 */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:

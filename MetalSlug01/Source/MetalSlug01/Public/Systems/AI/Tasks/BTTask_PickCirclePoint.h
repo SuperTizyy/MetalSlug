@@ -49,6 +49,7 @@ class METALSLUG01_API UBTTask_PickCirclePoint : public UBTTaskNode
 public:
 	UBTTask_PickCirclePoint();
 
+	/** @brief BT 编辑器静态描述 (显示 bOrbitSelf + StrafeRadius 范围) */
 	virtual FString GetStaticDescription() const override;
 
 	/**

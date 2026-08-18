@@ -45,6 +45,7 @@ class METALSLUG01_API UBTDecorator_HPThreshold : public UBTDecorator
 public:
 	UBTDecorator_HPThreshold();
 
+	/** @brief BT 编辑器静态描述 (显示 Mode + Threshold + HP%) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 血量百分比 BB Key — 读 BB.HealthPercent */
@@ -60,6 +61,7 @@ public:
 	float Threshold = 0.2f;
 
 protected:
+	/** @brief BT 决策: BB.HealthPercent vs Threshold, 按 Mode 返回 (低于/高于) */
 	virtual bool CalculateRawConditionValue(UBehaviorTreeComponent& OwnerComp,
 		uint8* NodeMemory) const override;
 };

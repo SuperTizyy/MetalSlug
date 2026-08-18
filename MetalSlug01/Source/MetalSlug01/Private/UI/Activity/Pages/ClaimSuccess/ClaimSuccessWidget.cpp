@@ -3,7 +3,17 @@
 // 普通领取成功弹窗 UI 类
 
 // ==========================================
-// 头文件包含区
+// ClaimSuccessWidget 实现 — 领取成功弹窗
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UClaimSuccessWidget — 通用领取成功提示弹窗
+//   2. Btn_Close 点击 → RemoveFromParent 关闭弹窗
+//
+// 大厂原则:
+//   - 单一职责: 只负责关闭, 不参与业务
+//   - 防御性: Btn_Close 未绑定 → Log Error
+//   - 复用: 通用弹窗, 不耦合任何业务
 // ==========================================
 #include "UI/Activity/Pages/ClaimSuccess/ClaimSuccessWidget.h"
 

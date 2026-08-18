@@ -1,6 +1,24 @@
 // MetalSlug01. All Rights Reserved.
 #pragma once
 
+/**
+ * @file SessionManagerSubsystem.h
+ * @brief 在线会话子系统 — OnlineSubsystem 操作的单一真理源
+ *
+ * 大厂原则:
+ *   - 单一职责: 封装所有 Find/Create/Join/Destroy Session 操作
+ *   - 跨地图持久: UGameInstanceSubsystem, 切图不丢失
+ *   - 业务解耦: UI 不直接访问 OnlineSubsystem, 通过本子系统间接操作
+ *
+ * 调用链:
+ *   - LANRoomPresenter (Presenter 层) → 本子系统 (Domain 层)
+ *   - GameFlowSubsystem 订阅 OnSessionTerminated → UI 中断
+ *
+ * 不依赖:
+ *   - 不依赖任何 UObject World (跨地图)
+ *   - 不依赖具体业务模式 (刀战/生化通用)
+ */
+
 // ==========================================
 // 标准库 & UE 引擎头文件
 // ==========================================

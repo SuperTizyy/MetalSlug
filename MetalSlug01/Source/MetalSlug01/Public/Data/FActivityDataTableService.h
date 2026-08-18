@@ -1,7 +1,18 @@
 // ==========================================
-// 活动 DataTable 集中加载服务 (v231 重构 — 大厂架构)
+// 活动 DataTable 集中加载服务 - 头文件声明 (v231 重构 — 大厂架构)
 // ==========================================
 // 目的: 消除散落的硬编码 /Game/UI/Activity/Data/... 路径
+//
+// 文件功能总览:
+//   - 定义 ActivityDataTable 命名空间,集中管理 DataTable 资产标识符
+//   - 声明 FActivityDataTableService 结构体(继承自 v231 重构,实例服务)
+//   - 提供 Get / ReloadAll / GetMissingTables / GetRowsSafe / FindRowByIdSafe 等模板 API
+//
+// 大厂架构角色:
+//   - 单一真理源: 任何 DataTable 访问必须走本 Service,不允许子系统再持有 CachedConfigTable
+//   - 实例服务: 由 UActivityDataTableService(UObject 子对象)持有生命周期
+//   - 强引用缓存: TStrongObjectPtr 内部 AddToRoot,GC 永不回收,野指针问题彻底消失
+// ==========================================
 //
 // v231 重构要点(根治静态 TMap 野指针崩溃):
 //   1. 静态服务 → 实例服务,由 UActivityDataTableService(UObject 子对象)持有生命周期
@@ -37,7 +48,9 @@ namespace ActivityDataTable
 	static const FName ActivityInfo         = TEXT("DT_ActivityInfoRow");
 	static const FName DailyLoginConfig     = TEXT("DT_DailyLoginConfigRow");
 	static const FName ItemDetail           = TEXT("DT_ItemDetailRow");
+	/** 宝箱道具表 — 母体变异的奖励道具 ItemID + 数量 */
 	static const FName TreasureBoxItem      = TEXT("DT_TreasureBoxItemRow");
+	/** 每日升级奖励表 — 宝箱 ID + 可获得道具列表 */
 	static const FName DailyUpgradeReward   = TEXT("DT_DailyUpgradeRewardConfigRow");
 }
 

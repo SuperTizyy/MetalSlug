@@ -80,6 +80,9 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	/**
+	 * @brief UE 组件注销时清理定时器与材质引用 (防止 GC 抖动)
+	 */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
@@ -108,20 +111,20 @@ protected:
 	class USkeletalMeshComponent* GetOwnerSkeletalMesh() const;
 
 private:
-	/** 动态材质实例数组（驱动 DissolveAmount 参数） */
+	/** 动态材质实例数组（驱动 DissolveAmount 参数）—— 真理源: 由 CollectDynamicMaterials 在 StartDissolveEffect 时一次性收集 */
 	UPROPERTY()
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> DynamicMaterials;
 
-	/** 当前溶解进度 0.0~1.1 */
+	/** 当前溶解进度 0.0~1.1 (>= 1.1 时视为溶解完成) */
 	float CurrentDissolveValue = 0.0f;
 
-	/** 是否正在溶解中 */
+	/** 是否正在溶解中 —— Tick 守卫位, 避免在非溶解状态做材质驱动 */
 	bool bIsDissolving = false;
 
-	/** 溶解定时器句柄（成员化以便 EndPlay 精确清理） */
+	/** 溶解定时器句柄（成员化以便 EndPlay 精确清理）—— 当前已不再使用 (StartDissolveImmediate 立即触发) */
 	FTimerHandle DissolveTimerHandle;
 
-	/** 是否已收集过材质（防止重复收集） */
+	/** 是否已收集过材质（防止重复收集）—— 幂等保护, 多次 StartDissolveEffect 只收集一次 */
 	bool bMaterialsCollected = false;
 
 	// 【已删除 2026.07.10 大厂 P0 重构 — 武器溶解已下放】

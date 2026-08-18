@@ -146,7 +146,7 @@ ABaseCharacter::ABaseCharacter()
 	FootstepComponent = CreateDefaultSubobject<UFootstepComponent>(TEXT("FootstepComponent"));
 	CharacterEvents  = CreateDefaultSubobject<UCharacterEvents>(TEXT("CharacterEvents"));
 	HealthRegenComponent = CreateDefaultSubobject<UHealthRegenComponent>(TEXT("HealthRegenComponent"));
-
+	
 	// 【v40.8 P0 大厂架构】复活无敌期视觉闪烁组件
 	//   - 数据/视觉分离: HealthComponent 持数据, 本组件持视觉 (MID 操作)
 	//   - 协议: 身体材质蓝图必须有 "FlickerAmount" 标量参数
@@ -571,6 +571,7 @@ void ABaseCharacter::OnRespawnMovementLockedChanged(bool bIsLocked, float Durati
 	{
 		// 锁定移动: MaxWalkSpeed=0
 		MoveComp->MaxWalkSpeed = 0.0f;
+		MoveComp->MaxWalkSpeedCrouched = 0.0f;
 		UE_LOG(LogTemp, Display,
 			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] ★ 锁定移动: Pawn=%s Duration=%.1fs"),
 			*GetName(), Duration);
@@ -578,22 +579,77 @@ void ABaseCharacter::OnRespawnMovementLockedChanged(bool bIsLocked, float Durati
 	else
 	{
 		// 解锁移动: 恢复配置速度
-		float TargetSpeed = 600.0f; // 默认人类速度
+			//
+			// 【v244 大厂架构重构】移除 UE 默认 600 兜底, 真理源优先 (镜像 HandleSlowStateChanged 简化版)
+			//   - 旧版: 玩家路径没读取, 默认 600 (反模式 — 强制 UE 默认值)
+			//   - v244: 玩家路径从 PlayerConfigAsset 读, AI 路径从 RuntimeConfig 读
+			//   - 真理源全缺失 → Log Error + 拒绝设 MaxWalkSpeed (零兜底)
+			//
+			// 【v246.3 大厂架构 P0 修复】母体速度真理源统一
+			//   根因 (用户 2026.08.19 反馈):
+			//     - 母体变异后 3s 移动锁定解锁 → 走 ConfigSO.MotherWalkSpeed (默认 500)
+			//     - 但 MutatePawnToMother 已设 PlayerConfig.MotherMaxWalkSpeed (800)
+			//     - 两条真理源不一致 → 解锁后 MaxWalkSpeed 永久从 500 起步 (看起来"走路很慢")
+			//   修复:
+			//     - 母体: 走 PlayerConfigAsset.MotherMaxWalkSpeed (与玩家路径镜像, 单一真理源)
+			//     - 人类: 走 RuntimeConfig.GetScaledMovement().WalkSpeed (AI 专属)
+			//   删除: ConfigSO.MotherWalkSpeed 字段 (已在 v246.3 标 DEPRECATED)
+			float TargetSpeed = 0.0f;
+			const TCHAR* TruthSourceName = TEXT("");
 
-		// AI 路径: 从 ABaseAIController::GetRuntimeConfig()->GetScaledMovement() 读速度
-		if (ABaseAIController* AICC = Cast<ABaseAIController>(GetController()))
-		{
-			if (UAIRuntimeConfigComponent* RuntimeConfig = AICC->GetRuntimeConfig())
+			if (ABaseAIController* AICC = Cast<ABaseAIController>(GetController()))
 			{
-				const FAIMovementParams MovementParams = RuntimeConfig->GetScaledMovement();
-				TargetSpeed = AICC->GetCachedIsMother() ? MovementParams.MotherWalkSpeed : MovementParams.WalkSpeed;
+				// AI 路径真理源: 母体走 PlayerConfigAsset (与玩家路径镜像), 人类走 RuntimeConfig
+				if (AICC->GetCachedIsMother())
+				{
+					if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+					{
+						if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+						{
+							TargetSpeed = PC->MotherMaxWalkSpeed;
+							TruthSourceName = TEXT("PlayerConfigAsset.MotherMaxWalkSpeed");
+						}
+					}
+				}
+				else if (UAIRuntimeConfigComponent* RuntimeConfig = AICC->GetRuntimeConfig())
+				{
+					const FAIMovementParams MovementParams = RuntimeConfig->GetScaledMovement();
+					TargetSpeed = MovementParams.WalkSpeed;
+					TruthSourceName = TEXT("AIRuntimeConfig.GetScaledMovement.WalkSpeed");
+				}
 			}
-		}
+			else if (Cast<APlayerController>(GetController()) != nullptr)
+			{
+				// 玩家路径真理源: PlayerConfigAsset
+				if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+				{
+					if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+					{
+						TargetSpeed = bIsMother ? PC->MotherMaxWalkSpeed : PC->MaxWalkSpeed;
+						TruthSourceName = TEXT("PlayerConfigAsset");
+					}
+				}
+			}
 
-		MoveComp->MaxWalkSpeed = TargetSpeed;
-		UE_LOG(LogTemp, Display,
-			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] ★ 解锁移动: Pawn=%s TargetSpeed=%.1f"),
-			*GetName(), TargetSpeed);
+			if (TargetSpeed > 0.0f)
+			{
+				MoveComp->MaxWalkSpeed = TargetSpeed;
+				MoveComp->MaxWalkSpeedCrouched = TargetSpeed * 0.5f;
+			}
+			else
+			{
+				// 【v244 零兜底】真理源全缺失 → 拒绝设 MaxWalkSpeed (强制修复)
+				UE_LOG(LogTemp, Error,
+					TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] 解锁移动但真理源全缺失 (真理源=%s, Pawn=%s). "
+					     "【v244 零兜底】拒绝设 MaxWalkSpeed, 保留当前值 (默认 0). "
+					     "修复: 检查 AIRuntimeConfigComponent / DA_PlayerConfigAsset 配置."),
+					TruthSourceName, *GetName());
+				return;
+			}
+
+UE_LOG(LogTemp, Display,
+			TEXT("[BaseCharacter][OnRespawnMovementLockedChanged] ★ 解锁移动: Pawn=%s TargetSpeed=%.1f (真理源=%s)"),
+			*GetName(), TargetSpeed, TruthSourceName);
 	}
 }
 
@@ -625,33 +681,37 @@ void ABaseCharacter::HandleHealthComponentRespawnMovementLockChanged(bool bIsLoc
 void ABaseCharacter::HandleSlowStateChanged()
 {
 	// ==========================================
-	// 【v133.5.3 大厂架构 — 修复永远不消退】母体被主武器击中后改 MaxWalkSpeed
+	// 【v244 P0 大厂架构重构】母体被主武器击中后改 MaxWalkSpeed
 	// ==========================================
 	//
-	// 旧版 (v133.5.1) 痛点:
-	//   - "还原" 路径用真理源优先 (PlayerConfig / ConfigSO)
-	//   - 真理源缺失 → 拒绝还原 + Log Error → MaxWalkSpeed 永远 = slow speed
-	//   - 用户场景: 母体被主武器击中 → 2s 后 Slow Timer 触发 → DeactivateSlow → Broadcast
-	//            → HandleSlowStateChanged 还原路径 → 真理源缺失 → 拒绝还原 → 永远 = 100
+	// v133.5.3 旧版痛点 (重复架构 + 兜底反模式):
+	//   - 还原路径用 3 级退化 (玩家真理源 > 缓存 > UE 默认 600)
+	//   - 真根因 (用户 2026.08.19 反馈):
+	//     "生化模式 AI 被击中减速,在没人攻打时恢复不了正常母体速度"
+	//   - 触发链:
+	//     1. AI 母体真实 MaxWalkSpeed = 400 (ConfigSO 配置, 通过 AIRuntimeConfig 读)
+	//     2. 第一次被击中 → ActivateSlow(2.0, 400) → 缓存 400 ✓
+	//     3. 2s 后 Timer 触发 → DeactivateSlow
+	//        └─ **旧版清缓存** (v133.5.1 修复加的, 反模式) → 缓存 = 0
+	//        └─ 还原路径: 缓存 = 0 → 退化到 UE 默认 600 ← **错误! 永久变 600**
+	//     4. 第二次被击中 → ActivateSlow(2.0, 600) → 缓存 600 ← **错误缓存!**
+	//     5. 2s 后还原: 缓存 600 → MaxWalkSpeed = 600 → 永远 600 (恢复不了 400)
 	//
-	// 大厂原则 — 零兜底 (v133.5.3 修复):
-	//   - 不要拒绝还原 — 必须给最可靠的值 (即使真理源缺失)
-	//   - 还原优先级: 玩家真理源 > 缓存 > 退化默认值 (UE 默认 600)
-	//   - 真理源缺失 → Log Error 但仍然还原 (不让用户卡在永远 100)
+	// v244 大厂架构重构 (与 MotherSkillComponent 完全对称):
+	//   - **DeactivateSlow 不清缓存** (镜像 MotherSkillComponent v121.3 注释"不清")
+	//   - **缓存生命周期 = Pawn 生命周期** (EndPlay 时才清)
+	//   - **慢速真理源 + 缓存真理源** 两条独立路径:
+	//     - 慢速中: 走 MotherSlowSpeed (策划真理源) — 缺失拒绝, 零兜底
+	//     - 退出慢速: 走缓存 (Pawn 激活时记录的原速度)
+	//   - **拒绝兜底**: 缓存 = 0 → Log Error + 不动 MaxWalkSpeed (强制修复)
+	//   - **职责分离**: PlayerConfig/AIRuntimeConfig 是策划真理源 (其他用途), 不参与 MaxWalkSpeed 还原决策
+	//     (还原决策只用缓存 — 这是 v244 单一真理源简化)
 	//
-	// 设计原则 (镜像 InvincibilityFlickerComponent):
-	//   - Component 持状态 (bIsSlowed), BaseCharacter 改 MaxWalkSpeed
-	//   - 跨边界: Component 不知道 MovementComponent 存在
-	//   - 服务器/客户端都执行 (双发保证, 同一份视觉逻辑)
-	//
-	// 真理源决策 (v133.5.3 修复后):
-	//   - 慢速速度: 玩家 = PlayerConfigAsset.MotherSlowSpeed, AI = ConfigSO.MotherSlowSpeed
-	//   - 原速度还原: 玩家路径优先 PlayerConfig 真理源 → 退化缓存 → 退化默认值
-	//                AI 路径用缓存 → 退化默认值
-	//
-	// 状态决策:
-	//   - bIsSlowed=true  → 改 MotherSlowSpeed (强制, 真理源) — 真理源缺失拒绝, **不还原**
-	//   - bIsSlowed=false → 还原 (真理源优先 > 缓存 > 退化默认值) — 配置错也还原, 不卡死
+	// 大厂原则:
+	//   - 单一真理源: MaxWalkSpeed 还原 = CachedBaseMaxWalkSpeed (激活时记录的 Pawn 级真理源)
+	//   - 零兜底: 缓存缺失 → 拒绝设 MaxWalkSpeed (强制配错修复)
+	//   - 镜像对称: MotherSlow 和 MotherSkill 都用缓存 + 不清缓存 + EndPlay 清缓存
+	// ==========================================
 
 	UMotherSlowComponent* SlowComp = ResolveMotherSlowComponent();
 	if (!SlowComp)
@@ -672,113 +732,96 @@ void ABaseCharacter::HandleSlowStateChanged()
 	}
 
 	const bool bIsSlowedNow = SlowComp->IsSlowed();
-
-	// 慢速速度真理源: 玩家读 PlayerConfig, AI 读 ConfigSO
-	float MotherSlowSpeedValue = 0.0f;
-	bool bIsPlayerPath = false;
-
-	if (Cast<APlayerController>(GetController()) != nullptr)
-	{
-		// 玩家路径: 读 PlayerConfigAsset.Spawn->PlayerConfigAsset 直指针
-		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
-		{
-			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
-			{
-				MotherSlowSpeedValue = PC->MotherSlowSpeed;
-			}
-		}
-		bIsPlayerPath = true;
-	}
-	else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(GetController()))
-	{
-		// AI 路径: 读 PlayerConfigAsset.Spawn->PlayerConfigAsset (v120 统一)
-		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
-		{
-			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
-			{
-				MotherSlowSpeedValue = PC->MotherSlowSpeed;
-			}
-		}
-	}
-
-	// ==========================================
-	// 真理源决策 — 慢速 vs 还原
-	// ==========================================
-	// 【v133.5.3 修复】永远给一个值 — 配置错也用最可靠的退化值
 	float TargetSpeed = 0.0f;
 	const TCHAR* Reason = TEXT("");
 
 	if (bIsSlowedNow)
 	{
-		// 慢速中 → 强制 MotherSlowSpeed (真理源)
-		// 真理源缺失 → 拒绝激活 (零兜底, 但这种情况还没发生慢速, 不会卡死)
+		// ==========================================
+		// 慢速中 → MotherSlowSpeed (策划真理源)
+		// ==========================================
+		float MotherSlowSpeedValue = 0.0f;
+		const TCHAR* TruthSourceName = TEXT("");
+
+		// 玩家路径: PlayerConfigAsset.MotherSlowSpeed
+		if (Cast<APlayerController>(GetController()) != nullptr)
+		{
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+				{
+					MotherSlowSpeedValue = PC->MotherSlowSpeed;
+					TruthSourceName = TEXT("PlayerConfigAsset.MotherSlowSpeed");
+				}
+			}
+		}
+		else if (ABaseAIController* BaseAIC = Cast<ABaseAIController>(GetController()))
+		{
+			// AI 路径: PlayerConfigAsset.MotherSlowSpeed (v120 统一真理源)
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+				{
+					MotherSlowSpeedValue = PC->MotherSlowSpeed;
+					TruthSourceName = TEXT("PlayerConfigAsset.MotherSlowSpeed");
+				}
+			}
+		}
+
 		if (MotherSlowSpeedValue <= 0.0f)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[BaseCharacter][HandleSlowStateChanged] 慢速速度真理源未配 MotherSlowSpeed=%.1f "
-				     "(Pawn=%s, 真理源=%s). 【v133.5.3 修复】检查 PlayerConfigAsset 或 ConfigSO 配置. 不强行设 MaxWalkSpeed."),
-				MotherSlowSpeedValue, *GetName(),
-				bIsPlayerPath ? TEXT("PlayerConfigAsset") : TEXT("ConfigSO"));
+				TEXT("[BaseCharacter][HandleSlowStateChanged] 慢速速度真理源未配 (真理源=%s, MotherSlowSpeed=%.1f, Pawn=%s). "
+				     "【v244 零兜底】拒绝激活慢速, 不动 MaxWalkSpeed (防止错误速度被应用). "
+				     "修复: 检查 DA_PlayerConfigAsset.MotherSlowSpeed (>0)."),
+				TruthSourceName, MotherSlowSpeedValue, *GetName());
 			return;
 		}
+
 		TargetSpeed = MotherSlowSpeedValue;
 		Reason = TEXT("Slowed (MotherSlowSpeed)");
 	}
 	else
 	{
 		// ==========================================
-		// 【v133.5.3 修复】还原路径 — 永远给一个值, 拒绝 "永远不还原"
+		// 【v244 P0 大厂架构重构】退出慢速 → 缓存真理源 (单一真理源)
 		// ==========================================
-		// 真根因 (v133.5.1): 还原路径要求两个真理源都拿到才还原, 任意一个缺失 → 拒绝 → 永远 = slow speed
-		// 修复: 三级退化, 永远有值
-		//   1. 玩家路径真理源 (PlayerConfig.MaxWalkSpeed / MotherMaxWalkSpeed)
-		//   2. Component 缓存 (SlowComp->GetCachedBaseMaxWalkSpeed)
-		//   3. 退化默认值 (UE 默认 600.0f) — 真理源全错时使用, 保证角色能动
-		// 真理源缺失 → Log Error 报告, 但仍然还原 (不让角色永远卡死)
-		float RestoredSpeed = 0.0f;
+		// v133.5.3 旧版: 玩家路径 → PlayerConfig; AI 路径 → 缓存; 兜底 → UE 600
+		//   - 真根因: DeactivateSlow 清缓存 + 玩家/AI 分流不一致 → 永远退化到 600
+		// v244 重构:
+		//   - 真理源唯一 = CachedBaseMaxWalkSpeed (Pawn 生命周期内的"原速度真理源")
+		//   - 玩家/AI 不分流 — 统一走缓存 (缓存语义就是"激活慢速前的 MaxWalkSpeed")
+		//   - 缓存 = 0 → Log Error + 拒绝设 MaxWalkSpeed (零兜底 — 强制修复)
+		// ==========================================
+		const float CachedSpeed = SlowComp->GetCachedBaseMaxWalkSpeed();
 
-		if (bIsPlayerPath)
+		if (CachedSpeed > 0.0f)
 		{
-			// 玩家路径: 用 PlayerConfig 真理源分流 (母体 → MotherMaxWalkSpeed, 人类 → MaxWalkSpeed)
-			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
-			{
-				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
-				{
-					RestoredSpeed = bIsMother
-						? PC->MotherMaxWalkSpeed
-						: PC->MaxWalkSpeed;
-				}
-			}
-		}
-
-		if (RestoredSpeed > 0.0f)
-		{
-			// 玩家路径真理源拿到 → 直接用
-			TargetSpeed = RestoredSpeed;
-			Reason = TEXT("PlayerPath-Restored (PlayerConfig truth source)");
+			TargetSpeed = CachedSpeed;
+			Reason = TEXT("Cache-Restored (CachedBaseMaxWalkSpeed)");
 		}
 		else
 		{
-			// AI 路径 / 玩家路径配置缺失 → 用 Component 缓存
-			const float CachedSpeed = SlowComp->GetCachedBaseMaxWalkSpeed();
-			if (CachedSpeed > 0.0f)
-			{
-				TargetSpeed = CachedSpeed;
-				Reason = TEXT("Cache-Restored (CachedBaseMaxWalkSpeed)");
-			}
-			else
-			{
-				// 【v133.5.3 最终修复】全部退化都没了 → 用 UE 默认 600
-				// 绝不容忍 "永远不还原" — 角色必须能动
-				UE_LOG(LogTemp, Error,
-					TEXT("[BaseCharacter][HandleSlowStateChanged] 还原速度真理源全缺失: 玩家路径=%s, 缓存=%.1f "
-					     "(Pawn=%s). 【v133.5.3 修复】检查 PlayerConfigAsset.MaxWalkSpeed / ConfigSO 配置. "
-					     "用退化默认值 600.0 防止 '永远不还原' bug."),
-					bIsPlayerPath ? TEXT("PlayerConfig") : TEXT("ConfigSO(N/A)"),
-					CachedSpeed, *GetName());
-				TargetSpeed = 600.0f; // UE ACharacter 默认 MaxWalkSpeed
-				Reason = TEXT("Fallback-Default (UE Default 600)");
-			}
+			// 【v244 P0 零兜底】缓存缺失 → 拒绝设 MaxWalkSpeed (绝对不容忍"恢复不了")
+			//
+			// 根因排查 (按可能性排序):
+			//   1. MotherSlowComponent 是 BP 子类在某种初始化阶段被清空
+			//      → ResolveMotherSlowComponent 内部 FindComponentByClass 兜底, 但字段被 BP 清空 → 缓存丢失
+			//   2. CombatDeathComponent::TakeDamage 调 ActivateSlow 时传入 CurrentMaxWalkSpeed=0
+			//      → 缓存拒绝 (line 73-80) → 拒绝激活 → 但用户场景"被击中减速了"说明激活成功, 所以这条不可能
+			//   3. Pawn 复活后第一次被击中前, 缓存还没建立 (CachedBaseMaxWalkSpeed=0)
+			//      → 这是正常生命周期, 不应触发 HandleSlowStateChanged (因为没激活过慢速)
+			//      → 但 BP 子类 archetype 让 ActivateSlow 时机异常可能触发
+			//
+			// 大厂原则: 不退化到 600 (旧版兜底), 不强制 PlayerConfig (玩家/AI 分流反模式)
+			//         拒绝设值 → Log Error 强制修复, 让策划/程序员看到根因
+			UE_LOG(LogTemp, Error,
+				TEXT("[BaseCharacter][HandleSlowStateChanged] 还原速度缓存缺失 (CachedBaseMaxWalkSpeed=%.1f, Pawn=%s). "
+				     "【v244 P0 零兜底】拒绝设 MaxWalkSpeed, 保留当前值. "
+				     "根因: MotherSlowComponent 缓存丢失 — 检查 BP 蓝图 Components 面板 'MotherSlow' 子对象是否连接, "
+				     "或 CombatDeathComponent 调 ActivateSlow 时是否传入有效 CurrentMaxWalkSpeed."),
+				CachedSpeed, *GetName());
+			return;
 		}
 	}
 
@@ -788,10 +831,8 @@ void ABaseCharacter::HandleSlowStateChanged()
 
 	UE_LOG(LogTemp, Display,
 		TEXT("[BaseCharacter][HandleSlowStateChanged] ★ 慢速状态变化: Pawn=%s bIsSlowed=%d → MaxWalkSpeed=%.1f "
-		     "(真理源=%s, SlowSpeed=%.1f, Reason=%s)"),
-		*GetName(), bIsSlowedNow ? 1 : 0, TargetSpeed,
-		bIsPlayerPath ? TEXT("PlayerConfig") : TEXT("ConfigSO"),
-		MotherSlowSpeedValue, Reason);
+		     "(Target=%.1f, Reason=%s)"),
+		*GetName(), bIsSlowedNow ? 1 : 0, TargetSpeed, TargetSpeed, Reason);
 }
 
 
@@ -878,13 +919,18 @@ void ABaseCharacter::HandleMotherSkillStateChanged(bool bIsNowActive)
 		}
 		else
 		{
-			// 缓存丢失 (可能是冷却到期自动清缓存) → 用 UE 默认值
-			MoveComp->MaxWalkSpeed = 600.0f;
-			MoveComp->MaxWalkSpeedCrouched = 300.0f;
-
+			// 【v244 P0 零兜底 — 与 HandleSlowStateChanged 镜像对称】缓存丢失 → 拒绝设 MaxWalkSpeed
+			//
+			// 旧版 (v119 ~ v243) 反模式: MoveComp->MaxWalkSpeed = 600.0f
+			//   - 后果: 缓存丢失 (可能是 BP archetype 把字段清掉) → AI 加速后永远 = 600
+			//   - 与 HandleSlowStateChanged 同一个 bug
+			//
+			// v244 修复: 拒绝设值, Log Error 强制修复 (强制策划/程序员看到根因)
 			UE_LOG(LogTemp, Error,
-				TEXT("[BaseCharacter][HandleMotherSkillStateChanged] 加速结束但 CachedBaseMaxWalkSpeed=%.1f. Pawn=%s. "
-				     "用退化默认值 600.0. 【v119 防御型设计】"),
+				TEXT("[BaseCharacter][HandleMotherSkillStateChanged] 加速结束但 CachedBaseMaxWalkSpeed=%.1f (缓存丢失, Pawn=%s). "
+				     "【v244 P0 零兜底】拒绝设 MaxWalkSpeed, 保留当前值. "
+				     "修复: 检查 BP 蓝图 Components 面板 'MotherSkill' 子对象是否连接, "
+				     "或 BTTask_ActivateMotherSpeedBoost 调 ActivateSkill 时是否传入有效 CurrentMaxWalkSpeed."),
 				BaseSpeed, *GetName());
 		}
 	}
@@ -2720,6 +2766,66 @@ const FString& ABaseCharacter::GetSpawnWeaponID() const
 
 	static const FString Empty = TEXT("");
 	return Empty;
+}
+
+
+/**
+ * 【v241 大厂架构新增】GetCharacterRowName — 按优先级解析当前角色的 RowName
+ *
+ * 优先级链 (与 WeaponAttachmentComponent.cpp::SetMeleeConfig 同设计):
+ *   1. 玩家路径 (有 ARoomPlayerState):
+ *      - ARoomPlayerState::SelectedCharacterID (Replicated FString)
+ *      - 玩家路径优先级最高, 因为 SelectedCharacterID 是大厅选择的真理源
+ *
+ *   2. AI 路径 (无 PS 但有 WeaponAttachmentComponent):
+ *      - WeaponAttachmentComponent::CharacterID (Replicated FString)
+ *      - AI 的 CharID 写入点在 RoomSpawnSubsystem::SpawnAIInternal / SetMeleeConfig
+ *
+ *   3. 都拿不到 → 返回 NAME_None (零兜底, 调用方处理)
+ *
+ * 大厂原则:
+ *   - 不缓存 (与 v40.6 同模式), 每次按需查 PlayerState / WeaponAttachmentComponent
+ *   - FString → FName 转换用 FName(*str), UE 内部哈希缓存, 性能可接受
+ *   - 零兜底: 拿不到 CharID 不静默 fallback, 返回 NAME_None 让调用方 Log Error
+ *
+ * 为什么用 const_cast:
+ *   - GetCharacterRowName 是 BlueprintPure (const), 但 ResolveWeaponAttach 是非 const
+ *   - v38 模板 Resolver 在 const 方法中需要非 const 字段 (lazy resolve 时会写回字段)
+ *   - const_cast 是 UE 组件解析的标准模式 (与 GetSpawnWeaponID 一致)
+ */
+FName ABaseCharacter::GetCharacterRowName() const
+{
+	// ============================================================
+	// Step 1: 玩家路径 — 从 ARoomPlayerState::SelectedCharacterID 读
+	// ============================================================
+	if (const ARoomPlayerState* RoomPS = GetPlayerState<ARoomPlayerState>())
+	{
+		const FString& CharID = RoomPS->GetSelectedCharacterID();
+		if (!CharID.IsEmpty())
+		{
+			// FString → FName 转换 (UE 内部哈希, 高效)
+			return FName(*CharID);
+		}
+	}
+
+	// ============================================================
+	// Step 2: AI 路径 — 从 WeaponAttachmentComponent::CharacterID 读
+	// ============================================================
+	if (UWeaponAttachmentComponent* ResolvedAttach = const_cast<ABaseCharacter*>(this)->ResolveWeaponAttach())
+	{
+		const FString& CharID = ResolvedAttach->GetCharacterIDForLog();
+		if (!CharID.IsEmpty())
+		{
+			return FName(*CharID);
+		}
+	}
+
+	// ============================================================
+	// Step 3: 零兜底 — 都拿不到, 返回 NAME_None
+	// ============================================================
+	// 不 Log Warning 在这里 (调用方 GetFireMontageHipByRow 会 Log Error 提示修复)
+	// 这里只返回, 让调用方决定怎么报错
+	return NAME_None;
 }
 
 
@@ -5125,6 +5231,13 @@ void ABaseCharacter::Server_StartFire_Implementation(
 	CurrentWeapon->Server_StartFire(ClientRayOrigin, ClientRayDirection);
 }
 
+/**
+ * @brief Server RPC 验证 — 客户端调用 Server_StartFire 时先走 Validate 防作弊
+ * @return true=允许执行, false=服务器拒绝 (玩家被踢/反作弊)
+ *
+ * 服务器权威: Validate 在 _Implementation 之前跑, 失败则 _Implementation 不会触发
+ * 当前实现: 永真 (信任客户端传入的射线方向, 反作弊由应用层处理)
+ */
 bool ABaseCharacter::Server_StartFire_Validate(
 	const FVector_NetQuantize& /*ClientRayOrigin*/,
 	const FVector_NetQuantizeNormal& /*ClientRayDirection*/)

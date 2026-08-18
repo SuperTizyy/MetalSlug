@@ -1,5 +1,33 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ========================================================================
+// RoomService.h — 房间业务服务头文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 声明 3 个事件委托(FOnRoomHostChanged / FOnRoomPlayerJoined / FOnRoomPlayerLeft)
+//   - 声明 URoomService 类(继承 UGameInstanceSubsystem),为 View 层提供
+//     房间业务(切队/准备/聊天/添加 AI/选 Loadout/开局/离房)统一门面
+//
+// 大厂架构角色 — L2 Service Layer (Transport Abstraction):
+//   - 业务层(RoomInsidePage)只调 RoomService, 零感知 RPC/GameMode
+//   - RoomService 内部自动判断: 联机模式走 RPC, 独立进程模式直接调 GameMode
+//   - 大厂对应:Riot 客户端的 Transport Layer / Epic Lyra 的 PlayerCommands
+//
+// 透明传输策略:
+//   ┌─────────────────┬─────────────────────┬─────────────────────┐
+//   │ 调用             │ 联机(Client/Server) │ 独立进程(Host=Client)│
+//   ├─────────────────┼─────────────────────┼─────────────────────┤
+//   │ RequestChangeTeam│ PC->Server_*        │ GM->ChangePlayerTeam│
+//   │ RequestReady     │ PC->Server_Toggle   │ GM->UpdateReady     │
+//   │ RequestChat      │ PC->Server_SendChat │ GM->BroadcastChat   │
+//   │ RequestAddAI     │ PC->Server_QueueAI  │ GM->QueueAIForBattleSpawn │
+//   │ RequestLoadout   │ PC->Server_Select   │ PS->SetPlayerLoadout│
+//   │ RequestStartGame │ PC->Server_Start    │ GM->RequestStartGame│
+//   │ RequestLeaveRoom │ SM->DestroySession  │ SM->DestroySession  │
+//   └─────────────────┴─────────────────────┴─────────────────────┘
+// ========================================================================
+
 #pragma once
 
 // ==========================================
@@ -63,21 +91,66 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestChangeTeam(bool bToAttackTeam);
 
+	/**
+	 * @brief 玩家切换准备状态 (联机走 Server RPC, 独立进程直接调 GM)
+	 *
+	 * 调用方: 房内 UI 准备按钮
+	 * 联机模式: 通过 PC->Server_TogglePlayerReady RPC 走真实网络
+	 * 独立进程: 直接 GM->UpdateReady(PC, bIsReady) (Host=Client 同进程, 无需 RPC)
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestReady(bool bIsReady);
 
+	/**
+	 * @brief 发送房间聊天消息 (联机走 Server RPC, 独立进程直接调 GM)
+	 *
+	 * 调用方: 房内聊天输入框
+	 * 消息经透明传输层发到服务器, 由 GM->BroadcastChat 广播给所有玩家
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestSendChatMessage(const FString& Message);
 
+	/**
+	 * @brief 房主添加 AI 占位 (v28: 大厅只入队, 战斗 Spawn 才生成 Pawn)
+	 *
+	 * 调用方: 房主 UI "添加 AI [攻方/守方]" 按钮
+	 * 联机模式: PC->Server_QueueAIForBattleSpawn RPC
+	 * 独立进程: 直接 GM->QueueAIForBattleSpawn(...)
+	 * AI Pawn 不立刻生成, 仅维护在 PendingAIQueue 等候战斗开局 Spawn
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestAddAI(bool bToAttackTeam, const FString& CharacterRowName, const FString& WeaponRowName, int32 Count);
 
+	/**
+	 * @brief 玩家选择大厅 Loadout (4 把武器: 主/副/副/近战)
+	 *
+	 * 调用方: 大厅选武器 UI 确认按钮
+	 * 联机模式: PC->Server_SelectLoadout RPC
+	 * 独立进程: 直接 PS->SetPlayerLoadout(...)
+	 * 仅玩家 UI 触发, 不影响已 Spawn 的 Pawn (战斗开始 Spawn 链才读这些字段)
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestSelectLoadout(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName);
 
+	/**
+	 * @brief 房主请求开始游戏 (联机走 Server RPC, 独立进程直接调 GM)
+	 *
+	 * 调用方: 房主 UI "开始游戏" 按钮 (仅房主可见/可点)
+	 * 联机模式: PC->Server_RequestStartGame RPC
+	 * 独立进程: 直接 GM->RequestStartGame()
+	 * 触发后进入 MatchCountdown 倒计时, 倒计时结束调 PerformGameStart
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestStartGame();
 
+	/**
+	 * @brief 玩家离开房间 (联机走 Server RPC, 独立进程直接调 GM)
+	 *
+	 * 调用方: 房内 UI "离开房间" 按钮
+	 * 联机模式: PC->Server_RequestLeaveRoom RPC
+	 * 独立进程: 直接 GM->RemovePlayerFromRoom(PC)
+	 * 房主离房 = 销毁整个 Session
+	 */
 	UFUNCTION(BlueprintCallable, Category = "RoomService")
 	void RequestLeaveRoom();
 

@@ -1,5 +1,6 @@
 // ==========================================
-// ANS_MeleeTraceState 实现 (v74 大厂架构)
+// ANS_MeleeTraceState 实现 (v74 大厂架构) — 近战武器命中检测区间通知
+// ==========================================
 //
 // 【大厂原则 — 责任链】
 //   ANS_MeleeTraceState (本类)
@@ -26,6 +27,12 @@
 #include "Weapons/WeaponDamageStrategy.h"
 
 
+/**
+ * UANS_MeleeTraceState 构造函数
+ *
+ * @brief  AnimNotifyState 构造 — 仅设置编辑器时间轴显示颜色
+ * @note   醒目橙色 NotifyColor — 与 Footstep 等其他 ANS 区分, 美术一眼能识别
+ */
 UANS_MeleeTraceState::UANS_MeleeTraceState()
 {
 #if WITH_EDITORONLY_DATA
@@ -39,6 +46,21 @@ UANS_MeleeTraceState::UANS_MeleeTraceState()
 // 1. NotifyBegin — 进入区间
 // ==========================================================
 
+/**
+ * NotifyBegin — 进入 trace 区间时引擎自动调用
+ *
+ * @brief  蒙太奇播放进入 ANS 区间起点时, 根据 EnterState 启动/停止 trace
+ * @param  MeshComp        当前播放动画的骨骼网格组件
+ * @param  Animation       触发该通知的动画序列
+ * @param  TotalDuration   本次 ANS 区间总时长 (秒)
+ * @param  EventReference  通知事件引用 (UE 5 新 API)
+ * @note   【v85.3 大厂重构】所有进程 (服务器+客户端) 都执行相同逻辑, 伤害只在服务器结算
+ * @note   【v93.2 母体复用】bIsMother=true 时走 StartMotherTrace/StopMotherTrace (零武器依赖)
+ * @note   EnterState 三种语义:
+ *         - Tracing: 启动 trace (最常用, 占区间大部分时长)
+ *         - Idle:    主动停止 trace (美术用于"先停一下"的视觉表达)
+ *         - Hit:     非法 — 命中状态由 TickDetection 自动设置, 不允许美术配置
+ */
 void UANS_MeleeTraceState::NotifyBegin(
 	USkeletalMeshComponent* MeshComp,
 	UAnimSequenceBase* Animation,
@@ -83,6 +105,7 @@ void UANS_MeleeTraceState::NotifyBegin(
 	// ============================================================
 	if (OwnerChar->bIsMother)
 	{
+		// 母体分支: 根据 EnterState 决策 (镜像普通武器路径)
 		switch (EnterState)
 		{
 		case EWeaponTraceState::Tracing:
@@ -184,6 +207,16 @@ void UANS_MeleeTraceState::NotifyBegin(
 // 2. NotifyEnd — 离开区间
 // ==========================================================
 
+/**
+ * NotifyEnd — 离开 trace 区间时引擎自动调用
+ *
+ * @brief  蒙太奇播放离开 ANS 区间终点时, 关闭 trace (无论是否命中)
+ * @param  MeshComp        当前播放动画的骨骼网格组件
+ * @param  Animation       触发该通知的动画序列
+ * @param  EventReference  通知事件引用 (UE 5 新 API)
+ * @note   【v85.3 大厂重构】所有进程都调 StopDamageTrace, 客户端 trace 立即关闭
+ * @note   StopDamageTrace 是幂等的 (蒙太奇自然结束时武器可能已切换/销毁, 静默 return 安全)
+ */
 void UANS_MeleeTraceState::NotifyEnd(
 	USkeletalMeshComponent* MeshComp,
 	UAnimSequenceBase* Animation,
@@ -247,6 +280,13 @@ void UANS_MeleeTraceState::NotifyEnd(
 // 3. GetNotifyName — 蒙太奇编辑器显示
 // ==========================================================
 
+/**
+ * GetNotifyName_Implementation
+ *
+ * @brief  返回蒙太奇编辑器时间轴上的显示名称, 便于美术识别不同 ANS 区间
+ * @return FString 形如 "Melee Trace (Tracing Heavy)" — 包含状态和是否重击
+ * @note   UE 5 AnimNotifyState 标准 API, 编辑器自动调用
+ */
 FString UANS_MeleeTraceState::GetNotifyName_Implementation() const
 {
 	// 编辑器时间轴上显示 "Melee Trace (Tracing)" / "Melee Trace (Idle)"

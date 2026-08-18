@@ -83,6 +83,7 @@ class METALSLUG01_API UBTTask_PlayAttackMontage : public UBTTaskNode
 public:
 	UBTTask_PlayAttackMontage();
 
+	/** @brief BT 编辑器静态描述 (显示 AttackType + ComboIndex + 锁脚状态) */
 	virtual FString GetStaticDescription() const override;
 
 	// ============================================================

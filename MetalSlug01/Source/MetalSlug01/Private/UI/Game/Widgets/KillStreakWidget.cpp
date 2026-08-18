@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// KillStreakWidget 实现 — 连杀图标组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UKillStreakWidget — 连杀数图标显示
+//   2. RecordKill 累计击杀 → 重置计时 → 更新图标 → 启动超时
+//   3. 超时回退: ShowKillStreakTimeout() 重置为单人击杀图标 (0 兜底)
+//   4. DataTable 查表: 按 KillCount + bIsHeadshot 查找对应图标
+//
+// 大厂原则 (v41 大厂重构):
+//   - 数据驱动: KillStreakConfig / IconDataTable 由 GameHUDWidget 注入
+//   - 0 兜底: 超时必须重置, 不能静默消失
+//   - 防御性: 控件未绑 → Log Warning 跳过 (不阻塞其他逻辑)
 // ==========================================
 #include "UI/Game/Widgets/KillStreakWidget.h"
 #include "Components/Image.h"

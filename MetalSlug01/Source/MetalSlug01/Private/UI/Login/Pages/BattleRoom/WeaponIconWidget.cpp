@@ -1,7 +1,20 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// WeaponIconWidget 实现 — 武器棋盘格 Item 控件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UWeaponIconWidget — 武器格子所有 UI 逻辑
+//   2. 初始化高亮框默认隐藏
+//   3. SetupWeaponItem 注入数据 + 父页面指针
+//   4. OnWeaponIconClicked 通知父页面
+//
+// 大厂原则:
+//   - 单一职责: 一个小格子只管自己
+//   - 反向引用: 持有 URoomInsidePage 指针回调
+//   - 防御性: 高亮框默认 Collapsed
+//   - 防呆: 先 RemoveAll 再 AddDynamic (避免重复绑定)
 // ==========================================
 #include "UI/Login/Pages/BattleRoom/WeaponIconWidget.h"
 

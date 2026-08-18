@@ -39,6 +39,10 @@ UBTService_UpdateMotherDistance::UBTService_UpdateMotherDistance()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示 AI 与母体距离派生频率与数据流
+ * @return 多行描述,展示 Interval / NearestMotherTarget / 平面距离 / BT 决策归属
+ */
 FString UBTService_UpdateMotherDistance::GetStaticDescription() const
 {
 	return FString::Printf(
@@ -61,6 +65,16 @@ float UBTService_UpdateMotherDistance::ComputeFlatDistanceToMother(
 }
 
 
+/**
+ * @brief Service 周期 Tick — 派生 AI 与母体的平面距离到 BB.DistanceToMother
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory Service 节点内存(本类未使用)
+ * @param DeltaSeconds 距上次 Tick 的间隔秒
+ *
+ * 大厂原则:本 Service 只派生事实,距离判断决策交回 BT Decorator.
+ * 流程:读 BB.NearestMotherTarget → 算平面距离(忽略 Z) → 写 BB.DistanceToMother.
+ * 无目标时 Distance=-1, Decorator 看到 -1 立即拒判(BT 决策回退).
+ */
 void UBTService_UpdateMotherDistance::TickNode(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {

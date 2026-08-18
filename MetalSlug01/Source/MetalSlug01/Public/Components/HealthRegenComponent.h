@@ -36,6 +36,34 @@ class USoundBase;
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRegenStateChanged, bool, bIsNowRegenerating);
 
+/**
+ * @class UHealthRegenComponent
+ * @brief 生命/能量回复组件 - 自动回复状态机 (主要用于母体待机回血)
+ *
+ * 单一职责: 检测 Owner 状态 (移动/满血/死亡) + 整秒节拍调 HealthComponent->Heal/EnergyComponent->Add
+ *
+ * 大厂架构中的角色:
+ *   - 自治状态机: bIsRegenerating 字段 + SetRegeneratingState 集中入口
+ *   - 整秒节拍: SetTimer(1.0s, loop) 触发回血 (业务规则: "每秒 30 滴" 精准整数, 非 DeltaTime 累加)
+ *   - 单一真理源: "满血"概念归 HealthComponent 拥有 (调 HealthComp->IsFullHealth())
+ *   - 事件总线: OnRegenStateChanged 触发回血音效 RPC
+ *
+ * 设计原则:
+ *   - 零重复广播: SetRegeneratingState 状态无变化时直接 return
+ *   - 防御性检查: 死亡/未启用/移动中/未到延迟 → 都不回血
+ *   - 配错零兜底: bEnableAutoRegen=false 时完全跳过
+ *
+ * 业务触发条件 (母体, 用户 2026.07.26 明确):
+ *   1. 不是满血状态
+ *   2. 非移动状态
+ *   3. 不被攻击 (NotifyDamageTaken 链路)
+ *   4. RegenerationDelay 秒静止后
+ *
+ * 使用方式:
+ *   - ABaseCharacter::PossessedBy 调用 ResetRegenerationState
+ *   - HealthComponent::ApplyDamage 调用 NotifyDamageTaken
+ *   - ABaseCharacter::BeginPlay 订阅 OnRegenStateChanged 触发音效 RPC
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UHealthRegenComponent : public UActorComponent
 {

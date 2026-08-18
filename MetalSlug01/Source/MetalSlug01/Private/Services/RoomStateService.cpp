@@ -1,8 +1,19 @@
-// ==========================================
-// URoomStateService.cpp
-// ==========================================
-// 房间状态查询门面实现
-// ==========================================
+// ========================================================================
+// RoomStateService.cpp — 房间状态查询门面实现文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 实现 GetMatchSnapshot/GetAttackFactionSnapshots/GetDefenseFactionSnapshots 等快照查询
+//   - 实现 GetFactionSnapshotsInternal (v29 大厂架构 — 单一真理源分离)
+//   - 实现 BuildSnapshot/BuildAISnapshot/BuildAISnapshotFromController (数据转换)
+//   - 实现 Initialize/Deinitialize + SubscribeToWorldEvents/UnsubscribeFromWorldEvents
+//     (v215 跨 World 生命周期管理)
+//
+// 大厂原则:
+//   - 单一真理源:真人(GS->PlayerArray)与 AI 占位(GM->PendingAIQueue) 两条独立数据流
+//   - 显式优于默认:GetFactionSnapshotsWithAI vs GetFactionSnapshots 显式 API > 隐式 bIncludeAI 参数
+//   - 事件驱动:Initialize 订阅 World 生命周期, World 切换时重新订阅 RoomGameState 事件
+// ========================================================================
 
 #include "Services/RoomStateService.h"
 #include "Systems/RoomGameState.h"
@@ -72,6 +83,12 @@ FMatchSnapshot URoomStateService::GetMatchSnapshot() const
     return Snapshot;
 }
 
+/**
+ * @brief 判断当前是否在房间内
+ * @return true = World 已加载 RoomGameState(在房间地图上),false = 不在
+ *
+ * 用于 UI 显示房间相关控件的可见性(房主按钮/玩家列表/准备按钮等)
+ */
 bool URoomStateService::IsInRoom() const
 {
     // 仅当 World 已加载 RoomGameState 才算"在房间内"
@@ -464,12 +481,23 @@ FPlayerSnapshot URoomStateService::GetLocalPlayerSnapshot() const
     return PS ? BuildSnapshot(PS, bIsHost) : FPlayerSnapshot();
 }
 
+/**
+ * @brief 判断本地玩家是否已准备(战斗开始前提)
+ * @return true = 本地 PlayerState.bIsReady = true,false = 未准备/无 PlayerState
+ */
 bool URoomStateService::IsLocalPlayerReady() const
 {
     const ARoomPlayerState* PS = GetLocalPlayerState();
     return PS && PS->bIsReady;
 }
 
+/**
+ * @brief 判断本地玩家是否为房主(走 RoomService.IsHost 而非 PS 比对)
+ * @return true = RoomService.bIsHost 为 true
+ *
+ * 为什么不读 PS:RoomService 是 bIsHost 的真理源(测试房主模式走 EnterSkipToHostMode 显式标定)
+ * PS->GetPlayerName() == GS->HostPlayerName 是备选验证,但 RoomService 是单一入口
+ */
 bool URoomStateService::IsLocalPlayerHost() const
 {
     const URoomService* RoomSvc = URoomService::Get(this);
@@ -498,6 +526,12 @@ int32 URoomStateService::GetAttackReadyCount() const
     return Count;
 }
 
+/**
+ * @brief 守方已准备真人数量(用于"全部准备"判定 + UI 显示)
+ * @return 守方阵营真人 Snapshot 中 bIsReady=true 的数量
+ *
+ * AI 不计入(AI 无 bIsReady 概念),与 GetDefenseReadyCount 配合形成两端镜像
+ */
 int32 URoomStateService::GetDefenseReadyCount() const
 {
     int32 Count = 0;

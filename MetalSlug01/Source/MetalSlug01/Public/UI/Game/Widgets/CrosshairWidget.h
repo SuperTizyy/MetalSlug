@@ -3,6 +3,26 @@
 #pragma once
 
 // ==========================================
+// CrosshairWidget 头文件 — 准星 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UCrosshairWidget — 屏幕中心的准星 UI
+//   2. 提供 Show/Hide/UpdateStyle 公共接口
+//   3. v60.11 新增 GetCenterScreenPosition — 武器射线检测的真理源
+//
+// 设计理念 (大厂原则 - 简单状态机):
+//   1. 隐藏(Collapsed) / 显示(HitTestInvisible) — 准星不影响其他 UI 点击
+//   2. 默认隐藏: NativeConstruct 中默认 Collapsed, 等战斗开始再显示
+//   3. 样式扩展: 预留 UpdateCrosshairStyle 给武器类型切换
+//
+// 武器射线检测 (v60.11 大厂架构):
+//   - 准星屏幕坐标 = 武器射线的真理源
+//   - URangedLineStrategy 通过 GetCenterScreenPosition 拿到绝对坐标
+//   - 然后用 PlayerController->DeprojectScreenPositionToWorld 转世界射线
+// ==========================================
+
+// ==========================================
 // 头文件包含说明
 // ==========================================
 #include "CoreMinimal.h"

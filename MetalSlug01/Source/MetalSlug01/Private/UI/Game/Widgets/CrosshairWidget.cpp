@@ -1,6 +1,24 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
+// CrosshairWidget 实现 — 准星 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. NativeConstruct 默认隐藏准星
+//   2. ShowCrosshair/HideCrosshair 控制显隐
+//   3. GetCenterScreenPosition 提供准星屏幕坐标 (武器射线真理源)
+//
+// 关键架构 (v60.11):
+//   - 玩家射线必须从 Muzzle 朝准星射出
+//   - 准星屏幕坐标 = Widget 几何中心 (绝对屏幕坐标)
+//   - UE 5.6 标准做法: GetCachedGeometry().LocalToAbsolute(LocalCenter)
+//
+// 零兜底:
+//   - Widget 未渲染 → 返回 ZeroVector, 调用方必须显式校验
+// ==========================================
+
+// ==========================================
 // 头文件包含区
 // ==========================================
 #include "UI/Game/Widgets/CrosshairWidget.h"

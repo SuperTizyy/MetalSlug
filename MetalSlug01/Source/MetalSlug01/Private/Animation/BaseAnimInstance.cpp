@@ -1,6 +1,34 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
+// UBaseAnimInstance 实现 (角色动画实例基类)
+// ==========================================
+//
+// 【大厂原则 — 职责单一】
+//   本类作为所有角色 AnimBP 的 C++ 基类 — 负责把游戏状态(速度/方向/武器/姿势)同步到 AnimGraph 变量
+//   不处理动画播放逻辑本身 (由 AnimGraph 节点处理)
+//
+// 【职责链】
+//   AnimInstance 每帧 NativeUpdateAnimation → 计算以下字段:
+//     Speed / VelocityZ / Direction / bIsFalling / bIsCrouching
+//     AnimSpeed (电竞步法抗滑步算法)
+//     AimPitch (瞄准俯仰角)
+//     LeftHandIKTransform/LeftHandIKAlpha (左手磁吸)
+//     CurrentWeaponStance (武器身体姿势 — 由 MeshType 派生)
+//
+//   AnimGraph 用这些变量驱动 BlendSpace / State Machine / IK 节点
+//
+// 【真理源】
+//   - 速度/下蹲/方向 → ABaseCharacter (Replicated 字段, 真理源)
+//   - 武器 MeshType → ABaseWeapon (Replicated, BP 配置)
+//   - MovementLocked → ABaseCharacter (服务器权威字段)
+//
+// 【零兜底原则】
+//   - Character 为空 → 直接 return (防崩, 编辑器预览常见)
+//   - 没武器 → LeftHandIKAlpha = 0, CurrentWeaponStance = Unarmed (合理默认值)
+// ==========================================
+
+// ==========================================
 // 头文件包含区
 // ==========================================
 // 引入本类头文件
@@ -23,8 +51,9 @@
 /**
  * NativeInitializeAnimation
  *
- * 相当于蓝图里的 Event Blueprint Initialize Animation（只运行一次）
- * 目的: 游戏开始时，拿到这具身体的主人
+ * @brief  AnimInstance 初始化 — 相当于蓝图里的 Event Blueprint Initialize Animation (仅运行一次)
+ * @note   职责: 游戏开始时拿到这具身体的主人 (Pawn) — 后续 Update 都用这个引用
+ * @note   TryGetPawnOwner 是 UE 5 AnimInstance 标准 API — 比缓存字段更安全
  */
 void UBaseAnimInstance::NativeInitializeAnimation()
 {
@@ -42,14 +71,17 @@ void UBaseAnimInstance::NativeInitializeAnimation()
 /**
  * NativeUpdateAnimation
  *
- * 相当于蓝图里的 Event Blueprint Update Animation（每帧运行）
- * 1. 防崩保护: Character 为空直接返回
- * 2. 获取下蹲/速度/Z轴速度
- * 3. 终极电竞步法算法（剥离物理与动画 + 动态锁步）
- * 4. 计算 8 向移动的 Direction 角度
- * 5. 检测离地
- * 6. 计算瞄准 Pitch 角度
- * 7. 搜寻左手磁铁坐标
+ * @brief  每帧更新 — 相当于蓝图里的 Event Blueprint Update Animation
+ * @param  DeltaSeconds  距上一帧的时间间隔 (秒)
+ * @note   计算顺序 (大厂原则 — 单一职责):
+ *         1. 防崩保护
+ *         2. 获取下蹲/速度/Z 轴速度
+ *         3. 终极电竞步法算法 (剥离物理与动画 + 动态锁步)
+ *         4. 计算 8 向移动的 Direction 角度
+ *         5. 检测离地
+ *         6. 计算瞄准 Pitch 角度
+ *         7. 搜寻左手磁铁坐标
+ *         8. 计算武器身体姿势 (由 MeshType 派生)
  */
 void UBaseAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
@@ -151,6 +183,7 @@ void UBaseAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 
 	if (ABaseWeapon* Weapon = Character->GetCurrentWeapon())
 	{
+		// 根据武器的 MeshType 派生 AnimGraph 需要的 EWeaponStance
 		switch (Weapon->GetMeshType())
 		{
 		case EWeaponMeshType::Melee:

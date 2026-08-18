@@ -1,3 +1,19 @@
+// ========================================================================
+// LocalAccountRepository.cpp — L1 仓储层 - 账号 CRUD 实现文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 实现 Initialize/Deinitialize(声明 Store 依赖)
+//   - 实现账号 CRUD: VerifyCredentials / Register / FindRecord
+//   - 实现战备偏好: Get/SaveLastSelectedCharacter / Weapon (含自愈式建档)
+//   - 实现私有 helper: GetStore (懒加载防御) / Persist (兜底保存)
+//
+// 大厂原则:
+//   - 自愈式 Save:Record 不存在 → 自动创建(用于 MockLogin 临时账号)
+//   - 单次持久化:Persist() 内部调 Store->FlushToDisk(),Repository 不在内存里冗余存 AccountData
+//   - 业务校验:用户名非空 + 密码非空 + 账号已存在 → 拒绝
+// ========================================================================
+
 // ==========================================
 // 头文件包含区
 // ==========================================
@@ -104,6 +120,14 @@ FString ULocalAccountRepository::GetLastSelectedCharacter(const FString& Usernam
 	return TEXT("");
 }
 
+/**
+ * @brief 保存玩家最后选择的角色名(自愈式建档)
+ * @param Username 账号名(非空)
+ * @param CharacterName 角色 ID(对应 DT_CharacterInfo)
+ *
+ * 如果 Record 不存在会自动创建临时空 Record, 用于 MockLogin 等临时账号场景
+ * 自愈策略确保 MockName (如 TestUser_XXXX) 也能正常保存偏好
+ */
 void ULocalAccountRepository::SaveLastSelectedCharacter(const FString& Username, const FString& CharacterName)
 {
 	ULocalAccountStore* Store = GetStore();
@@ -129,6 +153,12 @@ void ULocalAccountRepository::SaveLastSelectedCharacter(const FString& Username,
 	Persist();
 }
 
+/**
+ * @brief 读取玩家指定背包槽位最后选择的武器 ID
+ * @param Username 账号名
+ * @param BackpackSlot 背包槽位(1 或 2)
+ * @return 武器 RowName,Record 不存在或槽位非法返回空字符串
+ */
 FString ULocalAccountRepository::GetLastSelectedWeapon(const FString& Username, int32 BackpackSlot) const
 {
 	if (const FAccountRecord* Record = FindRecord(Username))
@@ -138,6 +168,15 @@ FString ULocalAccountRepository::GetLastSelectedWeapon(const FString& Username, 
 	return TEXT("");
 }
 
+/**
+ * @brief 保存玩家指定背包槽位的武器 ID(自愈式建档)
+ * @param Username 账号名(非空)
+ * @param BackpackSlot 背包槽位(1=主武器/2=副武器, 其他值被忽略)
+ * @param WeaponRowName DT_WeaponInfo 表中的 RowName
+ *
+ * 自愈式建档:Record 不存在则自动创建临时 Record, 保证 MockLogin 等场景能正常持久化偏好
+ * 修复关键路径: RoomInsidePage::NativeConstruct → InitDefaultWeapons 依赖此写入
+ */
 void ULocalAccountRepository::SaveLastSelectedWeapon(const FString& Username, int32 BackpackSlot, const FString& WeaponRowName)
 {
 	ULocalAccountStore* Store = GetStore();
@@ -181,6 +220,12 @@ ULocalAccountStore* ULocalAccountRepository::GetStore() const
 	return nullptr;
 }
 
+/**
+ * @brief 兜底持久化入口 — 将内存中的 Cache 写回磁盘
+ *
+ * Store 不可用时静默跳过(子系统销毁时序阶段不强制落盘)
+ * 业务层 Repository::Register/SaveLastSelectedXxx 末尾统一调用此方法
+ */
 void ULocalAccountRepository::Persist()
 {
 	if (ULocalAccountStore* Store = GetStore())

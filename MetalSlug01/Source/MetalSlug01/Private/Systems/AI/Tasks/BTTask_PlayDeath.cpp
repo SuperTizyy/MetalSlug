@@ -20,6 +20,10 @@ UBTTask_PlayDeath::UBTTask_PlayDeath()
 	NodeName = TEXT("Play Death");
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示终末节点语义(死亡自动完成, BT 不重复触发)
+ * @return 多行描述,展示 Die/UnPossess/Destroy 自动链 + HPThreshold 触发
+ */
 FString UBTTask_PlayDeath::GetStaticDescription() const
 {
 	return TEXT("终末节点。\n"

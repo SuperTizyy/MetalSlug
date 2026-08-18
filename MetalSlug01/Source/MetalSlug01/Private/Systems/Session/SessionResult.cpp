@@ -47,6 +47,15 @@ FString FRoomSessionResult::GenerateSignature() const
 	return FString::Printf(TEXT("%s_%d_%d_%d"), *RoomName, CurrentPlayers, MaxPlayers, bIsInBattle ? 1 : 0);
 }
 
+/**
+ * @brief 判断 Session 结果是否有效(用于 UI 列表过滤)
+ * @return true=RoomName 非空 + RawSearchResult 有效 + OnlineSession 有效
+ *
+ * 三重验证 (大厂原则 - 防御性校验):
+ * - RoomName 提取成功(防止匿名 Session 进入 UI 列表)
+ * - 内部 RawSearchResult 共享指针有效
+ * - 原始 FOnlineSessionSearchResult.IsValid() 为 true(防 GC 后野指针)
+ */
 bool FRoomSessionResult::IsValid() const
 {
 	return !RoomName.IsEmpty() && RawSearchResult.IsValid() && RawSearchResult->IsValid();

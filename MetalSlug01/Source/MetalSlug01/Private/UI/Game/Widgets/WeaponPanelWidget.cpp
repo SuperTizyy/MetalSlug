@@ -1,7 +1,25 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// WeaponPanelWidget 实现 — 武器面板组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UWeaponPanelWidget 的所有图标 + 弹药显示逻辑
+//   2. 主/副武器: SetBrushFromTexture 简单纹理设置
+//   3. 近战武器: 动态材质 M_WeaponIconRotate 旋转 90 度
+//   4. 弹药: 格式化 "30/120" + 颜色编码 (0=红 / ≤10=黄 / >10=白)
+//
+// 大厂原则 (v84/v85 大厂架构):
+//   - 单一真理源: Widget 只渲染, 数据由调用方提供
+//   - 零兜底: 控件缺失 Log Error, Icon 为空 Log Error
+//   - 防御性: 每个 Update* 都做空指针检查 (BP 可能不绑)
+//   - 缓存: M_WeaponIconRotate 用 static TWeakObjectPtr 缓存 (避免重复 LoadSynchronous)
+//
+// 近战图标降级策略:
+//   - 找不到 M_WeaponIconRotate 材质 → 降级为 SetBrushFromTexture
+//   - 降级时 Log Warning 提醒策划补回材质
+//   - 不阻塞 UI 显示 (降级是可接受的视觉妥协)
 // ==========================================
 #include "UI/Game/Widgets/WeaponPanelWidget.h"
 #include "Components/Image.h"

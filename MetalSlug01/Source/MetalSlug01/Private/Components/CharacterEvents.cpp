@@ -183,6 +183,18 @@ void UCharacterEvents::SetCachedWeaponAmmoInfo(int32 InCurrentAmmo, int32 InMaga
 	bCachedWeaponAmmoValid = true;
 }
 
+/**
+ * UCharacterEvents::GetCachedWeaponAmmoInfo
+ *
+ * 订阅者 (GameHUDWidget) 在订阅成功后拉取最近一次广播的武器弹药信息,
+ * 解决事件总线的"竞争订阅"问题 (镜像 GetCachedCharacterIcon 双轨制).
+ *
+ * @param OutCurrentAmmo 当前弹匣内剩余弹药数
+ * @param OutMagazineSize 弹匣容量
+ * @param OutReserveAmmo 备用弹药数
+ * @param OutbIsMelee 是否近战武器 (true=不显示弹药 UI, 例如刀)
+ * @return true=有缓存数据, false=从未广播过
+ */
 bool UCharacterEvents::GetCachedWeaponAmmoInfo(int32& OutCurrentAmmo, int32& OutMagazineSize, int32& OutReserveAmmo, bool& OutbIsMelee) const
 {
 	if (!bCachedWeaponAmmoValid)
@@ -297,6 +309,10 @@ void UCharacterEvents::BroadcastRespawnMovementLockChanged(bool bIsLocked, float
 
 /**
  * UCharacterEvents::SetCachedACValue
+ *
+ * 写入当前 AC 数值到本地缓存 (无 bCachedACValid 标志, 因为 AC 默认 0 已是有效状态)
+ *
+ * @param InAC 新的 AC 数值
  */
 void UCharacterEvents::SetCachedACValue(int32 InAC)
 {

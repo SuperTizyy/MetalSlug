@@ -27,6 +27,26 @@
 #include "ZombieAIController.generated.h"
 
 /**
+ * @file ZombieAIController.h
+ * @brief 生化模式 AI 控制器 (AZombieAIController) — 生化专属钩子扩展点
+ *
+ * 大厂架构角色:
+ *   - 完全继承 ABaseAIController 链路 (阵营协议 + 感知配置 + BT 启动)
+ *   - 仅 override 生化专属的"感染人 → 改 TeamId + 重启 BT"钩子
+ *   - 不污染共用层 (不写"如果我是僵尸就..."的 if 条件)
+ *
+ * 与其他组件的关系:
+ *   - 上游: ABaseAIController (基类)
+ *   - 配套: UAIBehaviorConfigSO (参数真理源) + ConfigSO.LevelPlacedAIControllerClass 反射决定
+ *   - 未来扩展: Phase 3 母体机制 (OnPawnBecomeZombie 委托已预留)
+ *
+ * 为什么需要单独 Controller 类:
+ *   1. 生化模式"母体"机制专属 (与刀战模式解耦)
+ *   2. GAS / GameplayAbility 绑订阅者 (感染技能 OnPawnBecomeZombie 等)
+ *   3. 工程预留扩展点 (群体扑击 / 感染范围伤害)
+ */
+
+/**
  * 【v54 大厂架构重构 — UAIProfileAsset 删除】Re-declare the file purpose
  *
  * 设计原则 (大厂架构):

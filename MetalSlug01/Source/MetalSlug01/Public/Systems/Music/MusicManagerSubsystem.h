@@ -2,6 +2,20 @@
 
 #pragma once
 
+/**
+ * @file MusicManagerSubsystem.h
+ * @brief 背景音乐管理系统 — 跨地图持久的单一真理源
+ *
+ * 大厂原则:
+ *   - 单一职责: 4 种场景音乐 + 生化战斗 BGM (v260)
+ *   - 跨地图持久: UGameInstanceSubsystem, 切图不重置
+ *   - 事件驱动: 自动订阅 GameFlow/UIViewService, 业务方零调用
+ *
+ * 架构设计:
+ *   - AB 槽位切换: 双 AudioComponent 槽位实现无 Gap 切换
+ *   - EnterBattleMode 路由: v260 新增, 按 ERoomMatchMode 自动选 Battle/ZombieBattle BGM
+ */
+
 // ==========================================
 // 头文件包含说明
 // ==========================================

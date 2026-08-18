@@ -96,6 +96,14 @@ public:
 		float TotalDuration,
 		const FAnimNotifyEventReference& EventReference) override;
 
+	/**
+	 * @brief 启动蒙太奇区间结束时关闭 trace (调 Weapon->StopDamageTrace)
+	 *
+	 * 与 NotifyBegin 配对使用 — 美术在蒙太奇时间轴上配置 AnimNotifyState 区间
+	 * 区间结束自动调用本方法,关闭武器检测并清理临时状态
+	 *
+	 * 零兜底: Mesh/Owner 无效 → Log Error + return,不抛异常
+	 */
 	virtual void NotifyEnd(
 		USkeletalMeshComponent* MeshComp,
 		UAnimSequenceBase* Animation,

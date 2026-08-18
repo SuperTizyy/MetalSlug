@@ -1,6 +1,20 @@
 // MetalSlug01. All Rights Reserved.
 #pragma once
 
+/**
+ * @file LANRoomPresenter.h
+ * @brief 大厅页面的 Presenter (ViewModel) — 状态机 + 业务逻辑
+ *
+ * 大厂原则 — MVVM 模式:
+ *   - View (LANRoomPage) 只负责展示, 不持有业务状态
+ *   - Presenter (本类) 持有会话状态机 + 缓存
+ *   - Model (SessionManagerSubsystem) 负责 OnlineSubsystem 操作
+ *
+ * 架构升级历史:
+ *   - v22-v54: UObject 派生, 手动 NewObject 创建
+ *   - v54+: UGameInstanceSubsystem, 全局单例自动管理
+ */
+
 // ==========================================
 // 标准库 & UE 引擎头文件
 // ==========================================
@@ -104,7 +118,11 @@ public:
     virtual void OnWidgetShow() override;
     virtual void OnWidgetHide() override;
     virtual void BindView(UUserWidget* InView) override;
+    /**
+     * @brief 解绑 View (IViewModel 接口) — 触发时机: Widget 销毁或 Hide
+     */
     virtual void UnbindView() override;
+    /** @brief 检查是否已绑定 View (IViewModel 接口) */
     virtual bool IsBoundToView() const override { return BoundView.IsValid(); }
     virtual FName GetViewModelType() const override { return TEXT("LANRoomPresenter"); }
 
@@ -168,6 +186,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "LANRoomPresenter|Data")
 	const TArray<FRoomSessionResult>& GetCachedRoomList() const { return CachedRoomList; }
 
+	/** @brief 当前选中的房间索引 (INDEX_NONE 表示未选) */
 	UFUNCTION(BlueprintPure, Category = "LANRoomPresenter|Data")
 	int32 GetSelectedRoomIndex() const { return SelectedRoomIndex; }
 

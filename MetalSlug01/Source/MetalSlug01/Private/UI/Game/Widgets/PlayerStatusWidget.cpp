@@ -1,7 +1,20 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// PlayerStatusWidget 实现 — 角色状态组件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UPlayerStatusWidget — 头部状态栏所有 UI 逻辑
+//   2. 血量/能量/AC/ACE 数值显示 + 颜色编码
+//   3. 头像图标刷新 (异步加载 + CharacterEvents 缓存)
+//   4. 母体技能冷却进度条 (v121.3 NativeTick 自动更新)
+//
+// 大厂原则:
+//   - 主动拉取: PullInitialDataFromCharacter 解决 UI 晚创建
+//   - 异步加载: FStreamableHandle 异步加载图标纹理, 不阻塞主线程
+//   - 缓存拉取: 从 CharacterEvents 缓存拉取头像 (事件 + 缓存双轨制)
+//   - 防御性: BindWidget 失败 → Log Error 报告
 // ==========================================
 #include "UI/Game/Widgets/PlayerStatusWidget.h"
 #include "Components/ProgressBar.h"

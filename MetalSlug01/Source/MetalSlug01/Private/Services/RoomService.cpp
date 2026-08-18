@@ -1,5 +1,22 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ========================================================================
+// RoomService.cpp — 房间业务服务实现文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 实现静态访问器 Get(WorldContextObject) — 业务层唯一调用入口
+//   - 实现业务接口(RequestChangeTeam/Ready/Chat/AddAI/SelectLoadout/StartGame/LeaveRoom)
+//     透明区分联机(RPC) / 独立进程(GameMode 直接调) 两种传输
+//   - 实现身份同步 API(NotifyBecameHost/Client, EnterSkipToHostMode 测试模式)
+//   - 实现静态广播器(BroadcastHostChanged/PlayerJoined/PlayerLeft)
+//
+// 大厂原则:
+//   - 单一入口:RequestLeaveRoom 是玩家离开房间的唯一入口(v217 修复旧多入口 bug)
+//   - 单一真理源:RequestAddAI 字段全部从 DT 反查, 零字符串模糊匹配
+//   - 零兜底:任一字段为空 → Log Error + 拒绝入队, 强制修复 UI/Data 配置
+// ========================================================================
+
 #include "Services/RoomService.h"
 #include "Systems/RoomPlayerController.h"
 #include "Systems/RoomGameMode.h"
@@ -60,6 +77,12 @@ ARoomGameMode* URoomService::GetRoomGameMode() const
 }
 
 
+/**
+ * @brief 获取当前已登录账号的用户名(从 AccountSubsystem 读)
+ * @return 当前账号用户名,未登录或子系统缺失返回空串
+ *
+ * 零兜底:返回空串表示"未登录",调用方自行判断后续路径
+ */
 FString URoomService::GetCurrentAccountName() const
 {
 	if (UGameInstance* GI = GetGameInstance())
@@ -123,6 +146,12 @@ void URoomService::RequestReady(bool bIsReady)
 	}
 }
 
+/**
+ * @brief 请求发送聊天消息(透明走联机 RPC 或独立进程 GameMode)
+ * @param Message 聊天内容
+ *
+ * 空消息直接 return;联机模式走 Server_SendChatMessage RPC,独立进程模式走 GameMode 广播
+ */
 void URoomService::RequestSendChatMessage(const FString& Message)
 {
 	if (Message.IsEmpty()) return;
@@ -139,6 +168,19 @@ void URoomService::RequestSendChatMessage(const FString& Message)
 	}
 }
 
+/**
+ * @brief 请求房主 UI 添加 AI — 大厅入队,战斗时统一 Spawn
+ * @param bToAttackTeam true=攻方,false=守方
+ * @param CharacterRowName DT_CharacterInfo RowName(强类型 ID,UI 直接传)
+ * @param WeaponRowName DT_WeaponInfo RowName(强类型 ID,UI 直接传)
+ * @param Count 添加数量(<=0 直接 return)
+ *
+ * 大厂原则 (v236 + v237.P5):
+ *   - 单一真理源:UI ComboBox 直接传 RowName(FName 强类型),Service 不做 O(N) 反查
+ *   - 零兜底:任一字段为空/查不到 → Log Error + 拒绝入队,强制修复 UI/Data 配置
+ *   - DT FindRow(FName) O(1) 直接拿 PawnClass + ConfigSO,避免 SpawnAIInternal 二次反查
+ *   - RoomState 阶段入队(QueueAIForBattleSpawn),战斗开始才真正 Spawn Pawn(v28 业务规则)
+ */
 void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterRowName, const FString& WeaponRowName, int32 Count)
 {
 	if (Count <= 0)
@@ -341,6 +383,16 @@ void URoomService::RequestAddAI(bool bToAttackTeam, const FString& CharacterRowN
 	}
 }
 
+/**
+ * @brief 请求玩家选择 Loadout(角色 + 三把武器)并同步到 SpawnSubsystem
+ * @param CharacterRowName DT_CharacterInfo RowName
+ * @param WeaponPrimaryRowName 主武器 DT_WeaponInfo RowName
+ * @param WeaponSecondaryRowName 副武器 DT_WeaponInfo RowName
+ * @param WeaponMeleeRowName 近战武器 DT_WeaponInfo RowName
+ *
+ * 联机模式:走 Server_SelectLoadout RPC
+ * 独立进程模式:直接写 PlayerState + 同步缓存到 RoomSpawnSubsystem(复活路径的真理源,v31.4 修复)
+ */
 void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))
@@ -371,6 +423,12 @@ void URoomService::RequestSelectLoadout(const FString& CharacterRowName, const F
 	}
 }
 
+/**
+ * @brief 房主请求开始游戏(进入战斗状态)
+ *
+ * 联机模式:走 Server_RequestStartGame RPC
+ * 独立进程模式:仅在 Authority 上下文中直接调 GameMode->RequestStartGame(避免客户端伪造)
+ */
 void URoomService::RequestStartGame()
 {
 	if (ARoomPlayerController* PC = Cast<ARoomPlayerController>(GetEffectivePC()))

@@ -1,5 +1,9 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+/**
+ * @file MusicManagerSubsystem.cpp
+ * @brief 背景音乐管理子系统实现 — AB 槽位切换 + EnterBattleMode 路由
+ */
 // ==========================================
 // 头文件包含区
 // ==========================================
@@ -119,6 +123,14 @@ void UMusicManagerSubsystem::StopAllMusic(float FadeOutDuration)
 	CurrentMusicType = EMusicType::None;
 }
 
+/**
+ * @brief 判断指定类型音乐是否正在播放
+ * @param MusicType 目标音乐类型
+ * @return true=类型匹配 + 当前激活轨道正在播放
+ *
+ * 仅检查当前激活轨道(TrackA 或 TrackB)的 IsPlaying 状态
+ * 单轨检查 = 实现简单 + 性能好 (无需遍历所有轨道)
+ */
 bool UMusicManagerSubsystem::IsMusicPlaying(EMusicType MusicType) const
 {
 	UAudioComponent* ActiveSlot = bTrackAIsActive ? TrackA : TrackB;
@@ -129,6 +141,17 @@ bool UMusicManagerSubsystem::IsMusicPlaying(EMusicType MusicType) const
 	return false;
 }
 
+/**
+ * @brief 比赛状态变更时的音乐路由回调(由 GameFlowSubsystem 订阅触发)
+ * @param NewState 新的比赛状态
+ *
+ * 路由策略 (大厂原则 - v260 战斗态特殊路由):
+ * - Battleing / SettlementPage → EnterBattleMode(模式感知, 刀战不播 BGM / 生化播 ZombieBattle)
+ * - 目标音乐 = None → StopAllMusic
+ * - 其他 → PlayMusic(TargetMusicType)
+ *
+ * 优先级链: 战斗态路由 > None 停止 > 默认 PlayMusic
+ */
 void UMusicManagerSubsystem::OnGameFlowStateChanged(EMatchState NewState)
 {
 	uint8 StateValue = static_cast<uint8>(NewState);
@@ -333,6 +356,18 @@ EMusicType UMusicManagerSubsystem::MapStateToMusicType(uint8 MatchState) const
 	}
 }
 
+/**
+ * @brief UI 面板切换时的音乐路由回调(由 UIViewService 订阅触发)
+ * @param OldPanel 旧面板
+ * @param NewPanel 新面板
+ *
+ * 面板 → 音乐类型映射:
+ * - ActivityPanel → Activity
+ * - RoomInside / LANRoom → Room
+ * - MainMenu → MainMenu
+ * - BattleHUD / SettlementPanel → EnterBattleMode(模式感知)
+ * - 其他面板不切换
+ */
 void UMusicManagerSubsystem::OnUIViewPanelChanged(EUIPanel OldPanel, EUIPanel NewPanel)
 {
 	// 【v228 新增】UI 面板切换时自动切换音乐（仅处理通过 UIViewService 的情况）
@@ -371,6 +406,16 @@ void UMusicManagerSubsystem::OnUIViewPanelChanged(EUIPanel OldPanel, EUIPanel Ne
 	}
 }
 
+/**
+ * @brief 进入活动页面专属音乐模式(供 GameMenuPage 等直接调用)
+ *
+ * 行为:
+ * - 已在活动模式 → no-op
+ * - 否则保存当前音乐到 PreviousMusicType + 切到 Activity
+ *
+ * 对称调用: RestorePreviousMusic() 用于活动页面关闭时恢复
+ * 大厂原则 - 状态栈: 保存前态以便对称恢复
+ */
 void UMusicManagerSubsystem::PlayActivityMusic()
 {
 	// 【v228 新增】切换到活动页面音乐（供 GameMenuPage 等直接调用）
@@ -625,6 +670,16 @@ UMusicManagerSubsystem::ERoomMatchCode UMusicManagerSubsystem::ResolveCurrentMat
 	}
 }
 
+/**
+ * @brief 战斗模式音乐路由入口(根据 GameMode 决定具体音乐策略)
+ *
+ * 路由决策 (大厂原则 - v260 模式感知):
+ * - Melee(刀战): 不播 BGM, StopAllMusic(零兜底, 不 fallback 到其他音乐)
+ * - Zombie(生化): PlayZombieBattleMusicInternal, 失败 → Log Warning 但不静默
+ * - None / Error: 拒绝路由, Log Error(强制修复 GameFlow 初始化)
+ *
+ * 单一调度: 所有进入战斗态路径(OnGameFlowStateChanged / OnUIViewPanelChanged)统一收敛到此函数
+ */
 void UMusicManagerSubsystem::EnterBattleMode()
 {
 	UE_LOG(LogTemp, Log,

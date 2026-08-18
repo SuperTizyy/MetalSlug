@@ -80,6 +80,11 @@
 #include "Sound/SoundBase.h"
 #include "Kismet/GameplayStatics.h"
 
+// 【v245 大厂架构】弹匣 AttachParent 单一真理源入口 — 需要 USkeletalMeshComponent 完整类型
+//   (ABaseWeapon::ResolveMagazineSkeletalMesh 返回 USkeletalMeshComponent*, 调用方 Cast 也需要)
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/MeshComponent.h"
+
 
 // ==========================================
 // 【v52 P0】槽位枚举 → 数组下标映射 (大厂原则 — 消除隐式偏移)
@@ -522,6 +527,14 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeapon(ABaseWeapon* OldWeapon)
 	{
 		IconComp->SubscribeToActiveWeaponAmmo();
 	}
+
+	// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源】
+	// 根因: UE Actor 复制不会自动同步子组件 AttachParent (UE 5.x 已知行为)
+	//       BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 跨网络后丢失
+	//       客户端弹匣变 World 坐标, 显示位置异常 (小局切换 Spawn 新武器时高频出现)
+	// 修复: OnRep 末尾强制 attach 弹匣到武器, 保证视觉位置永远正确
+	// 镜像对称 (服务器): SpawnAndConfigureWeaponInSlot 末尾也调用
+	EnsureMagazineAttachedToWeapon(CurrentWeapon);
 }
 
 
@@ -570,6 +583,15 @@ const FWeaponAttachmentRuntime* UWeaponAttachmentComponent::GetRuntimeBySlot(EWe
 	}
 }
 
+/**
+ * @brief 应用挂载运行时参数 (Offset/Rotation/Scale) 到武器 Actor
+ * @param Weapon 目标武器 (Server Spawn 后回调 / OnRep 同步)
+ *
+ * 大厂原则:
+ *   - 单一真理源: RuntimeBySlot(槽位) → 客户端按当前槽位读
+ *   - 零兜底: RuntimeBySlot 无效或 Weapon 为空 → Log Error + return (拒绝应用默认偏移)
+ *   - OnRep_CurrentWeapon 路径必备: 客户端先收到 CurrentWeapon, 再走本函数
+ */
 void UWeaponAttachmentComponent::ApplyAttachmentRuntime(ABaseWeapon* Weapon)
 {
 	if (!Weapon)
@@ -1286,6 +1308,18 @@ void UWeaponAttachmentComponent::SpawnAndEquipWeapon(TSubclassOf<ABaseWeapon> We
 				*RelativeRotation.ToString());
 		}
 	}
+
+	// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源】
+	// 根因: UE Actor 复制不会自动同步子组件 AttachParent (UE 5.x 已知行为)
+	//       BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 服务器 Spawn 时已正确
+	//       但跨网络后客户端丢失 → 弹匣变 World 坐标, 显示位置异常
+	// 修复: Spawn 末尾强制 attach 弹匣到武器, 保证服务器侧真理源正确
+	// 镜像对称 (客户端): OnRep_CurrentWeapon 末尾也调用
+	// 与 SpawnAndConfigureWeaponInSlot 末尾的 EnsureMagazineAttachedToWeapon 完全对称
+	//   - SpawnAndConfigureWeaponInSlot: 槽位 Spawn (主+副+近战 一次 3 个)
+	//   - SpawnAndEquipWeapon: 单武器 Spawn (关卡预放 AI 自举走这条)
+	//   - 两条路径都必须保证弹匣 attach, 避免"哪个入口漏了" 的反模式
+	EnsureMagazineAttachedToWeapon(NewWeapon);
 }
 
 
@@ -1321,7 +1355,12 @@ void UWeaponAttachmentComponent::SetSpawnWeaponID(const FString& InWeaponID)
 }
 
 
-/** Setter */
+/**
+ * @brief Setter — 写入 CharacterID (Replicated 字段)
+ * @param InCharacterID 角色 ID (对应 DT_CharacterInfo)
+ *
+ * 写入字段后由 DOREPLIFETIME 自动同步客户端
+ */
 void UWeaponAttachmentComponent::SetCharacterID(const FString& InCharacterID)
 {
 	CharacterID = InCharacterID;
@@ -2002,6 +2041,14 @@ void UWeaponAttachmentComponent::Server_SwitchToWeaponSlot(EWeaponSlotType Targe
 		// 2. 再刷新弹夹数量
 		IconComp->BroadcastWeaponAmmoInfo(Owner);
 	}
+
+	// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源】
+	// 根因: UE Actor 复制不会自动同步子组件 AttachParent (UE 5.x 已知行为)
+	//       BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 切槽位后丢失
+	//       客户端弹匣变 World 坐标, 显示位置异常
+	// 修复: SwitchToWeaponSlot 末尾强制 attach 弹匣到武器, 保证服务器侧真理源正确
+	// 镜像对称 (客户端): OnRep_CurrentWeaponSlot 末尾也调用 (line 2148)
+	EnsureMagazineAttachedToWeapon(TargetWeapon);
 }
 
 
@@ -2126,6 +2173,14 @@ void UWeaponAttachmentComponent::OnRep_CurrentWeaponSlot(EWeaponSlotType OldSlot
 		LexToString(OldSlot),
 		LexToString(TrueSlot),
 		*GetNameSafe(WeaponState.ActiveWeapon));
+
+	// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源】
+	// 根因: UE Actor 复制不会自动同步子组件 AttachParent (UE 5.x 已知行为)
+	//       BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 切槽位后丢失
+	//       客户端弹匣变 World 坐标, 显示位置异常
+	// 修复: OnRep 末尾强制 attach 弹匣到武器, 保证视觉位置永远正确
+	// 镜像对称 (服务器): SpawnAndConfigureWeaponInSlot 末尾也调用
+	EnsureMagazineAttachedToWeapon(WeaponState.ActiveWeapon);
 }
 
 // ==========================================
@@ -2868,7 +2923,111 @@ ABaseWeapon* UWeaponAttachmentComponent::SpawnAndConfigureWeaponInSlot(TSubclass
 			LexToString(Slot), LexToString(CurrentWeaponSlot), *NewWeapon->GetName(), *Owner->GetName());
 	}
 
+	// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源】
+	// 根因: UE Actor 复制不会自动同步子组件 AttachParent (UE 5.x 已知行为)
+	//       BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 服务器 Spawn 时已正确
+	//       但跨网络后客户端丢失 → 弹匣变 World 坐标, 显示位置异常
+	// 修复: Spawn 末尾强制 attach 弹匣到武器, 保证服务器侧真理源正确
+	// 镜像对称 (客户端): OnRep_CurrentWeapon 末尾也调用
+	EnsureMagazineAttachedToWeapon(NewWeapon);
+
 	return NewWeapon;
+}
+
+
+// ==========================================
+// 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源入口】
+// ==========================================
+//
+// 【根因 (Session1.txt 2026.08.19 用户反馈)】
+//   - "生化模式新问题: 偶尔 AI 角色进入新的一小局后, 主武器弹夹位置异常, 每次第一局弹夹位置都是正常的"
+//   - 第一局正常: BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 服务器 Spawn 后 attach 正确
+//   - 第二局异常: 新 Pawn Spawn → 新 Weapon Spawn → 服务器端 attach 正确
+//               → UE 复制 Weapon Actor 到客户端 → **客户端子组件 AttachParent 不同步** (UE 5.x 已知行为)
+//               → 客户端 MagazineSkeletal.AttachParent = World → 弹匣坐标变成世界坐标
+//               → 弹匣位置"异常" (远离武器, 漂在某个 BP 默认世界位置)
+//
+// 【单一真理源入口 — 4 个调用方】
+//   - 服务器 Spawn 路径: SpawnAndConfigureWeaponInSlot 末尾 (line 2898)
+//   - 服务器切换槽位: Server_SwitchToWeaponSlot 末尾 (镜像)
+//   - 客户端 OnRep_CurrentWeapon 末尾 (line 535 镜像对称)
+//   - 客户端 OnRep_CurrentWeaponSlot 末尾 (line 2146 镜像对称)
+//
+// 【大厂原则 — 镜像对称 (与 v40.2 武器图标双轨制对称)】
+//   - 弹匣位置: 服务器主动 AttachToComponent (替代品 — 走 Server-Side C++ 立即应用)
+//   - 客户端 OnRep: 镜像对称强制 attach, 保证视觉永远一致
+//   - 不依赖 BP 默认值, 不依赖 UE 隐式 AttachParent 复制, 全部显式
+//
+// 【零兜底】
+//   - Weapon nullptr → 用 CurrentWeapon 兜底 (省略参数便利, 不是隐式兜底)
+//   - Weapon 无 MagazineSkeletal (近战武器) → no-op (合法)
+//   - 武器无 WeaponMesh (主 Mesh) → Log Error (强制修复 BP)
+//   - MagazineSkeletal 已正确 attach → no-op (性能优化)
+//
+// 【Attach 规则】 KeepRelativeTransform — 保留 BP 默认 RelativeLocation/Rotation/Scale
+//   (v200.2.17 ResetWeaponMeshRelativeTransforms 已显式跳过 Magazine, BP 默认值是真理源)
+// ==========================================
+void UWeaponAttachmentComponent::EnsureMagazineAttachedToWeapon(ABaseWeapon* Weapon)
+{
+	// 参数兜底: 用 CurrentWeapon 兜底 — 但不是"隐式兜底", 是"调用方省略参数的便利"
+	//   (类似 UE 标准 API 设计: GetHitResultUnderCursor(FHitResult&, bool) 默认参数)
+	//   调用方显式传入 nullptr 才走兜底, 否则尊重调用方意图
+	if (!Weapon)
+	{
+		Weapon = CurrentWeapon;
+	}
+
+	if (!Weapon)
+	{
+		// 零兜底: 没有可用的武器 — 但这是合法状态 (玩家死/换装瞬间)
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponAttachment] EnsureMagazineAttachedToWeapon: 无可用武器 — 跳过. Pawn=%s"),
+			*GetNameSafe(GetOwner()));
+		return;
+	}
+
+	// 1. 解析 MagazineSkeletal (名字包含 "Magazine" 的 SkeletalMeshComponent)
+	USkeletalMeshComponent* MagazineMesh = Weapon->ResolveMagazineSkeletalMesh();
+	if (!MagazineMesh)
+	{
+		// ResolveMagazineSkeletalMesh 内部已 Log Error — 近战武器 (没弹匣) 会进这里
+		// 重复 Log 浪费, 这里 return 即可 (近战武器是合法 no-op)
+		return;
+	}
+
+	// 2. 解析武器主 Mesh
+	UMeshComponent* WeaponMesh = Weapon->GetMeshComponent();
+	USkeletalMeshComponent* WeaponSkeletalMesh = Cast<USkeletalMeshComponent>(WeaponMesh);
+	if (!WeaponSkeletalMesh)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[WeaponAttachment] EnsureMagazineAttachedToWeapon: 武器主 Mesh 不是 SkeletalMesh (或为空). "
+			     "Weapon=%s MeshClass=%s. 【v245 零兜底】修复: BP_Weapon_AK47 的 Components → SkeletalMeshComponent 主武器 Mesh 必须存在."),
+			*Weapon->GetName(),
+			WeaponMesh ? *WeaponMesh->GetClass()->GetName() : TEXT("<null>"));
+		return;
+	}
+
+	// 3. 检查当前 AttachParent — 已正确 → no-op (性能优化 + 避免无意义 RPC)
+	if (MagazineMesh->GetAttachParent() == WeaponSkeletalMesh)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[WeaponAttachment] EnsureMagazineAttachedToWeapon: 弹匣已正确 attach, 跳过. Weapon=%s"),
+			*Weapon->GetName());
+		return;
+	}
+
+	// 4. 强制 Attach 弹匣到武器主 Mesh — KeepRelativeTransform (保留 BP 默认 RelativeLocation)
+	const FAttachmentTransformRules AttachmentRules(EAttachmentRule::KeepRelative, EAttachmentRule::KeepRelative, EAttachmentRule::KeepRelative, false);
+	MagazineMesh->AttachToComponent(WeaponSkeletalMesh, AttachmentRules);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[WeaponAttachment][v245] EnsureMagazineAttachedToWeapon: 已强制 attach 弹匣到武器主 Mesh. "
+		     "Weapon=%s MagazineAttachParent=%s (旧=%s) Pawn=%s"),
+		*Weapon->GetName(),
+		*WeaponSkeletalMesh->GetName(),
+		MagazineMesh->GetAttachParent() ? *MagazineMesh->GetAttachParent()->GetName() : TEXT("<null>"),
+		*GetNameSafe(GetOwner()));
 }
 
 

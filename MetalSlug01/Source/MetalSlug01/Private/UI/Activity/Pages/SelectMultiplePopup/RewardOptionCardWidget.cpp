@@ -3,7 +3,18 @@
 // RewardOptionCardWidget.cpp
 
 // ==========================================
-// 头文件包含区
+// RewardOptionCardWidget 实现 — 奖励选项卡片 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 URewardOptionCardWidget — 奖励选项卡片所有 UI 逻辑
+//   2. SelectionCheckBox 状态同步 + OnCheckBoxStateChanged 广播
+//   3. SubscribeToRewardIconEvents 订阅外部索引变化
+//
+// 大厂原则:
+//   - 单一职责: 一张卡片只管自己
+//   - 双向同步: 外部状态变化能更新 UI
+//   - 防重复绑定: 先 RemoveAll 再 AddDynamic
 // ==========================================
 #include "UI/Activity/Pages/SelectMultiplePopup/RewardOptionCardWidget.h"
 #include "Systems/Activity/ActivitySubsystem.h"

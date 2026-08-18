@@ -1,5 +1,21 @@
 // ==========================================
-// 大厂标准：游戏实例实现
+// 大厂标准：游戏实例实现 (MetalSlug 自定义 GameInstance)
+// ==========================================
+//
+// 【大厂架构 - Lyra CommonGame 模式】
+//   本类作为全局启动编排器 — 在 Init() 钩子里编排所有 Subsystem 启动顺序
+//   这是 Lyra / Riot / EA 等顶级工作室的标准做法
+//
+// 【职责链】
+//   第一阶段 (Super::Init): 让引擎完成所有 GameInstanceSubsystem 的自然初始化
+//     - GameFlowSubsystem::Initialize()
+//     - UIViewService::Initialize()
+//     - AccountSubsystem::Initialize()
+//     - SessionManagerSubsystem::Initialize()
+//     - LANRoomPresenter::Initialize()
+//   第二阶段 (本类编排): 仅打印日志，不再主动 Boot (已迁移至 PostLoadMapWithWorld)
+//     - 旧版在此处主动调 BootToLogin → 导致 PIE 切图时 UI 闪烁
+//     - 新版让 PostLoadMapWithWorld 统一调度 → 时序保证 World 已加载
 // ==========================================
 
 // 引入本类头文件
@@ -15,6 +31,19 @@
 // 生命周期
 // ==========================================
 
+/**
+ * Init — UGameInstance 启动钩子
+ *
+ * @brief  所有 UGameInstanceSubsystem 已完成 Initialize() 后由引擎回调
+ * @note   启动时序 (大厂 P0 修复 2026.07.03):
+ *         1. Super::Init() 让所有 Subsystem 自然 Initialize
+ *         2. 打印阶段日志
+ *         3. 不再主动 BootToLogin — 改由 PostLoadMapWithWorld 统一调度
+ * @note   主动 Boot 的反模式 (已废除):
+ *         - GameInstance 调 BootToLogin → PIE 入口是战斗地图时 OpenLevel 切图
+ *         - 新 World 也走 PostLoadMapWithWorld → 冗余触发 + UI 闪烁
+ *         - 大厂方案: 单点编排 = PostLoadMapWithWorld (避免重复)
+ */
 void UMetalSlugGameInstance::Init()
 {
 	// ==========================================
@@ -57,6 +86,12 @@ void UMetalSlugGameInstance::Init()
 	UE_LOG(LogGameFlow, Log, TEXT("[GameInstance] 启动编排完成"));
 }
 
+/**
+ * Shutdown — UGameInstance 关闭钩子
+ *
+ * @brief  游戏退出/PIE 结束时由引擎回调 — 清理自定义资源
+ * @note   Super::Shutdown() 会让所有 Subsystem 自然 Deinitialize (顺序与 Init 相反)
+ */
 void UMetalSlugGameInstance::Shutdown()
 {
 	// 关闭期: 先调用 Super (Subsystem 自然 Deinitialize)

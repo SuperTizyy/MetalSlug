@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// LoginPage 头文件 — 登录页面 (双开测试下的"看门人")
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 ULoginPage — 登录入口页面
+//   2. 账号/密码输入 + 登录/注册按钮
+//   3. 调用 UAccountService 验证账号
+//   4. 登录成功后通知 GameFlowSubsystem 切到 MainMenu
+//
+// 架构理念 (MVVM):
+//   - View 完全无感知数据源: 只调 UAccountService, 不直接读 UAccountSubsystem
+//   - 全局唯一: 通过 GameInstance->GetSubsystem 获取 Service
+//   - 工业级防呆: 双开同账号互踢检测 (由 UAccountService 内部完成)
+//   - 状态机驱动: 登录成功后通知 GameFlowSubsystem 切状态
 // ==========================================
 // 包含虚幻引擎核心最小化组件
 #include "CoreMinimal.h"

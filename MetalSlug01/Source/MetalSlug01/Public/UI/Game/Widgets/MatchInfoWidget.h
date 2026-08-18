@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// MatchInfoWidget 头文件 — 比赛信息组件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UMatchInfoWidget — 顶部比赛信息面板
+//   2. 攻/守方人数 + 倒计时 + 总局数
+//   3. 母体变异倒计时数字音效映射 (v222 大厂架构)
+//   4. ERoomMatchMode 分支切换刀战/生化 UI 差异
+//
+// 大厂原则 (v92 大厂重构 + v222 大厂架构):
+//   - 防御性: 每个 BindWidget 调用前都做空指针检查
+//   - 显式优于隐式: TArray<FMotherMutationTickSoundEntry> 替代 TMap (BP 编辑器可读)
+//   - 0 兜底: 倒计时秒数找不到映射 → Log Error + 拒绝播放
+//   - 业务可禁用: TArray 为空 → Log Warning + 跳过 (业务可禁用整组音效)
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

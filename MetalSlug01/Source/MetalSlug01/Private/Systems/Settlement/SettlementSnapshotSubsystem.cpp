@@ -1,5 +1,9 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+/**
+ * @file SettlementSnapshotSubsystem.cpp
+ * @brief 结算页面快照子系统实现 — 跨地图持久化 POJO 数据
+ */
 #include "Systems/Settlement/SettlementSnapshotSubsystem.h"
 
 // ==========================================

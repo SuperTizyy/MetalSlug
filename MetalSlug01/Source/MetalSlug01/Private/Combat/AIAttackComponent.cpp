@@ -84,6 +84,10 @@
 // 【v93.2 大厂架构新增】模式校验 — ARoomGameState::CurrentMatchMode (真理源)
 #include "Systems/RoomGameState.h"
 
+// 【v246.3 大厂架构 P0 修复】母体真理源走 PlayerConfigAsset (母体速度 = PlayerConfig.MotherMaxWalkSpeed)
+#include "Systems/Spawn/RoomSpawnSubsystem.h"
+#include "Data/Config/PlayerConfigAsset.h"
+
 
 // ==========================================
 // 1. 构造函数
@@ -1229,38 +1233,54 @@ void UAIAttackComponent::RestoreMaxWalkSpeedFromConfig(ABaseCharacter* OwnerChar
 		return;
 	}
 
-	const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
+	// 【v246.3 大厂架构 P0 修复】母体速度真理源统一
+	//   - 母体: PlayerConfigAsset.MotherMaxWalkSpeed (与玩家路径镜像, 真理源唯一)
+	//   - 人类: RuntimeConfig.GetScaledMovement().WalkSpeed (AI 专属)
+	//   - 旧版 (v133.3) 用 ConfigSO.MotherWalkSpeed (默认 500) 当 AI 母体速度真理源
+	//     → 与 MutatePawnToMother 写的 PlayerConfig.MotherMaxWalkSpeed (800) 不一致
+	//     → 攻击蒙太奇结束后恢复速度走 ConfigSO (500) → "走路很慢"
+	float EffectiveWalkSpeed = 0.f;
+	const TCHAR* TruthSource = TEXT("");
 
-	// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
-	//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
-	//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
-	const float EffectiveWalkSpeed = OwnerCharacter->bIsMother
-		? MoveParams.MotherWalkSpeed
-		: MoveParams.WalkSpeed;
+	if (OwnerCharacter->bIsMother)
+	{
+		// 母体路径: PlayerConfigAsset.MotherMaxWalkSpeed
+		if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+		{
+			if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+			{
+				EffectiveWalkSpeed = PC->MotherMaxWalkSpeed;
+				TruthSource = TEXT("PlayerConfigAsset.MotherMaxWalkSpeed");
+			}
+		}
+	}
+	else
+	{
+		// 人类路径: RuntimeConfig.WalkSpeed
+		const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
+		EffectiveWalkSpeed = MoveParams.WalkSpeed;
+		TruthSource = TEXT("AIRuntimeConfig.WalkSpeed");
+	}
 
 	if (EffectiveWalkSpeed <= 0.f)
 	{
-		// 【零兜底】配置表 WalkSpeed <= 0 → 显式报错, 不静默用默认值
+		// 【零兜底】真理源未配或 <= 0 → 显式报错, 不静默用默认值
 		UE_LOG(LogTemp, Error,
-			TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 的配置表 %s=%.0f <= 0 (bIsMother=%d), "
+			TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 的真理源 (%s) =%.0f <= 0 (bIsMother=%d), "
 				 "AI 将保持 MaxWalkSpeed=0 (无法移动). "
-				 "【修复】DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
-			*OwnerCharacter->GetName(),
-			OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
-			EffectiveWalkSpeed,
-			OwnerCharacter->bIsMother ? 1 : 0,
-			OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
+				 "【修复】母体: DA_PlayerConfigAsset → Movement → MotherMaxWalkSpeed > 0; "
+				 "人类: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed > 0."),
+			*OwnerCharacter->GetName(), TruthSource, EffectiveWalkSpeed,
+			OwnerCharacter->bIsMother ? 1 : 0);
 		return;
 	}
 
 	// 速度恢复成功
 	MoveComp->MaxWalkSpeed = EffectiveWalkSpeed;
 	UE_LOG(LogTemp, Log,
-		TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 速度恢复为 %s=%.0f (bIsMother=%d, 配置表)"),
-		*OwnerCharacter->GetName(),
-		OwnerCharacter->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
-		EffectiveWalkSpeed,
-		OwnerCharacter->bIsMother ? 1 : 0);
+		TEXT("[AIAttackComponent] RestoreMaxWalkSpeedFromConfig: AI=%s 速度恢复为 %.0f (bIsMother=%d, 真理源=%s)"),
+		*OwnerCharacter->GetName(), EffectiveWalkSpeed,
+		OwnerCharacter->bIsMother ? 1 : 0, TruthSource);
 }
 
 
@@ -1524,7 +1544,7 @@ void UAIAttackComponent::Server_ReportAIAttackHit_Implementation(AActor* HitActo
 	);
 
 	UE_LOG(LogTemp, Log,
-		TEXT("[AIAttackComponent] Server_ReportAIAttackHit: AI=%s -> Victim=%s, Damage=%.1f (由 ConfigSO.Damage 决定)"),
+		TEXT("[AIAttackComponent] Server_ReportAIAttackHit: AI=%s -> Victim=%s, Damage=%.1f (由 BaseWeapon::LightDamageBody 决定, DT_WeaponInfo)"),
 		*OwnerCharacter->GetName(), *Victim->GetName(), FinalDamage);
 }
 

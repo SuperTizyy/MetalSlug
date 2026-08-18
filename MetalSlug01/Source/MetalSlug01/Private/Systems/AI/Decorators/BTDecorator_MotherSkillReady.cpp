@@ -26,6 +26,15 @@ FString UBTDecorator_MotherSkillReady::GetStaticDescription() const
 }
 
 
+/**
+ * @brief 母体加速技能冷却判定 — 比较 WorldTime 与 BB.CooldownEndTime
+ * @param OwnerComp BT 组件引用, 用于获取 BB / AIController
+ * @param NodeMemory Decorator 节点内存(本类未使用)
+ * @return 当前 WorldTime >= CooldownEndTime → 技能冷却完毕允许释放
+ *
+ * 三层防御: BB/AIC/World 任一无效 → false 拒判. Key 不存在时 GetValueAsFloat
+ * 默认返回 0, 此时视为"从未施放过技能"立即允许.
+ */
 bool UBTDecorator_MotherSkillReady::CalculateRawConditionValue(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
 {

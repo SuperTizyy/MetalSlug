@@ -22,6 +22,7 @@ class METALSLUG01_API UBTDecorator_ShouldChase : public UBTDecorator
 public:
 	UBTDecorator_ShouldChase();
 
+	/** @brief BT 编辑器静态描述 (显示 DistanceKey + AttackRangeKey + 阈值) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 距离 BB Key */
@@ -41,6 +42,7 @@ public:
 	float HysteresisMargin = 10.f;
 
 protected:
+	/** @brief BT 决策: Distance > (AttackRange + Hyst) → true=应追击 */
 	virtual bool CalculateRawConditionValue(
 		UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
 };

@@ -148,6 +148,12 @@ float UHealthComponent::ApplyDamage(float DamageAmount)
 }
 
 
+/**
+ * @brief 治疗血量(拾取/技能回复), 不超过 MaxHealth
+ * @param HealAmount 要恢复的血量(必须 > 0)
+ *
+ * 已死亡或 HealAmount <= 0 → 直接 return. 变化时主动 Broadcast.
+ */
 void UHealthComponent::Heal(float HealAmount)
 {
 	if (bIsDead || HealAmount <= 0.0f)

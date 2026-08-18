@@ -6,7 +6,26 @@
 // 【v216 大厂架构新增】结算页面快照子系统
 // ==========================================
 //
+// @file SettlementSnapshotSubsystem.h
+// @brief 结算页面快照持久化子系统 (跨地图)
+//
 // 业务背景:
+//   玩家进入结算页面时, 必须立即 OpenLevel 切到 L_Login 关卡.
+//   切图后旧 RoomGameState / GameHUDWidget 会被销毁, 结算页面要在 L_Login 上显示.
+//   旧的"冻结快照"机制 (v215) 仅存在 UScoreboardWidget 内存中, 切图后 widget 被销毁 → 数据丢失.
+//
+// 大厂架构 (v216):
+//   - 单例 GameInstanceSubsystem, 跨地图持久 (生命周期 = GameInstance, 不随 World 销毁)
+//   - 写入入口: RoomGameState::MulticastEnterSettlement_Implementation
+//   - 读取入口: UScoreboardWidget::ApplyPendingSnapshot (在 L_Login 上构造时拉取)
+//   - 0 兜底: 必须写入完整快照数据, 缺字段 Log Error
+//   - 单一真理源: 进入结算 → 写入 Snapshot. 任何切图/重连不影响.
+//
+// 大厂原则 — 与 UScoreboardWidget::FreezeSnapshot 的区别:
+//   - v215 FreezeSnapshot: widget 内存冻结, 切图后丢失 (旧房间关卡使用)
+//   - v216 SettlementSnapshot: GameInstance 持久, 切图后保留 (L_Login 上使用)
+//   - v216 不替代 v215, 而是在新地图上拉取 Snapshot 后, 仍然调 FreezeSnapshot 把数据再次冻结到 widget 内存
+//
 //   玩家进入结算页面时, 必须立即 OpenLevel 切到 L_Login 关卡.
 //   切图后旧 RoomGameState / GameHUDWidget 会被销毁, 结算页面要在 L_Login 上显示.
 //   旧的"冻结快照"机制 (v215) 仅存在 UScoreboardWidget 内存中, 切图后 widget 被销毁 → 数据丢失.

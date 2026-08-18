@@ -157,6 +157,12 @@ void UMotherLowHealthFlickerComponent::HandleHealthChanged(float NewHealth)
 }
 
 
+/**
+ * @brief Replicated 回调 — 客户端收到 bIsWeakFlickering 字段变化时触发
+ *
+ * 客户端专用 OnRep (服务器由 SetIsWeakFlickering 显式调用本函数).
+ * 守卫 bHasBeginPlayCompleted 防 BeginPlay 时序竞争 (MID 还没准备好).
+ */
 void UMotherLowHealthFlickerComponent::OnRep_WeakFlickeringChanged()
 {
 	UE_LOG(LogTemp, Log,
@@ -189,6 +195,13 @@ void UMotherLowHealthFlickerComponent::OnRep_WeakFlickeringChanged()
 }
 
 
+/**
+ * @brief 设置虚弱闪烁状态 — 集中入口, 服务器权威
+ * @param bNewState true=进入虚弱闪烁, false=退出
+ *
+ * 状态机:相同状态 → 幂等 return (大厂原则 - 零重复)
+ * 服务器写完字段后 → 显式调 OnRep_WeakFlickeringChanged (服务器不自动触发 OnRep)
+ */
 void UMotherLowHealthFlickerComponent::SetIsWeakFlickering(bool bNewState)
 {
 	if (bIsWeakFlickering == bNewState)
@@ -245,6 +258,12 @@ void UMotherLowHealthFlickerComponent::StartFlickerTimer()
 }
 
 
+/**
+ * @brief 停止闪烁 Timer
+ *
+ * 大厂原则 - 幂等: 多次调用安全 (IsTimerActive 检查)
+ * 用途:退出虚弱状态/材质失效时调用
+ */
 void UMotherLowHealthFlickerComponent::StopFlickerTimer()
 {
 	UWorld* World = GetWorld();
@@ -263,6 +282,12 @@ void UMotherLowHealthFlickerComponent::StopFlickerTimer()
 }
 
 
+/**
+ * @brief 闪烁 Timer 回调 — 每 FlickerTimerInterval 秒驱动一次材质参数
+ *
+ * 计算正弦波 FlickerAmount ∈ [0, 1] (在 [0, period] 时间里 0→1→0 循环)
+ * 边界守卫:不再虚弱 / 无有效材质 → 自动停 Timer
+ */
 void UMotherLowHealthFlickerComponent::OnFlickerTimerTick()
 {
 	UWorld* World = GetWorld();
@@ -394,6 +419,13 @@ void UMotherLowHealthFlickerComponent::PrepareMaterials()
 }
 
 
+/**
+ * @brief 协议验证 — 检查 MID 是否有闪烁参数 (FlickerMaterialParameterName)
+ * @param Mat 要校验的 MID
+ * @return true=含目标参数, false=缺失 (Log Warning 给出修复路径)
+ *
+ * 大厂原则 - 零兜底: 缺失协议参数时报警, 强制美术修材质, 不静默 no-op
+ */
 bool UMotherLowHealthFlickerComponent::ValidateMaterialHasFlickerParameter(UMaterialInstanceDynamic* Mat) const
 {
 	if (!Mat)

@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// TaskDetailWidget 实现 — 任务明细 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UTaskDetailWidget — 单个任务所有 UI 逻辑
+//   2. SetupClaimButton 解析 DayIdentifier + TaskIndex 状态机
+//   3. 3 种状态: 已领取 / 可领取 / 未满足(去完成)
+//
+// 大厂原则:
+//   - 单一职责: 每个状态调对应 helper (ApplyClaimedUI 等)
+//   - 防御链: GameInstance / UUpgradeActivitySubsystem
+//   - 越界防御: TaskClaimStatus 越界 → 全部隐藏
+//   - 跳转: "去完成" 走 GameFlowSubsystem 状态机 (v229)
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/TaskDetailWidget.h"
 #include "Components/TextBlock.h"

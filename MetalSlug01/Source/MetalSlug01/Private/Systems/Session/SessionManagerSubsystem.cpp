@@ -1,4 +1,8 @@
 // MetalSlug01. All Rights Reserved.
+/**
+ * @file SessionManagerSubsystem.cpp
+ * @brief 在线会话子系统实现 — 封装 Find/Create/Join/Destroy Session 操作
+ */
 #include "Systems/Session/SessionManagerSubsystem.h"
 #include "OnlineSubsystem.h"
 #include "OnlineSessionSettings.h"
@@ -295,6 +299,18 @@ void USessionManagerSubsystem::HandleJoinSessionComplete(FName SessionName, EOnJ
 	}
 }
 
+/**
+ * @brief DestroySession 异步完成回调(由 OnlineSubsystem 触发)
+ * @param SessionName 被销毁的 Session 名
+ * @param bWasSuccessful 销毁是否成功
+ *
+ * 流程:
+ * 1. 先注销 DestroySessionHandle(防重入)
+ * 2. 成功 → 清空 bIsHost/bIsInSession + 广播 OnSessionTerminated(MainLobby)
+ * 3. 失败 → 仅触发 PendingDestroyDelegate(false, "销毁房间失败")
+ *
+ * 业务侧订阅 OnSessionTerminated 触发跨地图统一 UI 中断链路
+ */
 void USessionManagerSubsystem::HandleDestroySessionComplete(FName SessionName, bool bWasSuccessful)
 {
 	// ---- 注销回调句柄 ----
@@ -348,6 +364,18 @@ IOnlineSessionPtr USessionManagerSubsystem::GetSessionInterface() const
 	return nullptr;
 }
 
+/**
+ * @brief 获取当前 Session 的显示信息(房间名 + 模式)— skip-login 与正常 Session 共用入口
+ * @param OutRoomName 输出房间名
+ * @param OutGameMode 输出游戏模式
+ * @return true=成功获取, false=无 Session
+ *
+ * 优先级 (大厂原则 - 单一入口):
+ * 1. SkipLoginRoomName 非空 → 直接返回(skip-login 测试模式专用)
+ * 2. 正常 Session → 读 SessionSettings.ROOM_NAME/GAME_MODE
+ *
+ * v54.5.1 P0 修复: skip-login 模式下 SessionSettings 为空, 必须先用 API 注入的字段
+ */
 bool USessionManagerSubsystem::GetCurrentSessionDisplayInfo(FString& OutRoomName, FString& OutGameMode) const
 {
 	OutRoomName.Reset();
@@ -384,6 +412,14 @@ bool USessionManagerSubsystem::GetCurrentSessionDisplayInfo(FString& OutRoomName
 	return true;
 }
 
+/**
+ * @brief 注入 skip-login 测试模式的房间显示信息(房主测试时使用)
+ * @param InRoomName 房间名(覆盖 SessionSettings.ROOM_NAME 的空值)
+ * @param InGameMode 游戏模式(覆盖 SessionSettings.GAME_MODE 的空值)
+ *
+ * 大厂原则: skip-login 流程不创建真实 Session, 但 UI 需要展示房间信息
+ * 这里注入字段 → GetCurrentSessionDisplayInfo 优先读这些字段
+ */
 void USessionManagerSubsystem::SetSkipLoginRoomDisplayInfo(const FString& InRoomName, const FString& InGameMode)
 {
 	SkipLoginRoomName = InRoomName;
@@ -393,6 +429,12 @@ void USessionManagerSubsystem::SetSkipLoginRoomDisplayInfo(const FString& InRoom
 		*InRoomName, *InGameMode);
 }
 
+/**
+ * @brief 清空 skip-login 房间显示信息(用于切回真实 Session 场景)
+ *
+ * 调用时机: 离开测试模式 / 创建真实 Session 之前
+ * Reset 后 GetCurrentSessionDisplayInfo 会走正常 SessionSettings 路径
+ */
 void USessionManagerSubsystem::ResetSkipLoginRoomDisplayInfo()
 {
 	SkipLoginRoomName.Reset();

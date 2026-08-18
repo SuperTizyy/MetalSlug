@@ -42,6 +42,44 @@ class AAIController;
 class AActor;
 
 /**
+ * @file AIFacingMoveHelper.h
+ * @brief AI "边移动边面向目标"通用工具类 — 解决 UE CharacterMovement 默认行为导致的"回头走"问题
+ *
+ * 大厂架构定位:
+ *   - 静态工具类 (BlueprintFunctionLibrary), 不持有任何状态
+ *   - 单一职责: 配置/恢复 Character 朝向相关 Movement 标志位 + AIController.SetFocus
+ *   - 调用方: BTTask_MoveAwayFromTarget / BTTask_MoveToFacingTarget 等需要"面朝目标移动"的 BTTask
+ *
+ * 设计动机 (大厂原则 — 单一真理源 + DRY):
+ *   v23.2 之前, "边移动边面向目标" 的实现散落在 BTTask_MoveAwayFromTarget 内部:
+ *     1. 保存 bOrientRotationToMovement / bUseControllerDesiredRotation
+ *     2. 临时改值 + SetFocus
+ *     3. MoveToLocation
+ *     4. 完成/Abort 恢复 + ClearFocus
+ *   v40.10 之后, 这套机制下沉到 UAIFacingMoveHelper, 任何 BTTask 复用即可.
+ *
+ *   影响范围 (重构点):
+ *     - BTTask_MoveAwayFromTarget  → 删除私有 Save/Restore, 调 Helper
+ *     - BTTask_MoveToFacingTarget  → 新建, 直接调 Helper
+ *     - BTTask_CircleAroundTarget  → 未来重构点 (目前直接用 SetFocus 没动 Movement,
+ *                                          存在回头走风险, 建议未来 P1 改为调 Helper)
+ *
+ * 职责 (单一职责):
+ *   - 解决 UE CharacterMovement "OrientRotationToMovement = true 时,
+ *     MoveTo 会强制 AI 朝向 = 移动方向 → 看起来背对目标走" 的回头走问题.
+ *   - 提供原子 Configure/Restore API, 调用方负责 MoveTo/Tick 检查到达.
+ *
+ * 零兜底:
+ *   - Character 无效 → 返回失败快照 + Log Error, 调用方判断.
+ *   - 调用方必须配对调用 Configure/Restore, 否则 Movement 设置泄漏.
+ *   - 二次 Configure 时, Helper 自动 Restore 上一次的快照, 防状态污染.
+ *
+ * 抗抖动:
+ *   - Save 失败 (Character 无效) 时, 调用方不能继续 MoveTo, 否则回头走.
+ *   - Restore 时如发现上次 Save 失败, 直接跳过恢复, 不报错 (幂等).
+ */
+
+/**
  * 快照数据 — 记录 Pawn Movement 原值, 用于 Restore 恢复.
  * 大厂原则: 字段对齐 CharacterMovement 的真实 bool, 不增加冗余字段.
  */
@@ -54,11 +92,11 @@ struct METALSLUG01_API FMovementOrientationSnapshot
 	UPROPERTY(BlueprintReadOnly, Category = "AI|FacingMove")
 	bool bValid = false;
 
-	/** 原 OrientRotationToMovement 值 */
+	/** 原 OrientRotationToMovement 值 — 由 Configure 写入, Restore 时还原回 CharacterMovement */
 	UPROPERTY(BlueprintReadOnly, Category = "AI|FacingMove")
 	bool bOriginalOrientRotationToMovement = false;
 
-	/** 原 UseControllerDesiredRotation 值 */
+	/** 原 UseControllerDesiredRotation 值 — 由 Configure 写入, Restore 时还原回 CharacterMovement */
 	UPROPERTY(BlueprintReadOnly, Category = "AI|FacingMove")
 	bool bOriginalUseControllerDesiredRotation = false;
 };
@@ -85,6 +123,12 @@ struct METALSLUG01_API FMovementOrientationSnapshot
  *   - Configure 失败 (Character/Controller/Target 无效) → 返回 bOutSnapshot.bValid = false,
  *     调用方收到失败快照必须拒绝 MoveTo, 否则回头走.
  *   - Restore 时如 bValid = false, 静默跳过 (幂等).
+ *
+ * 大厂架构原则:
+ *   - 单一职责: 仅管朝向相关 Movement 标志位 + AIController.Focus, 不参与 MoveTo/Tick 检查
+ *   - 零状态: 静态工具类, 不持有任何字段; 快照由调用方持有
+ *   - 零兜底: 任何输入参数无效 → 立即 Log Error + 返回失败, 调用方必须检查返回值
+ *   - 抗抖动: Save/Restore 必须配对, 否则 Movement 设置污染全局
  */
 UCLASS()
 class METALSLUG01_API UAIFacingMoveHelper : public UBlueprintFunctionLibrary

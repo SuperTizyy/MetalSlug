@@ -59,6 +59,10 @@ UBTTask_MoveToFacingTarget::UBTTask_MoveToFacingTarget()
 		AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示"边移动边面向"通用 Task 的关键参数
+ * @return 多行描述,展示 TargetActorKey/MoveLocationKey(V 或 Object)/AcceptanceRadius/超时/Helper 复用
+ */
 FString UBTTask_MoveToFacingTarget::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("【v40.12 大厂重构】边移动边面向目标的通用 Task.\n"
@@ -74,6 +78,21 @@ FString UBTTask_MoveToFacingTarget::GetStaticDescription() const
 		MaxWaitTime);
 }
 
+/**
+ * @brief 校验 BB Key 配置 — 4 层零兜底检查
+ * @param BB BT 黑板组件引用
+ * @param AIC AI 控制器引用(用于错误日志)
+ * @param OutResult [out] 校验失败时的结果码(EBTNodeResult::Failed)
+ * @return 所有 Key 检查通过 → true;任一失败 → false 且 OutResult 写入 Failed
+ *
+ * 4 层检查顺序:
+ *   1/4 TargetActorKey.SelectedKeyName != None
+ *   2/4 MoveLocationKey.SelectedKeyName != None
+ *   3/4 BB.GetKeyID(TargetActorKey) != InvalidKey(资产里有这个 Key)
+ *   4/4 BB.GetKeyID(MoveLocationKey) != InvalidKey
+ *
+ * 失败原因 Log Error + OutResult=Failed,调用方直接 return OutResult.
+ */
 bool UBTTask_MoveToFacingTarget::ValidateBlackboardKeys(
 	const UBlackboardComponent& BB,
 	const AAIController& AIC,
@@ -533,6 +552,17 @@ EBTNodeResult::Type UBTTask_MoveToFacingTarget::AbortTask(
 	return EBTNodeResult::Aborted;
 }
 
+/**
+ * @brief 启动异步 MoveToLocation — 调 UE 原生寻路接口
+ * @param OwnerComp BT 组件引用,用于拿 AIController
+ * @param Dest 目标位置(可能已被 v126 智能避障调整过)
+ * @return MoveTo 请求成功或已在目标 → true;失败 → false
+ *
+ * UE 原生参数(大厂标配):
+ *   AcceptanceRadius, bStopOnOverlap=false, bUsePathfinding=true,
+ *   bProjectDestinationToNavigation=true, bCanStrafe=false, FilterClass=nullptr,
+ *   bAllowPartialPath=true(半路径也接受, 防死锁).
+ */
 bool UBTTask_MoveToFacingTarget::StartMoveTo(
 	UBehaviorTreeComponent& OwnerComp, const FVector& Dest)
 {
@@ -559,6 +589,15 @@ bool UBTTask_MoveToFacingTarget::StartMoveTo(
 		|| Result == EPathFollowingRequestResult::AlreadyAtGoal;
 }
 
+/**
+ * @brief 异步检查 MoveTo 状态 — Idle 完成 / Waiting 超时则恢复朝向并 FinishLatentTask
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory 任务内存(FTaskMemory)
+ *
+ * 大厂对称:v40.12 行为仅在 bFacingConfigured=true 时调 RestoreFacingMove,
+ * 避免与 BTTask_FaceTarget 等其它修改 Movement 的任务冲突.
+ * 超时阈值 MaxWaitTime 与 BTTask_MoveAwayFromTarget 镜像一致.
+ */
 void UBTTask_MoveToFacingTarget::CheckArrival(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
@@ -761,6 +800,21 @@ AActor* UBTTask_MoveToFacingTarget::DetectActorsOnPathImpl(
 }
 
 
+/**
+ * @brief 检测路径段上是否有 OnlyClass 类型 Actor 阻挡 — v126 智能避障判定
+ * @param World 世界引用
+ * @param StartLoc 路径起点(AI 当前位置)
+ * @param EndLoc 路径终点(目标位置)
+ * @param OnlyClass 待检测的 Actor 类型
+ * @param CheckRadius 检测半径(球-线段相交球半径)
+ * @param IgnoreActor 忽略的 Actor(AI 自己,避免自己挡自己)
+ * @return 有任何 OnlyClass Actor 在路径段上 → true;否则 false
+ *
+ * v126 简化算法:用 A→EndLoc 的线段 + 各 Actor 中心 ± CheckRadius 球,
+ * SquaredDistPointToSegment 计算球-线段最短距离, ≤ CheckRadius 视为挡路.
+ * 性能优化:OnlyClass == ABaseCharacter 时用 TActorIterator<ABaseCharacter>;
+ * 其它类型走 GetAllActorsOfClass 兜底.
+ */
 bool UBTTask_MoveToFacingTarget::DetectActorsOnPath(
 	const UWorld* World,
 	const FVector& StartLoc,

@@ -1,5 +1,32 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file AirdropPickup.cpp
+ * @brief AAirdropPickup 实现 — 服务器权威空投拾取 Actor
+ *
+ * 大厂架构定位:
+ *   - 单一职责: 物理下落 + 触碰检测 + 弹药补给 + 音效 RPC + 账本自维护
+ *   - 真理源: OwningSubsystem (URoomAirdropSubsystem) 持有账本, Pickup 仅在销毁时通知
+ *   - 服务器权威: HasAuthority() 守卫, 业务逻辑只在服务器跑; 客户端仅播音效
+ *   - 零兜底: SphereComponent 缺失 → Log Error (空投将无法被吃掉); StaticMesh 缺失 → Warning
+ *
+ * 核心业务规则 (用户业务规则驱动):
+ *   - 人类必须持有主武器才能吃空投 (没武器 = 配置错, Log Error)
+ *   - 母体无效 (穿透空投, 不补给)
+ *   - 死亡人类无法吃空投 (死人不能吃, 业务过滤)
+ *
+ * RPC 设计 (服务器权威 Multicast):
+ *   - Multicast_PlayDropSound: 服务器校验 Sound 字段非空后推送
+ *   - Multicast_PlayPickupSound: 服务器校验 Sound 字段非空后推送 (镜像 Drop 模式)
+ *   - 客户端收到 RPC 后再次校验 Sound 非空 (防 RPC 序列化异常)
+ *
+ * 零兜底原则落地:
+ *   - SphereComponent 为空 → Log Error (空投将无法被吃掉)
+ *   - StaticMesh 未挂 → Log Warning (空投在场景中看不见)
+ *   - FireComponent 为空 → Log Error (策划误删 BP 子对象)
+ *   - 触碰者无主武器 → Log Error (业务规则要求主武器)
+ */
+
 #include "Pickups/AirdropPickup.h"
 
 // Engine includes
@@ -18,6 +45,16 @@
 #include "Components/WeaponFireComponent.h"
 #include "Systems/Airdrop/RoomAirdropSubsystem.h"
 
+/**
+ * @brief 构造函数 — 配置网络复制 + 创建 StaticMeshComponent + SphereComponent
+ *
+ * 大厂原则落地:
+ *   - 网络复制: 启用 bReplicates + SetReplicateMovement(true), 客户端能看到空投下落
+ *   - 单一真理源: StaticMeshComponent 是 Root, 也是物理载体 (物理参数统一在 Mesh 上设)
+ *   - 碰撞分工: StaticMesh = BlockAll (对地面); Sphere = Overlap Pawn (检测拾取)
+ *   - 物理参数: Mass=5.0kg + LinearDamping=0.5, 营造金属箱下落感
+ *   - 显式优于隐式: SetEnableGravity(true) 显式声明, 即使它是 UE 默认
+ */
 AAirdropPickup::AAirdropPickup()
 {
 	// 大厂原则 — 网络同步: Actor 复制 (外观必须同步)
@@ -90,6 +127,13 @@ AAirdropPickup::AAirdropPickup()
 }
 
 
+/**
+ * @brief 引擎回调 — 绑定 Overlap 事件 + 防御性日志 (SphereComponent/Mesh 缺失检测)
+ *
+ * 关键检查:
+ *   - SphereComponent 为空 → Log Error (空投将无法被吃掉)
+ *   - StaticMesh 未挂 → Log Warning (空投在场景中看不见)
+ */
 void AAirdropPickup::BeginPlay()
 {
 	Super::BeginPlay();
@@ -122,6 +166,14 @@ void AAirdropPickup::BeginPlay()
 }
 
 
+/**
+ * @brief 引擎回调 — 通知 OwningSubsystem 从账本移除 + 解绑 Overlap 事件
+ *
+ * @param EndPlayReason  销毁原因 (Destroyed / RemovedFromWorld / EndPlayInEditor 等)
+ *
+ * @note 即使手动 Destroy() 也会走这里, OwningSubsystem 账本自动清理
+ * @note 解绑 Overlap 是 UE 5.6 推荐做法, 防 Actor 销毁后回调悬空
+ */
 void AAirdropPickup::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	// 大厂原则 — 账本自维护: Actor 销毁时通知 Subsystem
@@ -147,6 +199,28 @@ void AAirdropPickup::EndPlay(const EEndPlayReason::Type EndPlayReason)
 // 【v117 业务核心】Overlap 回调 — 服务器权威
 // ==========================================
 
+/**
+ * @brief Overlap 回调 — 服务器权威触发"被吃掉"业务 (弹药补给 + 销毁 + 音效)
+ *
+ * 业务过滤链 (大厂原则 — 显式优于隐式):
+ *   1. 非 Character Actor (子弹/道具/抛出的武器等) → 跳过 (正常过滤, 不用 Error)
+ *   2. 母体 (bIsMother=true) → 跳过 (业务规则: 母体无效, 表现=穿透)
+ *   3. 死亡人类 → 跳过 (死人不能吃, 业务过滤)
+ *   4. 无主武器 → Log Error + return (业务规则: 必须持主武器才能吃空投)
+ *   5. 无 FireComponent → Log Error + return (策划误删 BP 子对象)
+ *   6. FireComp->Server_RefillAmmo() → 弹药全满 (真理源: FireComponent)
+ *   7. Play Pickup Sound RPC → Multicast 播放音效
+ *   8. Destroy() → 通知 Subsystem 清理账本
+ *
+ * @param OverlappedComponent  触发 Overlap 的组件 (SphereComponent)
+ * @param OtherActor           重叠的对端 Actor (玩家/AI)
+ * @param OtherComp            对端组件 (未使用)
+ * @param OtherBodyIndex       对端 body index (未使用)
+ * @param bFromSweep           是否由 Sweep 触发 (未使用)
+ * @param SweepResult          Sweep 命中结果 (未使用)
+ *
+ * @note 服务器权威: HasAuthority() == false 时直接 return (客户端不跑业务)
+ */
 void AAirdropPickup::Handle_OverlapBegin(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor,
 	UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
 	bool bFromSweep, const FHitResult& SweepResult)
@@ -252,6 +326,17 @@ void AAirdropPickup::Handle_OverlapBegin(UPrimitiveComponent* OverlappedComponen
 // 【v117 工具方法】解析触碰者拿的武器 (按需 lazy resolve)
 // ==========================================
 
+/**
+ * @brief 工具方法 — 通过触碰者 Character 解析其当前主武器 (按需 lazy resolve, 不缓存)
+ *
+ * @param OtherChar  触碰的 Character (可为 null, 返回 nullptr)
+ *
+ * @return 触碰者当前持有的主武器, 无武器时返回 nullptr
+ *
+ * @note 大厂原则 — 按需查询: 不缓存武器指针, 调一次约 0.001ms
+ * @note Character 可能在中途切武器, 缓存会失效
+ * @note 单一真理源: Character->GetCurrentWeapon() (由 WeaponAttachmentComponent 维护)
+ */
 ABaseWeapon* AAirdropPickup::ResolveTouchingWeapon(ABaseCharacter* OtherChar) const
 {
 	if (!OtherChar)
@@ -270,6 +355,20 @@ ABaseWeapon* AAirdropPickup::ResolveTouchingWeapon(ABaseCharacter* OtherChar) co
 // 【v118 大厂架构新增】音效 RPC — 服务器权威 Multicast 推送
 // ==========================================
 
+/**
+ * @brief Multicast RPC 实现 — 在所有客户端播放空投生成音效 (服务器权威推送)
+ *
+ * 大厂原则落地:
+ *   - 客户端零兜底: Sound 为空 → Log Error + 拒绝播放 (防 RPC 序列化异常)
+ *   - 单点播放: 用 Actor 当前位置 (生成时 = +DropHeight 悬空点, 业务可接受)
+ *
+ * @param InSound    要播放的 Sound 资产 (服务器校验非空后推送)
+ * @param VolumeMul  音量倍数
+ * @param PitchMul   音高倍数
+ *
+ * @note 客户端二次校验 Sound 非空, 防 RPC 序列化时 Sound 引用丢失
+ * @note 镜像 Multicast_PlayPickupSound (结构对称, 语义独立)
+ */
 void AAirdropPickup::Multicast_PlayDropSound_Implementation(USoundBase* InSound, float VolumeMul, float PitchMul)
 {
 	// 大厂原则 — 零兜底: Sound 字段为空 → 强制修复 BP_AirdropPickup
@@ -328,6 +427,21 @@ void AAirdropPickup::Multicast_PlayDropSound_Implementation(USoundBase* InSound,
 //   - 直接复制实现, 注释里明确"镜像 Multicast_PlayDropSound"
 //   - 这是 v117-v2xx 一直用的模式 (Multicast_PlayFireMontage / Multicast_PlayReloadMontage 也镜像)
 
+/**
+ * @brief Multicast RPC 实现 — 在所有客户端播放空投拾取音效 (服务器权威推送)
+ *
+ * 镜像 Multicast_PlayDropSound 完整对称设计:
+ *   - 结构 100% 相同, 仅注释 + Log tag 不同
+ *   - 业务语义独立: 生成音效 (Drop) vs 拾取音效 (Pickup)
+ *
+ * @param InSound    要播放的 Sound 资产 (服务器校验非空后推送)
+ * @param VolumeMul  音量倍数
+ * @param PitchMul   音高倍数
+ *
+ * @note 客户端二次校验 Sound 非空, 防 RPC 序列化时 Sound 引用丢失
+ * @note 时序: 必须在 Destroy() 之前调用, 否则 Actor 已销毁, Multicast 参数序列化失败
+ * @note 单点播放: 用 Actor 当前位置 (拾取时位置 = 空投落地点, 音效位置准确)
+ */
 void AAirdropPickup::Multicast_PlayPickupSound_Implementation(USoundBase* InSound, float VolumeMul, float PitchMul)
 {
 	// 大厂原则 — 零兜底: Sound 字段为空 → 强制修复 BP_AirdropPickup

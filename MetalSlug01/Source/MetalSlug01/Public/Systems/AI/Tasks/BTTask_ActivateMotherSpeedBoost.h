@@ -57,6 +57,7 @@ class METALSLUG01_API UBTTask_ActivateMotherSpeedBoost : public UBTTaskNode
 public:
 	UBTTask_ActivateMotherSpeedBoost();
 
+	/** @brief BT 编辑器静态描述 (显示 "激活母体加速技能") */
 	virtual FString GetStaticDescription() const override;
 
 protected:

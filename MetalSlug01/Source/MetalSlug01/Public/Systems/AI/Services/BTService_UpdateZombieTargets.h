@@ -43,6 +43,7 @@ class METALSLUG01_API UBTService_UpdateZombieTargets : public UBTService
 public:
 	UBTService_UpdateZombieTargets();
 
+	/** @brief BT 编辑器静态描述 (显示 5 个 BB Key + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 母体 → 最近人类 (Object Key) */
@@ -79,6 +80,7 @@ public:
 	FBlackboardKeySelector HomeLocationKey;
 
 protected:
+	/** @brief Tick: 母体选最近人类 / 人类选最近母体 → 写 BB.TargetActor + NearestXxx + HomeLocation */
 	virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
 		float DeltaSeconds) override;
 };

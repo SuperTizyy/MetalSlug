@@ -4,6 +4,9 @@
 //
 // 【v125 2026.08.01 v125 改动】新增"访问历史账本" + 反射式换点冷却 — 解决 A↔B 来回切换抖动
 //
+// @file RoomZombieRallySubsystem.h
+// @brief 生化模式集合点账本 + 服务器权威选点 Subsystem
+//
 // 业务背景 (用户 2026.08.01 反馈 "AI 在 TriggerRadius 内 + 母体在 ThreatRadius 内, LockedRallyPoint 黑板键来回切换"):
 //   v122-v124 实现的"反射式换点"逻辑没问题, 但 AI 在 A 集合点 ≤ TriggerRadius, 母体在 ThreatRadius
 //   → 触发换点 → 选 B → AI 跑到 B 期间还在 A 附近 → 又触发换点 → 选 A → 死循环 A↔B 来回跳

@@ -21,6 +21,25 @@
 // UE 自动生成的头文件
 #include "RoomPlayerController.generated.h"
 
+/**
+ * @file RoomPlayerController.h
+ * @brief 房间玩家控制器 — UE 5.6 网络输入 + RPC 编排核心
+ *
+ * 大厂架构角色:
+ *   - 客户端 UI 与服务器权威之间的 RPC 中转站 (Server_* RPC 全部由此进)
+ *   - Enhanced Input 系统绑定 (Tab 计分板 / ESC 菜单 / T 聊天)
+ *   - 死亡复活定时器 (挂在 Controller 上,不随 Pawn 销毁而失效)
+ *   - GameFlowSubsystem 状态机监听 + 结算状态监听
+ *
+ * 单一职责:
+ *   - PC = 收到客户端 RPC 入口 → 中转到 GameMode
+ *   - 不直接写业务逻辑 (业务逻辑在 GM / Subsystem / Component)
+ *
+ * 不破坏刀战模式:
+ * - 业务分支在 GameMode 内部按 EMatchState / FactionTag 决定
+ * - PC 仅做"通知服务器 + 委托转发", 0 if-else 模式判断
+ */
+
 // ==========================================
 // 前置声明（加快编译速度，避免循环包含）
 // ==========================================

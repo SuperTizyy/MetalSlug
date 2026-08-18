@@ -1,13 +1,31 @@
 // Copyright (c) 2026.
 //
 // ========================================================================
-// UAIBehaviorConfigSO — 关卡预放 AI 配置（单一真理源）
+// AIBehaviorConfigSO.h — AI 行为配置 DataAsset 声明文件
+// ========================================================================
+//
+// 文件功能总览:
+//   本文件声明 UAIBehaviorConfigSO(继承 UDataAsset),用于在 UE 编辑器中
+//   集中配置一类 AI(刀战 / 生化人类 / 母体 等)的全部行为参数与生成配置。
+//
+// 大厂架构角色:
+//   - 单一真理源: 每个 AI 类型对应一份 ConfigSO(DT_AIBehaviorConfig_XXX.uasset)
+//   - 数据驱动: 策划在编辑器配置,程序无需硬编码阈值
+//   - 模式隔离: 刀战参数与生化参数完全独立字段段(Combat / Zombie / Retreat / ReflexChange)
+//
+// 真理源链路:
+//   BT/BTTask/Service 通过 Owner->GetController<ABaseAIController>()->GetConfig() 读
+//   大厅 AI 的 BT 来源: GM_RoomGameMode.ModeRulesByMode[Mode].BehaviorTree
+//   关卡预放 AI 的 BT 来源: 本 ConfigSO.LevelPlacedBehaviorTree
+//
+// ========================================================================
+// UAIBehaviorConfigSO — 关卡预放 AI 配置(单一真理源)
 // ========================================================================
 //
 // 【v54.4 大厂架构重构】职责重新划分
 //
 // 旧架构 (v54.3):
-   //   - DA_AIBehaviorConfig 里同时有 LevelPlacedBehaviorTree + LevelPlacedAIControllerClass + LevelPlacedWeaponClass
+//   - DA_AIBehaviorConfig 里同时有 LevelPlacedBehaviorTree + LevelPlacedAIControllerClass + LevelPlacedWeaponClass
 //   - 关卡预放 AI 和大厅 AI 都从同一个 ConfigSO 读
 //   → 职责混乱: 一个表里既有「行为配置」(Combat/Perception) 又有「Spawn 配置」(BehaviorTree/AIController)
 //

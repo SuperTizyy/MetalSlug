@@ -1,5 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file RoomMembershipSubsystem.cpp
+ * @brief 房间成员管理子系统实现 — 玩家/AI 入队/换队/踢人
+ */
 #include "Systems/Membership/RoomMembershipSubsystem.h"
 #include "Systems/RoomGameMode.h"
 #include "Systems/RoomGameState.h"
@@ -27,6 +31,12 @@ URoomMembershipSubsystem* URoomMembershipSubsystem::Get(const UObject* WorldCont
 	return nullptr;
 }
 
+/**
+ * @brief 子系统创建守卫 — Server-only(仅服务器端创建)
+ *
+ * 客户端不创建 Membership Subsystem — 成员管理是 GameMode 职责
+ * 镜像 v31.5 风格: NetMode != NM_Client 才允许创建
+ */
 bool URoomMembershipSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	if (UWorld* World = Cast<UWorld>(Outer))
@@ -49,6 +59,14 @@ void URoomMembershipSubsystem::UpdatePlayerReadyState(AController* RequestingCon
 	}
 }
 
+/**
+ * @brief 检查除房主外所有玩家是否都已准备(用于开局门控)
+ * @return true=所有非房主玩家 bIsReady=true(或无有效阵营), false=存在未准备玩家
+ *
+ * 房主豁免 — 房主不需要点准备也能开局(业务规则)
+ * 无有效阵营玩家也视为已准备(防止空槽位永远卡门控)
+ * 任何非准备玩家 → 立即 Log Warning + return false
+ */
 bool URoomMembershipSubsystem::CheckAllPlayersReady()
 {
 	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
@@ -233,6 +251,15 @@ void URoomMembershipSubsystem::ChangePlayerTeam(AController* RequestingControlle
 	PS->OnRep_FactionTag();
 }
 
+/**
+ * @brief 转让房主权限给指定玩家(或自动选举下一任)
+ * @param NewHostPlayerName 目标玩家名, 空字符串表示自动选下一任
+ * @return true=转让成功, false=找不到候选(避免房主被清空)
+ *
+ * 自动选举规则: NewHostPlayerName 空 → 选 PlayerArray 中除当前房主外第一个非空名字玩家
+ * 失败兜底: 找不到候选 → Log Warning + return false, 保留旧房主(防止 HostPlayerName 被清空)
+ * 成功路径: 更新 GS.HostPlayerName + 广播系统消息 + 触发 HostChanged 事件
+ */
 bool URoomMembershipSubsystem::TransferHostTo(const FString& NewHostPlayerName)
 {
 	ARoomGameState* GS = GetWorld()->GetGameState<ARoomGameState>();
@@ -281,6 +308,14 @@ bool URoomMembershipSubsystem::TransferHostTo(const FString& NewHostPlayerName)
 	return true;
 }
 
+/**
+ * @brief 广播聊天消息到所有房间玩家 PC(房间内聊天)
+ * @param SenderName 发送者玩家名
+ * @param Message 聊天内容
+ *
+ * 自动判定发送者是否为房主, 给 Client_ReceiveChatMessage 传 bIsHost 标志
+ * 所有 ARoomPlayerController 收到 Client_ReceiveChatMessage, 由其 UI 层负责展示
+ */
 void URoomMembershipSubsystem::BroadcastChatMessage(const FString& SenderName, const FString& Message)
 {
 	FString HostName = TEXT("");

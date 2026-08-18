@@ -1,5 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file RoomAirdropSubsystem.cpp
+ * @brief 生化模式空投子系统实现 — 单一权威调度
+ */
 #include "Systems/Airdrop/RoomAirdropSubsystem.h"
 
 // Engine includes
@@ -28,6 +32,15 @@ URoomAirdropSubsystem* URoomAirdropSubsystem::Get(const UObject* WorldContextObj
 	return nullptr;
 }
 
+/**
+ * @brief 子系统创建守卫 — 仅 GameWorld + 服务器创建
+ *
+ * 拒绝条件:
+ * - Editor Preview / PIE Preview World(Super 已处理)
+ * - Outer 不是 UWorld(空 World)
+ *
+ * 大厂原则:空投业务只在服务器跑,客户端不需要本地空投管理(走 RPC 同步视觉)
+ */
 bool URoomAirdropSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	// 大厂原则 — 镜像 v31.5 RoomLifecycleSubsystem / RoomSpawnSubsystem 风格

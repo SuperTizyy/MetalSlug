@@ -2,6 +2,23 @@
 
 #pragma once
 
+/**
+ * @file GameFlowSubsystem.h
+ * @brief 游戏全局流程控制中心 (Game Flow Manager)
+ *
+ * 大厂原则:
+ *   - 单一入口: 地图流转 / 宏观状态调度唯一权威
+ *   - 全局唯一: UGameInstanceSubsystem, 游戏中只有一份
+ *   - UI 不允许直接 OpenLevel, 必须通过本子系统
+ *
+ * 跨地图持久:
+ *   - bHasBootedToLogin 防止双入口重入 (PostLoadMapWithWorld + OnWorldBeginPlay)
+ *   - RequestStateOnNextLoad 跨地图"下一步状态"意图机制
+ *
+ * 中断通道:
+ *   - OnInterrupted: 网络失败/强制退出时独立广播, UI 强制刷新
+ */
+
 // ==========================================
 // 头文件包含说明
 // ==========================================

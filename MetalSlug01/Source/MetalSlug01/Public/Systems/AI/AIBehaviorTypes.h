@@ -188,27 +188,42 @@ struct FAICombatParams
      *
      * 与武器 LightDamageBody 的关系 (大厂设计):
      *   - BaseWeapon.LightDamageBody = 武器固有属性 (这把刀砍谁都打 20)
+     *   - AIBehaviorConfigSO.Damage = 【v250 已废弃】统一走 DT_WeaponInfo 伤害字段
+     *
+     * 【v250 大厂架构重构】伤害真理源统一:
+     *   - 旧版: AI 走 AIBehaviorConfigSO.Damage, 玩家走 DT_WeaponInfo (两套配置, 维护成本高)
+     *   - 新版: AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
+     *   - 策划只需维护 DT_WeaponInfo 一份配置, AI 改武器自动影响伤害
+     *
+     * 遗留注释 (旧版说明, 仅作历史参考):
      *   - AIBehaviorConfigSO.Damage = AI 行为修正 (这个 AI 用刀时, 无论啥刀, 都打 12)
      *   - 最终伤害 = DamageOverride (AI 传) > 0 ? DamageOverride : Weapon.LightDamageBody
      *   - 这是经典"行为参数化": 同一把刀给不同 AI, 伤害可以不同 (Boss 武器 = +50%, 杂兵 = -30%)
+     *   - v250 已删除此路径, 统一走 DT_WeaponInfo
      */
     UPROPERTY(EditDefaultsOnly, Category = "Combat",
-        meta = (ClampMin = "0.0", ClampMax = "1000.0"))
+        meta = (ClampMin = "0.0", ClampMax = "1000.0", DeprecatedProperty,
+            DeprecationMessage = "【v250已废弃】伤害统一走DT_WeaponInfo.LightDamageBody/Head,不再被C++读取."))
     float Damage = 12.f;
 
     /**
      * 【P0 2026.07.06】AI 攻击爆头伤害（可选）
+     *
+     * 【v250 大厂架构重构】DamageHeadshot 已废弃
+     *   - 旧版: AI 爆头走 AIBehaviorConfigSO.DamageHeadshot
+     *   - 新版: AI 和玩家统一走 BaseWeapon::LightDamageHead (DT_WeaponInfo)
+     *   - 策划可删除此字段, 或保留为美术参考值
      *
      * 设计: 大厂 AI 行为配置会区分身体/爆头, 例如狙击手 AI 爆头 1.5x, 杂兵爆头 2.0x
      *       < 0 = 禁用爆头检测 (跟玩家一样不打头)
      *       = 0 = 用 Damage 作为爆头伤害 (1x, 等同身体)
      *       > 0 = 自定义爆头伤害值
      *
-     * 当前实现状态: 数据已加, 实际爆头检测需要在 AI 攻击时做 Trace (下个 Phase)
-     *              现在先让 OnAIRequestAttack_Simple 用 Damage (身体) 扣血
+     * 当前实现状态: v250 统一走 DT_WeaponInfo, 此字段不再被 C++ 读取
      */
     UPROPERTY(EditDefaultsOnly, Category = "Combat",
-        meta = (ClampMin = "-1.0", ClampMax = "1000.0"))
+        meta = (ClampMin = "-1.0", ClampMax = "1000.0", DeprecatedProperty,
+            DeprecationMessage = "【v250已废弃】伤害统一走DT_WeaponInfo.LightDamageHead,不再被C++读取."))
     float DamageHeadshot = -1.f;
 
     /** 弹药类型 (GameplayTag) - 留给武器系统 Phase 3 接入 */
@@ -343,23 +358,30 @@ struct FAIMovementParams
 	float WalkSpeed = 250.f;
 
 	/**
-	 * 【v133.3 2026.08.02】母体 AI 移动速度 (cm/s) — 母体 AI 专属速度参数
+	 * 【v133.3 2026.08.02】母体 AI 移动速度 (cm/s) — 原 AI 母体速度真理源
 	 *
-	 * 设计原则 (大厂架构 — 单一真理源 + 职责对等):
-	 *   - 与 WalkSpeed 严格分离: 母体 / 人类是两个独立真理源,不允许互相覆盖
-	 *   - 真理源: DA_AIBehaviorConfig_XXX → Movement → MotherWalkSpeed
-	 *   - 调用方按 Pawn.bIsMother 分流:
-	 *     - bIsMother=true  → MotherWalkSpeed (策划可配比人类快或慢)
-	 *     - bIsMother=false → WalkSpeed (人类 AI)
+	 * 【v246.3 2026.08.19 大厂架构 P0 修复】DEPRECATED — 真理源迁移到 PlayerConfigAsset.MotherMaxWalkSpeed
+	 *   - 旧版 (v133.3): 母体 AI 速度 = ConfigSO.MotherWalkSpeed (默认 500)
+	 *   - 新版 (v246.3): 母体 AI 速度 = PlayerConfigAsset.MotherMaxWalkSpeed (默认 800, 与玩家路径镜像)
+	 *   - 根因: 两条真理源不一致 → MutatePawnToMother 写 800, OnRespawnMovementLockedChanged 解锁读 500
+	 *         → 母体被杀死复活几次后走路很慢 (用户 2026.08.19 反馈)
+	 *   - 旧字段保留: 兼容 .uasset 已配 ConfigSO 数据, 仅标 DEPRECATED, 未来删除
+	 *   - 字段值已不读取 — 所有调用方 (BaseAIController / BaseCharacter / AIAttackComponent) 已改走 PlayerConfig
 	 *
-	 * 编辑器配置路径:
-	 *   DA_AIBehaviorConfig_ZombieMother → Movement → MotherWalkSpeed
+	 * 设计原则 (大厂架构 — 单一真理源):
+	 *   - 母体AI 与 玩家母体 共用同一真理源 = PlayerConfigAsset.MotherMaxWalkSpeed
+	 *   - 真理源迁移理由: 母体是"类型" (玩家/AI 变异),不是"模式" — 配置在 PlayerConfig 更合理
+	 *
+	 * 编辑器配置路径 (已迁移, 编辑器内仍可看到此字段, 仅日志提示 DEPRECATED):
+	 *   - 原配置: DA_AIBehaviorConfig_XXX → Movement → MotherWalkSpeed (已废弃)
+	 *   - 新配置: DA_PlayerConfigAsset → Movement → MotherMaxWalkSpeed (真理源)
 	 *
 	 * 典型值: 400~800 cm/s (母体比人类快, 体现变异加速感)
 	 *
-	 * 【零兜底】如果 MotherWalkSpeed <= 0, 母体 AI 不移动, Log Error 强制修复配置
+	 * 【零兜底】如果 MotherMaxWalkSpeed <= 0, 母体 AI 不移动, Log Error 强制修复配置
 	 */
-	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0",
+		DisplayName = "MotherWalkSpeed (DEPRECATED — 请改用 DA_PlayerConfigAsset.MotherMaxWalkSpeed)"))
 	float MotherWalkSpeed = 500.f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Movement", meta = (ClampMin = "0.0"))

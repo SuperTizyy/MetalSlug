@@ -1,5 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file RoomSpawnSubsystem.cpp
+ * @brief 房间生成子系统实现 — Pawn 生成/出生点分配唯一入口
+ */
 #include "Systems/Spawn/RoomSpawnSubsystem.h"
 #include "Systems/Spawn/RoomLoadoutDefaults.h" // 【v212】业务默认 RowName 集中管理 (JZ001)
 #include "Systems/RoomGameMode.h"
@@ -54,6 +58,12 @@ URoomSpawnSubsystem* URoomSpawnSubsystem::Get(const UObject* WorldContextObject)
 	return nullptr;
 }
 
+/**
+ * @brief 子系统创建守卫 — Server-only(仅服务器端创建)
+ *
+ * 镜像 v31.5 风格: NetMode != NM_Client 才允许创建
+ * Spawn 业务是 GameMode 职责, 客户端不需要本地 Spawn 管理
+ */
 bool URoomSpawnSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	// Server-only
@@ -503,8 +513,127 @@ void URoomSpawnSubsystem::ScanAndCachePlayerStarts(bool bReScan)
 	}
 }
 
+// ==========================================
+// 【v242 大厂架构重构】出生点占点 + 映射登记单一入口
+// ==========================================
+// 设计动机 (根因 - Session1.txt 2026.08.19 00240.861 ~ 00240.879):
+//   旧实现: GetAvailableSpawnPointForFaction(..., OccupancyOwner=nullptr) 首次 Spawn
+//   → OccupiedSpawnPoints.Add(SpawnPoint)  // 占点
+//   → if (OccupancyOwner) OccupiedSpawnByController.Add(...);  // 首次 Spawn OccupancyOwner=nullptr,不登记!
+//   → 后续创建 AIC 后,SpawnAIInternal 末尾不再补登记
+//   → 死亡时 ReleaseSpawnPointByController(Ctrl) → Find(WeakCtrl) = nullptr → 静默 return
+//   → OccupiedSpawnPoints 永久占满 → 复活时再次调用 GetAvailableSpawnPointForFaction
+//   → "阵营 'X' 全部 N 个出生点都被占用. 拒绝随机复用" → AI 永久消失
+//
+// 修复方案 (大厂原则 — 零兜底 + 单一入口):
+//   1. 提取 ClaimSpawnPointAndRegisterMapping() 私有原子:
+//      - 单一入口管理 OccupiedSpawnPoints + OccupiedSpawnByController 双表
+//      - 强制要求 Owner Controller(违反 = Log Error)
+//      - 自动覆盖旧映射(Cover,不是 Rewrite — 同一 Controller 已经在旧点死亡后释放)
+//
+//   2. GetAvailableSpawnPointForFaction / GetAvailableHumanSurvivorSpawnPoint
+//      退化为"扫描可用点 + 调 ClaimSpawnPointAndRegisterMapping"两步
+//      → 任何调用方都走同一登记路径,首次 Spawn 也必须传 OccupancyOwner
+//
+//   3. SpawnAIInternal 首次 Spawn 路径重构:
+//      - 旧: 调 GetAvailableSpawnPointForFaction(..., nullptr) → 占点不登记
+//      - 新: 调 GetAvailableSpawnPointForFaction(..., nullptr) → 仍占点不登记
+//             → 立即在 SpawnAI 末尾重新调 ClaimSpawnPointAndRegisterMapping(AIC, SpawnPoint) 补登记
+//
+//   4. HandlePlayerRequestSpawn 同步修复(对称路径)
+//
+//   5. 删除 ReleaseSpawnPoint(AActor*) 粗粒度接口 + ResetAllSpawnPointOccupancy
+//      → 唯一释放入口 = ReleaseSpawnPointByController(细粒度 + 大厂首选)
+//
+// 大厂原则 — 零兜底 + 集中调度:
+//   - 占点登记 = ClaimSpawnPointAndRegisterMapping(单一入口)
+//   - 释放 = ReleaseSpawnPointByController(单一入口)
+//   - 不允许任何调用方"先占点后登记"或"先登记后占点" — 必须原子
+
+/**
+ * ClaimSpawnPointAndRegisterMapping — 原子占点 + 映射登记 (v242 大厂架构重构)
+ *
+ * 单一入口 (大厂原则):
+ *   - 所有占用出生点逻辑必须走这里
+ *   - 同时维护 OccupiedSpawnPoints (数组) + OccupiedSpawnByController (Map)
+ *   - 两表一致性保证:总是同时 Add,Always Remove
+ *
+ * @param SpawnPoint 要占用的出生点 (不能为 nullptr)
+ * @param OccupancyOwner 占点 Controller (不能为 nullptr — 首次 Spawn 必须等 AIC 创建后调)
+ * @return true 占点成功,false 占点失败(点已占 或 Controller 已占过)
+ */
+bool URoomSpawnSubsystem::ClaimSpawnPointAndRegisterMapping(APlayerStart* SpawnPoint, AController* OccupancyOwner)
+{
+	// 零兜底 — 入参校验
+	if (!SpawnPoint)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] ClaimSpawnPointAndRegisterMapping: SpawnPoint 为空! 拒绝占点. "
+			     "【v242 零兜底】不允许空占点. 修复: 调用方必须先调 GetAvailableSpawnPointForFaction 拿到有效点."));
+		return false;
+	}
+	if (!OccupancyOwner)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] ClaimSpawnPointAndRegisterMapping: OccupancyOwner 为空! 拒绝占点. "
+			     "【v242 零兜底】不允许无 Controller 占点 — 死亡时无法精准释放. "
+			     "修复: 必须先创建 AIC,再调用本函数补登记."));
+		return false;
+	}
+
+	// 1. 检查 Controller 是不是已经占过别的点 (重复 Spawn 防御)
+	if (OccupiedSpawnByController.Contains(OccupancyOwner))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ClaimSpawnPointAndRegisterMapping: Controller '%s' 已占用过其他出生点. "
+			     "【v242 修复】撤销旧映射,重新占新点 — 避免双重占点. OldSpawn='%s' NewSpawn='%s'."),
+			*OccupancyOwner->GetName(),
+			*GetNameSafe(OccupiedSpawnByController[OccupancyOwner].Get()),
+			*SpawnPoint->GetName());
+
+		// 释放旧映射
+		ReleaseSpawnPointByController(OccupancyOwner);
+	}
+
+	// 2. 检查点是否被其他 Controller 占了
+	if (OccupiedSpawnPoints.Contains(SpawnPoint))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] ClaimSpawnPointAndRegisterMapping: SpawnPoint '%s' 已被占用! "
+			     "Controller='%s' 拒绝双重占点. "
+			     "【v243 零兜底】走到这里表示同帧并发调用 GetAvailableSpawnPointForFaction, 找到同一个点 — 这是 bug, "
+			     "需要检查 GetAvailableSpawnPointForFaction 是否在循环中没及时占点."),
+			*SpawnPoint->GetName(),
+			*OccupancyOwner->GetName());
+		return false;
+	}
+
+	// 3. 原子操作: 同时写两表 (SSOT 强约束)
+	OccupiedSpawnPoints.Add(SpawnPoint);
+	OccupiedSpawnByController.Add(OccupancyOwner, SpawnPoint);
+
+	UE_LOG(LogTemp, Verbose,
+		TEXT("[Spawn] ClaimSpawnPointAndRegisterMapping: Controller='%s' 占点 SpawnPoint='%s' 成功. "
+		     "OccupiedSpawnPoints.Num()=%d, OccupiedSpawnByController.Num()=%d."),
+		*OccupancyOwner->GetName(),
+		*SpawnPoint->GetName(),
+		OccupiedSpawnPoints.Num(),
+		OccupiedSpawnByController.Num());
+
+	return true;
+}
+
 AActor* URoomSpawnSubsystem::GetAvailableSpawnPointForFaction(FGameplayTag PlayerFactionTag, bool bRemoveOccupied, AController* OccupancyOwner)
 {
+	// 【v242 大厂架构重构】扫描 + 异步登记分离
+	//   - 扫描阶段: 找可用 SpawnPoint (不登记)
+	//   - 登记阶段: 调 ClaimSpawnPointAndRegisterMapping (OccupancyOwner 必须非空)
+	//
+	// 旧 (v30-v241) 反模式:
+	//   - GetAvailableSpawnPointForFaction 内部同时做占点 + 登记
+	//   - 首次 Spawn OccupancyOwner=nullptr → 跳过登记 → 永久占点
+	//   - 修复: 扫描和登记分离,首次 Spawn 完成后调 ClaimSpawnPointAndRegisterMapping 补登记
+
 	TArray<APlayerStart*>* FactionSpawns = nullptr;
 	if (FFactionTags::IsOffense(PlayerFactionTag))
 	{
@@ -531,31 +660,80 @@ AActor* URoomSpawnSubsystem::GetAvailableSpawnPointForFaction(FGameplayTag Playe
 		return nullptr;
 	}
 
+	// 1. 扫描阶段: 找未占用的 SpawnPoint
+	APlayerStart* AvailableSpawnPoint = nullptr;
 	for (APlayerStart* SpawnPoint : (*FactionSpawns))
 	{
 		if (SpawnPoint && !OccupiedSpawnPoints.Contains(SpawnPoint))
 		{
-			if (bRemoveOccupied)
-			{
-				OccupiedSpawnPoints.Add(SpawnPoint);
-				// 【v39 P0 修复】记录 Controller → PlayerStart 映射, 供 ReleaseSpawnPointByController 精准释放
-				// 根因: 旧版释放走 ResetAllSpawnPointOccupancy 会误清空其他玩家占用 (多玩家同帧死亡场景)
-				// 大厂原则: 集中调度 + SSOT — 死亡时通过 Controller 反查释放
-				if (OccupancyOwner)
-				{
-					OccupiedSpawnByController.Add(OccupancyOwner, SpawnPoint);
-				}
-			}
-			return SpawnPoint;
+			AvailableSpawnPoint = SpawnPoint;
+			break; // 找到第一个可用的
 		}
 	}
 
-	UE_LOG(LogTemp, Error,
-		TEXT("[Spawn] GetAvailableSpawnPointForFaction: 阵营 '%s' 全部 %d 个出生点都被占用. "
-		     "拒绝随机复用 (v30 零兜底). 排查上游 ReleaseSpawnPoint."),
-		*PlayerFactionTag.ToString(),
-		FactionSpawns->Num());
-	return nullptr;
+	// 2. 没找到 → 报告详细状态 (零兜底: 谁在占,谁没释放)
+	if (!AvailableSpawnPoint)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] GetAvailableSpawnPointForFaction: 阵营 '%s' 全部 %d 个出生点都被占用. "
+			     "【v242 大厂架构】OccupiedSpawnPoints.Num()=%d, OccupiedSpawnByController.Num()=%d. "
+			     "【根因排查】1) 死亡时 ReleaseSpawnPointByController 没被调 → 永久占点; "
+			     "2) 首次 Spawn OccupancyOwner=nullptr 没登记映射 → 死时找不到记录. "
+			     "修复: CombatDeathComponent::ReleaseOccupiedSpawnPoint 已统一释放入口, 检查链路是否走通."),
+			*PlayerFactionTag.ToString(),
+			FactionSpawns->Num(),
+			OccupiedSpawnPoints.Num(),
+			OccupiedSpawnByController.Num());
+		return nullptr;
+	}
+
+	// 3. 登记阶段: 调 ClaimSpawnPointAndRegisterMapping (原子操作)
+	if (bRemoveOccupied)
+	{
+		if (OccupancyOwner)
+		{
+			// 复活路径 / 玩家路径: OccupancyOwner 已知 → 直接调 ClaimSpawnPointAndRegisterMapping
+			const bool bClaimed = ClaimSpawnPointAndRegisterMapping(AvailableSpawnPoint, OccupancyOwner);
+			if (!bClaimed)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[Spawn] GetAvailableSpawnPointForFaction: ClaimSpawnPointAndRegisterMapping 失败. "
+					     "SpawnPoint='%s' Controller='%s'. 拒绝 Spawn."),
+					*AvailableSpawnPoint->GetName(),
+					*OccupancyOwner->GetName());
+				return nullptr;
+			}
+		}
+		else
+		{
+			// 首次 Spawn 路径: OccupancyOwner=nullptr → 【v243 修复】只返回 SpawnPoint,不占点
+			//
+			// 【v242 BUG → v243 修复】:
+			//   旧 (v242): OccupiedSpawnPoints.Add(AvailableSpawnPoint) 占点
+			//     → SpawnAIInternal 末尾再调 ClaimSpawnPointAndRegisterMapping(SpawnPoint, AIC)
+			//     → 内部检查 OccupiedSpawnPoints.Contains(SpawnPoint) → 永远 true → 拒绝!
+			//     → Log: "SpawnPoint 'X' 已被占用! 拒绝双重占点"
+			//     → AIC 销毁 + Pawn 销毁 → AI 永久不生成
+			//
+			// 【v243 大厂架构 — 单一原子写】:
+			//   - GetAvailableSpawnPointForFaction 不再占点 (无论 OccupancyOwner 是否非空)
+			//   - 占点责任完全交给 ClaimSpawnPointAndRegisterMapping (原子写两表)
+			//   - 首次 Spawn 路径: SpawnAIInternal 末尾调 ClaimSpawnPointAndRegisterMapping(SpawnPoint, AIC)
+			//   - 复活路径: GetAvailableSpawnPointForFaction 内部调 ClaimSpawnPointAndRegisterMapping(SpawnPoint, OccupancyOwner)
+			//
+			// 大厂原则 - 零兜底 + 单一入口:
+			//   - 不允许任何调用方 "先 Add OccupiedSpawnPoints + 后 Add OccupiedSpawnByController" 两次操作
+			//   - 必须原子写 — 这是 SSOT 强约束
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[Spawn] GetAvailableSpawnPointForFaction: 首次 Spawn — 返回 SpawnPoint (不占点,等待 SpawnAIInternal 末尾补登记). "
+				     "SpawnPoint='%s' Faction='%s'. "
+				     "【v243 修复】占点责任完全交给 ClaimSpawnPointAndRegisterMapping 原子写."),
+				*AvailableSpawnPoint->GetName(),
+				*PlayerFactionTag.ToString());
+		}
+	}
+
+	return AvailableSpawnPoint;
 }
 
 
@@ -567,6 +745,10 @@ AActor* URoomSpawnSubsystem::GetAvailableSpawnPointForFaction(FGameplayTag Playe
  * GetAvailableHumanSurvivorSpawnPoint
  *
  * 【v201 大厂架构新增】获取生化模式人类专用复活点
+ *
+ * 【v242 大厂架构重构】统一登记路径
+ *   - 首次 Spawn (OccupancyOwner=nullptr): 占点不登记,SpawnAIInternal 末尾补登记
+ *   - 复活路径 (OccupancyOwner 非空): 调 ClaimSpawnPointAndRegisterMapping 原子操作
  */
 AActor* URoomSpawnSubsystem::GetAvailableHumanSurvivorSpawnPoint(AController* OccupancyOwner)
 {
@@ -583,27 +765,64 @@ AActor* URoomSpawnSubsystem::GetAvailableHumanSurvivorSpawnPoint(AController* Oc
 		return nullptr;
 	}
 
-	// 遍历人类幸存者复活点，找一个未占用的
+	// 1. 扫描阶段: 找未占用的 SpawnPoint
+	APlayerStart* AvailableSpawnPoint = nullptr;
 	for (APlayerStart* SpawnPoint : HumanSurvivorSpawnPoints)
 	{
 		if (SpawnPoint && !OccupiedSpawnPoints.Contains(SpawnPoint))
 		{
-			// 标记为已占用
-			OccupiedSpawnPoints.Add(SpawnPoint);
-			if (OccupancyOwner)
-			{
-				OccupiedSpawnByController.Add(OccupancyOwner, SpawnPoint);
-			}
-			return SpawnPoint;
+			AvailableSpawnPoint = SpawnPoint;
+			break;
 		}
 	}
 
-	// 【v201】所有人类幸存者复活点都被占用 → Log Error + return nullptr
-	UE_LOG(LogTemp, Error,
-		TEXT("[Spawn] 【v201】GetAvailableHumanSurvivorSpawnPoint: 全部 %d 个人类幸存者复活点都被占用. "
-		     "生化模式人类玩家无法复活."),
-		HumanSurvivorSpawnPoints.Num());
-	return nullptr;
+	// 2. 没找到 → 报告状态
+	if (!AvailableSpawnPoint)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[Spawn] 【v201】GetAvailableHumanSurvivorSpawnPoint: 全部 %d 个人类幸存者复活点都被占用. "
+			     "生化模式人类玩家无法复活. "
+			     "OccupiedSpawnPoints.Num()=%d, OccupiedSpawnByController.Num()=%d. "
+			     "【v242 根因排查】同上 — 死亡时 ReleaseSpawnPointByController 没走通."),
+			HumanSurvivorSpawnPoints.Num(),
+			OccupiedSpawnPoints.Num(),
+			OccupiedSpawnByController.Num());
+		return nullptr;
+	}
+
+	// 3. 登记阶段: 调 ClaimSpawnPointAndRegisterMapping (原子操作)
+	if (OccupancyOwner)
+	{
+		const bool bClaimed = ClaimSpawnPointAndRegisterMapping(AvailableSpawnPoint, OccupancyOwner);
+		if (!bClaimed)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[Spawn] GetAvailableHumanSurvivorSpawnPoint: ClaimSpawnPointAndRegisterMapping 失败."
+				     " SpawnPoint='%s' Controller='%s'."),
+				*AvailableSpawnPoint->GetName(),
+				*OccupancyOwner->GetName());
+			return nullptr;
+		}
+	}
+	else
+	{
+		// 首次 Spawn: 【v243 修复】只返回 SpawnPoint,不占点 — 等 SpawnAIInternal 末尾补登记
+		//
+		// 【v242 BUG → v243 修复】:
+		//   旧 (v242): OccupiedSpawnPoints.Add(AvailableSpawnPoint) 占点
+		//     → SpawnAIInternal 末尾再调 ClaimSpawnPointAndRegisterMapping(SpawnPoint, AIC)
+		//     → ClaimSpawnPointAndRegisterMapping 内部检查 OccupiedSpawnPoints.Contains → 永远 true → 拒绝
+		//
+		// 大厂原则 - 单一原子写:
+		//   - 占点责任完全交给 ClaimSpawnPointAndRegisterMapping
+		//   - GetAvailableHumanSurvivorSpawnPoint 在 OccupancyOwner=null 时**不占点**
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[Spawn] GetAvailableHumanSurvivorSpawnPoint: 首次 Spawn — 返回 SpawnPoint (不占点,等待 SpawnAIInternal 末尾补登记). "
+			     "SpawnPoint='%s'. 【v243 修复】占点责任完全交给 ClaimSpawnPointAndRegisterMapping."),
+			*AvailableSpawnPoint->GetName());
+	}
+
+	return AvailableSpawnPoint;
 }
 
 
@@ -1693,21 +1912,227 @@ void URoomSpawnSubsystem::ReleaseSpawnPointByController(AController* Controller)
 	OccupiedSpawnByController.Remove(WeakController);
 }
 
+// ==========================================
+// 【v242 大厂架构】ReleaseSpawnPoint 强制双表一致
+// ==========================================
+//
+// 已废弃接口 (粗粒度), 但仍可能从 BP/外部调用, 必须保证双表一致:
+//   - OccupiedSpawnPoints.Remove(PlayerStart)
+//   - OccupiedSpawnByController: 反查所有 Map 找到映射此 PlayerStart 的 Controller, 一并 Remove
+//
+// 旧实现只清 OccupiedSpawnPoints → 双表不一致 → ReleaseSpawnPointByController
+// 之后会看到一个 key 指向已被本函数释放的点,造成混乱.
+//
+// 大厂原则:
+//   - 即使是废弃接口,也不能破坏双表 SSOT 一致性
 void URoomSpawnSubsystem::ReleaseSpawnPoint(AActor* PlayerStart)
 {
-	if (!PlayerStart) return;
-	if (APlayerStart* PS = Cast<APlayerStart>(PlayerStart))
+	if (!PlayerStart)
 	{
-		if (OccupiedSpawnPoints.Contains(PS))
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ReleaseSpawnPoint: PlayerStart 为空. 【v242 零兜底】拒绝静默 return, 上游必须传有效点. "
+			     "新代码请改用 ReleaseSpawnPointByController(AController*) 精准释放."));
+		return;
+	}
+
+	APlayerStart* PS = Cast<APlayerStart>(PlayerStart);
+	if (!PS)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ReleaseSpawnPoint: PlayerStart='%s' 不是 APlayerStart. 【v242】拒绝. "
+			     "新代码请改用 ReleaseSpawnPointByController(AController*) 精准释放."),
+			*PlayerStart->GetName());
+		return;
+	}
+
+	// 1. 删 OccupiedSpawnPoints
+	if (OccupiedSpawnPoints.Contains(PS))
+	{
+		OccupiedSpawnPoints.Remove(PS);
+	}
+
+	// 2. 反查 OccupiedSpawnByController, 删除所有映射此点的 Controller (双表一致性)
+	int32 RemovedMapCount = 0;
+	for (auto It = OccupiedSpawnByController.CreateIterator(); It; ++It)
+	{
+		if (It->Value.Get() == PS)
 		{
-			OccupiedSpawnPoints.Remove(PS);
+			It.RemoveCurrent();
+			++RemovedMapCount;
 		}
 	}
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[Spawn] ReleaseSpawnPoint: 【v242 粗粒度接口 — 不推荐】已释放 SpawnPoint='%s' (从 OccupiedSpawnPoints) + "
+		     "反查删除 %d 个 Controller 映射 (双表一致). 新代码请改用 ReleaseSpawnPointByController."),
+		*PS->GetName(), RemovedMapCount);
 }
 
+// ==========================================
+// 【v242 大厂架构】ResetAllSpawnPointOccupancy 强制同时清空双表
+// ==========================================
+//
+// 已废弃但内部仍可能调 (RoomGameMode 转发壳等), 必须保证双表一致:
+//   - OccupiedSpawnPoints (TSet)
+//   - OccupiedSpawnByController (TMap)
+//
+// 旧实现只清 OccupiedSpawnPoints → 双表不一致 → OccupiedSpawnByController
+// 残留指向已释放 SpawnPoint 的 WeakObjectPtr → ReleaseSpawnPointByController
+// 看到 key 但 PlayerStart 已不在 OccupiedSpawnPoints 里 → 误以为"点已释放"
+//
+// 大厂原则:
+//   - 双表一致性是 SSOT 强约束
+//   - 即使已废弃接口,也不能破坏 SSOT
 void URoomSpawnSubsystem::ResetAllSpawnPointOccupancy()
 {
+	const int32 BeforePoints = OccupiedSpawnPoints.Num();
+	const int32 BeforeMap = OccupiedSpawnByController.Num();
+
 	OccupiedSpawnPoints.Empty();
+	OccupiedSpawnByController.Empty();
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[Spawn] ResetAllSpawnPointOccupancy: 【v242 双表一致性】已清空 OccupiedSpawnPoints(%d→0) + OccupiedSpawnByController(%d→0). "
+		     "【v242 大厂原则】本接口是粗粒度, 新代码必须改用 ReleaseSpawnPointByController 精细化释放."),
+		BeforePoints, BeforeMap);
+}
+
+
+// ==========================================
+// 【v246 大厂架构】ReleaseAllSpawnPointOccupancy — 语义化入口, RoomGameMode 转发壳内部用
+// ==========================================
+//
+// 大厂原则 — 暴露行为, 不暴露数据结构:
+//   - 内部复制 OccupiedSpawnByController keys, 逐个调 ReleaseSpawnPointByController
+//   - 调用方 (RoomGameMode) 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+//   - 隐藏实现细节, 后续重构 TMap → TArray 时不影响调用方
+//
+// 双表一致性:
+//   - ReleaseSpawnPointByController 内部已维护 OccupiedSpawnPoints + OccupiedSpawnByController 双表一致
+//   - 本函数循环调 ReleaseSpawnPointByController, 双表自动一致
+//
+// 零兜底:
+//   - OccupiedSpawnByController 已为空 → return 0 (合法)
+//   - Controller 已 Destroy (TWeakObjectPtr.Get() 返回 nullptr) → 跳过 (不报错, 玩家可能已断线)
+//   - Controller 释放成功 → count++
+//
+// @return 实际释放的 Controller 数量 (0 = 无占用)
+int32 URoomSpawnSubsystem::ReleaseAllSpawnPointOccupancy()
+{
+	const int32 BeforeCount = OccupiedSpawnByController.Num();
+
+	if (BeforeCount == 0)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[Spawn] ReleaseAllSpawnPointOccupancy: OccupiedSpawnByController 已为空 — 无需释放. "
+			     "【v246 大厂原则】调用方应优先用 ReleaseSpawnPointByController 按 Controller 精准释放, 避免误清空."));
+		return 0;
+	}
+
+	// 1. 复制 keys 出来 (避免边遍历边 Remove 崩溃)
+	TArray<TWeakObjectPtr<AController>> ControllersToRelease;
+	ControllersToRelease.Reserve(BeforeCount);
+	for (const auto& Pair : OccupiedSpawnByController)
+	{
+		ControllersToRelease.Add(Pair.Key);
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[Spawn][v246] ReleaseAllSpawnPointOccupancy: 复制 %d 个 Controller — 逐个精准释放. "
+		     "【大厂原则】走 ReleaseSpawnPointByController 细粒度, 双表一致性由其内部维护."),
+		BeforeCount);
+
+	// 2. 逐个精准释放
+	int32 ReleasedCount = 0;
+	for (const TWeakObjectPtr<AController>& WeakController : ControllersToRelease)
+	{
+		if (AController* Controller = WeakController.Get())
+		{
+			ReleaseSpawnPointByController(Controller);
+			++ReleasedCount;
+		}
+		// Controller 已 Destroy (玩家断线): TWeakObjectPtr.Get() 返回 nullptr, 跳过
+	}
+
+	return ReleasedCount;
+}
+
+
+// ==========================================
+// 【v246 大厂架构】ReleaseSpawnPointBySpawnPoint — 语义化入口, RoomGameMode 转发壳内部用
+// ==========================================
+//
+// 大厂原则 — 暴露行为, 不暴露数据结构:
+//   - 内部反查 OccupiedSpawnByController, 找到所有映射此 PlayerStart 的 Controller
+//   - 调 ReleaseSpawnPointByController 精准释放每个
+//   - 调用方 (RoomGameMode) 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+//
+// 双表一致性:
+//   - ReleaseSpawnPointByController 内部已维护 OccupiedSpawnPoints + OccupiedSpawnByController 双表一致
+//
+// 零兜底:
+//   - PlayerStart 为空 → Log Warning + return 0
+//   - PlayerStart 不是 APlayerStart → Log Warning + return 0
+//   - 反查无 Controller 占用此点 → return 0 (合法)
+//
+// @param PlayerStart 要释放的出生点
+// @return 实际释放的 Controller 数量 (0 = 无占用)
+int32 URoomSpawnSubsystem::ReleaseSpawnPointBySpawnPoint(AActor* PlayerStart)
+{
+	if (!PlayerStart)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ReleaseSpawnPointBySpawnPoint: PlayerStart 为空 — 拒绝. "
+			     "【v246 零兜底】调用方必须传非空 PlayerStart, 否则请改用 ReleaseSpawnPointByController 按 Controller 精准释放."));
+		return 0;
+	}
+
+	APlayerStart* PS = Cast<APlayerStart>(PlayerStart);
+	if (!PS)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("[Spawn] ReleaseSpawnPointBySpawnPoint: PlayerStart='%s' 不是 APlayerStart — 拒绝. "
+			     "【v246 零兜底】调用方必须传 APlayerStart 类型."),
+			*PlayerStart->GetName());
+		return 0;
+	}
+
+	// 1. 反查 OccupiedSpawnByController, 复制所有映射此 PS 的 Controller
+	TArray<TWeakObjectPtr<AController>> ControllersToRelease;
+	for (const auto& Pair : OccupiedSpawnByController)
+	{
+		if (Pair.Value.Get() == PS)
+		{
+			ControllersToRelease.Add(Pair.Key);
+		}
+	}
+
+	if (ControllersToRelease.Num() == 0)
+	{
+		UE_LOG(LogTemp, Verbose,
+			TEXT("[Spawn] ReleaseSpawnPointBySpawnPoint: PlayerStart '%s' 在 OccupiedSpawnByController 中无映射 — 无需释放. "
+			     "【v246 零兜底】任何调用方都应改用 ReleaseSpawnPointByController 按 Controller 精准释放, 避免反查."),
+			*PS->GetName());
+		return 0;
+	}
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[Spawn][v246] ReleaseSpawnPointBySpawnPoint: 反查到 %d 个 Controller 占用 PlayerStart '%s' — 精准释放. "
+		     "【大厂原则】走 ReleaseSpawnPointByController 细粒度, 双表一致性由其内部维护."),
+		ControllersToRelease.Num(), *PS->GetName());
+
+	// 2. 逐个精准释放
+	int32 ReleasedCount = 0;
+	for (const TWeakObjectPtr<AController>& WeakController : ControllersToRelease)
+	{
+		if (AController* Controller = WeakController.Get())
+		{
+			ReleaseSpawnPointByController(Controller);
+			++ReleasedCount;
+		}
+	}
+
+	return ReleasedCount;
 }
 
 
@@ -2093,6 +2518,14 @@ TArray<FPendingAIEntry> URoomSpawnSubsystem::GetPendingAIInFaction(FGameplayTag 
 	});
 }
 
+/**
+ * @brief 判断指定 DisplayName 是否在 PendingAI 队列中(用于踢人前的阶段判定)
+ * @param DisplayName AI 显示名(如 "AI_GruntAI_1")
+ * @return true=队列中存在该 AI
+ *
+ * 大厂原则: 字段驱动判定(替代 v28 之前 StartsWith "[AI]" 的字符串模糊匹配)
+ * 用于 Server_KickPlayer 阶段 1(大厅阶段 PendingAI)分支判定
+ */
 bool URoomSpawnSubsystem::IsPendingAIByName(const FString& DisplayName) const
 {
 	if (DisplayName.IsEmpty()) return false;
@@ -2102,6 +2535,14 @@ bool URoomSpawnSubsystem::IsPendingAIByName(const FString& DisplayName) const
 	});
 }
 
+/**
+ * @brief 从 PendingAI 队列移除指定 DisplayName 的 AI(大厅阶段踢人)
+ * @param DisplayName AI 显示名
+ * @return true=找到并移除, false=未找到或入参为空
+ *
+ * 仅删除第一个匹配项(按入队顺序, v56.4 修复) — 同名多条目不会全删
+ * 用于 Server_KickPlayer 阶段 1(大厅阶段)分支
+ */
 bool URoomSpawnSubsystem::RemovePendingAIByName(const FString& DisplayName)
 {
 	if (DisplayName.IsEmpty())
@@ -2261,6 +2702,18 @@ bool URoomSpawnSubsystem::GetPlayerSpawnData(uint32 ControllerUniqueID, FString&
 	return false;
 }
 
+/**
+ * @brief 读取指定 Controller 的全部战备缓存(角色 + 3 把武器)
+ * @param ControllerUniqueID PlayerController 的 NetworkUniqueID
+ * @param OutCharID 输出角色 ID
+ * @param OutPrimaryID 输出主武器 ID(Slot 1)
+ * @param OutSecondaryID 输出副武器 ID(Slot 2)
+ * @param OutMeleeID 输出近战武器 ID(Slot 3)
+ * @return true=找到缓存, false=缓存中无该 Controller
+ *
+ * 与 GetPlayerSpawnData 二参版本区别: 本函数返回全部 3 把武器(Slot 1/2/3)
+ * 用于 HandlePlayerRequestSpawn 全套战备注入
+ */
 bool URoomSpawnSubsystem::GetPlayerSpawnDataAllWeapons(uint32 ControllerUniqueID, FString& OutCharID, FString& OutPrimaryID, FString& OutSecondaryID, FString& OutMeleeID) const
 {
 	if (const FPlayerSpawnData* Cached = PlayerSpawnDataCache.Find(ControllerUniqueID))
@@ -2453,22 +2906,30 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		}
 
 		// 4a. 出生点分配
+		//
+		// 【v242 大厂架构重构】首次 Spawn 路径修复
+		//   旧 (v30-v241) bug:
+		//     - GetAvailableSpawnPointForFaction(Faction, true, nullptr) → 占点不登记
+		//     - 后续 SpawnActor<AIC> 末尾不补登记
+		//     - 死亡时 ReleaseSpawnPointByController(Ctrl) → Find(WeakCtrl) = nullptr → 静默 return
+		//     - OccupiedSpawnPoints 永久占满 → 复活时返回 nullptr → AI 永久消失
+		//
+		//   新 (v242) 修复:
+		//     - 步骤 1: GetAvailableSpawnPointForFaction(Faction, true, nullptr) → 占点 (不登记)
+		//     - 步骤 2: SpawnActor<AIController> → AIC 创建成功
+		//     - 步骤 3: 【新】ClaimSpawnPointAndRegisterMapping(SpawnPoint, AIC) → 补登记
+		//     - 失败时: 主动释放占点 + 销毁 AIC + 销毁 Pawn (集中调度)
+		//
+		// 复用场景 (复活路径):
+		//   - OptionalExistingController != nullptr → 已是有效 Controller
+		//   - GetAvailableSpawnPointForFaction(Faction, true, OptionalExistingController) → 占点 + 登记 一气呵成
+		//   - 复活场景不需要步骤 3 补登记
 		FVector SpawnLoc = FVector::ZeroVector;
 		FRotator SpawnRot = FRotator::ZeroRotator;
+		APlayerStart* ClaimedSpawnPoint = nullptr; // 【v242】记录占的点,稍后补登记用
 		if (Request.bUseTeamSpawnPoint)
 		{
 			ScanAndCachePlayerStarts(false);
-			// 【v43 修复】必须传 OccupancyOwner (AI Controller), 否则 ReleaseSpawnPointByController 找不到记录
-			// 根因: AI 复活时占用出生点但没记录 OccupancyOwner → ReleaseOccupiedSpawnPoint 找不到记录
-			//       → 出生点永远不释放 → 5 次后全部占用 → AI 无法复活
-			// 注意: AIC 此时还未声明，用 OptionalExistingController（复活时非空，首次 Spawn 时为空让系统分配）
-			//
-			// 【v201 大厂架构 — 生化模式分支镜像玩家路径】
-			//   - 旧 (v201 之前): AI 走 GetAvailableSpawnPointForFaction (Offense/Defense 阵营复活点)
-			//     → 生化模式 AI 复活到 Faction_Defense 阵营点, 不在 Faction_HumanSurvivor 专用点
-			//     → 用户反馈: "生化模式里人类都应该随机复活在 Faction_HumanSurvivor 复活点上, 包括玩家和 ai"
-			//   - 新: 生化模式 + Defense 阵营 → 走 HumanSurvivorSpawnPoints (与玩家镜像)
-			//   - 大厂原则: AI/玩家/母体 在生化模式复活 = 同一逻辑 (单一真理源)
 			AActor* SpawnPt = nullptr;
 			UWorld* WorldForMode = GetWorld();
 			ARoomGameState* RoomGSForMode = WorldForMode ? WorldForMode->GetGameState<ARoomGameState>() : nullptr;
@@ -2476,8 +2937,8 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 			    FFactionTags::IsDefense(DesiredFaction))
 			{
 				// 生化模式人类 AI → 使用 HumanSurvivor 复活点
-				// OccupancyOwner 用 OptionalExistingController (复活时非空 = AI Controller; 首次 Spawn 为空 = 后续会让 AIC Possess)
-				// 零兜底: 没点 → Log Error + 终止 Spawn
+				// 复活场景: OptionalExistingController 非空 → 直接占点 + 登记
+				// 首次 Spawn: OptionalExistingController 为空 → 占点不登记,后面补登记
 				SpawnPt = GetAvailableHumanSurvivorSpawnPoint(OptionalExistingController);
 				if (!SpawnPt)
 				{
@@ -2502,6 +2963,7 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 					return SpawnedCount; // 终止整个 Spawn 流程
 				}
 			}
+			ClaimedSpawnPoint = Cast<APlayerStart>(SpawnPt);
 			SpawnLoc = SpawnPt->GetActorLocation();
 			SpawnRot = SpawnPt->GetActorRotation();
 		}
@@ -2595,6 +3057,68 @@ int32 URoomSpawnSubsystem::SpawnAIInternal(const FAISpawnRequest& Request, UAIBe
 		AIPawn->SetSpawnLoadout(DesiredCharID, DesiredWeaponID);
 
 		AIC->Possess(AIPawn);
+
+		// ============================================================
+		// 【v243 大厂架构 P0 修复】首次 Spawn 路径补登记映射
+		// ============================================================
+		//
+		// 根因 (Session1.txt 2026.08.19 line 00240.861 ~ 00240.879):
+		//   - 旧 (v30-v241) GetAvailableSpawnPointForFaction(Faction, true, nullptr) 首次 Spawn 时
+		//     因 OccupancyOwner=nullptr 跳过 OccupiedSpawnByController 登记
+		//   - 死亡时 ReleaseSpawnPointByController(Ctrl) 找不到映射 → 静默 return
+		//   - OccupiedSpawnPoints 永久占满 → 复活 GetAvailableSpawnPointForFaction 返回 nullptr
+		//   - AI 永久消失 (用户反馈: "刀战模式 AI 杀一个少一个")
+		//
+		// v242 修复:
+		//   - 提取 ClaimSpawnPointAndRegisterMapping 原子入口
+		//   - 首次 Spawn 末尾补登记
+		//   - 但 v242 有 BUG: GetAvailableSpawnPointForFaction 内部已 OccupiedSpawnPoints.Add(SpawnPoint)
+		//     → 末尾 ClaimSpawnPointAndRegisterMapping 内部检查 Contains → 永远 true → "拒绝双重占点" → AI 不生成
+		//
+		// v243 修复:
+		//   - GetAvailableSpawnPointForFaction (OccupancyOwner=null 时) 不再占点
+		//   - 占点责任完全交给 ClaimSpawnPointAndRegisterMapping (单一原子写)
+		//   - 首次 Spawn 末尾必须调 ClaimSpawnPointAndRegisterMapping — 失败时只需销毁 AIC/Pawn, 无残留
+		//   - 复活路径: GetAvailableSpawnPointForFaction 内部已调 ClaimSpawnPointAndRegisterMapping → 跳过
+		//
+		// 大厂原则 - 单一入口 + 零兜底 + 原子写:
+		//   - 占点必须原子写两表 (ClaimSpawnPointAndRegisterMapping 唯一入口)
+		//   - 失败时: 销毁 AIC + 销毁 Pawn (零兜底, 无残留)
+		// ============================================================
+		if (!OptionalExistingController && ClaimedSpawnPoint)
+		{
+			// 首次 Spawn: 必须原子占点 + 登记映射 (单入口)
+			const bool bClaimed = ClaimSpawnPointAndRegisterMapping(ClaimedSpawnPoint, AIC);
+			if (!bClaimed)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[RoomSpawn] SpawnAIInternal: 【v243】首次 Spawn 原子占点失败. "
+					     "SpawnPoint='%s' AIC='%s' AIName='%s'. 【零兜底】拒绝 Spawn — 销毁已生成的 Pawn 和 AIC."),
+					*ClaimedSpawnPoint->GetName(),
+					*AIC->GetName(),
+					*AIName);
+
+				// v243 修复: GetAvailableSpawnPointForFaction 已不再占点 — 无需再清理 OccupiedSpawnPoints
+				// (旧 v242 残留 OccupiedSpawnPoints.Remove 是冗余清理)
+
+				// 销毁 Pawn
+				AIPawn->Destroy();
+
+				// 销毁 AIC (首次 Spawn 路径, AIC 是我们刚 SpawnActor 的)
+				AIC->Destroy();
+
+				continue;
+			}
+
+			UE_LOG(LogTemp, Verbose,
+				TEXT("[RoomSpawn] SpawnAIInternal: 【v243】首次 Spawn 原子占点 + 登记成功. "
+				     "AI='%s' SpawnPoint='%s' AIC='%s'."),
+				*AIName,
+				*ClaimedSpawnPoint->GetName(),
+				*AIC->GetName());
+		}
+		// 复活路径: GetAvailableSpawnPointForFaction 内部已调 ClaimSpawnPointAndRegisterMapping(AvailableSpawnPoint, OptionalExistingController)
+		//         → OccupiedSpawnByController 已正确登记,无需重复
 
 		// 4d. Faction Tag
 		//   v31.5 大厂重构: 走 FFactionTags::ToGenericTeamId 统一转换 (单一真理源)
@@ -3429,6 +3953,13 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 	// 【v201 大厂架构新增】生化模式人类专用复活点分支
 	//   - 生化模式 + Defense 阵营 (人类) → 走 HumanSurvivorSpawnPoints
 	//   - 其他情况 → 走 GetAvailableSpawnPointForFaction (Offense/Defense 阵营复活点)
+	//
+	// 【v242 镜像对称验证】
+	//   - 玩家路径传入 PlayerToSpawn = AController (立即有效)
+	//   - GetAvailableSpawnPointForFaction / GetAvailableHumanSurvivorSpawnPoint 内部:
+	//     if (OccupancyOwner) → 立即调 ClaimSpawnPointAndRegisterMapping(SpawnPoint, PlayerToSpawn)
+	//   - 死亡时 ReleaseSpawnPointByController(PlayerToSpawn) 一定能找到映射 ✓
+	//   - 与 AI 路径"占点不登记 + 后续补登记"对称 (玩家路径直接登记,不需要补登记)
 	if (RoomGS && RoomGS->CurrentMatchMode == ERoomMatchMode::Zombie && FFactionTags::IsDefense(PlayerFactionTag))
 	{
 		// 生化模式人类玩家 → 使用 HumanSurvivor 复活点
@@ -3436,8 +3967,10 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 		if (!AssignedSpawnPoint)
 		{
 			UE_LOG(LogTemp, Error,
-				TEXT("[Spawn] HandlePlayerRequestSpawn: 生化模式人类玩家 '%s' 无法分配 HumanSurvivor 复活点."),
-				*PlayerToSpawn->GetName());
+				TEXT("[Spawn] HandlePlayerRequestSpawn: 生化模式人类玩家 '%s' 无法分配 HumanSurvivor 复活点. "
+				     "【v242 零兜底】已记录 OccupiedSpawnPoints.Num()=%d, OccupiedSpawnByController.Num()=%d."),
+				*PlayerToSpawn->GetName(),
+				OccupiedSpawnPoints.Num(), OccupiedSpawnByController.Num());
 			return;
 		}
 	}
@@ -3449,8 +3982,11 @@ void URoomSpawnSubsystem::HandlePlayerRequestSpawn(AController* PlayerToSpawn, c
 		{
 			UE_LOG(LogTemp, Error,
 				TEXT("[Spawn] HandlePlayerRequestSpawn: 阵营 '%s' 出生点分配失败. "
-				     "【v31.1 零兜底】不调 FindPlayerStart 兜底."),
-				*PlayerFactionTag.ToString());
+				     "【v31.1 零兜底】不调 FindPlayerStart 兜底. "
+				     "【v242 诊断】OccupiedSpawnPoints.Num()=%d, OccupiedSpawnByController.Num()=%d. "
+				     "请检查 ReleaseSpawnPointByController 是否被调用."),
+				*PlayerFactionTag.ToString(),
+				OccupiedSpawnPoints.Num(), OccupiedSpawnByController.Num());
 			return;
 		}
 	}

@@ -3,7 +3,18 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// DailyTaskWidget 头文件 — 每天任务 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UDailyTaskWidget — 升级奖励页面的单天任务项
+//   2. 极简: 4 个 BindWidget (选中高亮框 + 天数按钮 + 天数文本 + 锁定图标)
+//   3. 状态由父级 (UDailyUpgradeRewardPage) 维护
+//
+// 架构理念:
+//   - 极简 Widget: 只有 4 个 BindWidget, 状态由父级维护
+//   - 复用: 每一天一个实例
+//   - 数据驱动: 天数/选中/锁定都来自父级
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

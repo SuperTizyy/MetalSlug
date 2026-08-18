@@ -3,7 +3,17 @@
 // 每天任务 Widget 实现文件
 
 // ==========================================
-// 头文件包含区
+// DailyTaskWidget 实现 — 每天任务 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDailyTaskWidget — 极简的单天任务项 Widget
+//   2. 所有状态由父级维护, 本 Widget 只声明控件
+//
+// 架构优势:
+//   - 保持 Widget 极轻
+//   - 父级 (UDailyUpgradeRewardPage) 统筹所有状态
+//   - 避免子 Widget 状态飘移
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyTaskWidget.h"
 

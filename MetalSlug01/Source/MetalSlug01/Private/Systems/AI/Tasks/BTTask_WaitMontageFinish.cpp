@@ -83,6 +83,16 @@ EBTNodeResult::Type UBTTask_WaitMontageFinish::ExecuteTask(
 	return EBTNodeResult::InProgress;
 }
 
+/**
+ * @brief Tick 入口 — 每帧检查 AI 攻击状态, 蒙太奇结束自动 Succeeded
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory 任务内存(FTaskMemory)
+ * @param DeltaSeconds 帧间隔秒
+ *
+ * 大厂原则:简化判定, 不直接绑 OnMontageEnded 委托 — 由 OnMontageEnded 内
+ * SetCurrentlyAttacking(false) 完成通知,本函数轮询该标志.
+ * 三个退出路径:蒙太奇结束(正常)/ AIC/Pawn/Character 失效 / bFinished 已 true.
+ */
 void UBTTask_WaitMontageFinish::TickTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {
@@ -154,6 +164,13 @@ EBTNodeResult::Type UBTTask_WaitMontageFinish::AbortTask(
 	return EBTNodeResult::Aborted;
 }
 
+/**
+ * @brief BT 实例销毁回调 — 清理残留 Timer + 攻击状态, 防 AI 死亡时状态泄漏
+ * @param OwnerComp BT 组件引用(此时可能正在析构)
+ *
+ * 大厂原则:只清状态不调 FinishLatentTask — OwnerComp 已在析构,FinishLatentTask 无效.
+ * Mem.bFinished=true 防止后续 Timer/Tick 回调再进来.
+ */
 void UBTTask_WaitMontageFinish::OnInstanceDestroyed(
 	UBehaviorTreeComponent& OwnerComp)
 {
@@ -212,6 +229,14 @@ void UBTTask_WaitMontageFinish::OnTimeoutReached(
 	}
 }
 
+/**
+ * @brief 清理 Timer 句柄 + 标记 bFinished — 三个出口(正常结束/Abort/超时)共用兜底
+ * @param OwnerComp BT 组件引用(用于拿 World 清 Timer)
+ * @param Mem 任务内存引用
+ *
+ * 大厂原则:三个出口(蒙太奇完成/Abort/超时)都调本函数保持 Timer 状态一致.
+ * CleanupTimer 只清 Timer Handle 和 bFinished, 不清攻击状态(攻击状态由调用方按场景清).
+ */
 void UBTTask_WaitMontageFinish::CleanupTimer(
 	UBehaviorTreeComponent& OwnerComp, FTaskMemory& Mem)
 {

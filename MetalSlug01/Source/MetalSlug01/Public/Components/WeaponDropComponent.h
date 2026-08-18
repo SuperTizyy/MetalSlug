@@ -78,6 +78,34 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDroppedWeaponExpired, ABaseWeapon
 // ==========================================
 // UWeaponDropComponent
 // ==========================================
+/**
+ * @class UWeaponDropComponent
+ * @brief 掉落武器自治组件 - 管理玩家丢弃武器的生命周期/物理/弹药快照
+ *
+ * 单一职责: 玩家按 G 键丢弃主武器 → 武器落地 → 其他玩家可捡起 → 过期溶解
+ *
+ * 大厂架构中的角色:
+ *   - 武器自治: 挂在 ABaseWeapon 上, 与 WeaponDissolveComponent/WeaponFireComponent 对称
+ *   - 单一真理源: 弹药数据归 WeaponFireComponent, 本组件只保存快照用于恢复
+ *   - 零兜底: 参数错/状态错 → Log Error + return, 不静默跳过
+ *   - 单一 RPC 入口: 客户端 → Server_TryPickupWeapon → 服务器处理拾取
+ *
+ * 关键设计:
+ *   - PMC 抛物线 + OnProjectileStop 落地 (替代旧版 SetSimulatePhysics 双重模拟)
+ *   - 服务器权威: 客户端只发 RPC, 服务器处理 CancelDroppedState + Attach
+ *   - 扔飞刀模式: 锁定 throw_yaw → 抛出姿态 = 落地姿态, 无 yaw 突变
+ *   - 弹药快照: SaveAmmoSnapshot (丢弃时) + RestoreAmmoSnapshot (捡起时)
+ *
+ * 业务规则:
+ *   - AI 不捡武器 (玩家路径专用)
+ *   - 玩家只有 Primary 槽位为空时才能捡起
+ *   - 默认 60s 寿命到期 → 启动溶解消失
+ *
+ * 使用方式:
+ *   - ABaseWeapon 构造函数 CreateDefaultSubobject<UWeaponDropComponent>
+ *   - UWeaponAttachmentComponent::DetachWeaponToGround 调 StartDroppedState
+ *   - UWeaponAttachmentComponent::Server_TryPickupWeapon 调 CancelDroppedState
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UWeaponDropComponent : public UActorComponent
 {

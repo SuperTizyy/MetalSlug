@@ -16,6 +16,26 @@
 // 能量改变多播: 供 UI/HUD/特效订阅
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEnergyChanged, float, NewEnergy);
 
+/**
+ * @class UEnergyComponent
+ * @brief 能量管理组件 - 玩家技能消耗系统（冲刺/技能等）
+ *
+ * 单一职责: 持有并管理角色的能量值 (CurrentEnergy/MaxEnergy)
+ *
+ * 大厂架构中的角色:
+ *   - 数据权威: 真理源在此组件, BaseCharacter 不再持有重复的能量字段
+ *   - 网络复制: CurrentEnergy (ReplicatedUsing=OnRep_CurrentEnergy) 同步到所有客户端
+ *   - 事件总线: OnEnergyChanged 供 HUD/特效订阅 (替代 OnRep 轮询的反模式)
+ *
+ * 关键设计:
+ *   - 服务器调 Consume/Add → 直接修改 CurrentEnergy → 触发 Broadcast + 复制
+ *   - 客户端收到复制 → OnRep_CurrentEnergy → Broadcast 给本地 HUD
+ *   - InitializeEnergy 接收配置参数 (策划在 BP 配置)
+ *
+ * 使用方式:
+ *   - ABaseCharacter::ConsumeEnergy / AddEnergy 转发到本组件
+ *   - HUD (PlayerStatusWidget) 订阅 OnEnergyChanged 刷新能量条
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UEnergyComponent : public UActorComponent
 {

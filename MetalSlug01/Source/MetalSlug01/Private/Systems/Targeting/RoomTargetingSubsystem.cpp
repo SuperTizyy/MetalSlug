@@ -1,5 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file RoomTargetingSubsystem.cpp
+ * @brief AI 仇恨账本 + 目标选择子系统实现
+ */
 #include "Systems/Targeting/RoomTargetingSubsystem.h"
 #include "Systems/RoomGameState.h"
 #include "Systems/Core/RoomPlayerState.h"
@@ -24,6 +28,12 @@ URoomTargetingSubsystem* URoomTargetingSubsystem::Get(const UObject* WorldContex
 	return nullptr;
 }
 
+/**
+ * @brief 子系统创建守卫 — Server-only(仅服务器端创建)
+ *
+ * 镜像 v31.5 风格: NetMode != NM_Client 才允许创建
+ * AI 仇恨账本纯服务端管理, 客户端通过 GameState 复制感知
+ */
 bool URoomTargetingSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	if (UWorld* World = Cast<UWorld>(Outer))
@@ -53,11 +63,27 @@ int32 URoomTargetingSubsystem::GetAttackerCount(ABaseCharacter* TargetEnemy)
 	return Count;
 }
 
+/**
+ * @brief 判断目标是否被任意 AI 锁定(用于 BT 装饰器快速判定)
+ * @param TargetEnemy 候选目标
+ * @return true=至少有一个存活的 AI 正在追该目标
+ *
+ * 等价于 GetAttackerCount(TargetEnemy) > 0
+ * 常用于 BTDecorator_TargetAvailable 之类的节点
+ */
 bool URoomTargetingSubsystem::IsTargetLocked(ABaseCharacter* TargetEnemy)
 {
 	return TargetEnemy && GetAttackerCount(TargetEnemy) > 0;
 }
 
+/**
+ * @brief 判断目标是否被排除自己之外的其他 AI 锁定(反扎堆判定)
+ * @param TargetEnemy 候选目标
+ * @param ExcludeAI 要排除的 AI(通常是请求者自己)
+ * @return true=有其他 AI 在追这个目标
+ *
+ * 用于 RequestTargetForAI 的反扎堆过滤 — 避免 AI 都打同一个目标
+ */
 bool URoomTargetingSubsystem::IsTargetLockedByOthers(ABaseCharacter* TargetEnemy, ABaseCharacter* ExcludeAI)
 {
 	if (!TargetEnemy) return false;
@@ -84,6 +110,15 @@ void URoomTargetingSubsystem::ReleaseTarget(ABaseCharacter* RequestingAI)
 	}
 }
 
+/**
+ * @brief 清空所有 AI 仇恨账本(回合切换 / 重置场景)
+ *
+ * 调用时机:
+ * - 比赛结束 → 清空避免下一局继承
+ * - Round 切换 → 清空让 AI 重新选目标
+ *
+ * 大厂原则: 单一入口清空, 避免散落 TMap.Empty() 写法不一致
+ */
 void URoomTargetingSubsystem::ClearAllHunting()
 {
 	AIHuntingMap.Empty();

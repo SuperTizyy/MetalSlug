@@ -27,17 +27,8 @@
 #include "DrawDebugHelpers.h"
 #endif
 
-// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
-// 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
-static TAutoConsoleVariable<int32> CVarShowTraceDebug(
-	TEXT("g.MetalSlug.ShowTraceDebug"),
-	0,
-	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
-	TEXT("0 = hide all trace debug visuals (default)\n")
-	TEXT("1 = show all trace debug visuals\n")
-	TEXT("Affects: BaseWeapon::Multicast_PlayFireTraceVisual, BTDecorator_HasClearShot, RangedLineStrategy"),
-	ECVF_Default
-);
+// 【v241.1 大厂架构】trace debug 可视化统一开关 — 见 Debug/MetalSlugDebugCVars.h
+#include "Debug/MetalSlugDebugCVars.h"
 
 namespace HasClearShotPrivate
 {
@@ -77,6 +68,12 @@ UBTDecorator_HasClearShot::UBTDecorator_HasClearShot()
 		AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 显示 IAISightTargetInterface 调用链路与关键参数
+ * @return 多行描述字符串,展示 TargetKey / SelfKey / Policy / MaxRange
+ *
+ * 仅用于 BT 编辑器可视化, 不参与运行时决策. 配错 Target Key → 提示拒绝运行.
+ */
 FString UBTDecorator_HasClearShot::GetStaticDescription() const
 {
 	const FString PolicyStr = (Policy == EHasClearShotPolicy::RequireVisible)

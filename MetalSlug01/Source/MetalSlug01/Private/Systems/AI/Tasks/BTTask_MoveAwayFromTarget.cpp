@@ -55,6 +55,10 @@ UBTTask_MoveAwayFromTarget::UBTTask_MoveAwayFromTarget()
 		AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示退一步位移算法与朝向复用
+ * @return 多行描述,展示距离参数 + 方向算法 + UAIFacingMoveHelper 复用 + 到达/超时语义
+ */
 FString UBTTask_MoveAwayFromTarget::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("退一步 (面向敌人后退) — %.0fcm。\n"
@@ -133,6 +137,15 @@ EBTNodeResult::Type UBTTask_MoveAwayFromTarget::ExecuteTask(
 	return EBTNodeResult::InProgress;
 }
 
+/**
+ * @brief Tick 入口 — 异步任务每帧检测, 完成或超时 FinishLatentTask
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory 任务内存(FTaskMemory)
+ * @param DeltaSeconds 帧间隔秒
+ *
+ * 大厂架构:此函数只负责调度, 真正判断在 CheckArrival 内(MoveTo 状态机查询).
+ * 失败保护:bMoveStarted==false → Failed, 防止 ExecuteTask 失败后 Tick 还在跑.
+ */
 void UBTTask_MoveAwayFromTarget::TickTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {
@@ -192,6 +205,12 @@ FVector UBTTask_MoveAwayFromTarget::ComputeStepBackLocation(
 	return StepBackLoc;
 }
 
+/**
+ * @brief 发起异步 MoveToLocation, 调用 AIController 寻路接口
+ * @param OwnerComp BT 组件引用
+ * @param Dest 退一步的目标位置
+ * @return MoveTo 请求成功或已在目标 → true;失败 → false
+ */
 bool UBTTask_MoveAwayFromTarget::StartMoveTo(
 	UBehaviorTreeComponent& OwnerComp, const FVector& Dest)
 {
@@ -208,6 +227,13 @@ bool UBTTask_MoveAwayFromTarget::StartMoveTo(
 		|| Result == EPathFollowingRequestResult::AlreadyAtGoal;
 }
 
+/**
+ * @brief 检查 MoveTo 状态 — Idle 完成 / Waiting 超时则恢复朝向并 FinishLatentTask
+ * @param OwnerComp BT 组件引用
+ * @param NodeMemory 任务内存(FTaskMemory)
+ *
+ * 大厂原则:完成或超时都调 RestoreFacingMove(Helper 幂等)防止 Movement 残留.
+ */
 void UBTTask_MoveAwayFromTarget::CheckArrival(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {

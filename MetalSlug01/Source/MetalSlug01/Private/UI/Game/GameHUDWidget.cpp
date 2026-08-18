@@ -1,6 +1,28 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
+// GameHUDWidget 实现 — 游戏主 HUD 组件 (战斗中的根 Widget)
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UGameHUDWidget 类 — 所有战斗 HUD 子组件的容器
+//   2. NativeConstruct/NativeDestruct/NativeTick: UE 标准 Widget 生命周期
+//   3. GameState 绑定 + CharacterEvents 绑定: 双数据源委托驱动
+//   4. 转发壳模式: 所有公开方法都是转发给子 Widget (Widget_PlayerStatus 等)
+//
+// 关键架构决策:
+//   - 单一订阅点: GameHUDWidget 是唯一订阅 GameState/CharacterEvents 的对象
+//   - 事件 + 拉取双轨制: HUD 同时订阅事件 + 主动拉取快照 (兜底事件丢失)
+//   - 重试机制: TryBindToCharacterEvents/TryBindToGameState 都带定时器重试
+//   - Watchdog 兜底: TickInvincibilityWatchdog 每 0.1s 拉一次无敌期状态
+//
+// 大厂原则落地:
+//   - 单一真理源: HUD 不持有业务数据, 只转发 GameState/CharacterEvents
+//   - 零兜底: Widget 为空时 Log Error 提示修复 BP, 不静默跳过
+//   - 转发壳: 公开方法只做"if(Widget) Widget->UpdateXxx()", 不做业务
+// ==========================================
+
+// ==========================================
 // 头文件包含区
 // ==========================================
 #include "UI/Game/GameHUDWidget.h"

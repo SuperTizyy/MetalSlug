@@ -5,6 +5,9 @@
 // ==========================================
 // URoomTargetingSubsystem — AI 仇恨账本 + 目标选择子系统
 //
+// @file RoomTargetingSubsystem.h
+// @brief AI 仇恨账本子系统 — 服务器权威选目标
+//
 // 【2026.07.11 v31 大厂架构重构】从 RoomGameMode 拆出
 //
 // 设计原则:
@@ -111,6 +114,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Room|Targeting")
 	bool IsTargetLocked(ABaseCharacter* TargetEnemy);
 
+	/**
+	 * @brief 检查 TargetEnemy 是否被"非 ExcludeAI 的其他 AI"锁定
+	 *
+	 * 用途: AI 申请目标时,优先抢"别人没锁的" → 排除自己(GetAttackerCount 已包含自己)
+	 *
+	 * @param TargetEnemy 目标敌人
+	 * @param ExcludeAI 排除的 AI (通常是请求方 AI 自己)
+	 * @return true=被他人锁定, false=无人锁 / 仅 ExcludeAI 锁
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Room|Targeting")
 	bool IsTargetLockedByOthers(ABaseCharacter* TargetEnemy, ABaseCharacter* ExcludeAI);
 

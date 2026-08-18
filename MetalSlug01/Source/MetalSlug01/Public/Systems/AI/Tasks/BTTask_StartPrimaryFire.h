@@ -61,6 +61,7 @@ class METALSLUG01_API UBTTask_StartPrimaryFire : public UBTTaskNode
 public:
 	UBTTask_StartPrimaryFire();
 
+	/** @brief BT 编辑器静态描述 (显示 TargetActorKey + 开火模式) */
 	virtual FString GetStaticDescription() const override;
 
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;

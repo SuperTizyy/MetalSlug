@@ -1,6 +1,20 @@
 // Copyright (c) 2026.
-// 文件作用: AI 控制器基类，负责 AI 的感知、行为树驱动、阵营判定、追逐兜底等核心逻辑
-// 设计原则: 大厂架构 — 关键行为不依赖单一系统，多层兜底保证 AI 不会"死站"
+//
+// 文件作用: AI 控制器基类实现, 负责 AI 的感知、行为树驱动、阵营判定、追逐兜底等核心逻辑
+// 设计原则: 大厂架构 — 关键行为不依赖单一系统, 多层兜底保证 AI 不会"死站"
+//
+// ========================================================================
+// 大厂架构 P0 修复链 (按版本号倒序)
+// ========================================================================
+//   v222.0: AIC.bAlwaysRelevant=true (修复 Tab Scoreboard 远端 AI 被剔除)
+//   v221.x: CachedFactionTag 升级 Replicated (Tab Scoreboard 数据流)
+//   v218.x: Server_KickPlayer 阶段分支 (PendingAI / AIController / 真人)
+//   v202.0: bReplicates=true (AIC KDA 镜像字段同步到客户端)
+//   v54.4:  移除 UAIProfileAsset 中间层, 直接接 UAIBehaviorConfigSO
+//   v54.0:  BT 100% 接管, 删除 C++ TickChaseFallback / UpdateNearbyThreatByDistance
+//   v26.5:  关卡预放路径同步 Pawn.FactionTag → CachedFactionTag (真理源回退到 Pawn)
+//   v22-v23: BTService 上帝模式 → 单一职责拆分 (UpdateBlackboard → UpdateDistance/Health/RefreshTarget)
+// ========================================================================
 
 // 引入本类的头文件，包含类声明和接口定义
 #include "Systems/BaseAIController.h"
@@ -426,31 +440,62 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 	// 问题: BP 蓝图 CharacterMovement 组件的 Max Walk Speed=400 覆盖了 C++ 设的值,
 	//       导致 AI Spawn 后 MaxWalkSpeed=400 (玩家同速), 看起来"AI 变慢了"
 	// 修复: 无条件强制覆盖 BP 默认值, 优先从配置表读 WalkSpeed, 无配置才报错
+	//
+	// 【v246.3 大厂架构 P0 修复】母体速度真理源统一
+	//   - 母体: 走 PlayerConfigAsset.MotherMaxWalkSpeed (单一真理源, 与玩家/AI 共用)
+	//   - 人类: 走 RuntimeConfig.GetScaledMovement().WalkSpeed (AI 专属)
+	//   - 旧版 (v133.3) 用 ConfigSO.MotherWalkSpeed (默认 500) 当 AI 母体速度真理源
+	//     → 与 MutatePawnToMother 写的 PlayerConfig.MotherMaxWalkSpeed (800) 不一致
+	//     → 母体复活移动锁定解锁后 → 走 ConfigSO (500) → "走路很慢"
 	if (ABaseCharacter* Char = Cast<ABaseCharacter>(InPawn))
 	{
 		if (UCharacterMovementComponent* Move = Char->GetCharacterMovement())
 		{
 			// 【v42】优先从 RuntimeConfig 读 (Possess 后 SetupMeleeAI 已加载)
 			// 零兜底: 配置未加载时 Log Error, 不允许静默用默认值
-			if (RuntimeConfig)
+			if (Char->bIsMother)
 			{
+				// 母体路径: PlayerConfigAsset.MotherMaxWalkSpeed (单一真理源)
+				if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+				{
+					if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+					{
+						const float WS = PC->MotherMaxWalkSpeed;
+						if (WS <= 0.f)
+						{
+							UE_LOG(LogBaseAI, Error,
+								TEXT("[%s] OnPossess: 母体速度真理源未配 (PlayerConfigAsset.MotherMaxWalkSpeed=%.0f <= 0, Pawn=%s). "
+									 "修复: DA_PlayerConfigAsset → Movement → MotherMaxWalkSpeed 设置 > 0"),
+								*GetName(), WS, *Char->GetName());
+							Move->MaxWalkSpeed = 0.f;
+						}
+						else
+						{
+							Move->MaxWalkSpeed = WS;
+						}
+					}
+					else
+					{
+						UE_LOG(LogBaseAI, Error,
+							TEXT("[%s] OnPossess: SpawnSubsystem 或 PlayerConfigAsset 为空 (Pawn=%s, bIsMother=true). "
+								 "修复: 检查 GM.RoomsGameMode.PlayerConfigAsset 配置."),
+							*GetName(), *Char->GetName());
+						Move->MaxWalkSpeed = 0.f;
+					}
+				}
+			}
+			else if (RuntimeConfig)
+			{
+				// 人类路径: RuntimeConfig.GetScaledMovement().WalkSpeed (AI 专属)
 				const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
-
-				// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
-				//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
-				//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
-				const float WS = Char->bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
+				const float WS = MoveParams.WalkSpeed;
 
 				if (WS <= 0.f)
 				{
 					UE_LOG(LogBaseAI, Error,
-						TEXT("[%s] OnPossess: 配置表 %s=%.0f <= 0 (bIsMother=%d), AI 不会移动! "
-							 "修复: DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
-						*GetName(),
-						Char->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
-						WS,
-						Char->bIsMother ? 1 : 0,
-						Char->bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
+						TEXT("[%s] OnPossess: 配置表 WalkSpeed=%.0f <= 0 (bIsMother=%d), AI 不会移动! "
+							 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0"),
+						*GetName(), WS, Char->bIsMother ? 1 : 0);
 					Move->MaxWalkSpeed = 0.f;
 				}
 				else
@@ -460,9 +505,8 @@ void ABaseAIController::OnPossess(APawn* InPawn)
 			}
 			else
 			{
-				// RuntimeConfig 为空: 关卡预放 AI 在 SetupMeleeAI 调用之前触发 OnPossess
+				// RuntimeConfig 为空 (关卡预放 AI 在 SetupMeleeAI 调用之前触发 OnPossess)
 				// SetupMeleeAI 末尾会重新设 WalkSpeed, 这里只做防御性 0 值覆盖
-				// 【v201.10.2 降级】Display 级别 — Warning 触发 UI 弹窗
 				UE_LOG(LogBaseAI, Display,
 					TEXT("[%s] OnPossess: RuntimeConfig 为空, 速度将在 SetupMeleeAI 末尾初始化"),
 					*GetName());
@@ -1215,27 +1259,49 @@ void ABaseAIController::OnConfigLoaded()
 	// 修复: OnConfigLoaded 末尾直接设置 MaxWalkSpeed
 	//       → 不调用 LockMovementForCooldown(false) (幂等检查会拦截)
 	//       → 直接从 RuntimeConfig 读 WalkSpeed 并设置
+	//
+	// 【v246.3 大厂架构 P0 修复】母体速度真理源统一
+	//   - 母体: PlayerConfigAsset.MotherMaxWalkSpeed (与玩家路径镜像)
+	//   - 人类: RuntimeConfig.GetScaledMovement().WalkSpeed
 	if (ABaseCharacter* Char = Cast<ABaseCharacter>(GetPawn()))
 	{
 		if (UCharacterMovementComponent* Move = Char->GetCharacterMovement())
 		{
-			if (RuntimeConfig)
+			if (Char->bIsMother)
 			{
+				// 母体路径: PlayerConfigAsset.MotherMaxWalkSpeed (单一真理源)
+				if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+				{
+					if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+					{
+						const float WS = PC->MotherMaxWalkSpeed;
+						Move->MaxWalkSpeed = WS;
+						UE_LOG(LogBaseAI, Verbose,
+							TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f (bIsMother=1, MotherMaxWalkSpeed=PlayerConfigAsset)"),
+							*GetName(), WS);
+					}
+					else
+					{
+						UE_LOG(LogBaseAI, Error,
+							TEXT("[%s] OnConfigLoaded: 母体但 PlayerConfigAsset 为空, MaxWalkSpeed=0. 修复: GM.RoomsGameMode.PlayerConfigAsset."),
+							*GetName());
+						Move->MaxWalkSpeed = 0.f;
+					}
+				}
+			}
+			else if (RuntimeConfig)
+			{
+				// 人类路径: RuntimeConfig.GetScaledMovement().WalkSpeed
 				const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
-
-				// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
-				const float WS = Char->bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
-
+				const float WS = MoveParams.WalkSpeed;
 				Move->MaxWalkSpeed = WS;
-				Char->bIsMovementLocked = false;
-				bMovementLockedForCooldown = false;
 				UE_LOG(LogBaseAI, Verbose,
-					TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f (bIsMother=%d, %s)"),
-					*GetName(), WS,
-					Char->bIsMother ? 1 : 0,
-					Char->bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"));
+					TEXT("[%s] OnConfigLoaded: 速度恢复 MaxWalkSpeed=%.0f (bIsMother=0, WalkSpeed=AIRuntimeConfig)"),
+					*GetName(), WS);
 			}
 		}
+		Char->bIsMovementLocked = false;
+		bMovementLockedForCooldown = false;
 	}
 
 	// 【P0 架构升级 2026.07.06】延迟 BT 启动 — 等 GameMode 广播战斗开始
@@ -1860,33 +1926,6 @@ float ABaseAIController::GetEffectiveAttackInterval() const
 		TEXT("[%s] GetEffectiveAttackInterval: RuntimeConfig 缺失, 返回兜底 5s. 修复: 检查 RuntimeConfig 是否挂在 AIController"),
 		*GetName());
 	return 5.f;
-}
-
-
-/**
- * GetEffectiveAttackDamage — AI 攻击伤害的最终值
- *
- * 【P0 大厂架构 2026.07.06 重构】修复 ConfigSO.Damage 死代码 bug
- *
- * 优先级:
- *   1. RuntimeConfig 拿得到 → 难度缩放后的 Combat.Damage
- *   2. 拿不到 → 兜底 12.f (与 ConfigSO 默认一致)
- *
- * 设计:
- *   - 单点维护: 所有 AI 通道读伤害都走这里
- *   - 难度缩放在 Config 内部完成, 单一数据源
- *   - 跟 GetEffectiveAttackInterval 同一架构
- */
-float ABaseAIController::GetEffectiveAttackDamage() const
-{
-	if (UAIRuntimeConfigComponent* ConfigComp = RuntimeConfig)
-	{
-		// GetScaledCombat 内部完成难度缩放
-		return ConfigComp->GetScaledCombat().Damage;
-	}
-
-	// 兜底
-	return 12.f;
 }
 
 
@@ -2646,30 +2685,49 @@ void ABaseAIController::LockMovementForCooldown(bool bLock)
 	}
 	else
 	{
-		// 【v42 2026.07.14 大厂架构重构】恢复速度从配置表读 WalkSpeed
-		// RuntimeConfig 在 Possess 后 SetupMeleeAI 已加载, GetScaledMovement() 一定有效
+		// 【v42 2026.07.14 大厂架构重构】恢复速度按 Pawn.bIsMother 分流
+		// 【v246.3 大厂架构 P0 修复】母体真理源改为 PlayerConfigAsset (与 OnPossess 镜像)
 		float RestoreSpeed = 0.f; // 默认 0 (零兜底: 配置未加载时不允许 AI 乱跑)
-
-		// 【v133.3 2026.08.02 大厂架构】按 Pawn.bIsMother 分流 — 单一真理源
 		const bool bIsMother = MyChar ? MyChar->bIsMother : false;
 
-		if (RuntimeConfig)
+		if (bIsMother)
 		{
+			// 母体路径: PlayerConfigAsset.MotherMaxWalkSpeed (单一真理源)
+			if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+			{
+				if (UPlayerConfigAsset* PC = SpawnSys->GetPlayerConfigAsset())
+				{
+					RestoreSpeed = PC->MotherMaxWalkSpeed;
+					if (RestoreSpeed <= 0.f)
+					{
+						UE_LOG(LogBaseAI, Error,
+							TEXT("[%s] LockMovementForCooldown Unlock: 母体但 PlayerConfigAsset.MotherMaxWalkSpeed=%.0f <= 0. "
+								 "修复: DA_PlayerConfigAsset → Movement → MotherMaxWalkSpeed 设置 > 0"),
+							*GetName(), RestoreSpeed);
+						RestoreSpeed = 0.f;
+					}
+				}
+				else
+				{
+					UE_LOG(LogBaseAI, Error,
+						TEXT("[%s] LockMovementForCooldown Unlock: 母体但 PlayerConfigAsset 为空, RestoreSpeed=0. "
+							 "修复: GM.RoomsGameMode.PlayerConfigAsset."),
+						*GetName());
+				}
+			}
+		}
+		else if (RuntimeConfig)
+		{
+			// 人类路径: RuntimeConfig.GetScaledMovement().WalkSpeed
 			const FAIMovementParams MoveParams = RuntimeConfig->GetScaledMovement();
-			//   - bIsMother=true  → MotherWalkSpeed (母体 AI)
-			//   - bIsMother=false → WalkSpeed      (人类 AI, 默认)
-			RestoreSpeed = bIsMother ? MoveParams.MotherWalkSpeed : MoveParams.WalkSpeed;
+			RestoreSpeed = MoveParams.WalkSpeed;
 
 			if (RestoreSpeed <= 0.f)
 			{
 				UE_LOG(LogBaseAI, Error,
-					TEXT("[%s] LockMovementForCooldown: 配置表 %s=%.0f <= 0 (bIsMother=%d), AI 不会移动! "
-						 "修复: DA_AIBehaviorConfig_XXX → Movement → %s 设置 > 0"),
-					*GetName(),
-					bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"),
-					RestoreSpeed,
-					bIsMother ? 1 : 0,
-					bIsMother ? TEXT("MotherWalkSpeed (例如 500)") : TEXT("WalkSpeed (例如 250)"));
+					TEXT("[%s] LockMovementForCooldown Unlock: RuntimeConfig.WalkSpeed=%.0f <= 0, AI 不会移动! "
+						 "修复: DA_AIBehaviorConfig_XXX → Movement → WalkSpeed 设置 > 0"),
+					*GetName(), RestoreSpeed);
 				RestoreSpeed = 0.f;
 			}
 		}
@@ -2690,7 +2748,7 @@ void ABaseAIController::LockMovementForCooldown(bool bLock)
 		UE_LOG(LogBaseAI, Verbose,
 			TEXT("[%s] LockMovementForCooldown: UNLOCK (MaxWalkSpeed=%.0f, bIsMovementLocked=false, bIsMother=%d, 真理源=%s)"),
 			*GetName(), RestoreSpeed, bIsMother ? 1 : 0,
-			bIsMother ? TEXT("MotherWalkSpeed") : TEXT("WalkSpeed"));
+			bIsMother ? TEXT("PlayerConfigAsset.MotherMaxWalkSpeed") : TEXT("AIRuntimeConfig.WalkSpeed"));
 	}
 }
 

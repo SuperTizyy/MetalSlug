@@ -26,6 +26,26 @@ class USoundBase;
 class USoundAttenuation;
 class ACharacter;
 
+/**
+ * @class UFootstepComponent
+ * @brief 脚步音效组件 - 距离衰减播放封装
+ *
+ * 单一职责: 选择音效资源 + 应用距离衰减, 调用 UGameplayStatics::PlaySoundAtLocation
+ *
+ * 大厂架构中的角色:
+ *   - 职责单一: 只管"放音", 不管"网络同步" (那是 BaseCharacter::Multicast_PlayFootstep 的事)
+ *   - 单一真理源: FootstepSound + FootstepAttenuation 都在 BP 配置, 不允许 CVar/C++ 兜底
+ *   - 零兜底: 任一字段缺失 → Log Error + 拒绝播放, 强制修复 BP 配置
+ *
+ * 调用链:
+ *   AnimNotify → BaseCharacter::PlayFootstepSound → Multicast_PlayFootstep RPC
+ *   → FootstepComponent->PlayFootstep → UGameplayStatics::PlaySoundAtLocation
+ *
+ * v241 重构后:
+ *   - 删除 Crouch/Run/Walk 三选一反模式分支
+ *   - 删除 CVarFootstepVolume 兜底
+ *   - 删除地面 LineTrace 物理材质查询 (没有业务用途)
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UFootstepComponent : public UActorComponent
 {

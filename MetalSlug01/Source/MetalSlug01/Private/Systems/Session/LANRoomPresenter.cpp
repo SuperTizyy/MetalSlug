@@ -1,4 +1,8 @@
 // MetalSlug01. All Rights Reserved.
+/**
+ * @file LANRoomPresenter.cpp
+ * @brief 大厅页面的 Presenter (ViewModel) 实现 — 状态机 + 业务逻辑
+ */
 #include "Systems/Session/LANRoomPresenter.h"
 #include "Systems/Session/SessionManagerSubsystem.h"
 // 引入 AccountService (用于 NotifyBecame*Host 内部读取账号)
@@ -26,6 +30,17 @@ void ULANRoomPresenter::Initialize(FSubsystemCollectionBase& Collection)
     }
 }
 
+/**
+ * @brief Presenter 销毁时的清理入口(防止野指针回调 + 状态机重置)
+ *
+ * 清理流程(P0 防野指针):
+ * 1. 调 UnbindView() 解绑 UI Widget 弱引用
+ * 2. 清空内部状态(CachedRoomList/CachedSignatures/SelectedRoomIndex 等)
+ * 3. 状态机回到 Idle(避免 Presenter 死透但状态卡中间)
+ * 4. 清空 SessionManager 引用(UE GC 处理 Pending*Delegate 中 UFUNCTION 绑定)
+ *
+ * Dynamic Delegate ExecuteIfBound 在 Object dead 时自动 no-op, 显式重置仅更清晰
+ */
 void ULANRoomPresenter::Deinitialize()
 {
 	// 【P0 修复】解除所有等待中的 SessionManager 委托, 防止野指针回调
@@ -53,16 +68,29 @@ void ULANRoomPresenter::Deinitialize()
 	Super::Deinitialize();
 }
 
+/**
+ * @brief 绑定 UI Widget 视图(Presenter-View 模式)
+ * @param InView 要绑定的 Widget(弱引用, 不增加引用计数)
+ */
 void ULANRoomPresenter::BindView(UUserWidget* InView)
 {
     BoundView = InView;
 }
 
+/**
+ * @brief 解绑 UI Widget 视图 — 防止 Widget 销毁后 Presenter 仍持有野指针
+ */
 void ULANRoomPresenter::UnbindView()
 {
     BoundView.Reset();
 }
 
+/**
+ * @brief UI Widget 显示时的回调 — 标记可见状态 + 立即刷新房间列表
+ *
+ * 大厂原则: 状态机 bIsWidgetVisible 标记, 用于过滤异步回调时机
+ * 例如: SessionManager 异步 OnFindRoomsComplete 到达时若 Widget 已隐藏, 不刷新 UI
+ */
 void ULANRoomPresenter::OnWidgetShow()
 {
     bIsWidgetVisible = true;
@@ -98,6 +126,21 @@ void ULANRoomPresenter::RequestRefreshRoomList()
 	SessionManager->FindRooms(FindDelegate);
 }
 
+/**
+ * @brief 请求创建房间(玩家从 UI 触发)
+ * @param RoomName 房间名
+ * @param Password 房间密码(可空)
+ * @param GameMode 游戏模式字符串(用于房间元数据)
+ * @param MapName 地图名
+ * @param LevelName 关卡 FName(用于 Travel)
+ *
+ * 流程:
+ * 1. 状态守卫 — 仅 Idle 状态允许创房
+ * 2. 读取当前登录账号 → 写入 PendingCreationParams
+ * 3. 状态切到 AccountChecking
+ * 4. 先 FindRooms 检测同号冲突(防止双开撞车)
+ * 5. OnAccountCheckFindComplete 决定下一步(无冲突则真正创房)
+ */
 void ULANRoomPresenter::RequestCreateRoom(const FString& RoomName, const FString& Password,
 	const FString& GameMode, const FString& MapName, FName LevelName)
 {

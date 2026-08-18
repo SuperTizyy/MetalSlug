@@ -1,7 +1,20 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// KillFeedEntryWidget 实现 — 击杀信息条目子控件
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UKillFeedEntryWidget — 单条击杀信息的展示
+//   2. 三种模式: 击杀消息 / 系统消息 / 爆头击杀
+//   3. 字体颜色委托 WBP (蓝图详情面板配置, C++ 不设置颜色)
+//   4. 生命周期真理源 = Entry 自身 (启动 MessageLifetime Timer)
+//
+// 大厂原则 (v229.x v8 大厂重构):
+//   - 单一真理源: Entry 自己是生命周期权威 (Timer 在 SetKillInfo 内启动)
+//   - 字体颜色: 委托 WBP 蓝图, C++ 不内联 SetColorAndOpacity
+//   - 系统消息判定: KillerName 空 → 系统消息, Killer Text/Icon 隐藏
+//   - 0 兜底: Image_KillIcon 未绑 → Log Error; 不静默跳过
 // ==========================================
 #include "UI/Game/Widgets/SubWidgets/KillFeedEntryWidget.h"
 #include "Components/TextBlock.h"

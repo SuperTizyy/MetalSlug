@@ -34,6 +34,24 @@
 class UAIBehaviorConfigSO;
 
 /**
+ * @file MeleeAIController.h
+ * @brief 关卡预放 AI 控制器 (AMeleeAIController) — Level-Placed 路径单一入口
+ *
+ * 大厂架构角色:
+ *   - 单一职责: 仅处理「Level 预置 AI」的 Possess 逻辑
+ *   - 大厅入队 AI 不走这里, 走 SpawnAIInternal → InitializeFromConfig
+ *
+ * 与其他组件的关系:
+ *   - 上游: ABaseAIController (基类, 走 OnPossess 链路)
+ *   - 配套: UAIBehaviorConfigSO.LevelPlacedBehaviorTree + LevelPlacedWeaponClass (真理源)
+ *   - 下游: ABaseCharacter Pawn (执行武器生成 + 无敌期)
+ *
+ * v54.4 大厂重构:
+ *   - 直接接 UAIBehaviorConfigSO, 移除中间层 UAIProfileAsset
+ *   - 关卡预放 AI 唯一初始化入口: OnPossess → SetupMeleeAI(DefaultMeleeConfig)
+ */
+
+/**
  * AMeleeAIController — 关卡预放 AI 控制器
  *
  * 【v54.4 重构】职责明确: 只处理「Level 预置 AI」的 Possess 逻辑

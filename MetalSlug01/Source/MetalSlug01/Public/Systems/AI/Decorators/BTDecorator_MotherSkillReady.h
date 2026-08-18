@@ -53,6 +53,7 @@ class METALSLUG01_API UBTDecorator_MotherSkillReady : public UBTDecorator
 public:
 	UBTDecorator_MotherSkillReady();
 
+	/** @brief BT 编辑器静态描述 (显示 CooldownEndTimeKey 名) */
 	virtual FString GetStaticDescription() const override;
 
 	/**

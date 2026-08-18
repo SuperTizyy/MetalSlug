@@ -1,5 +1,18 @@
 // ==========================================
-// UDailyUpgradeRewardViewModel 实现
+// UDailyUpgradeRewardViewModel 实现 — DailyUpgradeReward 的 ViewModel
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDailyUpgradeRewardViewModel — Page 的 ViewModel 层
+//   2. Bind / Unbind 到 UUpgradeActivitySubsystem
+//   3. 数据访问接口: GetCurrentDay / GetTotalDays / IsCurrentDayClaimed 等
+//   4. 业务规则下沉到 ViewModel
+//
+// 大厂原则 (MVVM):
+//   - View 完全无感知数据源: ViewModel 集中处理数据访问
+//   - Bind/Unbind 生命周期: Page Initialize/Destruct 对应调用
+//   - 共享性: ViewModel 可被多个 Page/Widget 共享
+//   - BlueprintPure: 所有 Get 方法都是 BlueprintPure
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DailyUpgradeRewardViewModel.h"
 #include "Systems/Activity/UpgradeActivitySubsystem.h"

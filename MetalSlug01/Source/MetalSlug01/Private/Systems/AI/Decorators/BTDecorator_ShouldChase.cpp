@@ -25,6 +25,10 @@ UBTDecorator_ShouldChase::UBTDecorator_ShouldChase()
 		GET_MEMBER_NAME_CHECKED(UBTDecorator_ShouldChase, AttackRangeKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 显示追击判定表达式与迟滞阈值
+ * @return 多行描述,包含 BB Key 与 "距离 > AR + Margin" 判断
+ */
 FString UBTDecorator_ShouldChase::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("需要追击? (%s > %s+%.0f)\n"
@@ -35,6 +39,15 @@ FString UBTDecorator_ShouldChase::GetStaticDescription() const
 		HysteresisMargin);
 }
 
+/**
+ * @brief 追击距离判定 — 距离是否大于 (AR + Margin)
+ * @param OwnerComp BT 组件引用, 用于获取 BB
+ * @param NodeMemory Decorator 节点内存(本类未使用)
+ * @return 距离大于阈值 → true (进入 Chase 分支), 否则 false
+ *
+ * 单点决策: FlowAbortMode::Self, AI 进入攻击区间后会自动中断 Chase 分支切换到 Attack.
+ * 防御: BB 无效/Distance<0(无目标) → 拒判.
+ */
 bool UBTDecorator_ShouldChase::CalculateRawConditionValue(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
 {

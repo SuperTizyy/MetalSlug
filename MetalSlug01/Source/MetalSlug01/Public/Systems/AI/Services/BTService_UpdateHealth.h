@@ -42,6 +42,7 @@ class METALSLUG01_API UBTService_UpdateHealth : public UBTService
 public:
 	UBTService_UpdateHealth();
 
+	/** @brief BT 编辑器静态描述 (显示 HealthPercentKey + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 血量百分比 BB Key — 服务把 HP/MaxHP 写到这里 (Float, 0~1) */

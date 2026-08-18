@@ -1,6 +1,21 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
+// MetalSlug01GameModeBase 实现 (项目最基础 GameMode)
+// ==========================================
+//
+// 文件作用:
+//   1. AMyGameModeBase 构造函数 — 配置默认 Pawn/HUD/PlayerController
+//   2. 目前构造函数几乎全部注释 — 战斗地图使用更专门的 ARoomGameMode
+//   3. 本类主要用于登录/菜单地图, 不承担具体游戏逻辑
+//
+// 关键约束 (大厂原则 — 构造函数纯净):
+//   - 构造函数只能使用 ConstructorHelpers 或 StaticClass 等静态方式加载资源
+//   - 不能调用 SpawnActor 等运行时函数 (此时 World 尚未完全初始化)
+//   - 所有运行时逻辑应在 BeginPlay/PostLogin 等钩子里实现
+// ==========================================
+
+// ==========================================
 // 头文件包含区
 // ==========================================
 // 引入当前 GameMode 的头文件
@@ -17,11 +32,15 @@
 /**
  * AMyGameModeBase 构造函数
  *
- * 目的: 在 GameMode 创建时，立刻配置好默认的玩家角色蓝图和 HUD 类
- * 时机: 在游戏进入关卡、GameMode 被实例化时由引擎自动调用
+ * @brief  在 GameMode 创建时配置默认的玩家角色蓝图和 HUD 类
+ * @note   触发时机: 游戏进入关卡、GameMode 被引擎实例化时由引擎自动调用
+ * @note   关键约束: 构造函数中只能使用 ConstructorHelpers 或 StaticClass 等静态方式加载资源
+ *         不能调用 SpawnActor 等运行时函数,因为此时 World 尚未完全初始化
  *
- * 注意: 构造函数中只能使用 ConstructorHelpers 或 StaticClass 等静态方式加载资源
- *       不能调用 SpawnActor 等运行时函数，因为此时 World 尚未完全初始化
+ * 【当前状态】
+ * - 大部分配置项 (DefaultPawnClass/HUDClass/PlayerControllerClass) 已注释掉
+ * - 原因: 战斗地图使用 ARoomGameMode (更专门的子类), 本类主要服务登录/菜单地图
+ * - 启用方式: 取消对应行注释, 配 Blueprint 资源路径即可激活
  */
 AMyGameModeBase::AMyGameModeBase()
 {

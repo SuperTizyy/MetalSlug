@@ -1,7 +1,18 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// ActivityNavButton 实现 — 活动导航按钮 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UActivityNavButton — 活动导航按钮所有 UI 逻辑
+//   2. SetSelected / SetRedDot / SetActivityText 状态机
+//   3. OnMainButtonClicked 广播 OnNavButtonClicked
+//
+// 大厂原则:
+//   - 单一职责: 一个小按钮管自己的样式
+//   - 双委托: 普通委托 (Lambda) + 动态委托 (BP)
+//   - 防呆: 先 RemoveAll 再 AddDynamic
 // ==========================================
 #include "UI/Activity/Pages/Navigation/ActivityNavButton.h"
 #include "Styling/SlateBrush.h"

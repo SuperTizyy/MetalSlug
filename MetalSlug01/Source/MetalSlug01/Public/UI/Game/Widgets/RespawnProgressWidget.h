@@ -49,6 +49,13 @@
 //   UGameHUDWidget.OnInvincibilityChanged(false)
 //         ↓ SetVisibility(Collapsed)
 //   Widget_RespawnProgress 隐藏
+//
+// 【v201.6 大厂架构新增 — 移动锁定倒计时】
+//   - 与无敌期共用 UI 但语义不同:
+//     - 无敌期: 不可被攻击
+//     - 移动锁定: 复活后 3 秒不能移动
+//   - 由 UGameHUDWidget 的 OnRespawnMovementLockedChanged 事件驱动
+//   - 用 MovementLockRemainingSeconds 字段派生进度, 不与无敌期混淆
 // ==========================================
 #pragma once
 

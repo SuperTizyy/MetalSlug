@@ -52,6 +52,10 @@ UBTTask_StartPrimaryFire::UBTTask_StartPrimaryFire()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示主武器开火(v200.3.3 Owning Connection 修复 + v130 3D 追踪)
+ * @return 多行描述,展示射线算法路径 A/B + Muzzle Socket 起点 + Zero兜底
+ */
 FString UBTTask_StartPrimaryFire::GetStaticDescription() const
 {
 	const FString TargetInfo = TargetActorKey.SelectedKeyName.IsNone()

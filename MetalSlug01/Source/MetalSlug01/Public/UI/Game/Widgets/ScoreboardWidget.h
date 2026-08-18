@@ -3,6 +3,35 @@
 #pragma once
 
 // ==========================================
+// ScoreboardWidget 头文件 — 战斗排名计分板
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UScoreboardWidget — Tab 键打开的 Scoreboard 计分板 + 结算面板容器
+//   2. 显示攻/守方所有玩家 + 排名 + 击杀数 + 死亡数 + 助攻数
+//   3. 显示结算页: Border_SettlementOverlay + 返回大厅按钮
+//
+// 设计理念 (大厂原则 - 5 个核心原则):
+//   1. 单一真理源: Score 由 FKdaScoring::Compute(Kills, Assists, Deaths) 单一公式计算
+//   2. 单入口: RefreshScoreboard / RefreshRanksInContainer 统一所有排名更新
+//   3. 稳定排序: int64 复合 key 编码 + OriginalIndex tiebreaker
+//   4. 严格唯一排名: rank = i+1, 1,2,3,4... 即便同分也不重号
+//   5. 冻结快照: bIsFrozen 标志位让 Widget 与 Service 解耦 (结算页跨地图持久)
+//
+// 关键历史重构:
+//   v215: 增量更新替代 Clear+重建 → 修复闪烁
+//   v216: Border + Button 从 GameHUDWidget 迁移过来 (跨地图用)
+//   v217: 冻结后跳过 Tick 兜底刷新 → 修复排名"反复跳变"
+//   v229.x v2: 单一真理源 Score 公式 + 严格唯一排名 (用户业务规则)
+//   v229.x v2.1: 倒序 RemoveChild + 顺序 AddChild 修复排序顺序错乱
+//   v223.0: AI 数据源走 ReplicatedBattleAIEntries (Server-Authoritative)
+//
+// 大厂对应:
+//   - Lyra: UCommonActivatableWidget + 自定义排名 widget
+//   - Fortnite: 通用计分板
+// ==========================================
+
+// ==========================================
 // 头文件包含说明
 // ==========================================
 #include "CoreMinimal.h"

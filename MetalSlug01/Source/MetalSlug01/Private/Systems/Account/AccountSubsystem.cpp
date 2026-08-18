@@ -1,3 +1,19 @@
+// ========================================================================
+// AccountSubsystem.cpp — 本地账号会话层实现文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 实现 Initialize: 进程启动时生成 SessionToken (GUID)
+//   - 实现 SetCurrentUser / ClearSession: 纯内存操作,不写硬盘
+//   - 实现 MockLoginForTesting: 测试模式临时身份 (随机名 + Repository 自愈式建档)
+//   - 实现 GetAccountRecord: 占位返回 nullptr, 兼容旧蓝图调用点
+//
+// 大厂原则:
+//   - Session 零持久化:任何修改都不调用 SaveDataToDisk
+//   - 测试账号隔离:MockName 是内存临时账号,关闭游戏后自动销毁,不污染真实存档
+//   - 自愈式建档:MockLogin 时同步在 Repository 创建空 Record,避免下游 GetLastSelected 找不到
+// ========================================================================
+
 // ==========================================
 // 头文件包含区
 // ==========================================
@@ -39,6 +55,12 @@ void UAccountSubsystem::SetCurrentUser(const FString& Username)
 	UE_LOG(LogTemp, Log, TEXT("[AccountSession] SetCurrentUser = %s"), *Username);
 }
 
+/**
+ * @brief 清空当前登录会话(纯内存, 不写硬盘)
+ *
+ * 仅把 CurrentLoggedInUser 置空, 用于登出/账号切换场景
+ * 不触发任何磁盘 IO (账号持久化由 Repository 层负责, 不在 Session 层)
+ */
 void UAccountSubsystem::ClearSession()
 {
 	const FString Old = CurrentLoggedInUser;

@@ -16,6 +16,10 @@ UBTDecorator_ZombieAmmoEmpty::UBTDecorator_ZombieAmmoEmpty()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 显示生化 AI 弹夹空判定
+ * @return 多行描述,展示 "CurrentAmmo == 0 → 放行 (弹夹空)" 判定语义
+ */
 FString UBTDecorator_ZombieAmmoEmpty::GetStaticDescription() const
 {
 	return TEXT("BB.CurrentAmmo == 0 → 放行 (弹夹空)\n"

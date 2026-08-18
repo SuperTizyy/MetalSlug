@@ -1,6 +1,11 @@
 // Copyright (c) 2026. All Rights Reserved.
 // URoomMotherMutationSubsystem — 生化模式母体变异业务权威调度
 
+/**
+ * @file RoomMotherMutationSubsystem.cpp
+ * @brief 生化模式母体变异子系统实现 — 选母体 + 触发变异
+ */
+
 #include "Systems/Mother/RoomMotherMutationSubsystem.h"
 
 #include "Systems/RoomGameMode.h"

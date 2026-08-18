@@ -33,6 +33,10 @@ UBTService_UpdateZombieState::UBTService_UpdateZombieState()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示生化身份 + 人数快照频率与 BB Key 派生
+ * @return 多行描述,展示 Interval/bIsMother-Human/AliveMother-Human/身份切换清理 BB
+ */
 FString UBTService_UpdateZombieState::GetStaticDescription() const
 {
 	return FString::Printf(

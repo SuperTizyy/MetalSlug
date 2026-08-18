@@ -3,7 +3,19 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// DailyLoginDayItemWidget 头文件 — 每日登录单天条目
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UDailyLoginDayItemWidget — 单日登录条目 Widget
+//   2. 显示天数 + 奖励图标 + 领取按钮 + 状态颜色
+//   3. 第 8 天特殊样式 (可选, BindWidgetOptional 兼容)
+//
+// 架构理念:
+//   - 单一职责: 一个条目管自己
+//   - 数据驱动: Init 设置所有数据, 内部按状态显示
+//   - 异步加载: TSoftObjectPtr 异步加载贴图
+//   - 防御性: 颜色配置可空 (提供 EditAnywhere 默认)
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

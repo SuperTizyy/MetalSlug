@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// PlayerLabelWidget 实现 — 房间内的单个玩家条目 UI
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UPlayerLabelWidget — 单个玩家条目所有 UI 逻辑
+//   2. 4 个状态: 普通玩家/房主/AI/已踢
+//   3. 准备状态 + 房主标记 + AI 标记
+//
+// 大厂原则:
+//   - 单一职责: 只是 UI 列表项
+//   - 状态机: SetAsHost/SetAsAI/SetReadyState 切换
+//   - 防御性: 控件未绑 → 静默跳过 (BP 可能不绑)
+//   - 防自踢: SetAsHost 时永远隐藏踢人按钮
 // ==========================================
 #include "UI/Login/Pages/BattleRoom/PlayerLabelWidget.h"
 #include "Components/Border.h"

@@ -1,6 +1,21 @@
 // MetalSlug01. All Rights Reserved.
 #pragma once
 
+/**
+ * @file SessionResult.h
+ * @brief 会话结果结构体 + 房间模式转换工具类
+ *
+ * 包含内容:
+ *   - FRoomSessionResult: 解耦 UI 与 OnlineSubsystem 的结构化房间数据
+ *   - FRoomCreationParams: 创房参数结构
+ *   - URoomMatchModeUtils: 字符串 ↔ ERoomMatchMode 的单一真理源
+ *
+ * 大厂原则 — 单一真理源:
+ *   - SessionSettings GAME_MODE 字段只能存字符串 (广告层)
+ *   - GameState CurrentMatchMode 必须用枚举 (运行时决策层)
+ *   - 转换入口 = URoomMatchModeUtils, 不允许散落硬编码
+ */
+
 // ==========================================
 // 标准库 & UE 引擎头文件
 // ==========================================

@@ -38,6 +38,7 @@ class METALSLUG01_API UBTService_InitWanderHome : public UBTService
 public:
 	UBTService_InitWanderHome();
 
+	/** @brief BT 编辑器静态描述 (显示 WanderHomeKey) */
 	virtual FString GetStaticDescription() const override;
 
 	/**
@@ -51,6 +52,8 @@ public:
 	FBlackboardKeySelector WanderHomeKey;
 
 protected:
+	/** @brief 单次执行入口: BT 启动时把 AI 当前位置写入 BB.WanderHome (bNotifyActivate=true) */
 	virtual void OnBecomeRelevant(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;
+	/** @brief Tick 守卫: 首次写入后 bAlreadyInitialized=true, 后续 Tick 直接跳过 */
 	virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
 };

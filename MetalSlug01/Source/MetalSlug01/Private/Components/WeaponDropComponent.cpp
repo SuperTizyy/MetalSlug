@@ -48,9 +48,13 @@ UWeaponDropComponent::UWeaponDropComponent()
 	PrimaryComponentTick.bCanEverTick = false;
 }
 
-// ==========================================
-// BeginPlay
-// ==========================================
+/**
+ * @brief BeginPlay — 武器掉落组件初始化入口
+ *
+ * 职责:
+ *   - 注册 Owner Weapon 的 Mesh OnComponentBeginOverlap (拾取触发)
+ *   - 校验 Component 挂在 ABaseWeapon 上 (零兜底, 配置错则 Log Error)
+ */
 void UWeaponDropComponent::BeginPlay()
 {
 	Super::BeginPlay();
@@ -82,9 +86,13 @@ void UWeaponDropComponent::BeginPlay()
 	}
 }
 
-// ==========================================
-// EndPlay
-// ==========================================
+/**
+ * @brief EndPlay — 清理 Timer + 解绑 ProjectileMovement 委托
+ *
+ * 工业级规范:
+ *   - ClearTimer 防悬挂回调
+ *   - 解绑 PMC->OnProjectileStop (v200.4 修复悬垂指针崩溃)
+ */
 void UWeaponDropComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	// 清理计时器

@@ -30,6 +30,7 @@ class METALSLUG01_API UBTTask_StopPrimaryFire : public UBTTaskNode
 public:
 	UBTTask_StopPrimaryFire();
 
+	/** @brief BT 编辑器静态描述 (显示 "主武器停火 — 全自动武器用") */
 	virtual FString GetStaticDescription() const override;
 
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) override;

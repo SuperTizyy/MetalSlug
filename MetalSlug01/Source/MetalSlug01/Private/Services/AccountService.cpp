@@ -1,5 +1,16 @@
 // ==========================================
-// 头文件包含区
+// AccountService.cpp — 账号业务服务实现文件
+// ==========================================
+//
+// 文件功能总览:
+//   - 实现 Login / Register / Logout / GetCurrentUser 业务接口
+//   - 实现偏好查询(角色/武器)的 V 层接口(委托给 Repository)
+//   - 实现 GetRepository 私有 helper(懒加载防御)
+//   - 实现 OnLoginSuccess 私有 helper(写会话 + 切状态)
+//
+// 大厂原则:
+//   - V 层零感知:V 层不直接调 Repository/Subsystem,只调本 Service
+//   - 零兜底(用户偏好):配错/无存档一律返回空串,而不是 "Default" 占位字符串(避免污染 Spawn)
 // ==========================================
 #include "Services/AccountService.h"
 #include "Systems/Account/AccountSubsystem.h"
@@ -61,6 +72,12 @@ bool UAccountService::Register(const FString& Username, const FString& Password)
 	return Result == EAccountRegisterResult::Success;
 }
 
+/**
+ * @brief 登出 — 清空会话并将全局状态机切回 Login
+ *
+ * 两段顺序保证:先清空 AccountSubsystem 会话(纯内存),再切 GameFlow 状态
+ * 切状态后 UIViewService 监听会销毁主菜单页面并显示登录页
+ */
 void UAccountService::Logout()
 {
 	// 1. 清理会话 (纯内存, 不写硬盘)
@@ -82,6 +99,12 @@ void UAccountService::Logout()
 	}
 }
 
+/**
+ * @brief 获取当前已登录的用户名(从 AccountSubsystem 会话读)
+ * @return 当前用户名,未登录或子系统缺失返回空串
+ *
+ * 零兜底:返回空串表示"未登录",调用方应自行判断是否需要显示登录页
+ */
 FString UAccountService::GetCurrentUser() const
 {
 	if (UGameInstance* GI = GetGameInstance())
@@ -111,6 +134,12 @@ FString UAccountService::GetLastSelectedCharacter() const
 	return Repo ? Repo->GetLastSelectedCharacter(User) : TEXT("");
 }
 
+/**
+ * @brief 保存当前用户上次选择的角色名到本地仓库
+ * @param CharacterName 角色 RowName(对应 DT_CharacterInfo)
+ *
+ * 用户未登录或 Repo 缺失时静默跳过,不报错(偏好持久化非关键路径)
+ */
 void UAccountService::SaveLastSelectedCharacter(const FString& CharacterName)
 {
 	const FString User = GetCurrentUser();
@@ -121,6 +150,13 @@ void UAccountService::SaveLastSelectedCharacter(const FString& CharacterName)
 	}
 }
 
+/**
+ * @brief 获取指定背包槽位上次选择的武器 RowName
+ * @param BackpackSlot 背包槽位索引
+ * @return 武器 RowName,用户未登录/无存档/Repo 缺失返回空串
+ *
+ * 大厂原则 - 零兜底:统一返回空串而非魔法默认值,避免污染下游 Spawn 链
+ */
 FString UAccountService::GetLastSelectedWeapon(int32 BackpackSlot) const
 {
 	// 【v213+ 大厂架构修复 — 消除默认污染源】
@@ -132,6 +168,13 @@ FString UAccountService::GetLastSelectedWeapon(int32 BackpackSlot) const
 	return Repo ? Repo->GetLastSelectedWeapon(User, BackpackSlot) : TEXT("");
 }
 
+/**
+ * @brief 保存指定背包槽位的武器 RowName 到本地仓库
+ * @param BackpackSlot 背包槽位索引
+ * @param WeaponRowName 武器 RowName(对应 DT_WeaponInfo)
+ *
+ * 用户未登录或 Repo 缺失时静默跳过,不影响主流程
+ */
 void UAccountService::SaveLastSelectedWeapon(int32 BackpackSlot, const FString& WeaponRowName)
 {
 	const FString User = GetCurrentUser();

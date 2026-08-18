@@ -1,5 +1,24 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ========================================================================
+// UIViewService.cpp — UI 视图服务实现文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 实现 Initialize/Deinitialize(Subsystem 生命周期 + 面板配置填充)
+//   - 实现 ShowPanel/HideAllPanels/SetInputMode(公共 API)
+//   - 实现 OnGameFlowStateChanged(GameFlow 状态变化回调 → ShowPanel)
+//   - 实现 OnGameInterrupted(独立中断通道,响应网络失败等强制中断)
+//   - 实现 Preload/CreateAndShow/Destroy 面板(Widget 生命周期)
+//   - 实现 InjectViewModelForPanel(ViewModel 自动注入)
+//
+// 大厂原则:
+//   - 状态驱动:面板显示完全由 OnGameFlowStateChanged 驱动(不主动创建)
+//   - 跨 World 检测:任何 GameFlow 状态变化时检测 widget 是否属于当前 World,不是就清掉
+//   - 状态守卫:ShowPanel 在非法状态下被调用 → Log Error + 静默拒绝(v229 零兜底)
+//   - 单一事件出口:所有上游事件 → ForwardPlayerSnapshotsChanged → OnPlayerSnapshotsChanged.Broadcast
+// ========================================================================
+
 #include "Services/UIViewService.h"
 #include "Systems/GameFlowSubsystem.h"
 #include "Systems/Session/LANRoomPresenter.h"
@@ -212,6 +231,17 @@ void UUIViewService::ShowPanel(EUIPanel Panel)
 	ShowPanelWhenPCReady(Panel);
 }
 
+/**
+ * @brief PC 就绪守卫后的 ShowPanel 入口 — 等待 PC 可用后再创建 widget
+ * @param Panel 目标面板枚举(传 None 直接 return)
+ *
+ * 三层守卫:
+ *   1. 全局状态守卫(v229):Panel 与当前 EMatchState 不匹配 → Log Error + 静默拒绝
+ *   2. 幂等守卫:bWidgetReallyShown(对象存活 && IsInViewport)==true → 跳过
+ *   3. PC 就绪守卫:PC 未就绪 → 启动 0.1s 定时器轮询,MaxPCReadyChecks 次后超时放弃
+ *
+ * 大厂原则 — 0 兜底:非法状态/超时情况都 Log Error,从不静默失败
+ */
 void UUIViewService::ShowPanelWhenPCReady(EUIPanel Panel)
 {
 	if (Panel == EUIPanel::None) return;
@@ -359,6 +389,13 @@ void UUIViewService::ShowPanelWhenPCReady(EUIPanel Panel)
 	}
 }
 
+/**
+ * @brief PC 就绪轮询回调 — 0.1s 定时器触发,直到 PC 可用才真正显示
+ *
+ * 防重入:PendingShowPanel==None 直接 return(防止定时器回调和直接调用的竞争)
+ * 超时保护:PCReadyCheckCount > MaxPCReadyChecks → 清理定时器 + 屏幕报错
+ * PC 可用后:取 PendingShowPanel → 清状态 → ClearTimer → 调 ExecuteShowPanel
+ */
 void UUIViewService::TryShowPendingPanel()
 {
 	// 【大厂标准】防止重入：正在显示时就不要再处理定时器回调
@@ -407,6 +444,16 @@ void UUIViewService::TryShowPendingPanel()
 	ExecuteShowPanel(PanelToShow);
 }
 
+/**
+ * @brief 真正执行面板显示逻辑 — 销毁旧面板 + 显示新面板 + 应用输入模式
+ * @param Panel 目标面板
+ *
+ * 流程:保存 OldPanel 用于广播 → DestroyActivePanel → 取缓存 widget(跨 World 校验失效则丢弃)
+ * → 无缓存走 CreateAndShowPanel / 有缓存则 AddToViewport + 二次重试兜底
+ * → 应用 PanelConfigs.InputMode → 广播 OnPanelChanged(OldPanel, Panel)(v228,v216 Settlement 钩子)
+ *
+ * 大厂原则 — 单一事件出口:面板切换通知完全靠 OnPanelChanged(替代之前散落的广播)
+ */
 void UUIViewService::ExecuteShowPanel(EUIPanel Panel)
 {
 	// ==========================================
@@ -499,6 +546,13 @@ void UUIViewService::HideAllPanels()
 	ActivePanel = EUIPanel::None;
 }
 
+/**
+ * @brief 设置本地 PlayerController 的输入模式(UIOnly/GameOnly/GameAndUI)
+ * @param Mode 目标输入模式枚举
+ *
+ * PC 不可用时静默 return(GameInstance 关闭等极端情况)
+ * 各分支对应 UE 标准 FInputModeUIOnly/GameOnly/GameAndUI,自动同步鼠标可见性
+ */
 void UUIViewService::SetInputMode(EUIInputMode Mode)
 {
 	APlayerController* PC = GetLocalPlayerController();
@@ -649,6 +703,15 @@ void UUIViewService::PreloadConfiguredPanels()
 	}
 }
 
+/**
+ * @brief 预创建面板 widget 并缓存到 PreloadedWidgets(立即 AddToViewport + Collapsed)
+ * @param Panel 目标面板枚举
+ * @param Config 面板配置(必须含有效 WidgetClass)
+ *
+ * WidgetClass 为空 / 已缓存 / PC 不可用 → 直接 return
+ * 缓存目的:大面板(如 Login)首次启动时提前创建,后续 ShowPanel 直接从缓存拿,避免卡顿
+ * 跨 World 失效由 PurgePreloadedWidgetsForCurrentWorld 兜底
+ */
 void UUIViewService::PreCreatePanel(EUIPanel Panel, const FPanelConfig& Config)
 {
 	if (!Config.WidgetClass) return;

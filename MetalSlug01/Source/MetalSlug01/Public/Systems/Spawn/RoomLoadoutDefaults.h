@@ -4,6 +4,9 @@
 //
 // 【v212 大厂架构 — 业务默认值单一真理源 (Single Source of Truth for Business Defaults)】
 //
+// @file RoomLoadoutDefaults.h
+// @brief Loadout 业务默认 RowName 常量集中管理 (避免 "DT 行序约定" 这种隐性耦合)
+//
 // 根因 (用户 2026.08.09):
 //   "玩家如果没选近战武器, 那就默认使用 DT_WeaponInfo 的 RowName=JZ001 的武器,
 //    选了就把所选的近战武器带入游戏中"

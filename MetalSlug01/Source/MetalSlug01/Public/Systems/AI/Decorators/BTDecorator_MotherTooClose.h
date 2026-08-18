@@ -49,6 +49,7 @@ class METALSLUG01_API UBTDecorator_MotherTooClose : public UBTDecorator
 public:
 	UBTDecorator_MotherTooClose();
 
+	/** @brief BT 编辑器静态描述 (显示 DistanceKey + RetreatDistanceThreshold) */
 	virtual FString GetStaticDescription() const override;
 
 protected:

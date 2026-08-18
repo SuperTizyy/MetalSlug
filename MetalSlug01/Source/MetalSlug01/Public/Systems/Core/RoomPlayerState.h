@@ -22,6 +22,27 @@
 // UE 自动生成的头文件
 #include "RoomPlayerState.generated.h"
 
+/**
+ * @file RoomPlayerState.h
+ * @brief 房间玩家状态类 (ARoomPlayerState) — UE 5.6 玩家网络权威数据集中地
+ *
+ * 大厂架构角色 — 单一真理源 (Single Source of Truth):
+ *   - 阵营 (CurrentFactionTag FGameplayTag 替代 ERoomTeam)
+ *   - 准备状态 + 是否主动选过阵营
+ *   - 母体状态 (bIsMother) — 母体复活链真理源
+ *   - 战备选择 (CharID / 3 个武器槽位) — Spawn 阶段读取
+ *   - 计分板 (Score/Kills/Deaths/Assists) + 连杀计数 (CurrentKillStreak)
+ *
+ * 与其他组件的关系:
+ *   - 上游: ARoomGameMode (PostLogin 改阵营 / AddPlayerToRoom)
+ *   - 下游: ABaseCharacter Pawn (持引用, Pawn 死亡时仍存活)
+ *   - 配套: URoomSpawnSubsystem (复活链读 PS 字段)
+ *
+ * v229.x 重构:
+ *   - KDA 公式委托 FKdaScoring 单一真理源 (业务层 = UI 层)
+ *   - 旧 KillScoreValue / AssistScoreValue 标记 deprecated alias
+ */
+
 
 // ==========================================
 // 1. 委托声明

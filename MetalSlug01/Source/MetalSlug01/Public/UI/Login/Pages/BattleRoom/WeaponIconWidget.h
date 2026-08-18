@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// WeaponIconWidget 头文件 — 武器棋盘格 Item 控件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UWeaponIconWidget — 网格里的单一武器格子
+//   2. 接收数据 (武器 ID + FWeaponInfo + 父页面指针)
+//   3. 处理点击事件 (向父页面打小报告)
+//   4. 控制高亮框的显示/隐藏
+//
+// 架构理念:
+//   - 单一职责: 一个小格子只管自己
+//   - 反向引用: 持有 URoomInsidePage 指针方便回调
+//   - 状态自描述: RepresentedWeaponRowName 让父页面能反查
+//   - 防御性: 高亮框默认 Collapsed, 点击再显示
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

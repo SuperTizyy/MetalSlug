@@ -3,7 +3,19 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// ActivityConfirmPopupWidget 头文件 — 活动奖励确认弹窗
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UActivityConfirmPopupWidget — 标准的活动奖励领取确认界面
+//   2. 关闭按钮 + 确认按钮 + 水平布局容器
+//   3. 动态创建 3 张奖励选项卡片
+//
+// 架构理念:
+//   - 双层委托: 卡片选中通过 OnRewardCardSelected 广播
+//   - PendingSelectedIndex: 跟踪用户当前选择但尚未确认的索引
+//   - 复用: 各活动可共用此弹窗
+//   - 防御性: 防御卡片创建/绑定失败
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

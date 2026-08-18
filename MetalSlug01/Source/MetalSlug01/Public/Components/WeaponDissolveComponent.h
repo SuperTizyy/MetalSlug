@@ -38,6 +38,29 @@ class UMeshComponent;
 /** 【公开】溶解完成事件 (通知武器可以安全销毁) */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnWeaponDissolveFinished);
 
+/**
+ * @class UWeaponDissolveComponent
+ * @brief 武器溶解特效组件 - 武器自治 + 职责对等 (与身体 DissolveComponent 对称)
+ *
+ * 单一职责: 持有并驱动武器 Mesh 的材质溶解 (DissolveAmount 参数)
+ *
+ * 大厂架构中的角色:
+ *   - 职责对等: 武器管自己的溶解, 角色管自己的身体溶解 — 彻底消除跨边界
+ *   - 武器自治: 武器 Detach 后完全自治, 不再依赖角色任何状态
+ *   - 单一协议: 武器材质蓝图必须调用 MF_Dissolve Material Function 节点 (与身体协议一致)
+ *   - 零兜底: 协议不满足时 Log Warning 报警, 不静默兼容
+ *
+ * 设计原则:
+ *   - 幂等: 多次调用 StartDissolve 第二次起 no-op
+ *   - 伪溶解保护: 收集材质失败时**不**进入 bIsDissolving=true 状态
+ *   - MID 初始化: 创建后立即设 DissolveAmount=-1 (完全显示), 防止默认 0 半透明
+ *   - 不调 Actor::Destroy: 销毁由 Character::DropAndFadeWeapon 通过 SetLifeSpan 统一控制
+ *
+ * 调用方:
+ *   - ABaseWeapon::BeginPlay - 自动创建组件
+ *   - ABaseCharacter::DropAndFadeWeapon - 调 Weapon->StartDissolve()
+ *   - UE SetLifeSpan(0.1f) 到期 - 武器自动 Destroy
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UWeaponDissolveComponent : public UActorComponent
 {
@@ -77,8 +100,17 @@ public:
 	FOnWeaponDissolveFinished OnWeaponDissolveFinished;
 
 protected:
+	/**
+	 * @brief 组件注册时校验 Mesh + 设首次 MID 的 DissolveAmount=-1 (避免初始半透明)
+	 */
 	virtual void BeginPlay() override;
+	/**
+	 * @brief UE 组件注销时清理: 停 Tick + 清 MID 引用 (防 GC 抖动)
+	 */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	/**
+	 * @brief 溶解期间按 DissolveSpeed 累加 DissolveAmount, ≥1.1 时广播完成事件
+	 */
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	/**

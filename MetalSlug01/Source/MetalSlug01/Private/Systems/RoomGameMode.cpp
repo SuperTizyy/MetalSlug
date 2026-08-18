@@ -104,6 +104,19 @@
 //
 // @return 同步加载后的 UWeaponSoundMapAsset*, nullptr = 已 Log Error
 // ==========================================
+/**
+ * @brief 同步加载并返回武器音效映射数据资产 (DA_WeaponSoundMap)
+ *
+ * 真理源: GM->WeaponSoundMapAsset (TSoftObjectPtr)
+ * 大厂原则 — 单一真理源: 调用方拿 nullptr 时拒绝播放, 不允许 fallback
+ *
+ * @return UWeaponSoundMapAsset* 同步加载后的数据资产指针
+ * @return nullptr = 配置缺失或加载失败, 已 Log Error 报告根因
+ *
+ * @note v76 大厂架构重构 — 零兜底
+ * @note 频繁路径 (Tick/AnimNotify) 永不调用, 仅 Server_SwitchToWeaponSlot 触发
+ * @note 缺资产时强制 Log Error 引导修复 BP_GM_RoomGameMode → Room|Audio → Weapon Sound Map Asset
+ */
 UWeaponSoundMapAsset* ARoomGameMode::GetWeaponSoundMapAsset() const
 {
 	if (WeaponSoundMapAsset.IsNull())
@@ -137,10 +150,17 @@ UWeaponSoundMapAsset* ARoomGameMode::GetWeaponSoundMapAsset() const
 // ==========================================
 
 /**
- * ARoomGameMode 构造函数
+ * @brief ARoomGameMode 构造函数 — 配置默认的玩家类、控制器类、HUD 类
  *
  * 目的: 配置默认的玩家类、控制器类、HUD 类等
  * 时机: 在游戏进入战斗地图、GameMode 被实例化时由引擎自动调用
+ *
+ * @param ObjectInitializer UE 对象初始化器 (UE 内部使用)
+ *
+ * @note bUseSeamlessTravel=false — 局域网测试期避免 Spawn 时序错乱
+ * @note bSkipRoomPhaseForTesting=true — 开发期默认跳过大厅, 直进战斗
+ * @note PlayerStateClass/PlayerControllerClass/HUDClass 强制覆盖, 防止 BP 错配
+ * @note ABaseAIController::SelfTestArrivalDecision — 启动期单元自检 v9 大厂架构
  */
 ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -180,11 +200,17 @@ ARoomGameMode::ARoomGameMode(const FObjectInitializer& ObjectInitializer)
 // ==========================================
 
 /**
- * InitGame - UE override, World 已就绪后第一次调用
- *   - 这是把 GameMode 配置注入 Subsystem 的最早安全时机
+ * @brief UE override, World 已就绪后第一次调用 — 把 GameMode 配置注入 Subsystem 的最早安全时机
  *
- *   注意: InitGame 时 GameState **尚未创建** (GameState 在 InitGameState 中创建)
- *         所以写入 GS->CurrentMatchMode 的逻辑在 InitGameState 中 (见下方 override)
+ * 数据流: GameMode → Subsystem (单向, 只在 InitGame 时一次性注入)
+ * 真理源分层: 编辑器面板 (GameMode UPROPERTY) → 运行时副本 (Subsystem 内部副本, Fast 访问)
+ *
+ * @param MapName UE 引擎传入的当前地图名
+ * @param Options UE 引擎传入的 URL Options 字符串 (含 ?Mode= 等)
+ * @param ErrorMessage out 参数, 若初始化失败可写入错误信息
+ *
+ * @note InitGame 时 GameState 尚未创建, 所以写入 GS->CurrentMatchMode 的逻辑在 InitGameState 中
+ * @note v31.3 大厂架构 — 委派所有配置注入到 InjectSubsystemConfigs()
  */
 void ARoomGameMode::InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage)
 {
@@ -313,8 +339,13 @@ void ARoomGameMode::InitGameState()
 }
 
 /**
- * PostInitProperties - UE override, 属性构造后调用
- *   - 保险措施: 编辑器实例化时也注入 (用于 Subsystem 在 CDO 阶段被访问的场景)
+ * @brief UE override, 属性构造后调用 — 编辑器实例化时的兜底注入入口
+ *
+ * 保险措施: 编辑器实例化时也注入, 用于 Subsystem 在 CDO 阶段被访问的场景
+ * InitGame 是主入口, 这里只是兜底
+ *
+ * @note PostInitProperties 可能在 World 不存在时调用, 内部 Get() 会失败
+ * @note InitGame 是主入口, 这里只是兜底
  */
 void ARoomGameMode::PostInitProperties()
 {
@@ -328,7 +359,7 @@ void ARoomGameMode::PostInitProperties()
 }
 
 /**
- * InjectSubsystemConfigs - 把 GameMode 配置 (DT / AI Profile / ModeRules) 注入 Subsystem
+ * @brief 把 GameMode 配置 (DT / AI Profile / ModeRules) 注入 Subsystem
  *
  * 真理源设计 (v31.3):
  *   - 编辑器面板: GameMode UPROPERTY (策划在 BP_RoomGameMode 拖入)
@@ -346,6 +377,11 @@ void ARoomGameMode::PostInitProperties()
  *   - SpawnSubsystem.ModeRules 为空 → 大厅 AI Spawn 时 AIControllerClass / BehaviorTree 为空 → 拒绝 Spawn
  *   - SpawnSubsystem.CharacterDataTable = null → HandlePlayerRequestSpawn 查表失败
  *   - SpawnSubsystem.WeaponDataTable = null → 武器 Spawn 失败
+ *
+ * @note v31.3 大厂架构 — 数据单向流, InitGame 一次性注入
+ * @note v92 扩展注入 Lifecycle 配置 (母体变异 / 总局数 / 时长)
+ * @note v93.1 新增注入 MotherMutationSubsystem (母体变异业务权威调度)
+ * @note v108 扩展注入母体变异数量 + 目标选择策略
  */
 void ARoomGameMode::InjectSubsystemConfigs()
 {
@@ -464,11 +500,16 @@ void ARoomGameMode::InjectSubsystemConfigs()
 // ==========================================
 
 /**
- * AddPlayerToRoom - v31.5 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 把玩家加入房间 — 真理源在 URoomMembershipSubsystem
  *
- * 大厂原则 (v31.5):
- *   - PlayerStateClass 从 this->PlayerStateClass 传递 (GameMode 唯一真理源)
- *   - 不在 Subsystem 内部访问"不存在的字段"
+ * v31.5 重构: PlayerStateClass 从 this->PlayerStateClass 传递 (GameMode 唯一真理源),
+ * 不在 Subsystem 内部访问"不存在的字段"
+ *
+ * @param RequestingController 要加入房间的 Controller 指针
+ * @param PlayerName 玩家显示名
+ *
+ * @note 大厂委派层 — GameMode 不持有成员, 真理源下沉到 Subsystem
+ * @note v29.2 三层防御: InitPlayerState override + AddPlayerToRoom PS 二次机会 + EnterSkipToHostMode 调完整路径
  */
 void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FString& PlayerName)
 {
@@ -480,7 +521,13 @@ void ARoomGameMode::AddPlayerToRoom(AController* RequestingController, const FSt
 
 
 /**
- * ChangePlayerTeam - v31.1 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 切换玩家阵营 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param RequestingController 发起阵营切换的 Controller
+ * @param bToAttackTeam true=切到攻方, false=切到守方
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note v27 同时同步 Pawn.FactionTag (避免换阵营失效)
  */
 void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bToAttackTeam)
 {
@@ -492,7 +539,12 @@ void ARoomGameMode::ChangePlayerTeam(AController* RequestingController, bool bTo
 
 
 /**
- * RemovePlayerFromRoom - v31.1 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 从房间移除玩家 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param RequestingController 要移除的玩家 Controller
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note v28 按阶段分支 (PendingAI / AIController / 真人) 处理 Server_KickPlayer
  */
 void ARoomGameMode::RemovePlayerFromRoom(AController* RequestingController)
 {
@@ -504,7 +556,12 @@ void ARoomGameMode::RemovePlayerFromRoom(AController* RequestingController)
 
 
 /**
- * BroadcastChatMessage - v31.1 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 全房间广播聊天消息 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param SenderName 发送者名字
+ * @param Message 聊天内容
+ *
+ * @note 大厂委派层 — v31.1 重构
  */
 void ARoomGameMode::BroadcastChatMessage(const FString& SenderName, const FString& Message)
 {
@@ -516,7 +573,11 @@ void ARoomGameMode::BroadcastChatMessage(const FString& SenderName, const FStrin
 
 
 /**
- * BroadcastSystemMessage - v31.1 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 全房间广播系统消息 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param Message 系统消息内容
+ *
+ * @note 大厂委派层 — v31.1 重构
  */
 void ARoomGameMode::BroadcastSystemMessage(const FString& Message)
 {
@@ -528,7 +589,14 @@ void ARoomGameMode::BroadcastSystemMessage(const FString& Message)
 
 
 /**
- * GetModeRules - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询指定模式的 AI 配置规则 — 真理源在 URoomSpawnSubsystem
+ *
+ * @param Mode 房间模式 (Melee/Zombie)
+ * @param OutRules out 参数, 返回该模式下的 AI 配置规则 (AIControllerClass + BehaviorTree)
+ * @return true=找到, false=SpawnSubsystem 不可用或规则不存在
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 规则集由 GameMode 在 InjectSubsystemConfigs 时注入, 运行时真理源 = Subsystem
  */
 bool ARoomGameMode::GetModeRules(ERoomMatchMode Mode, FAIModeRules& OutRules) const
 {
@@ -541,9 +609,17 @@ bool ARoomGameMode::GetModeRules(ERoomMatchMode Mode, FAIModeRules& OutRules) co
 
 
 /**
- * SpawnAIInternal - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] AI 实际生成 — 真理源在 URoomSpawnSubsystem
  *
  * 【v54 大厂架构重构】参数从 Profile 改 Config (UAIBehaviorConfigSO)
+ *
+ * @param Request AI Spawn 请求 (阵营 / CharacterRowName / SequenceID 等)
+ * @param Config AI 行为配置资产 (DataAsset, 含 AttackRange/Hyst 等)
+ * @param OptionalExistingController 可选, 复用现有 Controller (用于复用机制, v24 大厂架构)
+ * @return int32 Spawn 成功的 AI 数量
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note v36 单一真理源: 武器 SpawnWeaponID 来源 = Profile.WeaponID (拒绝 NAME_None 静默写入)
  */
 int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIBehaviorConfigSO* Config, AAIController* OptionalExistingController)
 {
@@ -556,7 +632,12 @@ int32 ARoomGameMode::SpawnAIInternal(const FAISpawnRequest& Request, UAIBehavior
 
 
 /**
- * UpdatePlayerReadyState - v31.2 delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 更新玩家准备状态 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param RequestingController 发起准备的 Controller
+ * @param bIsReady true=已准备, false=取消准备
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bool bIsReady)
 {
@@ -567,7 +648,15 @@ void ARoomGameMode::UpdatePlayerReadyState(AController* RequestingController, bo
 }
 
 /**
- * QueueAIForBattleSpawn - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] AI 入队等待战斗 Spawn — 真理源在 URoomSpawnSubsystem
+ *
+ * 大厅阶段: AI 不生成, 只在 GameMode 维护 "待生成清单"
+ *
+ * @param Request AI Spawn 请求 (阵营 / CharacterRowName / ProfileTag 等)
+ * @return int32 成功入队的数量
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note v28 大厅入队 + 战斗 Spawn 架构: 大厅不生成, 战斗开局才 Spawn
  */
 int32 ARoomGameMode::QueueAIForBattleSpawn(const FAISpawnRequest& Request)
 {
@@ -580,7 +669,13 @@ int32 ARoomGameMode::QueueAIForBattleSpawn(const FAISpawnRequest& Request)
 
 
 /**
- * GetPendingAIInFaction - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询指定阵营的待生成 AI 列表 — 真理源在 URoomSpawnSubsystem
+ *
+ * @param FactionTag 阵营 Tag (Offense/Defense)
+ * @return TArray<FPendingAIEntry> 待生成 AI 列表
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note UI (URoomInsidePage) 直接读此接口用于大厅占位渲染
  */
 TArray<FPendingAIEntry> ARoomGameMode::GetPendingAIInFaction(FGameplayTag FactionTag) const
 {
@@ -593,7 +688,13 @@ TArray<FPendingAIEntry> ARoomGameMode::GetPendingAIInFaction(FGameplayTag Factio
 
 
 /**
- * ConsumePendingAIForBattleSpawn - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 消费所有待生成 AI 一次性 Spawn — 真理源在 URoomSpawnSubsystem
+ *
+ * 战斗开局时由 SpawnAllPlayersIntoBattle 调用, 清空队列
+ *
+ * @return TArray<FAISpawnRequest> 已消费的 Spawn 请求列表
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 TArray<FAISpawnRequest> ARoomGameMode::ConsumePendingAIForBattleSpawn()
 {
@@ -619,7 +720,14 @@ TArray<FAISpawnRequest> ARoomGameMode::ConsumePendingAIForBattleSpawn()
 
 
 /**
- * BuildSpawnRequestFromPending - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 从 PendingAIEntry 构建 Spawn 请求 — 真理源在 URoomSpawnSubsystem
+ *
+ * 字段转换集中一处, 避免散落各处的字段映射
+ *
+ * @param Entry 待生成 AI 条目
+ * @return FAISpawnRequest 转换后的 Spawn 请求
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 FAISpawnRequest ARoomGameMode::BuildSpawnRequestFromPending(const FPendingAIEntry& Entry) const
 {
@@ -632,7 +740,15 @@ FAISpawnRequest ARoomGameMode::BuildSpawnRequestFromPending(const FPendingAIEntr
 
 
 /**
- * IsPendingAIByName - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 判断名字是否为待生成 AI — 真理源在 URoomSpawnSubsystem
+ *
+ * 用于 Server_KickPlayer 阶段分支判定 (PendingAI vs AIController vs 真人)
+ *
+ * @param DisplayName 玩家显示名
+ * @return true=是 PendingAI, false=不是或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note v28 阶段分支判定 — 禁止用 StartsWith 等字符串模糊判定
  */
 bool ARoomGameMode::IsPendingAIByName(const FString& DisplayName) const
 {
@@ -645,7 +761,12 @@ bool ARoomGameMode::IsPendingAIByName(const FString& DisplayName) const
 
 
 /**
- * RemovePendingAIByName - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 按名字移除 PendingAI — 真理源在 URoomSpawnSubsystem
+ *
+ * @param DisplayName 玩家显示名
+ * @return true=成功移除, false=未找到或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 bool ARoomGameMode::RemovePendingAIByName(const FString& DisplayName)
 {
@@ -658,10 +779,14 @@ bool ARoomGameMode::RemovePendingAIByName(const FString& DisplayName)
 
 
 /**
- * GetAllPendingAI - v50 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询所有待生成 AI — 真理源在 URoomSpawnSubsystem
  *
  * 历史: v28-v49 直接返回 GameMode 自身 PendingAIQueue 字段
  * v50: GameMode 不再持有 PendingAIQueue 字段, 委派给 Subsystem
+ *
+ * @return TArray<FPendingAIEntry> 所有待生成 AI 列表 (跨阵营)
+ *
+ * @note 大厂委派层 — v50 重构
  */
 TArray<FPendingAIEntry> ARoomGameMode::GetAllPendingAI() const
 {
@@ -674,7 +799,13 @@ TArray<FPendingAIEntry> ARoomGameMode::GetAllPendingAI() const
 
 
 /**
- * RequestTargetForAI - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] AI 请求目标敌人 — 真理源在 URoomTargetingSubsystem
+ *
+ * @param RequestingAI 发起请求的 AI 角色
+ * @return ABaseCharacter* 选中的目标敌人, nullptr=无目标或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 内部走 GetAllAliveEnemiesFor → RequestTargetForAI 二阶段路径
  */
 ABaseCharacter* ARoomGameMode::RequestTargetForAI(ABaseCharacter* RequestingAI)
 {
@@ -688,7 +819,14 @@ ABaseCharacter* ARoomGameMode::RequestTargetForAI(ABaseCharacter* RequestingAI)
 }
 
 /**
- * GetEffectiveHuntPolicy - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] 获取 AI 的狩猎策略 — 真理源在 URoomTargetingSubsystem
+ *
+ * 狩猎策略包含目标选择权重配置 (距玩家 / 敌人数 / 阵营优先等)
+ *
+ * @param AI AI 角色
+ * @return FAIHuntPolicy AI 的狩猎策略 (Subsystem 不可用时返回默认构造)
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 FAIHuntPolicy ARoomGameMode::GetEffectiveHuntPolicy(ABaseCharacter* AI) const
 {
@@ -700,11 +838,19 @@ FAIHuntPolicy ARoomGameMode::GetEffectiveHuntPolicy(ABaseCharacter* AI) const
 }
 
 /**
- * ScoreCandidateForAI - v31.2 delegates to URoomTargetingSubsystem (3-arg signature)
+ * @brief [大厂委派层] 评估候选敌人得分 — 真理源在 URoomTargetingSubsystem (3 参数签名)
  *
  * 大厂原则 (v31.5):
  *   - 候选敌人必须 const (Subsystem 内部不修改 Candidate 状态, 仅读)
  *   - 头文件声明同步改为 const ABaseCharacter*, 与 cpp 委派签名一致
+ *
+ * @param RequestingAI 评分主体 AI
+ * @param Candidate 候选敌人 (const, 仅读)
+ * @param HuntPolicy 狩猎策略
+ * @return float 评分 (数值越大越优, 0=Subsystem 不可用)
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 委派时 const_cast 解包, 因 Subsystem 接口要求非 const (内部仍按 const 使用)
  */
 float ARoomGameMode::ScoreCandidateForAI(ABaseCharacter* RequestingAI,
 	const ABaseCharacter* Candidate,
@@ -719,7 +865,12 @@ float ARoomGameMode::ScoreCandidateForAI(ABaseCharacter* RequestingAI,
 
 
 /**
- * GetAllAliveEnemiesFor - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] 查询所有活着的敌人 — 真理源在 URoomTargetingSubsystem
+ *
+ * @param RequestingAI 视角 AI
+ * @return TArray<ABaseCharacter*> 所有活着且敌对的角色列表
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 TArray<ABaseCharacter*> ARoomGameMode::GetAllAliveEnemiesFor(ABaseCharacter* RequestingAI)
 {
@@ -732,7 +883,13 @@ TArray<ABaseCharacter*> ARoomGameMode::GetAllAliveEnemiesFor(ABaseCharacter* Req
 
 
 /**
- * ReleaseTarget - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] AI 释放目标 — 真理源在 URoomTargetingSubsystem
+ *
+ * AI 死亡 / 状态切换时调用, 清空锁定 + 释放候选池引用
+ *
+ * @param RequestingAI 释放目标的 AI
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 void ARoomGameMode::ReleaseTarget(ABaseCharacter* RequestingAI)
 {
@@ -744,7 +901,12 @@ void ARoomGameMode::ReleaseTarget(ABaseCharacter* RequestingAI)
 
 
 /**
- * GetAttackerCount - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] 查询锁定目标的 AI 数量 — 真理源在 URoomTargetingSubsystem
+ *
+ * @param TargetEnemy 被锁定的目标
+ * @return int32 锁定此目标的 AI 数量 (0=Subsystem 不可用)
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 int32 ARoomGameMode::GetAttackerCount(ABaseCharacter* TargetEnemy)
 {
@@ -757,7 +919,12 @@ int32 ARoomGameMode::GetAttackerCount(ABaseCharacter* TargetEnemy)
 
 
 /**
- * IsTargetLocked - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] 判断目标是否被任意 AI 锁定 — 真理源在 URoomTargetingSubsystem
+ *
+ * @param TargetEnemy 被查询的目标
+ * @return true=已被锁定, false=未被锁定或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 bool ARoomGameMode::IsTargetLocked(ABaseCharacter* TargetEnemy)
 {
@@ -770,7 +937,14 @@ bool ARoomGameMode::IsTargetLocked(ABaseCharacter* TargetEnemy)
 
 
 /**
- * IsTargetLockedByOthers - v31.2 delegates to URoomTargetingSubsystem
+ * @brief [大厂委派层] 判断目标是否被其他 AI 锁定 (排除指定 AI) — 真理源在 URoomTargetingSubsystem
+ *
+ * @param TargetEnemy 被查询的目标
+ * @param ExcludeAI 排除的 AI (一般是查询发起者自己)
+ * @return true=被其他 AI 锁定, false=未被其他锁定或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 用于狩猎策略判定: "目标被别 AI 抢了, 我是否要抢"
  */
 bool ARoomGameMode::IsTargetLockedByOthers(ABaseCharacter* TargetEnemy, ABaseCharacter* ExcludeAI)
 {
@@ -783,7 +957,12 @@ bool ARoomGameMode::IsTargetLockedByOthers(ABaseCharacter* TargetEnemy, ABaseCha
 
 
 /**
- * CheckAllPlayersReady - v31.2 delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 检查全员是否已准备 — 真理源在 URoomMembershipSubsystem
+ *
+ * @return true=全员已准备, false=有人未准备或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note RequestStartGame 会用此判定, 测试模式 (bSkipRoomPhaseForTesting=true) 会短路此检查
  */
 bool ARoomGameMode::CheckAllPlayersReady()
 {
@@ -800,9 +979,18 @@ bool ARoomGameMode::CheckAllPlayersReady()
 // ==========================================
 
 /**
- * HandlePlayerRequestSpawn - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 处理玩家 Spawn 请求 (3 把武器) — 真理源在 URoomSpawnSubsystem
  *
  * 【v52 P0】3 把武器一起转发 (主+副+近战)
+ *
+ * @param PlayerToSpawn 要 Spawn 的玩家 Controller
+ * @param CharRowName 角色 RowName (CharacterDataTable 查询)
+ * @param WeaponPrimaryRowName 主武器 RowName
+ * @param WeaponSecondaryRowName 副武器 RowName
+ * @param WeaponMeleeRowName 近战武器 RowName
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note v36 零兜底: CharID/WeaponID 空 → Log Error + 拒绝 Spawn
  */
 void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const FString& CharRowName, const FString& WeaponPrimaryRowName, const FString& WeaponSecondaryRowName, const FString& WeaponMeleeRowName)
 {
@@ -814,7 +1002,14 @@ void ARoomGameMode::HandlePlayerRequestSpawn(AController* PlayerToSpawn, const F
 
 
 /**
- * GetDefaultPawnClassForController_Implementation - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询 Controller 的默认 Pawn 类 — 真理源在 URoomSpawnSubsystem
+ *
+ * UE override, 由引擎在 Spawn Pawn 前调用
+ *
+ * @param InController 要查询的 Controller
+ * @return UClass* Pawn Class (nullptr=Subsystem 不可用)
+ *
+ * @note 大厂委派层 — v31.1 重构
  */
 UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AController* InController)
 {
@@ -827,7 +1022,13 @@ UClass* ARoomGameMode::GetDefaultPawnClassForController_Implementation(AControll
 
 
 /**
- * RestartPlayer - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 重生玩家 — 真理源在 URoomSpawnSubsystem
+ *
+ * UE override, 引擎在玩家死亡后调用
+ *
+ * @param NewPlayer 要重生的 Controller
+ *
+ * @note 大厂委派层 — v31.1 重构
  */
 void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 {
@@ -839,7 +1040,14 @@ void ARoomGameMode::RestartPlayer(AController* NewPlayer)
 
 
 /**
- * RequestRespawn - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 玩家/AI 复活请求 — 真理源在 URoomSpawnSubsystem
+ *
+ * @param DeadController 死亡的 Controller
+ * @param bImmediateRespawn true=立即复活, false=等复活延迟 (RespawnDelaySeconds)
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note v26 单一真理源: AI 复活链路走 CachedFactionTag, 不走 ModeRules 兜底
+ * @note v30 复活无敌期激活入口: 复活后自动触发 ActivateSpawnInvincibility
  */
 void ARoomGameMode::RequestRespawn(AController* DeadController, bool bImmediateRespawn)
 {
@@ -855,7 +1063,17 @@ void ARoomGameMode::RequestRespawn(AController* DeadController, bool bImmediateR
 // ==========================================
 
 /**
- * RequestStartGame - v31.1 delegates to URoomLifecycleSubsystem
+ * @brief 房主请求开始游戏 — RPC 入口, 含身份鉴权 + 全员准备校验 + 委派 LifecycleSubsystem
+ *
+ * 三段流程:
+ *   1. 身份鉴权: 只有 FirstPlayerController (房主) 可发起
+ *   2. 全员准备校验 (测试模式短路)
+ *   3. 转发到 LifecycleSubsystem, 倒计时后回调 SpawnAllPlayersIntoBattle
+ *
+ * @param RequestingController 发起开局请求的 Controller
+ *
+ * @note 不是纯委派 — 含鉴权和测试模式短路业务逻辑 (生命周期调度层)
+ * @note v31.1 重构 — 委派 LifecycleSubsystem 执行真正的倒计时
  */
 void ARoomGameMode::RequestStartGame(AController* RequestingController)
 {
@@ -901,7 +1119,13 @@ void ARoomGameMode::RequestStartGame(AController* RequestingController)
 
 
 /**
- * PerformGameStart - v31.1 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 执行游戏开始流程 — 真理源在 URoomLifecycleSubsystem
+ *
+ * 与 RequestStartGame 不同: 无鉴权, 直接触发倒计时
+ * 用于测试模式或外部直接触发场景
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note 通过 FSimpleDelegate 注册回调 (倒计时结束后 SpawnAllPlayersIntoBattle)
  */
 void ARoomGameMode::PerformGameStart()
 {
@@ -914,7 +1138,13 @@ void ARoomGameMode::PerformGameStart()
 
 
 /**
- * SpawnAllPlayersIntoBattle - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 战斗开局 Spawn 所有玩家/AI — 真理源在 URoomSpawnSubsystem
+ *
+ * LifecycleSubsystem 倒计时结束后的回调入口
+ * 遍历 GS->PlayerArray + ConsumePendingAIQueue → SpawnAIInternal/HandlePlayerRequestSpawn
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note v28 大厅入队 + 战斗 Spawn: 战斗开局才 Spawn AI (大厅不生成)
  */
 void ARoomGameMode::SpawnAllPlayersIntoBattle()
 {
@@ -930,7 +1160,14 @@ void ARoomGameMode::SpawnAllPlayersIntoBattle()
 // ==========================================
 
 /**
- * ScanAndCachePlayerStarts - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 扫描并缓存所有 PlayerStart — 真理源在 URoomSpawnSubsystem
+ *
+ * 按阵营前缀 (Attack_/Defense_) 分类, 用于 Spawn 时的出生点分配
+ *
+ * @param bReScan true=强制重新扫描 (忽略缓存), false=用现有缓存 (有则不重扫)
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note v27 修复: 无前缀 PlayerStart → Log Error + 拒绝静默归 Attack
  */
 void ARoomGameMode::ScanAndCachePlayerStarts(bool bReScan)
 {
@@ -941,27 +1178,79 @@ void ARoomGameMode::ScanAndCachePlayerStarts(bool bReScan)
 }
 
 
+// ==========================================
+// 【v242 大厂架构重构】粗粒度接口 DEPRECATED — 引导走 ReleaseSpawnPointByController 精准释放
+// ==========================================
+//
+// 编译警告根因 (v242 修复后):
+//   旧实现 (v242) 直接调 SpawnSys->ReleaseSpawnPoint(PlayerStart) → 触发下层 UE_DEPRECATED 警告
+//   编译警告本身就是 UE 5.6 C4996 报错, "请改用新版 API"
+//
+// 新实现 (v246) — 转发壳内部走 v246 新增的语义化 API:
+//   - ReleaseSpawnPointBySpawnPoint: 反查 OccupiedSpawnByController, 释放所有映射此点的 Controller
+//   - 不再调下层废弃方法 (ReleaseSpawnPoint), 编译警告消失
+//   - 不暴露 OccupiedSpawnByController 字段给 RoomGameMode (大厂封装原则)
+//
+// 大厂原则 - 暴露行为, 不暴露数据结构:
+//   - RoomGameMode 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+//   - URoomSpawnSubsystem 提供语义化 API (ReleaseSpawnPointByController / ReleaseSpawnPointBySpawnPoint)
+//   - 后续重构 TMap → TArray 时, RoomGameMode 不需要任何改动
+//
+// 大厂原则 - 单一释放入口:
+//   - ReleaseSpawnPoint(AActor*) 是粗粒度,多玩家同帧死亡会误清空
+//   - ReleaseSpawnPointByController(AController*) 是精准释放,大厂首选
+//   - 本接口仅保留用于兼容旧 BP 调用方,新代码必须走细粒度
+//
 /**
- * ReleaseSpawnPoint - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] DEPRECATED — 粗粒度释放指定出生点 — 真理源在 URoomSpawnSubsystem
+ *
+ * 旧 API 已废弃, 新代码必须改用 ReleaseSpawnPointByController(AController*) 精准释放
+ *
+ * @param PlayerStart 要释放的出生点 (粗粒度 — 会释放所有映射到此点的 Controller)
+ *
+ * @note v242 DEPRECATED — 编译警告引导改用 ReleaseSpawnPointByController
+ * @note v246 转发壳内部走 ReleaseSpawnPointBySpawnPoint 语义化 API (不调下层废弃方法)
  */
+UE_DEPRECATED(5.6, "【v242 零兜底】ReleaseSpawnPoint(AActor*) 是粗粒度接口, 请改用 ReleaseSpawnPointByController(AController*) 精准释放, 避免多玩家同帧死亡误清空.")
 void ARoomGameMode::ReleaseSpawnPoint(AActor* PlayerStart)
 {
-	if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+	URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this);
+	if (!SpawnSys)
 	{
-		SpawnSys->ReleaseSpawnPoint(PlayerStart);
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] ReleaseSpawnPoint: URoomSpawnSubsystem 未找到. "
+			     "请检查 GameMode 初始化 (InjectSubsystemConfigs 是否调用)."));
+		return;
 	}
+
+	// 【v246 大厂架构重构】走语义化 API, 不再调下层废弃方法
+	//   - ReleaseSpawnPointBySpawnPoint 内部反查 OccupiedSpawnByController, 释放所有映射此点的 Controller
+	//   - 内部逐个调 ReleaseSpawnPointByController, 双表一致性由其内部维护
+	//   - 不暴露 OccupiedSpawnByController 字段给外部 (大厂封装)
+	const int32 ReleasedCount = SpawnSys->ReleaseSpawnPointBySpawnPoint(PlayerStart);
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomGameMode] ReleaseSpawnPoint: 释放完成 — 共释放 %d 个 Controller. "
+		     "【v246 零兜底】新代码请改用 ReleaseSpawnPointByController 按 Controller 精准释放, 避免反查."),
+		ReleasedCount);
 }
 
 
 /**
- * GetAvailableSpawnPointForFaction - v31.5 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询可用的阵营出生点 — 真理源在 URoomSpawnSubsystem
  *
  * 历史: v25 之前是 RoomGameMode 直接维护 AttackSpawnPoints/DefenseSpawnPoints
  *       v31 大厂重构拆到 URoomSpawnSubsystem, 但本方法 .h 声明保留作为 BP 兼容入口
  *       v31.5 修复: 补上委派实现, 不再是孤儿声明
- */
-/**
- * GetAvailableSpawnPointForFaction - v39 扩展 OccupancyOwner 参数 (零兜底)
+ *
+ * @param PlayerFactionTag 阵营 Tag (Offense/Defense)
+ * @param bRemoveOccupied true=占用此点 (Spawn 时调用), false=仅查询 (测试时调用)
+ * @param OccupancyOwner 占用者 Controller (用于记录 Controller → PlayerStart 映射, v39 新增)
+ * @return AActor* 出生点 (nullptr=无可用或 Subsystem 不可用, 已 Log Error)
+ *
+ * @note 大厂委派层 — v31.5 重构
+ * @note v39 零兜底: Subsystem 不可用时显式 Log Error, 不静默 return nullptr
+ * @note v39 OccupancyOwner 用于追踪占用关系, 实现精准释放 (避免多玩家同帧死亡误清空)
  */
 AActor* ARoomGameMode::GetAvailableSpawnPointForFaction(FGameplayTag PlayerFactionTag, bool bRemoveOccupied, AController* OccupancyOwner)
 {
@@ -978,20 +1267,74 @@ AActor* ARoomGameMode::GetAvailableSpawnPointForFaction(FGameplayTag PlayerFacti
 }
 
 
+// ==========================================
+// 【v242 大厂架构重构】粗粒度接口 DEPRECATED — 引导走 ReleaseSpawnPointByController 精准释放
+// ==========================================
+//
+// 编译警告根因 (v242 修复后):
+//   旧实现 (v242) 直接调 SpawnSys->ResetAllSpawnPointOccupancy() → 触发下层 UE_DEPRECATED 警告
+//   编译警告本身就是 UE 5.6 C4996 报错, "请改用新版 API"
+//
+// 新实现 (v246) — 转发壳内部走 v246 新增的语义化 API:
+//   - ReleaseAllSpawnPointOccupancy: 释放所有占用,内部逐个调 ReleaseSpawnPointByController
+//   - 不再调下层废弃方法 (ResetAllSpawnPointOccupancy), 编译警告消失
+//   - 不暴露 OccupiedSpawnByController 字段给 RoomGameMode (大厂封装原则)
+//
+// 大厂原则 - 暴露行为, 不暴露数据结构:
+//   - RoomGameMode 不需要知道 OccupiedSpawnByController 是 TMap 还是 TSet
+//   - URoomSpawnSubsystem 提供语义化 API (ReleaseSpawnPointByController / ReleaseAllSpawnPointOccupancy)
+//   - 后续重构 TMap → TArray 时, RoomGameMode 不需要任何改动
+//
+// 大厂原则 - 单一释放入口:
+//   - ResetAllSpawnPointOccupancy 是粗粒度,会误清空其他玩家占用
+//   - ReleaseSpawnPointByController 是精准释放,大厂首选
+//   - 本接口仅保留用于兼容旧 BP 调用方,新代码必须走细粒度
+//
 /**
- * ResetAllSpawnPointOccupancy - v31.2 delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] DEPRECATED — 重置所有出生点占用 — 真理源在 URoomSpawnSubsystem
+ *
+ * 旧 API 已废弃, 新代码必须改用 ReleaseSpawnPointByController(AController*) 精准释放
+ *
+ * @note v242 DEPRECATED — 编译警告引导改用 ReleaseSpawnPointByController
+ * @note v246 转发壳内部走 ReleaseAllSpawnPointOccupancy 语义化 API (不调下层废弃方法)
  */
+UE_DEPRECATED(5.6, "【v242 零兜底】ResetAllSpawnPointOccupancy 是粗粒度接口, 请改用 ReleaseSpawnPointByController 精细化释放, 避免多玩家同帧死亡误清空.")
 void ARoomGameMode::ResetAllSpawnPointOccupancy()
 {
-	if (URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this))
+	URoomSpawnSubsystem* SpawnSys = URoomSpawnSubsystem::Get(this);
+	if (!SpawnSys)
 	{
-		SpawnSys->ResetAllSpawnPointOccupancy();
+		UE_LOG(LogTemp, Error,
+			TEXT("[RoomGameMode] ResetAllSpawnPointOccupancy: URoomSpawnSubsystem 未找到. "
+			     "请检查 GameMode 初始化 (InjectSubsystemConfigs 是否调用)."));
+		return;
 	}
+
+	// 【v246 大厂架构重构】走语义化 API, 不再调下层废弃方法
+	//   - ReleaseAllSpawnPointOccupancy 内部逐个调 ReleaseSpawnPointByController
+	//   - 双表一致性由 ReleaseSpawnPointByController 内部维护
+	//   - 不暴露 OccupiedSpawnByController 字段给外部 (大厂封装)
+	const int32 ReleasedCount = SpawnSys->ReleaseAllSpawnPointOccupancy();
+
+	UE_LOG(LogTemp, Display,
+		TEXT("[RoomGameMode] ResetAllSpawnPointOccupancy: 释放完成 — 共释放 %d 个 Controller. "
+		     "【v246 零兜底】新代码应使用 ReleaseSpawnPointByController 按 Controller 精准释放, 避免误清空."),
+		ReleasedCount);
 }
 
 
 /**
- * GetPlayerSpawnData - v31.1 Refactored - delegates to URoomSpawnSubsystem
+ * @brief [大厂委派层] 查询玩家的 CharID/WeaponID 缓存 — 真理源在 URoomSpawnSubsystem
+ *
+ * 用于临时调试 / 兼容旧接口; 当前主链路已走 Pawn.SpawnWeaponID (Replicated, 单一真理源 v36)
+ *
+ * @param ControllerUniqueID Controller UniqueID (网络唯一标识)
+ * @param OutCharID out 参数, 返回角色 ID
+ * @param OutWeaponID out 参数, 返回武器 ID
+ * @return true=查询成功, false=未找到或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note v36 起此接口为"兼容缓存", 主链路不再依赖 (真理源 = Pawn 字段)
  */
 bool ARoomGameMode::GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCharID, FString& OutWeaponID) const
 {
@@ -1008,7 +1351,12 @@ bool ARoomGameMode::GetPlayerSpawnData(uint32 ControllerUniqueID, FString& OutCh
 // ==========================================
 
 /**
- * StartMatchTimer - v31.2 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 启动比赛计时器 — 真理源在 URoomLifecycleSubsystem
+ *
+ * 倒计时参数来自 ZombieMatchDurationSeconds / MeleeMatchDurationSeconds (按模式选择)
+ * 到期回调 OnMatchTimerTick → HandleMatchTimeOut
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 void ARoomGameMode::StartMatchTimer()
 {
@@ -1020,7 +1368,11 @@ void ARoomGameMode::StartMatchTimer()
 
 
 /**
- * OnMatchTimerTick - v31.2 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 比赛计时器 Tick 回调 — 真理源在 URoomLifecycleSubsystem
+ *
+ * 由 UE Timer 系统按 0.1s 频率调用, 更新 GS->MatchRemainingSeconds / 触发提前结束判定
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 void ARoomGameMode::OnMatchTimerTick()
 {
@@ -1032,7 +1384,11 @@ void ARoomGameMode::OnMatchTimerTick()
 
 
 /**
- * HandleMatchTimeOut - v31.2 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 处理比赛超时 — 真理源在 URoomLifecycleSubsystem
+ *
+ * 计时器归零时触发, 根据当前模式进入结算流程 (Melee/Zombie 分支)
+ *
+ * @note 大厂委派层 — v31.2 重构
  */
 void ARoomGameMode::HandleMatchTimeOut()
 {
@@ -1044,7 +1400,12 @@ void ARoomGameMode::HandleMatchTimeOut()
 
 
 /**
- * HandleZombieRoundEnd - v31.2 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 处理生化小局结束 — 真理源在 URoomLifecycleSubsystem
+ *
+ * 生化模式特有: 母体被击杀或人类全灭时触发
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 进入结算 UI, 准备下一局 / 切换模式
  */
 void ARoomGameMode::HandleZombieRoundEnd()
 {
@@ -1056,7 +1417,10 @@ void ARoomGameMode::HandleZombieRoundEnd()
 
 
 /**
- * StartNextZombieRound - v31.2 delegates to URoomLifecycleSubsystem
+ * @brief [大厂委派层] 开启下一局生化小局 — 真理源在 URoomLifecycleSubsystem
+ *
+ * @note 大厂委派层 — v31.2 重构
+ * @note 走 Reset + 重新占位 + 重置母体的完整链路
  */
 void ARoomGameMode::StartNextZombieRound()
 {
@@ -1072,7 +1436,13 @@ void ARoomGameMode::StartNextZombieRound()
 // ==========================================
 
 /**
- * TransferHostTo - v31.1 Refactored - delegates to URoomMembershipSubsystem
+ * @brief [大厂委派层] 服务端房主权限转移 — 真理源在 URoomMembershipSubsystem
+ *
+ * @param NewHostPlayerName 新房主玩家名
+ * @return true=转移成功, false=未找到玩家或 Subsystem 不可用
+ *
+ * @note 大厂委派层 — v31.1 重构
+ * @note 触发 GS->HostPlayerName 更新 + Broadcast OnHostChanged 事件
  */
 bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
 {
@@ -1107,6 +1477,30 @@ bool ARoomGameMode::TransferHostTo(const FString& NewHostPlayerName)
 // 不破坏刀战模式:
 //   - GameHUDWidget 仅在 Bio 模式 + RoundWinner 已写时调本函数
 //   - 刀战永远不调, 4 个字段刀战模式 0 影响
+/**
+ * @brief [v210.4 大厂架构重构] 生化小局结算音效查表 — 已废弃, 永远返回 nullptr
+ *
+ * 【v210.4 大厂架构重构 — 废弃 ResolveZombieRoundEndSound】
+ *   旧 (v134 - v210.3): GM 提供 ResolveZombieRoundEndSound(RoundWinner) 集中决策
+ *   根因: 客户端 World->GetAuthGameMode() 返回 nullptr, 此函数在客户端永远走 fallback 路径
+ *   修复: 音效配置真理源保留在 GM, 但查表/播放上移到 RPC 链路 (服务器查 GM → FSoftObjectPath → 客户端 LoadSynchronous)
+ *   调用方: 已无, v210.4 后 UI / Lifecycle 都不再调此函数
+ *   保留函数体避免遗留调用编译错误, 但永远返回 nullptr (零兜底, 不允许 fallback)
+ *
+ * 大厂原则 — 零兜底:
+ *   - RoundWinner == None → 返回 nullptr (胜负未定, 不允许基于未定播放)
+ *   - 音效资产为空 → 返回 nullptr (策划配置错, Log Error 告知)
+ *
+ * 不破坏刀战模式:
+ *   - GameHUDWidget 仅在 Bio 模式 + RoundWinner 已写时调本函数
+ *   - 刀战永远不调, 4 个字段刀战模式 0 影响
+ *
+ * @param InRoundWinner 小局胜负方 (Human/Mother)
+ * @return USoundBase* 永远返回 nullptr (函数已废弃, 已 Log Error 引导修复)
+ *
+ * @note v210.4 永远返回 nullptr, 强制调用方走新 RPC 链路
+ * @note 新路径: RoomGS->MulticastPlayZombieRoundSound(NewWinner, FSoftObjectPath(Sound))
+ */
 USoundBase* ARoomGameMode::ResolveZombieRoundEndSound(EZombieRoundWinner InRoundWinner) const
 {
 	// 【v210.4 大厂架构重构】此函数已废弃, 永远返回 nullptr, 强制走新路径 (RPC FSoftObjectPath)

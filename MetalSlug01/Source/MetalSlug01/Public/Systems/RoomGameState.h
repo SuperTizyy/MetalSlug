@@ -22,6 +22,23 @@
 // UE 自动生成的头文件
 #include "RoomGameState.generated.h"
 
+/**
+ * @file RoomGameState.h
+ * @brief 房间全局状态类 (ARoomGameState) — UE 5.6 网络权威状态数据集中地
+ *
+ * 大厂架构角色 — 单一真理源 (Single Source of Truth):
+ *   - 比赛模式 (Melee/Zombie) + 总回合数 + 当前回合数 + 比赛剩余时间
+ *   - 母体变异倒计时 / 空投降临倒计时 (服务器写入,客户端本地计算剩余秒数)
+ *   - 双方击杀数 + 胜局数 (Replicated)
+ *   - 结算状态 (bInSettlement) + 本局赢家 (RoundWinner/MeleeWinner) + 结算 RPC 链路
+ *   - AI 占位队列 + 战斗阶段 AI 名单 (镜像 v217 跨地图快照链路)
+ *
+ * 与其他组件的关系:
+ *   - 上游: ARoomGameMode 写入字段 (SetTotalRounds / SetCurrentMatchMode / AddTeamKill 等)
+ *   - 下游: ARoomPlayerState / ABaseAIController / 战斗 HUD 订阅 OnRep_* 回调或 Dynamic Delegate
+ *   - 跨端: NetMulticast RPC + Client RPC 推结算快照 (v217 大厂重构)
+ */
+
 // ==========================================
 // 动态多播委托声明（事件驱动机制）
 // ==========================================
@@ -661,7 +678,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Room|AI")
 	void ServerRefreshAllBattleAIEntries();
 
-	/** 客户端读取 API (Tab Scoreboard 用) */
+	/** @brief 客户端读取 API (Tab Scoreboard 用) — 按阵营过滤 AI 名单 */
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Room|AI")
 	TArray<FFactionSnapshotEntry> GetBattleAIEntries(FGameplayTag InFactionTag) const;
 

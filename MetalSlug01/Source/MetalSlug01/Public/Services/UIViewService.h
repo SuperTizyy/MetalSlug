@@ -1,5 +1,35 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ========================================================================
+// UIViewService.h — UI 视图服务头文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 声明 EUIInputMode 枚举(UI Only / Game+UI / Game Only)
+//   - 声明 FPanelConfig 结构体(Widget 类 + 预创建标志 + 输入模式)
+//   - 声明 FOnPanelChanged 委托(面板切换广播,MusicManager 等订阅)
+//   - 声明 UUIViewService 类(继承 UGameInstanceSubsystem),
+//     提供 Widget 显示/隐藏/输入模式的统一门面
+//
+// 大厂架构角色 — L2 Service Layer (Lyra CommonGameUI 实现):
+//   - 订阅 UGameFlowSubsystem::OnStateChanged
+//   - 自动创建/销毁 Widget(View 自己不 CreateWidget)
+//   - 自动注入 ViewModel(Presenter)(View 自己不 NewObject)
+//   - 自动应用输入模式
+//   - 预创建机制:高频面板预加载,避免战斗中卡顿
+//
+// 设计原则:
+//   1. 单一职责:只管 UI 显示/隐藏/输入模式
+//   2. View 完全无感知:View 不知道自己的 Widget 类是如何被创建的
+//   3. ViewModel 完全无感知:View 不知道 ViewModel 怎么来
+//   4. 全局唯一:GameInstance 子系统
+//
+// 大厂对应:
+//   - Lyra:UCommonGameUI / UCommonActivatableWidget
+//   - Riot:UIManager
+//   - EA Frostbite:UIViewController
+// ========================================================================
+
 #pragma once
 
 // ==========================================

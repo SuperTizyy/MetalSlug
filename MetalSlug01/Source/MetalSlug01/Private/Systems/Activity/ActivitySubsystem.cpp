@@ -121,6 +121,14 @@ const FActivityInfoRow* UActivitySubsystem::GetActivityInfo(int32 ActivityID) co
 	);
 }
 
+/**
+ * @brief 构造活动存档槽位名(进程级隔离)
+ * @param ActivityID 活动 ID
+ * @return 槽位名字符串, 格式 "DailyLogin_<ActivityID>_<PID>"
+ *
+ * 包含进程 ID (PID) 防止多开客户端 / PIE 多端覆盖同一存档
+ * 单一构造点: 所有 SaveGame 路径必须走此函数, 不允许硬编码
+ */
 FString UActivitySubsystem::BuildSaveSlotName(int32 ActivityID) const
 {
 	return FString::Printf(TEXT("DailyLogin_%d_%d"), ActivityID, FPlatformProcess::GetCurrentProcessId());
@@ -174,6 +182,13 @@ FPlayerLoginRecord& UActivitySubsystem::GetOrInitPlayerRecord(int32 ActivityID)
 	return SaveGameInstance->ActivityRecords[ActivityID];
 }
 
+/**
+ * @brief 将 CachedSaveGame 中的玩家记录持久化到磁盘
+ * @param ActivityID 活动 ID(用于构建槽位名)
+ *
+ * 依赖 CachedSaveGame 已由 GetOrInitPlayerRecord 加载/初始化
+ * CachedSaveGame 为空时 Log Error 并跳过(零兜底 — 调用方必须先 Init)
+ */
 void UActivitySubsystem::SavePlayerRecord(int32 ActivityID)
 {
 	if (CachedSaveGame)
@@ -210,6 +225,17 @@ const TArray<const FDailyLoginConfigRow*> UActivitySubsystem::GetRewardsByDay(in
 	);
 }
 
+/**
+ * @brief 尝试领取指定天的奖励
+ * @param ActivityID 活动 ID
+ * @param DayIndex 目标天数(1-based)
+ * @return 领取是否成功(超出进度 / 已领取 / 存档失败 → false)
+ *
+ * 三层校验: 进度范围校验 → 重复领取校验 → 顺序/跳跃分支
+ * 顺序领取(DayIndex == Progress+1)→ Progress 推进
+ * 跳跃领取(DayIndex > Progress+1)→ Progress 不变(防作弊穿透)
+ * 成功时广播 OnActivityDataChanged 通知 UI 刷新
+ */
 bool UActivitySubsystem::TryClaimReward(int32 ActivityID, int32 DayIndex)
 {
 	// 获取玩家记录
@@ -338,6 +364,14 @@ UDailyLoginSaveModifier* UActivitySubsystem::GetSaveModifier() const
 	return SaveModifier;
 }
 
+/**
+ * @brief 初始化动态存档修改器(可重复调用, 幂等)
+ * @param WorldContext 世界上下文(用于 SaveModifier 内部访问 World)
+ * @return 初始化是否成功
+ *
+ * SaveModifier 为空时懒加载创建; 重复调用安全
+ * 失败时 Log Error 但不中断上层流程(降级到无修改器模式)
+ */
 bool UActivitySubsystem::InitializeSaveModifier(UObject* WorldContext)
 {
 	if (!SaveModifier)

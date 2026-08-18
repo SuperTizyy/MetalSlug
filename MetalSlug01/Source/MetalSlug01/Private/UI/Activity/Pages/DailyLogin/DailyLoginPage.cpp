@@ -1,7 +1,20 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// DailyLoginPage 实现 — 每日登录活动页面
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDailyLoginPage — 每日登录奖励页面所有 UI 逻辑
+//   2. ScrollBox 渲染 DayItem + 第 8 天 BigReward 单独显示
+//   3. 全领取/单天领取/重置进度/礼包选项弹窗/宝箱选择弹窗
+//
+// 大厂原则:
+//   - 数据驱动: ActivitySubsystem 提供 Record + Rewards (单一真理源)
+//   - 防重入: static bAlreadyCalled 防同一事件多次触发
+//   - 解耦: 监听 Subsystem OnActivityDataChanged 自动刷新
+//   - 防御性: 控件未绑 → Log Error 提示
+//   - 滚动定位: SetTimerForNextTick 延迟 ScrollToCurrentDay
 // ==========================================
 #include "UI/Activity/Pages/DailyLogin/DailyLoginPage.h"
 #include "Components/ScrollBox.h"

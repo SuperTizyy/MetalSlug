@@ -28,6 +28,15 @@ FString UBTDecorator_HPThreshold::GetStaticDescription() const
 		Threshold);
 }
 
+/**
+ * @brief HP 阈值判定 — 比较 BB.HealthPercent 与配置阈值, 按 Less/Greater 模式返回
+ * @param OwnerComp BT 组件引用, 用于获取 BB
+ * @param NodeMemory Decorator 节点内存(本类未使用)
+ * @return 血量百分比与阈值按模式比较的结果, BB 无效默认 false
+ *
+ * 单点决策: BT 每次重算分支时调用, 无 Tick. 血量变化通过 FlowAbortMode::Self
+ * 在受击/死亡时自动重算, 不需要 Service 推 BB.
+ */
 bool UBTDecorator_HPThreshold::CalculateRawConditionValue(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
 {

@@ -16,6 +16,43 @@ class UTexture2D;
 class UAnimMontage;
 
 /**
+ * @struct FAnimMontageByCharacterEntry
+ * @brief 【v241.1 修复 — UE 5.6 不支持 Replicated TMap】
+ *
+ * 替代方案: TArray<FAnimMontageByCharacterEntry> 作为蒙太奇按角色查表的容器
+ * (Replicated TArray<FStruct> 是 UE 5.6 标准支持, Replicated TMap **不支持**)
+ *
+ * 字段:
+ *   - CharacterRowName: 角色身份字符串 (如 "SWAT", "CosmoBunnyGirl") — 由用户在 DT 自由命名,
+ *     唯一要求 = 必须跟 Owner Character 端的 GetCharacterRowName() 返回值一致
+ *   - Montage: 对应角色 Skeleton 的 UAnimMontage 资产
+ *
+ * 大厂原则:
+ *   - 客户端 / 服务器共享同一个 struct 类型 (UE 网络序列化自动处理)
+ *   - DT 编辑器自动展开为多行 UI (策划可手动添加/删除每个角色配的 Montage)
+ *   - 查询复杂度 O(N), N 通常 < 10 (角色总数), 无性能问题
+ *   - 零兜底: 找不到匹配项 → Log Error + return nullptr (不静默 fallback)
+ *
+ * 匹配规则 (大厂原则 — 单一真理源):
+ *   DT 数组的 CharacterRowName 必须 == Owner Character 端 GetCharacterRowName() 返回的 FName 字符串
+ *   - 玩家路径: RoomPlayerState::SelectedCharacterID 字符串 ("SWAT" / "CosmoBunnyGirl" / 等)
+ *   - AI 路径:   WeaponAttachmentComponent::CharacterID 字符串 (同样格式)
+ */
+USTRUCT(BlueprintType)
+struct FAnimMontageByCharacterEntry
+{
+	GENERATED_BODY()
+
+	/** 角色身份字符串 (如 "SWAT", "CosmoBunnyGirl") — 必须跟 Owner Character 端 GetCharacterRowName() 一致 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Montage")
+	FName CharacterRowName;
+
+	/** 对应角色 Skeleton 的 AnimMontage 资产 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Montage")
+	TObjectPtr<UAnimMontage> Montage;
+};
+
+/**
  * @struct FWeaponInfo
  * @brief 武器信息数据表行
  * 用途: 关联 DT_WeaponList, 让 UI 选武器/3D 武器生成数据驱动
@@ -151,17 +188,42 @@ public:
 	float MuzzleOffset = 50.0f;
 
 	/**
-	 * 腰射 (Hip) 状态下播放的开火蒙太奇
-	 * 留空 → 不播放蒙太奇 (只走射线)
+	 * 【v241.1 大厂架构 — 按角色查表】开火蒙太奇 (按角色区分 Skeleton)
+	 *
+	 * 设计动机:
+	 *   - AnimMontage 必须与角色 Skeleton 兼容, 跨 Skeleton 播放会静默失败 (UE Montage_Play no-op)
+	 *   - DT_WeaponInfo 旧版用单值字段 FireMontageHip → 同一武器在所有角色播同一 Montage
+	 *     → BP_CosmoBunnyGirl 用 SWAT 配的 Montage → 没动画
+	 *
+	 * 实现方案 (v241.1 修复):
+	 *   - UE 5.6 不支持 Replicated TMap (硬限制, 见编译错误 "Replicated maps are not supported")
+	 *   - 改用 TArray<FAnimMontageByCharacterEntry> 替代 TMap
+	 *   - Replicated TArray<FStruct> 是 UE 支持的标准方案
+	 *   - 查询时遍历数组找 CharacterRowName 匹配 (N 个角色, O(N), N 通常 < 10, 无性能问题)
+	 *
+	 * 真理源: 唯一, 仅 DT 行 (策划在 DataTable 编辑器里配 — UE 5.6 DT 编辑器支持 TArray<FStruct> 自动展开 UI)
+	 * 服务器写入: WeaponFireComponent::InitializeFromWeaponConfig
+	 * 客户端查询: WeaponFireComponent::GetFireMontageHip (内部用 Owner Character 的 RowName 遍历查找)
+	 *
+	 * 零兜底:
+	 *   - 数组为空 → Log Error + GetFireMontageHip 返回 nullptr
+	 *   - 数组没有匹配 CharacterRowName 的项 → Log Error + 不播
+	 *
+	 * 使用示例 (DT 编辑器配 WQ001 行 — UE 自动展开为表格行):
+	 *   | CharacterRowName | Montage                              |
+	 *   | "SWAT"           | AS_Fire_Rifle_Ironsights             |
+	 *   | "CosmoBunnyGirl" | AS_Fire_Rifle_Ironsights_CBG        |
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data|Animation")
-	TObjectPtr<UAnimMontage> FireMontageHip;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data|Animation",
+		meta = (DisplayName = "腰射开火蒙太奇 (按角色配置)"))
+	TArray<FAnimMontageByCharacterEntry> FireMontageHipByCharacter;
 
 	/**
-	 * 腰射状态下的换弹蒙太奇
+	 * 【v241.1 大厂架构】换弹蒙太奇 (与 FireMontageHipByCharacter 同模式)
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data|Animation")
-	TObjectPtr<UAnimMontage> ReloadMontageHip;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Data|Animation",
+		meta = (DisplayName = "腰射换弹蒙太奇 (按角色配置)"))
+	TArray<FAnimMontageByCharacterEntry> ReloadMontageHipByCharacter;
 
 	/**
 	 * 是否能在换弹时被其他输入打断 (false = 强制等 ReloadTimeSeconds)

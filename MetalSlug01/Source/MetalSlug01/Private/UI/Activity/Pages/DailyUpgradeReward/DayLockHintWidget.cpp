@@ -1,7 +1,16 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// DayLockHintWidget 实现 — 天数锁提示 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDayLockHintWidget — 天数锁定状态所有 UI 逻辑
+//   2. InitializeWidget 设置 HintText + 任务/限时奖励图标
+//
+// 大厂原则:
+//   - 数据驱动: DayIdentifier 从 UUpgradeActivitySubsystem 取数据
+//   - 双容器: 限时奖励 + 任务奖励 分离显示
 // ==========================================
 #include "UI/Activity/Pages/DailyUpgradeReward/DayLockHintWidget.h"
 

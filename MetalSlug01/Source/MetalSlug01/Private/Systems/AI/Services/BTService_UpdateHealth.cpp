@@ -23,6 +23,10 @@ UBTService_UpdateHealth::UBTService_UpdateHealth()
 		GET_MEMBER_NAME_CHECKED(UBTService_UpdateHealth, HealthPercentKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示 HP 百分比派生频率与数据源
+ * @return 多行描述,展示 Interval 频率与 BB.HealthPercent 数据来自 HealthComponent
+ */
 FString UBTService_UpdateHealth::GetStaticDescription() const
 {
 	return FString::Printf(

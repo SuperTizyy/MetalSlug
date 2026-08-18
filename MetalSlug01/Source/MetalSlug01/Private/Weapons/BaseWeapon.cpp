@@ -15,17 +15,9 @@
 // 引入武器模型类型枚举 (v61.2 — DT_WeaponInfo 真理源)
 #include "Data/Tables/WeaponTableRow.h"
 
-// 【v241 大厂架构】trace debug 可视化统一开关 — 所有 DrawDebug* 都受这个 CVar 控制
+// 【v241.1 大厂架构】trace debug 可视化统一开关 — 见 Debug/MetalSlugDebugCVars.h
 // 控制台命令: g.MetalSlug.ShowTraceDebug 1 打开, 0 关闭 (默认关闭, 用户要求)
-static TAutoConsoleVariable<int32> CVarShowTraceDebug(
-	TEXT("g.MetalSlug.ShowTraceDebug"),
-	0,
-	TEXT("Toggle trace debug visualization (DrawDebugLine/Sphere/Box).\n")
-	TEXT("0 = hide all trace debug visuals (default)\n")
-	TEXT("1 = show all trace debug visuals\n")
-	TEXT("Affects: BaseWeapon::Multicast_PlayFireTraceVisual, BTDecorator_HasClearShot, RangedLineStrategy"),
-	ECVF_Default
-);
+#include "Debug/MetalSlugDebugCVars.h"
 
 // 引入 Mesh 组件基类 (GetMeshComponent 返回 UMeshComponent*)
 #include "Components/MeshComponent.h"
@@ -40,7 +32,7 @@ static TAutoConsoleVariable<int32> CVarShowTraceDebug(
 #include "GameFramework/Character.h"
 // 引入 AIController（用于 bIsAIDriven 时从 AIC 读 ConfigSO.Damage）
 #include "AIController.h"
-#include "Systems/BaseAIController.h" // ABaseAIController::GetEffectiveAttackDamage
+#include "Systems/BaseAIController.h" // AAIController::StaticClass() 用于 bIsAIDriven_Authoritative 判定
 // 射线检测核心库
 #include "Kismet/KismetSystemLibrary.h"
 #include "GameFramework/Pawn.h"
@@ -644,16 +636,10 @@ UAnimMontage* ABaseWeapon::GetAttackMontage(bool bIsHeavy, int32 ComboIndex) con
  * 2. 更新 LastKillMethod（供 HUD 显示击杀图标）
  * 3. 调用 UGameplayStatics::ApplyPointDamage 真正扣血
  *
- * 【P0 2026.07.07 大厂架构重构】AI 通道伤害来源 - 服务器权威读 ConfigSO.Damage
- *   - bIsAIDriven=true  (AI 路径):   服务器拉 AIController->GetEffectiveAttackDamage()
- *                                    (含难度缩放, 单一真值源)
- *   - bIsAIDriven=false (玩家路径): 走武器字段重算 (LightDamageBody/Head/Heavy)
- *
- * 为什么服务器读 ConfigSO.Damage 而不是 RPC 传入:
- *   - trace 端在 Tick 中跑, 没必要每帧查 AIController 浪费 CPU
- *   - 服务器端只在命中那 1 帧调用, 集中查 1 次更省
- *   - RPC 网络: 少传一个 float = 省带宽
- *   - 单一职责: 服务器权威决定伤害 (防客户端伪造 Damage 攻击 AI 通道)
+ * 【v250 大厂架构重构】伤害统一走 DT_WeaponInfo
+ *   - AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
+ *   - bIsAIDriven 参数仅用于诊断日志, 不再决定伤害分支
+ *   - 策划只需维护 DT_WeaponInfo 一份伤害配置
  */
 void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy, bool bIsAIDriven)
 {
@@ -774,107 +760,42 @@ void ABaseWeapon::Server_ReportHit_Implementation(AActor* HitActor, float Damage
 	// 服务器根据部位计算伤害
 	float FinalDamage = 0.0f;
 
-	// 【v40.9.6 P0 大厂架构】AI 通道: 服务器权威读 ConfigSO.Damage
+	// 【v250 大厂架构重构】AI/玩家统一走 DT_WeaponInfo 伤害字段
 	//
-	// 旧版: bIsAIDriven 由客户端读 Owner.bIsCurrentlyAttackerAI 传入 → 残留 bug
-	//   → AI 攻击蒙太奇被打断时, AIAttackComponent::OnAIAttackMontageEnded 早退出,
-	//     SetAttackerIsAI(false) 没调用, 但下一帧新 AI 攻击的 box trace 命中玩家
-	//     → IsAttackerAI() 返回残留 false → RPC 传 bIsAIDriven=false → 走玩家路径 → 60 伤害
-	// 新版: bIsAIDriven 用服务器权威值 (bIsAIDriven_Authoritative), 从 Controller 类型判定
-	//   → 真理源 = Actor 类型 (运行时不可变), 不依赖攻击状态 bool
-	if (bIsAIDriven_Authoritative)
-	{
-		// 服务器从攻击者 Owner 拉 AIController → 难度缩放后的 ConfigSO.Damage
-		if (const ABaseCharacter* AttackerChar = Cast<ABaseCharacter>(GetOwner()))
-		{
-			if (const AAIController* AIC = Cast<AAIController>(AttackerChar->GetController()))
-			{
-				if (const ABaseAIController* BaseAIC = Cast<ABaseAIController>(AIC))
-				{
-					FinalDamage = BaseAIC->GetEffectiveAttackDamage();
-				}
-				else
-				{
-					UE_LOG(LogTemp, Error,
-						TEXT("ABaseWeapon::Server_ReportHit: AIC 不是 ABaseAIController (类型=%s), 无法读 ConfigSO.Damage — 攻击者=%s 受击者=%s"),
-						AIC ? *AIC->GetClass()->GetName() : TEXT("<null>"),
-						*AttackerChar->GetName(),
-						*Victim->GetName());
-					return;
-				}
-			}
-			else
-			{
-				UE_LOG(LogTemp, Error,
-					TEXT("ABaseWeapon::Server_ReportHit: Attacker=%s Controller 不是 AAIController (类型=%s), AI 通道无法解析"),
-					*AttackerChar->GetName(),
-					AttackerChar->GetController() ? *AttackerChar->GetController()->GetClass()->GetName() : TEXT("<null>"));
-				return;
-			}
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("ABaseWeapon::Server_ReportHit: Weapon=%s Owner 不是 ABaseCharacter (类型=%s), AI 通道无法解析"),
-				*GetName(),
-				GetOwner() ? *GetOwner()->GetClass()->GetName() : TEXT("<null>"));
-			return;
-		}
-
-		if (FinalDamage <= 0.0f)
-		{
-			UE_LOG(LogTemp, Error,
-				TEXT("ABaseWeapon::Server_ReportHit: AI 通道读到的 FinalDamage<=0 (ConfigSO.Damage * DifficultyScale=%.2f), 拒绝造成 0 伤害攻击 — Attacker=%s Victim=%s"),
-				FinalDamage,
-				GetOwner() ? *GetOwner()->GetName() : TEXT("<none>"),
-				*Victim->GetName());
-			return;
-		}
-
-		// 【v229.x v6 大厂架构】KillMethod 由 ResolveKillMethod 统一推导
-		//   旧版硬编码 LastKillMethod = EKillMethod::MeleeWeapon → 主武器击杀也被错配成 Melee
-		//   新版走真理源 this->MeshType (DT_WeaponInfo.MeshType 写入, 已 Replicated)
-		LastKillMethod = ResolveKillMethod(BoneName);
-	}
-	else if (Damage > 0.0f)
-	{
-		// 玩家路径但客户端传了非零 Damage — 不再兼容旧版, 直接走武器字段
-		//   兜底逻辑会掩盖"玩家通道 + ConfigSO 不一致"的真因, 大厂架构已删除
-		if (bIsHeavy)
-		{
-			FinalDamage = HeavyDamage;
-		}
-		else if (BoneName == FName("head"))
-		{
-			FinalDamage = LightDamageHead;
-		}
-		else
-		{
-			FinalDamage = LightDamageBody;
-		}
-		// 【v229.x v6】统一入口 — 不再硬编码 Melee
-		LastKillMethod = ResolveKillMethod(BoneName);
-	}
-	else if (bIsHeavy)
+	// 旧版痛点 (v40-v249):
+	//   - AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
+	//   - 玩家通道走 BaseWeapon::LightDamageBody/Head/Heavy (来自 DT_WeaponInfo)
+	//   - 两套伤害配置, 策划维护成本高, AI 改武器不影响伤害
+	//
+	// 新版 (v250 — 单一真理源):
+	//   - AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
+	//   - AI 拿刀: LightDamageBody=20; AI 拿枪: LightDamageBody=20 (都走 DT_WeaponInfo)
+	//   - 策划只需维护 DT_WeaponInfo 一份配置
+	//   - bIsAIDriven_Authoritative 只用于诊断日志, 不再用于伤害分支
+	//
+	// 【v40.9.6 遗留问题已修复】:
+	//   - 旧版 bIsAIDriven 用于伤害分支, 但由客户端传入不可信
+	//   - 新版伤害不区分 AI/玩家, bIsAIDriven_Authoritative 仅用于日志标识
+	if (bIsHeavy)
 	{
 		FinalDamage = HeavyDamage;
-		// 【v229.x v6】统一入口 — 不再硬编码 Melee
-		LastKillMethod = ResolveKillMethod(BoneName);
+	}
+	else if (BoneName == FName("head"))
+	{
+		FinalDamage = LightDamageHead;
 	}
 	else
 	{
-		// 玩家路径: 轻击按部位判定
-		if (BoneName == FName("head"))
-		{
-			FinalDamage = LightDamageHead;
-		}
-		else
-		{
-			FinalDamage = LightDamageBody;
-		}
-		// 【v229.x v6】统一入口 — 不再硬编码 Melee (刀/枪按 MeshType 自动区分)
-		LastKillMethod = ResolveKillMethod(BoneName);
+		FinalDamage = LightDamageBody;
 	}
+	// 【v229.x v6 大厂架构】KillMethod 由 ResolveKillMethod 统一推导
+	LastKillMethod = ResolveKillMethod(BoneName);
+
+	// 【v250 诊断日志】区分 AI/玩家伤害来源 (仅用于可观测性)
+	UE_LOG(LogTemp, Display,
+		TEXT("[BaseWeapon::Server_ReportHit] 【v250 统一伤害】Attacker=%s Damage=%.1f (Bone=%s, AI=%d) "
+		     "— AI/玩家统一走 DT_WeaponInfo 伤害字段"),
+		*GetName(), FinalDamage, *BoneName.ToString(), bIsAIDriven_Authoritative ? 1 : 0);
 
 	// 服务器执行伤害
 	// 【P0 修复 2026.07.10】正确设置 FHitResult 的 BoneName 用于部位伤害判定
@@ -1333,7 +1254,12 @@ void ABaseWeapon::Multicast_PlayFireMontage_Implementation()
 	if (!FireMontage)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayFireMontage_Implementation: FireMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 FireMontage_Ironsights 必须配置 Anim_Fire_Rifle_Ironsights_Montage."),
+			TEXT("[BaseWeapon][v241] Multicast_PlayFireMontage_Implementation: FireMontage 为空! Weapon=%s. "
+			     "【v241 修复】DT_WeaponInfo 中该武器行的 FireMontageHipByCharacter Map 必须按角色配 — "
+			     "Key=CharacterRowName (如 'SWAT', 'CosmoBunnyGirl' — 跟 Owner Character 的 GetCharacterRowName() 返回值一致), Value=对应 Skeleton 的 AnimMontage. "
+			     "【诊断链】1) Owner Character 的 GetCharacterRowName() 返回什么? "
+			     "2) DT_WeaponInfo 的 FireMontageHipByCharacter Map 里有没有这个 Key? "
+			     "3) Map 配错时 WeaponFireComponent::GetFireMontageHipByRow 会 Log Error 显示具体缺哪个 Key."),
 			*GetName());
 		return;
 	}
@@ -1389,7 +1315,10 @@ void ABaseWeapon::Multicast_PlayReloadMontage_Implementation()
 	if (!ReloadMontage)
 	{
 		UE_LOG(LogTemp, Error,
-			TEXT("[BaseWeapon][v200.2.19] Multicast_PlayReloadMontage_Implementation: ReloadMontage 为空! Weapon=%s. 修复: DT_WeaponInfo 中 BQ001 行的 ReloadMontage_Ironsights 必须配置 Anim_Reload_Rifle_Ironsights_Montage."),
+			TEXT("[BaseWeapon][v241] Multicast_PlayReloadMontage_Implementation: ReloadMontage 为空! Weapon=%s. "
+			     "【v241 修复】DT_WeaponInfo 中该武器行的 ReloadMontageHipByCharacter Map 必须按角色配 — "
+			     "Key=CharacterRowName (如 'SWAT', 'CosmoBunnyGirl' — 跟 Owner Character 的 GetCharacterRowName() 返回值一致), Value=对应 Skeleton 的 AnimMontage. "
+			     "【诊断链】WeaponFireComponent::GetReloadMontageHipByRow 会 Log Error 显示具体缺哪个 Key."),
 			*GetName());
 		return;
 	}

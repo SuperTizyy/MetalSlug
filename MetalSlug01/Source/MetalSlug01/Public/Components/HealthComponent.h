@@ -41,6 +41,32 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnInvincibilityChanged, bool, bIsNo
 //   - ABaseCharacter::OnRespawnMovementLockedChanged: 收到事件后修改 MaxWalkSpeed
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRespawnMovementLockedChanged, bool, bIsLocked, float, Duration);
 
+/**
+ * @class UHealthComponent
+ * @brief 生命值管理组件 - 角色血量/死亡/无敌期/复活移动锁定的数据权威
+ *
+ * 单一职责: 持有并管理角色的血量、死亡标志、无敌期、复活移动锁定状态
+ *
+ * 大厂架构中的角色:
+ *   - 数据权威: 真理源 (MaxHealth/CurrentHealth/bIsDead/bIsInvincible/bIsRespawnMovementLocked)
+ *     全部在本组件, ABaseCharacter 不再持有重复字段
+ *   - 职责单一: 只管"血量+无敌+锁定" 数据, Actor 只编排行为 (Die/ExecuteDeath/ApplyDamage)
+ *   - 网络复制: 所有数据字段 DOREPLIFETIME 同步到客户端
+ *   - 事件总线: OnDeath/OnHealthChanged/OnInvincibilityChanged/OnRespawnMovementLockedChanged
+ *     供 HUD/特效/Actor 订阅 (替代 OnRep 轮询)
+ *
+ * 设计原则:
+ *   - 单一真理源: 扣血入口只需在 ApplyDamage 守卫 IsInvincible()/IsRespawnMovementLocked() 即可
+ *   - 双发保证: 服务器主动 Broadcast + 客户端 OnRep 自动 Broadcast
+ *   - 派生字段 > 衍生 bool: GetInvincibilityRemainingSeconds 用 ExpiresAt 派生而非依赖 bIsInvincible
+ *   - 拒绝缩短: ActivateInvincibility 已激活时取较晚到期时间
+ *
+ * 使用方式:
+ *   - ABaseCharacter::PossessedBy 调用 InitializeHealth 初始化
+ *   - 武器/AI 攻击调用 ApplyDamage 扣血
+ *   - 死亡流程订阅 OnDeath.Broadcast
+ *   - HUD 订阅 OnHealthChanged/OnInvincibilityChanged/OnRespawnMovementLockedChanged
+ */
 UCLASS(ClassGroup = (MetalSlug), meta = (BlueprintSpawnableComponent))
 class METALSLUG01_API UHealthComponent : public UActorComponent
 {

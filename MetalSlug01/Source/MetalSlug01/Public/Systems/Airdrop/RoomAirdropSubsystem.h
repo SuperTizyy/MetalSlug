@@ -70,9 +70,13 @@
 // 大厂注意 (UE 5.6 UHT 严格模式): .generated.h 必须用裸文件名
 #include "RoomAirdropSubsystem.generated.h"
 
+// 前向声明 — AAirdropPickup 完整类型在 cpp 内 include (避免循环依赖)
 class AAirdropPickup;
 
 /**
+ * @file RoomAirdropSubsystem.h
+ * @brief 生化模式空投子系统 — 服务器权威调度 (大厂架构)
+ *
  * @class URoomAirdropSubsystem
  * @brief 生化模式空投系统 — 服务器权威单一调度
  *

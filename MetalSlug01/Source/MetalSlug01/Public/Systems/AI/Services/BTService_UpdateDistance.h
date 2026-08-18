@@ -57,6 +57,7 @@ class METALSLUG01_API UBTService_UpdateDistance : public UBTService
 public:
 	UBTService_UpdateDistance();
 
+	/** @brief BT 编辑器静态描述 (显示 TargetKey + DistanceKey + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 目标 BB Key — 服务从这里读目标 Actor */

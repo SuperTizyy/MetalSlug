@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// RoomInsidePage 头文件 — 房间内部 UI 页面
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 URoomInsidePage — 在黑屏的 Map_Lobby 中显示的房间 UI
+//   2. 显示攻守方 + 准备 + 开始游戏
+//   3. 玩家在进入战斗前的准备区域 (队伍选择 + 角色配置 + 武器选择)
+//
+// 架构理念:
+//   - 房主/玩家区分: HasAuthority() 控制按钮可见性
+//   - 自动订阅: 0.5s CheckForNewPlayers 扫 GameState
+//   - 角色/武器/AI 配置: 全部从 DataTable 加载
+//   - 跨关卡: 监听 GameFlowSubsystem 状态变化, 战斗开始自我销毁
+//   - 双数据流: 真人 (GS->PlayerArray) + AI 占位 (GM->PendingAIQueue) 独立循环
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
@@ -155,17 +168,26 @@ protected:
 	// 必须是 UFUNCTION, 因为是 Dynamic 委托的 BindDynamic 目标
 	// ==========================================
 
-	/** 房主身份变化: 刷新按钮可见性 */
-	UFUNCTION()
-	void OnRoomServiceHostChanged(bool bIsHostNow);
+    /**
+     * @brief 监听状态改变的回调函数 — UIViewService 触发, 房主变更时刷新按钮可见性
+     * @param bIsHostNow 是否为房主
+     */
+    UFUNCTION()
+    void OnRoomServiceHostChanged(bool bIsHostNow);
 
-	/** 玩家加入: 立即刷新房间标签列表 */
-	UFUNCTION()
-	void OnRoomServicePlayerJoined(const FString& PlayerName);
+    /**
+     * @brief 玩家加入: 立即刷新房间标签列表
+     * @param PlayerName 加入的玩家名
+     */
+    UFUNCTION()
+    void OnRoomServicePlayerJoined(const FString& PlayerName);
 
-	/** 玩家离开: 立即刷新房间标签列表 */
-	UFUNCTION()
-	void OnRoomServicePlayerLeft(const FString& PlayerName);
+    /**
+     * @brief 玩家离开: 立即刷新房间标签列表
+     * @param PlayerName 离开的玩家名
+     */
+    UFUNCTION()
+    void OnRoomServicePlayerLeft(const FString& PlayerName);
 
 	// ==========================================================
 	// 【v93 新增】游戏模式变化响应

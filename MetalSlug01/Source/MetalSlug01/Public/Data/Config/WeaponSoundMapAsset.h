@@ -1,11 +1,21 @@
 // ==================================
-// 武器切换音效配置 DataAsset
+// 武器切换音效配置 DataAsset 头文件
 // 关联: DA_WeaponSoundMap (PrimaryAsset)
 // 用途: 按 EWeaponSlotType 映射 USoundBase (策划不碰代码)
 // 大厂原则:
 //   1. 单一真理源: GM->WeaponSoundMapAsset → DA_WeaponSoundMap → 按 EWeaponSlotType 查 Sound
 //   2. 数据驱动: 策划在编辑器配置, 不用改代码
 //   3. 零兜底: 未配 Slot → Log Error + return, 触发调用方报错
+// ==================================
+//
+// 文件功能总览:
+//   - 声明 FWeaponSlotSoundEntry 结构体(单槽位音效条目 = Sound + VolumeMultiplier + PitchMultiplier)
+//   - 声明 UWeaponSoundMapAsset 类(继承 UDataAsset),集中存放 3 种武器槽位的切换音效
+//   - 提供 FindSoundForSlot API 用于按 EWeaponSlotType 查询
+//
+// 大厂架构角色:
+//   - 单一真理源: 武器切换音效集中由本 DataAsset 提供,无散落硬编码
+//   - 调用链: BaseWeapon::PlayEquipSound → WeaponAttachmentComponent::GetWeaponSoundForSlot → 本资产
 // ==================================
 #pragma once
 

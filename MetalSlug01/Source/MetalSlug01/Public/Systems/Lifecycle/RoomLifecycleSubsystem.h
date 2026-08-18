@@ -5,6 +5,9 @@
 // ==========================================
 // URoomLifecycleSubsystem — 比赛状态机子系统
 //
+// @file RoomLifecycleSubsystem.h
+// @brief 比赛生命周期调度 — 单一权威
+//
 // 【2026.07.11 v31 大厂架构重构】从 RoomGameMode 拆出
 //
 // 设计原则:

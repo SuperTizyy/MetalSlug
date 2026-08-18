@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// RewardOptionWidget 实现 — 奖励选项 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 URewardOptionWidget — 奖励选项弹窗
+//   2. StoreBtn / OpenBtn 点击 → 广播对应委托
+//   3. 防重复: 已点击后 SetIsEnabled(false) 禁用按钮
+//
+// 大厂原则:
+//   - 双委托: 业务分发给上层页面 (DailyLoginPage / DailyUpgradeRewardPage)
+//   - 防重复: 二次点击 SetIsEnabled(false), 防止业务重复触发
+//   - 防御性: StoreBtn / OpenBtn 未绑定 → Log Error
+//   - 跨子系统禁用: 不 include UpgradeActivitySubsystem (职责单一)
 // ==========================================
 #include "UI/Activity/Pages/ClaimBox/RewardOptionWidget.h"
 #include "Components/Button.h"

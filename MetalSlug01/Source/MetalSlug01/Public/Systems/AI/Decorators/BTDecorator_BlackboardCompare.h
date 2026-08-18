@@ -116,6 +116,7 @@ class METALSLUG01_API UBTDecorator_BlackboardCompare : public UBTDecorator
 public:
 	UBTDecorator_BlackboardCompare();
 
+	/** @brief BT 编辑器静态描述 (策划看节点作用) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 【KeyA】左侧 BB Key — 强制, 必须配 */
@@ -166,6 +167,7 @@ public:
 	TObjectPtr<UObject> BObjectValue = nullptr;
 
 protected:
+	/** @brief BT 实际决策: 比较 KeyA vs KeyB/常量, 按 Op 返回 bool */
 	virtual bool CalculateRawConditionValue(
 		UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
 

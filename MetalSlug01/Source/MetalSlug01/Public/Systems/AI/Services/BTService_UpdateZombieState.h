@@ -50,6 +50,7 @@ class METALSLUG01_API UBTService_UpdateZombieState : public UBTService
 public:
 	UBTService_UpdateZombieState();
 
+	/** @brief BT 编辑器静态描述 (显示 7 个 BB Key 名 + Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** BB.bIsMother 写入目标 */

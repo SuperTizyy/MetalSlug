@@ -1,5 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+/**
+ * @file RoomLifecycleSubsystem.cpp
+ * @brief 比赛状态机子系统实现 — 房间生命周期调度权威
+ */
 #include "Systems/Lifecycle/RoomLifecycleSubsystem.h"
 #include "Systems/Airdrop/RoomAirdropSubsystem.h"  // 【v117】空投子系统回调
 #include "Systems/RoomGameMode.h"
@@ -32,6 +36,12 @@ URoomLifecycleSubsystem* URoomLifecycleSubsystem::Get(const UObject* WorldContex
 	return nullptr;
 }
 
+/**
+ * @brief 子系统创建守卫 — Server-only (仅服务器端创建)
+ *
+ * 客户端不创建 Lifecycle Subsystem — 主要职责集中在 GameMode, 比赛状态由 ARoomGameState 复制传递
+ * 镜像 v31.5 风格: 防止客户端误创建导致重复调度
+ */
 bool URoomLifecycleSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
 	// 大厂原则 - Server-only: 只在服务器端创建 (GameMode 只在 server 跑)
@@ -212,6 +222,17 @@ void URoomLifecycleSubsystem::SetTotalRounds(int32 InRounds)
 }
 
 
+/**
+ * @brief 启动比赛倒计时 Timer(按模式分支设置 MatchEndTime)
+ *
+ * 模式分支 (大厂原则 - 严格模式分支, 零兜底):
+ * - Melee: MatchDurationSeconds 写入 MatchEndTime
+ * - Zombie: ZombieMatchDurationSeconds 写入 MatchEndTime
+ * - 其他 (None): 显式 Error + return, 不静默跳过
+ *
+ * 配置 <= 0 拒绝启动 + Log Error (v134 零下限修复, 强制修复 BP 配置)
+ * 末尾启动 1Hz Timer (MatchTimerHandle) 触发 OnMatchTimerTick
+ */
 void URoomLifecycleSubsystem::StartMatchTimer()
 {
 	ARoomGameState* RoomGS = GetWorld()->GetGameState<ARoomGameState>();
@@ -278,6 +299,16 @@ void URoomLifecycleSubsystem::StartMatchTimer()
 	GetWorld()->GetTimerManager().SetTimer(MatchTimerHandle, this, &URoomLifecycleSubsystem::OnMatchTimerTick, 1.0f, true);
 }
 
+/**
+ * @brief 比赛倒计时 Tick 回调(1Hz)
+ *
+ * 模式分支:
+ * - Melee: 倒计时归零 → 终止 Timer + HandleMatchTimeOut(走 TriggerSettlement 旧路径)
+ * - Zombie: 双路径检测 — 倒计时归零 OR 场上无存活人类 → FinishZombieRound(新路径, 走 HasAliveHumanOnField 判定)
+ *
+ * 大厂原则 - 零重复架构: 单个 Tick 内同时检查两个条件, 任一满足即 FinishZombieRound
+ * FinishZombieRound 内部幂等, 同一 Tick 多次调用只有第一次生效
+ */
 void URoomLifecycleSubsystem::OnMatchTimerTick()
 {
 	ARoomGameState* RoomGS = GetWorld()->GetGameState<ARoomGameState>();
@@ -785,6 +816,14 @@ bool URoomLifecycleSubsystem::FinishMeleeMatch()
 	return true;
 }
 
+/**
+ * @brief 处理生化模式单回合结束 — 判断是否还有下一回合
+ * @return true=还有下一回合(由 Timer 触发 StartNextZombieRound), false=所有回合结束
+ *
+ * 单一入口 (v134 重构): 内部调 FinishZombieRound 完成胜负判定 + RoundWinner 写入 + Multicast
+ * 当前回合数 <= 1 时关闭母体变异倒计时, 返回 false 触发全局结算
+ * 当前回合数 > 1 时关闭母体变异倒计时, 返回 true 等 Timer 3s 后自动开下一回合
+ */
 bool URoomLifecycleSubsystem::HandleZombieRoundEnd()
 {
 	ARoomGameState* RoomGS = GetWorld()->GetGameState<ARoomGameState>();

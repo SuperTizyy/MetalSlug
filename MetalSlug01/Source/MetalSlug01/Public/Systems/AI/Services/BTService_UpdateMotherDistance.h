@@ -54,9 +54,11 @@ class METALSLUG01_API UBTService_UpdateMotherDistance : public UBTService
 public:
 	UBTService_UpdateMotherDistance();
 
+	/** @brief BT 编辑器静态描述 (显示 MotherTargetKey + DistanceKey) */
 	virtual FString GetStaticDescription() const override;
 
 protected:
+	/** @brief Tick: 读 WeaponFireComponent, 写 BB.CurrentAmmo + MagazineSize + ReserveAmmo + bIsReloading */
 	virtual void TickNode(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
 		float DeltaSeconds) override;
 

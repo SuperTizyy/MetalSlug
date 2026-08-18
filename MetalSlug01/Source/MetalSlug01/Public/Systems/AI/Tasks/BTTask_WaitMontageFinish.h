@@ -50,6 +50,7 @@ class METALSLUG01_API UBTTask_WaitMontageFinish : public UBTTaskNode
 public:
 	UBTTask_WaitMontageFinish();
 
+	/** @brief BT 编辑器静态描述 (显示 TimeoutSeconds 默认 10s) */
 	virtual FString GetStaticDescription() const override;
 
 	/**

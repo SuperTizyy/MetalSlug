@@ -116,14 +116,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DailyUpgradeReward|Debug")
 	void ManualRefreshUI();
 	/**
-	 * 绑定 ReselectRewardButton 按钮事件
-	 * 【vXXX 大厂修复】将此方法在 NativeConstruct 中调用，确保页面从缓存激活时重新绑定
+	 * @brief 绑定 ReselectRewardButton 按钮事件 — 必须在 NativeConstruct 调用, 防止页面缓存激活时事件丢失
 	 */
 	void BindReselectRewardButton();
 
 	/**
-	 * 绑定调试按钮事件 (Button_ApplyDebugValues / Button_ResetAllActivity / ComboBoxString_SelectedDay)
-	 * 【vXXX.1 大厂修复】模仿 BindReselectRewardButton 模式, 在 NativeConstruct 调用, 防止页面缓存激活时事件丢失
+	 * @brief 绑定调试按钮事件 (Button_ApplyDebugValues / Button_ResetAllActivity / ComboBoxString_SelectedDay)
 	 */
 	void BindDebugButtons();
 

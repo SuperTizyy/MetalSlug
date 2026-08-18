@@ -28,6 +28,10 @@ UBTService_RefreshTarget::UBTService_RefreshTarget()
 		AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示反扎堆账本驱动的目标刷新逻辑
+ * @return 多行描述,展示 0.3s Tick + RequestTargetForAI 调用 + 失败清 BB
+ */
 FString UBTService_RefreshTarget::GetStaticDescription() const
 {
 	return TEXT("【反扎堆账本】每 0.3s 调 URoomTargetingSubsystem::RequestTargetForAI 申请锁定目标。\n"

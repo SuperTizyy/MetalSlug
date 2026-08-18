@@ -21,6 +21,7 @@ class METALSLUG01_API UBTDecorator_InAttackRange : public UBTDecorator
 public:
 	UBTDecorator_InAttackRange();
 
+	/** @brief BT 编辑器静态描述 (显示 DistanceKey + AttackRangeKey + 区间) */
 	virtual FString GetStaticDescription() const override;
 
 	/** 距离 BB Key */
@@ -44,6 +45,7 @@ public:
 	float HysteresisMargin = 10.f;
 
 protected:
+	/** @brief BT 决策: 距离是否落在 [AR-Hyst, AR+Hyst] 区间内 → true=可攻击 */
 	virtual bool CalculateRawConditionValue(
 		UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
 };

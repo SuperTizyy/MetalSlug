@@ -33,6 +33,14 @@ void UEnergyComponent::InitializeEnergy(float InMax, float InCurrent)
 }
 
 
+/**
+ * @brief 消耗指定数量的能量(技能释放入口)
+ * @param Amount 要消耗的能量值(必须 > 0)
+ * @return true=消耗成功, false=数值非法或能量不足
+ *
+ * 服务器权威写入:CurrentEnergy 已 Replicated, 自动同步到客户端
+ * 服务器主动 Broadcast (OnRep 只在客户端触发, 大厂原则 - 单一真理源)
+ */
 bool UEnergyComponent::Consume(float Amount)
 {
 	// 防御: 非法数值直接短路
@@ -61,6 +69,12 @@ bool UEnergyComponent::Consume(float Amount)
 }
 
 
+/**
+ * @brief 增加能量(拾取/技能触发/自然回复)
+ * @param Amount 要增加的能量值(必须 > 0)
+ *
+ * 不会超过 MaxEnergy 上限. 同样在变化时主动 Broadcast (镜像 Consume).
+ */
 void UEnergyComponent::Add(float Amount)
 {
 	if (Amount <= 0.0f)
@@ -78,6 +92,12 @@ void UEnergyComponent::Add(float Amount)
 }
 
 
+/**
+ * @brief 客户端血量复制回调 — 收到 Replicated 字段时触发 Broadcast
+ *
+ * 客户端专用 (服务器不会进 OnRep). 服务器必须主动 Broadcast (见 Consume/Add).
+ * ReplicatedUsing 机制, 字段变化时自动触发.
+ */
 void UEnergyComponent::OnRep_CurrentEnergy()
 {
 	// 【2026-06-15 新增】: 客户端收到能量更新时, 广播给 HUD

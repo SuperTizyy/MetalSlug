@@ -33,6 +33,7 @@ class METALSLUG01_API UBTDecorator_ZombieAmmoEmpty : public UBTDecorator
 public:
 	UBTDecorator_ZombieAmmoEmpty();
 
+	/** @brief BT 编辑器静态描述 (显示 CurrentAmmoKey) */
 	virtual FString GetStaticDescription() const override;
 
 	/** BB.CurrentAmmo (Int) */
@@ -40,5 +41,6 @@ public:
 	FBlackboardKeySelector CurrentAmmoKey;
 
 protected:
+	/** @brief BT 决策: BB.CurrentAmmo == 0 → true=允许进换弹/找补给分支 */
 	virtual bool CalculateRawConditionValue(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const override;
 };

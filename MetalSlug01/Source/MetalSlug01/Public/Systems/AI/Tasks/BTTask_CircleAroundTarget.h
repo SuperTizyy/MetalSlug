@@ -44,6 +44,7 @@ class METALSLUG01_API UBTTask_CircleAroundTarget : public UBTTaskNode
 public:
 	UBTTask_CircleAroundTarget();
 
+	/** @brief BT 编辑器静态描述 (显示 OrbitAngleDegrees + 停顿秒数) */
 	virtual FString GetStaticDescription() const override;
 
 	/**

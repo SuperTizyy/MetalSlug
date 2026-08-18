@@ -3,7 +3,22 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// ActivityNavMenuWidget 头文件 — 活动导航菜单组件
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UActivityNavMenuWidget — 活动中心左侧导航栏
+//   2. 导航容器 + 页面容器 + 返回按钮
+//   3. 动态创建 UActivityNavButton 子项 + 页面缓存/切换
+//   4. 30 秒定时刷新红点
+//
+// 架构理念:
+//   - 页面缓存: TMap<FName, TWeakObjectPtr<UUserWidget>> 避免重复创建
+//   - 数据驱动: DT_ActivityInfoRow 是单一数据源
+//   - 双委托: OnNavItemSelected / OnNavigateToPage
+//   - 状态机: SetSelectedActivity 维护选中状态
+//   - 防御性: 多级降级方案 (DataTable/Subsystem/测试数据)
+//   - 生命周期: 30s 定时器, NativeDestruct 清理
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
@@ -235,7 +250,6 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "RedDot")
 	void UpdateNavItemRedDot(FName ActivityId, const FRedDotData& RedDotData);
-
 	// ==========================================
 	// 8. 时间信息
 	// ==========================================

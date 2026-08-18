@@ -3,7 +3,20 @@
 #pragma once
 
 // ==========================================
-// 头文件包含说明
+// RoomLabelWidget 头文件 — 房间列表中的单个房间条目 UI
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 URoomLabelWidget — 单个房间条目 Widget
+//   2. 显示房间名 + 玩家数 + 状态 + 高亮
+//   3. 点击后通过 OnRoomSelected 通知外层大厅
+//
+// 架构理念 (大厂架构升级):
+//   - 委托反通知: 不依赖外部主动查询, 点击时主动广播
+//   - 状态机: SetHighlight / SetRoomState 都是单一职责方法
+//   - 复用: 每个房间一条 URoomLabelWidget
+//   - 防御性: GetRoomName 时做空指针保护
+//   - 架构升级: OnRoomSelected 改为广播 widget 自身引用 (避免字符串丢失)
 // ==========================================
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"

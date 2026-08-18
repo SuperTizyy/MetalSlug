@@ -266,6 +266,17 @@ bool UWeaponDissolveComponent::ValidateMaterialHasDissolveParameter(UMaterialIns
 }
 
 
+/**
+ * @brief Tick 驱动 — 累加 DissolveAmount 进度并刷新所有材质 MID
+ * @param DeltaTime 帧间隔
+ * @param TickType Tick 类型
+ * @param ThisTickFunction Tick 函数引用
+ *
+ * 大厂原则 (v24):
+ *   - 协议: 武器材质蓝图必须含 DissolveAmount 参数, 缺失则驱动无效 (UE no-op)
+ *   - 范围: CurrentDissolveValue 从 -1 → 1, 钳到 [-1, 1]
+ *   - 完成 (>=1.0) 自动关 Tick + 广播 OnWeaponDissolveFinished
+ */
 void UWeaponDissolveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);

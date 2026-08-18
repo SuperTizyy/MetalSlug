@@ -17,6 +17,16 @@ UFootstepComponent::UFootstepComponent()
 	PrimaryComponentTick.bCanEverTick = false;
 }
 
+/**
+ * @brief 播放脚步声 — 单次触发, 带距离衰减
+ * @param OwnerChar 脚步声所属的 ACharacter (用于 Log Error 时显示角色名)
+ * @param Location  脚步触发的世界位置 (UE AnimNotify 传入)
+ *
+ * 大厂原则 (v241):
+ *   - 距离衰减完全由 FootstepAttenuation (BP 配置 SoundAttenuation 资产) 决定, C++ 不做兜底
+ *   - 缺失 FootstepSound / FootstepAttenuation → Log Error + 拒绝播放 (零兜底, 强制 BP 修复)
+ *   - 随机音高 (0.9~1.1) 提升听感自然度
+ */
 void UFootstepComponent::PlayFootstep(ACharacter* OwnerChar, const FVector& Location)
 {
 	// 【v241 零兜底】Owner 链校验

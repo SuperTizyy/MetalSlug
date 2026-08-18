@@ -29,6 +29,10 @@ UBTService_UpdateWeaponAmmo::UBTService_UpdateWeaponAmmo()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示弹药快照频率与四个 BB Key 派生语义
+ * @return 多行描述,展示 Interval/4 个 BB Key/无武器零兜底
+ */
 FString UBTService_UpdateWeaponAmmo::GetStaticDescription() const
 {
 	return FString::Printf(

@@ -35,6 +35,22 @@ class UAIBehaviorConfigSO;
 class UBlackboardComponent;
 
 /**
+ * @file BaseAIController.h
+ * @brief AI 控制器基类 (ABaseAIController) — UE 5.6 项目所有 AI 控制器 C++ 基类
+ *
+ * 大厂架构角色:
+ *   - 所有 AI Controller (Melee / Zombie) 的统一基类, 集中"感知 + BT + 阵营"链路
+ *   - 配置源 = UAIBehaviorConfigSO (关卡预放) + FAIModeRules (大厅)
+ *   - v221.1 CachedFactionTag 升级 Replicated (Tab Scoreboard 修复)
+ *   - v202.0 KDA 字段镜像玩家 PS (跨玩家/AI 统一计分板)
+ *
+ * 与其他组件的关系:
+ *   - 上游: ARoomGameMode (SpawnAIInternal / RequestRespawn)
+ *   - 下游: ABaseCharacter Pawn (AIController 控制)
+ *   - 配套: UAIRuntimeConfigComponent (行为参数注入) + BT/BTService (行为决策)
+ */
+
+/**
  * ABaseAIController — 项目所有 AI 控制器的 C++ 基类
  *
  * 【v54.4 重构】配置源 = UAIBehaviorConfigSO (关卡预放 AI) + FAIModeRules (大厅 AI)
@@ -123,6 +139,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	void InitializeFromConfig(UAIBehaviorConfigSO* InConfig, UBehaviorTree* BehaviorTreeOverride = nullptr);
 
+	UFUNCTION(BlueprintCallable, Category = "AI")
+	void SetDifficultyTier(EAIDifficultyTier NewTier);
+
+	/** @brief 运行时配置组件 (持有 ConfigSO 引用, BT/BTTask 拿数据的中介) */
+	UFUNCTION(BlueprintPure, Category = "AI")
+	UAIRuntimeConfigComponent* GetRuntimeConfig() const { return RuntimeConfig; }
+
+	/**
+	 * 【v54 重构】读取当前生效的 ConfigSO (真理源)
+	 *
+	 * 替代 v53 之前的 GetCurrentProfile() — Profile 中间层已删除
+	 * 调用方: BT/BTTask 通过 GetConfig() 读 ConfigSO 的所有参数
+	 */
+	UFUNCTION(BlueprintPure, Category = "AI")
+	const UAIBehaviorConfigSO* GetConfig() const;
+
 	/**
 	 * 【v201.10 大厂架构新增】重启 BT + 清空 Blackboard
 	 *
@@ -139,21 +171,6 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI")
 	void RestartBehaviorTreeAndClearBlackboard();
-
-	UFUNCTION(BlueprintCallable, Category = "AI")
-	void SetDifficultyTier(EAIDifficultyTier NewTier);
-
-	UFUNCTION(BlueprintPure, Category = "AI")
-	UAIRuntimeConfigComponent* GetRuntimeConfig() const { return RuntimeConfig; }
-
-	/**
-	 * 【v54 重构】读取当前生效的 ConfigSO (真理源)
-	 *
-	 * 替代 v53 之前的 GetCurrentProfile() — Profile 中间层已删除
-	 * 调用方: BT/BTTask 通过 GetConfig() 读 ConfigSO 的所有参数
-	 */
-	UFUNCTION(BlueprintPure, Category = "AI")
-	const UAIBehaviorConfigSO* GetConfig() const;
 
 	// ============================================================
 	// 【v221.1 大厂架构 — CachedFactionTag 升级为 Replicated (Tab Scoreboard 修复)】
@@ -570,7 +587,7 @@ public:
 	void AddDeath();
 
 	/**
-	 * 【v202.0】服务器专用: 重置 AI 计分数据 (每小局开始时调用, 镜像 ARoomPlayerState::ResetScoreboardStats)
+	 * @brief 重置 AI 计分数据 (每小局开始时调用, 镜像 ARoomPlayerState::ResetScoreboardStats)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AI|Scoreboard")
 	void ResetScoreboardStats();
@@ -609,9 +626,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "AI|Combat")
 	float GetEffectiveAttackInterval() const;
 
-	// 攻击伤害
-	UFUNCTION(BlueprintPure, Category = "AI|Combat")
-	float GetEffectiveAttackDamage() const;
+	// 【v250 大厂架构重构】攻击伤害已删除
+	//   旧版: AI 通道走 ABaseAIController::GetEffectiveAttackDamage() → AIBehaviorConfigSO.Combat.Damage
+	//   新版: AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
+	//   策划只需维护 DT_WeaponInfo 一份伤害配置
 
 	// 当前目标
 	UFUNCTION(BlueprintPure, Category = "AI|Combat")

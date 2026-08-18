@@ -1,5 +1,8 @@
 // Copyright (c) 2026.
 //
+// 文件作用: AZombieAIController 实现 — 生化模式 AI 控制器
+// 设计: 完全复用 ABaseAIController 基础能力, 仅 override 生化专属钩子
+//
 // 【Phase 2 模式化】生化模式专用 AI Controller 实现
 //
 // 关键设计:

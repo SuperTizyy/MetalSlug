@@ -21,6 +21,10 @@ UBTTask_ReloadPrimaryWeapon::UBTTask_ReloadPrimaryWeapon()
 }
 
 
+/**
+ * @brief 生成 BT 节点描述 — 展示主武器换弹调用镜像玩家 R 键语义
+ * @return 多行描述,展示 Server_StartReload 调用 + 业务拒绝(满/空/换弹中)→ Succeeded
+ */
 FString UBTTask_ReloadPrimaryWeapon::GetStaticDescription() const
 {
 	return TEXT("调 CurrentWeapon->Server_StartReload (镜像玩家 R 键)\n"

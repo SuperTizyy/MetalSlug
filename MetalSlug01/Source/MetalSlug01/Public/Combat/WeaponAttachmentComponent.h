@@ -445,6 +445,31 @@ public:
 	ABaseWeapon* SpawnAndConfigureWeaponInSlot(TSubclassOf<ABaseWeapon> WeaponClass, EWeaponSlotType Slot);
 
 	/**
+	 * 【v245 P0 大厂架构 — 弹匣 AttachParent 单一真理源入口】
+	 *
+	 * 根因:
+	 *   - UE Actor 复制不会自动同步子组件的 AttachParent (UE 5.x 已知行为)
+	 *   - BP CDO 默认 MagazineSkeletal.AttachParent = WeaponMesh, 但跨网络后丢失
+	 *   - 客户端弹匣变 World 坐标, 显示位置异常 (小局切换 Spawn 新武器时高频出现)
+	 *
+	 * 单一真理源入口 — 必须保证:
+	 *   - 服务器: SpawnAndConfigureWeaponInSlot 末尾 + AttachToCharacter 后
+	 *   - 客户端: OnRep_CurrentWeapon 末尾 + ApplyAttachmentRuntime 后
+	 *   - 任何时机: MagazineSkeletal.AttachParent != WeaponMesh → 强制修复
+	 *
+	 * 零兜底:
+	 *   - Weapon 没有 Magazine 子组件 (近战武器) → Log Verbose + return (合法 no-op)
+	 *   - MagazineSkeletal 已正确 attach → no-op
+	 *   - 找不到 WeaponMesh → Log Error + return (强制修复 BP)
+	 *
+	 * Attach 规则: KeepRelativeTransform — 保留 BP 默认 RelativeLocation/Rotation
+	 *
+	 * @param Weapon 要修复的武器 (nullptr → 自动用 CurrentWeapon)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Combat|Weapons|Magazine")
+	void EnsureMagazineAttachedToWeapon(ABaseWeapon* Weapon = nullptr);
+
+	/**
 	 * 统一的武器/角色预填入口
 	 *
 	 * @param InCharacterID 角色 ID (用于查找挂载配置)

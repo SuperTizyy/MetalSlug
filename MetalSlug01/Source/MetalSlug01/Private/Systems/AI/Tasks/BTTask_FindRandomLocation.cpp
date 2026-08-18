@@ -29,6 +29,10 @@ UBTTask_FindRandomLocation::UBTTask_FindRandomLocation()
 		GET_MEMBER_NAME_CHECKED(UBTTask_FindRandomLocation, WanderTargetKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示漫游原子(选随机 NavMesh 点)语义
+ * @return 多行描述,展示 OriginLocation 中心 + WanderRadius(唯一真理源 ConfigSO)+ 失败无兜底
+ */
 FString UBTTask_FindRandomLocation::GetStaticDescription() const
 {
 	return TEXT("【漫游原子能力】以 OriginLocation 为中心, WanderRadius (ConfigSO) 为半径, "

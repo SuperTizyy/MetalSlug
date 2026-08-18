@@ -26,6 +26,10 @@ UBTDecorator_InAttackRange::UBTDecorator_InAttackRange()
 		GET_MEMBER_NAME_CHECKED(UBTDecorator_InAttackRange, AttackRangeKey));
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 显示攻击区间判断表达式与迟滞边界
+ * @return 多行描述,包含 BB Key 与 AR ± Margin 区间,用于 BT 编辑器可视化
+ */
 FString UBTDecorator_InAttackRange::GetStaticDescription() const
 {
 	return FString::Printf(TEXT("可攻击? (%s-%.0f <= %s <= %s+%.0f)\n"
@@ -38,6 +42,16 @@ FString UBTDecorator_InAttackRange::GetStaticDescription() const
 		HysteresisMargin);
 }
 
+/**
+ * @brief 攻击距离判定 — 距离是否在 [AR-Margin, AR+Margin] 区间内
+ * @param OwnerComp BT 组件引用, 用于获取 BB / AIController
+ * @param NodeMemory Decorator 节点内存(本类未使用)
+ * @return 在区间内且目标有效 → true(允许进入 Attack 分支)
+ *
+ * 单点决策: 无 Tick, 距离变化由 FlowAbortMode::Self 在 BB.Distance 变化时重算.
+ * 三层防御: BB 无效/Distance<0(无目标)/不在区间 → 全部返 false 拒判.
+ * v40.5 节点级可观测性:Verbose Log 默认隐藏, 调试时开启可看到决策过程.
+ */
 bool UBTDecorator_InAttackRange::CalculateRawConditionValue(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory) const
 {

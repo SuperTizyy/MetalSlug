@@ -1,14 +1,32 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
+// ========================================================================
+// MusicManagerConfig.h — 背景音乐配置数据资产 头文件
+// ========================================================================
+//
+// 文件功能总览:
+//   - 声明 UMusicManagerConfig 类(继承 UDataAsset),用于在 UE 编辑器中配置
+//     4 种场景的背景音乐资产(主菜单 / 活动页 / 房间 / 战斗)
+//   - 每个音乐条目 = USoundBase 资产 + 是否循环播放
+//
+// 大厂架构角色:
+//   - 单一真理源: 背景音乐配置全部由 DA_MusicManagerConfig.uasset 提供
+//   - 数据驱动: 严禁在 Subsystem 中硬编码资产路径
+//   - 由 UMusicManagerSubsystem 在运行时读取并 Play
+//
+// 编辑器配置路径:
+//   Content Browser → Right Click → Miscellaneous → Data Asset → UMusicManagerConfig
+// ========================================================================
+
 #pragma once
 
 // ==========================================
 // 头文件包含说明
 // ==========================================
-#include "CoreMinimal.h"
-#include "Engine/DataAsset.h"
-#include "Sound/SoundBase.h"
-#include "MusicManagerConfig.generated.h"
+#include "CoreMinimal.h"           // UE 引擎核心最小化头文件
+#include "Engine/DataAsset.h"       // UDataAsset 基类
+#include "Sound/SoundBase.h"        // USoundBase(兼容 SoundCue / SoundWave / MetaSoundSource)
+#include "MusicManagerConfig.generated.h"  // UE 自动生成的反射代码头
 
 // 前向声明
 class USoundBase;

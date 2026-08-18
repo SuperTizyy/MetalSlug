@@ -10,6 +10,23 @@
  * @details 实现经验宝箱领取功能的 UI Widget
  */
 
+// ==========================================
+// ExperienceChestClaimWidget 头文件 — 经验宝箱领取 Widget
+// ==========================================
+//
+// 文件作用:
+//   1. 声明 UExperienceChestClaimWidget — 经验宝箱 UI
+//   2. 经验宝箱 + 数量 + 进度条 + 钻石图标
+//   3. 玩家点击后请求父页面领取
+//
+// 架构理念:
+//   - 单一职责: 一个 Widget 管一个宝箱
+//   - 数据驱动: ChestIndex 路由数据
+//   - 委托通信: OnChestClaimRequested(ChestIndex) 通知父级
+//   - 复用: FixedPrizeWidget 也用此类, 通过 ChestIndex 区分
+//   - 状态机: Enabled(可领) / Disabled(经验不足) / Claimed(已领)
+//   - UMG 时序: ChestClaimButton->OnClicked 绑定必须在 NativeConstruct (v230)
+// ==========================================
 #pragma once
 
 // ==========================================

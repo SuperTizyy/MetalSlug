@@ -1,7 +1,12 @@
 // Copyright (c) 2026. All Rights Reserved.
 //
 // 【v107 2026.07.28 生化模式 AI】集合点账本 + 选点 Subsystem 实现
-
+//
+// 【v125 2026.08.01 v125 改动】访问历史账本 + 反射式换点冷却 — 解决 A↔B 来回切换抖动
+/**
+ * @file RoomZombieRallySubsystem.cpp
+ * @brief 生化模式集合点账本 + 服务器权威选点子系统实现
+ */
 #include "Systems/Zombie/RoomZombieRallySubsystem.h"
 
 #include "World/Objectives/ZombieRallyPoint.h"
@@ -100,6 +105,17 @@ bool URoomZombieRallySubsystem::RegisterRallyPoint(AZombieRallyPoint* Point)
 }
 
 
+/**
+ * @brief 注销集合点(Actor 销毁 / 移除时调用)
+ * @param Point 要注销的集合点
+ * @return true=已注销或本就在销毁中, false=被锁定没法注销
+ *
+ * 大厂原则 — 账本完整性:
+ * - 若 PointID 仍被任意 AI 锁定 → 拒绝注销(避免 AI 持有失效 PointID)
+ * - 集合点应设计为"整局不被销毁", 不要在游戏过程中 RemoveAllActorsOfClass
+ *
+ * 锁定账本里搜这个 PointID, 找到任何 AI 都不允许注销
+ */
 bool URoomZombieRallySubsystem::UnregisterRallyPoint(AZombieRallyPoint* Point)
 {
 	if (!IsValid(Point))
@@ -217,6 +233,13 @@ bool URoomZombieRallySubsystem::LockRallyPointForAI(AController* Controller, con
 }
 
 
+/**
+ * @brief 查询指定 Controller 锁定的集合点 ID
+ * @param Controller 要查询的 AI 控制器
+ * @return PointID 字符串, 未锁定则返回空字符串
+ *
+ * 用于 BT 节点读账本: 当前 AI 已经决定去哪个集合点
+ */
 FString URoomZombieRallySubsystem::GetLockedRallyPointID(AController* Controller) const
 {
 	if (const FString* Existing = LockedRallyByAI.Find(Controller))
@@ -226,7 +249,15 @@ FString URoomZombieRallySubsystem::GetLockedRallyPointID(AController* Controller
 	return FString();
 }
 
-
+/**
+ * @brief 解锁指定 Controller 的集合点占用(死亡 / 重置时调用)
+ * @param Controller 要解锁的 AI 控制器
+ * @return true=存在锁定并已移除, false=无锁定或 Controller 无效
+ *
+ * 调用时机:
+ * - AI 死亡 → 立即解锁让其他 AI 能抢这个点
+ * - AI 状态切换(放弃本集合点) → 解锁
+ */
 bool URoomZombieRallySubsystem::UnlockRallyPointForAI(AController* Controller)
 {
 	if (!IsValid(Controller))

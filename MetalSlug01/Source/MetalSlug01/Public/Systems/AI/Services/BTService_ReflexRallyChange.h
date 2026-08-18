@@ -94,6 +94,7 @@ class METALSLUG01_API UBTService_ReflexRallyChange : public UBTService
 public:
 	UBTService_ReflexRallyChange();
 
+	/** @brief BT 编辑器静态描述 (显示 TriggerRadius / MotherThreatRadius / Tick 频率) */
 	virtual FString GetStaticDescription() const override;
 
 	/** BB.LockedRallyPoint (Object Key) — 读取当前锁点 / 写入新锁点 */

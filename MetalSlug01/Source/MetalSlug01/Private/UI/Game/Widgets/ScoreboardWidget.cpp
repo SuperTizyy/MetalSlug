@@ -1,64 +1,32 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 【v229.x v2 大厂架构重构 — ScoreboardWidget 排名权威化 v2】
+// ScoreboardWidget 实现 — 战斗排名计分板
 // ==========================================
 //
-// 用户反馈 (2026.08.16 v3 明确):
-//   - "排名显示就数字就行, 不要特殊字符"
-//   - "排名不能重复数字" (严格唯一: 1,2,3,4 即便同分)
-//   - "排名按得分: 击杀 +10 / 助攻 +5 / 死亡 -1"
-//   - "绝对不能有兜底行为"
+// 文件作用:
+//   1. 实现 UScoreboardWidget — 计分板所有 UI 逻辑
+//   2. 增量更新 (RefreshScoreboard) — 修复历史闪烁
+//   3. 单一入口排名刷新 (RefreshRanksInContainer) — 排序+排名赋值一气呵成
+//   4. 冻结快照 (FreezeSnapshot/ApplySnapshot) — 结算跨地图持久
+//   5. 阵营文案 (ScoreboardFactionNames namespace) — 集中 UI 文案
 //
-// 历史 (v22-v228) 5 个反模式:
-//   1. 排序字段错: 用 Snap.Score (总分 = Kill*20 + Assist*10), 与玩家直觉不符
-//   2. N² 重复架构: SortEntriesByScore 在内重读 ActiveSnapshots 线性查 Score (总复杂度 N²)
-//   3. 不稳定排序: TArray::Sort 用 introsort (UE 实现),同 Kills 玩家顺序跳变
-//   4. UpdateAllRanks 按位置 1,2,3 累加: 同 Kills 玩家挤占名次
-//   5. 调用方必须两次调用 (Sort + UpdateRanks), 散落维护成本
-//   6. RemoveStaleEntries 用 N×M ContainsByPredicate (反模式)
+// 关键架构 (v229.x v2 大厂重构):
+//   - 排序字段: Entry->GetScore() 走 FKdaScoring::Compute (Kills*10 + Assists*5 - Deaths)
+//   - 排名算法: 严格唯一 (rank = i+1, 1,2,3,4 即便同分也不重号)
+//   - 稳定排序: int64 复合 key (-Score 高 32 位 + OriginalIndex 低 32 位)
+//   - 排序实现: 倒序 RemoveChild + 顺序 AddChild (修复 InsertChildAt 时序竞争)
+//   - 排序复杂度: O(N log N) (一次收集 + Sort + 重排)
 //
-// v229.x (v1) 修复 — 旧 (已过期):
-//   - 排序字段: Entry->GetKills() (按击杀数)
-//   - 排名算法: Standard Competition Ranking (1,2,2,4)
-//
-// v229.x (v2) 修复 — 新 (用户业务规则 2026.08.16):
-//   - 排序字段: Entry->GetScore() 走 FKdaScoring::Compute (按"得分", 击杀+10/助攻+5/死亡-1)
-//   - 排名算法: 严格唯一 (rank = i+1, 永远递增, 1,2,3,4 即便同分)
-//   - 同分时: 按 OriginalIndex 升序 (稳定排序已保证), rank 也升序 (用户规则: "先插入在前")
-//   - 排名显示: 仅数字 (用户规则: "排名显示就数字就行, 不要特殊字符"), SetRank 内 emoji 删除
-//
-// 终极修复 (大厂架构 v229.x v2):
-//
-//   [单一真理源 + 公式唯一]  FKdaScoring::Compute(Kills, Assists, Deaths) = Kills*10 + Assists*5 - Deaths
-//                            → 业务层 (RoomPlayerState/BaseAIController) = UI 层 (Entry::GetScore) 同一真理源
-//                            → 业务层 20/10 → 10/5, 死亡 -1 (单一修正, 不分散)
-//                            → CachedScore 不缓存 (派生数据每次现算, 避免字段飘移)
-//
-//   [单入口]                  RefreshRanksInContainer(VerticalBox) 一函数搞定排序+排名赋值
-//                            → RefreshScoreboard 末尾一次调用, 代替旧两次调用
-//
-//   [稳定排序]                用 int64 复合 key 编码 (-Score 高 32 位 + OriginalIndex 低 32 位)
-//                            → 同 Score 玩家按入位先后顺序, 视觉稳定不抖
-//
-//   [严格唯一排名]            rank = i + 1 (永远递增, 1, 2, 3, 4 ...)
-//                            → 同分玩家按 OriginalIndex 升序 = "先插入在前" 满足用户规则
-//
-//   [O(N) 集合]               RemoveStaleEntries 用 TSet<FString> 哈希查找 (替代 N² ContainsByPredicate)
-//
-//   [0 兜底]
-//   - VerticalBox 为空 → return (无需排序)
-//   - Entry->GetScore() 永远有效 (CachedKills/Deaths/Assists 默认 0, 不抛)
-//   - SetRank 严格只输出数字 (无 emoji, 无 fallback)
-//   - RemoveChild(Widget) 不销毁 Widget 对象, 后续 AddChild 复用 (与 v215 Bug #1 闪烁修复一致)
-//
-// [v229.x v2.1 大厂架构修复 — 排序顺序生效]
-//   历史 (v229.x v2): RemoveChild + InsertChildAt(i, Widget) — 用户反馈"排名正确但排序不对"
-//   根因: UE 5.6 UPanelWidget::InsertChildAt 在 Widget->Slot==nullptr 时序竞争下, 实际插入位置可能不是 i
-//   修复: 倒序 RemoveChildAll + 按 EncodedList 顺序 AddChild (100% 可靠)
-//
+// 大厂原则:
+//   - 单一真理源: Score 计算公式在 FKdaScoring.cpp (业务层与 UI 层共用)
+//   - 零兜底: 配置错显式 Log Error, 不静默
+//   - DRY: ApplySnapshotToEntry 单一入口统一所有 Setter 调用
 // ==========================================
 
+// ==========================================
+// 头文件包含区
+// ==========================================
 #include "UI/Game/Widgets/ScoreboardWidget.h"
 #include "UI/Game/Widgets/SubWidgets/ScoreboardEntryWidget.h"
 #include "Components/VerticalBox.h"

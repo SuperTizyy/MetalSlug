@@ -50,6 +50,7 @@ class METALSLUG01_API UBTDecorator_CooldownReady : public UBTDecorator
 public:
 	UBTDecorator_CooldownReady();
 
+	/** @brief BT 编辑器节点静态描述 (显示 Op + RightSource + Key/常量) */
 	virtual FString GetStaticDescription() const override;
 
 	/**

@@ -31,6 +31,10 @@ UBTTask_FaceTarget::UBTTask_FaceTarget()
 		AActor::StaticClass());
 }
 
+/**
+ * @brief 生成 BT 节点描述 — 展示原子化"面朝目标"语义与中止清理
+ * @return 多行描述,展示 InProgress 返回 + AbortTask 清焦点 + TargetActor 零兜底
+ */
 FString UBTTask_FaceTarget::GetStaticDescription() const
 {
 	return TEXT("【原子化】让 AI 持续面朝 TargetActor。\n"

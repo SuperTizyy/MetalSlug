@@ -116,6 +116,14 @@ void UInvincibilityFlickerComponent::BeginPlay()
 }
 
 
+/**
+ * @brief EndPlay — 清理无敌闪烁组件所有残留资源
+ *
+ * 大厂原则 - 防御型清理:
+ *   - 强制重置 MID 闪烁值 = 0 (退出关卡/Actor 销毁前防残留)
+ *   - 取消订阅 HealthComponent->OnInvincibilityChanged (避免 Owner 销毁后回调 crash)
+ *   - 清 CachedHealthComponent TWeakObjectPtr
+ */
 void UInvincibilityFlickerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	// ============================================================

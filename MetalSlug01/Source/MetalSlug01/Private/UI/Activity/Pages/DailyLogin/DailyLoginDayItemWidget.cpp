@@ -1,7 +1,19 @@
 // 版权声明：在项目设置的描述页面填写您的版权信息。
 
 // ==========================================
-// 头文件包含区
+// DailyLoginDayItemWidget 实现 — 每日登录单天条目
+// ==========================================
+//
+// 文件作用:
+//   1. 实现 UDailyLoginDayItemWidget — 单日登录条目所有 UI 逻辑
+//   2. 4 种状态颜色: 可领取/明日可领/已领取/未完成
+//   3. 第 8 天大奖特殊样式 (BigRewardItem)
+//
+// 大厂原则:
+//   - 单一职责: 一个条目管自己, 不影响其他条目
+//   - 防御性: 控件未绑 → Log Error
+//   - 异步加载: TSoftObjectPtr 避免主线程卡顿
+//   - 防重入: SetTimer 延迟初始化避免按钮未初始化时访问
 // ==========================================
 #include "UI/Activity/Pages/DailyLogin/DailyLoginDayItemWidget.h"
 #include "Components/TextBlock.h"

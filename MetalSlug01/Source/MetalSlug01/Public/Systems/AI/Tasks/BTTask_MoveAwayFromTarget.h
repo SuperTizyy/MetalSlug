@@ -47,13 +47,19 @@ class METALSLUG01_API UBTTask_MoveAwayFromTarget : public UBTTaskNode
 public:
 	UBTTask_MoveAwayFromTarget();
 
+	/** @brief BT 编辑器静态描述 (显示 StepDistance + AcceptanceRadius + MaxWaitTime) */
 	virtual FString GetStaticDescription() const override;
 
 	/**
 	 * 退步距离 (cm) — 默认 5cm, 刚好脱离 BTDecorator_TooClose (D <= AR) 决策
+	 *
+	 * v246.2 移除 ClampMax (用户反馈: 不能设置最大限度)
+	 *   - 旧版 ClampMax = 100cm, 但某些关卡 (大场地 Boss 战) AI 需要退更远
+	 *   - 仅保留下限 1cm (避免 0 / 负数导致 MoveTo 无方向)
+	 *   - 设计师可按场景自由设置 (50/100/300/500cm 均可)
 	 */
 	UPROPERTY(EditAnywhere, Category = "Config",
-		meta = (ClampMin = "1.0", ClampMax = "100.0"))
+		meta = (ClampMin = "1.0"))
 	float StepDistance = 5.f;
 
 	UPROPERTY(EditAnywhere, Category = "Config",
@@ -71,6 +77,7 @@ protected:
 	virtual EBTNodeResult::Type ExecuteTask(UBehaviorTreeComponent& OwnerComp,
 		uint8* NodeMemory) override;
 
+	/** @brief Tick: 异步等 MoveTo 到达 / 超时, 满足条件恢复 Movement 设置并 Succeeded */
 	virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory,
 		float DeltaSeconds) override;
 
@@ -98,6 +105,8 @@ private:
 	}
 
 	FVector ComputeStepBackLocation(APawn* AIPawn, AActor* TargetActor) const;
+	/** @brief 启动后退 MoveTo (异步): 朝向 SnapToTarget + MoveToLocation(RetreatPoint) */
 	bool StartMoveTo(UBehaviorTreeComponent& OwnerComp, const FVector& Dest);
+	/** @brief Tick 检查: 到达 AcceptanceRadius 或超 MaxWaitTime → 恢复 Movement 设置 + FinishLatentTask */
 	void CheckArrival(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory);
 };

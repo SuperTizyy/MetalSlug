@@ -164,33 +164,32 @@ void StopWeaponTrace();
 	 *   - 旧版设计: 武器有一个统一的"基础伤害"字段, 各种攻击都从这里派生
 	 *   - 实际: 该字段从未被 C++ 读过, LightDamageBody/Head/Heavy 才是真正的伤害源
 	 *
-	 * 当前:
-	 *   - AI 通道: 走 ABaseAIController::GetEffectiveAttackDamage() → ConfigSO.Damage
-	 *   - 玩家通道: 走 BaseWeapon::Server_ReportHit → LightDamageBody/Head/Heavy
+	 * 当前 (v250 重构后):
+	 *   - AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (已从 DT_WeaponInfo 初始化)
 	 *   - BaseDamage 字段保留 (BlueprintReadWrite) 以免破坏现有 BP, 但不参与实际伤害计算
 	 *
-	 * 新设计: 武器的"统一伤害"概念被拆为 LightDamageBody/Head/Heavy 三个精确字段
-	 *         AI 行为配置走 ConfigSO, 不再受武器"基础伤害"字段干扰
+	 * 【v250 大厂架构重构】: AI 和玩家统一走 DT_WeaponInfo, 不再走 ConfigSO.Damage
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat",
-		meta = (DeprecatedProperty, DeprecationMessage = "已废弃, AI 通道走 ConfigSO.Damage, 玩家通道走 LightDamageBody/Head/Heavy"))
+		meta = (DeprecatedProperty, DeprecationMessage = "【v250 已废弃】AI 和玩家伤害统一走 DT_WeaponInfo.LightDamageBody/Head, 此字段不再被读取."))
 	float BaseDamage = 20.0f;
 
 	/**
 	 * 轻击时允许移动吗？
+	 *
 	 * 例: 短剑 = true（轻击快）, 大锤 = false（重击慢）
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat Config")
 	bool bCanMoveWhileLightAttack = true;
 
 	/**
-	 * 重击时允许移动吗？
+	 * 重击时允许移动吗？(true=边走边打, false=站在原地打)
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat Config")
 	bool bCanMoveWhileHeavyAttack = false;
 
 	/**
-	 * 下蹲时允许攻击吗？(统管轻重击)
+	 * 下蹲时允许攻击吗？(统管轻重击, true=蹲姿可攻击, false=蹲姿禁止)
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat Config")
 	bool bCanAttackWhileCrouched = true;
@@ -217,25 +216,20 @@ public:
 	/**
 	 * 报告命中（Server RPC）
 	 *
-	 * 【P0 2026.07.07 大厂架构重构】新增 bIsAIDriven 参数
-	 *   - bIsAIDriven=false (玩家路径,默认): 走武器字段重算 (LightDamageBody/Head/Heavy)
-	 *   - bIsAIDriven=true  (AI 路径):     强制走 DamageOverride, 不读武器字段
-	 *     这是修复"AI 一次攻击造成两种伤害"的核心:
-	 *       旧版 AI 调用时 Damage=AIDamage, 但代码仍会兜底 if (bIsHeavy) else, 走武器字段
-	 *       → 若 BP 把 LightDamageBody 改了, AI 伤害被覆盖
-	 *       → 加上 bIsAIDriven 后, AI 通道完全独立, ConfigSO.Damage 单一真值源
+	 * 【v250 大厂架构重构】伤害统一走 DT_WeaponInfo
+	 *   - 旧版 (v40-v249): AI 走 ConfigSO.Damage, 玩家走 LightDamageBody/Head/Heavy
+	 *   - 新版 (v250): AI 和玩家统一走 BaseWeapon::LightDamageBody/Head/Heavy (DT_WeaponInfo)
+	 *   - bIsAIDriven 参数仅用于诊断日志, 不再决定伤害分支
 	 *
 	 * 流程: 客户端检测到命中后调用，服务器执行伤害
 	 *
 	 * @param HitActor    受击目标 (服务器校验: 必须是 ABaseCharacter 且未死)
-	 * @param Damage      伤害值
-	 *                      - 玩家路径: 传 0.0f, 服务器按部位 + bIsHeavy 重算
-	 *                      - AI 路径:   传 ConfigSO.Damage (已难度缩放), 服务器直接用
+	 * @param Damage      伤害值 (玩家路径传 0.0f, 服务器按部位重算; AI 路径也传 0.0f)
 	 * @param HitLocation 命中世界坐标 (服务器校验 NaN)
 	 * @param HitNormal   命中法线 (服务器校验单位向量)
-	 * @param BoneName    骨骼名 (玩家路径用于判定爆头)
+	 * @param BoneName    骨骼名 (用于判定爆头)
 	 * @param bIsHeavy    是否重击
-	 * @param bIsAIDriven 是否 AI 通道 (强制走 DamageOverride, 默认 false 玩家路径)
+	 * @param bIsAIDriven 是否 AI 通道 (仅用于日志标识, 不再决定伤害分支)
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void Server_ReportHit(AActor* HitActor, float Damage, FVector HitLocation, FVector HitNormal, FName BoneName, bool bIsHeavy, bool bIsAIDriven = false);

@@ -38,6 +38,7 @@ class METALSLUG01_API UBTTask_FindRandomLocation : public UBTTaskNode
 public:
 	UBTTask_FindRandomLocation();
 
+	/** @brief BT 编辑器静态描述 (显示 OriginLocation + WanderRadius 范围) */
 	virtual FString GetStaticDescription() const override;
 
 	/**
